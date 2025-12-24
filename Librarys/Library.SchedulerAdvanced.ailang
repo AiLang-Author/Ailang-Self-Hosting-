@@ -1,0 +1,626 @@
+// Library.SchedulerAdvanced.ailang
+// Enhanced scheduler with priority queues, work-stealing, supervision trees, and MapReduce
+
+//LibraryImport.Scheduler
+
+// ============================================================
+// PRIORITY SCHEDULING
+// ============================================================
+
+FixedPool.Priority {
+    "LOW": Initialize=0
+    "NORMAL": Initialize=1
+    "HIGH": Initialize=2
+    "CRITICAL": Initialize=3
+}
+
+// Enhanced actor registration with priority
+Function.SchedulerPriority.RegisterActor {
+    Input: sched: Address
+    Input: actor_id: Integer
+    Input: priority: Integer
+    Output: Integer
+    Body: {
+        // First do normal registration
+        result = Scheduler.RegisterActor(sched, actor_id)
+        
+        // Store priority (using high bits of state for simplicity)
+        // State format: [priority:2 bits][actual_state:6 bits]
+        state_offset = Add(SchedulerConfig.ACTOR_STATES_OFFSET, actor_id)
+        current_state = ArrayGet(sched, state_offset)
+        
+        // Encode priority in high bits
+        priority_shifted = Multiply(priority, 64)  // Shift left 6 bits
+        new_state = Add(priority_shifted, current_state)
+        ArraySet(sched, state_offset, new_state)
+        
+        PrintMessage("[PRIORITY] Actor ")
+        PrintNumber(actor_id)
+        PrintMessage(" registered with priority ")
+        PrintNumber(priority)
+        PrintMessage("\n")
+        
+        ReturnValue(result)
+    }
+}
+
+// Priority-aware scheduling step
+Function.SchedulerPriority.Step {
+    Input: sched: Address
+    Output: Integer
+    Body: {
+        head = ArrayGet(sched, SchedulerConfig.RUN_QUEUE_HEAD)
+        tail = ArrayGet(sched, SchedulerConfig.RUN_QUEUE_TAIL)
+        
+        // Empty queue
+        IfCondition EqualTo(head, tail) ThenBlock: {
+            ReturnValue(-1)
+        }
+        
+        // Find highest priority actor in queue
+        best_actor = -1
+        best_priority = -1
+        best_index = -1
+        
+        current = head
+        index = 0
+        
+        WhileLoop NotEqual(current, tail) {
+            queue_offset = Add(SchedulerConfig.RUN_QUEUE_OFFSET, current)
+            actor_id = ArrayGet(sched, queue_offset)
+            
+            // Extract priority from state
+            state_offset = Add(SchedulerConfig.ACTOR_STATES_OFFSET, actor_id)
+            state = ArrayGet(sched, state_offset)
+            priority = Divide(state, 64)  // Extract high bits
+            
+            IfCondition GreaterThan(priority, best_priority) ThenBlock: {
+                best_actor = actor_id
+                best_priority = priority
+                best_index = current
+            }
+            
+            current = Modulo(Add(current, 1), SchedulerConfig.MAX_ACTORS)
+            index = Add(index, 1)
+        }
+        
+        // Remove best actor from queue (compact the queue)
+        IfCondition NotEqual(best_actor, -1) ThenBlock: {
+            // Shift all elements after best_index
+            current = best_index
+            next = Modulo(Add(current, 1), SchedulerConfig.MAX_ACTORS)
+            
+            WhileLoop NotEqual(next, tail) {
+                queue_offset_current = Add(SchedulerConfig.RUN_QUEUE_OFFSET, current)
+                queue_offset_next = Add(SchedulerConfig.RUN_QUEUE_OFFSET, next)
+                
+                next_actor = ArrayGet(sched, queue_offset_next)
+                ArraySet(sched, queue_offset_current, next_actor)
+                
+                current = next
+                next = Modulo(Add(current, 1), SchedulerConfig.MAX_ACTORS)
+            }
+            
+            // Update tail
+            new_tail = Modulo(Subtract(tail, 1), SchedulerConfig.MAX_ACTORS)
+            ArraySet(sched, SchedulerConfig.RUN_QUEUE_TAIL, new_tail)
+            
+            // Set current actor
+            ArraySet(sched, SchedulerConfig.CURRENT_ACTOR, best_actor)
+            
+            // Update state to RUNNING (preserve priority)
+            state_offset = Add(SchedulerConfig.ACTOR_STATES_OFFSET, best_actor)
+            state = ArrayGet(sched, state_offset)
+            priority_bits = Multiply(Divide(state, 64), 64)
+            new_state = Add(priority_bits, ActorState.RUNNING)
+            ArraySet(sched, state_offset, new_state)
+        }
+        
+        ReturnValue(best_actor)
+    }
+}
+
+// ============================================================
+// WORK STEALING
+// ============================================================
+
+// Work queue per actor for stealing
+Function.WorkStealing.InitQueues {
+    Input: sched: Address
+    Output: Address
+    Body: {
+        // Create work queues array (64 actors * 16 work items each)
+        work_queues = ArrayCreate(1024)
+        
+        // Initialize all to empty
+        i = 0
+        WhileLoop LessThan(i, 1024) {
+            ArraySet(work_queues, i, -1)
+            i = Add(i, 1)
+        }
+        
+        PrintMessage("[WORK-STEAL] Initialized work queues\n")
+        ReturnValue(work_queues)
+    }
+}
+
+// Add work to an actor's queue
+Function.WorkStealing.AddWork {
+    Input: work_queues: Address
+    Input: actor_id: Integer
+    Input: work_item: Integer
+    Body: {
+        base = Multiply(actor_id, 16)
+        
+        // Find empty slot
+        i = 0
+        WhileLoop LessThan(i, 16) {
+            offset = Add(base, i)
+            current = ArrayGet(work_queues, offset)
+            
+            IfCondition EqualTo(current, -1) ThenBlock: {
+                ArraySet(work_queues, offset, work_item)
+                PrintMessage("[WORK-STEAL] Added work item ")
+                PrintNumber(work_item)
+                PrintMessage(" to actor ")
+                PrintNumber(actor_id)
+                PrintMessage("\n")
+                ReturnValue(1)
+            }
+            
+            i = Add(i, 1)
+        }
+        
+        PrintMessage("[WORK-STEAL] Queue full for actor ")
+        PrintNumber(actor_id)
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}
+
+// Steal work from another actor
+Function.WorkStealing.StealFrom {
+    Input: work_queues: Address
+    Input: thief_id: Integer
+    Input: victim_id: Integer
+    Output: Integer
+    Body: {
+        victim_base = Multiply(victim_id, 16)
+        
+        // Find last work item in victim's queue
+        i = 15
+        WhileLoop GreaterEqual(i, 0) {
+            offset = Add(victim_base, i)
+            work_item = ArrayGet(work_queues, offset)
+            
+            IfCondition NotEqual(work_item, -1) ThenBlock: {
+                // Steal it!
+                ArraySet(work_queues, offset, -1)
+                
+                // Add to thief's queue
+                WorkStealing.AddWork(work_queues, thief_id, work_item)
+                
+                PrintMessage("[WORK-STEAL] Actor ")
+                PrintNumber(thief_id)
+                PrintMessage(" stole work ")
+                PrintNumber(work_item)
+                PrintMessage(" from actor ")
+                PrintNumber(victim_id)
+                PrintMessage("\n")
+                
+                ReturnValue(work_item)
+            }
+            
+            i = Subtract(i, 1)
+        }
+        
+        ReturnValue(-1)  // Nothing to steal
+    }
+}
+
+// Try to steal work when idle
+Function.WorkStealing.TrySteal {
+    Input: work_queues: Address
+    Input: sched: Address
+    Input: thief_id: Integer
+    Output: Integer
+    Body: {
+        num_actors = ArrayGet(sched, SchedulerConfig.NUM_ACTORS)
+        
+        // Try to steal from each other actor
+        victim = 0
+        WhileLoop LessThan(victim, num_actors) {
+            IfCondition NotEqual(victim, thief_id) ThenBlock: {
+                stolen = WorkStealing.StealFrom(work_queues, thief_id, victim)
+                
+                IfCondition NotEqual(stolen, -1) ThenBlock: {
+                    ReturnValue(stolen)
+                }
+            }
+            
+            victim = Add(victim, 1)
+        }
+        
+        ReturnValue(-1)  // No work available to steal
+    }
+}
+
+// ============================================================
+// SUPERVISION TREES
+// ============================================================
+
+FixedPool.SupervisorStrategy {
+    "ONE_FOR_ONE": Initialize=0      
+    "ONE_FOR_ALL": Initialize=1      
+    "REST_FOR_ONE": Initialize=2     
+}
+
+// Supervisor registration
+Function.Supervisor.Create {
+    Input: sched: Address
+    Input: supervisor_id: Integer
+    Input: strategy: Integer
+    Output: Address
+    Body: {
+        // Allocate supervisor structure
+        // [strategy, num_children, child1, child2, ...]
+        supervisor = ArrayCreate(66)
+        ArraySet(supervisor, 0, strategy)
+        ArraySet(supervisor, 1, 0)  // num_children
+        
+        PrintMessage("[SUPERVISOR] Created supervisor ")
+        PrintNumber(supervisor_id)
+        PrintMessage(" with strategy ")
+        PrintNumber(strategy)
+        PrintMessage("\n")
+        
+        ReturnValue(supervisor)
+    }
+}
+
+// Add child to supervisor
+Function.Supervisor.AddChild {
+    Input: supervisor: Address
+    Input: child_id: Integer
+    Body: {
+        num_children = ArrayGet(supervisor, 1)
+        
+        IfCondition LessThan(num_children, 64) ThenBlock: {
+            child_offset = Add(2, num_children)
+            ArraySet(supervisor, child_offset, child_id)
+            ArraySet(supervisor, 1, Add(num_children, 1))
+            
+            PrintMessage("[SUPERVISOR] Added child ")
+            PrintNumber(child_id)
+            PrintMessage(" (total: ")
+            PrintNumber(Add(num_children, 1))
+            PrintMessage(")\n")
+        }
+    }
+}
+
+// Handle actor failure
+Function.Supervisor.HandleFailure {
+    Input: supervisor: Address
+    Input: sched: Address
+    Input: failed_actor: Integer
+    Body: {
+        strategy = ArrayGet(supervisor, 0)
+        num_children = ArrayGet(supervisor, 1)
+        
+        PrintMessage("[SUPERVISOR] Handling failure of actor ")
+        PrintNumber(failed_actor)
+        PrintMessage(" with strategy ")
+        PrintNumber(strategy)
+        PrintMessage("\n")
+        
+        IfCondition EqualTo(strategy, SupervisorStrategy.ONE_FOR_ONE) ThenBlock: {
+            // Restart only the failed actor
+            Supervisor.RestartActor(sched, failed_actor)
+        }
+        
+        IfCondition EqualTo(strategy, SupervisorStrategy.ONE_FOR_ALL) ThenBlock: {
+            // Restart all children
+            i = 0
+            WhileLoop LessThan(i, num_children) {
+                child_offset = Add(2, i)
+                child_id = ArrayGet(supervisor, child_offset)
+                Supervisor.RestartActor(sched, child_id)
+                i = Add(i, 1)
+            }
+        }
+        
+        IfCondition EqualTo(strategy, SupervisorStrategy.REST_FOR_ONE) ThenBlock: {
+            // Find failed actor and restart it plus all after it
+            found = 0
+            i = 0
+            WhileLoop LessThan(i, num_children) {
+                child_offset = Add(2, i)
+                child_id = ArrayGet(supervisor, child_offset)
+                
+                IfCondition EqualTo(child_id, failed_actor) ThenBlock: {
+                    found = 1
+                }
+                
+                IfCondition found ThenBlock: {
+                    Supervisor.RestartActor(sched, child_id)
+                }
+                
+                i = Add(i, 1)
+            }
+        }
+    }
+}
+
+// Restart an actor
+Function.Supervisor.RestartActor {
+    Input: sched: Address
+    Input: actor_id: Integer
+    Body: {
+        PrintMessage("[SUPERVISOR] Restarting actor ")
+        PrintNumber(actor_id)
+        PrintMessage("\n")
+        
+        // Clear actor's message queue
+        head_offset = Add(SchedulerConfig.MSG_HEADS_OFFSET, actor_id)
+        tail_offset = Add(SchedulerConfig.MSG_TAILS_OFFSET, actor_id)
+        count_offset = Add(SchedulerConfig.MSG_COUNTS_OFFSET, actor_id)
+        
+        ArraySet(sched, head_offset, 0)
+        ArraySet(sched, tail_offset, 0)
+        ArraySet(sched, count_offset, 0)
+        
+        // Set state back to READY
+        state_offset = Add(SchedulerConfig.ACTOR_STATES_OFFSET, actor_id)
+        ArraySet(sched, state_offset, ActorState.READY)
+        
+        // Re-queue actor
+        Scheduler.RequeueActor(sched, actor_id)
+    }
+}
+
+// ============================================================
+// MAPREDUCE PATTERN
+// ============================================================
+
+// Map phase - distribute work to mappers
+Function.MapReduce.Map {
+    Input: sched: Address
+    Input: data: Address
+    Input: data_size: Integer
+    Input: num_mappers: Integer
+    Output: Address
+    Body: {
+        PrintMessage("[MAPREDUCE] Starting map phase with ")
+        PrintNumber(num_mappers)
+        PrintMessage(" mappers for ")
+        PrintNumber(data_size)
+        PrintMessage(" items\n")
+        
+        // Calculate work distribution
+        items_per_mapper = Divide(data_size, num_mappers)
+        remainder = Modulo(data_size, num_mappers)
+        
+        // Send work chunks to each mapper
+        mapper = 0
+        offset = 0
+        
+        WhileLoop LessThan(mapper, num_mappers) {
+            chunk_size = items_per_mapper
+            
+            // Give extra item to first 'remainder' mappers
+            IfCondition LessThan(mapper, remainder) ThenBlock: {
+                chunk_size = Add(chunk_size, 1)
+            }
+            
+            // Pack message: offset in high bits, size in low bits
+            work_msg = Add(Multiply(offset, 1000), chunk_size)
+            
+            // Send to mapper actor
+            Scheduler.SendMessage(sched, mapper, MessageType.DATA, work_msg)
+            
+            PrintMessage("  Mapper ")
+            PrintNumber(mapper)
+            PrintMessage(": offset=")
+            PrintNumber(offset)
+            PrintMessage(", size=")
+            PrintNumber(chunk_size)
+            PrintMessage("\n")
+            
+            offset = Add(offset, chunk_size)
+            mapper = Add(mapper, 1)
+        }
+        
+        // Return results array
+        results = ArrayCreate(data_size)
+        ReturnValue(results)
+    }
+}
+
+// Reduce phase - combine mapper results
+Function.MapReduce.Reduce {
+    Input: sched: Address
+    Input: results: Address
+    Input: num_mappers: Integer
+    Input: reducer_id: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[MAPREDUCE] Starting reduce phase\n")
+        
+        total = 0
+        received = 0
+        
+        // Collect results from all mappers
+        WhileLoop LessThan(received, num_mappers) {
+            msg = Scheduler.ReceiveMessage(sched, reducer_id)
+            
+            IfCondition NotEqual(msg, -1) ThenBlock: {
+                msg_type = Scheduler.GetMessageType(msg)
+                msg_data = Scheduler.GetMessageData(msg)
+                
+                IfCondition EqualTo(msg_type, MessageType.RESULT) ThenBlock: {
+                    PrintMessage("  Received result: ")
+                    PrintNumber(msg_data)
+                    PrintMessage(" from mapper\n")
+                    
+                    total = Add(total, msg_data)
+                    received = Add(received, 1)
+                }
+            }
+        }
+        
+        PrintMessage("[MAPREDUCE] Reduce complete. Total: ")
+        PrintNumber(total)
+        PrintMessage("\n")
+        
+        ReturnValue(total)
+    }
+}
+
+// Mapper actor logic
+Function.MapReduce.MapperLogic {
+    Input: sched: Address
+    Input: actor_id: Integer
+    Input: data: Address
+    Output: Integer
+    Body: {
+        // Receive work assignment
+        msg = Scheduler.ReceiveMessage(sched, actor_id)
+        
+        IfCondition EqualTo(msg, -1) ThenBlock: {
+            ReturnValue(0)  // No work
+        }
+        
+        msg_data = Scheduler.GetMessageData(msg)
+        
+        // Unpack offset and size
+        offset = Divide(msg_data, 1000)
+        size = Modulo(msg_data, 1000)
+        
+        PrintMessage("[MAPPER ")
+        PrintNumber(actor_id)
+        PrintMessage("] Processing ")
+        PrintNumber(size)
+        PrintMessage(" items from offset ")
+        PrintNumber(offset)
+        PrintMessage("\n")
+        
+        // Process data (sum for demo)
+        result = 0
+        i = 0
+        WhileLoop LessThan(i, size) {
+            index = Add(offset, i)
+            value = ArrayGet(data, index)
+            result = Add(result, value)
+            i = Add(i, 1)
+        }
+        
+        PrintMessage("[MAPPER ")
+        PrintNumber(actor_id)
+        PrintMessage("] Result: ")
+        PrintNumber(result)
+        PrintMessage("\n")
+        
+        // Send result to reducer (last actor)
+        num_actors = ArrayGet(sched, SchedulerConfig.NUM_ACTORS)
+        reducer_id = Subtract(num_actors, 1)
+        
+        Scheduler.SendMessage(sched, reducer_id, MessageType.RESULT, result)
+        
+        ReturnValue(0)  // Done
+    }
+}
+
+// ============================================================
+// PIPELINE PATTERN
+// ============================================================
+
+// Pipeline stage
+Function.Pipeline.Stage {
+    Input: sched: Address
+    Input: actor_id: Integer
+    Input: next_stage: Integer
+    Output: Integer
+    Body: {
+        msg = Scheduler.ReceiveMessage(sched, actor_id)
+        
+        IfCondition EqualTo(msg, -1) ThenBlock: {
+            ReturnValue(1)  // Keep running
+        }
+        
+        msg_type = Scheduler.GetMessageType(msg)
+        msg_data = Scheduler.GetMessageData(msg)
+        
+        IfCondition EqualTo(msg_type, MessageType.TERMINATE) ThenBlock: {
+            // Propagate termination
+            IfCondition NotEqual(next_stage, -1) ThenBlock: {
+                Scheduler.SendMessage(sched, next_stage, MessageType.TERMINATE, 0)
+            }
+            ReturnValue(0)
+        }
+        
+        // Process data (multiply by stage number for demo)
+        processed = Multiply(msg_data, Add(actor_id, 1))
+        
+        PrintMessage("[PIPELINE] Stage ")
+        PrintNumber(actor_id)
+        PrintMessage(": ")
+        PrintNumber(msg_data)
+        PrintMessage(" -> ")
+        PrintNumber(processed)
+        PrintMessage("\n")
+        
+        // Send to next stage
+        IfCondition NotEqual(next_stage, -1) ThenBlock: {
+            Scheduler.SendMessage(sched, next_stage, MessageType.DATA, processed)
+        }
+        ElseBlock: {
+            PrintMessage("[PIPELINE] Final result: ")
+            PrintNumber(processed)
+            PrintMessage("\n")
+        }
+        
+        ReturnValue(1)  // Keep running
+    }
+}
+
+// ============================================================
+// DEMONSTRATION FUNCTIONS
+// ============================================================
+
+// Demo data generator
+Function.Demo.GenerateData {
+    Input: size: Integer
+    Output: Address
+    Body: {
+        data = ArrayCreate(size)
+        
+        i = 0
+        WhileLoop LessThan(i, size) {
+            // Generate simple test data
+            value = Add(i, 1)
+            ArraySet(data, i, value)
+            i = Add(i, 1)
+        }
+        
+        ReturnValue(data)
+    }
+}
+
+// Print array for debugging
+Function.Demo.PrintArray {
+    Input: arr: Address
+    Input: size: Integer
+    Body: {
+        PrintMessage("[")
+        i = 0
+        WhileLoop LessThan(i, size) {
+            PrintNumber(ArrayGet(arr, i))
+            IfCondition LessThan(i, Subtract(size, 1)) ThenBlock: {
+                PrintMessage(", ")
+            }
+            i = Add(i, 1)
+        }
+        PrintMessage("]\n")
+    }
+}
