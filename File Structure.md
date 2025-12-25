@@ -2,7 +2,7 @@
 
 ```
 Librarys/
-├── XArrays.ailang                    # Dynamic array library
+├── Baseline Librarys shipped with compiler 
 │
 └── Compiler/
     │
