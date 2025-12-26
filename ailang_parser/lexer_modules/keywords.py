@@ -1,0 +1,431 @@
+# Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+#
+# Licensed under the Sean Collins Software License (SCSL). See the LICENSE file in the root directory of this project
+# for the full terms and conditions, including restrictions on forking, corporate use, and permissions for private/teaching purposes.
+
+# keywords.py - Keyword mappings for the lexer
+from .token_type import TokenType
+
+def get_keyword_mapping():
+    """Returns the complete keyword to TokenType mapping dictionary."""
+    return {
+        # Original keywords (preserved)
+        'Body': TokenType.BODY,
+        'RunTask': TokenType.RUNTASK,
+        'PrintMessage': TokenType.PRINTMESSAGE,
+        'ReturnValue': TokenType.RETURNVALUE,
+        'IfCondition': TokenType.IFCONDITION,
+        'ThenBlock': TokenType.THENBLOCK,
+        'ElseBlock': TokenType.ELSEBLOCK,
+        'TrueBlock': TokenType.TRUEBLOCK,
+        'FalseBlock': TokenType.FALSEBLOCK,
+        'WhileLoop': TokenType.WHILELOOP,
+        'UntilCondition': TokenType.UNTILCONDITION,
+        'ForEvery': TokenType.FOREVERY,
+        'in': TokenType.IN,
+        'TryBlock': TokenType.TRYBLOCK,
+        'CatchError': TokenType.CATCHERROR,
+        'FinallyBlock': TokenType.FINALLYBLOCK,
+        'SendMessage': TokenType.SENDMESSAGE,
+        'ReceiveMessage': TokenType.RECEIVEMESSAGE,
+        'EveryInterval': TokenType.EVERYINTERVAL,
+        'BreakLoop': TokenType.BREAKLOOP,
+        'HaltProgram': TokenType.HALTPROGRAM,
+
+        'Debug': TokenType.DEBUG,
+        'DebugAssert': TokenType.DEBUGASSERT,
+        'DebugTrace': TokenType.DEBUGTRACE,
+        'DebugBreak': TokenType.DEBUGBREAK,
+        'DebugMemory': TokenType.DEBUGMEMORY,
+        'DebugPerf': TokenType.DEBUGPERF,
+        'DebugInspect': TokenType.DEBUGINSPECT,
+        'DebugControl': TokenType.DEBUGCONTROL,
+        'ContinueLoop': TokenType.CONTINUELOOP,
+        'FixedPool': TokenType.FIXEDPOOL,
+        'DynamicPool': TokenType.DYNAMICPOOL,
+        'TemporalPool': TokenType.TEMPORALPOOL,
+        'NeuralPool': TokenType.NEURALPOOL,
+        'KernelPool': TokenType.KERNELPOOL,
+        'ActorPool': TokenType.ACTORPOOL,
+        'SecurityPool': TokenType.SECURITYPOOL,
+        'ConstrainedPool': TokenType.CONSTRAINEDPOOL,
+        'PoolResize': TokenType.POOLRESIZE,
+        'PoolMove': TokenType.POOLMOVE,
+        'PoolCompact': TokenType.POOLCOMPACT,
+        'PoolAllocate': TokenType.POOLALLOCATE,
+        'PoolFree': TokenType.POOLFREE,
+        'FilePool': TokenType.FILEPOOL,
+        
+        
+            
+        'SubPool': TokenType.SUBPOOL,
+        'Initialize': TokenType.INITIALIZE,
+        'CanChange': TokenType.CANCHANGE,
+        'CanBeNull': TokenType.CANBENULL,
+        'Range': TokenType.RANGE,
+        'MaximumLength': TokenType.MAXIMUMLENGTH,
+        'MinimumLength': TokenType.MINIMUMLENGTH,
+        'ElementType': TokenType.ELEMENTTYPE,
+        'Where': TokenType.WHERE,
+        'Add': TokenType.ADD,
+        'Subtract': TokenType.SUBTRACT,
+        'Multiply': TokenType.MULTIPLY,
+        'Divide': TokenType.DIVIDE,
+        'Power': TokenType.POWER,
+        'Modulo': TokenType.MODULO,
+      #  'SquareRoot': TokenType.SQUAREROOT,
+      #  'AbsoluteValue': TokenType.ABSOLUTEVALUE,
+            
+        # === NEW MATH PRIMITIVES ===
+        'ISqrt': TokenType.ISQRT,
+        'Abs': TokenType.ABS,
+        'Min': TokenType.MIN,
+        'Max': TokenType.MAX,
+        'Pow': TokenType.POW,
+        
+        'GreaterThan': TokenType.GREATERTHAN,
+        'LessThan': TokenType.LESSTHAN,
+        'GreaterEqual': TokenType.GREATEREQUAL,
+        'LessEqual': TokenType.LESSEQUAL,
+        'EqualTo': TokenType.EQUALTO,
+        'NotEqual': TokenType.NOTEQUAL,
+        'And': TokenType.AND,
+        'Or': TokenType.OR,
+        'Not': TokenType.NOT,
+        'Xor': TokenType.XOR,
+        'Implies': TokenType.IMPLIES,
+        'BitwiseAnd': TokenType.BITWISEAND,
+        'BitwiseOr': TokenType.BITWISEOR,
+        'BitwiseXor': TokenType.BITWISEXOR,
+        'BitwiseNot': TokenType.BITWISENOT,
+        'LeftShift': TokenType.LEFTSHIFT,
+        'RightShift': TokenType.RIGHTSHIFT,
+        'Function': TokenType.FUNCTION,
+        'Lambda': TokenType.LAMBDA,
+        'Apply': TokenType.APPLY,
+        'Combinator': TokenType.COMBINATOR,
+        'Input': TokenType.INPUT,
+        'Output': TokenType.OUTPUT,
+        'Body': TokenType.BODY,
+        'Curry': TokenType.CURRY,
+        'Uncurry': TokenType.UNCURRY,
+        'Compose': TokenType.COMPOSE,
+        'Integer': TokenType.INTEGER,
+        'FloatingPoint': TokenType.FLOATINGPOINT,
+        'Text': TokenType.TEXT,
+        'Boolean': TokenType.BOOLEAN,
+        'Address': TokenType.ADDRESS,
+        'Array': TokenType.ARRAY,
+        'Map': TokenType.MAP,
+        'Tuple': TokenType.TUPLE,
+        'Record': TokenType.RECORD,
+        'OptionalType': TokenType.OPTIONALTYPE,
+        'ConstrainedType': TokenType.CONSTRAINEDTYPE,
+        'Any': TokenType.ANY,
+        'Void': TokenType.VOID,
+        'MacroBlock': TokenType.MACROBLOCK,
+        'Macro': TokenType.MACRO,
+        'RunMacro': TokenType.RUNMACRO,
+        'ExpandMacro': TokenType.EXPANDMACRO,
+        'SecurityContext': TokenType.SECURITYCONTEXT,
+        'WithSecurity': TokenType.WITHSECURITY,
+        'AllowedOperations': TokenType.ALLOWEDOPERATIONS,
+        'DeniedOperations': TokenType.DENIEDOPERATIONS,
+        'MemoryLimit': TokenType.MEMORYLIMIT,
+        'CPUQuota': TokenType.CPUQUOTA,
+        'Level': TokenType.LEVEL,
+        'Hardware': TokenType.HARDWARE, 
+        'SystemCall': TokenType.SYSCALL, # Changed from 'Syscall' to match usage
+        'Interrupt': TokenType.INTERRUPT, 
+        'Register': TokenType.REGISTER, 
+        'Memory': TokenType.MEMORY,
+        'PhysicalAddress': TokenType.PHYSICALADDRESS,
+        'VirtualAddress': TokenType.VIRTUALADDRESS,
+        'Flags': TokenType.FLAGS,
+        'SubRoutine': TokenType.SUBROUTINE,
+        'LibraryImport': TokenType.LIBRARYIMPORT,
+        'LoopMain': TokenType.LOOPMAIN,
+        'LoopActor': TokenType.LOOPACTOR,
+        'LoopStart': TokenType.LOOPSTART,
+        'LoopEnd': TokenType.LOOPEND,
+        'LoopShadow': TokenType.LOOPSHADOW,
+        'True': TokenType.TRUE,
+        'False': TokenType.FALSE,
+        'Null': TokenType.NULL,
+        'Automatic': TokenType.AUTOMATIC,
+        'Unlimited': TokenType.UNLIMITED,
+        'Constant': TokenType.CONSTANT,
+        'PI': TokenType.PI,
+        'E': TokenType.E,
+        'PHI': TokenType.PHI,
+        'Bytes': TokenType.BYTES,
+        'Kilobytes': TokenType.KILOBYTES,
+        'Megabytes': TokenType.MEGABYTES,
+        'Gigabytes': TokenType.GIGABYTES,
+        'Seconds': TokenType.SECONDS,
+        'Milliseconds': TokenType.MILLISECONDS,
+        'Microseconds': TokenType.MICROSECONDS,
+        'Percent': TokenType.PERCENT,
+
+        #branching logic
+        'Fork': TokenType.FORK,
+        'Branch': TokenType.BRANCH,
+        'Case': TokenType.CASE,
+        'Default': TokenType.DEFAULT,
+        'TruePath': TokenType.TRUEPATH,
+        'FalsePath': TokenType.FALSEPATH,
+
+
+
+        # String and I/O functions (preserved)
+        'ReadInput': TokenType.READINPUT,
+        'ReadInputNumber': TokenType.READINPUTNUMBER,
+        'GetUserChoice': TokenType.GETUSERCHOICE,
+        'ReadKey': TokenType.READKEY,
+        'StringEquals': TokenType.STRINGEQUALS,
+        'StringContains': TokenType.STRINGCONTAINS,
+        'StringStartsWith': TokenType.STRINGSTARTSWITH,
+        'StringEndsWith': TokenType.STRINGENDSWITH,
+        'StringConcat': TokenType.STRINGCONCAT,
+        'StringLength': TokenType.STRINGLENGTH,
+        'StringSubstring': TokenType.STRINGSUBSTRING,
+        'StringToUpper': TokenType.STRINGTOUPPER,
+        'StringToLower': TokenType.STRINGTOLOWER,
+        'StringTrim': TokenType.STRINGTRIM,
+        'StringReplace': TokenType.STRINGREPLACE,
+        'StringToString': TokenType.STRINGTOSTRING,
+        'NumberToString': TokenType.NUMBERTOSTRING,
+        'StringToNumber': TokenType.STRINGTONUMBER,
+        # === NEW: Add missing string utilities ===
+        'StringExtract': TokenType.STRINGEXTRACT,
+        'StringCharAt': TokenType.STRINGCHARAT,
+        'StringExtractUntil': TokenType.STRINGEXTRACTUNTIL,
+        # From new test harness
+        'StringIndexOf': TokenType.STRINGINDEXOF,
+        'StringSplit': TokenType.STRINGSPLIT,
+        'StringFromChar': TokenType.CHARTOSTRING,
+
+        # File I/O (preserved)
+        'OpenFile': TokenType.OPENFILE,
+        'CloseFile': TokenType.CLOSEFILE,
+        'ReadFile': TokenType.READFILE,
+        'WriteFile': TokenType.WRITEFILE,
+        'CreateFile': TokenType.CREATEFILE,
+        'DeleteFile': TokenType.DELETEFILE,
+        'ReadLine': TokenType.READLINE,
+        'WriteLine': TokenType.WRITELINE,
+        'ReadTextFile': TokenType.READTEXTFILE,
+        'WriteTextFile': TokenType.WRITETEXTFILE,
+        'AppendTextFile': TokenType.APPENDTEXTFILE,
+        'ReadBinaryFile': TokenType.READBINARYFILE,
+        'WriteBinaryFile': TokenType.WRITEBINARYFILE,
+        'AppendBinaryFile': TokenType.APPENDBINARYFILE,
+        'FileExists': TokenType.FILEEXISTS,
+        'GetFileSize': TokenType.GETFILESIZE,
+        'GetFileDate': TokenType.GETFILEDATE,
+        'SetFileDate': TokenType.SETFILEDATE,
+        'GetFilePermissions': TokenType.GETFILEPERMISSIONS,
+        'SetFilePermissions': TokenType.SETFILEPERMISSIONS,
+        'SeekPosition': TokenType.SEEKPOSITION,
+        'GetPosition': TokenType.GETPOSITION,
+        'Rewind': TokenType.REWIND,
+        'CopyFile': TokenType.COPYFILE,
+        'MoveFile': TokenType.MOVEFILE,
+        'RenameFile': TokenType.RENAMEFILE,
+        'FlushFile': TokenType.FLUSHFILE,
+        'LockFile': TokenType.LOCKFILE,
+        'UnlockFile': TokenType.UNLOCKFILE,
+        'CreateDirectory': TokenType.CREATEDIRECTORY,
+        'DeleteDirectory': TokenType.DELETEDIRECTORY,
+        'ListDirectory': TokenType.LISTDIRECTORY,
+        'DirectoryExists': TokenType.DIRECTORYEXISTS,
+        'GetWorkingDirectory': TokenType.GETWORKINGDIRECTORY,
+        'SetWorkingDirectory': TokenType.SETWORKINGDIRECTORY,
+        'BufferedRead': TokenType.BUFFEREDREAD,
+        'BufferedWrite': TokenType.BUFFEREDWRITE,
+        'SetBufferSize': TokenType.SETBUFFERSIZE,
+        'FlushBuffers': TokenType.FLUSHBUFFERS,
+
+        # === NEW: Low-Level Systems Programming Keywords ===
+
+        # Memory and Pointer Operations
+        'Pointer': TokenType.POINTER,
+        'Dereference': TokenType.DEREFERENCE,
+        'AddressOf': TokenType.ADDRESSOF,
+        'SizeOf': TokenType.SIZEOF,
+        'Allocate': TokenType.ALLOCATE,
+        'HashCreate': TokenType.HASHCREATE,
+        'HashFunction': TokenType.HASHFUNCTION,
+        'HashSet': TokenType.HASHSET,
+        'HashGet': TokenType.HASHGET,
+        'SocketCreate': TokenType.SOCKETCREATE,
+        'SocketBind': TokenType.SOCKETBIND,
+        'SocketListen': TokenType.SOCKETLISTEN,
+        'SocketAccept': TokenType.SOCKETACCEPT,
+        'SocketRead': TokenType.SOCKETREAD,
+        'SocketWrite': TokenType.SOCKETWRITE,
+        'SocketClose': TokenType.SOCKETCLOSE,
+        'SocketConnect': TokenType.SOCKETCONNECT,
+        'SocketSetOption': TokenType.SOCKETSETOPTION,
+        'Deallocate': TokenType.DEALLOCATE,
+        'MemoryCopy': TokenType.MEMORYCOPY,
+        'MemorySet': TokenType.MEMORYSET,
+        'MemoryCompare': TokenType.MEMORYCOMPARE,
+        'MemCompare': TokenType.MEMORYCOMPARE, # Alias for MemoryCompare
+        'MemChr': TokenType.MEMCHR,
+        'MemFind': TokenType.MEMFIND,
+        'MemCopy': TokenType.MEMORYCOPY,
+        'StoreValue': TokenType.STOREVALUE,
+
+        # Hardware Register Access
+        'HardwareRegister': TokenType.HARDWAREREGISTER,
+        'ControlRegister': TokenType.CONTROLREGISTER,
+        'SegmentRegister': TokenType.SEGMENTREGISTER,
+        'FlagsRegister': TokenType.FLAGSREGISTER,
+        'ModelSpecificRegister': TokenType.MODELSPECIFICREGISTER,
+
+        # Port I/O Operations
+        'PortRead': TokenType.PORTREAD,
+        'PortWrite': TokenType.PORTWRITE,
+        'PortReadByte': TokenType.PORTREADBYTE,
+        'PortWriteByte': TokenType.PORTWRITEBYTE,
+        'PortReadWord': TokenType.PORTREADWORD,
+        'PortWriteWord': TokenType.PORTWRITEWORD,
+        'PortReadDWord': TokenType.PORTREADDWORD,
+        'PortWriteDWord': TokenType.PORTWRITEDWORD,
+
+        # Interrupt and Exception Handling
+        'InterruptHandler': TokenType.INTERRUPTHANDLER,
+        'ExceptionHandler': TokenType.EXCEPTIONHANDLER,
+        'EnableInterrupts': TokenType.ENABLEINTERRUPTS,
+        'DisableInterrupts': TokenType.DISABLEINTERRUPTS,
+        'Halt': TokenType.HALT,
+        'Wait': TokenType.WAIT,
+        'TriggerSoftwareInterrupt': TokenType.TRIGGERSOFTWAREINTERRUPT,
+        'InterruptVector': TokenType.INTERRUPTVECTOR,
+
+        # Atomic Operations
+        'AtomicRead': TokenType.ATOMICREAD,
+        'AtomicWrite': TokenType.ATOMICWRITE,
+        'AtomicAdd': TokenType.ATOMICADD,
+        'AtomicSubtract': TokenType.ATOMICSUBTRACT,
+        'AtomicCompareSwap': TokenType.ATOMICCOMPARESWAP,
+        'AtomicExchange': TokenType.ATOMICEXCHANGE,
+        'CompilerFence': TokenType.COMPILERFENCE,
+
+        # Cache and Memory Management
+        'CacheInvalidate': TokenType.CACHEINVALIDATE,
+        'CacheFlush': TokenType.CACHEFLUSH,
+        'TLBInvalidate': TokenType.TLBINVALIDATE,
+        'TLBFlush': TokenType.TLBFLUSH,
+        'PhysicalMemory': TokenType.PHYSICALMEMORY,
+
+        # Inline Assembly
+        'InlineAssembly': TokenType.INLINEASSEMBLY,
+        'Assembly': TokenType.ASSEMBLY,
+        'Volatile': TokenType.VOLATILE,
+        'Barrier': TokenType.BARRIER,
+
+        # System Calls and Kernel Operations
+        'PrivilegeLevel': TokenType.PRIVILEGELEVEL,
+        'TaskSwitch': TokenType.TASKSWITCH,
+        'ProcessContext': TokenType.PROCESSCONTEXT,
+
+        # Device Driver Operations
+        'DeviceDriver': TokenType.DEVICEDRIVER,
+        'DeviceRegister': TokenType.DEVICEREGISTER,
+        'DMAOperation': TokenType.DMAOPERATION,
+        'MMIORead': TokenType.MMIOREAD,
+        'MMIOWrite': TokenType.MMIOWRITE,
+        'DeviceInterrupt': TokenType.DEVICEINTERRUPT,
+
+        # Boot and Initialization
+        'Bootloader': TokenType.BOOTLOADER,
+        'KernelEntry': TokenType.KERNELENTRY,
+        'Initialization': TokenType.INITIALIZATION,
+        'GlobalConstructors': TokenType.GLOBALCONSTRUCTORS,
+        'GlobalDestructors': TokenType.GLOBALDESTRUCTORS,
+
+        # Low-Level Types
+        'Byte': TokenType.BYTE,
+        'Word': TokenType.WORD,
+        'DWord': TokenType.DWORD,
+        'QWord': TokenType.QWORD,
+        'UInt8': TokenType.UINT8,
+        'UInt16': TokenType.UINT16,
+        'UInt32': TokenType.UINT32,
+        'UInt64': TokenType.UINT64,
+        'Int8': TokenType.INT8,
+        'Int16': TokenType.INT16,
+        'Int32': TokenType.INT32,
+        'Int64': TokenType.INT64,
+
+        # === VIRTUAL MEMORY KEYWORDS ===
+
+        # Main VM Operations
+        'PageTable': TokenType.PAGETABLE,
+        'VirtualMemory': TokenType.VIRTUALMEMORY,
+        'MMIO': TokenType.MMIO,
+        'Cache': TokenType.CACHE,
+        'TLB': TokenType.TLB,
+        'MemoryBarrier': TokenType.MEMORYBARRIER,
+
+
+        # Memory Protection Flags
+        'ReadOnly': TokenType.READONLY,
+        'ReadWrite': TokenType.READWRITE,
+        'ReadExecute': TokenType.READEXECUTE,
+        'ReadWriteExecute': TokenType.READWRITEEXECUTE,
+        'RO': TokenType.READONLY,           # Short form
+        'RW': TokenType.READWRITE,          # Short form
+        'RX': TokenType.READEXECUTE,        # Short form
+        'RWX': TokenType.READWRITEEXECUTE,  # Short form
+        'UserMode': TokenType.USERMODE,
+        'KernelMode': TokenType.KERNELMODE,
+        'Global': TokenType.GLOBAL,
+        'Dirty': TokenType.DIRTY,
+        'Accessed': TokenType.ACCESSED,
+
+        # Cache Types
+        'Cached': TokenType.CACHED,
+        'Uncached': TokenType.UNCACHED,
+        'WriteCombining': TokenType.WRITECOMBINING,
+        'WriteThrough': TokenType.WRITETHROUGH,
+        'WriteBack': TokenType.WRITEBACK,
+
+        # Cache Levels
+        'L1': TokenType.L1CACHE,
+        'L2': TokenType.L2CACHE,
+        'L3': TokenType.L3CACHE,
+
+        # Page Sizes
+        '4KB': TokenType.PAGESIZE4KB,
+        '2MB': TokenType.PAGESIZE2MB,
+        '1GB': TokenType.PAGESIZE1GB,
+
+        # TLB Operations
+        'Invalidate': TokenType.INVALIDATE,
+        'Flush': TokenType.FLUSH,
+        'FlushAll': TokenType.FLUSHALL,
+        'FlushGlobal': TokenType.FLUSHGLOBAL,
+
+        # LinkagePool keywords
+        'LinkagePool': TokenType.LINKAGEPOOL,
+        'Direction': TokenType.DIRECTION,
+        # Input and Output are already mapped for functions
+        'InOut': TokenType.INOUT,
+    }
+
+def get_allowed_short_identifiers():
+    """Returns the set of allowed short identifiers for systems programming."""
+    return {
+        'in', 'to', 'by', 'of', 'as', 'is', 'on', 'at', 'PI', 'E',
+        'GRP', 'HW', 'CFG', 'MEM', 'CPU', 'SYS', 'IO', 'RG', 'VG',
+        'PG', 'TG', 'NG', 'KG', 'AG', 'SG', 'CG', 'FG',
+        # New: CPU register names
+        'EAX', 'EBX', 'ECX', 'EDX', 'ESI', 'EDI', 'ESP', 'EBP',
+        'RAX', 'RBX', 'RCX', 'RDX', 'RSI', 'RDI', 'RSP', 'RBP',
+        'R8', 'R9', 'R10', 'R11', 'R12', 'R13', 'R14', 'R15',
+        'CS', 'DS', 'ES', 'FS', 'GS', 'SS', 'CR0', 'CR1', 'CR2',
+        'CR3', 'CR4', 'CR8', 'DR0', 'DR1', 'DR2', 'DR3', 'DR6', 'DR7'
+    }

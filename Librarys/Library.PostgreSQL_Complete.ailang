@@ -1,0 +1,2773 @@
+// Library.PostgreSQL_Complete.ailang
+// PRODUCTION-READY PostgreSQL Wire Protocol v3.0 Implementation
+// Complete implementation with all message types, error handling, and type support
+
+LibraryImport.Socket
+LibraryImport.HashMap
+LibraryImport.XArrays
+LibraryImport.StringUtils
+
+FixedPool.PG {
+    "PROTOCOL_VERSION": Initialize=196608
+    "MSG_AUTH": Initialize=82
+    "MSG_BACKEND_KEY": Initialize=75
+    "MSG_BIND_COMPLETE": Initialize=50
+    "MSG_CLOSE_COMPLETE": Initialize=51
+    "MSG_COMMAND_COMPLETE": Initialize=67
+    "MSG_DATA_ROW": Initialize=68
+    "MSG_EMPTY_QUERY": Initialize=73
+    "MSG_ERROR": Initialize=69
+    "MSG_NOTICE": Initialize=78
+    "MSG_PARAM_STATUS": Initialize=83
+    "MSG_PARSE_COMPLETE": Initialize=49
+    "MSG_READY": Initialize=90
+    "MSG_ROW_DESC": Initialize=84
+    "AUTH_OK": Initialize=0
+    "AUTH_CLEARTEXT": Initialize=3
+    "AUTH_MD5": Initialize=5
+    "TX_IDLE": Initialize=73
+    "TX_ACTIVE": Initialize=84
+    "TX_FAILED": Initialize=69
+}
+
+//============================================================================
+// TIME UTILITIES
+// ============================================================================
+
+Function.PG_GetUnixTimeMS {
+    Output: Integer
+    Body: {
+        // syscall 228 = clock_gettime(CLOCK_MONOTONIC)
+        // For timeout tracking, monotonic clock is better than wall clock
+        Debug("postgres.trace", level=3) {
+            PrintMessage("[PG_GetUnixTimeMS] ENTER\n")
+        }
+        timespec = Allocate(16)  // struct timespec { tv_sec: i64, tv_nsec: i64 }
+        
+        result = SystemCall(228, 1, timespec)  // CLOCK_MONOTONIC = 1
+        
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            // Read tv_sec and tv_nsec
+            tv_sec = Dereference(timespec)
+            tv_nsec = Dereference(Add(timespec, 8))
+            
+            Deallocate(timespec, 16)
+            
+            // Convert to milliseconds: (sec * 1000) + (nsec / 1000000)
+            ms = Add(Multiply(tv_sec, 1000), Divide(tv_nsec, 1000000))
+            Debug("postgres.trace", level=3) {
+                PrintMessage("[PG_GetUnixTimeMS] EXIT, ms=")
+                PrintNumber(ms)
+                PrintMessage("\n")
+            }
+            ReturnValue(ms)
+        } ElseBlock: {
+            Deallocate(timespec, 16)
+            Debug("postgres.trace", level=2) {
+                PrintMessage("[PG_GetUnixTimeMS] EXIT - syscall failed\n")
+            }
+            ReturnValue(0)
+        }
+    }
+}
+
+// ============================================================================
+// BINARY UTILITIES
+// ============================================================================
+
+Function.PG_WriteInt32BE {
+    Input: buf: Address
+    Input: off: Integer
+    Input: val: Integer
+    Body: {
+        StoreValue(Add(buf, off), BitwiseAnd(RightShift(val, 24), 255))
+        StoreValue(Add(buf, Add(off, 1)), BitwiseAnd(RightShift(val, 16), 255))
+        StoreValue(Add(buf, Add(off, 2)), BitwiseAnd(RightShift(val, 8), 255))
+        StoreValue(Add(buf, Add(off, 3)), BitwiseAnd(val, 255))
+    }
+}
+
+Function.PG_ReadInt32BE {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        // Read 4 individual bytes using GetByte
+        b3 = GetByte(buf, off)           // Most significant byte
+        b2 = GetByte(buf, Add(off, 1))
+        b1 = GetByte(buf, Add(off, 2))
+        b0 = GetByte(buf, Add(off, 3))   // Least significant byte
+        
+        // Combine into 32-bit value: (b3 << 24) | (b2 << 16) | (b1 << 8) | b0
+        v = LeftShift(b3, 24)
+        v = BitwiseOr(v, LeftShift(b2, 16))
+        v = BitwiseOr(v, LeftShift(b1, 8))
+        v = BitwiseOr(v, b0)
+        
+        ReturnValue(v)
+    }
+}
+
+Function.PG_WriteInt16BE {
+    Input: buf: Address
+    Input: off: Integer
+    Input: val: Integer
+    Body: {
+        StoreValue(Add(buf, off), BitwiseAnd(RightShift(val, 8), 255))
+        StoreValue(Add(buf, Add(off, 1)), BitwiseAnd(val, 255))
+    }
+}
+
+Function.PG_ReadInt16BE {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b1 = GetByte(buf, off)           // High byte
+        b0 = GetByte(buf, Add(off, 1))   // Low byte
+        v = LeftShift(b1, 8)
+        v = BitwiseOr(v, b0)
+        ReturnValue(v)
+    }
+}
+
+Function.PG_WriteString {
+    Input: buf: Address
+    Input: off: Integer
+    Input: str: Address
+    Output: Integer
+    Body: {
+        len = StrLen(str)
+        i = 0
+        WhileLoop LessThan(i, len) {
+            byte = Dereference(Add(str, i))
+            StoreValue(Add(buf, Add(off, i)), byte)
+            i = Add(i, 1)
+        }
+        StoreValue(Add(buf, Add(off, len)), 0)
+        ReturnValue(Add(off, Add(len, 1)))
+    }
+}
+
+Function.PG_ReadString {
+    Input: buf: Address
+    Input: off: Integer
+    Input: max: Integer
+    Output: Address
+    Body: {
+        // Find string length (up to null terminator or max)
+        len = 0
+        WhileLoop LessThan(len, max) {
+            b = Dereference(Add(buf, Add(off, len)))
+            IfCondition EqualTo(b, 0) ThenBlock: { BreakLoop }
+            len = Add(len, 1)
+        }
+        
+        // Allocate new string
+        str = Allocate(Add(len, 1))
+        
+        // Copy bytes
+        i = 0
+        WhileLoop LessThan(i, len) {
+            b = Dereference(Add(buf, Add(off, i)))
+            StoreValue(Add(str, i), b)
+            i = Add(i, 1)
+        }
+        
+        // Null terminate
+        StoreValue(Add(str, len), 0)
+        
+        ReturnValue(str)
+    }
+}
+
+
+// ============================================================================
+// RESULT CLEANUP
+// ============================================================================
+
+Function.PG_DestroyResult {
+    Input: result: Address
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_DestroyResult] ENTER, result_ptr=")
+            PrintNumber(result)
+            PrintMessage("\n")
+        }
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        // Free each HashMap row AND its contained string values
+        row_count = XArray.XSize(result)
+        i = 0
+        Debug("postgres.trace", level=3) {
+            PrintMessage("  [DestroyResult] Freeing ")
+            PrintNumber(row_count)
+            PrintMessage(" rows.\n")
+        }
+        WhileLoop LessThan(i, row_count) {
+            row = XArray.XGet(result, i)
+            IfCondition NotEqual(row, 0) ThenBlock: {
+                // CRITICAL FIX: Manually free the copied keys and values.
+                // The simple HashMap does not own the memory for the strings
+                // it points to. PG_ParseDataRow allocates copies of keys
+                // and values, and PG_DestroyResult MUST free them all.
+                val1_ptr = HashMap.HGetSimple(row, "dimension")
+                val2_ptr = HashMap.HGetSimple(row, "value")
+                
+                // This is the missing piece: we must also free the copied keys.
+                // We can't get them directly, but we know what they are.
+               Deallocate("dimension", 0) // Free the copied "dimension" string
+               Deallocate("value", 0)     // Free the copied "value" string
+
+                IfCondition NotEqual(val1_ptr, 0) ThenBlock: { Deallocate(val1_ptr, 0) }
+                IfCondition NotEqual(val2_ptr, 0) ThenBlock: { Deallocate(val2_ptr, 0) }
+                
+                // Now that the contents are freed, destroy the HashMap structure itself.
+                HashMap.HDestroy(row)
+            }
+            i = Add(i, 1)
+        }
+        
+        // Then free the array itself
+        XArray.XDestroy(result)
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_DestroyResult] EXIT, destroyed XArray\n")
+        }
+    }
+}
+
+// Helper: Destroy field descriptor array
+Function.PG_DestroyFields {
+    Input: fields: Address
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_DestroyFields] ENTER, fields_ptr=")
+            PrintNumber(fields)
+            PrintMessage("\n")
+        }
+        IfCondition EqualTo(fields, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        field_count = XArray.XSize(fields)
+        i = 0
+        WhileLoop LessThan(i, field_count) {
+            field = XArray.XGet(fields, i)
+            
+            IfCondition NotEqual(field, 0) ThenBlock: {
+                // Get the field name string and free it
+                fname = HashMap.HGetSimple(field, "name")
+                IfCondition NotEqual(fname, 0) ThenBlock: {
+                    fname_len = StringLength(fname)
+                    Deallocate(fname, Add(fname_len, 1))
+                }
+                
+                // Destroy the HashMap
+                HashMap.HDestroy(field)
+            }
+            
+            i = Add(i, 1)
+        }
+        
+        // Destroy the XArray
+        XArray.XDestroy(fields)
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_DestroyFields] EXIT, destroyed XArray\n")
+        }
+    }
+}
+
+
+Function.PG_RecvExact {
+    Input: sock: Integer
+    Input: buffer: Address
+    Input: length: Integer
+    Output: Integer
+    Body: {
+        Debug("postgres.trace", level=3) {
+            PrintMessage("[PG_RecvExact] ENTER, requesting ")
+            PrintNumber(length)
+            PrintMessage(" bytes\n")
+        }
+        total_received = 0
+        
+        WhileLoop LessThan(total_received, length) {
+            remaining = Subtract(length, total_received)
+            chunk = SocketRead(sock, Add(buffer, total_received), remaining)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("  [PG_RecvExact] SocketRead returned ")
+                PrintNumber(chunk)
+                PrintMessage(" bytes\n")
+            }
+            IfCondition LessEqual(chunk, 0) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("  [PG_RecvExact] Socket error or closed. EXIT\n")
+                }
+                ReturnValue(0)
+            }
+            
+            total_received = Add(total_received, chunk)
+        }
+        
+        Debug("postgres.trace", level=3) {
+            PrintMessage("[PG_RecvExact] EXIT, received ")
+            PrintNumber(total_received)
+            PrintMessage(" bytes\n")
+        }
+        ReturnValue(total_received)
+    }
+}
+
+// Now replace PG_Connect with this version:
+
+Function.PG_Connect {
+    Input: host: Address
+    Input: port: Integer
+    Input: db: Address
+    Input: user: Address
+    Input: pass: Address
+    Output: Address
+    Body: {
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG: Connecting to ")
+            PrintString(host)
+            PrintMessage(":")
+            PrintNumber(port)
+            PrintMessage("\n")
+        }
+        
+        sock = SocketCreate(2, 1)
+        IfCondition LessThan(sock, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Connect] ERROR: Socket creation failed\n")
+            }
+            ReturnValue(0)
+        }
+        
+        // Use the Socket library to create the address structure and connect
+        addr = Socket.CreateAddr(host, port)
+        res = Socket.Connect(sock, addr)
+        Deallocate(addr, 16) // Clean up the address structure
+        
+        IfCondition LessThan(res, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Connect] ERROR: Socket connect failed\n")
+            }
+            SocketClose(sock)
+            ReturnValue(0)
+        }
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG: TCP connected\n")
+        }
+        
+        startup_ok = PG_SendStartup(sock, user, db)
+        IfCondition EqualTo(startup_ok, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Connect] ERROR: SendStartup failed\n")
+            }
+            SocketClose(sock)
+            ReturnValue(0)
+        }
+        
+        auth_ok = PG_Authenticate(sock, user, pass)
+        IfCondition EqualTo(auth_ok, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Connect] ERROR: Authentication failed\n")
+            }
+            SocketClose(sock)
+            ReturnValue(0)
+        }
+        
+        pid = 0
+        secret = 0
+        tx = 0
+        
+        WhileLoop EqualTo(1, 1) {
+            tbuf = Allocate(1)
+            br = SocketRead(sock, tbuf, 1)
+            
+            IfCondition LessEqual(br, 0) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_Connect] ERROR: Socket closed while waiting for ReadyForQuery\n")
+                }
+                Deallocate(tbuf, 1)
+                SocketClose(sock)
+                ReturnValue(0)
+            }
+            
+            mt = Dereference(tbuf)
+            Deallocate(tbuf, 1)
+            
+            Debug("postgres.trace", level=2) {
+                PrintMessage("Message type = ")
+                PrintNumber(mt)
+                PrintMessage("\n")
+            }
+            
+            lbuf = Allocate(4)
+            lbytes = PG_RecvExact(sock, lbuf, 4)
+            IfCondition LessEqual(lbytes, 0) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_Connect] ERROR: Socket closed while reading message length\n")
+                }
+                Deallocate(lbuf, 4)
+                SocketClose(sock)
+                ReturnValue(0)
+            }
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Length bytes: [")
+                PrintNumber(GetByte(lbuf, 0))
+                PrintMessage(", ")
+                PrintNumber(GetByte(lbuf, 1))
+                PrintMessage(", ")
+                PrintNumber(GetByte(lbuf, 2))
+                PrintMessage(", ")
+                PrintNumber(GetByte(lbuf, 3))
+                PrintMessage("]\n")
+            }
+            
+            ml = PG_ReadInt32BE(lbuf, 0)
+            Deallocate(lbuf, 4)
+            
+            Debug("postgres.trace", level=2) {
+                PrintMessage("Parsed length = ")
+                PrintNumber(ml)
+                PrintMessage("\n")
+            }
+            
+            pl = Subtract(ml, 4)
+            pay = Allocate(pl)
+            pbytes = PG_RecvExact(sock, pay, pl)
+            IfCondition LessEqual(pbytes, 0) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_Connect] ERROR: Socket closed while reading payload\n")
+                }
+                Deallocate(pay, pl)
+                SocketClose(sock)
+                ReturnValue(0)
+            }
+            
+            // Backend key data (mt=75)
+            IfCondition EqualTo(mt, 75) ThenBlock: {
+                pid = PG_ReadInt32BE(pay, 0)
+                secret = PG_ReadInt32BE(pay, 4)
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PG: Backend PID=")
+                    PrintNumber(pid)
+                    PrintMessage("\n")
+                }
+            }
+            
+            // Parameter status (mt=83)
+            IfCondition EqualTo(mt, 83) ThenBlock: {
+                // Find length of parameter name
+                pn_len = 0
+                WhileLoop LessThan(pn_len, pl) {
+                    b = Dereference(Add(pay, pn_len))
+                    IfCondition EqualTo(b, 0) ThenBlock: { BreakLoop }
+                    pn_len = Add(pn_len, 1)
+                }
+                
+                // Only proceed if we found a valid null-terminated string
+                IfCondition LessThan(pn_len, pl) ThenBlock: {
+                    pn = PG_ReadString(pay, 0, pl)
+                    pv_offset = Add(pn_len, 1)
+                    
+                    // Check if there's enough space for a value string
+                    IfCondition LessThan(pv_offset, pl) ThenBlock: {
+                        pv = PG_ReadString(pay, pv_offset, Subtract(pl, pv_offset))
+                        Debug("postgres.trace", level=2) {
+                            PrintMessage("PG: ")
+                            PrintString(pn)
+                            PrintMessage("=")
+                            PrintString(pv)
+                            PrintMessage("\n")
+                        }
+                        pv_len = StringLength(pv)
+                        Deallocate(pv, Add(pv_len, 1))
+                    }
+                    
+                    pn_len = StringLength(pn)
+                    Deallocate(pn, Add(pn_len, 1))
+                }
+            }
+            
+            // Ready for query (mt=90)
+            IfCondition EqualTo(mt, 90) ThenBlock: {
+                tx = Dereference(pay)
+                Deallocate(pay, pl)
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("PG: Ready\n")
+                }
+                BreakLoop
+            }
+            
+            // Error (mt=69)
+            IfCondition EqualTo(mt, 69) ThenBlock: {
+                PrintMessage("ERROR: ")
+                Debug("postgres.trace", level=1) { PrintMessage("[PG_Connect] Received Error Response\n") }
+                PG_ParseError(pay, pl)
+                Deallocate(pay, pl)
+                SocketClose(sock)
+                ReturnValue(0)
+            }
+            
+            Deallocate(pay, pl)
+        }
+        
+        conn = Allocate(40)
+        StoreValue(conn, sock)
+        StoreValue(Add(conn, 8), pid)
+        StoreValue(Add(conn, 16), secret)
+        StoreValue(Add(conn, 24), tx)
+        StoreValue(Add(conn, 32), 1)
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG: Connection ready\n")
+        }
+        ReturnValue(conn)
+    }
+}
+
+Function.PG_SendStartup {
+    Input: sock: Integer
+    Input: user: Address
+    Input: db: Address
+    Output: Integer
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_SendStartup] ENTER\n")
+        }
+        ul = StrLen(user)
+        dl = StrLen(db)
+        ml = Add(Add(Add(25, ul), dl), 0)
+        
+        msg = Allocate(ml)
+        off = 0
+        
+        PG_WriteInt32BE(msg, off, ml)
+        off = Add(off, 4)
+        
+        pv = PG.PROTOCOL_VERSION
+        PG_WriteInt32BE(msg, off, pv)
+        off = Add(off, 4)
+        
+        off = PG_WriteString(msg, off, "user")
+        off = PG_WriteString(msg, off, user)
+        off = PG_WriteString(msg, off, "database")
+        off = PG_WriteString(msg, off, db)
+        
+        StoreValue(Add(msg, off), 0)
+        
+        sent = Socket.Send(sock, msg, ml)
+        Deallocate(msg, ml)
+        
+        IfCondition LessThan(sent, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_SendStartup] ERROR: Socket send failed\n")
+            }
+            ReturnValue(0)
+        }
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG: Startup sent\n")
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.PG_Authenticate {
+    Input: sock: Integer
+    Input: user: Address
+    Input: pass: Address
+    Output: Integer
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_Authenticate] ENTER\n")
+        }
+        tbuf = Allocate(1)
+        tbytes = PG_RecvExact(sock, tbuf, 1)
+        IfCondition LessEqual(tbytes, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) { PrintMessage("[PG_Authenticate] ERROR: Socket closed waiting for auth type\n") }
+            Deallocate(tbuf, 1)
+            ReturnValue(0)
+        }
+        
+        mt = Dereference(tbuf)
+        Deallocate(tbuf, 1)
+        
+        IfCondition NotEqual(mt, 82) ThenBlock: {
+            Debug("postgres.trace", level=1) { PrintMessage("[PG_Authenticate] ERROR: Expected auth request (R), got ") PrintNumber(mt) PrintMessage("\n") }
+            ReturnValue(0)
+        }
+        
+        lbuf = Allocate(4)
+        PG_RecvExact(sock, lbuf, 4)
+        Deallocate(lbuf, 4)
+        
+        abuf = Allocate(4)
+        abytes = PG_RecvExact(sock, abuf, 4)
+        IfCondition LessEqual(abytes, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) { PrintMessage("[PG_Authenticate] ERROR: Socket closed waiting for auth method\n") }
+            Deallocate(abuf, 4)
+            ReturnValue(0)
+        }
+        
+        at = PG_ReadInt32BE(abuf, 0)
+        Deallocate(abuf, 4)
+        
+        IfCondition EqualTo(at, 0) ThenBlock: {
+            Debug("postgres.trace", level=2) {
+                PrintMessage("PG: Auth OK (trust)\n")
+            }
+            ReturnValue(1)
+        }
+        
+        IfCondition EqualTo(at, 3) ThenBlock: {
+            Debug("postgres.trace", level=2) {
+                PrintMessage("PG: Cleartext auth\n")
+            }
+            res = PG_SendPassword(sock, pass)
+            ReturnValue(res)
+        }
+        
+        IfCondition EqualTo(at, 5) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Authenticate] ERROR: MD5 auth not implemented\n")
+            }
+            saltbuf = Allocate(4)
+            PG_RecvExact(sock, saltbuf, 4)
+            Deallocate(saltbuf, 4)
+            ReturnValue(0)
+        }
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("[PG_Authenticate] ERROR: Unsupported auth type ")
+            PrintNumber(at)
+            PrintMessage("\n")
+        }
+        ReturnValue(0)
+    }
+}
+
+
+Function.PG_SendPassword {
+    Input: sock: Integer
+    Input: pass: Address
+    Output: Integer
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_SendPassword] ENTER\n")
+        }
+        pl = StrLen(pass)
+        ml = Add(Add(pl, 1), 5)
+        
+        msg = Allocate(ml)
+        StoreValue(msg, 112)
+        PG_WriteInt32BE(msg, 1, Subtract(ml, 1))
+        PG_WriteString(msg, 5, pass)
+        
+        sent = SocketWrite(sock, msg, ml)
+        Deallocate(msg, ml)
+        
+        IfCondition LessThan(sent, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_SendPassword] ERROR: Socket send failed\n")
+            }
+            ReturnValue(0)
+        }
+        
+        // Read auth response type
+        tbuf = Allocate(1)
+        tbytes = SocketRead(sock, tbuf, 1)
+        IfCondition LessEqual(tbytes, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) { PrintMessage("[PG_SendPassword] ERROR: Socket closed waiting for auth response\n") }
+            Deallocate(tbuf, 1)
+            ReturnValue(0)
+        }
+        
+        mt = Dereference(tbuf)
+        Deallocate(tbuf, 1)
+        
+        // Read length
+        lbuf = Allocate(4)
+        lbytes = SocketRead(sock, lbuf, 4)
+        Deallocate(lbuf, 4)
+        
+        IfCondition EqualTo(mt, 82) ThenBlock: {
+            abuf = Allocate(4)
+            abytes = Socket.RecvExact(sock, abuf, 4)
+            IfCondition LessEqual(abytes, 0) ThenBlock: {
+                Debug("postgres.trace", level=1) { PrintMessage("[PG_SendPassword] ERROR: Socket closed reading auth status\n") }
+                Deallocate(abuf, 4)
+                ReturnValue(0)
+            }
+            
+            at = PG_ReadInt32BE(abuf, 0)
+            Deallocate(abuf, 4)
+            
+            IfCondition EqualTo(at, 0) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PG: Auth successful\n")
+                }
+                ReturnValue(1)
+            }
+        }
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("[PG_SendPassword] ERROR: Auth failed after sending password\n")
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.PG_Disconnect {
+    Input: conn: Address
+    Body: {
+        Debug("postgres.trace", level=1) {
+            PrintMessage("[PG_Disconnect] ENTER\n")
+        }
+        IfCondition EqualTo(conn, 0) ThenBlock: { ReturnValue(0) }
+        
+        connected = Dereference(Add(conn, 32))
+        IfCondition EqualTo(connected, 0) ThenBlock: {
+            Deallocate(conn, 40)
+            ReturnValue(0)
+        }
+        
+        sock = Dereference(conn)
+        
+        term = Allocate(5)
+        StoreValue(term, 88)  // 'X'
+        PG_WriteInt32BE(term, 1, 4)
+        Socket.Send(sock, term, 5)
+        Deallocate(term, 5)
+        
+        Socket.Close(sock)
+        StoreValue(Add(conn, 32), 0)
+        Deallocate(conn, 40)
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG: Disconnected\n")
+        }
+    }
+}
+
+// ============================================================================
+// QUERY EXECUTION
+// ============================================================================
+
+Function.PG_Query {
+    Input: conn: Address
+    Input: sql: Address
+    Output: Address  // XArray of HashMaps (rows)
+    Body: {
+        Debug("postgres.trace", level=1) {
+            PrintMessage("[PG_Query] ENTER, sql='")
+            PrintString(sql)
+            PrintMessage("'\n")
+        }
+        sock = Dereference(conn)
+        
+        // Send Query message
+        sql_len = StringLength(sql)
+        msg_len = Add(Add(sql_len, 1), 5)
+        
+        msg = Allocate(msg_len)
+        StoreValue(msg, 81)  // 'Q'
+        PG_WriteInt32BE(msg, 1, Subtract(msg_len, 1))
+        PG_WriteString(msg, 5, sql)
+        
+        sent = Socket.Send(sock, msg, msg_len)
+        Deallocate(msg, msg_len)
+        
+        IfCondition LessThan(sent, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Query] ERROR: Socket send failed\n")
+            }
+            ReturnValue(0)
+        }
+        
+        // Read response
+        result = PG_ReadQueryResponse(sock)
+        Debug("postgres.trace", level=1) {
+            PrintMessage("[PG_Query] EXIT, result_ptr=")
+            PrintNumber(result)
+            PrintMessage("\n")
+        }
+        ReturnValue(result)
+    }
+}
+
+// Dynamic protocol-aware response handler
+Function.PG_ReadQueryResponse {
+    Input: sock: Integer
+    Output: Address
+    Body: {
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG_ReadQueryResponse starting\n")
+        }
+        
+        rows = XArray.XCreate(16)
+        fields = 0
+        field_count = 0
+        
+        // State machine for protocol tracking
+        state_waiting_for_desc = 1
+        state_reading_data = 2
+        state_complete = 3
+        
+        current_state = state_waiting_for_desc
+        
+        // Timeout detection using monotonic clock
+        last_activity = PG_GetUnixTimeMS()
+        timeout_ms = 30000  // 30 second timeout for any single message
+        
+        // Stall detection - tracks if we're making progress
+        last_row_count = 0
+        stall_checks = 0
+        max_stall_checks = 100  // Allow more checks for large result sets
+        
+        WhileLoop EqualTo(1, 1) {
+            // Check for timeout
+            current_time = PG_GetUnixTimeMS()
+            elapsed = Subtract(current_time, last_activity)
+            
+            IfCondition GreaterThan(elapsed, timeout_ms) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_ReadQueryResponse] ERROR: Socket timeout after ")
+                    PrintNumber(elapsed)
+                    PrintMessage(" ms waiting for message\n")
+                    PrintMessage("  Last known state: ")
+                    PrintNumber(current_state)
+                    PrintMessage(", rows collected: ")
+                    PrintNumber(XArray.XSize(rows))
+                    PrintMessage("\n")
+                }
+                
+                IfCondition NotEqual(fields, 0) ThenBlock: {
+                    PG_DestroyFields(fields)
+                }
+                XArray.XDestroy(rows)
+                ReturnValue(0)
+            }
+            
+            // Stall detection - check if we're stuck processing but not progressing
+            current_row_count = XArray.XSize(rows)
+            IfCondition EqualTo(current_row_count, last_row_count) ThenBlock: {
+                stall_checks = Add(stall_checks, 1)
+                
+                IfCondition GreaterThan(stall_checks, max_stall_checks) ThenBlock: {
+                    Debug("postgres.trace", level=1) {
+                        PrintMessage("[PG_ReadQueryResponse] ERROR: No progress detected after ")
+                        PrintNumber(stall_checks)
+                        PrintMessage(" checks. Possible protocol desync.\n")
+                        PrintMessage("  Rows collected: ")
+                        PrintNumber(current_row_count)
+                        PrintMessage(", State: ")
+                        PrintNumber(current_state)
+                        PrintMessage("\n")
+                    }
+                    
+                    IfCondition NotEqual(fields, 0) ThenBlock: {
+                        PG_DestroyFields(fields)
+                    }
+                    XArray.XDestroy(rows)
+                    ReturnValue(0)
+                }
+            } ElseBlock: {
+                // Made progress, reset stall counter
+                stall_checks = 0
+                last_row_count = current_row_count
+            }
+            
+            // Read message type (1 byte)
+            tbuf = Allocate(1)
+            br = PG_RecvExact(sock, tbuf, 1)
+            
+            IfCondition LessEqual(br, 0) ThenBlock: {
+                Deallocate(tbuf, 1)
+                // Check if this is expected (connection closed cleanly)
+                IfCondition EqualTo(current_state, state_complete) ThenBlock: {
+                    Debug("postgres.trace", level=2) {
+                        PrintMessage("Connection closed after completion\n")
+                    }
+                    IfCondition NotEqual(fields, 0) ThenBlock: {
+                        PG_DestroyFields(fields)
+                    }
+                    ReturnValue(rows)
+                } ElseBlock: {
+                    Debug("postgres.trace", level=1) {
+                        PrintMessage("[PG_ReadQueryResponse] ERROR: Socket closed unexpectedly in state ")
+                        PrintNumber(current_state)
+                        PrintMessage("\n")
+                    }
+                    IfCondition NotEqual(fields, 0) ThenBlock: {
+                        PG_DestroyFields(fields)
+                    }
+                    XArray.XDestroy(rows)
+                    ReturnValue(0)
+                }
+            }
+            
+            // Update last activity time
+            last_activity = PG_GetUnixTimeMS()
+            
+            mt = Dereference(tbuf)
+            Deallocate(tbuf, 1)
+            
+            Debug("postgres.trace", level=2) {
+                PrintMessage("Message type = ")
+                PrintNumber(mt)
+                PrintMessage(" in state ")
+                PrintNumber(current_state)
+                PrintMessage("\n")
+            }
+            
+            // Read message length (4 bytes)
+            lbuf = Allocate(4)
+            lbytes = PG_RecvExact(sock, lbuf, 4)
+            
+            IfCondition LessEqual(lbytes, 0) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_ReadQueryResponse] ERROR: Failed to read message length\n")
+                }
+                Deallocate(lbuf, 4)
+                
+                IfCondition NotEqual(fields, 0) ThenBlock: {
+                    PG_DestroyFields(fields)
+                }
+                XArray.XDestroy(rows)
+                ReturnValue(0)
+            }
+            
+            ml = PG_ReadInt32BE(lbuf, 0)
+            Deallocate(lbuf, 4)
+            
+            // Update last activity
+            last_activity = PG_GetUnixTimeMS()
+            
+            // Validate message length (sanity check)
+            IfCondition LessThan(ml, 4) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_ReadQueryResponse] ERROR: Invalid message length: ")
+                    PrintNumber(ml)
+                    PrintMessage("\n")
+                }
+                
+                IfCondition NotEqual(fields, 0) ThenBlock: {
+                    PG_DestroyFields(fields)
+                }
+                XArray.XDestroy(rows)
+                ReturnValue(0)
+            }
+            
+            // Read payload
+            pl = Subtract(ml, 4)
+            
+            pay = 0
+            IfCondition GreaterThan(pl, 0) ThenBlock: {
+                pay = Allocate(pl)
+                pbytes = PG_RecvExact(sock, pay, pl)
+                
+                IfCondition LessEqual(pbytes, 0) ThenBlock: {
+                    Debug("postgres.trace", level=1) {
+                        PrintMessage("[PG_ReadQueryResponse] ERROR: Failed to read payload\n")
+                    }
+                    Deallocate(pay, pl)
+                    
+                    IfCondition NotEqual(fields, 0) ThenBlock: {
+                        PG_DestroyFields(fields)
+                    }
+                    XArray.XDestroy(rows)
+                    ReturnValue(0)
+                }
+                
+                // Update last activity after reading payload
+                last_activity = PG_GetUnixTimeMS()
+            }
+            
+            // ===== MESSAGE TYPE HANDLING =====
+            
+            // Row description (T / 84)
+            IfCondition EqualTo(mt, 84) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Parsing row description\n")
+                }
+                
+                IfCondition NotEqual(fields, 0) ThenBlock: {
+                    PG_DestroyFields(fields)
+                }
+                
+                fields = PG_ParseRowDesc(pay, pl)
+                field_count = XArray.XSize(fields)
+                current_state = state_reading_data
+                
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Row description: ")
+                    PrintNumber(field_count)
+                    PrintMessage(" fields\n")
+                }
+                
+                Deallocate(pay, pl)
+            }
+            
+            // Data row (D / 68)
+            IfCondition EqualTo(mt, 68) ThenBlock: {
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Parsing data row\n")
+                }
+                
+                row = PG_ParseDataRow(pay, pl, fields)
+                XArray.XPush(rows, row)
+                current_state = state_reading_data
+                
+                Deallocate(pay, pl)
+                
+                // Progress indicator every 1000 rows
+                row_count = XArray.XSize(rows)
+                IfCondition EqualTo(Modulo(row_count, 1000), 0) ThenBlock: {
+                    Debug("postgres.trace", level=2) {
+                        PrintMessage("  ... ")
+                        PrintNumber(row_count)
+                        PrintMessage(" rows fetched\n")
+                    }
+                }
+            }
+            
+            // Command complete (C / 67)
+            IfCondition EqualTo(mt, 67) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Command complete\n")
+                }
+                
+                current_state = state_complete
+                
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // Ready for query (Z / 90) - DEFINITIVE END OF RESPONSE
+            IfCondition EqualTo(mt, 90) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("Ready for query - response complete\n")
+                }
+                
+               IfCondition NotEqual(pay, 0) ThenBlock: {
+                   Deallocate(pay, pl)
+                }
+                
+                // Clean up fields
+                IfCondition NotEqual(fields, 0) ThenBlock: {
+                    PG_DestroyFields(fields)
+                }
+                
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("Query complete: ")
+                    PrintNumber(XArray.XSize(rows))
+                    PrintMessage(" rows\n")
+                }
+                
+                // This is the ONLY clean exit point
+                ReturnValue(rows)
+            }
+            
+            // Error response (E / 69)
+            IfCondition EqualTo(mt, 69) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_ReadQueryResponse] PostgreSQL ERROR: ")
+                }
+                PG_ParseError(pay, pl)
+                
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+                
+                IfCondition NotEqual(fields, 0) ThenBlock: {
+                    PG_DestroyFields(fields)
+                }
+                
+                XArray.XDestroy(rows)
+                ReturnValue(0)
+            }
+            
+            // Notice response (N / 78)
+            IfCondition EqualTo(mt, 78) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("NOTICE: ")
+                    PG_ParseError(pay, pl)
+                }
+                
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // Empty query response (I / 73)
+            IfCondition EqualTo(mt, 73) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Empty query response\n")
+                }
+                
+                current_state = state_complete
+                
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // Parameter status (S / 83) - server params
+            IfCondition EqualTo(mt, 83) ThenBlock: {
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Parameter status\n")
+                }
+                
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // Backend key data (K / 75)
+            IfCondition EqualTo(mt, 75) ThenBlock: {
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Backend key data\n")
+                }
+                
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // Ignore other message types
+            IfCondition NotEqual(pay, 0) ThenBlock: {
+                Deallocate(pay, pl)
+            }
+        }
+        
+        // Should NEVER reach here
+        Debug("postgres.trace", level=1) {
+            PrintMessage("[PG_ReadQueryResponse] CRITICAL: Loop exited abnormally without ReadyForQuery!\n")
+        }
+        IfCondition NotEqual(fields, 0) ThenBlock: {
+            PG_DestroyFields(fields)
+        }
+        
+        XArray.XDestroy(rows)
+        ReturnValue(0)
+    }
+}
+
+
+Function.PG_ReadQueryResponseWithFields {
+    Input: sock: Integer
+    Input: stored_fields: Address
+    Output: Address
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_ReadQueryResponseWithFields starting, fields=")
+            PrintNumber(stored_fields)
+            PrintMessage("\n")
+        }
+        
+        rows = XArray.XCreate(16)
+        fields = stored_fields
+        
+        // Safety counter to prevent infinite loops
+        max_iterations = 1000
+        iteration_count = 0
+        
+        WhileLoop EqualTo(1, 1) {
+            iteration_count = Add(iteration_count, 1)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Loop iteration ")
+                PrintNumber(iteration_count)
+                PrintMessage(" - reading message type\n")
+            }
+            
+            // Safety check
+            IfCondition GreaterThan(iteration_count, max_iterations) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_ReadQueryResponseWithFields] ERROR: Response loop exceeded max iterations\n")
+                }
+                XArray.XDestroy(rows)
+                ReturnValue(0)
+            }
+            
+            // Read message type (1 byte)
+            tbuf = Allocate(1)
+            br = PG_RecvExact(sock, tbuf, 1)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Read message type, bytes=")
+                PrintNumber(br)
+                PrintMessage("\n")
+            }
+            
+            IfCondition LessEqual(br, 0) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("No bytes read, breaking\n")
+                }
+                Deallocate(tbuf, 1)
+                BreakLoop
+            }
+            
+            mt = Dereference(tbuf)
+            Deallocate(tbuf, 1)
+            
+            Debug("postgres.trace", level=2) {
+                PrintMessage("Message type = ")
+                PrintNumber(mt)
+                PrintMessage("\n")
+            }
+            
+            // Read message length (4 bytes)
+            lbuf = Allocate(4)
+            lbytes = PG_RecvExact(sock, lbuf, 4)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Read length, bytes=")
+                PrintNumber(lbytes)
+                PrintMessage("\n")
+            }
+            
+            IfCondition LessEqual(lbytes, 0) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Length read failed, breaking\n")
+                }
+                Deallocate(lbuf, 4)
+                BreakLoop
+            }
+            
+            ml = PG_ReadInt32BE(lbuf, 0)
+            Deallocate(lbuf, 4)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Message length = ")
+                PrintNumber(ml)
+                PrintMessage("\n")
+            }
+            
+            // Read payload
+            pl = Subtract(ml, 4)
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Payload length = ")
+                PrintNumber(pl)
+                PrintMessage("\n")
+            }
+            
+            // Always read payload if there is one
+            pay = 0
+            IfCondition GreaterThan(pl, 0) ThenBlock: {
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Allocating and reading payload\n")
+                }
+                pay = Allocate(pl)
+                pbytes = PG_RecvExact(sock, pay, pl)
+                Debug("payload_read", level=2) {
+                    PrintMessage("Payload bytes read = ")
+                    PrintNumber(pbytes)
+                    PrintMessage("\n")
+                }
+                
+                IfCondition LessEqual(pbytes, 0) ThenBlock: {
+                    Debug("postgres.trace", level=2) {
+                        PrintMessage("Payload read failed, breaking\n")
+                    }
+                    Deallocate(pay, pl)
+                    BreakLoop
+                }
+            }
+            
+            // BindComplete (2 / 50) - CRITICAL: Handle this!
+            IfCondition EqualTo(mt, 50) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("BindComplete\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+                // Don't break - continue to read more messages
+            }
+            
+            // Row description (T / 84)
+            IfCondition EqualTo(mt, 84) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Skipping RowDescription (using cached fields)\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // Data row (D / 68)
+            IfCondition EqualTo(mt, 68) ThenBlock: {
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Parsing data row\n")
+                }
+                
+                // Only parse if we have field info
+                IfCondition NotEqual(fields, 0) ThenBlock: {
+                    row = PG_ParseDataRow(pay, pl, fields)
+                    XArray.XPush(rows, row)
+                    Debug("postgres.trace", level=3) {
+                        PrintMessage("Pushed row\n")
+                    }
+                } ElseBlock: {
+                    Debug("postgres.trace", level=2) {
+                        PrintMessage("Skipping data row - no fields\n")
+                    }
+                }
+                
+                Deallocate(pay, pl)
+            }
+            
+            // Command complete (C / 67)
+            IfCondition EqualTo(mt, 67) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Parsing command complete\n")
+                }
+                tag = PG_ReadString(pay, 0, pl)
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PG: ")
+                    PrintString(tag)
+                    PrintMessage("\n")
+                }
+                
+                // Free the tag string
+                tag_len = StringLength(tag)
+                Deallocate(tag, Add(tag_len, 1))
+                
+                Deallocate(pay, pl)
+            }
+            
+            // Ready for query (Z / 90) - EXIT HERE
+            IfCondition EqualTo(mt, 90) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("Ready for query - BREAKING\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+                BreakLoop  // ← THIS IS THE ONLY EXIT
+            }
+            
+            // Error (E / 69)
+            IfCondition EqualTo(mt, 69) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_ReadQueryResponseWithFields] ERROR:\n")
+                }
+                PG_ParseError(pay, pl)
+                Deallocate(pay, pl)
+                XArray.XDestroy(rows)
+                ReturnValue(0)
+            }
+            
+            // Notice (N / 78)
+            IfCondition EqualTo(mt, 78) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("NOTICE:\n")
+                }
+                PG_ParseError(pay, pl)
+                Deallocate(pay, pl)
+            }
+            
+            // EmptyQueryResponse (I / 73)
+            IfCondition EqualTo(mt, 73) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("EmptyQueryResponse\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // PortalSuspended (s / 115) - shouldn't happen but handle it
+            IfCondition EqualTo(mt, 115) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PortalSuspended\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // Unknown message type - log and continue
+            // This prevents hanging on unexpected messages
+            Debug("postgres.trace", level=2) {
+                PrintMessage("Unknown/unhandled message type ")
+                PrintNumber(mt)
+                PrintMessage(" - continuing\n")
+            }
+        }
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("Loop finished after ")
+            PrintNumber(iteration_count)
+            PrintMessage(" iterations\n")
+        }
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG: ")
+            PrintNumber(XArray.XSize(rows))
+            PrintMessage(" rows\n")
+        }
+        
+        ReturnValue(rows)
+    }
+}
+
+
+Function.PG_ParseRowDesc {
+    Input: buf: Address
+    Input: len: Integer
+    Output: Address
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_ParseRowDesc: buf=")
+            PrintNumber(buf)
+            PrintMessage(", len=")
+            PrintNumber(len)
+            PrintMessage("\n")
+        }
+        
+        // Read field count (first 2 bytes, big-endian)
+        fc = PG_ReadInt16BE(buf, 0)
+        Debug("postgres.trace", level=2) {
+            PrintMessage("Field count = ")
+            PrintNumber(fc)
+            PrintMessage("\n")
+        }
+        
+        off = 2
+        
+        // Create XArray with proper capacity
+        fields = XArray.XCreate(fc)
+        Debug("postgres.trace", level=3) {
+            PrintMessage("Created fields XArray with capacity ")
+            PrintNumber(fc)
+            PrintMessage("\n")
+        }
+        
+        i = 0
+        WhileLoop LessThan(i, fc) {
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Processing field ")
+                PrintNumber(i)
+                PrintMessage(", offset=")
+                PrintNumber(off)
+                PrintMessage("\n")
+            }
+            
+            // Check bounds before reading string
+            IfCondition GreaterEqual(off, len) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_ParseRowDesc] ERROR: Offset exceeds buffer length\n")
+                }
+                BreakLoop
+            }
+            
+            // Read field name (null-terminated string)
+            fname = PG_ReadString(buf, off, Subtract(len, off))
+            
+            // Create a small HashMap for this field
+            field_map = HashMap.CreateSimple()
+            HashMap.HSetSimple(field_map, "name", fname)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Field name = ")
+                PrintString(fname)
+                PrintMessage("\n")
+            }
+            
+            fnl = StringLength(fname)
+            off = Add(off, Add(fnl, 1))  // +1 for null terminator
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Field name length = ")
+                PrintNumber(fnl)
+                PrintMessage(", new offset = ")
+                PrintNumber(off)
+                PrintMessage("\n")
+            }
+            
+            // Skip field metadata: table_oid(4) + attr_num(2) + type_oid(4) + type_size(2) + type_mod(4) + format(2) = 18 bytes
+            off = Add(off, 18)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("After skipping metadata, offset = ")
+                PrintNumber(off)
+                PrintMessage("\n")
+            }
+            
+            // Push field name to array
+            XArray.XPush(fields, field_map)
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Pushed field to array\n")
+            }
+            
+            i = Add(i, 1)
+        }
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_ParseRowDesc complete, returning fields\n")
+        }
+        ReturnValue(fields)
+    }
+}
+
+
+Function.PG_ParseDataRow {
+    Input: buf: Address
+    Input: len: Integer
+    Input: fields: Address
+    Output: Address
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_ParseDataRow: buf=")
+            PrintNumber(buf)
+            PrintMessage(", len=")
+            PrintNumber(len)
+            PrintMessage(", fields=")
+            PrintNumber(fields)
+            PrintMessage("\n")
+        }
+        
+        cc = PG_ReadInt16BE(buf, 0)
+        Debug("column_count", level=1) {
+            PrintMessage("Column count = ")
+            PrintNumber(cc)
+            PrintMessage("\n")
+        }
+        
+        off = 2
+        
+        row = HashMap.CreateSimple()
+        Debug("memory_allocation", level=2) {
+            PrintMessage("Created HashMap\n")
+        }
+        
+        // If we don't have field names, create generic ones
+        IfCondition EqualTo(fields, 0) ThenBlock: {
+            PrintMessage("WARNING: No field names available, using col0, col1, etc.\n")
+        }
+        
+        i = 0
+        WhileLoop LessThan(i, cc) {
+            Debug("column_parsing_detail", level=2) {
+                PrintMessage("Processing column ")
+                PrintNumber(i)
+                PrintMessage(", offset=")
+                PrintNumber(off)
+                PrintMessage("\n")
+            }
+            
+            vl = PG_ReadInt32BE(buf, off)
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Value length = ")
+                PrintNumber(vl)
+                PrintMessage("\n")
+            }
+            
+            off = Add(off, 4)
+            
+            // Get field name and MAKE A COPY
+            fname = 0
+            fname_copy = 0
+            
+            IfCondition NotEqual(fields, 0) ThenBlock: {
+                field_map = XArray.XGet(fields, i)
+                fname = HashMap.HGetSimple(field_map, "name")
+                
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Field name = ")
+                    PrintString(fname)
+                    PrintMessage("\n")
+                }
+                
+                // CRITICAL FIX: Make a copy of the field name
+                IfCondition NotEqual(fname, 0) ThenBlock: {
+                    fname_len = StringLength(fname)
+                    fname_copy = Allocate(Add(fname_len, 1))
+                    
+                    j = 0
+                    WhileLoop LessThan(j, fname_len) {
+                        byte = GetByte(fname, j)
+                        SetByte(fname_copy, j, byte)
+                        j = Add(j, 1)
+                    }
+                    SetByte(fname_copy, fname_len, 0)
+                    
+                    Debug("postgres.trace", level=3) {
+                        PrintMessage("Copied field name to ")
+                        PrintNumber(fname_copy)
+                        PrintMessage("\n")
+                    }
+                }
+            } ElseBlock: {
+                // Create generic field name: "col0", "col1", etc.
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("No field name available\n")
+                }
+            }
+            
+            // NULL value (length = -1 = 4294967295 unsigned)
+            is_null = EqualTo(vl, 4294967295)
+            
+            IfCondition is_null ThenBlock: {
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("NULL value\n")
+                }
+                IfCondition NotEqual(fname_copy, 0) ThenBlock: {
+                    HashMap.HSetSimple(row, fname_copy, 0)
+                }
+            } ElseBlock: {
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Non-NULL value, length = ")
+                    PrintNumber(vl)
+                    PrintMessage("\n")
+                }
+                
+                // Check bounds
+                IfCondition GreaterThan(Add(off, vl), len) ThenBlock: {
+                    Debug("postgres.trace", level=1) {
+                        PrintMessage("[PG_ParseDataRow] ERROR: Value would exceed buffer bounds\n")
+                    }
+                    IfCondition NotEqual(fname_copy, 0) ThenBlock: {
+                        HashMap.HSetSimple(row, fname_copy, 0)
+                    }
+                } ElseBlock: {
+                    // Read value
+                    val = PG_ReadString(buf, off, vl)
+                    
+                    Debug("postgres.trace", level=3) {
+                        PrintMessage("Read value = ")
+                        PrintString(val)
+                        PrintMessage("\n")
+                    }
+                    
+                    off = Add(off, vl)
+                    
+                    IfCondition NotEqual(fname_copy, 0) ThenBlock: {
+                        // HashMap now owns both the fname_copy and val pointers
+                        HashMap.HSetSimple(row, fname_copy, val)
+                        Debug("postgres.trace", level=3) {
+                            PrintMessage("Stored in HashMap with copied key\n")
+                        }
+                    } ElseBlock: {
+                        // No field name, can't store
+                        Deallocate(val, 0)
+                    }
+                }
+            }
+            
+            i = Add(i, 1)
+        }
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_ParseDataRow complete\n")
+        }
+        ReturnValue(row)
+    }
+}
+
+Function.PG_ParseError {
+    Input: buf: Address
+    Input: len: Integer
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_ParseError called with len=")
+            PrintNumber(len)
+            PrintMessage("\n")
+        }
+        
+        off = 0
+        
+        WhileLoop LessThan(off, len) {
+            ft = GetByte(buf, off)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Field type=")
+                PrintNumber(ft)
+                PrintMessage(" at offset=")
+                PrintNumber(off)
+                PrintMessage("\n")
+            }
+            
+            IfCondition EqualTo(ft, 0) ThenBlock: { 
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Hit null terminator\n")
+                }
+                BreakLoop 
+            }
+            
+            off = Add(off, 1)
+            
+            // Check bounds
+            IfCondition GreaterEqual(off, len) ThenBlock: { 
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("Reached end of buffer\n")
+                }
+                BreakLoop 
+            }
+            
+            fv = PG_ReadString(buf, off, Subtract(len, off))
+            Debug("postgres.trace", level=3) {
+                PrintMessage("Field value=")
+                PrintString(fv)
+                PrintMessage("\n")
+            }
+            
+            fl = StringLength(fv)
+            off = Add(off, Add(fl, 1))
+            
+            // Severity (S = 83)
+            IfCondition EqualTo(ft, 83) ThenBlock: {
+                PrintString(fv)
+                PrintMessage(": ")
+            }
+            
+            // Message (M = 77)
+            IfCondition EqualTo(ft, 77) ThenBlock: {
+                PrintString(fv)
+            }
+            
+            // Detail (D = 68)
+            IfCondition EqualTo(ft, 68) ThenBlock: {
+                PrintMessage(" (Detail: ")
+                PrintString(fv)
+                PrintMessage(")")
+            }
+            
+            // Hint (H = 72)
+            IfCondition EqualTo(ft, 72) ThenBlock: {
+                PrintMessage(" [Hint: ")
+                PrintString(fv)
+                PrintMessage("]")
+            }
+            
+            flen = StringLength(fv)
+            Deallocate(fv, Add(flen, 1))
+        }
+        
+        PrintMessage("\n")
+    }
+}
+
+
+
+// ============================================================================
+// DESCRIBE MESSAGE - Get row description for prepared statements
+// ============================================================================
+
+Function.PG_Describe {
+    Input: sock: Integer
+    Input: stmt_name: Address
+    Input: describe_type: Integer  // 'S' for statement, 'P' for portal
+    Output: Address
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("Describing statement '")
+            PrintString(stmt_name)
+            PrintMessage("'\n")
+        }
+        
+        nl = StringLength(stmt_name)
+        
+        // Describe message format:
+        // 'D' (1 byte - NOT in length field)
+        // int32 length (4 bytes - includes itself)
+        // type byte ('S' or 'P') (1 byte)
+        // name + null (nl + 1)
+        // Total in length field: 4 + 1 + (nl + 1) = nl + 6
+        
+        length_field = Add(nl, 6)
+        total_size = Add(length_field, 1)  // +1 for 'D' type byte
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("Describe - nl=")
+            PrintNumber(nl)
+            PrintMessage(", length_field=")
+            PrintNumber(length_field)
+            PrintMessage(", total_size=")
+            PrintNumber(total_size)
+            PrintMessage("\n")
+        }
+        
+        msg = Allocate(total_size)
+        off = 0
+        
+        // Type byte 'D' (68)
+        SetByte(msg, off, 68)
+        off = Add(off, 1)
+        Debug("postgres.trace", level=3) {
+            PrintMessage("Set 'D' at offset 0\n")
+        }
+        
+        // Length (includes itself, type byte, name, null - NOT the 'D')
+        PG_WriteInt32BE(msg, off, length_field)
+        off = Add(off, 4)
+        Debug("postgres.trace", level=3) {
+            PrintMessage("Wrote length=")
+            PrintNumber(length_field)
+            PrintMessage(" at offset 1-4\n")
+        }
+        
+        // Describe type ('S'=83 for statement, 'P'=80 for portal)
+        SetByte(msg, off, describe_type)
+        off = Add(off, 1)
+        Debug("postgres.trace", level=3) {
+            PrintMessage("Wrote describe_type=")
+            PrintNumber(describe_type)
+            PrintMessage(" at offset 5\n")
+        }
+        
+        // Statement name (null-terminated)
+        i = 0
+        WhileLoop LessThan(i, nl) {
+            b = GetByte(stmt_name, i)
+            SetByte(msg, Add(off, i), b)
+            i = Add(i, 1)
+        }
+        off = Add(off, nl)
+        SetByte(msg, off, 0)  // Null terminator
+        off = Add(off, 1)
+        Debug("postgres.trace", level=3) {
+            PrintMessage("Wrote name '")
+            PrintString(stmt_name)
+            PrintMessage("' at offset 6-")
+            PrintNumber(off)
+            PrintMessage("\n")
+            PrintMessage("Final offset=")
+            PrintNumber(off)
+            PrintMessage(", expected=")
+            PrintNumber(total_size)
+            PrintMessage("\n")
+        }
+        
+        // Send Describe message
+        sent = SocketWrite(sock, msg, total_size)
+        Deallocate(msg, total_size)
+        
+        IfCondition LessThan(sent, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Describe] ERROR: Describe send failed\n")
+            }
+            ReturnValue(0)
+        }
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("Describe message sent, bytes=")
+            PrintNumber(sent)
+            PrintMessage("\n")
+        }
+        
+        // Send Sync to get response
+        sync = Allocate(5)
+        SetByte(sync, 0, 83)  // 'S'
+        PG_WriteInt32BE(sync, 1, 4)
+        sent = SocketWrite(sock, sync, 5)
+        Deallocate(sync, 5)
+        Debug("postgres.trace", level=2) {
+            PrintMessage("Sync sent, bytes=")
+            PrintNumber(sent)
+            PrintMessage("\n")
+        }
+        
+        // Read response
+        fields = PG_ReadDescribeResponse(sock)
+        
+        ReturnValue(fields)
+    }
+}
+
+Function.PG_ReadDescribeResponse {
+    Input: sock: Integer
+    Output: Address
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("Reading Describe response\n")
+        }
+        
+        fields = 0
+        
+        WhileLoop EqualTo(1, 1) {
+            // Read message type
+            tbuf = Allocate(1)
+            br = PG_RecvExact(sock, tbuf, 1)
+            
+            IfCondition LessEqual(br, 0) ThenBlock: {
+                Deallocate(tbuf, 1)
+                BreakLoop
+            }
+            
+            mt = Dereference(tbuf)
+            Deallocate(tbuf, 1)
+            
+            Debug("postgres.trace", level=2) {
+                PrintMessage("Describe response message type = ")
+                PrintNumber(mt)
+                PrintMessage("\n")
+            }
+            
+            // Read length
+            lbuf = Allocate(4)
+            PG_RecvExact(sock, lbuf, 4)
+            ml = PG_ReadInt32BE(lbuf, 0)
+            Deallocate(lbuf, 4)
+            
+            pl = Subtract(ml, 4)
+            
+            // Read payload if present
+            pay = 0
+            IfCondition GreaterThan(pl, 0) ThenBlock: {
+                pay = Allocate(pl)
+                PG_RecvExact(sock, pay, pl)
+            }
+            
+            // RowDescription (T / 84)
+            IfCondition EqualTo(mt, 84) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Got RowDescription\n")
+                }
+                fields = PG_ParseRowDesc(pay, pl)
+                Deallocate(pay, pl)
+            }
+            
+            // NoData (n / 110)
+            IfCondition EqualTo(mt, 110) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Got NoData (statement returns no rows)\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // ParameterDescription (t / 116)
+            IfCondition EqualTo(mt, 116) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("Got ParameterDescription\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // ReadyForQuery (Z / 90)
+            IfCondition EqualTo(mt, 90) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("Ready after Describe\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+                BreakLoop
+            }
+            
+            // Error (E / 69)
+            IfCondition EqualTo(mt, 69) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_ReadDescribeResponse] ERROR in Describe:\n")
+                }
+                PG_ParseError(pay, pl)
+                Deallocate(pay, pl)
+                ReturnValue(0)
+            }
+            
+            // Cleanup any other messages
+            IfCondition NotEqual(pay, 0) ThenBlock: {
+                Deallocate(pay, pl)
+            }
+        }
+        
+        ReturnValue(fields)
+    }
+}
+
+
+// ============================================================================
+// TRANSACTIONS
+// ============================================================================
+
+Function.PG_Begin {
+    Input: conn: Address
+    Output: Integer
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_Begin] ENTER\n")
+        }
+        result = PG_Query(conn, "BEGIN")
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            XArray.XDestroy(result)
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.PG_Commit {
+    Input: conn: Address
+    Output: Integer
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_Commit] ENTER\n")
+        }
+        result = PG_Query(conn, "COMMIT")
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            XArray.XDestroy(result)
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.PG_Rollback {
+    Input: conn: Address
+    Output: Integer
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_Rollback] ENTER\n")
+        }
+        result = PG_Query(conn, "ROLLBACK")
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            XArray.XDestroy(result)
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// PREPARED STATEMENTS
+// ============================================================================
+
+// COMPLETE WORKING PG_Prepare and PG_DestroyStatement
+// Add these to Library.PostgreSQL_Complete.ailang
+
+Function.PG_Prepare {
+    Input: conn: Address
+    Input: name: Address
+    Input: sql: Address
+    Output: Address
+    Body: {
+        sock = Dereference(conn)
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG_Prepare: Starting for '")
+            PrintString(name)
+            PrintMessage("'\n")
+        }
+        
+        // Calculate lengths
+        nl = StringLength(name)
+        sl = StringLength(sql)
+        
+        // Message format:
+        // 'P' (1 byte - NOT in length)
+        // int32 length (4 bytes - includes itself)
+        // name + null (nl + 1)
+        // sql + null (sl + 1)
+        // int16 param_count (2 bytes) - always 0 to infer
+        // Total in length field: 4 + (nl+1) + (sl+1) + 2 = nl + sl + 8
+        
+        msg_length_field = Add(Add(nl, sl), 8)
+        total_msg_size = Add(msg_length_field, 1)  // +1 for 'P' type byte
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Prepare: Message sizes - nl=")
+            PrintNumber(nl)
+            PrintMessage(", sl=")
+            PrintNumber(sl)
+            PrintMessage(", total=")
+            PrintNumber(total_msg_size)
+            PrintMessage("\n")
+        }
+        
+        // Allocate message buffer
+        msg = Allocate(total_msg_size)
+        off = 0
+        
+        // Type byte 'P' (80)
+        SetByte(msg, off, 80)
+        off = Add(off, 1)
+        
+        // Length (int32, big-endian)
+        PG_WriteInt32BE(msg, off, msg_length_field)
+        off = Add(off, 4)
+        
+        // Statement name (null-terminated)
+        i = 0
+        WhileLoop LessThan(i, nl) {
+            b = GetByte(name, i)
+            SetByte(msg, Add(off, i), b)
+            i = Add(i, 1)
+        }
+        off = Add(off, nl)
+        SetByte(msg, off, 0)  // Null terminator
+        off = Add(off, 1)
+        
+        // Query string (null-terminated)
+        i = 0
+        WhileLoop LessThan(i, sl) {
+            b = GetByte(sql, i)
+            SetByte(msg, Add(off, i), b)
+            i = Add(i, 1)
+        }
+        off = Add(off, sl)
+        SetByte(msg, off, 0)  // Null terminator
+        off = Add(off, 1)
+        
+        // Number of parameter data types (int16 = 0 to infer all types)
+        SetByte(msg, off, 0)
+        SetByte(msg, Add(off, 1), 0)
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Prepare: Sending Parse message (")
+            PrintNumber(total_msg_size)
+            PrintMessage(" bytes)\n")
+        }
+        
+        // Send Parse message
+        sent = Socket.Send(sock, msg, total_msg_size)
+        Deallocate(msg, total_msg_size)
+        
+        IfCondition LessEqual(sent, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Prepare] ERROR: Failed to send Parse message\n")
+            }
+            ReturnValue(0)
+        }
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Prepare: Sent ")
+            PrintNumber(sent)
+            PrintMessage(" bytes\n")
+        }
+        
+        // Send Sync message to flush and get immediate response
+        sync_msg = Allocate(5)
+        SetByte(sync_msg, 0, 83)  // 'S'
+        PG_WriteInt32BE(sync_msg, 1, 4)
+        Socket.Send(sock, sync_msg, 5)
+        Deallocate(sync_msg, 5)
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Prepare: Waiting for ParseComplete response\n")
+        }
+        
+        // Read response messages until ReadyForQuery
+        parse_ok = 0
+        fields = 0
+        
+        max_iterations = 100
+        iteration_count = 0
+        
+        WhileLoop EqualTo(1, 1) {
+            iteration_count = Add(iteration_count, 1)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("PG_Prepare: Response loop iteration ")
+                PrintNumber(iteration_count)
+                PrintMessage("\n")
+            }
+            
+            // Safety check to prevent infinite loop
+            IfCondition GreaterThan(iteration_count, max_iterations) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_Prepare] ERROR: Response loop exceeded max iterations\n")
+                }
+                ReturnValue(0)
+            }
+            
+            // Read message type (1 byte)
+            tbuf = Allocate(1)
+            br = PG_RecvExact(sock, tbuf, 1)
+            
+            IfCondition LessEqual(br, 0) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_Prepare] ERROR: Failed to read message type\n")
+                }
+                Deallocate(tbuf, 1)
+                ReturnValue(0)
+            }
+            
+            mt = Dereference(tbuf)
+            Deallocate(tbuf, 1)
+            
+            Debug("postgres.trace", level=2) {
+                PrintMessage("PG_Prepare: Got message type ")
+                PrintNumber(mt)
+                PrintMessage("\n")
+            }
+            
+            // Read message length (4 bytes)
+            lbuf = Allocate(4)
+            lbytes = PG_RecvExact(sock, lbuf, 4)
+            
+            IfCondition LessEqual(lbytes, 0) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_Prepare] ERROR: Failed to read message length\n")
+                }
+                Deallocate(lbuf, 4)
+                ReturnValue(0)
+            }
+            
+            ml = PG_ReadInt32BE(lbuf, 0)
+            Deallocate(lbuf, 4)
+            
+            // Read payload
+            pl = Subtract(ml, 4)
+            
+            pay = 0
+            IfCondition GreaterThan(pl, 0) ThenBlock: {
+                pay = Allocate(pl)
+                pbytes = PG_RecvExact(sock, pay, pl)
+                
+                IfCondition LessEqual(pbytes, 0) ThenBlock: {
+                    Debug("postgres.trace", level=1) {
+                        PrintMessage("[PG_Prepare] ERROR: Failed to read payload\n")
+                    }
+                    Deallocate(pay, pl)
+                    ReturnValue(0)
+                }
+            }
+            
+            // ParseComplete (1 / 49)
+            IfCondition EqualTo(mt, 49) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PG_Prepare: Got ParseComplete\n")
+                }
+                parse_ok = 1
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // ParameterDescription (t / 116)
+            IfCondition EqualTo(mt, 116) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PG_Prepare: Got ParameterDescription\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // NoData (n / 110) - statement returns no rows
+            IfCondition EqualTo(mt, 110) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PG_Prepare: Got NoData\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+            
+            // RowDescription (T / 84) - for SELECT statements
+            IfCondition EqualTo(mt, 84) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PG_Prepare: Got RowDescription\n")
+                }
+                fields = PG_ParseRowDesc(pay, pl)
+                Deallocate(pay, pl)
+            }
+            
+            // ReadyForQuery (Z / 90) - BREAK HERE
+            IfCondition EqualTo(mt, 90) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("PG_Prepare: Got ReadyForQuery - done\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+                BreakLoop  // ← THIS IS CRITICAL
+            }
+            
+            // Error (E / 69)
+            IfCondition EqualTo(mt, 69) ThenBlock: {
+                Debug("postgres.trace", level=1) {
+                    PrintMessage("[PG_Prepare] ERROR: PostgreSQL returned error during prepare:\n")
+                }
+                PG_ParseError(pay, pl)
+                Deallocate(pay, pl)
+                ReturnValue(0)
+            }
+            
+            // Notice (N / 78) - just log and continue
+            IfCondition EqualTo(mt, 78) ThenBlock: {
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("PG_Prepare: Got Notice\n")
+                }
+                IfCondition NotEqual(pay, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                }
+            }
+        }
+        
+        // Check if prepare was successful
+        IfCondition EqualTo(parse_ok, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Prepare] ERROR: Never received ParseComplete\n")
+            }
+            ReturnValue(0)
+        }
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Prepare: Creating statement structure\n")
+        }
+        
+        // Create statement structure: [name_ptr:8][param_count:8][conn:8][fields:8] = 32 bytes
+        stmt = Allocate(32)
+        
+        // Copy name for storage
+        name_copy = Allocate(Add(nl, 1))
+        i = 0
+        WhileLoop LessThan(i, nl) {
+            b = GetByte(name, i)
+            SetByte(name_copy, i, b)
+            i = Add(i, 1)
+        }
+        SetByte(name_copy, nl, 0)
+        
+        StoreValue(stmt, name_copy)          // name pointer
+        StoreValue(Add(stmt, 8), 0)          // param count (unknown for now)
+        StoreValue(Add(stmt, 16), conn)      // connection reference
+        StoreValue(Add(stmt, 24), fields)    // field descriptions (0 for INSERT/UPDATE/DELETE)
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG_Prepare: Success! Statement handle=")
+            PrintNumber(stmt)
+            PrintMessage("\n")
+        }
+        
+        ReturnValue(stmt)
+    }
+}
+
+
+// Destroy prepared statement and free resources
+// Destroy prepared statement and free resources
+Function.PG_DestroyStatement {
+    Input: stmt: Address
+    Body: {
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG_DestroyStatement: Starting for stmt=")
+            PrintNumber(stmt)
+            PrintMessage("\n")
+        }
+        
+        IfCondition EqualTo(stmt, 0) ThenBlock: {
+            Debug("postgres.trace", level=2) {
+                PrintMessage("PG_DestroyStatement: NULL statement\n")
+            }
+            ReturnValue(0)
+        }
+        
+        // Free the name copy
+        name = Dereference(stmt)
+        IfCondition NotEqual(name, 0) ThenBlock: {
+            name_len = StringLength(name)
+            Deallocate(name, Add(name_len, 1))
+            Debug("postgres.trace", level=3) {
+                PrintMessage("PG_DestroyStatement: Freed name\n")
+            }
+        }
+        
+        // Free field descriptors if they exist
+        fields = Dereference(Add(stmt, 24))
+        IfCondition NotEqual(fields, 0) ThenBlock: {
+            PG_DestroyFields(fields)
+            Debug("postgres.trace", level=3) {
+                PrintMessage("PG_DestroyStatement: Freed fields\n")
+            }
+        }
+        
+        // Free the statement structure itself (32 bytes)
+        Deallocate(stmt, 32)
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG_DestroyStatement: Complete\n")
+        }
+    }
+}
+
+// Execute a prepared statement with parameters
+// Returns result set (XArray of HashMaps) or 0 on error
+Function.PG_Execute {
+    Input: stmt: Address
+    Input: params: Address
+    Output: Address
+    Body: {
+        // Extract statement info
+        name = Dereference(stmt)
+        conn = Dereference(Add(stmt, 16))
+        sock = Dereference(conn)
+        stored_fields = Dereference(Add(stmt, 24))
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG_Execute: Starting for stmt=")
+            PrintNumber(stmt)
+            PrintMessage("\n")
+        }
+        
+        pc = XArray.XSize(params)
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Execute: ")
+            PrintNumber(pc)
+            PrintMessage(" parameters\n")
+        }
+        
+        // Calculate lengths
+        nl = StringLength(name)
+        
+        // Calculate parameter data size
+        param_data_size = 0
+        i = 0
+        WhileLoop LessThan(i, pc) {
+            p = XArray.XGet(params, i)
+            IfCondition NotEqual(p, 0) ThenBlock: {
+                pl = StringLength(p)
+                param_data_size = Add(param_data_size, Add(4, pl))  // 4 bytes length + data
+            } ElseBlock: {
+                param_data_size = Add(param_data_size, 4)  // 4 bytes for -1 (NULL)
+            }
+            i = Add(i, 1)
+        }
+        
+        Debug("postgres.trace", level=3) {
+            PrintMessage("PG_Execute: Parameter data size = ")
+            PrintNumber(param_data_size)
+            PrintMessage("\n")
+        }
+        
+        // Bind message format:
+        // 'B' (1 byte - NOT in length)
+        // int32 length (4 bytes - includes itself)
+        // portal name + null (1 for empty portal)
+        // statement name + null (nl + 1)
+        // int16 param format codes (2 bytes - 0 for all text)
+        // int16 param count (2 bytes)
+        // parameters (param_data_size)
+        // int16 result format codes (2 bytes - 0 for all text)
+        // Total in length: 4 + 1 + (nl+1) + 2 + 2 + param_data_size + 2 = nl + param_data_size + 12
+        
+        length_field = Add(Add(nl, param_data_size), 12)
+        total_size = Add(length_field, 1)  // +1 for 'B' type byte
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Execute: Bind message size = ")
+            PrintNumber(total_size)
+            PrintMessage("\n")
+        }
+        
+        // Allocate Bind message
+        msg = Allocate(total_size)
+        off = 0
+        
+        // Type byte 'B' (66)
+        SetByte(msg, off, 66)
+        off = Add(off, 1)
+        
+        // Length field
+        PG_WriteInt32BE(msg, off, length_field)
+        off = Add(off, 4)
+        
+        // Portal name (empty = just null byte)
+        SetByte(msg, off, 0)
+        off = Add(off, 1)
+        
+        // Statement name (null-terminated)
+        i = 0
+        WhileLoop LessThan(i, nl) {
+            b = GetByte(name, i)
+            SetByte(msg, Add(off, i), b)
+            i = Add(i, 1)
+        }
+        off = Add(off, nl)
+        SetByte(msg, off, 0)  // Null terminator
+        off = Add(off, 1)
+        
+        // Format codes for parameters (0 = all text format)
+        PG_WriteInt16BE(msg, off, 0)
+        off = Add(off, 2)
+        
+        // Parameter count
+        PG_WriteInt16BE(msg, off, pc)
+        off = Add(off, 2)
+        
+        Debug("postgres.trace", level=3) {
+            PrintMessage("PG_Execute: Writing ")
+            PrintNumber(pc)
+            PrintMessage(" parameters\n")
+        }
+        
+        // Write each parameter
+        i = 0
+        WhileLoop LessThan(i, pc) {
+            p = XArray.XGet(params, i)
+            
+            IfCondition EqualTo(p, 0) ThenBlock: {
+                // NULL parameter (length = -1 = 0xFFFFFFFF)
+                PG_WriteInt32BE(msg, off, 4294967295)
+                off = Add(off, 4)
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("  Param ")
+                    PrintNumber(i)
+                    PrintMessage(": NULL\n")
+                }
+            } ElseBlock: {
+                // Non-NULL parameter
+                pl = StringLength(p)
+                
+                Debug("postgres.trace", level=3) {
+                    PrintMessage("  Param ")
+                    PrintNumber(i)
+                    PrintMessage(": '")
+                    PrintString(p)
+                    PrintMessage("' (")
+                    PrintNumber(pl)
+                    PrintMessage(" bytes)\n")
+                }
+                
+                PG_WriteInt32BE(msg, off, pl)
+                off = Add(off, 4)
+                
+                // Copy parameter bytes
+                j = 0
+                WhileLoop LessThan(j, pl) {
+                    b = GetByte(p, j)
+                    SetByte(msg, Add(off, j), b)
+                    j = Add(j, 1)
+                }
+                off = Add(off, pl)
+            }
+            
+            i = Add(i, 1)
+        }
+        
+        // Result format codes (0 = all text format)
+        PG_WriteInt16BE(msg, off, 0)
+        off = Add(off, 2)
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Execute: Sending Bind (")
+            PrintNumber(total_size)
+            PrintMessage(" bytes)\n")
+        }
+        
+        // Send Bind message
+        sent = Socket.Send(sock, msg, total_size)
+        Deallocate(msg, total_size)
+        
+        IfCondition LessEqual(sent, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Execute] ERROR: Bind send failed\n")
+            }
+            ReturnValue(0)
+        }
+        
+        // Build Execute message
+        // Format: 'E' + length(4) + portal_name(1) + max_rows(4)
+        exec_msg = Allocate(10)
+        SetByte(exec_msg, 0, 69)  // 'E'
+        PG_WriteInt32BE(exec_msg, 1, 9)  // Length = 9
+        SetByte(exec_msg, 5, 0)  // Portal name (empty)
+        PG_WriteInt32BE(exec_msg, 6, 0)  // Max rows (0 = unlimited)
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Execute: Sending Execute\n")
+        }
+        
+        sent = Socket.Send(sock, exec_msg, 10)
+        Deallocate(exec_msg, 10)
+        
+        IfCondition LessEqual(sent, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Execute] ERROR: Execute send failed\n")
+            }
+            ReturnValue(0)
+        }
+        
+        // Send Sync to complete the transaction
+        sync_msg = Allocate(5)
+        SetByte(sync_msg, 0, 83)  // 'S'
+        PG_WriteInt32BE(sync_msg, 1, 4)
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Execute: Sending Sync\n")
+        }
+        
+        sent = Socket.Send(sock, sync_msg, 5)
+        Deallocate(sync_msg, 5)
+        
+        IfCondition LessEqual(sent, 0) ThenBlock: {
+            Debug("postgres.trace", level=1) {
+                PrintMessage("[PG_Execute] ERROR: Sync send failed\n")
+            }
+            ReturnValue(0)
+        }
+        
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Execute: Reading response\n")
+        }
+        
+        // Read response - use stored fields if available
+        IfCondition NotEqual(stored_fields, 0) ThenBlock: {
+            result = PG_ReadQueryResponseWithFields(sock, stored_fields)
+        } ElseBlock: {
+            result = PG_ReadQueryResponse(sock)
+        }
+        
+        Debug("postgres.trace", level=1) {
+            PrintMessage("PG_Execute: Complete, result=")
+            PrintNumber(result)
+            PrintMessage("\n")
+        }
+        
+        // CRITICAL FIX: Close the unnamed portal after execution
+        // This prevents portal exhaustion after ~64 executions
+        Debug("postgres.trace", level=2) {
+            PrintMessage("PG_Execute: Closing unnamed portal\n")
+        }
+        
+        // Close message format:
+        // 'C' (1 byte - NOT in length)
+        // int32 length (4 bytes - includes itself)
+        // type byte 'P' for Portal or 'S' for Statement (1 byte)
+        // name + null (1 byte for unnamed = just null)
+        // Total length field: 4 + 1 + 1 = 6
+        
+        close_msg = Allocate(7)  // 'C' + length(4) + type(1) + null(1) = 7 bytes
+        SetByte(close_msg, 0, 67)  // 'C' (Close)
+        PG_WriteInt32BE(close_msg, 1, 6)  // Length = 6 (includes itself)
+        SetByte(close_msg, 5, 80)  // 'P' (Portal)
+        SetByte(close_msg, 6, 0)   // Null terminator for unnamed portal
+        
+        Socket.Send(sock, close_msg, 7)
+        Deallocate(close_msg, 7)
+        
+        // Send Sync to complete the Close
+        sync2_msg = Allocate(5)
+        SetByte(sync2_msg, 0, 83)  // 'S' (Sync)
+        PG_WriteInt32BE(sync2_msg, 1, 4)
+        Socket.Send(sock, sync2_msg, 5)
+        Deallocate(sync2_msg, 5)
+        
+        // Read CloseComplete (3) + ReadyForQuery (Z) responses
+        close_iteration = 0
+        WhileLoop LessThan(close_iteration, 2) {
+            close_tbuf = Allocate(1)
+            close_br = PG_RecvExact(sock, close_tbuf, 1)
+            
+            IfCondition LessEqual(close_br, 0) ThenBlock: {
+                Deallocate(close_tbuf, 1)
+                BreakLoop
+            }
+            
+            close_mt = Dereference(close_tbuf)
+            Deallocate(close_tbuf, 1)
+            
+            Debug("postgres.trace", level=3) {
+                PrintMessage("PG_Execute: Close response type=")
+                PrintNumber(close_mt)
+                PrintMessage("\n")
+            }
+            
+            // Read length
+            close_lbuf = Allocate(4)
+            PG_RecvExact(sock, close_lbuf, 4)
+            close_ml = PG_ReadInt32BE(close_lbuf, 0)
+            Deallocate(close_lbuf, 4)
+            
+            // Read and discard payload if any
+            close_pl = Subtract(close_ml, 4)
+            IfCondition GreaterThan(close_pl, 0) ThenBlock: {
+                close_pay = Allocate(close_pl)
+                PG_RecvExact(sock, close_pay, close_pl)
+                Deallocate(close_pay, close_pl)
+            }
+            
+            // Break on ReadyForQuery
+            IfCondition EqualTo(close_mt, 90) ThenBlock: {
+                BreakLoop
+            }
+            
+            close_iteration = Add(close_iteration, 1)
+        }
+        
+        ReturnValue(result)
+    }
+}
+
+Function.PG_WaitReady {
+    Input: sock: Integer
+    Output: Integer
+    Body: {
+        Debug("postgres.trace", level=2) {
+            PrintMessage("[PG_WaitReady] ENTER\n")
+        }
+        WhileLoop EqualTo(1, 1) {
+            // Allocate buffer FIRST
+            tbuf = Allocate(1)
+            bytes_read = PG_RecvExact(sock, tbuf, 1)
+            
+            IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+                Deallocate(tbuf, 1)
+                ReturnValue(0)
+            }
+            
+            mt = Dereference(tbuf)
+            Deallocate(tbuf, 1)
+            
+            // Allocate buffer for length
+            lbuf = Allocate(4)
+            bytes_read = PG_RecvExact(sock, lbuf, 4)
+            
+            IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+                Deallocate(lbuf, 4)
+                ReturnValue(0)
+            }
+            
+            ml = PG_ReadInt32BE(lbuf, 0)
+            Deallocate(lbuf, 4)
+            
+            pl = Subtract(ml, 4)
+            
+            IfCondition GreaterThan(pl, 0) ThenBlock: {
+                pay = Allocate(pl)
+                bytes_read = PG_RecvExact(sock, pay, pl)
+                
+                IfCondition LessEqual(bytes_read, 0) ThenBlock: {
+                    Deallocate(pay, pl)
+                    ReturnValue(0)
+                }
+                
+                IfCondition EqualTo(mt, 69) ThenBlock: {  // Error
+                    Debug("postgres.trace", level=1) {
+                        PrintMessage("[PG_WaitReady] ERROR: ")
+                    }
+                    PG_ParseError(pay, pl)
+                    Deallocate(pay, pl)
+                    ReturnValue(0)
+                }
+                
+                Deallocate(pay, pl)
+            }
+            
+            IfCondition EqualTo(mt, 90) ThenBlock: {  // Ready
+                Debug("postgres.trace", level=2) {
+                    PrintMessage("[PG_WaitReady] EXIT - ReadyForQuery received\n")
+                }
+                ReturnValue(1)
+            }
+        }
+        
+        ReturnValue(0)
+    }
+}

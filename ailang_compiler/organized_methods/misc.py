@@ -1,0 +1,358 @@
+"""
+Additional methods for misc.py
+Miscellaneous instructions
+"""
+
+class MiscAdditional:
+    """Miscellaneous instructions"""
+
+    def emit_cld(self):
+        """CLD"""
+        self.emit_bytes(0xFC)
+
+    def emit_rdtsc(self):
+        """RDTSC"""
+        self.emit_bytes(0x0F, 0x31)
+
+    def emit_call_rel32(self):
+        """CALL opcode"""
+        self.emit_bytes(0xE8)
+
+    def emit_clflush(self):
+        """CLFLUSH [RAX]"""
+        self.emit_bytes(0x0F, 0xAE, 0x38)
+
+    def emit_instr_0x04_0x20(self):
+        """ADD AL, 32"""
+        self.emit_bytes(0x04, 0x20)
+
+    def emit_instr_0x0f_0x1f_0x44_0x00_0x00(self):
+        """TODO: Add description"""
+        self.emit_bytes(
+            0x0F, 0x1F, 0x44, 0x00, 0x00
+        )
+
+    def emit_instr_0x0f_0x84_0x85_0x00_0x00_0x00_0x00(self):
+        """TODO: Add description"""
+        self.emit_bytes(
+            0x0F, 0x84, 0x85, 0x00, 0x00, 0x00, 0x00
+        )
+
+    def emit_instr_0x44_0x88_0x18(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x44, 0x88, 0x18)
+
+    def emit_instr_0x48_0x01_0xc1(self):
+        """ADD RCX, RAX"""
+        self.emit_bytes(0x48, 0x01, 0xC1)
+
+    def emit_instr_0x48_0x01_0xc7(self):
+        """ADD RDI, RAX (advance haystack by start_pos)"""
+        self.emit_bytes(0x48, 0x01, 0xC7)
+
+    def emit_instr_0x48_0x01_0xca(self):
+        """ADD RDX, RCX"""
+        self.emit_bytes(0x48, 0x01, 0xCA)
+
+    def emit_instr_0x48_0x01_0xcf(self):
+        """ADD RDI, RCX"""
+        self.emit_bytes(0x48, 0x01, 0xCF)
+
+    def emit_instr_0x48_0x01_0xd0(self):
+        """ADD RAX, RDX"""
+        self.emit_bytes(0x48, 0x01, 0xD0)
+
+    def emit_instr_0x48_0x01_0xd1(self):
+        """ADD RCX, RDX"""
+        self.emit_bytes(0x48, 0x01, 0xD1)
+
+    def emit_instr_0x48_0x01_0xd8(self):
+        """ADD RAX, RBX"""
+        self.emit_bytes(0x48, 0x01, 0xD8)
+
+    def emit_instr_0x48_0x01_0xd9(self):
+        """ADD RCX, RBX"""
+        self.emit_bytes(0x48, 0x01, 0xD9)
+
+    def emit_instr_0x48_0x01_0xf1(self):
+        """ADD RCX, RSI"""
+        self.emit_bytes(0x48, 0x01, 0xF1)
+
+    def emit_instr_0x48_0x01_0xf2(self):
+        """ADD RDX, RSI"""
+        self.emit_bytes(0x48, 0x01, 0xF2)
+
+    def emit_instr_0x48_0x01_0xf8(self):
+        """ADD RAX, RDI"""
+        self.emit_bytes(0x48, 0x01, 0xF8)
+
+    def emit_instr_0x48_0x03_0x44_0x24_0x10(self):
+        """ADD RAX, [RSP+16] (haystack_len)"""
+        self.emit_bytes(
+            0x48, 0x03, 0x44, 0x24, 0x10
+        )
+
+    def emit_instr_0x48_0x03_0x74_0x24_0x10(self):
+        """ADD RSI, [RSP+16] (skip needle)"""
+        self.emit_bytes(
+            0x48, 0x03, 0x74, 0x24, 0x10
+        )
+
+    def emit_instr_0x48_0x05(self):
+        """ADD RAX, offset"""
+        self.emit_bytes(0x48, 0x05)
+
+    def emit_instr_0x48_0x0f_0xbd_0xc0(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x0F, 0xBD, 0xC0)
+
+    def emit_instr_0x48_0x0f_0xc8(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x0F, 0xC8)
+
+    def emit_instr_0x48_0x29_0xc4(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x29, 0xC4)
+
+    def emit_instr_0x48_0x81_0xc1(self):
+        """ADD RCX, member_offset"""
+        self.emit_bytes(0x48, 0x81, 0xC1)
+
+    def emit_instr_0x48_0x81_0xec(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x81, 0xEC)
+
+    def emit_instr_0x48_0x81_0xf9(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x81, 0xF9)
+
+    def emit_instr_0x48_0x83_0xc0_0x07(self):
+        """ADD RAX, 7"""
+        self.emit_bytes(0x48, 0x83, 0xC0, 0x07)
+
+    def emit_instr_0x48_0x83_0xc0_0x08(self):
+        """ADD RAX, 8"""
+        self.emit_bytes(0x48, 0x83, 0xC0, 0x08)
+
+    def emit_instr_0x48_0x83_0xc1_0x08(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x83, 0xC1, 0x08)
+
+    def emit_instr_0x48_0x83_0xc1_0x10(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x83, 0xC1, 0x10)
+
+    def emit_instr_0x48_0x83_0xc2_0x30(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x83, 0xC2, 0x30)
+
+    def emit_instr_0x48_0x83_0xc3_0x18(self):
+        """ADD RBX, 24 (next entry)"""
+        self.emit_bytes(0x48, 0x83, 0xC3, 0x18)
+
+    def emit_instr_0x48_0x83_0xc4(self):
+        """ADD RSP, imm8"""
+        self.emit_bytes(0x48, 0x83, 0xC4)
+
+    def emit_instr_0x48_0x83_0xc4_0x08(self):
+        """ADD RSP, 8 (pop source)"""
+        self.emit_bytes(0x48, 0x83, 0xC4, 0x08)
+
+    def emit_instr_0x48_0x83_0xc4_0x10(self):
+        """ADD RSP, 16"""
+        self.emit_bytes(0x48, 0x83, 0xC4, 0x10)
+
+    def emit_instr_0x48_0x83_0xc4_0x18(self):
+        """ADD RSP, 24 (saved addr + 2 strings)"""
+        self.emit_bytes(0x48, 0x83, 0xC4, 0x18)
+
+    def emit_instr_0x48_0x83_0xc4_0x20(self):
+        """ADD RSP, 32 (clean stack)"""
+        self.emit_bytes(0x48, 0x83, 0xC4, 0x20)
+
+    def emit_instr_0x48_0x83_0xc6_0x07(self):
+        """ADD RSI, 7"""
+        self.emit_bytes(0x48, 0x83, 0xC6, 0x07)
+
+    def emit_instr_0x48_0x83_0xc6_0x18(self):
+        """ADD RSI, 24"""
+        self.emit_bytes(0x48, 0x83, 0xC6, 0x18)
+
+    def emit_instr_0x48_0x83_0xc7_0x08(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x83, 0xC7, 0x08)
+
+    def emit_instr_0x48_0x83_0xc7_0x1f(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x83, 0xC7, 0x1F)
+
+    def emit_instr_0x48_0x83_0xec(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x83, 0xEC)
+
+    def emit_instr_0x48_0x89_0x98(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x89, 0x98)
+
+    def emit_instr_0x48_0x89_0xe5(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x89, 0xE5)
+
+    def emit_instr_0x48_0x89_0xec(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x89, 0xEC)
+
+    def emit_instr_0x48_0x8b_0x40_0xf8(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x8B, 0x40, 0xF8)
+
+    def emit_instr_0x48_0x8b_0x48_0xf8(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x8B, 0x48, 0xF8)
+
+    def emit_instr_0x48_0x8d_0x45(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0x8D, 0x45)
+
+    def emit_instr_0x48_0xbb_0x0a_0x00_0x00_0x00_0x00_0x00_0x00_0x00(self):
+        """TODO: Add description"""
+        self.emit_bytes(
+            0x48, 0xBB, 0x0A, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00
+        )
+
+    def emit_instr_0x48_0xd3_0xc0(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0xD3, 0xC0)
+
+    def emit_instr_0x48_0xd3_0xc8(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0xD3, 0xC8)
+
+    def emit_instr_0x48_0xf7_0xf3(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x48, 0xF7, 0xF3)
+
+    def emit_instr_0x48_0xf7_0xfb(self):
+        """IDIV RBX"""
+        self.emit_bytes(0x48, 0xF7, 0xFB)
+
+    def emit_instr_0x49_0x01_0xc4(self):
+        """ADD R12, RAX (x + n/x)"""
+        self.emit_bytes(0x49, 0x01, 0xC4)
+
+    def emit_instr_0x49_0x8b_0x83(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x49, 0x8B, 0x83)
+
+    def emit_instr_0x49_0xf7_0xfc(self):
+        """IDIV R12 (n/x)"""
+        self.emit_bytes(0x49, 0xF7, 0xFC)
+
+    def emit_instr_0x4c_0x01_0xe0(self):
+        """ADD RAX, R12"""
+        self.emit_bytes(0x4C, 0x01, 0xE0)
+
+    def emit_instr_0x4c_0x01_0xe8(self):
+        """ADD RAX, R13"""
+        self.emit_bytes(0x4C, 0x01, 0xE8)
+
+    def emit_instr_0x4c_0x01_0xee(self):
+        """ADD RSI, R13 (add start offset)"""
+        self.emit_bytes(0x4C, 0x01, 0xEE)
+
+    def emit_instr_0x4c_0x89_0x18(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x4C, 0x89, 0x18)
+
+    def emit_instr_0x4c_0x8b_0x5d_0x9d(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x4C, 0x8B, 0x5D, 0x9D)
+
+    def emit_instr_0x4c_0x8b_0x9d(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x4C, 0x8B, 0x9D)
+
+    def emit_instr_0x4c_0x8b_0xad(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x4C, 0x8B, 0xAD)
+
+    def emit_instr_0x4d_0x89_0x53(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x4D, 0x89, 0x53)
+
+    def emit_instr_0x4d_0x89_0x93(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x4D, 0x89, 0x93)
+
+    def emit_instr_0x88_0x17(self):
+        """TODO: Add description"""
+        self.emit_bytes(0x88, 0x17)
+
+    def emit_instr_0xf0_0x48_0x01_0x18(self):
+        """TODO: Add description"""
+        self.emit_bytes(0xF0, 0x48, 0x01, 0x18)
+
+    def emit_instr_0xf3_0x48_0x0f_0xb8_0xc0(self):
+        """TODO: Add description"""
+        self.emit_bytes(
+            0xF3, 0x48, 0x0F, 0xB8, 0xC0
+        )
+
+    def emit_instr_0xf3_0x48_0x0f_0xbc_0xc0(self):
+        """TODO: Add description"""
+        self.emit_bytes(
+            0xF3, 0x48, 0x0F, 0xBC, 0xC0
+        )
+
+    def emit_instr_0xf3_0x48_0x0f_0xbd_0xc0(self):
+        """TODO: Add description"""
+        self.emit_bytes(
+            0xF3, 0x48, 0x0F, 0xBD, 0xC0
+        )
+
+    def emit_instr_0xff(self):
+        """TODO: Add description"""
+        self.emit_bytes(0xFF)
+
+    def emit_mov_byte_rbx(self):
+        """MOV BYTE [RBX], 0"""
+        self.emit_bytes(0xC6, 0x03, 0x00)
+
+    def emit_mov_byte_rdi(self):
+        """MOV BYTE [RDI], 0"""
+        self.emit_bytes(0xC6, 0x07, 0x00)
+
+    def emit_mov_byte_rdi(self):
+        """MOV BYTE [RDI], '-'"""
+        self.emit_bytes(0xC6, 0x07, 0x2D)
+
+    def emit_mov_byte_rdi(self):
+        """MOV BYTE [RDI], '0'"""
+        self.emit_bytes(0xC6, 0x07, 0x30)
+
+    def emit_mov_eax_dword(self):
+        """MOV EAX, DWORD [RAX]"""
+        self.emit_bytes(0x8B, 0x00)
+
+    def emit_mov_ecx_eax(self):
+        """MOV ECX, EAX"""
+        self.emit_bytes(0x89, 0xC1)
+
+    def emit_mov_moffs64_rax(self):
+        """MOV moffs64, RAX"""
+        self.emit_bytes(0x48, 0xA3)
+
+    def emit_mov_rax_1(self):
+        """MOV RAX, 1"""
+        self.emit_bytes(
+            0x48, 0xC7, 0xC0, 0x01, 0x00, 0x00, 0x00
+        )
+
+    def emit_mov_rax_moffs64(self):
+        """MOV RAX, moffs64"""
+        self.emit_bytes(0x48, 0xA1)
+
+    def emit_prefetch(self):
+        """PREFETCH [RAX]"""
+        self.emit_bytes(0x0F, 0x18, 0x00)
