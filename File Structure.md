@@ -2,7 +2,7 @@
 
 ```
 Librarys/
-├── Baseline Librarys shipped with compiler 
+├── XArrays.ailang                    # Dynamic array library
 │
 └── Compiler/
     │
@@ -59,14 +59,14 @@ Librarys/
     │   ├── Library.CEmitCore.ailang          # Buffer mgmt, labels, fixups ✓
     │   │
     │   ├── X86/                      # x86-64 target
-    │   │   ├── Library.CEmitX86Reg.ailang    # MOV reg,reg / MOV reg,imm
-    │   │   ├── Library.CEmitX86Mem.ailang    # Load/store, addressing modes
-    │   │   ├── Library.CEmitX86Stack.ailang  # PUSH, POP, prologue/epilogue
-    │   │   ├── Library.CEmitX86Arith.ailang  # ADD, SUB, MUL, DIV, NEG
-    │   │   ├── Library.CEmitX86Logic.ailang  # AND, OR, XOR, NOT, shifts
-    │   │   ├── Library.CEmitX86Cmp.ailang    # CMP, TEST, SETcc
-    │   │   ├── Library.CEmitX86Jump.ailang   # JMP, Jcc, CALL, RET
-    │   │   └── Library.CEmitX86Sys.ailang    # SYSCALL, NOP, misc
+    │   │   ├── Library.CEmitX86Reg.ailang    # MOV reg,reg / MOV reg,imm ✓
+    │   │   ├── Library.CEmitX86Mem.ailang    # Load/store, addressing modes ✓
+    │   │   ├── Library.CEmitX86Stack.ailang  # PUSH, POP, prologue/epilogue ✓
+    │   │   ├── Library.CEmitX86Arith.ailang  # ADD, SUB, MUL, DIV, NEG ✓
+    │   │   ├── Library.CEmitX86Logic.ailang  # AND, OR, XOR, NOT, shifts ✓
+    │   │   ├── Library.CEmitX86Cmp.ailang    # CMP, TEST, SETcc ✓
+    │   │   ├── Library.CEmitX86Jump.ailang   # JMP, Jcc, CALL, RET ✓
+    │   │   └── Library.CEmitX86Sys.ailang    # SYSCALL, NOP, misc ✓
     │   │
     │   └── RISCV/                    # RISC-V target (future)
     │       ├── Library.CEmitRISCV.ailang
@@ -76,9 +76,10 @@ Librarys/
     │   └── (reserved for future use)
     │
     ├── Output/                       # Binary output generation
+    │   ├── Library.CELFTypes.ailang          # ELF constants, header structs
     │   ├── Library.CELFBuilder.ailang        # ELF executable builder
     │   ├── Library.CRelocate.ailang          # Relocation handling
-    │   └── Library.COutput.ailang            # File output
+    │   └── Library.COutput.ailang            # File writing
     │
     └── Modules/                      # Shared/utility modules
         └── (reserved for future use)
@@ -106,37 +107,43 @@ LibraryImport.Compiler.Output.CELFBuilder
 
 ## Build Status
 
-### Phase 1: Foundation
+### Phase 1: Foundation ✓
 - [x] Lexer (complete)
 - [x] Parser (complete)
 - [x] AST module (complete)
 - [x] CEmitTypes (complete)
-- [x] CEmitCore (complete)
-- [x] CEmitX86 (complete)
+- [x] CEmitCore (complete) - includes label/fixup management
+- [x] CEmitX86* (complete) - all 8 instruction files
 
-### Phase 2: Minimal Compiler
-- [ ] CEmitX86 (basic: MOV, ADD, SUB, RET)
-- [ ] CCompileTypes
-- [ ] CCompileExpr (NUMBER, IDENTIFIER)
-- [ ] CCompileArith (Add, Subtract)
-- [ ] CCompileIO (PrintMessage, PrintNumber)
+### Phase 2: Minimal Compiler (CURRENT)
+- [x] CCompileMain - dispatcher skeleton
+- [ ] CCompileArith - Add, Subtract, Multiply, Divide
+- [ ] CCompileIO - PrintMessage, PrintNumber
+- [ ] CCompileExpr - expression evaluation
+- [ ] CCompileFunc - Function compilation
 
-### Phase 3: Functions
-- [ ] CCompileFunc (Function, SubRoutine)
-- [ ] CCompileStmt (Assignment, Return)
+**Test Target**: `PrintNumber(Add(1, 2))`
 
-### Phase 4: Control Flow
-- [ ] CCompileStmt (If, While)
+### Phase 3: Output
+- [ ] CELFTypes - ELF constants
+- [ ] CELFBuilder - ELF generation
+- [ ] COutput - File writing
+
+**Test Target**: Generate working ELF executable
+
+### Phase 4: Statements & Control Flow
+- [ ] CCompileStmt - Assignment, Return, Block
+- [ ] CCompileStmt - If, While
 - [ ] Loop context (break, continue)
 
 ### Phase 5: Memory & Pools
-- [ ] CCompileMem
-- [ ] CCompilePool
+- [ ] CCompileMem - Allocate, StoreValue, Dereference
+- [ ] CCompilePool - FixedPool access
 
-### Phase 6: Output
-- [ ] CELFBuilder
-- [ ] CRelocate
-- [ ] COutput
+### Phase 6: Full Compiler
+- [ ] CCompileCompare, CCompileLogic, CCompileBitwise
+- [ ] CCompileString, CCompileArray, CCompileXArray
+- [ ] CCompileSystem
 
 ### Phase 7: Self-Hosting
 - [ ] Compile the compiler with itself!
