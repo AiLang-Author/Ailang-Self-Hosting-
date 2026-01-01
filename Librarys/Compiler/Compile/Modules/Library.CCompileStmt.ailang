@@ -10,6 +10,7 @@ LibraryImport.Compiler.Frontend.AST.CASTCore
 LibraryImport.Compiler.CodeEmit.CEmitTypes
 LibraryImport.Compiler.CodeEmit.CEmitCore
 LibraryImport.Compiler.CodeEmit.CEmitCoreArch
+LibraryImport.Compiler.Compile.Modules.CCompileScope
 
 // =============================================================================
 // ASSIGNMENT
@@ -215,8 +216,8 @@ Function.CompileStmt_Block {
 }
 
 // =============================================================================
-// BREAK
-// ExitLoop
+// BREAK (ExitLoop/BreakLoop)
+// Jumps to loop end label
 // =============================================================================
 Function.CompileStmt_Break {
     Input: node: Address
@@ -238,8 +239,8 @@ Function.CompileStmt_Break {
 }
 
 // =============================================================================
-// CONTINUE
-// ContinueLoop
+// CONTINUE (ContinueLoop)
+// Jumps to loop start label (re-evaluate condition)
 // =============================================================================
 Function.CompileStmt_Continue {
     Input: node: Address
@@ -256,6 +257,593 @@ Function.CompileStmt_Continue {
         continue_label = XArray.XGet(Compile.loop_stack, Add(Multiply(ctx_index, 2), 1))
         
         Emit_Jmp(continue_label)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FOREVERY
+// ForEvery var in collection { body }
+// 
+// Strategy: Use dedicated stack frame slots for loop state
+// This avoids R12/R13/R14 being clobbered by body compilation
+// 
+// Frame layout (relative to RBP):
+//   [RBP-8]   = loop variable (element)
+//   [RBP-16]  = index
+//   [RBP-24]  = length  
+//   [RBP-32]  = array address
+// =============================================================================
+Function.CompileStmt_ForEvery {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        // AST: DATA1=var_name, children=[iterable, body]
+        var_name = AST_GetData1(node)
+        iterable = AST_GetChild(node, 0)
+        body = AST_GetChild(node, 1)
+        
+        // Allocate stack space for loop state (4 slots = 32 bytes)
+        base_offset = Compile.stack_offset
+        Compile.stack_offset = Add(Compile.stack_offset, 32)
+        
+        off_var = Subtract(0, Add(base_offset, 8))
+        off_index = Subtract(0, Add(base_offset, 16))
+        off_length = Subtract(0, Add(base_offset, 24))
+        off_array = Subtract(0, Add(base_offset, 32))
+        
+        // Register loop variable so body can access it
+        Compile_RegisterLocal(var_name, off_var)
+        
+        // Labels
+        loop_start = Emit_CreateLabel()
+        loop_end = Emit_CreateLabel()
+        
+        Compile_PushLoop(loop_end, loop_start)
+        
+        // Compile iterable -> RAX
+        Compile_Expression(iterable)
+        
+        // Store array address
+        Emit_MovRbpOffsetRax(off_array)
+        
+        // Get length (stored at array[0])
+        Emit_MovRaxDerefRax()
+        Emit_MovRbpOffsetRax(off_length)
+        
+        // Initialize index = 0
+        Emit_MovRaxImm64(0)
+        Emit_MovRbpOffsetRax(off_index)
+        
+        // LOOP START
+        Emit_MarkLabel(loop_start)
+        
+        // Load index and length, compare
+        Emit_MovRaxRbpOffset(off_index)
+        Emit_MovRbxRax()
+        Emit_MovRaxRbpOffset(off_length)
+        Emit_CmpRbxRax()
+        Emit_Jge(loop_end)
+        
+        // Get element: array + 8 + index*8
+        Emit_MovRaxRbpOffset(off_array)
+        Emit_AddRaxImm8(8)
+        Emit_MovRegReg(Reg.RCX, Reg.RBX)
+        Emit_ShlRcxImm8(3)
+        Emit_AddRaxRcx()
+        Emit_MovRaxDerefRax()
+        
+        // Store to loop variable
+        Emit_MovRbpOffsetRax(off_var)
+        
+        // Compile body
+        CompileStmt_Block(body)
+        
+        // Increment index
+        Emit_MovRaxRbpOffset(off_index)
+        Emit_IncRax()
+        Emit_MovRbpOffsetRax(off_index)
+        
+        Emit_Jmp(loop_start)
+        
+        // LOOP END
+        Emit_MarkLabel(loop_end)
+        
+        Compile_PopLoop()
+        
+        ReturnValue(1)
+    }
+}
+
+
+// =============================================================================
+// SWITCH / BRANCH
+// Branch expr { Case val: { ... } Case val: { ... } Default: { ... } }
+// 
+// Strategy (linear scan - simple, works for all case counts):
+//   1. Compile expression once, push to stack
+//   2. For each case: pop saved value, compare with case value, push back
+//      - If equal, jump to case body
+//   3. After all cases checked, fall through to default (if present) or end
+//   4. Each case body jumps to end_label after execution
+// =============================================================================
+Function.CompileStmt_Switch {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        // Get child count: first child is expression, rest are cases/default
+        child_count = AST_GetChildCount(node)
+        
+        IfCondition LessThan(child_count, 1) ThenBlock: {
+            PrintMessage("[COMPILE ERROR] Branch with no expression\n")
+            Compile.error = 1
+            ReturnValue(0)
+        }
+        
+        // Get expression (first child)
+        expr = AST_GetChild(node, 0)
+        
+        // Compile expression -> RAX
+        result = Compile_Expression(expr)
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        // Push expression value to stack (we'll compare against this repeatedly)
+        Emit_PushRax()
+        
+        // Create end label
+        end_label = Compile_NewLabel()
+        
+        // Count cases and find default
+        case_count = Subtract(child_count, 1)
+        default_node = 0
+        default_label = 0
+        
+        // First pass: create labels for each case body and find default
+        // We'll store labels in a simple approach - compile inline
+        
+        // Create labels for case bodies
+        i = 1
+        WhileLoop LessThan(i, child_count) {
+            case_child = AST_GetChild(node, i)
+            case_type = AST_GetType(case_child)
+            
+            IfCondition EqualTo(case_type, AST.DEFAULT) ThenBlock: {
+                default_node = case_child
+            }
+            
+            i = Add(i, 1)
+        }
+        
+        // Create default label if we have a default
+        IfCondition NotEqual(default_node, 0) ThenBlock: {
+            default_label = Compile_NewLabel()
+        }
+        
+        // ===== COMPARISON CHAIN =====
+        // For each CASE, compare and jump if match
+        i = 1
+        WhileLoop LessThan(i, child_count) {
+            case_child = AST_GetChild(node, i)
+            case_type = AST_GetType(case_child)
+            
+            IfCondition EqualTo(case_type, AST.CASE) ThenBlock: {
+                // Get case value (child 0 of CASE node)
+                case_value_node = AST_GetChild(case_child, 0)
+                
+                // Create label for this case's body
+                case_body_label = Compile_NewLabel()
+                
+                // Load saved expression value: MOV RAX, [RSP]
+                // (peek at stack without popping)
+                Emit_MovRaxDerefRsp()
+                
+                // Compile case value -> RCX
+                // We need to preserve RAX, so push it
+                Emit_PushRax()
+                result = Compile_Expression(case_value_node)
+                IfCondition EqualTo(result, 0) ThenBlock: {
+                    ReturnValue(0)
+                }
+                // RAX now has case value, move to RCX
+                Emit_MovRcxRax()
+                // Restore expression value to RAX
+                Emit_PopRax()
+                
+                // CMP RAX, RCX
+                Emit_CmpRaxRcx()
+                
+                // JE to case body
+                Emit_Je(case_body_label)
+                
+                // Store the case info for body compilation
+                // We'll compile bodies in a second pass
+                AST_SetData2(case_child, case_body_label)
+            }
+            
+            i = Add(i, 1)
+        }
+        
+        // ===== NO MATCH - GO TO DEFAULT OR END =====
+        IfCondition NotEqual(default_node, 0) ThenBlock: {
+            Emit_Jmp(default_label)
+        } ElseBlock: {
+            Emit_Jmp(end_label)
+        }
+        
+        // ===== COMPILE CASE BODIES =====
+        i = 1
+        WhileLoop LessThan(i, child_count) {
+            case_child = AST_GetChild(node, i)
+            case_type = AST_GetType(case_child)
+            
+            IfCondition EqualTo(case_type, AST.CASE) ThenBlock: {
+                // Get the label we stored
+                case_body_label = AST_GetData2(case_child)
+                
+                // Mark label
+                Emit_MarkLabel(case_body_label)
+                
+                // Get body (child 1 of CASE node)
+                case_body = AST_GetChild(case_child, 1)
+                
+                // Compile body
+                IfCondition NotEqual(case_body, 0) ThenBlock: {
+                    result = CompileStmt_Block(case_body)
+                    IfCondition EqualTo(result, 0) ThenBlock: {
+                        ReturnValue(0)
+                    }
+                }
+                
+                // Jump to end (no fall-through)
+                Emit_Jmp(end_label)
+            }
+            
+            i = Add(i, 1)
+        }
+        
+        // ===== DEFAULT BODY =====
+        IfCondition NotEqual(default_node, 0) ThenBlock: {
+            Emit_MarkLabel(default_label)
+            
+            // Get default body (child 0 of DEFAULT node)
+            default_body = AST_GetChild(default_node, 0)
+            
+            IfCondition NotEqual(default_body, 0) ThenBlock: {
+                result = CompileStmt_Block(default_body)
+                IfCondition EqualTo(result, 0) ThenBlock: {
+                    ReturnValue(0)
+                }
+            }
+            // Fall through to end (or explicit jump)
+        }
+        
+        // ===== END =====
+        Emit_MarkLabel(end_label)
+        
+        // Clean up: pop the saved expression value
+        Emit_PopRax()
+        
+        ReturnValue(1)
+    }
+}
+
+
+// =============================================================================
+// FORK
+// Fork condition TrueBlock: { ... } FalseBlock: { ... }
+// Same as IfCondition but different syntax
+// =============================================================================
+Function.CompileStmt_Fork {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        condition = AST_GetChild(node, 0)
+        true_block = AST_GetChild(node, 1)
+        
+        child_count = AST_GetChildCount(node)
+        has_false = GreaterThan(child_count, 2)
+        false_block = 0
+        IfCondition EqualTo(has_false, 1) ThenBlock: {
+            false_block = AST_GetChild(node, 2)
+        }
+        
+        false_label = Emit_CreateLabel()
+        end_label = 0
+        IfCondition EqualTo(has_false, 1) ThenBlock: {
+            end_label = Emit_CreateLabel()
+        }
+        
+        // Compile condition -> RAX
+        Compile_Expression(condition)
+        
+        // Test and branch
+        Emit_TestRaxRax()
+        Emit_Jz(false_label)
+        
+        // True block
+        CompileStmt_Block(true_block)
+        
+        IfCondition EqualTo(has_false, 1) ThenBlock: {
+            Emit_Jmp(end_label)
+        }
+        
+        Emit_MarkLabel(false_label)
+        
+        IfCondition EqualTo(has_false, 1) ThenBlock: {
+            CompileStmt_Block(false_block)
+            Emit_MarkLabel(end_label)
+        }
+        
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// TRY/CATCH/FINALLY
+// TryBlock { ... } CatchError e { ... } FinallyBlock { ... }
+// Basic implementation - no actual exception handling, just structured flow
+// =============================================================================
+Function.CompileStmt_Try {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        // AST structure: children=[try_body, catch_block?, finally_block?]
+        try_body = AST_GetChild(node, 0)
+        
+        child_count = AST_GetChildCount(node)
+        catch_block = 0
+        finally_block = 0
+        
+        IfCondition GreaterEqual(child_count, 2) ThenBlock: {
+            catch_block = AST_GetChild(node, 1)
+        }
+        IfCondition GreaterEqual(child_count, 3) ThenBlock: {
+            finally_block = AST_GetChild(node, 2)
+        }
+        
+        catch_label = Emit_CreateLabel()
+        finally_label = Emit_CreateLabel()
+        end_label = Emit_CreateLabel()
+        
+        // Save error state location (use a global or thread-local)
+        // For simple impl: Compile.error_handler_addr = catch_label
+        
+        // Compile try body
+        CompileStmt_Block(try_body)
+        
+        // No error: skip catch, go to finally
+        Emit_Jmp(finally_label)
+        
+        // Catch block (jumped to on error)
+        Emit_MarkLabel(catch_label)
+        IfCondition NotEqual(catch_block, 0) ThenBlock: {
+            CompileStmt_Block(catch_block)
+        }
+        
+        // Finally block (always runs)
+        Emit_MarkLabel(finally_label)
+        IfCondition NotEqual(finally_block, 0) ThenBlock: {
+            CompileStmt_Block(finally_block)
+        }
+        
+        Emit_MarkLabel(end_label)
+        
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FOREVERY
+// ForEvery var in collection { body }
+// 
+// Strategy: Use dedicated stack frame slots for loop state
+// This avoids R12/R13/R14 being clobbered by body compilation
+// 
+// Uses existing functions:
+//   - Compile_RegisterLocal(name, offset) - registers new local
+//   - Emit_MovRegReg(dst, src) - generic register move
+// =============================================================================
+Function.CompileStmt_ForEvery {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        // AST: DATA1=var_name, children=[iterable, body]
+        var_name = AST_GetData1(node)
+        iterable = AST_GetChild(node, 0)
+        body = AST_GetChild(node, 1)
+        
+        // Allocate stack space for loop state (4 slots = 32 bytes)
+        // [RBP - stack_offset - 8]  = loop variable
+        // [RBP - stack_offset - 16] = index
+        // [RBP - stack_offset - 24] = length
+        // [RBP - stack_offset - 32] = array address
+        
+        base_offset = Compile.stack_offset
+        Compile.stack_offset = Add(Compile.stack_offset, 32)
+        
+        off_var = Subtract(0, Add(base_offset, 8))
+        off_index = Subtract(0, Add(base_offset, 16))
+        off_length = Subtract(0, Add(base_offset, 24))
+        off_array = Subtract(0, Add(base_offset, 32))
+        
+        // Allocate stack slots
+        Emit_SubRspImm8(32)
+
+        // Register loop variable so body can access it
+        Compile_RegisterLocal(var_name, off_var)
+        
+        // Labels
+        loop_start = Emit_CreateLabel()
+        loop_end = Emit_CreateLabel()
+        
+        Compile_PushLoop(loop_end, loop_start)
+        
+        // Compile iterable -> RAX
+        Compile_Expression(iterable)
+        
+        // Store array address
+        Emit_MovRbpOffsetRax(off_array)
+        
+        // Get length (stored at array[0] for AILang arrays)
+        Emit_MovRaxDerefRax()
+        Emit_MovRbpOffsetRax(off_length)
+        
+        // Initialize index = 0
+        Emit_MovRaxImm64(0)
+        Emit_MovRbpOffsetRax(off_index)
+        
+        // ===== LOOP START =====
+        Emit_MarkLabel(loop_start)
+        
+        // Load index and length, compare
+        Emit_MovRaxRbpOffset(off_index)     // RAX = index
+        Emit_MovRbxRax()                    // RBX = index
+        Emit_MovRaxRbpOffset(off_length)    // RAX = length
+        
+        // CMP RBX, RAX (index vs length)
+        Emit_CmpRegReg(Reg.RBX, Reg.RAX)
+        Emit_Jge(loop_end)                  // if index >= length, exit
+        
+        // Get element: array_addr + 8 + index*8 (skip length at offset 0)
+        Emit_MovRaxRbpOffset(off_array)     // RAX = array
+        Emit_AddRaxImm8(8)                  // Skip length field
+        
+        // Calculate offset: RBX*8 (RBX still has index)
+        Emit_MovRegReg(Reg.RCX, Reg.RBX)    // RCX = index
+        Emit_ShlRcxImm8(3)                  // RCX = index * 8
+        Emit_AddRaxRcx()                    // RAX = array + 8 + index*8
+        
+        Emit_MovRaxDerefRax()               // RAX = element
+        
+        // Store to loop variable
+        Emit_MovRbpOffsetRax(off_var)
+        
+        // Compile body
+        CompileStmt_Block(body)
+        
+        // Increment index
+        Emit_MovRaxRbpOffset(off_index)
+        Emit_IncRax()
+        Emit_MovRbpOffsetRax(off_index)
+        
+        // Loop back
+        Emit_Jmp(loop_start)
+        
+        // ===== LOOP END =====
+        Emit_MarkLabel(loop_end)
+        
+        Compile_PopLoop()
+        
+        // Deallocate stack slots
+        Emit_AddRspImm8(32)
+        Compile.stack_offset = base_offset
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FORK
+// Fork condition TrueBlock: { ... } FalseBlock: { ... }
+// Same as IfCondition but different syntax
+// =============================================================================
+Function.CompileStmt_Fork {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        condition = AST_GetChild(node, 0)
+        true_block = AST_GetChild(node, 1)
+        
+        child_count = AST_GetChildCount(node)
+        has_false = GreaterThan(child_count, 2)
+        false_block = 0
+        IfCondition EqualTo(has_false, 1) ThenBlock: {
+            false_block = AST_GetChild(node, 2)
+        }
+        
+        false_label = Emit_CreateLabel()
+        end_label = 0
+        IfCondition EqualTo(has_false, 1) ThenBlock: {
+            end_label = Emit_CreateLabel()
+        }
+        
+        // Compile condition -> RAX
+        Compile_Expression(condition)
+        
+        // Test and branch
+        Emit_TestRaxRax()
+        Emit_Jz(false_label)
+        
+        // True block
+        CompileStmt_Block(true_block)
+        
+        IfCondition EqualTo(has_false, 1) ThenBlock: {
+            Emit_Jmp(end_label)
+        }
+        
+        Emit_MarkLabel(false_label)
+        
+        IfCondition EqualTo(has_false, 1) ThenBlock: {
+            CompileStmt_Block(false_block)
+            Emit_MarkLabel(end_label)
+        }
+        
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// TRY/CATCH/FINALLY
+// TryBlock { ... } CatchError e { ... } FinallyBlock { ... }
+// Basic implementation - no actual exception handling, just structured flow
+// =============================================================================
+Function.CompileStmt_Try {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        // AST structure: children=[try_body, catch_block?, finally_block?]
+        try_body = AST_GetChild(node, 0)
+        
+        child_count = AST_GetChildCount(node)
+        catch_block = 0
+        finally_block = 0
+        
+        IfCondition GreaterEqual(child_count, 2) ThenBlock: {
+            catch_block = AST_GetChild(node, 1)
+        }
+        IfCondition GreaterEqual(child_count, 3) ThenBlock: {
+            finally_block = AST_GetChild(node, 2)
+        }
+        
+        catch_label = Emit_CreateLabel()
+        finally_label = Emit_CreateLabel()
+        end_label = Emit_CreateLabel()
+        
+        // Save error state location (use a global or thread-local)
+        // For simple impl: Compile.error_handler_addr = catch_label
+        
+        // Compile try body
+        CompileStmt_Block(try_body)
+        
+        // No error: skip catch, go to finally
+        Emit_Jmp(finally_label)
+        
+        // Catch block (jumped to on error)
+        Emit_MarkLabel(catch_label)
+        IfCondition NotEqual(catch_block, 0) ThenBlock: {
+            CompileStmt_Block(catch_block)
+        }
+        
+        // Finally block (always runs)
+        Emit_MarkLabel(finally_label)
+        IfCondition NotEqual(finally_block, 0) ThenBlock: {
+            CompileStmt_Block(finally_block)
+        }
+        
+        Emit_MarkLabel(end_label)
+        
         ReturnValue(1)
     }
 }
