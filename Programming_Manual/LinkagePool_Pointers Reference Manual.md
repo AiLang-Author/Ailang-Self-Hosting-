@@ -8,8 +8,6 @@
 
 **v3.0 Change:** Introduces the `@` operator for pointer field access, replacing ambiguous dot notation.
 
-**Status:** Fully implemented and tested (January 26, 2026)
-
 ---
 
 ## Table of Contents
