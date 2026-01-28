@@ -1,416 +1,770 @@
-AILANG Debug Programming Manual
-Table of Contents
+# AILANG Debug System Manual
+## Version 2.0 - Self-Hosting Compiler
 
-Overview
-Debug Levels
-Debug Assertions
-Debug Blocks
-Performance Profiling
-Command-Line Options
-Examples and Patterns
-Performance Considerations
-Troubleshooting
+---
 
-Overview
-AILANG provides a comprehensive debugging system that enables developers to add diagnostic code that can be conditionally compiled and executed based on debug levels. The debug system is designed for zero-overhead production builds while providing rich debugging capabilities during development.
-Core Debug Features
+## Table of Contents
 
-Debug Assertions: DebugAssert for runtime validation
-Debug Blocks: Debug() blocks with level-based execution
-Performance Profiling: DebugPerf for timing measurements
-Conditional Compilation: Debug code compiles to NOPs at level 0
-Multi-level Control: Fine-grained control via -D flags
+1. [Overview](#overview)
+2. [Debug Levels](#debug-levels)
+3. [Compilation Flags](#compilation-flags)
+4. [Debug Blocks](#debug-blocks)
+5. [Debug Assertions](#debug-assertions)
+6. [Debug Tracing](#debug-tracing)
+7. [Debug Breakpoints](#debug-breakpoints)
+8. [Performance Profiling](#performance-profiling)
+9. [Memory Debugging](#memory-debugging)
+10. [Debug Inspection](#debug-inspection)
+11. [Patterns and Examples](#patterns-and-examples)
+12. [Performance Considerations](#performance-considerations)
+13. [Compiler Implementation](#compiler-implementation)
 
-Debug Philosophy
+---
 
-Zero overhead when disabled (production builds)
-Progressive detail levels for different debugging needs
-Integration with existing code without modification
-Runtime control of debug output
+## Overview
 
-Debug Levels
-AILANG uses a hierarchical debug level system (0-4) where higher levels include all features of lower levels:
-Level 0: Production (Default)
+AILANG provides a comprehensive built-in debug system as a language primitive. Unlike external debuggers, AILANG's debug features are part of the language itself, enabling:
 
-All debug code disabled
-Debug statements compile to NOPs
-Zero runtime overhead
-Use for production releases
+- **Zero-overhead production builds** - Debug code compiles to NOPs when disabled
+- **Conditional compilation** - Debug blocks only compile when the required level is met
+- **Progressive detail levels** - Fine-grained control from basic assertions to full tracing
+- **Native integration** - Debug primitives understand AILANG's memory model and constructs
 
-Level 1: Basic Validation
+### Design Philosophy
 
-Assertions enabled (DebugAssert)
-Critical error checking
-Minimal performance impact
-Use for testing and QA
+1. **Zero Cost Abstraction** - Disabled debug code has no runtime overhead
+2. **Hierarchical Levels** - Higher levels include all lower-level features
+3. **Source Integration** - Debug logic lives in your source code, not external tools
+4. **Self-Documenting** - Debug blocks serve as inline documentation of expectations
 
-Level 2: Tracing
+---
 
-All Level 1 features
-Debug blocks up to level 2 execute
-Function entry/exit traces
-Variable inspection points
-Use for development debugging
+## Debug Levels
 
-Level 3: Detailed Analysis
+AILANG uses a hierarchical debug level system (0-4). Higher levels include all features of lower levels.
 
-All Level 2 features
-Debug blocks up to level 3 execute
-Memory inspection
-Watchpoint simulation
-Concurrency checks
-Use for complex debugging
+| Level | Name | Features | Use Case |
+|-------|------|----------|----------|
+| 0 | Production | All debug code stripped | Release builds |
+| 1 | Basic | `DebugAssert` only | Testing, QA |
+| 2 | Trace | + `Debug` blocks (level 1-2) | Development |
+| 3 | Detailed | + Memory inspection, level 3 blocks | Complex debugging |
+| 4 | Full | + Breakpoints, all blocks | Deep investigation |
 
-Level 4: Interactive Debugging
+### Level Details
 
-All Level 3 features
-All debug blocks execute
-Breakpoint simulation
-Interactive inspection
-Core dump control
-Use for deep debugging sessions
+**Level 0 (Production)**
+- All debug statements compile to single-byte NOPs
+- Zero runtime overhead
+- Binary size minimally affected
+- Use for all production releases
 
-Debug Assertions
-Runtime validation that halts execution on failure:
-ailangDebugAssert(condition, message)
-Parameters:
+**Level 1 (Basic)**
+- `DebugAssert` statements are active
+- Assertions halt program on failure with message
+- Minimal performance impact (~1-2%)
+- Use for testing and quality assurance
 
-condition: Boolean expression to validate
-message: String displayed if assertion fails
+**Level 2 (Trace)**
+- Debug blocks with `level=1` and `level=2` execute
+- Function entry/exit tracing available
+- Variable inspection points active
+- Use during active development
 
-Behavior:
+**Level 3 (Detailed)**
+- All Level 2 features plus level 3 blocks
+- Memory debugging features active
+- Detailed state inspection available
+- Use for investigating complex bugs
 
-Evaluates condition at runtime (when debug level ≥ 1)
-Continues execution if condition is true
-Prints message and exits if condition is false
-Compiles to NOP at debug level 0
+**Level 4 (Full)**
+- All debug features active
+- `DebugBreak` emits INT3 instructions
+- Interactive debugging support
+- Use for deep debugging sessions
 
-Examples:
-ailang// Basic assertions
-DebugAssert(GreaterThan(x, 0), "x must be positive")
-DebugAssert(NotEqual(ptr, 0), "Null pointer detected")
+---
 
-// Complex conditions
-result = CalculateValue()
-DebugAssert(And(GreaterEqual(result, 0), LessEqual(result, 100)), "Result out of range")
+## Compilation Flags
 
-// Loop invariants
-i = 0
-WhileLoop LessThan(i, count) {
-    DebugAssert(LessThan(i, array_size), "Array index out of bounds")
-    // Process array[i]
-    i = Add(i, 1)
+### Command Line
+
+```bash
+# Production build (level 0, default)
+./compiler.x program.ailang
+
+# Basic debugging (level 1)
+./compiler.x -D program.ailang
+./compiler.x -D1 program.ailang
+
+# Trace debugging (level 2)
+./compiler.x -D2 program.ailang
+
+# Detailed debugging (level 3)
+./compiler.x -D3 program.ailang
+
+# Full debugging (level 4)
+./compiler.x -D4 program.ailang
+
+# Enable performance profiling
+./compiler.x -P program.ailang
+
+# Combine flags
+./compiler.x -D2 -P program.ailang
+```
+
+### Console Commands
+
+```
+ailang> debug 0        # Set to production
+ailang> debug 1        # Set to basic
+ailang> debug 2        # Set to trace
+ailang> debug 3        # Set to detailed
+ailang> debug 4        # Set to full
+ailang> perf on        # Enable profiling
+ailang> perf off       # Disable profiling
+```
+
+---
+
+## Debug Blocks
+
+Conditional code blocks that only compile when the debug level meets the requirement.
+
+### Syntax
+
+```ailang
+Debug("label", level=N) {
+    // Code here only compiles if debug level >= N
 }
-Debug Blocks
-Conditional code execution based on debug level:
-ailangDebug(label, level=N) {
-    // Debug code here
-}
-Parameters:
+```
 
-label: String identifier for the debug block
-level: Minimum debug level for execution (1-4)
+### Parameters
 
-Behavior:
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| label | String | Yes | Identifier for the debug block |
+| level | Integer | No | Minimum debug level (default: 1) |
 
-Block executes only if current debug level ≥ specified level
-Label helps identify debug output
-Can contain any valid AILANG code
-Compiles to NOP if level requirement not met
+### Behavior
 
-Examples:
-ailang// Basic debug block
-Debug("initialization", level=1) {
-    PrintMessage("System initializing...")
-}
+- Block compiles only if current debug level ≥ specified level
+- Below required level: entire block becomes a single NOP
+- Label helps identify debug output and aids in filtering
+- Can contain any valid AILANG statements
 
-// Variable inspection
-Debug("variables", level=2) {
-    PrintMessage("Current values:")
-    PrintMessage("  x =")
-    PrintNumber(x)
-    PrintMessage("  status =")
-    PrintNumber(status)
+### Examples
+
+```ailang
+// Basic debug output (level 1+)
+Debug("startup", level=1) {
+    PrintMessage("Application starting...\n")
 }
 
-// Detailed analysis
-Debug("memory_check", level=3) {
-    PrintMessage("Memory analysis:")
-    // Simulate memory dump
-    PrintMessage("  Stack usage: 1024 bytes")
-    PrintMessage("  Heap usage: 4096 bytes")
+// Variable inspection (level 2+)
+Debug("state check", level=2) {
+    PrintMessage("Current counter: ")
+    PrintNumber(counter)
+    PrintMessage("\n")
 }
 
-// Nested debug blocks
+// Detailed memory state (level 3+)
+Debug("memory analysis", level=3) {
+    PrintMessage("Buffer address: ")
+    PrintNumber(buffer_ptr)
+    PrintMessage(" Size: ")
+    PrintNumber(buffer_size)
+    PrintMessage("\n")
+}
+
+// Interactive checkpoint (level 4 only)
+Debug("checkpoint", level=4) {
+    PrintMessage("=== CHECKPOINT: About to process data ===\n")
+    DebugBreak("pre-process")
+}
+```
+
+### Nested Blocks
+
+Debug blocks can be nested. Inner blocks only execute if both their level AND the outer block's level are met.
+
+```ailang
 Debug("outer", level=2) {
-    PrintMessage("Outer block")
+    PrintMessage("Outer block executing\n")
     
     Debug("inner", level=3) {
-        PrintMessage("Inner block (only at level 3+)")
+        // Only executes at level 3+
+        PrintMessage("Inner block (detailed)\n")
     }
 }
-Performance Profiling
-Measure execution time of code sections:
-ailangDebugPerf.Start(label)
-// Code to profile
-DebugPerf.End(label)
-DebugPerf.Mark(label)
-Operations:
+```
 
-Start: Begin timing a section
-End: Stop timing and record duration
-Mark: Record a timestamp marker
+---
 
-Behavior:
+## Debug Assertions
 
-Only active when -P flag is set
-Uses RDTSC instruction for cycle-accurate timing
-Minimal overhead when enabled
-Compiles to NOP when disabled
+Runtime validation that halts execution on failure.
 
-Examples:
-ailang// Time a computation
-DebugPerf.Start("calculation")
+### Syntax
 
-result = 0
-i = 0
-WhileLoop LessThan(i, 1000) {
-    result = Add(result, Multiply(i, i))
-    i = Add(i, 1)
-}
+```ailang
+DebugAssert(condition, "message")
+DebugAssert(condition)  // Message optional
+```
 
-DebugPerf.End("calculation")
+### Parameters
 
-// Time multiple sections
-DebugPerf.Start("phase1")
-ProcessPhaseOne()
-DebugPerf.End("phase1")
+| Parameter | Type | Required | Description |
+|-----------|------|----------|-------------|
+| condition | Expression | Yes | Boolean expression to validate |
+| message | String | No | Message displayed on failure |
 
-DebugPerf.Start("phase2")
-ProcessPhaseTwo()
-DebugPerf.End("phase2")
+### Behavior
 
-// Mark important points
-DebugPerf.Mark("checkpoint_reached")
-Command-Line Options
-Debug Level Control
-bash# No debug (production)
-python3 main.py program.ailang
+- Active at debug level 1 and above
+- Evaluates condition at runtime
+- If true (non-zero): continues execution
+- If false (zero): prints message and exits with code 1
+- At level 0: compiles to NOP
 
-# Level 1: Assertions only
-python3 main.py program.ailang -D1
+### Examples
 
-# Level 2: + Debug blocks and traces
-python3 main.py program.ailang -D2
+```ailang
+// Basic null check
+DebugAssert(NotEqual(ptr, 0), "Null pointer")
 
-# Level 3: + Detailed analysis
-python3 main.py program.ailang -D3
+// Range validation
+DebugAssert(And(GreaterEqual(index, 0), LessThan(index, array_size)), 
+            "Index out of bounds")
 
-# Level 4: Full debugging
-python3 main.py program.ailang -D4
-Performance Profiling
-bash# Enable profiling
-python3 main.py program.ailang -P
+// Postcondition check
+result = Calculate(x, y)
+DebugAssert(GreaterEqual(result, 0), "Calculation returned negative")
 
-# Combine with debug level
-python3 main.py program.ailang -D2 -P
+// Without message
+DebugAssert(GreaterThan(count, 0))
+```
 
-# Profile production build
-python3 main.py program.ailang -D0 -P
-Examples and Patterns
-Pattern 1: Progressive Debug Detail
-ailangSubRoutine.ProcessData {
-    // Always validate inputs (level 1+)
-    DebugAssert(GreaterThan(data_size, 0), "Invalid data size")
-    
-    // Basic trace (level 2+)
-    Debug("trace", level=2) {
-        PrintMessage("ProcessData: Starting")
-    }
-    
-    // Detailed state (level 3+)
-    Debug("state", level=3) {
-        PrintMessage("Input parameters:")
-        PrintMessage("  data_size =")
-        PrintNumber(data_size)
-    }
-    
-    // Process data
-    result = PerformCalculation(data_size)
-    
-    // Validate result
-    DebugAssert(GreaterEqual(result, 0), "Calculation failed")
-    
-    Debug("trace", level=2) {
-        PrintMessage("ProcessData: Complete")
-    }
-}
-Pattern 2: Performance Analysis
-ailangSubRoutine.OptimizedAlgorithm {
-    DebugPerf.Start("total")
-    
-    // Phase 1: Initialization
-    DebugPerf.Start("init")
-    InitializeStructures()
-    DebugPerf.End("init")
-    
-    // Phase 2: Main computation
-    DebugPerf.Start("compute")
-    
-    i = 0
-    WhileLoop LessThan(i, iterations) {
-        // Mark every 100 iterations
-        IfCondition EqualTo(Modulo(i, 100), 0) ThenBlock {
-            DebugPerf.Mark("iteration_100")
+### Failure Output
+
+When an assertion fails:
+
+```
+ASSERTION FAILED: Index out of bounds
+```
+
+Program exits with code 1.
+
+---
+
+## Debug Tracing
+
+Track function execution flow and variable values.
+
+### Syntax
+
+```ailang
+DebugTrace.Entry("function_name", param1, param2, ...)
+DebugTrace.Exit("function_name", return_value)
+DebugTrace.Point("label", value)
+```
+
+### Behavior
+
+- Active at debug level 2 and above
+- `Entry`: Log function entry with parameters
+- `Exit`: Log function exit with return value
+- `Point`: Log arbitrary checkpoint with value
+
+### Examples
+
+```ailang
+Function.ProcessOrder {
+    Input: order_id: Integer
+    Input: quantity: Integer
+    Output: Integer
+    Body: {
+        DebugTrace.Entry("ProcessOrder", order_id, quantity)
+        
+        total = Multiply(quantity, GetPrice(order_id))
+        
+        DebugTrace.Point("calculated_total", total)
+        
+        IfCondition LessThan(total, 0) ThenBlock: {
+            DebugTrace.Exit("ProcessOrder", -1)
+            ReturnValue(-1)
         }
         
-        ProcessIteration(i)
-        i = Add(i, 1)
-    }
-    
-    DebugPerf.End("compute")
-    
-    // Phase 3: Cleanup
-    DebugPerf.Start("cleanup")
-    CleanupStructures()
-    DebugPerf.End("cleanup")
-    
-    DebugPerf.End("total")
-}
-Pattern 3: Error Investigation
-ailangSubRoutine.ComplexOperation {
-    Debug("entry", level=2) {
-        PrintMessage("ComplexOperation: Entry")
-    }
-    
-    // Checkpoint 1
-    step1_result = StepOne()
-    Debug("checkpoint1", level=3) {
-        PrintMessage("After StepOne:")
-        PrintNumber(step1_result)
-    }
-    DebugAssert(GreaterThan(step1_result, 0), "StepOne failed")
-    
-    // Checkpoint 2
-    step2_result = StepTwo(step1_result)
-    Debug("checkpoint2", level=3) {
-        PrintMessage("After StepTwo:")
-        PrintNumber(step2_result)
-    }
-    
-    // Detailed debugging for problem area
-    Debug("problem_area", level=4) {
-        PrintMessage("Entering problem area")
-        PrintMessage("All variables:")
-        PrintNumber(step1_result)
-        PrintNumber(step2_result)
-        // Add breakpoint simulation
-        PrintMessage("BREAKPOINT: Check state")
-    }
-    
-    final_result = StepThree(step2_result)
-    
-    Debug("exit", level=2) {
-        PrintMessage("ComplexOperation: Exit")
+        DebugTrace.Exit("ProcessOrder", total)
+        ReturnValue(total)
     }
 }
-Pattern 4: Memory Debugging
-ailangSubRoutine.MemoryIntensive {
-    // Track allocations
-    Debug("memory_start", level=3) {
-        PrintMessage("Memory tracking started")
-    }
-    
-    // Allocation
-    buffer_size = 1024
-    DebugAssert(LessEqual(buffer_size, 65536), "Buffer too large")
-    
-    Debug("allocation", level=3) {
-        PrintMessage("Allocating buffer:")
-        PrintNumber(buffer_size)
-    }
-    
-    // Use buffer
-    ProcessBuffer(buffer_size)
-    
-    // Cleanup verification
-    Debug("memory_end", level=3) {
-        PrintMessage("Memory cleanup complete")
+```
+
+### Output Format
+
+```
+[TRACE] ENTRY ProcessOrder(42, 5)
+[TRACE] POINT calculated_total = 250
+[TRACE] EXIT ProcessOrder -> 250
+```
+
+---
+
+## Debug Breakpoints
+
+Insert software breakpoints for debugger interaction.
+
+### Syntax
+
+```ailang
+DebugBreak("label")
+```
+
+### Behavior
+
+- Active at debug level 4 only
+- Emits x86 INT3 instruction (0xCC)
+- Triggers debugger breakpoint trap
+- Without debugger: causes SIGTRAP (program terminates)
+- Below level 4: compiles to NOP
+
+### Examples
+
+```ailang
+Function.CriticalOperation {
+    Body: {
+        // Break before dangerous operation
+        DebugBreak("pre-critical")
+        
+        PerformCriticalWork()
+        
+        // Break after to inspect results
+        DebugBreak("post-critical")
     }
 }
-Performance Considerations
-Debug Level Impact
-LevelOverheadUse Case0NoneProduction releases1MinimalTesting and QA2LowDevelopment3ModerateDebugging4HighDeep investigation
-Optimization Tips
+```
 
-Use Appropriate Levels: Choose the minimum level needed
-Avoid Level 4 in Loops: High-level debug blocks in tight loops impact performance
-Profile Sparingly: DebugPerf has measurable overhead
-Conditional Debug: Use runtime conditions to limit debug output
-Production Builds: Always compile with -D0 for release
+### Usage with GDB
 
-Memory Usage
-Debug blocks may increase stack usage when enabled:
+```bash
+# Compile with full debug
+./compiler.x -D4 program.ailang -o program.x
 
-Level 1: Negligible impact
-Level 2-3: Small stack overhead for trace data
-Level 4: Larger overhead for state preservation
+# Run under GDB
+gdb ./program.x
+(gdb) run
+# Program stops at DebugBreak points
+(gdb) info registers
+(gdb) continue
+```
 
-Troubleshooting
-Common Issues
-Assertion Always Fails
-ailang// Wrong: Assignment instead of comparison
-DebugAssert(x = 10, "x should be 10")
+---
 
-// Correct: Use comparison
-DebugAssert(EqualTo(x, 10), "x should be 10")
-Debug Block Not Executing
-ailang// Check compilation flags
-// This only runs at level 3+
-Debug("test", level=3) {
-    PrintMessage("This needs -D3 or higher")
+## Performance Profiling
+
+Measure execution time of code sections using CPU cycle counter.
+
+### Syntax
+
+```ailang
+DebugPerf.Start("label")
+// ... code to profile ...
+DebugPerf.End("label")
+
+DebugPerf.Mark("checkpoint")
+```
+
+### Behavior
+
+- Requires `-P` flag to enable
+- Uses RDTSC/RDTSCP instructions for cycle-accurate timing
+- `Start`: Records start timestamp
+- `End`: Records end timestamp, calculates duration
+- `Mark`: Records single timestamp marker
+- Without `-P`: compiles to NOPs
+
+### Examples
+
+```ailang
+Function.OptimizedSort {
+    Input: arr: Address
+    Input: size: Integer
+    Body: {
+        DebugPerf.Start("total_sort")
+        
+        DebugPerf.Start("partition")
+        pivot = Partition(arr, size)
+        DebugPerf.End("partition")
+        
+        DebugPerf.Start("recursion")
+        QuickSort(arr, pivot)
+        QuickSort(Add(arr, Multiply(pivot, 8)), Subtract(size, pivot))
+        DebugPerf.End("recursion")
+        
+        DebugPerf.End("total_sort")
+    }
 }
-Performance Data Not Collected
-ailang// Requires -P flag
-DebugPerf.Start("test")
-// Only works with: python3 main.py file.ailang -P
-Debug Strategy
+```
 
-Start with Level 1: Verify assertions pass
-Add Level 2 Traces: Track execution flow
-Use Level 3 for State: Inspect variables at key points
-Level 4 for Deep Dive: When other levels insufficient
-Profile After Fixing: Optimize only after correctness
+### Output
 
-Integration with Development
-bash# Development workflow
-make debug   # Compile with -D2
-make test    # Run with -D1
-make profile # Run with -P
-make release # Compile with -D0
-Compiler Implementation Notes
-The AILANG debug system uses conditional compilation:
+```
+[PERF] partition: 12,456 cycles
+[PERF] recursion: 89,234 cycles
+[PERF] total_sort: 102,891 cycles
+```
 
-Level Check: Debug level compared at compile time
-NOP Generation: Disabled debug code becomes no-ops
-Runtime Library: Debug support functions linked when needed
-Symbol Preservation: Debug symbols retained based on level
+---
 
-Debug Code Generation
-pythondef compile_debug_block(self, node):
-    if node.level > self.debug_level:
-        # Emit NOP
-        self.asm.emit_nop()
-    else:
-        # Compile block contents
-        for stmt in node.body:
-            self.compile_statement(stmt)
-Performance Profiling Implementation
-The profiler uses x86-64 RDTSC instruction:
+## Memory Debugging
 
-Reads processor timestamp counter
-64-bit cycle count since reset
-Overhead: ~20-30 cycles per measurement
-Resolution: Single CPU cycle
+Inspect and validate memory state.
 
-This manual provides comprehensive coverage of AILANG's debug capabilities, enabling developers to effectively diagnose and optimize their programs while maintaining zero-overhead production builds.
+### Syntax
+
+```ailang
+DebugMemory.Dump(address, size, "label")
+DebugMemory.Watch(address, "label")
+DebugMemory.Pattern(address, size, pattern)
+DebugMemory.Leak.Start()
+DebugMemory.Leak.Check()
+```
+
+### Behavior
+
+- Active at debug level 3 and above
+- `Dump`: Hex dump memory region
+- `Watch`: Monitor address for changes (future)
+- `Pattern`: Fill memory with pattern (e.g., 0xDEADBEEF)
+- `Leak.Start/Check`: Track allocations for leak detection
+
+### Examples
+
+```ailang
+Function.ProcessBuffer {
+    Input: data: Address
+    Input: size: Integer
+    Body: {
+        DebugMemory.Leak.Start()
+        
+        buffer = Allocate(1024)
+        
+        Debug("buffer state", level=3) {
+            DebugMemory.Dump(buffer, 64, "allocated buffer")
+            DebugMemory.Pattern(buffer, 1024, 0xDEADBEEF)
+        }
+        
+        ProcessData(buffer, data, size)
+        
+        Deallocate(buffer, 1024)
+        
+        DebugMemory.Leak.Check()  // Warns if leaks detected
+    }
+}
+```
+
+---
+
+## Debug Inspection
+
+Examine runtime state.
+
+### Syntax
+
+```ailang
+DebugInspect.Variables()
+DebugInspect.Stack()
+DebugInspect.Pools()
+```
+
+### Behavior
+
+- Active at debug level 3 and above
+- `Variables`: Dump all variables in current scope
+- `Stack`: Show current stack frame
+- `Pools`: Display FixedPool and DynamicPool states
+
+### Examples
+
+```ailang
+Function.ComplexCalculation {
+    Input: x: Integer
+    Input: y: Integer
+    Body: {
+        temp1 = Add(x, y)
+        temp2 = Multiply(x, y)
+        
+        Debug("inspect", level=3) {
+            DebugInspect.Variables()
+            // Output: x=5, y=3, temp1=8, temp2=15
+        }
+        
+        result = Divide(temp2, temp1)
+        ReturnValue(result)
+    }
+}
+```
+
+---
+
+## Patterns and Examples
+
+### Pattern 1: Progressive Debug Detail
+
+```ailang
+Function.ProcessData {
+    Input: data: Address
+    Input: size: Integer
+    Output: Integer
+    Body: {
+        // Always validate (level 1+)
+        DebugAssert(NotEqual(data, 0), "Null data pointer")
+        DebugAssert(GreaterThan(size, 0), "Invalid size")
+        
+        // Basic trace (level 2+)
+        Debug("trace", level=2) {
+            PrintMessage("[ProcessData] Starting, size=")
+            PrintNumber(size)
+            PrintMessage("\n")
+        }
+        
+        // Detailed state (level 3+)
+        Debug("state", level=3) {
+            DebugMemory.Dump(data, 32, "input data")
+        }
+        
+        result = DoProcessing(data, size)
+        
+        // Validate result
+        DebugAssert(GreaterEqual(result, 0), "Processing failed")
+        
+        Debug("trace", level=2) {
+            PrintMessage("[ProcessData] Complete, result=")
+            PrintNumber(result)
+            PrintMessage("\n")
+        }
+        
+        ReturnValue(result)
+    }
+}
+```
+
+### Pattern 2: Performance Analysis
+
+```ailang
+Function.RenderFrame {
+    Body: {
+        DebugPerf.Start("frame")
+        
+        DebugPerf.Start("physics")
+        UpdatePhysics()
+        DebugPerf.End("physics")
+        
+        DebugPerf.Start("ai")
+        UpdateAI()
+        DebugPerf.End("ai")
+        
+        DebugPerf.Start("render")
+        DrawScene()
+        DebugPerf.End("render")
+        
+        DebugPerf.End("frame")
+    }
+}
+```
+
+### Pattern 3: Memory Safety
+
+```ailang
+Function.SafeArrayAccess {
+    Input: arr: Address
+    Input: index: Integer
+    Input: arr_size: Integer
+    Output: Integer
+    Body: {
+        DebugAssert(NotEqual(arr, 0), "Null array")
+        DebugAssert(GreaterEqual(index, 0), "Negative index")
+        DebugAssert(LessThan(index, arr_size), "Index out of bounds")
+        
+        value = ArrayGet(arr, index)
+        ReturnValue(value)
+    }
+}
+```
+
+### Pattern 4: Error Investigation
+
+```ailang
+Function.DiagnoseIssue {
+    Input: input: Address
+    Body: {
+        Debug("entry", level=2) {
+            PrintMessage("=== DiagnoseIssue Entry ===\n")
+        }
+        
+        // Checkpoint 1
+        step1 = ProcessStep1(input)
+        Debug("checkpoint1", level=3) {
+            PrintMessage("After Step1: ")
+            PrintNumber(step1)
+            PrintMessage("\n")
+        }
+        DebugAssert(NotEqual(step1, -1), "Step1 failed")
+        
+        // Checkpoint 2
+        step2 = ProcessStep2(step1)
+        Debug("checkpoint2", level=3) {
+            PrintMessage("After Step2: ")
+            PrintNumber(step2)
+            PrintMessage("\n")
+        }
+        
+        // Full debug for problem area
+        Debug("problem_area", level=4) {
+            PrintMessage("=== ENTERING PROBLEM AREA ===\n")
+            DebugInspect.Variables()
+            DebugBreak("investigate")
+        }
+        
+        FinalStep(step2)
+    }
+}
+```
+
+---
+
+## Performance Considerations
+
+### Overhead by Level
+
+| Level | Overhead | Impact |
+|-------|----------|--------|
+| 0 | None | Zero - NOPs optimized away |
+| 1 | Minimal | ~1-2% (assertion checks only) |
+| 2 | Low | ~5-10% (traces add I/O) |
+| 3 | Moderate | ~15-25% (memory inspection) |
+| 4 | High | Variable (breakpoints halt execution) |
+
+### Best Practices
+
+1. **Use appropriate levels** - Don't put level 1 checks in hot loops
+2. **Level 4 sparingly** - Breakpoints in loops will halt repeatedly
+3. **Profile without debug** - Use `-P` alone for accurate perf data
+4. **Production = Level 0** - Always ship with debug disabled
+5. **Assertions are cheap** - Use liberally at level 1
+
+### Memory Impact
+
+- Level 0: No additional memory
+- Level 1-2: Minimal (string literals for messages)
+- Level 3+: Additional buffers for memory tracking
+- With `-P`: Perf slot storage (~32 bytes per marker)
+
+---
+
+## Compiler Implementation
+
+### File Structure
+
+```
+Librarys/Compiler/Debug/
+├── Library.CDebugTypes.ailang      # State and constants
+├── Library.CCompileDebug.ailang    # Compile DEBUG_* nodes
+└── X86/
+    └── Library.CEmitDebugX86.ailang # INT3, RDTSC, NOP
+```
+
+### AST Node Types
+
+| Node Type | Value | Description |
+|-----------|-------|-------------|
+| DEBUG_BLOCK | 900 | Debug block with body |
+| DEBUG_ASSERT | 901 | Assertion statement |
+| DEBUG_TRACE | 902 | Trace point |
+| DEBUG_BREAK | 903 | Breakpoint |
+
+### Token Types
+
+| Token | Value | Keyword |
+|-------|-------|---------|
+| DEBUG | 21 | Debug |
+| DEBUGASSERT | 22 | DebugAssert |
+| DEBUGTRACE | 23 | DebugTrace |
+| DEBUGBREAK | 24 | DebugBreak |
+| DEBUGMEMORY | 25 | DebugMemory |
+| DEBUGPERF | 26 | DebugPerf |
+| DEBUGINSPECT | 27 | DebugInspect |
+| DEBUGCONTROL | 28 | DebugControl |
+
+### Code Generation
+
+**Debug Block (level met):**
+```
+; Compile body normally
+<body instructions>
+```
+
+**Debug Block (level not met):**
+```
+90                  ; NOP
+```
+
+**DebugAssert:**
+```
+<compile condition> ; Result in RAX
+48 85 C0           ; TEST RAX, RAX
+75 XX              ; JNE pass_label
+; Print failure message
+; MOV RDI, 1
+; MOV RAX, 60 (exit)
+; SYSCALL
+pass_label:
+```
+
+**DebugBreak:**
+```
+CC                  ; INT3
+```
+
+**DebugPerf.Start:**
+```
+0F 31              ; RDTSC (EDX:EAX = timestamp)
+; Store to perf slot
+```
+
+---
+
+## Quick Reference
+
+### Debug Statements
+
+| Statement | Min Level | Description |
+|-----------|-----------|-------------|
+| `Debug("label", level=N) { }` | N | Conditional block |
+| `DebugAssert(cond, "msg")` | 1 | Runtime assertion |
+| `DebugTrace.Entry(...)` | 2 | Function entry log |
+| `DebugTrace.Exit(...)` | 2 | Function exit log |
+| `DebugTrace.Point(...)` | 2 | Checkpoint log |
+| `DebugBreak("label")` | 4 | Software breakpoint |
+| `DebugPerf.Start("label")` | -P flag | Start timer |
+| `DebugPerf.End("label")` | -P flag | End timer |
+| `DebugMemory.Dump(...)` | 3 | Hex dump |
+| `DebugMemory.Leak.Start()` | 3 | Start leak tracking |
+| `DebugMemory.Leak.Check()` | 3 | Check for leaks |
+| `DebugInspect.Variables()` | 3 | Dump scope vars |
+
+### Command Line Flags
+
+| Flag | Effect |
+|------|--------|
+| (none) | Level 0 - production |
+| `-D` or `-D1` | Level 1 - assertions |
+| `-D2` | Level 2 - tracing |
+| `-D3` | Level 3 - detailed |
+| `-D4` | Level 4 - full |
+| `-P` | Enable profiling |
+
+---
+
+*AILANG Debug System v2.0 - Zero-overhead debugging as a language primitive*
