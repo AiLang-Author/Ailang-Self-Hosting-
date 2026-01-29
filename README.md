@@ -1,4 +1,4 @@
-# AILang Self-Hosting Compiler
+# AILang
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-SELF--HOSTING-brightgreen?style=for-the-badge" alt="Status">
@@ -6,11 +6,13 @@
   <img src="https://img.shields.io/badge/license-SCSL-orange?style=for-the-badge" alt="License">
 </p>
 
+<p align="center"><strong>Where every operation states its intent.</strong></p>
+
 ---
 
-## 🎉 Milestone: Self-Hosting Achieved
+## Compiler.x Alpha 1 — Self-Hosting Achieved
 
-**January 5, 2026** - The AILang compiler has reached its primary goal: **true self-hosting**.Core language feature top 98% in use now are implmented. additional feautres underway. Goal is to reach 100% feature parity with python based compiler by jan 31,2026
+**43,000 lines. 75 files. ~300 primitives. 43 days.**
 
 ```
 Python Bootstrap → compiler.x → compiler2.x → compiler3.x ═══ compiler4.x
@@ -19,43 +21,181 @@ Python Bootstrap → compiler.x → compiler2.x → compiler3.x ═══ compil
                                                        BYTE-IDENTICAL
 ```
 
-The compiler builds itself across multiple generations and produces **byte-identical binaries** - the definition of a fixed-point self-hosting compiler.
+The compiler builds itself across generations and produces **byte-identical binaries**—the definition of a fixed-point self-hosting compiler.
 
 ---
 
-## What is AILang?
+## Design Philosophy
 
-AILang is a systems programming language designed for:
-- **Reliable**: LLM Generation and lower cognitive debt
-- **Comprehension**: The only Language designed for legibility
-- **Search**: The language and it;s structure make Grep and similar code tools much much more powerful.
-- **Clarity**: Named operators, explicit control flow, no hidden behavior
-- **Self-hosting**: The compiler is written in itself
-- **Direct compilation**: Source → native x86-64 ELF executables (no intermediate steps)
-- **Minimal dependencies**: Only needs Linux syscalls
+### Inspirations
+
+**COBOL** - Self-documenting verbosity. Programs from 1965 still run because the code says what it does.
+
+**Ada** - Rigorous contracts. Strictness prevents bugs. AILang wants Ada's discipline without the tooling pain.
+
+**Forth** - Direct hardware access, minimal runtime. Systems-level control without abstraction theater.
+
+The goal: COBOL's clarity + Ada's rigor + Forth's directness.
+
+### Core Principle: Comprehension Over Convenience
+
+Code is read 10x more than it's written. AILang optimizes for the reader.
+
+### The Problem with Implicit Languages
+
+C's operator precedence was copied from B without questioning if it made sense. C++ layered templates and implicit conversions on top. The result: code that hides behavior.
+
+```c
+result = a << 2 + b * c & mask;  // What's the order? Most get it wrong.
+```
+
+**AILang rejects implicit behavior.**
+
+---
+
+## Side-by-Side: AILang vs C vs Python
+
+**Ambiguous math:**
+```c
+// C: What does this mean?
+result = a << 2 + b * c & mask;
+
+// AILang: Explicit nesting IS the precedence
+result = BitwiseAnd(LeftShift(a, Add(2, Multiply(b, c))), mask)
+```
+
+**Hidden dependencies:**
+```python
+# Python: Where do counter and scale come from?
+def process():
+    return counter * scale
+
+# AILang: Dependencies are parameters
+Function.Process {
+    Input: counter: Integer
+    Input: scale: Integer
+    Output: Integer
+    Body: { ReturnValue(Multiply(counter, scale)) }
+}
+```
+
+**Dangling else:**
+```c
+// C: Is doSomethingElse() in the if? Indentation lies.
+if (x > 0)
+    doSomething();
+    doSomethingElse();
+
+// AILang: Braces mandatory, structure enforced
+IfCondition GreaterThan(x, 0) ThenBlock: {
+    DoSomething()
+    DoSomethingElse()
+}
+```
+
+---
+
+## Key Design Decisions
+
+### Named Operators
+The nesting IS the precedence. You can't get it wrong.
+
+### Scientific Infix Math
+For math-heavy code, AILang supports infix inside parentheses—scientific notation, not C notation:
+```ailang
+velocity = ((initial_v * t) + (0.5 * a * (t ^ 2)))  // Infix when math IS the point
+distance = Add(Multiply(initial_v, t), ...)         // Named when clarity matters
+```
+Both compile identically. Choose based on context.
+
+### No Global Variables
+All state lives in pools (FixedPool, DynamicPool, LinkagePool) or function locals. Dependencies are always explicit.
+
+### LinkagePool: Structured Memory with the @ Operator
+```c
+// C: Manual everything, cast soup, lifetime chaos
+Customer* c = (Customer*)malloc(sizeof(Customer));
+c->name = strdup("Alice");
+free(c->name);  // Did we remember?
+free(c);        // Double-free?
+```
 
 ```ailang
-// Clear, explicit syntax
-Function.Factorial {
-    Input: n: Integer
-    Output: Integer
-    Body: {
-        IfCondition LessEqual(n, 1) ThenBlock: {
-            ReturnValue(1)
-        }
-        result = Multiply(n, Factorial(Subtract(n, 1)))
-        ReturnValue(result)
-    }
+// AILang: Semantic structure, type-safe @ access
+LinkagePool.Customer {
+    "name": Initialize=0
+    "balance": Initialize=0
+    "account": Initialize=0, PointerTo=LinkagePool.Account
 }
 
-SubRoutine.Main {
-    PrintMessage("5! = ")
-    PrintNumber(Factorial(5))
-    PrintMessage("\n")
-}
-
-RunTask(Main)
+customer = AllocateLinkage(LinkagePool.Customer)
+customer@name = "Alice"
+customer@balance = 100
+customer@account@routing = 12345   // Chained access - compiler tracks types!
+FreeLinkage(customer, LinkagePool.Customer)
 ```
+
+**Why `@` instead of dot?** The dot is overloaded (`FixedPool.X.field`, `Library.Module`, `LinkagePool.Type`). The `@` operator is unambiguous, grep-friendly (`grep "@"` finds all dereferences), and self-documenting ("at this address").
+
+**Type propagation:** `PointerTo=` lets the compiler track types through pointer chains. `customer@account@routing` works because the compiler knows `account` points to a `LinkagePool.Account`.
+
+Influenced by COBOL's LINKAGE SECTION—data structures with clear contracts.
+
+### Functions vs Subroutines
+**Functions** - Computation with contracts (Input/Output/Body). Stack-based locals. Unit of reasoning.
+
+**Subroutines** - Imperative coordination. Shared state via pools. About *doing*, not computing.
+
+### Formal Grammar
+AILang has a complete BNF specification - not informal docs, but a real grammar definition covering all constructs: pools, functions, control flow, expressions, operators, and the 50+ math/bit primitives. The parser implements this grammar directly.
+```ailang
+LibraryImport.Customer
+LibraryImport.Order
+```
+No headers. No forward declarations. No include guards. Conflict resolution at import time.
+
+### Primitives vs Libraries: Where Functionality Lives
+
+**Primitives (in compiler):** Operations you'd otherwise rewrite in every project. AILang includes ~300 built-in primitives:
+- 22+ string operations (`StringConcat`, `StringLength`, `StringCompare`, `StringToUpper`...)
+- Memory operations (`Allocate`, `Deallocate`, `MemoryCopy`, `GetByte`, `SetByte`...)
+- Math operations (`Add`, `Multiply`, `Power`, `SquareRoot`, `Sin`, `Cos`...)
+- File I/O (`ReadTextFile`, `WriteTextFile`, `FileExists`...)
+
+**Libraries (opt-in):** Complex abstractions that not everyone needs:
+- `Library.OOP` - Classes, inheritance, method dispatch (if you want OOP)
+- `Library.HashMap` - Hash tables
+- `Library.JSON` - JSON parsing
+- `Library.PostgreSQL` - Database connectivity
+
+This split is intentional: primitives eliminate boilerplate, libraries stay optional. You don't pay for OOP if you don't use it, but you never have to write `StringConcat` yourself.
+
+---
+
+## The Compiler
+
+A complete development environment:
+
+- **Console** - Interactive REPL, load/parse/compile/run from one interface
+- **Built-in Editor** - Nano-style with syntax highlighting
+- **Static Analysis** - Memory leak detection, unused variables, signature checking
+- **Debug Primitives** - Zero overhead in production:
+
+```ailang
+DebugAssert(GreaterThan(balance, 0), "Balance must be positive")
+Debug("trace", level=2) { PrintMessage("Entering critical section\n") }
+```
+At `-D0`, these compile to NOPs. Full functionality at higher debug levels.
+
+### Multi-Architecture Design
+Built for multiple backends from day one:
+```
+CodeEmit/
+├── CEmitCore.ailang       # Architecture-agnostic
+├── X86/                   # x86-64 (complete)
+└── RISCV/                 # Future target
+```
+Adding architectures means implementing backend functions—compiler logic stays unchanged.
 
 ---
 
@@ -74,18 +214,12 @@ RunTask(Main)
 | **Arrays** | ArrayCreate, ArrayGet, ArraySet, ArrayLength, ArrayDestroy |
 | **Dynamic Arrays** | XArray.XCreate, XPush, XGet, XSet, XSize, XDestroy |
 | **Memory** | Allocate, Deallocate, StoreValue, Dereference, GetByte, SetByte, MemoryCopy, MemorySet |
+| **LinkagePool** | AllocateLinkage, FreeLinkage, `@` field access, PointerTo chaining, Type embedding, Direction enforcement |
 | **Control Flow** | IfCondition/ThenBlock/ElseBlock, WhileLoop, ForEach, ExitLoop, ContinueLoop, Branch/Case |
 | **Functions** | Function/SubRoutine definitions, parameters (6 registers), locals, nested calls, ReturnValue |
 | **File I/O** | WriteTextFile, ReadTextFile, FileExists, GetFileSize |
 | **Import System** | Multi-file compilation, library imports, symbol conflict detection |
 | **Code Generation** | x86-64 native instructions, ELF64 executables, data relocations |
-
-### 🔄 In Development
-
-| Feature | Status |
-|---------|--------|
-
-| Debug output cleanup | Planned |
 
 ---
 
@@ -96,13 +230,11 @@ RunTask(Main)
 - Python 3.x (for initial bootstrap only)
 
 ### Bootstrap the Compiler
-
 ```bash
-# Clone the repository
 git clone https://github.com/AiLang-Author/Ailang-Self-Hosting-.git
 cd Ailang-Self-Hosting-
 
-# Now the compiler builds itself
+# The compiler builds itself
 ./compiler.x
 ailang> load ailang_console.ailang
 ailang> build compiler2.x
@@ -110,7 +242,7 @@ ailang> quit
 
 # Verify self-hosting (should produce identical binary)
 ./compiler2.x
-ailang> load ailang_console.ailang
+ailang> load ailang_console.ailang  
 ailang> build compiler3.x
 ailang> quit
 
@@ -118,20 +250,17 @@ cmp compiler2.x compiler3.x  # No output = identical!
 ```
 
 ### Compile a Program
-
 ```bash
 ./compiler.x
 ailang> load myprogram.ailang
-ailang> build myprogram.x or exec etc
+ailang> build myprogram.x
 ailang> quit
 
-./myprogram
+./myprogram.x
 ```
 
 ### Hello World
-
 ```ailang
-// hello.ailang
 SubRoutine.Main {
     PrintMessage("Hello, World!\n")
 }
@@ -140,50 +269,25 @@ RunTask(Main)
 
 ---
 
-## Language Features
-
-### Named Operators
-No operator precedence confusion - every operation is explicit:
-```ailang
-// Instead of: result = a * b + c * d
-result = Add(Multiply(a, b), Multiply(c, d))
-
-Also Fully scientific Engineering infix notiation for Math operators.
-```
-
-### Explicit Control Flow
-```ailang
-IfCondition GreaterThan(score, 100) ThenBlock: {
-    PrintMessage("High score!\n")
-} ElseBlock: {
-    PrintMessage("Keep trying\n")
-}
-
-WhileLoop LessThan(i, 10) {
-    PrintNumber(i)
-    i = Add(i, 1)
-}
-```
+## Language Examples
 
 ### Functions with Contracts
 ```ailang
-Function.SafeDivide {
-    Input: a: Integer
-    Input: b: Integer
+Function.Factorial {
+    Input: n: Integer
     Output: Integer
     Body: {
-        IfCondition EqualTo(b, 0) ThenBlock: {
-            PrintMessage("Error: Division by zero\n")
-            ReturnValue(0)
+        IfCondition LessEqual(n, 1) ThenBlock: {
+            ReturnValue(1)
         }
-        ReturnValue(Divide(a, b))
+        result = Multiply(n, Factorial(Subtract(n, 1)))
+        ReturnValue(result)
     }
 }
 ```
 
 ### Multi-File Projects
 ```ailang
-// main.ailang
 Import.utils
 Import.math
 
@@ -202,6 +306,64 @@ SetByte(buffer, 0, 65)      // Write 'A'
 char = GetByte(buffer, 0)   // Read back
 Deallocate(buffer, 1024)
 ```
+
+### LinkagePool with @ Operator
+```ailang
+LinkagePool.Node {
+    "value": Initialize=0
+    "next": Initialize=0, PointerTo=LinkagePool.Node
+}
+
+node = AllocateLinkage(LinkagePool.Node)
+node@value = 42
+node@next = AllocateLinkage(LinkagePool.Node)
+node@next@value = 100    // Chained access works!
+```
+
+---
+
+## The Self-Hosting Story
+
+**Dec 15, 2025 → Jan 27, 2026. 43 days.**
+
+**What this proves:**
+1. **Expressiveness** - Lexing, parsing, AST, code generation, symbol tables, scope management—all in AILang.
+2. **AI collaboration velocity** - Clear syntax means AI suggestions are correct more often. Structure catches bugs earlier.
+3. **Verbosity ≠ bloat** - Deep primitives reduce glue code. Structure reduces error handling.
+
+**Compare to TCC (Tiny C Compiler):** TCC needs ~100,000 lines of C for ANSI C89/C99. AILang needs ~43,000 lines for ~300 primitives PLUS integrated tooling.
+
+### Subsystem Breakdown
+
+| Subsystem | Lines | Files |
+|-----------|-------|-------|
+| Frontend | 8,827 | 18 |
+| Compile | 14,447 | 29 |
+| CodeEmit | 10,162 | 15 |
+| Import | 2,601 | 3 |
+| Output | 1,111 | 3 |
+| Debug | 1,016 | 3 |
+| Console | 1,653 | 1 |
+| Core Libs | 3,232 | 3 |
+| **Total** | **~43,000** | **75** |
+
+---
+
+## Why These Choices Matter
+
+| Decision | Problem | Benefit |
+|----------|---------|---------|
+| Named operators | Precedence bugs | Unambiguous by construction |
+| Scientific infix | Math readability | Domain experts read domain code |
+| No globals | Hidden dependencies | All state flows explicit |
+| LinkagePool | Pointer ambiguity | `@` operator - unambiguous, grep-friendly |
+| PointerTo= | Lost type info | Compiler tracks types through chains |
+| Primitives vs Libs | Boilerplate vs bloat | 300 built-ins, OOP optional |
+| Functions vs Subroutines | Confused intent | Computation vs coordination |
+| Library imports | Header hell | No redundancy, no circular deps |
+| Built-in debug | Tooling fragmentation | Zero-overhead, always available |
+| Multi-arch design | Platform lock-in | Add targets, keep logic |
+| Formal BNF grammar | Informal specs | Parser matches spec exactly |
 
 ---
 
@@ -258,7 +420,6 @@ Deallocate(buffer, 1024)
 
 ```
 AILangSH/
-
 ├── ailang_console.ailang      # Self-hosting compiler source
 ├── compiler.x                 # Compiled self-hosting compiler
 │
@@ -268,47 +429,40 @@ AILangSH/
 │   │   │   ├── Lexer/         # CLexer - tokenization
 │   │   │   ├── Parser/        # CParser - AST generation
 │   │   │   └── AST/           # AST types and operations
-│   │   │
 │   │   ├── Compile/
 │   │   │   └── Modules/       # CCompile* - compilation
-│   │   │       ├── CCompileArith.ailang
-│   │   │       ├── CCompileIO.ailang
-│   │   │       ├── CCompileStmt.ailang
-│   │   │       └── ...
-│   │   │
 │   │   ├── CodeEmit/
 │   │   │   └── X86/           # CEmitX86* - x86-64 code gen
-│   │   │
 │   │   └── Output/            # ELF builder
 │   │
 │   ├── Library.XArrays.ailang # Dynamic arrays
 │   └── Library.FileIO.ailang  # File operations
 │
-└── tests/                     # Test programs
+└── TestCode/                  # Test programs
 ```
+
+---
+
+## What AILang Is For
+
+- Systems programming with memory/hardware control
+- Code that must be obviously correct by inspection
+- Long-lived codebases where maintenance dominates
+- AI-assisted development (explicit structure = better suggestions)
+- COBOL modernization preserving semantic clarity
+
+**Not for:** Quick scripts, C/C++ interop, code golf.
 
 ---
 
 ## Roadmap
 
-### v0.3.0 (Next)
-- [X] Hex literal support in lexer
-- [X] Remove debug output
-- [X] NumberToString / StringToNumber implementation
-
-### v0.4.0
-- [X] Static checker integration
-- [X] Additional string functions
-- [X] Performance Optimizations Ongoing
-
-### v0.5.0
-- [X] Float support
-- [X] Struct types
-- [X] Enhanced error messages
-
-### v1.0.0
-- [X] Complete standard library
-- [X] Documentation
+- [x] Self-hosting compiler
+- [x] Hex/octal/binary literals
+- [x] Float support (SSE)
+- [x] Static analysis tools
+- [x] Complete standard library
+- [ ] RISC-V backend
 - [ ] Multi-platform support
 
 ---
@@ -323,10 +477,6 @@ See [LICENSE](LICENSE) for full terms.
 
 ---
 
-## Acknowledgments
-
-AILang is a solo project demonstrating that self-hosting compilers can be built from scratch with clear, explicit language design principles.
-
----
-
-
+<p align="center">
+  <strong>AILang: Written in itself. Compiling itself. Running itself.</strong>
+</p>
