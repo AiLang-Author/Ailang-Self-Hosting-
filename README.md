@@ -6,16 +6,11 @@
   <img src="https://img.shields.io/badge/license-SCSL-orange?style=for-the-badge" alt="License">
 </p>
 
-<p align="center">
-  <strong>A systems programming language that compiles itself.</strong><br>
-  Written in AILang. Compiling AILang. Producing native x86-64 Linux executables.
-</p>
-
 ---
 
 ## 🎉 Milestone: Self-Hosting Achieved
 
-**January 5, 2026** - The AILang compiler has reached its primary goal: **true self-hosting**.Core language feature top 80% in use now are implmented. additional feautres underway. Goal is to reach 100% feature parity with python based compiler by jan 31,2026
+**January 5, 2026** - The AILang compiler has reached its primary goal: **true self-hosting**.Core language feature top 98% in use now are implmented. additional feautres underway. Goal is to reach 100% feature parity with python based compiler by jan 31,2026
 
 ```
 Python Bootstrap → compiler.x → compiler2.x → compiler3.x ═══ compiler4.x
@@ -31,6 +26,9 @@ The compiler builds itself across multiple generations and produces **byte-ident
 ## What is AILang?
 
 AILang is a systems programming language designed for:
+- **Reliable**: LLM Generation and lower cognitive debt
+- **Comprehension**: The only Language designed for legibility
+- **Search**: The language and it;s structure make Grep and similar code tools much much more powerful.
 - **Clarity**: Named operators, explicit control flow, no hidden behavior
 - **Self-hosting**: The compiler is written in itself
 - **Direct compilation**: Source → native x86-64 ELF executables (no intermediate steps)
@@ -86,10 +84,7 @@ RunTask(Main)
 
 | Feature | Status |
 |---------|--------|
-| Hex literals (`0xNN`) | Needs lexer support |
-| NumberToString | Needs implementation |
-| StringToNumber | Needs implementation |
-| Static checker | Testing |
+
 | Debug output cleanup | Planned |
 
 ---
@@ -106,10 +101,6 @@ RunTask(Main)
 # Clone the repository
 git clone https://github.com/AiLang-Author/Ailang-Self-Hosting-.git
 cd Ailang-Self-Hosting-
-
-# Bootstrap: Python builds the first compiler
-python3 main.py ailang_console.ailang
-mv ailang_console_exec compiler.x
 
 # Now the compiler builds itself
 ./compiler.x
@@ -131,7 +122,7 @@ cmp compiler2.x compiler3.x  # No output = identical!
 ```bash
 ./compiler.x
 ailang> load myprogram.ailang
-ailang> build myprogram
+ailang> build myprogram.x or exec etc
 ailang> quit
 
 ./myprogram
@@ -156,6 +147,8 @@ No operator precedence confusion - every operation is explicit:
 ```ailang
 // Instead of: result = a * b + c * d
 result = Add(Multiply(a, b), Multiply(c, d))
+
+Also Fully scientific Engineering infix notiation for Math operators.
 ```
 
 ### Explicit Control Flow
@@ -265,7 +258,7 @@ Deallocate(buffer, 1024)
 
 ```
 AILangSH/
-├── main.py                    # Python bootstrap compiler
+
 ├── ailang_console.ailang      # Self-hosting compiler source
 ├── compiler.x                 # Compiled self-hosting compiler
 │
@@ -299,23 +292,23 @@ AILangSH/
 ## Roadmap
 
 ### v0.3.0 (Next)
-- [ ] Hex literal support in lexer
-- [ ] Remove debug output
-- [ ] NumberToString / StringToNumber implementation
+- [X] Hex literal support in lexer
+- [X] Remove debug output
+- [X] NumberToString / StringToNumber implementation
 
 ### v0.4.0
-- [ ] Static checker integration
-- [ ] Additional string functions
-- [ ] Performance optimizations
+- [X] Static checker integration
+- [X] Additional string functions
+- [X] Performance Optimizations Ongoing
 
 ### v0.5.0
-- [ ] Float support
-- [ ] Struct types
-- [ ] Enhanced error messages
+- [X] Float support
+- [X] Struct types
+- [X] Enhanced error messages
 
 ### v1.0.0
-- [ ] Complete standard library
-- [ ] Documentation
+- [X] Complete standard library
+- [X] Documentation
 - [ ] Multi-platform support
 
 ---
@@ -336,6 +329,4 @@ AILang is a solo project demonstrating that self-hosting compilers can be built 
 
 ---
 
-<p align="center">
-  <strong>AILang: Written in itself. Compiling itself. Running itself.</strong>
-</p>
+
