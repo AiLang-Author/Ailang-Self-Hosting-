@@ -2,6 +2,7 @@
 
 <p align="center">
   <img src="https://img.shields.io/badge/status-SELF--HOSTING-brightgreen?style=for-the-badge" alt="Status">
+  <img src="https://img.shields.io/badge/version-1.0.0--beta-blue?style=for-the-badge" alt="Version">
   <img src="https://img.shields.io/badge/platform-Linux%20x86__64-blue?style=for-the-badge" alt="Platform">
   <img src="https://img.shields.io/badge/license-SCSL-orange?style=for-the-badge" alt="License">
 </p>
@@ -10,9 +11,79 @@
 
 ---
 
-## Compiler.x Alpha 1 — Self-Hosting Achieved
+## 🚀 1.0.0 Beta — VS Code Extension Release
 
-**43,000 lines. 75 files. ~300 primitives. 43 days.**
+**The compiler now ships inside the VS Code extension. No separate downloads. No PATH configuration. Install the extension, open a `.ailang` file, and everything works.**
+
+### What's in the box
+
+The extension bundles the complete self-hosting compiler toolchain:
+
+- **Compiler** (`ailang.x`) — builds native Linux ELF64 executables
+- **LSP** (`ailang_lsp.x`) — powers all IDE features with multi-file analysis
+- **Three-pass static analyzer** — memory safety, control flow, data flow analysis
+- **Interactive code graph** — force-directed connectome visualization
+
+### Requirements
+
+| Requirement | Details |
+|---|---|
+| **VS Code** | 1.75 or later |
+| **Windows** | WSL (Windows Subsystem for Linux) must be installed with a default distribution |
+| **Linux** | Native — works directly, no extra setup |
+| **Architecture** | x86-64 only — the compiler produces Linux ELF64 binaries |
+| **macOS** | Not currently supported |
+
+> **Windows users:** The extension handles WSL path translation automatically. All compilation, analysis, and LSP operations run transparently inside WSL. Just have WSL installed — no manual configuration needed.
+
+### Install
+
+Download the `.vsix` from the [Releases](https://github.com/AiLang-Author/Ailang-Self-Hosting-/releases) page, then:
+
+```
+Ctrl+Shift+P → "Extensions: Install from VSIX..." → select the .vsix file
+```
+
+Or from the command line:
+
+```bash
+code --install-extension ailang-support-beta-1.0.0.vsix
+```
+
+### IDE Features
+
+| Feature | Description |
+|---|---|
+| **Syntax Highlighting** | Full grammar coverage — pools, functions, control flow, operators, strings |
+| **Autocomplete** | Keywords, builtins, shorthand aliases, and symbols from the current file |
+| **Diagnostics** | Real-time error and warning reporting in the Problems panel |
+| **Multi-file Analysis** | Import resolution — tracks issues across all imported modules |
+| **Symbol Outline** | Hierarchical view of functions, pools, fields, imports |
+| **Go to Definition** | `F12` / `Ctrl+Click` — works within files and across imports |
+| **Connectome** | Interactive force-directed code graph with call relationships |
+| **Snippets** | Scaffolding for functions, pools, control flow, loops |
+| **Code Lens** | Run button appears above Main subroutines |
+| **Shorthand Expansion** | Type abbreviations, they expand to full keywords on save |
+| **Documentation Sidebar** | Built-in language manuals accessible from the activity bar |
+| **Compile** | `Ctrl+Shift+B` — compiles to native executable |
+| **Run** | `F5` — compile and run in integrated terminal |
+| **Analyze** | `Ctrl+Shift+A` — run static analysis |
+
+### Static Analysis
+
+The LSP runs three analysis passes on every save:
+
+- **Pass 1 (MEM)** — Memory lifecycle: leaks, double-free, use-after-free, unused variables
+- **Pass 2 (CFG)** — Control flow: null dereference, unreachable code, infinite loops, missing else branches
+- **Pass 3 (DFA)** — Data flow: read-before-write, variable shadowing, arena allocation in loops, recursion detection
+
+All diagnostics are routed to the correct file with accurate line numbers, even across imported modules.
+
+---
+
+## Compiler.x — Self-Hosting Achieved
+
+**43,000+ lines. 75+ files. ~300 primitives. 43 days.**
 
 ```
 Python Bootstrap → compiler.x → compiler2.x → compiler3.x ═══ compiler4.x
@@ -21,7 +92,7 @@ Python Bootstrap → compiler.x → compiler2.x → compiler3.x ═══ compil
                                                        BYTE-IDENTICAL
 ```
 
-The compiler builds itself across generations and produces **byte-identical binaries**—the definition of a fixed-point self-hosting compiler.
+The compiler builds itself across generations and produces byte-identical binaries — the definition of a fixed-point self-hosting compiler.
 
 ---
 
@@ -29,11 +100,11 @@ The compiler builds itself across generations and produces **byte-identical bina
 
 ### Inspirations
 
-**COBOL** - Self-documenting verbosity. Programs from 1965 still run because the code says what it does.
+**COBOL** — Self-documenting verbosity. Programs from 1965 still run because the code says what it does.
 
-**Ada** - Rigorous contracts. Strictness prevents bugs. AILang wants Ada's discipline without the tooling pain.
+**Ada** — Rigorous contracts. Strictness prevents bugs. AILang wants Ada's discipline without the tooling pain.
 
-**Forth** - Direct hardware access, minimal runtime. Systems-level control without abstraction theater.
+**Forth** — Direct hardware access, minimal runtime. Systems-level control without abstraction theater.
 
 The goal: COBOL's clarity + Ada's rigor + Forth's directness.
 
@@ -101,10 +172,10 @@ IfCondition GreaterThan(x, 0) ThenBlock: {
 The nesting IS the precedence. You can't get it wrong.
 
 ### Scientific Infix Math
-For math-heavy code, AILang supports infix inside parentheses—scientific notation, not C notation:
+For math-heavy code, AILang supports infix inside parentheses — scientific notation, not C notation:
 ```ailang
 velocity = ((initial_v * t) + (0.5 * a * (t ^ 2)))  // Infix when math IS the point
-distance = Add(Multiply(initial_v, t), ...)         // Named when clarity matters
+distance = Add(Multiply(initial_v, t), ...)           // Named when clarity matters
 ```
 Both compile identically. Choose based on context.
 
@@ -131,7 +202,7 @@ LinkagePool.Customer {
 customer = AllocateLinkage(LinkagePool.Customer)
 customer@name = "Alice"
 customer@balance = 100
-customer@account@routing = 12345   // Chained access - compiler tracks types!
+customer@account@routing = 12345   // Chained access — compiler tracks types
 FreeLinkage(customer, LinkagePool.Customer)
 ```
 
@@ -139,36 +210,43 @@ FreeLinkage(customer, LinkagePool.Customer)
 
 **Type propagation:** `PointerTo=` lets the compiler track types through pointer chains. `customer@account@routing` works because the compiler knows `account` points to a `LinkagePool.Account`.
 
-Influenced by COBOL's LINKAGE SECTION—data structures with clear contracts.
+Influenced by COBOL's LINKAGE SECTION — data structures with clear contracts.
 
 ### Functions vs Subroutines
-**Functions** - Computation with contracts (Input/Output/Body). Stack-based locals. Unit of reasoning.
+**Functions** — Computation with contracts (Input/Output/Body). Stack-based locals. Unit of reasoning.
 
-**Subroutines** - Imperative coordination. Shared state via pools. About *doing*, not computing.
+**Subroutines** — Imperative coordination. Shared state via pools. About *doing*, not computing.
 
 ### Formal Grammar
-AILang has a complete BNF specification - not informal docs, but a real grammar definition covering all constructs: pools, functions, control flow, expressions, operators, and the 50+ math/bit primitives. The parser implements this grammar directly.
+AILang has a complete BNF specification — not informal docs, but a real grammar definition covering all constructs: pools, functions, control flow, expressions, operators, and the 50+ math/bit primitives. The parser implements this grammar directly.
+
+### Import System
 ```ailang
-LibraryImport.Customer
-LibraryImport.Order
+// Library imports — pull from Librarys/ directory
+LibraryImport.JSON
+LibraryImport.Compiler.Frontend.Lexer.CLexerMain
+
+// Local imports — pull from the same folder as your file
+Import.Utils
+Import.GameLogic
+Import.Renderer
 ```
 No headers. No forward declarations. No include guards. Conflict resolution at import time.
 
-### Primitives vs Libraries: Where Functionality Lives
+**Two forms:** `LibraryImport` resolves from the `Librarys/` directory tree. `Import` resolves from the current file's directory — perfect for splitting large programs into manageable pieces. Create a folder, split your code across files, and `Import.FileName` pulls them in. This also makes AI-assisted development easier: hand an LLM one file at a time instead of a 3,000-line monolith.
 
-**Primitives (in compiler):** Operations you'd otherwise rewrite in every project. AILang includes ~300 built-in primitives:
+### Primitives vs Libraries
+
+**Primitives (in compiler):** ~300 built-in operations you'd otherwise rewrite in every project:
 - 22+ string operations (`StringConcat`, `StringLength`, `StringCompare`, `StringToUpper`...)
 - Memory operations (`Allocate`, `Deallocate`, `MemoryCopy`, `GetByte`, `SetByte`...)
 - Math operations (`Add`, `Multiply`, `Power`, `SquareRoot`, `Sin`, `Cos`...)
 - File I/O (`ReadTextFile`, `WriteTextFile`, `FileExists`...)
+- Bitwise operations (`BitwiseAnd`, `LeftShift`, `RightShift`...)
 
-**Libraries (opt-in):** Complex abstractions that not everyone needs:
-- `Library.OOP` - Classes, inheritance, method dispatch (if you want OOP)
-- `Library.HashMap` - Hash tables
-- `Library.JSON` - JSON parsing
-- `Library.PostgreSQL` - Database connectivity
+**Libraries (opt-in):** Complex abstractions that not everyone needs — `Library.OOP`, `Library.HashMap`, `Library.JSON`, `Library.SQL`, `Library.PostgreSQL`.
 
-This split is intentional: primitives eliminate boilerplate, libraries stay optional. You don't pay for OOP if you don't use it, but you never have to write `StringConcat` yourself.
+You don't pay for OOP if you don't use it, but you never have to write `StringConcat` yourself.
 
 ---
 
@@ -176,10 +254,10 @@ This split is intentional: primitives eliminate boilerplate, libraries stay opti
 
 A complete development environment:
 
-- **Console** - Interactive REPL, load/parse/compile/run from one interface
-- **Built-in Editor** - Nano-style with syntax highlighting
-- **Static Analysis** - Memory leak detection, unused variables, signature checking
-- **Debug Primitives** - Zero overhead in production:
+- **Console** — Interactive REPL, load/parse/compile/run from one interface
+- **Built-in Editor** — Nano-style with syntax highlighting
+- **Static Analysis** — Three-pass analyzer: memory, control flow, data flow
+- **Debug Primitives** — Zero overhead in production:
 
 ```ailang
 DebugAssert(GreaterThan(balance, 0), "Balance must be positive")
@@ -195,13 +273,13 @@ CodeEmit/
 ├── X86/                   # x86-64 (complete)
 └── RISCV/                 # Future target
 ```
-Adding architectures means implementing backend functions—compiler logic stays unchanged.
+Adding architectures means implementing backend functions — compiler logic stays unchanged.
 
 ---
 
 ## Compiler Capabilities
 
-### ✅ Fully Working
+### Fully Working
 
 | Category | Features |
 |----------|----------|
@@ -214,7 +292,7 @@ Adding architectures means implementing backend functions—compiler logic stays
 | **Arrays** | ArrayCreate, ArrayGet, ArraySet, ArrayLength, ArrayDestroy |
 | **Dynamic Arrays** | XArray.XCreate, XPush, XGet, XSet, XSize, XDestroy |
 | **Memory** | Allocate, Deallocate, StoreValue, Dereference, GetByte, SetByte, MemoryCopy, MemorySet |
-| **LinkagePool** | AllocateLinkage, FreeLinkage, `@` field access, PointerTo chaining, Type embedding, Direction enforcement |
+| **LinkagePool** | AllocateLinkage, FreeLinkage, `@` field access, PointerTo chaining, Type embedding |
 | **Control Flow** | IfCondition/ThenBlock/ElseBlock, WhileLoop, ForEach, ExitLoop, ContinueLoop, Branch/Case |
 | **Functions** | Function/SubRoutine definitions, parameters (6 registers), locals, nested calls, ReturnValue |
 | **File I/O** | WriteTextFile, ReadTextFile, FileExists, GetFileSize |
@@ -225,11 +303,16 @@ Adding architectures means implementing backend functions—compiler logic stays
 
 ## Quick Start
 
-### Prerequisites
-- Linux x86-64
-- Python 3.x (for initial bootstrap only)
+### Using the VS Code Extension (Recommended)
 
-### Bootstrap the Compiler
+1. Install the `.vsix` (see Install section above)
+2. Open any `.ailang` file — syntax highlighting and diagnostics activate automatically
+3. `F5` to compile and run
+4. `Ctrl+Shift+A` to run static analysis
+5. `Ctrl+Shift+P` → "AILang: Show Flow Graph" for the interactive connectome
+
+### From the Command Line
+
 ```bash
 git clone https://github.com/AiLang-Author/Ailang-Self-Hosting-.git
 cd Ailang-Self-Hosting-
@@ -242,7 +325,7 @@ ailang> quit
 
 # Verify self-hosting (should produce identical binary)
 ./compiler2.x
-ailang> load ailang_console.ailang  
+ailang> load ailang_console.ailang
 ailang> build compiler3.x
 ailang> quit
 
@@ -250,6 +333,7 @@ cmp compiler2.x compiler3.x  # No output = identical!
 ```
 
 ### Compile a Program
+
 ```bash
 ./compiler.x
 ailang> load myprogram.ailang
@@ -288,19 +372,31 @@ Function.Factorial {
 
 ### Multi-File Projects
 ```ailang
-Import.utils
-Import.math
+// Split a big program across files in the same folder:
+//   myproject/
+//     main.ailang        ← this file
+//     Utils.ailang
+//     GameLogic.ailang
+//     Renderer.ailang
+
+Import.Utils
+Import.GameLogic
+Import.Renderer
+
+// Or pull shared libraries from Librarys/
+LibraryImport.JSON
+LibraryImport.HashMap
 
 SubRoutine.Main {
-    result = Math_Add(10, 20)
-    Utils_PrintResult(result)
+    data = JSON.Parse(ReadTextFile("config.json"))
+    GameLogic_Init(data)
+    Renderer_Start()
 }
 RunTask(Main)
 ```
 
 ### Memory Management
 ```ailang
-// Direct memory control
 buffer = Allocate(1024)
 SetByte(buffer, 0, 65)      // Write 'A'
 char = GetByte(buffer, 0)   // Read back
@@ -327,9 +423,9 @@ node@next@value = 100    // Chained access works!
 **Dec 15, 2025 → Jan 27, 2026. 43 days.**
 
 **What this proves:**
-1. **Expressiveness** - Lexing, parsing, AST, code generation, symbol tables, scope management—all in AILang.
-2. **AI collaboration velocity** - Clear syntax means AI suggestions are correct more often. Structure catches bugs earlier.
-3. **Verbosity ≠ bloat** - Deep primitives reduce glue code. Structure reduces error handling.
+1. **Expressiveness** — Lexing, parsing, AST, code generation, symbol tables, scope management — all in AILang
+2. **AI collaboration velocity** — Clear syntax means AI suggestions are correct more often. Structure catches bugs earlier
+3. **Verbosity ≠ bloat** — Deep primitives reduce glue code. Structure reduces error handling
 
 **Compare to TCC (Tiny C Compiler):** TCC needs ~100,000 lines of C for ANSI C89/C99. AILang needs ~43,000 lines for ~300 primitives PLUS integrated tooling.
 
@@ -356,7 +452,7 @@ node@next@value = 100    // Chained access works!
 | Named operators | Precedence bugs | Unambiguous by construction |
 | Scientific infix | Math readability | Domain experts read domain code |
 | No globals | Hidden dependencies | All state flows explicit |
-| LinkagePool | Pointer ambiguity | `@` operator - unambiguous, grep-friendly |
+| LinkagePool | Pointer ambiguity | `@` operator — unambiguous, grep-friendly |
 | PointerTo= | Lost type info | Compiler tracks types through chains |
 | Primitives vs Libs | Boilerplate vs bloat | 300 built-ins, OOP optional |
 | Functions vs Subroutines | Confused intent | Computation vs coordination |
@@ -422,21 +518,30 @@ node@next@value = 100    // Chained access works!
 AILangSH/
 ├── ailang_console.ailang      # Self-hosting compiler source
 ├── compiler.x                 # Compiled self-hosting compiler
+├── ailang_lsp.ailang          # LSP server source (also self-hosting)
 │
 ├── Librarys/
 │   ├── Compiler/
 │   │   ├── Frontend/
-│   │   │   ├── Lexer/         # CLexer - tokenization
-│   │   │   ├── Parser/        # CParser - AST generation
+│   │   │   ├── Lexer/         # CLexer — tokenization
+│   │   │   ├── Parser/        # CParser — AST generation
 │   │   │   └── AST/           # AST types and operations
 │   │   ├── Compile/
-│   │   │   └── Modules/       # CCompile* - compilation
+│   │   │   └── Modules/       # CCompile* — compilation
 │   │   ├── CodeEmit/
-│   │   │   └── X86/           # CEmitX86* - x86-64 code gen
+│   │   │   └── X86/           # CEmitX86* — x86-64 code gen
+│   │   ├── Import/            # Import resolution + FileMap
 │   │   └── Output/            # ELF builder
 │   │
 │   ├── Library.XArrays.ailang # Dynamic arrays
-│   └── Library.FileIO.ailang  # File operations
+│   ├── Library.JSON.ailang    # JSON serialization
+│   ├── Library.OOP.ailang     # Optional OOP support
+│   └── Library.HashMap.ailang # Hash tables
+│
+├── vscode-extension/          # VS Code extension source
+│   ├── extension.js           # Extension logic
+│   ├── package.json           # Extension manifest
+│   └── resources/             # Icons
 │
 └── TestCode/                  # Test programs
 ```
@@ -457,13 +562,16 @@ AILangSH/
 
 ## Roadmap
 
-- [x] Self-hosting compiler
+- [x] Self-hosting compiler (byte-identical across generations)
 - [x] Hex/octal/binary literals
 - [x] Float support (SSE)
-- [x] Static analysis tools
-- [x] Complete standard library
+- [x] Three-pass static analysis (MEM/CFG/DFA)
+- [x] VS Code extension with bundled toolchain
+- [x] Multi-file import resolution in LSP
+- [x] Interactive connectome visualization
 - [ ] RISC-V backend
 - [ ] Multi-platform support
+- [ ] Debug stepping integration
 
 ---
 
@@ -478,5 +586,5 @@ See [LICENSE](LICENSE) for full terms.
 ---
 
 <p align="center">
-  <strong>AILang: Written in itself. Compiling itself. Running itself.</strong>
+  <strong>AILang: Written in itself. Compiling itself. Analyzing itself.</strong>
 </p>

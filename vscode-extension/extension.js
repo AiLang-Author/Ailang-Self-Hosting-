@@ -541,6 +541,15 @@ function resolveAilangModule(moduleName, document) {
 function activate(context) {
     console.log('AILang extension active (Phase 2)');
 
+    // Force .ailang file association — works around VS Code caching files as Plain Text
+    const config = vscode.workspace.getConfiguration('files');
+    const assoc = config.get('associations') || {};
+    if (!assoc['*.ailang']) {
+        assoc['*.ailang'] = 'ailang';
+        config.update('associations', assoc, vscode.ConfigurationTarget.Global);
+    }
+
+
     diagnosticCollection = vscode.languages.createDiagnosticCollection('ailang');
     context.subscriptions.push(diagnosticCollection);
     const flowLog = vscode.window.createOutputChannel('AILang Flow Debug');
