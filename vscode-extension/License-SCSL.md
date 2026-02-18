@@ -1,0 +1,32 @@
+Sean Collins Software License (SCSL v1.0)
+=========================================
+
+Copyright © 2025 Sean Collins. All rights reserved.
+
+This software is licensed under the following terms:
+
+1. Free Use
+-----------
+You may use this software at no cost if:
+- You are an individual using it for personal or academic, non-commercial purposes.
+
+2. Commercial Use
+-----------------
+Commercial use is strictly prohibited without a valid paid license.
+License terms and pricing are available upon request.
+To inquire, contact: smc.collins1977@gmail.com
+
+3. Redistribution, Forking, and Modification
+--------------------------------------------
+- Forking or redistribution of this codebase is not permitted.
+- All modifications must be submitted upstream for review.
+- You may not create derivative works or alternate versions without written permission.
+
+4. Warranty and Liability
+-------------------------
+This software is provided “as-is” with no warranty of any kind.
+Use at your own risk.
+
+By using this software, you agree to the terms above.
+
+Sean Collins

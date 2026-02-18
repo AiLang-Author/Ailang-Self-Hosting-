@@ -2,7 +2,9 @@
 
 Full-featured language support for AILang — the self-hosting, explicit-syntax systems programming language.
 
-**Publisher:** 2Paws · **Version:** 0.1.2 · **Requires:** VS Code 1.75+
+**Compiler + three-pass static analyzer + LSP + interactive code graph — all in ~500KB. Zero dependencies.**
+
+**Publisher:** 2Paws · **Version:** 1.0.0 · **Requires:** VS Code 1.75+
 
 ---
 
@@ -55,7 +57,13 @@ A ▶ Run button also appears in the editor title bar for any `.ailang` file, an
 
 ### Real-Time Diagnostics
 
-The LSP tool runs automatically when you open or save an `.ailang` file. Errors and warnings appear inline in the editor and in the Problems panel. No manual step required.
+The LSP runs three analysis passes automatically when you open or save an `.ailang` file:
+
+- **Pass 1 (MEM)** — Memory lifecycle: leaks, double-free, use-after-free, unused variables
+- **Pass 2 (CFG)** — Control flow: null dereference, unreachable code, infinite loops, missing else branches
+- **Pass 3 (DFA)** — Data flow: read-before-write, variable shadowing, arena allocation in loops, recursion detection
+
+Errors and warnings appear inline in the editor and in the Problems panel. Diagnostics are routed to the correct file with accurate line numbers, even across imported modules. No manual step required.
 
 ### IntelliSense and Completions
 
@@ -131,6 +139,10 @@ The editor's Outline view (sidebar) shows all symbols in the current file organi
 ### Go to Definition
 
 `F12` or `Ctrl+Click` on any symbol jumps to its definition within the file.
+
+### Hover Information
+
+Hover over any symbol to see its kind, scope, line number, and — for functions — parameters, return type, and call graph (who calls it, what it calls). Pool hovers show their fields.
 
 ### Connectome — Interactive Code Graph
 
@@ -246,11 +258,18 @@ File symbols come from the LSP cache, which populates on open and save. Try savi
 
 AILang is a self-hosting systems programming language designed around radical explicitness. Every operation is a named function call — no operator precedence, no implicit behavior, no hidden control flow. The language is designed so that source code reads unambiguously by humans and machines alike.
 
-The compiler is written in AILang itself. It compiles AILang source to native x86-64 Linux executables through a pipeline of lexing, parsing, AST construction, compilation, x86 code emission, and ELF64 binary output.
+The compiler is written in AILang itself — 43,000+ lines across 75 files, achieving byte-identical self-hosting in 43 days. It compiles AILang source to native x86-64 Linux executables through a pipeline of lexing, parsing, AST construction, compilation, x86 code emission, and ELF64 binary output.
 
 For more information, see the [GitHub repository](https://github.com/AiLang-Author/Ailang-Self-Hosting-).
 
 ---
 
-**Sean Collins Software License (SCSL)**
-Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+## License
+
+This extension uses a **dual license** structure:
+
+**VS Code extension** (extension.js, package.json, TextMate grammar, snippets, documentation) — [MIT License](LICENSE). Free to use, modify, and redistribute.
+
+**AILang compiler and tools** (ailang.x, ailang_lsp.x, and all AILang source code) — [Sean Collins Software License (SCSL)](LICENSE-COMPILER.md). Free for personal and academic use. Commercial use requires a paid license. Forking and redistribution of source code is not permitted.
+
+Copyright (c) 2025–2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.

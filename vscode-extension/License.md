@@ -1,32 +1,31 @@
-Sean Collins Software License (SCSL v1.0)
-=========================================
+MIT License
 
-Copyright © 2025 Sean Collins. All rights reserved.
+Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering
 
-This software is licensed under the following terms:
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-1. Free Use
------------
-You may use this software at no cost if:
-- You are an individual using it for personal or academic, non-commercial purposes.
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-2. Commercial Use
------------------
-Commercial use is strictly prohibited without a valid paid license.
-License terms and pricing are available upon request.
-To inquire, contact: smc.collins1977@gmail.com
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
-3. Redistribution, Forking, and Modification
---------------------------------------------
-- Forking or redistribution of this codebase is not permitted.
-- All modifications must be submitted upstream for review.
-- You may not create derivative works or alternate versions without written permission.
+---
 
-4. Warranty and Liability
--------------------------
-This software is provided “as-is” with no warranty of any kind.
-Use at your own risk.
+SCOPE: This MIT License applies to the VS Code extension components only:
+extension.js, package.json, language-configuration.json, TextMate grammar
+(syntaxes/), code snippets, and documentation files.
 
-By using this software, you agree to the terms above.
-
-Sean Collins
+The AILang compiler (ailang.x), language server (ailang_lsp.x), and all AILang
+source code (.ailang files) are licensed separately under the Sean Collins
+Software License (SCSL). See LICENSE-COMPILER.md.

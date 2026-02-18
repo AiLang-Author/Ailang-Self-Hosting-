@@ -1814,7 +1814,8 @@ let dragNodeRef = null;
 Object.defineProperty(window, '_dragNode', { get: () => dragNode });
 
 function loop() {
-    simulate();
+    // Optimization: Only run physics if the simulation is "hot" or user is dragging a node
+    if (simCooldown > 0 || dragNode) simulate();
     draw();
     requestAnimationFrame(loop);
 }
