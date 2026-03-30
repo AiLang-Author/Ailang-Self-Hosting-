@@ -1,0 +1,183 @@
+// Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// PATENT Pending. USTPO Filing Date 11-10-2025
+// Licensed under the Sean Collins Software License (SCSL). See the LICENSE file in the root directory
+// of this project for the full terms and conditions, including restrictions on forking, corporate use,
+// and permissions for private/teaching purposes.
+
+// FFN.ailang
+// RMSNorm, SiLU activation, Feed-Forward Network.
+// All arithmetic is native float64 — no fixed-point scaling.
+
+Import.Config
+Import.ModelLoader
+
+// ============================================================================
+// RMSNORM
+// Reads from LayerInput.x_ptr, writes normalised vector to LayerOutput.x_ptr.
+// Uses the learned norm weight vector from the model arena when norm_weights != 0.
+// After completion sets the next command in ControlMailbox.slot0.
+// ============================================================================
+
+SubRoutine.RMSNorm {
+    // --- sum of squares ---
+    sum_sq = 0.0
+    dim = 0
+    WhileLoop LessThan(dim, Config.hidden_dim) {
+        ptr = Add(LayerInput.x_ptr, Multiply(dim, 8))
+        val = Dereference(ptr)
+        sum_sq = Add(sum_sq, Multiply(val, val))
+        dim = Add(dim, 1)
+    }
+
+    // mean square then RMS
+    mean_sq = Divide(sum_sq, Config.hidden_dim)
+    rms_val = SquareRoot(Add(mean_sq, 1e-5))
+
+    inv_rms = 0.0
+    IfCondition GreaterThan(rms_val, 0.0) ThenBlock: {
+        inv_rms = Divide(1.0, rms_val)
+    }
+
+    // --- normalise and apply learned weight ---
+    // norm_weights_ptr is set by the caller (Layer.ailang) before RunTask(RMSNorm)
+    dim = 0
+    WhileLoop LessThan(dim, Config.hidden_dim) {
+        byte_off = Multiply(dim, 8)
+        in_ptr   = Add(LayerInput.x_ptr, byte_off)
+        out_ptr  = Add(LayerOutput.x_ptr, byte_off)
+        val      = Dereference(in_ptr)
+        norm_val = Multiply(val, inv_rms)
+
+        // Apply learned scale weight if provided
+        IfCondition NotEqual(RMSNorm_WeightPtr, 0) ThenBlock: {
+            w_ptr    = Add(RMSNorm_WeightPtr, byte_off)
+            w        = Dereference(w_ptr)
+            norm_val = Multiply(norm_val, w)
+        }
+
+        StoreValue(out_ptr, norm_val)
+        dim = Add(dim, 1)
+    }
+
+    // --- signal next stage ---
+    IfCondition EqualTo(State.current_command, Commands.CMD_RMS_NORM_PRE) ThenBlock: {
+        ControlMailbox.slot0 = Commands.CMD_PROJECT_Q
+    } ElseBlock: {
+        IfCondition EqualTo(State.current_command, Commands.CMD_RMS_NORM_FFN) ThenBlock: {
+            ControlMailbox.slot0 = Commands.CMD_FFN
+        }
+    }
+
+    ReturnValue(0)
+}
+
+// ============================================================================
+// SILU
+// SiLU(x) = x * sigmoid(x) = x / (1 + exp(-x))
+// Native float — Math.Exp gives proper precision.
+// ============================================================================
+
+Function.SiLU {
+    Input: x: Float
+    Output: Float
+    Body: {
+        neg_x   = Multiply(x, -1.0)
+        exp_neg = Math.Exp(neg_x)
+        denom   = Add(1.0, exp_neg)
+        sigmoid = Divide(1.0, denom)
+        ReturnValue(Multiply(x, sigmoid))
+    }
+}
+
+// ============================================================================
+// FFN
+// Gated FFN: output = W_down * (SiLU(W_gate * x) * (W_up * x))
+// Reads from LayerInput.x_ptr, writes to LayerOutput.x_ptr.
+// Weight matrices come from the Model arena via Model_Get* accessors.
+// ============================================================================
+
+SubRoutine.FFN {
+    hidden = Config.hidden_dim
+    inter  = Config.intermediate_size
+
+    w_gate = Model_GetWGate(State.current_layer)
+    w_up   = Model_GetWUp(State.current_layer)
+    w_down = Model_GetWDown(State.current_layer)
+
+    // Allocate two intermediate vectors: gate_vec and up_vec
+    gate_vec = Allocate(Multiply(inter, 8))
+    up_vec   = Allocate(Multiply(inter, 8))
+
+    // --- gate projection: gate_vec = W_gate * x ---
+    out_dim = 0
+    WhileLoop LessThan(out_dim, inter) {
+        sum = 0.0
+        in_dim = 0
+        WhileLoop LessThan(in_dim, hidden) {
+            x_ptr  = Add(LayerInput.x_ptr, Multiply(in_dim, 8))
+            x_val  = Dereference(x_ptr)
+            w_off  = Multiply(Add(Multiply(out_dim, hidden), in_dim), 8)
+            w_ptr  = Add(w_gate, w_off)
+            w_val  = Dereference(w_ptr)
+            sum    = Add(sum, Multiply(x_val, w_val))
+            in_dim = Add(in_dim, 1)
+        }
+        StoreValue(Add(gate_vec, Multiply(out_dim, 8)), sum)
+        out_dim = Add(out_dim, 1)
+    }
+
+    // --- up projection: up_vec = W_up * x ---
+    out_dim = 0
+    WhileLoop LessThan(out_dim, inter) {
+        sum = 0.0
+        in_dim = 0
+        WhileLoop LessThan(in_dim, hidden) {
+            x_ptr  = Add(LayerInput.x_ptr, Multiply(in_dim, 8))
+            x_val  = Dereference(x_ptr)
+            w_off  = Multiply(Add(Multiply(out_dim, hidden), in_dim), 8)
+            w_ptr  = Add(w_up, w_off)
+            w_val  = Dereference(w_ptr)
+            sum    = Add(sum, Multiply(x_val, w_val))
+            in_dim = Add(in_dim, 1)
+        }
+        StoreValue(Add(up_vec, Multiply(out_dim, 8)), sum)
+        out_dim = Add(out_dim, 1)
+    }
+
+    // --- fuse: hidden_vec[i] = SiLU(gate_vec[i]) * up_vec[i] ---
+    // Reuse gate_vec to hold the fused result
+    i = 0
+    WhileLoop LessThan(i, inter) {
+        g_ptr   = Add(gate_vec, Multiply(i, 8))
+        u_ptr   = Add(up_vec,   Multiply(i, 8))
+        g_val   = Dereference(g_ptr)
+        u_val   = Dereference(u_ptr)
+        fused   = Multiply(SiLU(g_val), u_val)
+        StoreValue(g_ptr, fused)
+        i = Add(i, 1)
+    }
+
+    // --- down projection: output = W_down * fused ---
+    out_dim = 0
+    WhileLoop LessThan(out_dim, hidden) {
+        sum = 0.0
+        in_dim = 0
+        WhileLoop LessThan(in_dim, inter) {
+            f_ptr  = Add(gate_vec, Multiply(in_dim, 8))
+            f_val  = Dereference(f_ptr)
+            w_off  = Multiply(Add(Multiply(out_dim, inter), in_dim), 8)
+            w_ptr  = Add(w_down, w_off)
+            w_val  = Dereference(w_ptr)
+            sum    = Add(sum, Multiply(f_val, w_val))
+            in_dim = Add(in_dim, 1)
+        }
+        StoreValue(Add(LayerOutput.x_ptr, Multiply(out_dim, 8)), sum)
+        out_dim = Add(out_dim, 1)
+    }
+
+    Deallocate(gate_vec, Multiply(inter, 8))
+    Deallocate(up_vec,   Multiply(inter, 8))
+
+    ControlMailbox.slot0 = Commands.CMD_RESIDUAL_2
+    ReturnValue(0)
+}
