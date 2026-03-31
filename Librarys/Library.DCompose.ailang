@@ -3,26 +3,25 @@
 //
 // Library.DCompose.ailang
 // Compositor tick loop — connects Ring2 → dirty → BSP → blit
-// Phase 4: Axis 2 — Compose
+// Phase 7b: Ring0 window handlers + WinTable + WinColors
 //
 // Tick order (every frame):
 //   1. Drain Ring 0 (focus/control/BSP changes)
 //   2. Drain Ring 1 (input — not yet wired, placeholder)
 //   3. Process Ring 2 (draw commands → mark dirty)
 //   4. Process Ring 3 (dirty regions → BSP query → blit)
-//
-// Usage: LibraryImport.DCompose
 
 LibraryImport.DSurfaceTypes
 LibraryImport.DSurface
+LibraryImport.DDrawPixel
 LibraryImport.Framebuffer
+LibraryImport.DRenderFB
 LibraryImport.DRingTypes
 LibraryImport.DRing
 LibraryImport.DRing0
 LibraryImport.DRing1
 LibraryImport.DRing2
 LibraryImport.DRing3
-LibraryImport.DRenderFB
 LibraryImport.DComposeTypes
 LibraryImport.DComposeBSP
 LibraryImport.DComposeStack
@@ -47,6 +46,7 @@ Function.Compose_Init {
         Ring1_Init()
         Ring2_Init()
         Ring3_Init()
+        WinTable_Init()
 
         Compositor.focused_leaf  = root
         Compositor.focus_mode    = Add(FocusMode.CLICK_TO_FOCUS, 65536)
@@ -75,17 +75,15 @@ SubRoutine.Compose_Shutdown {
 }
 
 // =============================================================================
-// NEW: Compose_InitFB
+// Compose_InitFB
 // Call after RenderFB_Init (or RenderFB_InitDouble) to enable FB blit path.
-// Sets ComposeOutput.mode and records fb offsets.
 // =============================================================================
 Function.Compose_InitFB {
     Input: offset_x: Integer
     Input: offset_y: Integer
     Output: Integer
     Body: {
-        // mode=2 with StoreValue bias
-        ComposeOutput.mode       = Add(2, 65536)
+        ComposeOutput.mode        = Add(2, 65536)
         ComposeOutput.fb_offset_x = Add(offset_x, 65536)
         ComposeOutput.fb_offset_y = Add(offset_y, 65536)
         PrintMessage("[Compose] FB blit mode enabled\n")
@@ -94,23 +92,319 @@ Function.Compose_InitFB {
 }
 
 // =============================================================================
-// TICK PHASE 1 — Drain Ring 0 (focus/control)
+// WIN TABLE — maps BSP leaf → surface handle
+// 16 entries max. Each entry: [leaf_ptr(8), surface_ptr(8)] = 16 bytes
+// Total = 256 bytes allocated once on init.
+// =============================================================================
+FixedPool.WinTable {
+    "entries": Initialize=0
+    "count":   Initialize=0
+}
+
+FixedPool.WinTableConst {
+    "MAX":        Initialize=16
+    "ENTRY_SIZE": Initialize=16
+    "LEAF_OFS":   Initialize=0
+    "SURF_OFS":   Initialize=8
+}
+
+SubRoutine.WinTable_Init {
+    WinTable.entries = Allocate(256)
+    WinTable.count   = 0
+    i = 0
+    WhileLoop LessThan(i, 256) {
+        SetByte(WinTable.entries, i, 0)
+        i = Add(i, 1)
+    }
+    PrintMessage("[WinTable] initialized\n")
+}
+
+Function.WinTable_Add {
+    Input:  leaf:    Integer
+    Input:  surface: Integer
+    Output: Integer
+    Body: {
+        cnt = WinTable.count
+        IfCondition GreaterEqual(cnt, WinTableConst.MAX) ThenBlock: {
+            PrintMessage("[WinTable] ERROR: table full\n")
+            ReturnValue(0)
+        }
+        base = Add(WinTable.entries, Multiply(cnt, WinTableConst.ENTRY_SIZE))
+        StoreValue(Add(base, WinTableConst.LEAF_OFS), leaf)
+        StoreValue(Add(base, WinTableConst.SURF_OFS), surface)
+        WinTable.count = Add(cnt, 1)
+        ReturnValue(1)
+    }
+}
+
+Function.WinTable_GetSurface {
+    Input:  leaf: Integer
+    Output: Integer
+    Body: {
+        cnt    = WinTable.count
+        i      = 0
+        result = 0
+        WhileLoop LessThan(i, cnt) {
+            base       = Add(WinTable.entries, Multiply(i, WinTableConst.ENTRY_SIZE))
+            entry_leaf = Dereference(Add(base, WinTableConst.LEAF_OFS))
+            IfCondition EqualTo(entry_leaf, leaf) ThenBlock: {
+                result = Dereference(Add(base, WinTableConst.SURF_OFS))
+                i = cnt
+            } ElseBlock: {
+                i = Add(i, 1)
+            }
+        }
+        ReturnValue(result)
+    }
+}
+
+Function.WinTable_Remove {
+    Input:  leaf: Integer
+    Output: Integer
+    Body: {
+        cnt   = WinTable.count
+        found = 0
+        i     = 0
+        WhileLoop LessThan(i, cnt) {
+            base       = Add(WinTable.entries, Multiply(i, WinTableConst.ENTRY_SIZE))
+            entry_leaf = Dereference(Add(base, WinTableConst.LEAF_OFS))
+            IfCondition EqualTo(entry_leaf, leaf) ThenBlock: {
+                found = 1
+                j = Add(i, 1)
+                WhileLoop LessThan(j, cnt) {
+                    src      = Add(WinTable.entries, Multiply(j,             WinTableConst.ENTRY_SIZE))
+                    dst      = Add(WinTable.entries, Multiply(Subtract(j,1), WinTableConst.ENTRY_SIZE))
+                    lv       = Dereference(Add(src, WinTableConst.LEAF_OFS))
+                    sv       = Dereference(Add(src, WinTableConst.SURF_OFS))
+                    StoreValue(Add(dst, WinTableConst.LEAF_OFS), lv)
+                    StoreValue(Add(dst, WinTableConst.SURF_OFS), sv)
+                    j = Add(j, 1)
+                }
+                WinTable.count = Subtract(cnt, 1)
+                i = cnt
+            } ElseBlock: {
+                i = Add(i, 1)
+            }
+        }
+        ReturnValue(found)
+    }
+}
+
+SubRoutine.WinTable_MarkAllDirty {
+    cnt = WinTable.count
+    i   = 0
+    WhileLoop LessThan(i, cnt) {
+        base = Add(WinTable.entries, Multiply(i, WinTableConst.ENTRY_SIZE))
+        surf = Dereference(Add(base, WinTableConst.SURF_OFS))
+        IfCondition NotEqual(surf, 0) ThenBlock: {
+            w = Surface_GetWidth(surf)
+            h = Surface_GetHeight(surf)
+            Ring3_MarkDirty(surf, 0, 0, w, h)
+        }
+        i = Add(i, 1)
+    }
+}
+
+// =============================================================================
+// COLOR TABLE — cycle through distinct window colors
+// =============================================================================
+FixedPool.WinColors {
+    "idx": Initialize=0
+    "c0":  Initialize=0x1A3A5C
+    "c1":  Initialize=0x3A1A1A
+    "c2":  Initialize=0x1A3A1A
+    "c3":  Initialize=0x3A3A1A
+    "c4":  Initialize=0x2A1A3A
+    "c5":  Initialize=0x1A3A3A
+    "c6":  Initialize=0x3A2A1A
+    "c7":  Initialize=0x2A2A2A
+}
+
+Function.WinColors_Next {
+    Output: Integer
+    Body: {
+        idx = WinColors.idx
+        col = WinColors.c0
+        IfCondition EqualTo(idx, 1) ThenBlock: { col = WinColors.c1 }
+        IfCondition EqualTo(idx, 2) ThenBlock: { col = WinColors.c2 }
+        IfCondition EqualTo(idx, 3) ThenBlock: { col = WinColors.c3 }
+        IfCondition EqualTo(idx, 4) ThenBlock: { col = WinColors.c4 }
+        IfCondition EqualTo(idx, 5) ThenBlock: { col = WinColors.c5 }
+        IfCondition EqualTo(idx, 6) ThenBlock: { col = WinColors.c6 }
+        IfCondition EqualTo(idx, 7) ThenBlock: { col = WinColors.c7 }
+        next = Add(idx, 1)
+        IfCondition GreaterEqual(next, 8) ThenBlock: { next = 0 }
+        WinColors.idx = next
+        ReturnValue(col)
+    }
+}
+
+// =============================================================================
+// WIN CREATE FOR LEAF — allocate surface, fill color, white border, register
+// =============================================================================
+Function.WinCreate_ForLeaf {
+    Input:  leaf: Integer
+    Output: Integer
+    Body: {
+        w = BSP_GetRegionW(leaf)
+        h = BSP_GetRegionH(leaf)
+        IfCondition EqualTo(w, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(h, 0) ThenBlock: { ReturnValue(0) }
+
+        surf = Surface_Create(w, h, SurfaceFormat.PIXEL_32)
+        IfCondition EqualTo(surf, 0) ThenBlock: {
+            PrintMessage("[WinCreate] ERROR: Surface_Create failed\n")
+            ReturnValue(0)
+        }
+
+        col = WinColors_Next()
+        Draw_Pix_FillRect(surf, 0, 0, w, h, col)
+
+        // White border
+        bw = Subtract(w, 1)
+        bh = Subtract(h, 1)
+        Draw_Pix_HLine(surf, 0, bw, 0,  0xFFFFFF)
+        Draw_Pix_HLine(surf, 0, bw, bh, 0xFFFFFF)
+        Draw_Pix_VLine(surf, 0,  0, bh, 0xFFFFFF)
+        Draw_Pix_VLine(surf, bw, 0, bh, 0xFFFFFF)
+
+        WinTable_Add(leaf, surf)
+
+        PrintMessage("[WinCreate] leaf=")
+        PrintNumber(leaf)
+        PrintMessage(" ")
+        PrintNumber(w)
+        PrintMessage("x")
+        PrintNumber(h)
+        PrintMessage("\n")
+
+        ReturnValue(surf)
+    }
+}
+
+// =============================================================================
+// TICK PHASE 1 — Drain Ring 0 (focus/control/window management)
 // =============================================================================
 SubRoutine.Compose_TickRing0 {
     entry = Allocate(RingEntry.SIZE)
+
     WhileLoop EqualTo(Ring0_IsEmpty(), 0) {
         Ring0_Drain(entry)
         cmd = Subtract(Dereference(Add(entry, RingEntry.TYPE)),    65536)
         pa  = Subtract(Dereference(Add(entry, RingEntry.PARAM_A)), 65536)
+        pb  = Subtract(Dereference(Add(entry, RingEntry.PARAM_B)), 65536)
 
         IfCondition EqualTo(cmd, Ring0Cmd.FOCUS_SET) ThenBlock: {
             Compositor.focused_leaf = pa
         }
+
         IfCondition EqualTo(cmd, Ring0Cmd.QUIT) ThenBlock: {
             Compositor.initialized = Add(0, 65536)
         }
-        // Additional Ring0 commands wired in future phases
+
+        IfCondition EqualTo(cmd, Ring0Cmd.FOCUS_MODE) ThenBlock: {
+            Compositor.focus_mode = Add(pa, 65536)
+        }
+
+        IfCondition EqualTo(cmd, Ring0Cmd.WIN_CREATE) ThenBlock: {
+            focused = Compositor.focused_leaf
+            IfCondition NotEqual(focused, 0) ThenBlock: {
+                split_type = pa
+                split_pos  = pb
+                IfCondition EqualTo(split_pos, 0) ThenBlock: {
+                    IfCondition EqualTo(split_type, BSPNodeType.SPLIT_V) ThenBlock: {
+                        split_pos = Divide(BSP_GetRegionW(focused), 2)
+                    } ElseBlock: {
+                        split_pos = Divide(BSP_GetRegionH(focused), 2)
+                    }
+                }
+                new_leaf = BSP_Split(focused, split_type, split_pos)
+                IfCondition NotEqual(new_leaf, 0) ThenBlock: {
+                    WinCreate_ForLeaf(new_leaf)
+                    Compositor.focused_leaf = new_leaf
+                    WinTable_MarkAllDirty()
+                }
+            }
+        }
+
+        IfCondition EqualTo(cmd, Ring0Cmd.WIN_DESTROY) ThenBlock: {
+            target = pa
+            IfCondition EqualTo(target, 0) ThenBlock: {
+                target = Compositor.focused_leaf
+            }
+            IfCondition NotEqual(target, 0) ThenBlock: {
+                surf = WinTable_GetSurface(target)
+                IfCondition NotEqual(surf, 0) ThenBlock: {
+                    Surface_Destroy(surf)
+                    WinTable_Remove(target)
+                }
+                parent = BSP_GetParent(target)
+                IfCondition NotEqual(parent, 0) ThenBlock: {
+                    BSP_Merge(parent)
+                    Compositor.focused_leaf = parent
+                    WinTable_MarkAllDirty()
+                }
+            }
+        }
+
+        IfCondition EqualTo(cmd, Ring0Cmd.TILE_SPLIT_H) ThenBlock: {
+            focused = Compositor.focused_leaf
+            IfCondition NotEqual(focused, 0) ThenBlock: {
+                split_pos = pa
+                IfCondition EqualTo(split_pos, 0) ThenBlock: {
+                    split_pos = Divide(BSP_GetRegionH(focused), 2)
+                }
+                new_leaf = BSP_Split(focused, BSPNodeType.SPLIT_H, split_pos)
+                IfCondition NotEqual(new_leaf, 0) ThenBlock: {
+                    WinCreate_ForLeaf(new_leaf)
+                    Compositor.focused_leaf = new_leaf
+                    WinTable_MarkAllDirty()
+                }
+            }
+        }
+
+        IfCondition EqualTo(cmd, Ring0Cmd.TILE_SPLIT_V) ThenBlock: {
+            focused = Compositor.focused_leaf
+            IfCondition NotEqual(focused, 0) ThenBlock: {
+                split_pos = pa
+                IfCondition EqualTo(split_pos, 0) ThenBlock: {
+                    split_pos = Divide(BSP_GetRegionW(focused), 2)
+                }
+                new_leaf = BSP_Split(focused, BSPNodeType.SPLIT_V, split_pos)
+                IfCondition NotEqual(new_leaf, 0) ThenBlock: {
+                    WinCreate_ForLeaf(new_leaf)
+                    Compositor.focused_leaf = new_leaf
+                    WinTable_MarkAllDirty()
+                }
+            }
+        }
+
+        IfCondition EqualTo(cmd, Ring0Cmd.TILE_MERGE) ThenBlock: {
+            focused = Compositor.focused_leaf
+            IfCondition NotEqual(focused, 0) ThenBlock: {
+                parent = BSP_GetParent(focused)
+                IfCondition NotEqual(parent, 0) ThenBlock: {
+                    ca = BSP_GetChildA(parent)
+                    cb = BSP_GetChildB(parent)
+                    sa = WinTable_GetSurface(ca)
+                    sb = WinTable_GetSurface(cb)
+                    IfCondition NotEqual(sa, 0) ThenBlock: {
+                        Surface_Destroy(sa)
+                        WinTable_Remove(ca)
+                    }
+                    IfCondition NotEqual(sb, 0) ThenBlock: {
+                        Surface_Destroy(sb)
+                        WinTable_Remove(cb)
+                    }
+                    BSP_Merge(parent)
+                    WinCreate_ForLeaf(parent)
+                    Compositor.focused_leaf = parent
+                    WinTable_MarkAllDirty()
+                }
+            }
+        }
     }
+
     Deallocate(entry, RingEntry.SIZE)
 }
 
@@ -128,7 +422,6 @@ SubRoutine.Compose_TickRing2 {
         IfCondition EqualTo(surface, 0) ThenBlock: {
             // Invalid surface — skip
         } ElseBlock: {
-            // Mark entire surface dirty — compositor will blit it
             w = Surface_GetWidth(surface)
             h = Surface_GetHeight(surface)
             Ring3_MarkDirty(surface, 0, 0, w, h)
@@ -139,18 +432,15 @@ SubRoutine.Compose_TickRing2 {
 
 // =============================================================================
 // TICK PHASE 4 — Process Ring 3 (dirty regions → blit to output)
-// For each dirty region: BSP query → get active surface → blit
-// This is the compositor's core: opaque copy, no blending
 // =============================================================================
 SubRoutine.Compose_TickRing3 {
     IfCondition EqualTo(Ring3_IsDirty(), 0) ThenBlock: {
-        ReturnValue(0)   // nothing to do — zero cost idle
+        ReturnValue(0)
     }
 
     count = Ring3_GetCount()
     i = 0
     WhileLoop LessThan(i, count) {
-        // Read dirty entry from DirtyState
         surf = 0
         dx   = 0
         dy   = 0
@@ -185,36 +475,7 @@ SubRoutine.Compose_TickRing3 {
             dw   = Subtract(DirtyState.w3, 65536)
             dh   = Subtract(DirtyState.h3, 65536)
         }
-        IfCondition EqualTo(i, 4) ThenBlock: {
-            surf = DirtyState.surf4
-            dx   = DirtyState.x4
-            dy   = DirtyState.y4
-            dw   = Subtract(DirtyState.w4, 65536)
-            dh   = Subtract(DirtyState.h4, 65536)
-        }
-        IfCondition EqualTo(i, 5) ThenBlock: {
-            surf = DirtyState.surf5
-            dx   = DirtyState.x5
-            dy   = DirtyState.y5
-            dw   = Subtract(DirtyState.w5, 65536)
-            dh   = Subtract(DirtyState.h5, 65536)
-        }
-        IfCondition EqualTo(i, 6) ThenBlock: {
-            surf = DirtyState.surf6
-            dx   = DirtyState.x6
-            dy   = DirtyState.y6
-            dw   = Subtract(DirtyState.w6, 65536)
-            dh   = Subtract(DirtyState.h6, 65536)
-        }
-        IfCondition EqualTo(i, 7) ThenBlock: {
-            surf = DirtyState.surf7
-            dx   = DirtyState.x7
-            dy   = DirtyState.y7
-            dw   = Subtract(DirtyState.w7, 65536)
-            dh   = Subtract(DirtyState.h7, 65536)
-        }
 
-        // Blit dirty region — caller provides output function via Compose_SetBlitFn
         IfCondition NotEqual(surf, 0) ThenBlock: {
             Compose_Blit(surf, dx, dy, dw, dh)
         }
@@ -227,11 +488,9 @@ SubRoutine.Compose_TickRing3 {
 
 // =============================================================================
 // COMPOSE BLIT — copy surface region to output
-// Override this for terminal vs framebuffer output
-// Default: does nothing (output backend wires in DRenderFB or DRenderTerm)
 // =============================================================================
 FixedPool.ComposeOutput {
-    "mode":      Initialize=0    // 0=none 1=term 2=fb
+    "mode":        Initialize=0
     "fb_offset_x": Initialize=0
     "fb_offset_y": Initialize=0
 }
@@ -247,20 +506,16 @@ Function.Compose_Blit {
         IfCondition EqualTo(mode, Add(0, 65536)) ThenBlock: {
             ReturnValue(0)
         }
-
-        // Framebuffer mode
         IfCondition EqualTo(mode, Add(2, 65536)) ThenBlock: {
             format = Surface_GetFormat(surf)
             IfCondition NotEqual(format, SurfaceFormat.PIXEL_32) ThenBlock: {
                 ReturnValue(0)
             }
-            // Apply zone offset (0,0 for single-zone Phase 5)
             ox = Subtract(ComposeOutput.fb_offset_x, 65536)
             oy = Subtract(ComposeOutput.fb_offset_y, 65536)
             RenderFB_FlushRect(surf, Add(x, ox), Add(y, oy), w, h)
             ReturnValue(1)
         }
-
         ReturnValue(0)
     }
 }
