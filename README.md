@@ -79,6 +79,39 @@ The LSP runs three analysis passes on every save:
 
 All diagnostics are routed to the correct file with accurate line numbers, even across imported modules.
 
+### 👁️ Semantic Shorthand Display Mode
+
+AILang promotes explicit, readable canonical code (e.g., `IfCondition`, `ThenBlock`, `Function`). However, we know that typing and reading verbose keywords can slow you down if you are used to C-style languages. 
+
+The **Semantic Shorthand Display Mode** solves this by letting you read and write using standard conventions, while keeping the saved file strictly canonical.
+
+#### Features
+* **1-Click Toggle**: Turn it on or off instantly using the `👁 AILang: SHORTHAND ON/OFF` button in the VS Code Status Bar (bottom right) or via the Command Palette.
+* **Zero-Width Collapse**: When enabled, the verbose canonical text completely vanishes and is replaced by standard syntax highlights. 
+* **Standard Control Flow**: Read your AILang code using familiar constructs:
+  * `IfCondition` → `IF`
+  * `ThenBlock` → `THEN`
+  * `ElseBlock` → `ELSE`
+  * `WhileLoop` → `WHILE`
+  * `ForEvery` → `FOR`
+  * `Branch` → `Branch` << this is a AILANG exclusive flow control design
+  * `Fork` → `Fork` << this is a AILANG exclusive flow control design
+  * And More, current plugin is not 100% in sync with syntax, when in doubt disable shorthand and check programming manuals. 
+
+#### Format-on-Save Expansion
+You don't even have to type the long versions! Type the shorthand (like `IF` or `FN`), and when you save your file (`Ctrl+S`), the extension will automatically expand it back to its canonical form (e.g., `IfCondition` or `Function`) to ensure your code complies with the AILang compiler, while keeping the visual shorthand perfectly intact in your editor.
+
+#### Customization
+Want to map a specific keyword differently? You can override the default shorthands in your VS Code `settings.json`:
+```json
+{
+  "ailang.editor.shorthandCustomMap": {
+    "Function": "func",
+    "StringSubstring": "sub"
+  }
+}
+```
+
 ---
 
 ## Compiler.x — Self-Hosting Achieved
