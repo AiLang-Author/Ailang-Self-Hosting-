@@ -94,9 +94,9 @@ The **Semantic Shorthand Display Mode** solves this by letting you read and writ
   * `ElseBlock` → `ELSE`
   * `WhileLoop` → `WHILE`
   * `ForEvery` → `FOR`
-  * `ChoosePath` → `SWITCH`
-  * `CaseOption` → `CASE`
-  * `CatchError` → `CATCH`
+  * `Branch` → `Branch` << this is a AILANG exclsuive flow control design
+  * `Fork` → `Fork` << this is a AILANG exclsuive flow control design
+  * And More, current plugin is not 100% in sync with syntax, when in doubt disable shorthand and check programming manuals. 
 
 #### Format-on-Save Expansion
 You don't even have to type the long versions! Type the shorthand (like `IF` or `FN`), and when you save your file (`Ctrl+S`), the extension will automatically expand it back to its canonical form (e.g., `IfCondition` or `Function`) to ensure your code complies with the AILang compiler, while keeping the visual shorthand perfectly intact in your editor.
