@@ -94,8 +94,8 @@ The **Semantic Shorthand Display Mode** solves this by letting you read and writ
   * `ElseBlock` → `ELSE`
   * `WhileLoop` → `WHILE`
   * `ForEvery` → `FOR`
-  * `Branch` → `Branch` << this is a AILANG exclsuive flow control design
-  * `Fork` → `Fork` << this is a AILANG exclsuive flow control design
+  * `Branch` → `Branch` << this is a AILANG exclusive flow control design
+  * `Fork` → `Fork` << this is a AILANG exclusive flow control design
   * And More, current plugin is not 100% in sync with syntax, when in doubt disable shorthand and check programming manuals. 
 
 #### Format-on-Save Expansion
