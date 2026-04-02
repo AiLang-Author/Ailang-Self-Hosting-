@@ -1,0 +1,299 @@
+// Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.Focus.ailang
+// Focus management — tracks active pane, routes input, manages focus history.
+// Single source of truth for "what is focused and what does input go to."
+//
+// Sits between Ring1 drain and BSP/TextBuffer layers.
+// Protocol shims call Focus_SetLeaf() — they never touch Compositor directly.
+//
+// Usage:
+//   Focus_Init(tb_map_data, tb_map_size)
+//   Focus_SetLeaf(leaf)
+//   Focus_KeyDown(keycode, shift)
+//   Focus_MouseDown(x, y)
+
+LibraryImport.DComposeTypes
+LibraryImport.DComposeBSP
+LibraryImport.DRingTypes
+LibraryImport.DRing0
+LibraryImport.TextBuffer
+
+// =============================================================================
+// FOCUS CONFIG — set before Focus_Init
+// =============================================================================
+FixedPool.FocusConfig {
+    "mode":           Initialize=0   // FocusMode: 0=click 1=sloppy 2=sloppy+raise
+    "alt_tab_enable": Initialize=1   // 1=Alt+Tab cycles focus
+    "border_width":   Initialize=2   // pixels — resize hit zone width
+}
+
+// =============================================================================
+// FOCUS STATE
+// =============================================================================
+FixedPool.FocusState {
+    "initialized":    Initialize=0
+    "current_leaf":   Initialize=0   // currently focused BSP leaf
+    "previous_leaf":  Initialize=0   // previously focused leaf (for Alt+Tab)
+    "tb_map_data":    Initialize=0   // ptr to TBMap array (borrowed, not owned)
+    "tb_map_size":    Initialize=0   // number of slots
+    "wintable_data":  Initialize=0   // ptr to WinTable.entries (borrowed)
+    "wintable_count": Initialize=0   // ptr to WinTable.count (borrowed)
+    "entry_size":     Initialize=0   // WinTableConst.ENTRY_SIZE
+    "leaf_ofs":       Initialize=0   // WinTableConst.LEAF_OFS
+    "mode":           Initialize=0   // current FocusMode
+}
+
+// =============================================================================
+// INIT
+// Pass pointers to TBMap and WinTable so Focus doesn't own them.
+// =============================================================================
+Function.Focus_Init {
+    Input:  tb_map_data:   Integer
+    Input:  wintable_data: Integer
+    Output: Integer
+    Body: {
+        FocusState.tb_map_data    = tb_map_data
+        FocusState.wintable_data  = wintable_data
+        FocusState.mode           = FocusConfig.mode
+        FocusState.current_leaf   = Compositor.root
+        FocusState.previous_leaf  = 0
+        FocusState.initialized    = 1
+        PrintMessage("[Focus] initialized mode=")
+        PrintNumber(FocusConfig.mode)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SET LEAF — change focused pane
+// Updates Compositor.focused_leaf and posts FOCUS_SET to Ring0.
+// =============================================================================
+Function.Focus_SetLeaf {
+    Input:  leaf: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(leaf, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(leaf, FocusState.current_leaf) ThenBlock: {
+            ReturnValue(1)  // already focused
+        }
+        FocusState.previous_leaf = FocusState.current_leaf
+        FocusState.current_leaf  = leaf
+        // Update compositor directly and via Ring0
+        Compositor.focused_leaf  = leaf
+        Ring0_Post(Ring0Cmd.FOCUS_SET, leaf, 0, 0)
+        PrintMessage("[Focus] leaf=")
+        PrintNumber(leaf)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GET LEAF
+// =============================================================================
+Function.Focus_GetLeaf {
+    Output: Integer
+    Body: {
+        ReturnValue(FocusState.current_leaf)
+    }
+}
+
+// =============================================================================
+// GET TB — find TextBuffer handle for focused leaf
+// Scans WinTable to find slot, then reads TBMap
+// =============================================================================
+Function.Focus_GetTB {
+    Output: Integer
+    Body: {
+        leaf     = FocusState.current_leaf
+        wt_data  = FocusState.wintable_data
+        tb_data  = FocusState.tb_map_data
+        entry_sz = 24   // WinTableConst.ENTRY_SIZE
+        leaf_ofs = 0    // WinTableConst.LEAF_OFS
+        cnt      = WinTable.count
+        i        = 0
+        WhileLoop LessThan(i, cnt) {
+            base       = Add(wt_data, Multiply(i, entry_sz))
+            entry_leaf = Dereference(Add(base, leaf_ofs))
+            IfCondition EqualTo(entry_leaf, leaf) ThenBlock: {
+                tb = Dereference(Add(tb_data, Multiply(i, 8)))
+                ReturnValue(tb)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// MOUSE DOWN — hit test BSP, update focus if click-to-focus
+// Returns 1 if focus changed
+// =============================================================================
+Function.Focus_MouseDown {
+    Input:  x:      Integer
+    Input:  y:      Integer
+    Input:  button: Integer
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(button, 0) ThenBlock: { ReturnValue(0) }
+
+        leaf = BSP_Query(Compositor.root, x, y)
+        IfCondition EqualTo(leaf, 0) ThenBlock: { ReturnValue(0) }
+
+        mode = FocusState.mode
+        IfCondition EqualTo(mode, FocusMode.CLICK_TO_FOCUS) ThenBlock: {
+            ReturnValue(Focus_SetLeaf(leaf))
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MOUSE MOVE — for sloppy focus modes
+// =============================================================================
+Function.Focus_MouseMove {
+    Input:  x: Integer
+    Input:  y: Integer
+    Output: Integer
+    Body: {
+        mode = FocusState.mode
+        IfCondition EqualTo(mode, FocusMode.CLICK_TO_FOCUS) ThenBlock: {
+            ReturnValue(0)  // click-to-focus ignores mouse move
+        }
+        leaf = BSP_Query(Compositor.root, x, y)
+        IfCondition EqualTo(leaf, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Focus_SetLeaf(leaf))
+    }
+}
+
+// =============================================================================
+// KEY DOWN — route to focused TextBuffer or return 0 if unhandled
+// Caller checks return: 0 = not consumed, 1 = consumed by TB
+// =============================================================================
+Function.Focus_KeyDown {
+    Input:  keycode: Integer
+    Input:  shift:   Integer
+    Output: Integer
+    Body: {
+        tb = Focus_GetTB()
+        IfCondition LessThan(tb, 0) ThenBlock: { ReturnValue(0) }
+        result = TextBuffer_KeyDown(tb, keycode, shift)
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// CYCLE FOCUS — move focus to next/prev pane in WinTable order
+// Used for Alt+Tab equivalent
+// =============================================================================
+Function.Focus_CycleNext {
+    Output: Integer
+    Body: {
+        cnt = WinTable.count
+        IfCondition LessThan(cnt, 2) ThenBlock: { ReturnValue(0) }
+
+        wt_data  = FocusState.wintable_data
+        entry_sz = 24
+        leaf_ofs = 0
+        cur_leaf = FocusState.current_leaf
+
+        // Find current slot
+        cur_slot = 0
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            base = Add(wt_data, Multiply(i, entry_sz))
+            leaf = Dereference(Add(base, leaf_ofs))
+            IfCondition EqualTo(leaf, cur_leaf) ThenBlock: {
+                cur_slot = i
+                i = cnt
+            } ElseBlock: {
+                i = Add(i, 1)
+            }
+        }
+
+        next_slot = Modulo(Add(cur_slot, 1), cnt)
+        next_base = Add(wt_data, Multiply(next_slot, entry_sz))
+        next_leaf = Dereference(Add(next_base, leaf_ofs))
+        ReturnValue(Focus_SetLeaf(next_leaf))
+    }
+}
+
+Function.Focus_CyclePrev {
+    Output: Integer
+    Body: {
+        cnt = WinTable.count
+        IfCondition LessThan(cnt, 2) ThenBlock: { ReturnValue(0) }
+
+        wt_data  = FocusState.wintable_data
+        entry_sz = 24
+        leaf_ofs = 0
+        cur_leaf = FocusState.current_leaf
+
+        cur_slot = 0
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            base = Add(wt_data, Multiply(i, entry_sz))
+            leaf = Dereference(Add(base, leaf_ofs))
+            IfCondition EqualTo(leaf, cur_leaf) ThenBlock: {
+                cur_slot = i
+                i = cnt
+            } ElseBlock: {
+                i = Add(i, 1)
+            }
+        }
+
+        prev_slot = Modulo(Add(cur_slot, Subtract(cnt, 1)), cnt)
+        prev_base = Add(wt_data, Multiply(prev_slot, entry_sz))
+        prev_leaf = Dereference(Add(prev_base, leaf_ofs))
+        ReturnValue(Focus_SetLeaf(prev_leaf))
+    }
+}
+
+// =============================================================================
+// BORDER HIT TEST — is point (x,y) near a BSP split edge?
+// Returns 1 if near a border (for resize cursor shape)
+// =============================================================================
+Function.Focus_NearBorder {
+    Input:  x: Integer
+    Input:  y: Integer
+    Output: Integer
+    Body: {
+        bw = FocusConfig.border_width
+        // Find the leaf at this point
+        leaf = BSP_Query(Compositor.root, x, y)
+        IfCondition EqualTo(leaf, 0) ThenBlock: { ReturnValue(0) }
+        lx = BSP_GetRegionX(leaf)
+        ly = BSP_GetRegionY(leaf)
+        lw = BSP_GetRegionW(leaf)
+        lh = BSP_GetRegionH(leaf)
+        // Near right edge
+        IfCondition GreaterEqual(x, Subtract(Add(lx, lw), bw)) ThenBlock: { ReturnValue(1) }
+        // Near bottom edge
+        IfCondition GreaterEqual(y, Subtract(Add(ly, lh), bw)) ThenBlock: { ReturnValue(1) }
+        // Near left edge (not screen left)
+        IfCondition And(GreaterThan(lx, 0), LessThan(x, Add(lx, bw))) ThenBlock: { ReturnValue(1) }
+        // Near top edge (not screen top)
+        IfCondition And(GreaterThan(ly, 0), LessThan(y, Add(ly, bw))) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// GET CURSOR SHAPE — returns CursorShape based on context
+// Near border → CROSSHAIR (resize)
+// Normal → ARROW
+// =============================================================================
+Function.Focus_GetCursorShape {
+    Input:  x: Integer
+    Input:  y: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Focus_NearBorder(x, y), 1) ThenBlock: {
+            ReturnValue(CursorShape.CROSSHAIR)
+        }
+        ReturnValue(CursorShape.ARROW)
+    }
+}
