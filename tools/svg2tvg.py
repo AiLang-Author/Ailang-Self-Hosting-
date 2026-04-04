@@ -265,7 +265,7 @@ def segments_from_commands(commands):
     return segments
 
 
-def encode_tvg(paths, width, height, scale_bits=4):
+def encode_tvg(paths, width, height, scale_bits=0):
     """Encode parsed SVG paths as TinyVG binary."""
     w = TVGWriter()
 
@@ -277,7 +277,7 @@ def encode_tvg(paths, width, height, scale_bits=4):
     w.write_byte(1)
 
     # Flags: scale(u4) | color_enc(u2) | coord_range(u2)
-    # scale_bits=4, color_enc=0 (RGBA8888), coord_range=0 (i16)
+    # scale_bits=0 for fonts (integer coords), color_enc=0 (RGBA8888), coord_range=0 (i16)
     flags = (scale_bits & 0xF) | (0 << 4) | (0 << 6)
     w.write_byte(flags)
 
