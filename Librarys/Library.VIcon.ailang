@@ -1,0 +1,352 @@
+// Library.VIcon.ailang
+// Named icon loading from VIF icon packs.
+// Three-tier resolution: custom → widgets → default.
+// Uses Library.JSON for manifest parsing — XSHash gives us hash lookups for free.
+//
+// Copyright © 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.DSurfaceTypes
+LibraryImport.DSurface
+LibraryImport.VIF
+LibraryImport.SurfaceBlit
+LibraryImport.JSON
+
+// =============================================================================
+// TIERS
+// =============================================================================
+FixedPool.IconTier {
+    "DEFAULT":  Initialize=0
+    "WIDGETS":  Initialize=1
+    "CUSTOM":   Initialize=2
+    "MAX":      Initialize=3
+}
+
+// =============================================================================
+// PER-TIER STATE
+// Each tier holds: manifest (XSHash), file data pointer, entry offset table
+// Layout: 3 tiers × 5 fields × 8 bytes = 120 bytes
+// =============================================================================
+FixedPool.IconTierField {
+    "MANIFEST":    Initialize=0     // XSHash from JSON manifest
+    "FILE_DATA":   Initialize=8     // raw file bytes (mmap or Allocate+read)
+    "FILE_SIZE":   Initialize=16    // total file size
+    "ENTRY_BASE":  Initialize=24    // offset into file_data where entries start
+    "ENTRY_COUNT": Initialize=32    // number of entries
+    "TIER_SIZE":   Initialize=40    // bytes per tier record
+}
+
+FixedPool.VIconState {
+    "tiers":        Initialize=0    // allocated block: 3 × 40 bytes
+    "render_size":  Initialize=24   // pixel size to rasterize at
+    "cache":        Initialize=0    // flat array: MAX_ICONS × 8 bytes (surface handles)
+    "cache_tier":   Initialize=0    // flat array: MAX_ICONS × 8 bytes (which tier)
+    "cache_idx":    Initialize=0    // flat array: MAX_ICONS × 8 bytes (entry index)
+    "cache_count":  Initialize=0
+    "initialized":  Initialize=0
+}
+
+FixedPool.VIconConst {
+    "MAX_ICONS":    Initialize=512
+    "VIF_MAGIC":    Initialize=0x02464956  // "VIF\x02" little-endian
+}
+
+// =============================================================================
+// INIT
+// =============================================================================
+Function.VIcon_Init {
+    Body: {
+        IfCondition EqualTo(VIconState.initialized, 1) ThenBlock: { ReturnValue(0) }
+
+        // Allocate tier table: 3 tiers × 40 bytes
+        tier_bytes = Multiply(IconTier.MAX, IconTierField.TIER_SIZE)
+        VIconState.tiers = Allocate(tier_bytes)
+
+        // Zero all tier fields
+        i = 0
+        WhileLoop LessThan(i, tier_bytes) {
+            SetByte(VIconState.tiers, i, 0)
+            i = Add(i, 1)
+        }
+
+        // Allocate surface cache
+        cache_bytes = Multiply(VIconConst.MAX_ICONS, 8)
+        VIconState.cache = Allocate(cache_bytes)
+        i = 0
+        WhileLoop LessThan(i, cache_bytes) {
+            SetByte(VIconState.cache, i, 0)
+            i = Add(i, 1)
+        }
+
+        VIconState.render_size = 24
+        VIconState.cache_count = 0
+        VIconState.initialized = 1
+        PrintMessage("[VIcon] initialized\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// TIER FIELD ACCESS
+// =============================================================================
+Function.VIcon_TierGet {
+    Input: tier: Integer
+    Input: field: Integer
+    Output: Integer
+    Body: {
+        off = Add(Multiply(tier, IconTierField.TIER_SIZE), field)
+        addr = Add(VIconState.tiers, off)
+        ReturnValue(Dereference(addr))
+    }
+}
+
+Function.VIcon_TierSet {
+    Input: tier: Integer
+    Input: field: Integer
+    Input: value: Integer
+    Body: {
+        off = Add(Multiply(tier, IconTierField.TIER_SIZE), field)
+        addr = Add(VIconState.tiers, off)
+        StoreValue(addr, value)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LOAD VIF ICON PACK INTO A TIER
+//
+// File format:
+//   [4] magic "VIF\x02"
+//   [4] entry_count
+//   [4] manifest_len
+//   [manifest_len] JSON manifest string (null-terminated)
+//   For each entry:
+//     [4] tvg_len
+//     [4] design_w
+//     [4] design_h
+//     [tvg_len] TVG data
+// =============================================================================
+Function.VIcon_LoadVIF {
+    Input: tier: Integer
+    Input: path: Address
+    Output: Integer
+    Body: {
+        // Read file
+        fd = SystemCall(2, path, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[VIcon] cannot open: ")
+            PrintMessage(path)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        // Get file size via lseek
+        file_size = SystemCall(8, fd, 0, 2)
+        SystemCall(8, fd, 0, 0)
+
+        // Read entire file
+        data = Allocate(file_size)
+        SystemCall(0, fd, data, file_size)
+        SystemCall(3, fd, 0, 0)
+
+        // Verify magic
+        magic = Dereference(data)
+        m32 = BitwiseAnd(magic, 0xFFFFFFFF)
+        IfCondition NotEqual(m32, VIconConst.VIF_MAGIC) ThenBlock: {
+            PrintMessage("[VIcon] bad magic in: ")
+            PrintMessage(path)
+            PrintMessage("\n")
+            Deallocate(data, file_size)
+            ReturnValue(0)
+        }
+
+        // Read header
+        entry_count = Dereference(Add(data, 4))
+        ec32 = BitwiseAnd(entry_count, 0xFFFFFFFF)
+        manifest_len = Dereference(Add(data, 8))
+        ml32 = BitwiseAnd(manifest_len, 0xFFFFFFFF)
+
+        // Parse manifest JSON
+        manifest_ptr = Add(data, 12)
+        manifest_obj = ParseJSON(manifest_ptr)
+        manifest_hash = JSON.AsObject(manifest_obj)
+
+        // Entry data starts after header + manifest
+        entry_base = Add(12, ml32)
+
+        // Store in tier
+        VIcon_TierSet(tier, IconTierField.MANIFEST, manifest_hash)
+        VIcon_TierSet(tier, IconTierField.FILE_DATA, data)
+        VIcon_TierSet(tier, IconTierField.FILE_SIZE, file_size)
+        VIcon_TierSet(tier, IconTierField.ENTRY_BASE, entry_base)
+        VIcon_TierSet(tier, IconTierField.ENTRY_COUNT, ec32)
+
+        PrintMessage("[VIcon] loaded ")
+        PrintMessage(path)
+        PrintMessage(" tier=")
+        PrintNumber(tier)
+        PrintMessage(" entries=")
+        PrintNumber(ec32)
+        PrintMessage("\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FIND ENTRY IN A SINGLE TIER — returns TVG data pointer or 0
+// Also sets VIconResult fields for the caller.
+// =============================================================================
+FixedPool.VIconResult {
+    "tvg_ptr":  Initialize=0
+    "tvg_len":  Initialize=0
+    "design_w": Initialize=0
+    "design_h": Initialize=0
+}
+
+Function.VIcon_FindIn {
+    Input: tier: Integer
+    Input: name: Address
+    Output: Integer
+    Body: {
+        manifest = VIcon_TierGet(tier, IconTierField.MANIFEST)
+        IfCondition EqualTo(manifest, 0) ThenBlock: { ReturnValue(0) }
+
+        // Lookup name in manifest hash → entry index
+        entry_idx = JSON.GetNumber(manifest, name)
+        // JSON.GetNumber returns 0 for missing keys AND for index 0
+        // Check if key actually exists
+        key_type = JSON.GetType(manifest, name)
+        IfCondition EqualTo(key_type, JType.NULL) ThenBlock: { ReturnValue(0) }
+
+        // Walk to entry in file data
+        file_data = VIcon_TierGet(tier, IconTierField.FILE_DATA)
+        entry_base = VIcon_TierGet(tier, IconTierField.ENTRY_BASE)
+
+        // Scan to entry_idx (entries are variable-length)
+        pos = entry_base
+        ei = 0
+        WhileLoop LessThan(ei, entry_idx) {
+            tvg_len = Dereference(Add(file_data, pos))
+            tl32 = BitwiseAnd(tvg_len, 0xFFFFFFFF)
+            pos = Add(pos, Add(12, tl32))
+            ei = Add(ei, 1)
+        }
+
+        // Read this entry's header
+        tvg_len = Dereference(Add(file_data, pos))
+        tl32 = BitwiseAnd(tvg_len, 0xFFFFFFFF)
+        dw = Dereference(Add(file_data, Add(pos, 4)))
+        dh = Dereference(Add(file_data, Add(pos, 8)))
+        tvg_ptr = Add(file_data, Add(pos, 12))
+
+        VIconResult.tvg_ptr = tvg_ptr
+        VIconResult.tvg_len = tl32
+        VIconResult.design_w = BitwiseAnd(dw, 0xFFFFFFFF)
+        VIconResult.design_h = BitwiseAnd(dh, 0xFFFFFFFF)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// RESOLVE — three-tier lookup: custom → widgets → default
+// Returns rasterized surface handle, or 0 if not found.
+// Caches rasterized surfaces — rasterize once per name per render_size.
+// =============================================================================
+Function.VIcon_Resolve {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        // Try custom first
+        found = VIcon_FindIn(IconTier.CUSTOM, name)
+        IfCondition EqualTo(found, 0) ThenBlock: {
+            // Try widgets
+            found = VIcon_FindIn(IconTier.WIDGETS, name)
+        }
+        IfCondition EqualTo(found, 0) ThenBlock: {
+            // Try default
+            found = VIcon_FindIn(IconTier.DEFAULT, name)
+        }
+        IfCondition EqualTo(found, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Rasterize TVG at current render size
+        tvg_ptr = VIconResult.tvg_ptr
+        tvg_len = VIconResult.tvg_len
+        dw = VIconResult.design_w
+        dh = VIconResult.design_h
+        rs = VIconState.render_size
+
+        surf = Surface_Create(SurfaceFormat.PIXEL_32, rs, rs)
+        TVG_Render(surf, tvg_ptr, tvg_len, rs, rs)
+
+        ReturnValue(surf)
+    }
+}
+
+// =============================================================================
+// SET RENDER SIZE — for DPI/scale changes, flush cache and re-render
+// =============================================================================
+Function.VIcon_SetSize {
+    Input: size: Integer
+    Body: {
+        VIconState.render_size = size
+        // TODO: flush cached surfaces on size change
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// DRAW — resolve icon by name, blit tinted at position
+// Convenience wrapper for Auckland draw pass.
+// =============================================================================
+Function.VIcon_Draw {
+    Input: canvas: Integer
+    Input: name: Address
+    Input: x: Integer
+    Input: y: Integer
+    Input: color: Integer
+    Output: Integer
+    Body: {
+        surf = VIcon_Resolve(name)
+        IfCondition EqualTo(surf, 0) ThenBlock: { ReturnValue(0) }
+
+        Surface_BlitTinted(canvas, surf, x, y, color)
+        // TODO: cache surf instead of leaking it
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SHUTDOWN
+// =============================================================================
+Function.VIcon_Shutdown {
+    Body: {
+        // Free tier data
+        t = 0
+        WhileLoop LessThan(t, IconTier.MAX) {
+            fd = VIcon_TierGet(t, IconTierField.FILE_DATA)
+            fs = VIcon_TierGet(t, IconTierField.FILE_SIZE)
+            IfCondition NotEqual(fd, 0) ThenBlock: {
+                Deallocate(fd, fs)
+            }
+            t = Add(t, 1)
+        }
+
+        tb = Multiply(IconTier.MAX, IconTierField.TIER_SIZE)
+        IfCondition NotEqual(VIconState.tiers, 0) ThenBlock: {
+            Deallocate(VIconState.tiers, tb)
+        }
+
+        cb = Multiply(VIconConst.MAX_ICONS, 8)
+        IfCondition NotEqual(VIconState.cache, 0) ThenBlock: {
+            Deallocate(VIconState.cache, cb)
+        }
+
+        VIconState.initialized = 0
+        PrintMessage("[VIcon] shutdown\n")
+        ReturnValue(0)
+    }
+}
