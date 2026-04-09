@@ -85,6 +85,8 @@ Function.WinMgr_Init {
 
         PrintMessage("[WinMgr] stacks initialized\n")
 
+        WinView_Init()
+
         ReturnValue(1)
     }
 }
@@ -872,6 +874,9 @@ Function.Win_BringToFront {
         save_toolbar_h   = WinMgr_GetToolbarH(idx)
         save_toolbar_ctx = WinMgr_GetToolbarCtx(idx)
 
+        // Save WinView for the window being moved
+        save_view = WinView_Save(idx)
+
         // Shift everything down from idx+1..last → idx..last-1
         i = idx
         WhileLoop LessThan(i, last) {
@@ -902,6 +907,9 @@ Function.Win_BringToFront {
             WinMgr_SetToolbarH(i,   WinMgr_GetToolbarH(next))
             WinMgr_SetToolbarCtx(i, WinMgr_GetToolbarCtx(next))
 
+            // Shift WinView slot
+            WinView_ShiftDown(i, next)
+
             i = Add(i, 1)
         }
 
@@ -928,6 +936,9 @@ Function.Win_BringToFront {
         WinMgr_SetToolbar(last,    save_toolbar)
         WinMgr_SetToolbarH(last,   save_toolbar_h)
         WinMgr_SetToolbarCtx(last, save_toolbar_ctx)
+
+        // Restore WinView at tail (also frees the save buffer)
+        WinView_Restore(last, save_view)
 
         Deallocate(save_float, FloatEntryConst.SIZE)
         Deallocate(save_geom,  WinGeomConst.ENTRY_SIZE)
@@ -1129,6 +1140,9 @@ Function.Win_Close {
         toolbar_ctx = WinMgr_GetToolbarCtx(idx)
         IfCondition NotEqual(toolbar_ctx, 0) ThenBlock: { AKCtx_Destroy(toolbar_ctx) }
 
+        // Destroy WinView bindings for the closing window
+        WinView_Clear(idx)
+
         Float_Remove(idx)
 
         // Shift all parallel arrays down
@@ -1151,6 +1165,10 @@ Function.Win_Close {
                 SetByte(dst, j, GetByte(src, j))
                 j = Add(j, 1)
             }
+
+            // Copy WinView slot i+1 → i
+            WinView_ShiftDown(i, Add(i, 1))
+
             i = Add(i, 1)
         }
 
@@ -1168,6 +1186,7 @@ Function.Win_Close {
             SetByte(last, j, 0)
             j = Add(j, 1)
         }
+        WinView_Clear(new_cnt)
 
         WinMgr.count = Subtract(WinMgr.count, 1)
         new_focus = Subtract(idx, 1)
@@ -1876,3 +1895,294 @@ Function.Win_KeyDown {
         ReturnValue(0)
     }
 }
+
+// ============================================================================
+// WINVIEW — Per-window job linkage and cached bindings
+//
+// Append this entire block to the end of Library.WinManager.ailang.
+// Does NOT replace any existing code. The parallel arrays stay as-is.
+//
+// WinView adds the fields needed for app launch + action dispatch:
+//   - job_ptr:       pointer to JobInstance (0 if internal/no service)
+//   - service_id:    links to services table in PostgreSQL
+//   - bindings:      XArray of cached {action, msg_method} pairs
+//   - binding_count: number of cached bindings
+//   - view_type:     string ptr ("notepad", "filebrowser", etc.)
+//   - doc_handle:    Document library handle (-1 if none)
+//   - page_handle:   current PageSurface handle (-1 if none)
+//
+// Layout (56 bytes per entry, 8 slots = 448 bytes total):
+//   Offset  0: job_ptr        (Address, 0 = no service)
+//   Offset  8: service_id     (Integer, -1 = none)
+//   Offset 16: bindings       (Address, XArray ptr or 0)
+//   Offset 24: binding_count  (Integer)
+//   Offset 32: view_type      (Address, string ptr or 0)
+//   Offset 40: doc_handle     (Integer, -1 = none)
+//   Offset 48: page_handle    (Integer, -1 = none)
+// ============================================================================
+
+FixedPool.WinViewFields {
+    "JOB_PTR":       Initialize=0
+    "SERVICE_ID":    Initialize=8
+    "BINDINGS":      Initialize=16
+    "BINDING_COUNT": Initialize=24
+    "VIEW_TYPE":     Initialize=32
+    "DOC_HANDLE":    Initialize=40
+    "PAGE_HANDLE":   Initialize=48
+}
+
+FixedPool.WinViewConst {
+    "ENTRY_SIZE": Initialize=56
+    "MAX":        Initialize=8
+}
+
+FixedPool.WinViewTable {
+    "data": Initialize=0
+}
+
+// ============================================================================
+// INIT — call from WinMgr_Init (add WinView_Init() call there)
+// ============================================================================
+Function.WinView_Init {
+    Output: Integer
+    Body: {
+        sz = Multiply(WinViewConst.MAX, WinViewConst.ENTRY_SIZE)
+        buf = Allocate(sz)
+        IfCondition EqualTo(buf, 0) ThenBlock: {
+            PrintMessage("[WinView] alloc fail\n")
+            ReturnValue(0)
+        }
+
+        // Zero the buffer
+        i = 0
+        WhileLoop LessThan(i, sz) {
+            SetByte(buf, i, 0)
+            i = Add(i, 1)
+        }
+
+        // Set sentinel values for each slot
+        s = 0
+        WhileLoop LessThan(s, WinViewConst.MAX) {
+            base = Add(buf, Multiply(s, WinViewConst.ENTRY_SIZE))
+            StoreValue(Add(base, WinViewFields.JOB_PTR),       0)
+            StoreValue(Add(base, WinViewFields.SERVICE_ID),    -1)
+            StoreValue(Add(base, WinViewFields.BINDINGS),       0)
+            StoreValue(Add(base, WinViewFields.BINDING_COUNT),  0)
+            StoreValue(Add(base, WinViewFields.VIEW_TYPE),      0)
+            StoreValue(Add(base, WinViewFields.DOC_HANDLE),    -1)
+            StoreValue(Add(base, WinViewFields.PAGE_HANDLE),   -1)
+            s = Add(s, 1)
+        }
+
+        WinViewTable.data = buf
+        PrintMessage("[WinView] initialized\n")
+        ReturnValue(1)
+    }
+}
+
+// ============================================================================
+// POINTER — get base address for a slot
+// ============================================================================
+Function.WinView_Ptr {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(WinViewTable.data, Multiply(idx, WinViewConst.ENTRY_SIZE)))
+    }
+}
+
+// ============================================================================
+// FIELD ACCESSORS — Get/Set for each field
+// ============================================================================
+Function.WinView_GetJobPtr {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        ReturnValue(Dereference(Add(base, WinViewFields.JOB_PTR)))
+    }
+}
+Function.WinView_SetJobPtr {
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        StoreValue(Add(base, WinViewFields.JOB_PTR), val)
+    }
+}
+
+Function.WinView_GetServiceId {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        ReturnValue(Dereference(Add(base, WinViewFields.SERVICE_ID)))
+    }
+}
+Function.WinView_SetServiceId {
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        StoreValue(Add(base, WinViewFields.SERVICE_ID), val)
+    }
+}
+
+Function.WinView_GetBindings {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        ReturnValue(Dereference(Add(base, WinViewFields.BINDINGS)))
+    }
+}
+Function.WinView_SetBindings {
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        StoreValue(Add(base, WinViewFields.BINDINGS), val)
+    }
+}
+
+Function.WinView_GetBindingCount {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        ReturnValue(Dereference(Add(base, WinViewFields.BINDING_COUNT)))
+    }
+}
+Function.WinView_SetBindingCount {
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        StoreValue(Add(base, WinViewFields.BINDING_COUNT), val)
+    }
+}
+
+Function.WinView_GetViewType {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        ReturnValue(Dereference(Add(base, WinViewFields.VIEW_TYPE)))
+    }
+}
+Function.WinView_SetViewType {
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        StoreValue(Add(base, WinViewFields.VIEW_TYPE), val)
+    }
+}
+
+Function.WinView_GetDocHandle {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        ReturnValue(Dereference(Add(base, WinViewFields.DOC_HANDLE)))
+    }
+}
+Function.WinView_SetDocHandle {
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        StoreValue(Add(base, WinViewFields.DOC_HANDLE), val)
+    }
+}
+
+Function.WinView_GetPageHandle {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        ReturnValue(Dereference(Add(base, WinViewFields.PAGE_HANDLE)))
+    }
+}
+Function.WinView_SetPageHandle {
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        base = WinView_Ptr(idx)
+        StoreValue(Add(base, WinViewFields.PAGE_HANDLE), val)
+    }
+}
+
+// ============================================================================
+// CLEAR — reset a slot to defaults (call from Win_Close)
+// ============================================================================
+Function.WinView_Clear {
+    Input: idx: Integer
+    Body: {
+        // Destroy bindings XArray if present
+        bindings = WinView_GetBindings(idx)
+        IfCondition NotEqual(bindings, 0) ThenBlock: {
+            XArray.XDestroy(bindings)
+        }
+
+        base = WinView_Ptr(idx)
+        StoreValue(Add(base, WinViewFields.JOB_PTR),       0)
+        StoreValue(Add(base, WinViewFields.SERVICE_ID),    -1)
+        StoreValue(Add(base, WinViewFields.BINDINGS),       0)
+        StoreValue(Add(base, WinViewFields.BINDING_COUNT),  0)
+        StoreValue(Add(base, WinViewFields.VIEW_TYPE),      0)
+        StoreValue(Add(base, WinViewFields.DOC_HANDLE),    -1)
+        StoreValue(Add(base, WinViewFields.PAGE_HANDLE),   -1)
+    }
+}
+
+// ============================================================================
+// SHIFT DOWN — for Win_Close, shift slot i+1 into slot i (memcpy)
+// ============================================================================
+Function.WinView_ShiftDown {
+    Input: dst_idx: Integer
+    Input: src_idx: Integer
+    Body: {
+        src = WinView_Ptr(src_idx)
+        dst = WinView_Ptr(dst_idx)
+        j = 0
+        WhileLoop LessThan(j, WinViewConst.ENTRY_SIZE) {
+            SetByte(dst, j, GetByte(src, j))
+            j = Add(j, 1)
+        }
+    }
+}
+
+// ============================================================================
+// SAVE / RESTORE — for Win_BringToFront
+// ============================================================================
+Function.WinView_Save {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        buf = Allocate(WinViewConst.ENTRY_SIZE)
+        src = WinView_Ptr(idx)
+        j = 0
+        WhileLoop LessThan(j, WinViewConst.ENTRY_SIZE) {
+            SetByte(buf, j, GetByte(src, j))
+            j = Add(j, 1)
+        }
+        ReturnValue(buf)
+    }
+}
+
+Function.WinView_Restore {
+    Input: idx: Integer
+    Input: buf: Integer
+    Body: {
+        dst = WinView_Ptr(idx)
+        j = 0
+        WhileLoop LessThan(j, WinViewConst.ENTRY_SIZE) {
+            SetByte(dst, j, GetByte(buf, j))
+            j = Add(j, 1)
+        }
+        Deallocate(buf, WinViewConst.ENTRY_SIZE)
+    }
+}
+
+
