@@ -1,0 +1,1545 @@
+// Library.Analyzer4.ailang
+// Pool-Type Flow Analysis — Address Safety Checker
+// Complements Analyzer + Analyzer2 + Analyzer3
+//
+// Features:
+//   - Concrete pool type propagation through variables
+//   - Address parameter type conflict detection (two pool types → same param)
+//   - @ field access validation against inferred pool type
+//   - Raw Allocate() vs AllocateLinkage() distinction
+//   - PointerTo field type propagation through @ chains
+//   - FreeLinkage type mismatch detection
+//   - Cross-function pool type flow summary
+//
+// Architecture:
+//   Pass 1: CollectPoolSchemas  — gather pool names, fields, PointerTo metadata
+//   Pass 2: CollectFuncSignatures — gather param names, declared types
+//   Pass 3: WalkNode — propagate concrete pool types, emit warnings
+//   Pass 4: PostAnalysis — cross-call-site Address param conflict detection
+//
+// AST Node Types Used:
+//   POOL_LINKAGE (210)          — LinkagePool declaration
+//   POOL_MEMBER (211)           — Field declaration (children are attribute nodes)
+//   POINTER_FIELD_ACCESS (975)  — ptr@field read
+//   POINTER_FIELD_ASSIGN (976)  — ptr@field write
+//   MEMBER_ACCESS (412)         — dot-based Pool.member access
+//   TYPE_CUSTOM (973)           — LinkagePool parameter type declaration
+//   TYPE_ADDRESS (951)          — Address parameter type
+//   TYPE_INTEGER (950)          — Integer parameter type
+//
+// Usage:
+//   Analyzer4.Run(ast)
+//   -- results in Analyzer4.warnings / Analyzer4.hints --
+
+LibraryImport.XArrays
+LibraryImport.Compiler.Frontend.AST.CASTCore
+LibraryImport.Compiler.Frontend.AST.CASTTypes
+LibraryImport.Compiler.Import.CFileMap
+
+
+// =============================================================================
+// ANALYZER4 STATE
+// =============================================================================
+FixedPool.Analyzer4 {
+    // --- Pool schema registry ---
+    "pool_names": Initialize=0, CanChange=True           // XArray of full pool name strings ("LinkagePool.X")
+    "pool_field_names": Initialize=0, CanChange=True     // XArray of field name strings
+    "pool_field_pool_idx": Initialize=0, CanChange=True  // XArray of index into pool_names
+    "pool_field_pointer_to": Initialize=0, CanChange=True // XArray of target pool name (or 0)
+    "pool_field_is_embedded": Initialize=0, CanChange=True // XArray of 1/0 for Type= embedded
+    
+    // --- Variable → concrete pool type mapping (per function) ---
+    "var_names": Initialize=0, CanChange=True            // XArray of variable name strings
+    "var_pool_types": Initialize=0, CanChange=True       // XArray of pool name string (or sentinel)
+    
+    // --- Function signature tracking ---
+    "func_names": Initialize=0, CanChange=True           // XArray of function name strings
+    "func_param_keys": Initialize=0, CanChange=True      // XArray of "funcname\tparamname" keys
+    "func_param_declared": Initialize=0, CanChange=True  // XArray of declared type string
+    
+    // --- Call site tracking (for Address param conflicts) ---
+    "callsite_func": Initialize=0, CanChange=True        // XArray of called function name
+    "callsite_param_idx": Initialize=0, CanChange=True   // XArray of parameter index (0-based)
+    "callsite_pool_type": Initialize=0, CanChange=True   // XArray of concrete pool type passed
+    "callsite_lines": Initialize=0, CanChange=True       // XArray of source line
+    
+    // --- Results ---
+    "warnings": Initialize=0, CanChange=True
+    "hints": Initialize=0, CanChange=True
+    "warning_count": Initialize=0, CanChange=True
+    "hint_count": Initialize=0, CanChange=True
+    
+    // --- Current context ---
+    "current_func": Initialize=0, CanChange=True
+    "last_valid_line": Initialize=0, CanChange=True
+    
+    // --- Stats ---
+    "type_conflict_warnings": Initialize=0, CanChange=True
+    "field_mismatch_warnings": Initialize=0, CanChange=True
+    "free_mismatch_warnings": Initialize=0, CanChange=True
+    "raw_to_pool_warnings": Initialize=0, CanChange=True
+    "pools_registered": Initialize=0, CanChange=True
+    "vars_tracked": Initialize=0, CanChange=True
+    "callsites_recorded": Initialize=0, CanChange=True
+    
+    // --- Config ---
+    "check_type_conflicts": Initialize=1, CanChange=True
+    "check_field_access": Initialize=1, CanChange=True
+    "check_free_mismatch": Initialize=1, CanChange=True
+    "check_raw_to_pool": Initialize=1, CanChange=True
+    "emit_flow_hints": Initialize=1, CanChange=True
+    "verbose": Initialize=0, CanChange=True
+}
+
+// Sentinel values stored in var_pool_types for non-pool pointer types
+FixedPool.PoolTypeTag {
+    "UNKNOWN": Initialize=0
+    "RAW_ALLOC": Initialize=-1
+    "STRING_LITERAL": Initialize=-2
+    "INTEGER_LITERAL": Initialize=-3
+}
+
+
+// =============================================================================
+// INITIALIZATION
+// =============================================================================
+Function.Analyzer4.Init {
+    Body: {
+        // Pool schema
+        Analyzer4.pool_names = XArray.XCreate(64)
+        Analyzer4.pool_field_names = XArray.XCreate(256)
+        Analyzer4.pool_field_pool_idx = XArray.XCreate(256)
+        Analyzer4.pool_field_pointer_to = XArray.XCreate(256)
+        Analyzer4.pool_field_is_embedded = XArray.XCreate(256)
+        
+        // Variable tracking
+        Analyzer4.var_names = XArray.XCreate(128)
+        Analyzer4.var_pool_types = XArray.XCreate(128)
+        
+        // Function signatures
+        Analyzer4.func_names = XArray.XCreate(128)
+        Analyzer4.func_param_keys = XArray.XCreate(256)
+        Analyzer4.func_param_declared = XArray.XCreate(256)
+        
+        // Call sites
+        Analyzer4.callsite_func = XArray.XCreate(256)
+        Analyzer4.callsite_param_idx = XArray.XCreate(256)
+        Analyzer4.callsite_pool_type = XArray.XCreate(256)
+        Analyzer4.callsite_lines = XArray.XCreate(256)
+        
+        // Results
+        Analyzer4.warnings = XArray.XCreate(128)
+        Analyzer4.hints = XArray.XCreate(64)
+        Analyzer4.warning_count = 0
+        Analyzer4.hint_count = 0
+        
+        // Context
+        Analyzer4.current_func = 0
+        Analyzer4.last_valid_line = 0
+        
+        // Stats
+        Analyzer4.type_conflict_warnings = 0
+        Analyzer4.field_mismatch_warnings = 0
+        Analyzer4.free_mismatch_warnings = 0
+        Analyzer4.raw_to_pool_warnings = 0
+        Analyzer4.pools_registered = 0
+        Analyzer4.vars_tracked = 0
+        Analyzer4.callsites_recorded = 0
+    }
+}
+
+
+// =============================================================================
+// DIAGNOSTICS
+// =============================================================================
+Function.Analyzer4.AddWarning {
+    Input: msg: Address
+    Body: {
+        // Deduplicate
+        count = XArray.XSize(Analyzer4.warnings)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer4.warnings, i)
+            IfCondition EqualTo(StringCompare(existing, msg), 0) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        XArray.XPush(Analyzer4.warnings, msg)
+        Analyzer4.warning_count = Add(Analyzer4.warning_count, 1)
+    }
+}
+
+Function.Analyzer4.AddHint {
+    Input: msg: Address
+    Body: {
+        // Deduplicate
+        count = XArray.XSize(Analyzer4.hints)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer4.hints, i)
+            IfCondition EqualTo(StringCompare(existing, msg), 0) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        XArray.XPush(Analyzer4.hints, msg)
+        Analyzer4.hint_count = Add(Analyzer4.hint_count, 1)
+    }
+}
+
+
+// =============================================================================
+// STRING HELPERS
+// =============================================================================
+Function.Analyzer4.StrEqual {
+    Input: a: Address
+    Input: b: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(a, 0) ThenBlock: {
+            IfCondition EqualTo(b, 0) ThenBlock: { ReturnValue(1) }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(b, 0) ThenBlock: { ReturnValue(0) }
+        cmp = StringCompare(a, b)
+        IfCondition EqualTo(cmp, 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.Analyzer4.StartsWith {
+    Input: str: Address
+    Input: prefix: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(prefix, 0) ThenBlock: { ReturnValue(1) }
+        
+        plen = StringLength(prefix)
+        slen = StringLength(str)
+        IfCondition GreaterThan(plen, slen) ThenBlock: { ReturnValue(0) }
+        
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            IfCondition NotEqual(GetByte(str, i), GetByte(prefix, i)) ThenBlock: {
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Check if string starts with "LinkagePool."
+Function.Analyzer4.IsLinkagePoolRef {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        ReturnValue(Analyzer4.StartsWith(name, "LinkagePool."))
+    }
+}
+
+// Build "funcname\tparamname" key
+Function.Analyzer4.MakeParamKey {
+    Input: func_name: Address
+    Input: param_name: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(func_name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(param_name, 0) ThenBlock: { ReturnValue(0) }
+        key = StringConcat(func_name, "\t")
+        key = StringConcat(key, param_name)
+        ReturnValue(key)
+    }
+}
+
+
+// =============================================================================
+// POOL SCHEMA REGISTRY
+// =============================================================================
+
+Function.Analyzer4.RegisterPool {
+    Input: pool_name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(pool_name, 0) ThenBlock: { ReturnValue(-1) }
+        
+        // Check if already registered
+        count = XArray.XSize(Analyzer4.pool_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer4.pool_names, i)
+            IfCondition EqualTo(Analyzer4.StrEqual(existing, pool_name), 1) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        
+        XArray.XPush(Analyzer4.pool_names, pool_name)
+        Analyzer4.pools_registered = Add(Analyzer4.pools_registered, 1)
+        ReturnValue(count)
+    }
+}
+
+Function.Analyzer4.RegisterPoolField {
+    Input: field_name: Address
+    Input: pool_idx: Integer
+    Input: pointer_to: Address
+    Input: is_embedded: Integer
+    Body: {
+        XArray.XPush(Analyzer4.pool_field_names, field_name)
+        XArray.XPush(Analyzer4.pool_field_pool_idx, pool_idx)
+        XArray.XPush(Analyzer4.pool_field_pointer_to, pointer_to)
+        XArray.XPush(Analyzer4.pool_field_is_embedded, is_embedded)
+    }
+}
+
+Function.Analyzer4.GetPoolIndex {
+    Input: pool_name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(pool_name, 0) ThenBlock: { ReturnValue(-1) }
+        
+        count = XArray.XSize(Analyzer4.pool_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer4.pool_names, i)
+            IfCondition EqualTo(Analyzer4.StrEqual(existing, pool_name), 1) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.Analyzer4.PoolHasField {
+    Input: pool_name: Address
+    Input: field_name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(pool_name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(field_name, 0) ThenBlock: { ReturnValue(0) }
+        
+        pool_idx = Analyzer4.GetPoolIndex(pool_name)
+        IfCondition LessThan(pool_idx, 0) ThenBlock: { ReturnValue(0) }
+        
+        count = XArray.XSize(Analyzer4.pool_field_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            fidx = XArray.XGet(Analyzer4.pool_field_pool_idx, i)
+            IfCondition EqualTo(fidx, pool_idx) ThenBlock: {
+                fname = XArray.XGet(Analyzer4.pool_field_names, i)
+                IfCondition EqualTo(Analyzer4.StrEqual(fname, field_name), 1) ThenBlock: {
+                    ReturnValue(1)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Analyzer4.GetFieldPointerTo {
+    Input: pool_name: Address
+    Input: field_name: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(pool_name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(field_name, 0) ThenBlock: { ReturnValue(0) }
+        
+        pool_idx = Analyzer4.GetPoolIndex(pool_name)
+        IfCondition LessThan(pool_idx, 0) ThenBlock: { ReturnValue(0) }
+        
+        count = XArray.XSize(Analyzer4.pool_field_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            fidx = XArray.XGet(Analyzer4.pool_field_pool_idx, i)
+            IfCondition EqualTo(fidx, pool_idx) ThenBlock: {
+                fname = XArray.XGet(Analyzer4.pool_field_names, i)
+                IfCondition EqualTo(Analyzer4.StrEqual(fname, field_name), 1) ThenBlock: {
+                    ReturnValue(XArray.XGet(Analyzer4.pool_field_pointer_to, i))
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Analyzer4.GetFieldEmbeddedType {
+    Input: pool_name: Address
+    Input: field_name: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(pool_name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(field_name, 0) ThenBlock: { ReturnValue(0) }
+        
+        pool_idx = Analyzer4.GetPoolIndex(pool_name)
+        IfCondition LessThan(pool_idx, 0) ThenBlock: { ReturnValue(0) }
+        
+        count = XArray.XSize(Analyzer4.pool_field_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            fidx = XArray.XGet(Analyzer4.pool_field_pool_idx, i)
+            IfCondition EqualTo(fidx, pool_idx) ThenBlock: {
+                fname = XArray.XGet(Analyzer4.pool_field_names, i)
+                IfCondition EqualTo(Analyzer4.StrEqual(fname, field_name), 1) ThenBlock: {
+                    is_emb = XArray.XGet(Analyzer4.pool_field_is_embedded, i)
+                    IfCondition EqualTo(is_emb, 1) ThenBlock: {
+                        ReturnValue(XArray.XGet(Analyzer4.pool_field_pointer_to, i))
+                    }
+                    ReturnValue(0)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Analyzer4.GetPoolFieldCount {
+    Input: pool_name: Address
+    Output: Integer
+    Body: {
+        pool_idx = Analyzer4.GetPoolIndex(pool_name)
+        IfCondition LessThan(pool_idx, 0) ThenBlock: { ReturnValue(0) }
+        
+        field_count = 0
+        total = XArray.XSize(Analyzer4.pool_field_names)
+        i = 0
+        WhileLoop LessThan(i, total) {
+            fidx = XArray.XGet(Analyzer4.pool_field_pool_idx, i)
+            IfCondition EqualTo(fidx, pool_idx) ThenBlock: {
+                field_count = Add(field_count, 1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(field_count)
+    }
+}
+
+
+// =============================================================================
+// VARIABLE → POOL TYPE TRACKING (per function scope)
+// =============================================================================
+Function.Analyzer4.SetVarPoolType {
+    Input: var_name: Address
+    Input: pool_type: Address
+    Body: {
+        IfCondition EqualTo(var_name, 0) ThenBlock: { ReturnValue(0) }
+        
+        count = XArray.XSize(Analyzer4.var_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer4.var_names, i)
+            IfCondition EqualTo(Analyzer4.StrEqual(existing, var_name), 1) ThenBlock: {
+                XArray.XSet(Analyzer4.var_pool_types, i, pool_type)
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        
+        XArray.XPush(Analyzer4.var_names, var_name)
+        XArray.XPush(Analyzer4.var_pool_types, pool_type)
+        Analyzer4.vars_tracked = Add(Analyzer4.vars_tracked, 1)
+    }
+}
+
+Function.Analyzer4.GetVarPoolType {
+    Input: var_name: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(var_name, 0) ThenBlock: { ReturnValue(0) }
+        
+        count = XArray.XSize(Analyzer4.var_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer4.var_names, i)
+            IfCondition EqualTo(Analyzer4.StrEqual(existing, var_name), 1) ThenBlock: {
+                ReturnValue(XArray.XGet(Analyzer4.var_pool_types, i))
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Analyzer4.ClearVarTracking {
+    Body: {
+        XArray.XClear(Analyzer4.var_names)
+        XArray.XClear(Analyzer4.var_pool_types)
+    }
+}
+
+
+// =============================================================================
+// CALL SITE TRACKING
+// =============================================================================
+Function.Analyzer4.RecordCallSite {
+    Input: func_name: Address
+    Input: param_idx: Integer
+    Input: pool_type: Address
+    Input: line: Integer
+    Body: {
+        IfCondition EqualTo(func_name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(pool_type, 0) ThenBlock: { ReturnValue(0) }
+        
+        XArray.XPush(Analyzer4.callsite_func, func_name)
+        XArray.XPush(Analyzer4.callsite_param_idx, param_idx)
+        XArray.XPush(Analyzer4.callsite_pool_type, pool_type)
+        XArray.XPush(Analyzer4.callsite_lines, line)
+        Analyzer4.callsites_recorded = Add(Analyzer4.callsites_recorded, 1)
+    }
+}
+
+
+// =============================================================================
+// PASS 1: COLLECT POOL SCHEMAS
+// Walks AST for POOL_LINKAGE (210) nodes.
+// Field attributes (PointerTo, Type, Direction) are children of POOL_MEMBER
+// where AST_GetData1(attr) = key string, AST_GetChild(attr, 0) = value node.
+// =============================================================================
+Function.Analyzer4.CollectPoolSchemas {
+    Input: node: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        
+        node_type = AST_GetType(node)
+        
+        // LinkagePool declaration — AST.POOL_LINKAGE = 210
+        IfCondition EqualTo(node_type, AST.POOL_LINKAGE) ThenBlock: {
+            pool_name = AST_GetData1(node)
+            IfCondition NotEqual(pool_name, 0) ThenBlock: {
+                full_name = StringConcat("LinkagePool.", pool_name)
+                pool_idx = Analyzer4.RegisterPool(full_name)
+                
+                // Collect fields — direct children are POOL_MEMBER (211) nodes
+                child_count = AST_GetChildCount(node)
+                i = 0
+                WhileLoop LessThan(i, child_count) {
+                    child = AST_GetChild(node, i)
+                    IfCondition NotEqual(child, 0) ThenBlock: {
+                        child_type = AST_GetType(child)
+                        IfCondition EqualTo(child_type, AST.POOL_MEMBER) ThenBlock: {
+                            field_name = AST_GetData1(child)
+                            
+                            // Walk member children for attribute nodes
+                            // Each attr: AST_GetData1(attr) = key ("PointerTo", "Type", etc.)
+                            //            AST_GetChild(attr, 0) = value node
+                            pointer_to = 0
+                            is_embedded = 0
+                            
+                            mc = AST_GetChildCount(child)
+                            mi = 0
+                            WhileLoop LessThan(mi, mc) {
+                                attr = AST_GetChild(child, mi)
+                                IfCondition NotEqual(attr, 0) ThenBlock: {
+                                    attr_key = AST_GetData1(attr)
+                                    IfCondition NotEqual(attr_key, 0) ThenBlock: {
+                                        
+                                        // PointerTo=LinkagePool.X
+                                        IfCondition EqualTo(StringCompare(attr_key, "PointerTo"), 0) ThenBlock: {
+                                            attr_val_node = AST_GetChild(attr, 0)
+                                            IfCondition NotEqual(attr_val_node, 0) ThenBlock: {
+                                                pt_name = AST_GetData1(attr_val_node)
+                                                IfCondition NotEqual(pt_name, 0) ThenBlock: {
+                                                    pointer_to = pt_name
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Type=LinkagePool.X (embedded)
+                                        IfCondition EqualTo(StringCompare(attr_key, "Type"), 0) ThenBlock: {
+                                            attr_val_node = AST_GetChild(attr, 0)
+                                            IfCondition NotEqual(attr_val_node, 0) ThenBlock: {
+                                                emb_name = AST_GetData1(attr_val_node)
+                                                IfCondition NotEqual(emb_name, 0) ThenBlock: {
+                                                    pointer_to = emb_name
+                                                    is_embedded = 1
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                mi = Add(mi, 1)
+                            }
+                            
+                            Analyzer4.RegisterPoolField(field_name, pool_idx, pointer_to, is_embedded)
+                        }
+                    }
+                    i = Add(i, 1)
+                }
+            }
+        }
+        
+        // Also register FixedPool names (for distinguishing access patterns)
+        IfCondition EqualTo(node_type, AST.POOL_FIXED) ThenBlock: {
+            pool_name = AST_GetData1(node)
+            IfCondition NotEqual(pool_name, 0) ThenBlock: {
+                full_name = StringConcat("FixedPool.", pool_name)
+                Analyzer4.RegisterPool(full_name)
+            }
+        }
+        
+        // Recurse
+        child_count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, child_count) {
+            child = AST_GetChild(node, i)
+            Analyzer4.CollectPoolSchemas(child)
+            i = Add(i, 1)
+        }
+    }
+}
+
+
+// =============================================================================
+// PASS 2: COLLECT FUNCTION SIGNATURES
+// Parameter types come from child type nodes:
+//   TYPE_ADDRESS (951) → "Address"
+//   TYPE_INTEGER (950) → "Integer"
+//   TYPE_CUSTOM (973) with DATA1=pool_name → LinkagePool type
+// =============================================================================
+Function.Analyzer4.CollectFuncSignatures {
+    Input: node: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        
+        node_type = AST_GetType(node)
+        
+        IfCondition EqualTo(node_type, AST.FUNCTION) ThenBlock: {
+            func_name = AST_GetData1(node)
+            
+            // Register function name (dedup)
+            existing_idx = Analyzer4.GetFuncIndex(func_name)
+            IfCondition LessThan(existing_idx, 0) ThenBlock: {
+                XArray.XPush(Analyzer4.func_names, func_name)
+            }
+            
+            // Collect parameters
+            child_count = AST_GetChildCount(node)
+            i = 0
+            WhileLoop LessThan(i, child_count) {
+                child = AST_GetChild(node, i)
+                IfCondition NotEqual(child, 0) ThenBlock: {
+                    child_type = AST_GetType(child)
+                    IfCondition EqualTo(child_type, AST.PARAMETER) ThenBlock: {
+                        param_name = AST_GetData1(child)
+                        
+                        // Determine declared type from type child node
+                        // DATA2 has type string, but child node 0 has structured type
+                        declared_type = "unknown"
+                        type_node = AST_GetChild(child, 0)
+                        IfCondition GreaterThan(type_node, 0) ThenBlock: {
+                            tk = AST_GetType(type_node)
+                            IfCondition EqualTo(tk, AST.TYPE_ADDRESS) ThenBlock: {
+                                declared_type = "Address"
+                            }
+                            IfCondition EqualTo(tk, AST.TYPE_INTEGER) ThenBlock: {
+                                declared_type = "Integer"
+                            }
+                            IfCondition EqualTo(tk, AST.TYPE_TEXT) ThenBlock: {
+                                declared_type = "Text"
+                            }
+                            IfCondition EqualTo(tk, AST.TYPE_BOOLEAN) ThenBlock: {
+                                declared_type = "Boolean"
+                            }
+                            // TYPE_CUSTOM (973) — used for LinkagePool parameter types
+                            IfCondition EqualTo(tk, AST.TYPE_CUSTOM) ThenBlock: {
+                                lp_name = AST_GetData1(type_node)
+                                IfCondition NotEqual(lp_name, 0) ThenBlock: {
+                                    declared_type = lp_name
+                                }
+                            }
+                        }
+                        
+                        key = Analyzer4.MakeParamKey(func_name, param_name)
+                        XArray.XPush(Analyzer4.func_param_keys, key)
+                        XArray.XPush(Analyzer4.func_param_declared, declared_type)
+                    }
+                }
+                i = Add(i, 1)
+            }
+        }
+        
+        // Also handle subroutines
+        IfCondition EqualTo(node_type, AST.SUBROUTINE) ThenBlock: {
+            func_name = AST_GetData1(node)
+            existing_idx = Analyzer4.GetFuncIndex(func_name)
+            IfCondition LessThan(existing_idx, 0) ThenBlock: {
+                XArray.XPush(Analyzer4.func_names, func_name)
+            }
+        }
+        
+        // Recurse
+        child_count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, child_count) {
+            child = AST_GetChild(node, i)
+            Analyzer4.CollectFuncSignatures(child)
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.Analyzer4.GetFuncIndex {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(-1) }
+        count = XArray.XSize(Analyzer4.func_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer4.func_names, i)
+            IfCondition EqualTo(Analyzer4.StrEqual(existing, name), 1) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.Analyzer4.GetParamDeclaredType {
+    Input: func_name: Address
+    Input: param_name: Address
+    Output: Address
+    Body: {
+        key = Analyzer4.MakeParamKey(func_name, param_name)
+        IfCondition EqualTo(key, 0) ThenBlock: { ReturnValue(0) }
+        
+        count = XArray.XSize(Analyzer4.func_param_keys)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer4.func_param_keys, i)
+            IfCondition EqualTo(Analyzer4.StrEqual(existing, key), 1) ThenBlock: {
+                ReturnValue(XArray.XGet(Analyzer4.func_param_declared, i))
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Get param name at position param_idx for a given function
+Function.Analyzer4.GetFuncParamNameByIndex {
+    Input: func_name: Address
+    Input: param_idx: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(func_name, 0) ThenBlock: { ReturnValue(0) }
+        
+        prefix = StringConcat(func_name, "\t")
+        prefix_len = StringLength(prefix)
+        
+        match_count = 0
+        count = XArray.XSize(Analyzer4.func_param_keys)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            key = XArray.XGet(Analyzer4.func_param_keys, i)
+            IfCondition NotEqual(key, 0) ThenBlock: {
+                IfCondition EqualTo(Analyzer4.StartsWith(key, prefix), 1) ThenBlock: {
+                    IfCondition EqualTo(match_count, param_idx) ThenBlock: {
+                        // Extract param name: everything after the \t
+                        key_len = StringLength(key)
+                        param_len = Subtract(key_len, prefix_len)
+                        param_name = Allocate(Add(param_len, 1))
+                        j = 0
+                        WhileLoop LessThan(j, param_len) {
+                            SetByte(param_name, j, GetByte(key, Add(j, prefix_len)))
+                            j = Add(j, 1)
+                        }
+                        SetByte(param_name, param_len, 0)
+                        ReturnValue(param_name)
+                    }
+                    match_count = Add(match_count, 1)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+
+// =============================================================================
+// PASS 3: MAIN WALK — TYPE PROPAGATION AND WARNINGS
+// =============================================================================
+Function.Analyzer4.WalkNode {
+    Input: node: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        
+        node_type = AST_GetType(node)
+        node_line = AST_GetLine(node)
+        
+        // Propagate last valid line for "Line 0" fix
+        IfCondition GreaterThan(node_line, 0) ThenBlock: {
+            Analyzer4.last_valid_line = node_line
+        } ElseBlock: {
+            node_line = Analyzer4.last_valid_line
+        }
+        
+        // === FUNCTION ENTRY ===
+        IfCondition EqualTo(node_type, AST.FUNCTION) ThenBlock: {
+            Analyzer4.current_func = AST_GetData1(node)
+            Analyzer4.ClearVarTracking()
+            
+            // Seed parameter pool types from TYPE_CUSTOM declarations
+            child_count = AST_GetChildCount(node)
+            i = 0
+            WhileLoop LessThan(i, child_count) {
+                child = AST_GetChild(node, i)
+                IfCondition NotEqual(child, 0) ThenBlock: {
+                    child_type = AST_GetType(child)
+                    IfCondition EqualTo(child_type, AST.PARAMETER) ThenBlock: {
+                        param_name = AST_GetData1(child)
+                        type_node = AST_GetChild(child, 0)
+                        IfCondition GreaterThan(type_node, 0) ThenBlock: {
+                            tk = AST_GetType(type_node)
+                            // TYPE_CUSTOM = LinkagePool type
+                            IfCondition EqualTo(tk, AST.TYPE_CUSTOM) ThenBlock: {
+                                lp_name = AST_GetData1(type_node)
+                                IfCondition NotEqual(lp_name, 0) ThenBlock: {
+                                    Analyzer4.SetVarPoolType(param_name, lp_name)
+                                }
+                            }
+                        }
+                    }
+                }
+                i = Add(i, 1)
+            }
+            
+            Analyzer4.WalkChildren(node)
+            Analyzer4.current_func = 0
+            ReturnValue(0)
+        }
+        
+        // === SUBROUTINE ===
+        IfCondition EqualTo(node_type, AST.SUBROUTINE) ThenBlock: {
+            Analyzer4.current_func = AST_GetData1(node)
+            Analyzer4.ClearVarTracking()
+            Analyzer4.WalkChildren(node)
+            Analyzer4.current_func = 0
+            ReturnValue(0)
+        }
+        
+        // === ASSIGNMENT — core type propagation ===
+        IfCondition EqualTo(node_type, AST.ASSIGNMENT) ThenBlock: {
+            target = AST_GetData1(node)
+            child_count = AST_GetChildCount(node)
+            
+            IfCondition GreaterThan(child_count, 0) ThenBlock: {
+                rhs = AST_GetChild(node, 0)
+                IfCondition NotEqual(rhs, 0) ThenBlock: {
+                    inferred = Analyzer4.InferPoolType(rhs)
+                    
+                    IfCondition NotEqual(inferred, 0) ThenBlock: {
+                        Analyzer4.SetVarPoolType(target, inferred)
+                        
+                        IfCondition EqualTo(Analyzer4.verbose, 1) ThenBlock: {
+                            PrintMessage("  [A4] ")
+                            IfCondition NotEqual(target, 0) ThenBlock: { PrintMessage(target) }
+                            PrintMessage(" := ")
+                            IfCondition EqualTo(inferred, PoolTypeTag.RAW_ALLOC) ThenBlock: {
+                                PrintMessage("<raw>")
+                            } ElseBlock: {
+                                IfCondition GreaterThan(inferred, 0) ThenBlock: {
+                                    PrintMessage(inferred)
+                                } ElseBlock: {
+                                    PrintMessage("<special>")
+                                }
+                            }
+                            PrintMessage("\n")
+                        }
+                    }
+                    
+                    Analyzer4.WalkNode(rhs)
+                }
+            }
+            ReturnValue(0)
+        }
+        
+        // === POINTER FIELD ACCESS (975) — ptr@field read ===
+        IfCondition EqualTo(node_type, AST.POINTER_FIELD_ACCESS) ThenBlock: {
+            Analyzer4.CheckFieldAccess(node, node_line)
+            Analyzer4.WalkChildren(node)
+            ReturnValue(0)
+        }
+        
+        // === POINTER FIELD ASSIGN (976) — ptr@field write ===
+        IfCondition EqualTo(node_type, AST.POINTER_FIELD_ASSIGN) ThenBlock: {
+            Analyzer4.CheckFieldAccess(node, node_line)
+            Analyzer4.WalkChildren(node)
+            ReturnValue(0)
+        }
+        
+        // === FUNCTION CALL ===
+        IfCondition EqualTo(node_type, AST.CALL) ThenBlock: {
+            func_name = AST_GetData1(node)
+            
+            // Check FreeLinkage type mismatch
+            IfCondition NotEqual(func_name, 0) ThenBlock: {
+                IfCondition EqualTo(StringCompare(func_name, "FreeLinkage"), 0) ThenBlock: {
+                    Analyzer4.CheckFreeLinkage(node, node_line)
+                }
+            }
+            
+            // Check Address parameter type flow
+            IfCondition EqualTo(Analyzer4.check_type_conflicts, 1) ThenBlock: {
+                Analyzer4.CheckCallArgs(node, node_line)
+            }
+            
+            Analyzer4.WalkChildren(node)
+            ReturnValue(0)
+        }
+        
+        // === DEFAULT: recurse ===
+        Analyzer4.WalkChildren(node)
+    }
+}
+
+Function.Analyzer4.WalkChildren {
+    Input: node: Address
+    Body: {
+        child_count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, child_count) {
+            child = AST_GetChild(node, i)
+            Analyzer4.WalkNode(child)
+            i = Add(i, 1)
+        }
+    }
+}
+
+
+// =============================================================================
+// TYPE INFERENCE — determine concrete pool type from an expression
+// =============================================================================
+Function.Analyzer4.InferPoolType {
+    Input: node: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        
+        node_type = AST_GetType(node)
+        
+        // CALL — check for AllocateLinkage, CopyLinkage, Allocate
+        IfCondition EqualTo(node_type, AST.CALL) ThenBlock: {
+            func_name = AST_GetData1(node)
+            IfCondition NotEqual(func_name, 0) ThenBlock: {
+                
+                // AllocateLinkage(LinkagePool.X) → "LinkagePool.X"
+                IfCondition EqualTo(StringCompare(func_name, "AllocateLinkage"), 0) ThenBlock: {
+                    child_count = AST_GetChildCount(node)
+                    IfCondition GreaterThan(child_count, 0) ThenBlock: {
+                        arg = AST_GetChild(node, 0)
+                        IfCondition NotEqual(arg, 0) ThenBlock: {
+                            // AST_GetData1 returns "LinkagePool.TypeName" as identifier string
+                            arg_name = AST_GetData1(arg)
+                            IfCondition NotEqual(arg_name, 0) ThenBlock: {
+                                IfCondition EqualTo(Analyzer4.IsLinkagePoolRef(arg_name), 1) ThenBlock: {
+                                    ReturnValue(arg_name)
+                                }
+                                // Try prepending prefix if just the short name
+                                full = StringConcat("LinkagePool.", arg_name)
+                                idx = Analyzer4.GetPoolIndex(full)
+                                IfCondition GreaterEqual(idx, 0) ThenBlock: {
+                                    ReturnValue(full)
+                                }
+                                ReturnValue(arg_name)
+                            }
+                        }
+                    }
+                    ReturnValue(0)
+                }
+                
+                // CopyLinkage(src, LinkagePool.X) → type from 2nd arg
+                IfCondition EqualTo(StringCompare(func_name, "CopyLinkage"), 0) ThenBlock: {
+                    child_count = AST_GetChildCount(node)
+                    IfCondition GreaterThan(child_count, 1) ThenBlock: {
+                        type_arg = AST_GetChild(node, 1)
+                        IfCondition NotEqual(type_arg, 0) ThenBlock: {
+                            type_name = AST_GetData1(type_arg)
+                            IfCondition NotEqual(type_name, 0) ThenBlock: {
+                                IfCondition EqualTo(Analyzer4.IsLinkagePoolRef(type_name), 1) ThenBlock: {
+                                    ReturnValue(type_name)
+                                }
+                            }
+                        }
+                    }
+                    ReturnValue(0)
+                }
+                
+                // Raw Allocate() → sentinel
+                IfCondition EqualTo(StringCompare(func_name, "Allocate"), 0) ThenBlock: {
+                    ReturnValue(PoolTypeTag.RAW_ALLOC)
+                }
+            }
+            ReturnValue(0)
+        }
+        
+        // IDENTIFIER — propagate from known variable
+        IfCondition EqualTo(node_type, AST.IDENTIFIER) ThenBlock: {
+            var_name = AST_GetData1(node)
+            ReturnValue(Analyzer4.GetVarPoolType(var_name))
+        }
+        
+        // POINTER_FIELD_ACCESS (975) — resolve through PointerTo chain
+        // DATA1=base_var, DATA2=field_name
+        IfCondition EqualTo(node_type, AST.POINTER_FIELD_ACCESS) ThenBlock: {
+            ReturnValue(Analyzer4.ResolveFieldAccessType(node))
+        }
+        
+        ReturnValue(0)
+    }
+}
+
+// Resolve pool type that a ptr@field expression evaluates to
+// POINTER_FIELD_ACCESS: DATA1=base_var, DATA2=field_name
+Function.Analyzer4.ResolveFieldAccessType {
+    Input: node: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        
+        base_var = AST_GetData1(node)
+        field_name = AST_GetData2(node)
+        
+        // Get base pool type from variable tracking
+        base_type = Analyzer4.GetVarPoolType(base_var)
+        IfCondition EqualTo(base_type, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(base_type, 0) ThenBlock: { ReturnValue(0) }
+        
+        // Check PointerTo for this field → returns the target pool type
+        ptr_to = Analyzer4.GetFieldPointerTo(base_type, field_name)
+        IfCondition NotEqual(ptr_to, 0) ThenBlock: {
+            ReturnValue(ptr_to)
+        }
+        
+        // Check embedded Type= → returns the embedded pool type
+        emb = Analyzer4.GetFieldEmbeddedType(base_type, field_name)
+        IfCondition NotEqual(emb, 0) ThenBlock: {
+            ReturnValue(emb)
+        }
+        
+        // Plain field (integer, string) — no pool type propagation
+        ReturnValue(0)
+    }
+}
+
+
+// =============================================================================
+// CHECK: @ FIELD ACCESS AGAINST SCHEMA
+// POINTER_FIELD_ACCESS (975) / POINTER_FIELD_ASSIGN (976):
+//   DATA1 = base_var, DATA2 = field_name
+// =============================================================================
+Function.Analyzer4.CheckFieldAccess {
+    Input: node: Address
+    Input: line: Integer
+    Body: {
+        IfCondition EqualTo(Analyzer4.check_field_access, 0) ThenBlock: { ReturnValue(0) }
+        
+        base_var = AST_GetData1(node)
+        field_name = AST_GetData2(node)
+        IfCondition EqualTo(field_name, 0) ThenBlock: { ReturnValue(0) }
+        
+        // Get base variable's pool type
+        base_type = Analyzer4.GetVarPoolType(base_var)
+        IfCondition EqualTo(base_type, 0) ThenBlock: { ReturnValue(0) }
+        
+        // Raw Allocate pointer — warn about @ access
+        IfCondition EqualTo(base_type, PoolTypeTag.RAW_ALLOC) ThenBlock: {
+            IfCondition EqualTo(Analyzer4.check_raw_to_pool, 1) ThenBlock: {
+                location = FileMap_Format(line)
+                msg = location
+                msg = StringConcat(msg, ": Field access '@")
+                msg = StringConcat(msg, field_name)
+                msg = StringConcat(msg, "' on raw Allocate() pointer — use AllocateLinkage for typed access")
+                IfCondition NotEqual(Analyzer4.current_func, 0) ThenBlock: {
+                    msg = StringConcat(msg, " in '")
+                    msg = StringConcat(msg, Analyzer4.current_func)
+                    msg = StringConcat(msg, "'")
+                }
+                Analyzer4.AddWarning(msg)
+                Analyzer4.raw_to_pool_warnings = Add(Analyzer4.raw_to_pool_warnings, 1)
+            }
+            ReturnValue(0)
+        }
+        
+        // Skip other sentinel values
+        IfCondition LessEqual(base_type, 0) ThenBlock: { ReturnValue(0) }
+        
+        // Validate field exists in pool schema
+        has_field = Analyzer4.PoolHasField(base_type, field_name)
+        IfCondition EqualTo(has_field, 0) ThenBlock: {
+            // Only warn if pool itself is known (might be external/imported)
+            pool_idx = Analyzer4.GetPoolIndex(base_type)
+            IfCondition GreaterEqual(pool_idx, 0) ThenBlock: {
+                location = FileMap_Format(line)
+                msg = location
+                msg = StringConcat(msg, ": Field '@")
+                msg = StringConcat(msg, field_name)
+                msg = StringConcat(msg, "' not found in ")
+                msg = StringConcat(msg, base_type)
+                IfCondition NotEqual(Analyzer4.current_func, 0) ThenBlock: {
+                    msg = StringConcat(msg, " in '")
+                    msg = StringConcat(msg, Analyzer4.current_func)
+                    msg = StringConcat(msg, "'")
+                }
+                Analyzer4.AddWarning(msg)
+                Analyzer4.field_mismatch_warnings = Add(Analyzer4.field_mismatch_warnings, 1)
+            }
+        }
+    }
+}
+
+
+// =============================================================================
+// CHECK: FreeLinkage TYPE MISMATCH
+// FreeLinkage(ptr, LinkagePool.Type) — 2 children
+// =============================================================================
+Function.Analyzer4.CheckFreeLinkage {
+    Input: node: Address
+    Input: line: Integer
+    Body: {
+        IfCondition EqualTo(Analyzer4.check_free_mismatch, 0) ThenBlock: { ReturnValue(0) }
+        
+        child_count = AST_GetChildCount(node)
+        IfCondition LessThan(child_count, 2) ThenBlock: { ReturnValue(0) }
+        
+        ptr_arg = AST_GetChild(node, 0)
+        type_arg = AST_GetChild(node, 1)
+        IfCondition EqualTo(ptr_arg, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(type_arg, 0) ThenBlock: { ReturnValue(0) }
+        
+        // Only check if ptr is a simple identifier we can look up
+        IfCondition EqualTo(AST_GetType(ptr_arg), AST.IDENTIFIER) ThenBlock: {
+            var_name = AST_GetData1(ptr_arg)
+            tracked_type = Analyzer4.GetVarPoolType(var_name)
+            
+            IfCondition NotEqual(tracked_type, 0) ThenBlock: {
+                IfCondition GreaterThan(tracked_type, 0) ThenBlock: {
+                    // Get declared free type from second argument
+                    free_type = AST_GetData1(type_arg)
+                    IfCondition NotEqual(free_type, 0) ThenBlock: {
+                        // Normalize both to "LinkagePool.X" form
+                        norm_tracked = tracked_type
+                        norm_free = free_type
+                        
+                        IfCondition EqualTo(Analyzer4.IsLinkagePoolRef(free_type), 0) ThenBlock: {
+                            norm_free = StringConcat("LinkagePool.", free_type)
+                        }
+                        
+                        IfCondition EqualTo(Analyzer4.StrEqual(norm_tracked, norm_free), 0) ThenBlock: {
+                            location = FileMap_Format(line)
+                            msg = location
+                            msg = StringConcat(msg, ": FreeLinkage type mismatch — '")
+                            IfCondition NotEqual(var_name, 0) ThenBlock: {
+                                msg = StringConcat(msg, var_name)
+                            }
+                            msg = StringConcat(msg, "' tracked as ")
+                            msg = StringConcat(msg, norm_tracked)
+                            msg = StringConcat(msg, " but freed as ")
+                            msg = StringConcat(msg, norm_free)
+                            IfCondition NotEqual(Analyzer4.current_func, 0) ThenBlock: {
+                                msg = StringConcat(msg, " in '")
+                                msg = StringConcat(msg, Analyzer4.current_func)
+                                msg = StringConcat(msg, "'")
+                            }
+                            Analyzer4.AddWarning(msg)
+                            Analyzer4.free_mismatch_warnings = Add(Analyzer4.free_mismatch_warnings, 1)
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+
+// =============================================================================
+// CHECK: CALL ARGUMENT TYPES VS ADDRESS PARAMETERS
+// =============================================================================
+Function.Analyzer4.CheckCallArgs {
+    Input: node: Address
+    Input: line: Integer
+    Body: {
+        func_name = AST_GetData1(node)
+        IfCondition EqualTo(func_name, 0) ThenBlock: { ReturnValue(0) }
+        
+        // Skip builtins
+        IfCondition EqualTo(Analyzer4.IsBuiltinFunc(func_name), 1) ThenBlock: { ReturnValue(0) }
+        
+        child_count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, child_count) {
+            arg = AST_GetChild(node, i)
+            IfCondition NotEqual(arg, 0) ThenBlock: {
+                arg_pool = Analyzer4.InferPoolType(arg)
+                
+                // Only interested in concrete pool types (positive pointers)
+                IfCondition NotEqual(arg_pool, 0) ThenBlock: {
+                    IfCondition GreaterThan(arg_pool, 0) ThenBlock: {
+                        // Look up the corresponding parameter's declared type
+                        param_name = Analyzer4.GetFuncParamNameByIndex(func_name, i)
+                        IfCondition NotEqual(param_name, 0) ThenBlock: {
+                            declared = Analyzer4.GetParamDeclaredType(func_name, param_name)
+                            IfCondition NotEqual(declared, 0) ThenBlock: {
+                                IfCondition EqualTo(Analyzer4.StrEqual(declared, "Address"), 1) ThenBlock: {
+                                    // Concrete pool type → Address param = type erasure
+                                    Analyzer4.RecordCallSite(func_name, i, arg_pool, line)
+                                    
+                                    IfCondition EqualTo(Analyzer4.emit_flow_hints, 1) ThenBlock: {
+                                        location = FileMap_Format(line)
+                                        hint = location
+                                        hint = StringConcat(hint, ": ")
+                                        hint = StringConcat(hint, arg_pool)
+                                        hint = StringConcat(hint, " flows into Address param '")
+                                        hint = StringConcat(hint, param_name)
+                                        hint = StringConcat(hint, "' of '")
+                                        hint = StringConcat(hint, func_name)
+                                        hint = StringConcat(hint, "' — type erased")
+                                        Analyzer4.AddHint(hint)
+                                    }
+                                }
+                            }
+                            // Free the allocated param_name string
+                            Deallocate(param_name, Add(StringLength(param_name), 1))
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.Analyzer4.IsBuiltinFunc {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        
+        IfCondition EqualTo(StringCompare(name, "Add"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Subtract"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Multiply"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Divide"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Modulo"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "EqualTo"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "NotEqual"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "LessThan"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "GreaterThan"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "LessEqual"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "GreaterEqual"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "And"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Or"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Not"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "PrintMessage"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "PrintNumber"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "PrintString"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "StringConcat"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "StringCompare"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "StringLength"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "NumberToString"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Allocate"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Deallocate"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "AllocateLinkage"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "FreeLinkage"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "GetByte"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "SetByte"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Dereference"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "StoreValue"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "SystemCall"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Exit"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "RunTask"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "ArrayCreate"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "ArrayGet"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "ArraySet"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "ArrayDestroy"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "BitwiseAnd"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "BitwiseOr"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "BitwiseXor"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "ShiftLeft"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "ShiftRight"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "MemoryCopy"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "MemorySet"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "StringToNumber"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "CopyLinkage"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "CopyLinkageInto"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "ResetLinkage"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "CompareLinkage"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "PoolSize"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "PoolFieldCount"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "PoolFieldOffset"), 0) ThenBlock: { ReturnValue(1) }
+        
+        ReturnValue(0)
+    }
+}
+
+
+// =============================================================================
+// PASS 4: CROSS-CALL-SITE CONFLICT DETECTION
+// For each (func, param_idx) pair, warn if multiple different pool types flow in
+// =============================================================================
+Function.Analyzer4.PostAnalysis {
+    Body: {
+        IfCondition EqualTo(Analyzer4.check_type_conflicts, 0) ThenBlock: { ReturnValue(0) }
+        
+        count = XArray.XSize(Analyzer4.callsite_func)
+        
+        i = 0
+        WhileLoop LessThan(i, count) {
+            func_i = XArray.XGet(Analyzer4.callsite_func, i)
+            pidx_i = XArray.XGet(Analyzer4.callsite_param_idx, i)
+            type_i = XArray.XGet(Analyzer4.callsite_pool_type, i)
+            line_i = XArray.XGet(Analyzer4.callsite_lines, i)
+            
+            j = Add(i, 1)
+            WhileLoop LessThan(j, count) {
+                func_j = XArray.XGet(Analyzer4.callsite_func, j)
+                pidx_j = XArray.XGet(Analyzer4.callsite_param_idx, j)
+                type_j = XArray.XGet(Analyzer4.callsite_pool_type, j)
+                line_j = XArray.XGet(Analyzer4.callsite_lines, j)
+                
+                // Same function, same param index, different pool type = conflict
+                IfCondition EqualTo(Analyzer4.StrEqual(func_i, func_j), 1) ThenBlock: {
+                    IfCondition EqualTo(pidx_i, pidx_j) ThenBlock: {
+                        IfCondition EqualTo(Analyzer4.StrEqual(type_i, type_j), 0) ThenBlock: {
+                            location_i = FileMap_Format(line_i)
+                            location_j = FileMap_Format(line_j)
+                            
+                            msg = StringConcat("Address param conflict in '", "")
+                            msg = StringConcat(msg, func_i)
+                            msg = StringConcat(msg, "' param #")
+                            msg = StringConcat(msg, NumberToString(pidx_i))
+                            msg = StringConcat(msg, ": receives ")
+                            IfCondition GreaterThan(type_i, 0) ThenBlock: {
+                                msg = StringConcat(msg, type_i)
+                            }
+                            msg = StringConcat(msg, " (")
+                            msg = StringConcat(msg, location_i)
+                            msg = StringConcat(msg, ") vs ")
+                            IfCondition GreaterThan(type_j, 0) ThenBlock: {
+                                msg = StringConcat(msg, type_j)
+                            }
+                            msg = StringConcat(msg, " (")
+                            msg = StringConcat(msg, location_j)
+                            msg = StringConcat(msg, ")")
+                            Analyzer4.AddWarning(msg)
+                            Analyzer4.type_conflict_warnings = Add(Analyzer4.type_conflict_warnings, 1)
+                        }
+                    }
+                }
+                
+                j = Add(j, 1)
+            }
+            
+            i = Add(i, 1)
+        }
+    }
+}
+
+
+// =============================================================================
+// REPORT
+// =============================================================================
+Function.Analyzer4.Report {
+    Body: {
+        PrintMessage("\n")
+        PrintMessage("========================================\n")
+        PrintMessage("   Pool-Type Flow Analysis Report\n")
+        PrintMessage("========================================\n\n")
+        
+        // Schema stats
+        PrintMessage("--- Schema ---\n")
+        PrintMessage("Pools registered: ")
+        PrintNumber(Analyzer4.pools_registered)
+        PrintMessage("\n")
+        
+        pool_count = XArray.XSize(Analyzer4.pool_names)
+        i = 0
+        WhileLoop LessThan(i, pool_count) {
+            pname = XArray.XGet(Analyzer4.pool_names, i)
+            fcount = Analyzer4.GetPoolFieldCount(pname)
+            PrintMessage("  ")
+            IfCondition NotEqual(pname, 0) ThenBlock: { PrintMessage(pname) }
+            PrintMessage(" (")
+            PrintNumber(fcount)
+            PrintMessage(" fields)\n")
+            i = Add(i, 1)
+        }
+        
+        PrintMessage("\n--- Flow ---\n")
+        PrintMessage("Variables tracked: ")
+        PrintNumber(Analyzer4.vars_tracked)
+        PrintMessage("\n")
+        PrintMessage("Call sites recorded: ")
+        PrintNumber(Analyzer4.callsites_recorded)
+        PrintMessage("\n\n")
+        
+        // Warnings
+        IfCondition GreaterThan(Analyzer4.warning_count, 0) ThenBlock: {
+            PrintMessage("========================================\n")
+            PrintMessage("WARNINGS (")
+            PrintNumber(Analyzer4.warning_count)
+            PrintMessage("):\n")
+            PrintMessage("========================================\n")
+            
+            i = 0
+            WhileLoop LessThan(i, Analyzer4.warning_count) {
+                msg = XArray.XGet(Analyzer4.warnings, i)
+                PrintMessage("  [POOL-TYPE] ")
+                PrintMessage(msg)
+                PrintMessage("\n")
+                i = Add(i, 1)
+            }
+            PrintMessage("\n")
+        }
+        
+        // Hints
+        IfCondition GreaterThan(Analyzer4.hint_count, 0) ThenBlock: {
+            PrintMessage("--- Type Flow Hints (")
+            PrintNumber(Analyzer4.hint_count)
+            PrintMessage(") ---\n")
+            
+            i = 0
+            WhileLoop LessThan(i, Analyzer4.hint_count) {
+                msg = XArray.XGet(Analyzer4.hints, i)
+                PrintMessage("  [HINT] ")
+                PrintMessage(msg)
+                PrintMessage("\n")
+                i = Add(i, 1)
+            }
+            PrintMessage("\n")
+        }
+        
+        // Breakdown
+        PrintMessage("--- Breakdown ---\n")
+        PrintMessage("Type conflict warnings: ")
+        PrintNumber(Analyzer4.type_conflict_warnings)
+        PrintMessage("\n")
+        PrintMessage("Field mismatch warnings: ")
+        PrintNumber(Analyzer4.field_mismatch_warnings)
+        PrintMessage("\n")
+        PrintMessage("FreeLinkage mismatch warnings: ")
+        PrintNumber(Analyzer4.free_mismatch_warnings)
+        PrintMessage("\n")
+        PrintMessage("Raw-to-Pool access warnings: ")
+        PrintNumber(Analyzer4.raw_to_pool_warnings)
+        PrintMessage("\n")
+        
+        // Summary
+        PrintMessage("\n========================================\n")
+        IfCondition EqualTo(Analyzer4.warning_count, 0) ThenBlock: {
+            PrintMessage("  Pool-type flow: No issues found!\n")
+        } ElseBlock: {
+            PrintMessage("  Summary: ")
+            PrintNumber(Analyzer4.warning_count)
+            PrintMessage(" warning(s), ")
+            PrintNumber(Analyzer4.hint_count)
+            PrintMessage(" hint(s)\n")
+        }
+        PrintMessage("========================================\n\n")
+    }
+}
+
+
+// =============================================================================
+// CLEANUP
+// =============================================================================
+Function.Analyzer4.Cleanup {
+    Body: {
+        IfCondition NotEqual(Analyzer4.pool_names, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.pool_names)
+            Analyzer4.pool_names = 0
+        }
+        IfCondition NotEqual(Analyzer4.pool_field_names, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.pool_field_names)
+            Analyzer4.pool_field_names = 0
+        }
+        IfCondition NotEqual(Analyzer4.pool_field_pool_idx, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.pool_field_pool_idx)
+            Analyzer4.pool_field_pool_idx = 0
+        }
+        IfCondition NotEqual(Analyzer4.pool_field_pointer_to, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.pool_field_pointer_to)
+            Analyzer4.pool_field_pointer_to = 0
+        }
+        IfCondition NotEqual(Analyzer4.pool_field_is_embedded, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.pool_field_is_embedded)
+            Analyzer4.pool_field_is_embedded = 0
+        }
+        IfCondition NotEqual(Analyzer4.var_names, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.var_names)
+            Analyzer4.var_names = 0
+        }
+        IfCondition NotEqual(Analyzer4.var_pool_types, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.var_pool_types)
+            Analyzer4.var_pool_types = 0
+        }
+        IfCondition NotEqual(Analyzer4.func_names, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.func_names)
+            Analyzer4.func_names = 0
+        }
+        IfCondition NotEqual(Analyzer4.func_param_keys, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.func_param_keys)
+            Analyzer4.func_param_keys = 0
+        }
+        IfCondition NotEqual(Analyzer4.func_param_declared, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.func_param_declared)
+            Analyzer4.func_param_declared = 0
+        }
+        IfCondition NotEqual(Analyzer4.callsite_func, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.callsite_func)
+            Analyzer4.callsite_func = 0
+        }
+        IfCondition NotEqual(Analyzer4.callsite_param_idx, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.callsite_param_idx)
+            Analyzer4.callsite_param_idx = 0
+        }
+        IfCondition NotEqual(Analyzer4.callsite_pool_type, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.callsite_pool_type)
+            Analyzer4.callsite_pool_type = 0
+        }
+        IfCondition NotEqual(Analyzer4.callsite_lines, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.callsite_lines)
+            Analyzer4.callsite_lines = 0
+        }
+        IfCondition NotEqual(Analyzer4.warnings, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.warnings)
+            Analyzer4.warnings = 0
+        }
+        IfCondition NotEqual(Analyzer4.hints, 0) ThenBlock: {
+            XArray.XDestroy(Analyzer4.hints)
+            Analyzer4.hints = 0
+        }
+        
+        Analyzer4.warning_count = 0
+        Analyzer4.hint_count = 0
+    }
+}
+
+
+// =============================================================================
+// MAIN ENTRY POINT
+// =============================================================================
+Function.Analyzer4.Run {
+    Input: ast: Address
+    Output: Integer
+    Body: {
+        Analyzer4.Init()
+        
+        // Pass 1: Build pool schema registry from POOL_LINKAGE nodes
+        Analyzer4.CollectPoolSchemas(ast)
+        
+        // Pass 2: Collect function signatures and param declared types
+        Analyzer4.CollectFuncSignatures(ast)
+        
+        // Pass 3: Walk AST — propagate pool types, emit field/free warnings
+        Analyzer4.WalkNode(ast)
+        
+        // Pass 4: Cross-call-site Address param conflict detection
+        Analyzer4.PostAnalysis()
+        
+        ReturnValue(1)
+    }
+}

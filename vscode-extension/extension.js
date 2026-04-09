@@ -602,6 +602,44 @@ function activate(context) {
         });
     }));
 
+    // ─── Command: Compile (Console) ──────────────────────────────────
+    context.subscriptions.push(vscode.commands.registerCommand('ailang.compileConsole', () => {
+        const e = vscode.window.activeTextEditor;
+        if (!e || e.document.languageId !== 'ailang') {
+            vscode.window.showErrorMessage('Open an AILang file to compile.');
+            return;
+        }
+        e.document.save().then(() => {
+            const comp = toWslPath(path.join(__dirname, 'compcon.x'));
+            const src = toWslPath(e.document.fileName);
+            const srcDir = toWslPath(path.dirname(e.document.fileName));
+            const out = src.replace(/\.[^/.]+$/, '') + '.x';
+            const shellPath = isWindows ? 'wsl.exe' : '/bin/bash';
+            const t = vscode.window.createTerminal({ name: 'AILang Console Build', shellPath });
+            t.show();
+            t.sendText(`cd "${srcDir}" && chmod +x "${comp}" && "${comp}" "${src}" "${out}"`);
+        });
+    }));
+
+    // ─── Command: Run (Console) ──────────────────────────────────────
+    context.subscriptions.push(vscode.commands.registerCommand('ailang.runConsole', () => {
+        const e = vscode.window.activeTextEditor;
+        if (!e || e.document.languageId !== 'ailang') {
+            vscode.window.showErrorMessage('Open an AILang file to run.');
+            return;
+        }
+        e.document.save().then(() => {
+            const comp = toWslPath(path.join(__dirname, 'compcon.x'));
+            const src = toWslPath(e.document.fileName);
+            const srcDir = toWslPath(path.dirname(e.document.fileName));
+            const out = src.replace(/\.[^/.]+$/, '') + '.x';
+            const shellPath = isWindows ? 'wsl.exe' : '/bin/bash';
+            const t = vscode.window.createTerminal({ name: 'AILang Console Run', shellPath });
+            t.show();
+            t.sendText(`cd "${srcDir}" && chmod +x "${comp}" && "${comp}" "${src}" "${out}" && chmod +x "${out}" && "${out}"`);
+        });
+    }));
+
     // ─── Command: Analyze ────────────────────────────────────────────
     context.subscriptions.push(vscode.commands.registerCommand('ailang.analyze', () => {
         const e = vscode.window.activeTextEditor;
@@ -979,6 +1017,10 @@ function activate(context) {
                 const pos = doc.positionAt(m.index);
                 const r = new vscode.Range(pos, pos);
                 lenses.push(new vscode.CodeLens(r, { title: '$(play) Run', command: 'ailang.run' }));
+                lenses.push(new vscode.CodeLens(r, { title: '$(terminal) Run Console', command: 'ailang.runConsole' }));
+                lenses.push(new vscode.CodeLens(r, { title: '$(file-binary) Compile', command: 'ailang.compile' }));
+                lenses.push(new vscode.CodeLens(r, { title: '$(gear) Compile Console', command: 'ailang.compileConsole' }));
+                lenses.push(new vscode.CodeLens(r, { title: '$(eye) Analyze', command: 'ailang.analyze' }));
             }
             return lenses;
         }
