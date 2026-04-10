@@ -1,0 +1,557 @@
+// =============================================================================
+// Library.COptimizeHoist.ailang
+// Loop-Invariant Code Motion — AST-to-AST transformation pass
+//
+// Runs BEFORE code generation. Rewrites the AST so that expressions
+// which don't depend on anything written inside a loop are moved to
+// assignment statements before the loop.
+//
+// Strategy:
+//   1. Walk AST looking for BLOCK nodes containing WHILE children
+//   2. For each WHILE, collect variables written in the loop body
+//   3. Walk all expressions in the loop body and condition
+//   4. Find the LARGEST invariant subtrees (don't hoist leaves — 
+//      hoist entire Multiply(arr, 8) not just "arr" and "8" separately)
+//   5. Create __hoist_N = expression assignments
+//   6. Insert them into the parent BLOCK before the WHILE
+//   7. Replace original expressions with __hoist_N identifier references
+//
+// Conservative: only hoists pure math ops (Add, Subtract, Multiply, etc.)
+// Does NOT hoist function calls, memory ops, or anything with side effects
+//
+// Location: Librarys/Compiler/Compile/Modules/Library.COptimizeHoist.ailang
+// =============================================================================
+
+LibraryImport.XArrays
+LibraryImport.Compiler.Frontend.AST.CASTTypes
+LibraryImport.Compiler.Frontend.AST.CASTCore
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.Hoist {
+    "temp_counter": Initialize=0, CanChange=True
+    "total_hoisted": Initialize=0, CanChange=True
+    "debug": Initialize=1, CanChange=True
+}
+
+// =============================================================================
+// MAIN ENTRY POINT
+// Call this after parsing, before code generation:
+//   Hoist_OptimizeAST(program_node)
+// =============================================================================
+Function.Hoist_OptimizeAST {
+    Input: root: Address
+    Output: Integer
+    Body: {
+        Hoist.temp_counter = 0
+        Hoist.total_hoisted = 0
+        
+        IfCondition EqualTo(root, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        IfCondition EqualTo(Hoist.debug, 1) ThenBlock: {
+            PrintMessage("[HOIST] Starting loop-invariant code motion pass\n")
+        }
+        
+        // Walk the entire AST looking for blocks containing loops
+        Hoist_WalkNode(root)
+        
+        IfCondition EqualTo(Hoist.debug, 1) ThenBlock: {
+            PrintMessage("[HOIST] Pass complete. Hoisted: ")
+            PrintNumber(Hoist.total_hoisted)
+            PrintMessage(" expressions\n")
+        }
+        
+        ReturnValue(Hoist.total_hoisted)
+    }
+}
+
+// =============================================================================
+// RECURSIVE AST WALKER
+// Looks for BLOCK nodes, then checks their children for WHILE nodes
+// =============================================================================
+
+Function.Hoist_WalkNode {
+    Input: node: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        node_type = AST_GetType(node)
+        
+        // If this is a BLOCK or BODY, process it for WHILE loops
+        IfCondition EqualTo(node_type, AST.BLOCK) ThenBlock: {
+            Hoist_ProcessBlock(node)
+        }
+        IfCondition EqualTo(node_type, AST.BODY) ThenBlock: {
+            Hoist_ProcessBlock(node)
+        }
+        
+        // Now recurse into children using FRESH count
+        // (ProcessBlock may have inserted nodes)
+        fresh_count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, fresh_count) {
+            child = AST_GetChild(node, i)
+            IfCondition NotEqual(child, 0) ThenBlock: {
+                // Don't recurse into children we just processed as blocks
+                // Only recurse into non-BLOCK, non-BODY children
+                // OR into blocks that contain nested functions/loops
+                child_type = AST_GetType(child)
+                
+                // Skip WHILE nodes — we already processed their bodies
+                // via ProcessBlock above
+                IfCondition NotEqual(child_type, AST.WHILE) ThenBlock: {
+                    Hoist_WalkNode(child)
+                }
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// PROCESS A BLOCK — find WHILE children and optimize them
+// =============================================================================
+Function.Hoist_ProcessBlock {
+    Input: block: Address
+    Body: {
+        children = AST_GetChildren(block)
+        IfCondition EqualTo(children, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        count = XArray.XSize(children)
+        
+        // Scan for WHILE nodes (iterate backwards because inserts shift indices)
+        i = Subtract(count, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            child = XArray.XGet(children, i)
+            IfCondition NotEqual(child, 0) ThenBlock: {
+                child_type = AST_GetType(child)
+                IfCondition EqualTo(child_type, AST.WHILE) ThenBlock: {
+                    Hoist_OptimizeWhile(block, i)
+                }
+            }
+            i = Subtract(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// OPTIMIZE A SINGLE WHILE LOOP
+// block = parent BLOCK node
+// loop_index = position of the WHILE in the block's children
+// =============================================================================
+
+Function.Hoist_OptimizeWhile {
+    Input: block: Address
+    Input: loop_index: Integer
+    Body: {
+        children = AST_GetChildren(block)
+        loop_node = XArray.XGet(children, loop_index)
+        
+        condition = AST_GetChild(loop_node, 0)
+        body = AST_GetChild(loop_node, 1)
+        
+        IfCondition EqualTo(body, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        // Step 1: Collect written variables from body AND condition
+        written_vars = XArray.XCreate(32)
+        Hoist_CollectWrittenVars(body, written_vars)
+        Hoist_CollectWrittenVars(condition, written_vars)
+        
+        IfCondition EqualTo(Hoist.debug, 1) ThenBlock: {
+            PrintMessage("[HOIST] Loop at index ")
+            PrintNumber(loop_index)
+            PrintMessage(", written vars: ")
+            PrintNumber(XArray.XSize(written_vars))
+            PrintMessage("\n")
+        }
+        
+        // Step 2: Find invariants in body ONLY (not condition)
+        hoistable = XArray.XCreate(16)
+        Hoist_FindInvariantsInNode(body, written_vars, hoistable)
+        
+        // Each candidate is 3 entries: parent, child_idx, expr
+        total_entries = XArray.XSize(hoistable)
+        hoist_count = Divide(total_entries, 3)
+        
+        IfCondition EqualTo(hoist_count, 0) ThenBlock: {
+            XArray.XDestroy(written_vars)
+            XArray.XDestroy(hoistable)
+            ReturnValue(0)
+        }
+        
+        // Safety limit
+        IfCondition GreaterThan(hoist_count, 4) ThenBlock: {
+            IfCondition EqualTo(Hoist.debug, 1) ThenBlock: {
+                PrintMessage("[HOIST] Limiting from ")
+                PrintNumber(hoist_count)
+                PrintMessage(" to 4\n")
+            }
+            hoist_count = 4
+        }
+        
+        IfCondition EqualTo(Hoist.debug, 1) ThenBlock: {
+            PrintMessage("[HOIST] Found ")
+            PrintNumber(hoist_count)
+            PrintMessage(" hoistable expressions\n")
+        }
+        
+        // Step 3: FIRST PASS — do all replacements (no index changes)
+        assignments_to_insert = XArray.XCreate(8)
+        
+        i = 0
+        WhileLoop LessThan(i, hoist_count) {
+            base = Multiply(i, 3)
+            parent_node = XArray.XGet(hoistable, base)
+            child_idx = XArray.XGet(hoistable, Add(base, 1))
+            inv_expr = XArray.XGet(hoistable, Add(base, 2))
+            
+            // Null safety
+            IfCondition EqualTo(inv_expr, 0) ThenBlock: {
+                i = Add(i, 1)
+                ContinueLoop
+            }
+            IfCondition EqualTo(parent_node, 0) ThenBlock: {
+                i = Add(i, 1)
+                ContinueLoop
+            }
+            
+            temp_name = Hoist_MakeTempName()
+            
+            // Create assignment: __hoist_N = <expression>
+            assign_node = AST_MakeAssignment(temp_name, inv_expr)
+            
+            // Create replacement: __hoist_N identifier
+            replacement = AST_MakeIdentifier(temp_name)
+            
+            // Replace in parent (does NOT change any indices)
+            AST_SetChild(parent_node, child_idx, replacement)
+            
+            // Save for insertion later
+            XArray.XPush(assignments_to_insert, assign_node)
+            
+            IfCondition EqualTo(Hoist.debug, 1) ThenBlock: {
+                PrintMessage("[HOIST] Prepared: ")
+                PrintString(temp_name)
+                PrintMessage("\n")
+            }
+            
+            Hoist.total_hoisted = Add(Hoist.total_hoisted, 1)
+            i = Add(i, 1)
+        }
+        
+        // Step 4: SECOND PASS — insert all assignments before loop
+        // Insert in REVERSE order so each insert at loop_index
+        // pushes previous inserts forward correctly
+        num_to_insert = XArray.XSize(assignments_to_insert)
+        j = Subtract(num_to_insert, 1)
+        WhileLoop GreaterEqual(j, 0) {
+            assign_node = XArray.XGet(assignments_to_insert, j)
+            XArray.XInsert(children, loop_index, assign_node)
+            
+            IfCondition EqualTo(Hoist.debug, 1) ThenBlock: {
+                PrintMessage("[HOIST] Inserted at position ")
+                PrintNumber(loop_index)
+                PrintMessage("\n")
+            }
+            
+            j = Subtract(j, 1)
+        }
+        
+        XArray.XDestroy(assignments_to_insert)
+        XArray.XDestroy(written_vars)
+        XArray.XDestroy(hoistable)
+    }
+}
+
+// =============================================================================
+// COLLECT WRITTEN VARIABLES
+// Walks a subtree and adds any assigned-to variable names to the set
+// =============================================================================
+Function.Hoist_CollectWrittenVars {
+    Input: node: Address
+    Input: written_vars: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        node_type = AST_GetType(node)
+        
+        // Assignment: DATA1 = target variable name
+        IfCondition EqualTo(node_type, AST.ASSIGNMENT) ThenBlock: {
+            target = AST_GetData1(node)
+            IfCondition NotEqual(target, 0) ThenBlock: {
+                // Add if not already in set
+                IfCondition EqualTo(Hoist_InSet(written_vars, target), 0) ThenBlock: {
+                    XArray.XPush(written_vars, target)
+                }
+            }
+        }
+        
+        // Recurse into children
+        child_count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, child_count) {
+            child = AST_GetChild(node, i)
+            Hoist_CollectWrittenVars(child, written_vars)
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// FIND INVARIANT EXPRESSIONS
+// Walks expressions looking for the LARGEST invariant subtrees
+// Stores results as triples: [parent_node, child_index, expr] in hoistable
+// =============================================================================
+Function.Hoist_FindInvariantsInNode {
+    Input: node: Address
+    Input: written_vars: Address
+    Input: hoistable: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        // Walk all children looking for CALL nodes (math ops)
+        child_count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, child_count) {
+            child = AST_GetChild(node, i)
+            IfCondition NotEqual(child, 0) ThenBlock: {
+                child_type = AST_GetType(child)
+                
+                IfCondition EqualTo(child_type, AST.CALL) ThenBlock: {
+                    // Check if this entire subtree is invariant
+                    IfCondition EqualTo(Hoist_IsInvariant(child, written_vars), 1) ThenBlock: {
+                        // Check it's worth hoisting (not just a simple leaf)
+                        IfCondition EqualTo(Hoist_IsWorthHoisting(child), 1) ThenBlock: {
+                            // Record: parent, child_index, expression
+                            XArray.XPush(hoistable, node)
+                            XArray.XPush(hoistable, i)
+                            XArray.XPush(hoistable, child)
+                        }
+                    } ElseBlock: {
+                        // This subtree is NOT fully invariant
+                        // But maybe some of its children are — recurse deeper
+                        Hoist_FindInvariantsInNode(child, written_vars, hoistable)
+                    }
+                } ElseBlock: {
+                    // Not a CALL — recurse into it looking for CALL descendants
+                    Hoist_FindInvariantsInNode(child, written_vars, hoistable)
+                }
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// CHECK IF EXPRESSION IS LOOP-INVARIANT
+// Returns 1 if the expression only depends on constants and variables
+// not written inside the loop
+// =============================================================================
+Function.Hoist_IsInvariant {
+    Input: expr: Address
+    Input: written_vars: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(expr, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        expr_type = AST_GetType(expr)
+        
+        // Constants are always invariant
+        IfCondition EqualTo(expr_type, AST.NUMBER) ThenBlock: {
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(expr_type, AST.STRING) ThenBlock: {
+            ReturnValue(1)
+        }
+        
+        // Identifiers: invariant if NOT in the written set
+        IfCondition EqualTo(expr_type, AST.IDENTIFIER) ThenBlock: {
+            name = AST_GetData1(expr)
+            IfCondition EqualTo(Hoist_InSet(written_vars, name), 1) ThenBlock: {
+                ReturnValue(0)  // Written in loop — NOT invariant
+            }
+            ReturnValue(1)  // Not written — invariant
+        }
+        
+        // CALL nodes: only hoist pure math operations
+        IfCondition EqualTo(expr_type, AST.CALL) ThenBlock: {
+            func_name = AST_GetData1(expr)
+            
+            // Check if it's a pure math operation (no side effects)
+            IfCondition EqualTo(Hoist_IsPureMathOp(func_name), 0) ThenBlock: {
+                ReturnValue(0)  // Not a pure op — can't hoist
+            }
+            
+            // All arguments must also be invariant (recursive check)
+            arg_count = AST_GetChildCount(expr)
+            j = 0
+            WhileLoop LessThan(j, arg_count) {
+                arg = AST_GetChild(expr, j)
+                IfCondition EqualTo(Hoist_IsInvariant(arg, written_vars), 0) ThenBlock: {
+                    ReturnValue(0)  // One arg depends on loop — not invariant
+                }
+                j = Add(j, 1)
+            }
+            ReturnValue(1)  // All args invariant — whole expression is invariant
+        }
+        
+        // Anything else (memory ops, calls, etc.) — not safe to hoist
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CHECK IF EXPRESSION IS WORTH HOISTING
+// Don't hoist simple leaves (numbers, single identifiers)
+// Only hoist actual computations (CALL nodes with children)
+// =============================================================================
+Function.Hoist_IsWorthHoisting {
+    Input: expr: Address
+    Output: Integer
+    Body: {
+        expr_type = AST_GetType(expr)
+        
+        // Only hoist CALL nodes (actual operations)
+        IfCondition NotEqual(expr_type, AST.CALL) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        // Must have at least 1 argument that isn't a bare constant
+        // (no point hoisting Multiply(2, 8) — that's constant folding territory)
+        arg_count = AST_GetChildCount(expr)
+        has_variable = 0
+        i = 0
+        WhileLoop LessThan(i, arg_count) {
+            arg = AST_GetChild(expr, i)
+            arg_type = AST_GetType(arg)
+            IfCondition NotEqual(arg_type, AST.NUMBER) ThenBlock: {
+                has_variable = 1
+            }
+            i = Add(i, 1)
+        }
+        
+        ReturnValue(has_variable)
+    }
+}
+
+// =============================================================================
+// PURE MATH OPERATION CHECK
+// Returns 1 if the function name is a side-effect-free math operation
+// =============================================================================
+Function.Hoist_IsPureMathOp {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        IfCondition EqualTo(StringCompare(name, "Add"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Subtract"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Multiply"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Divide"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Modulo"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "BitwiseAnd"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "BitwiseOr"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "BitwiseXor"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "LeftShift"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "RightShift"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Negate"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "AbsoluteValue"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "Power"), 0) ThenBlock: { ReturnValue(1) }
+        
+        // Comparisons are pure too
+        IfCondition EqualTo(StringCompare(name, "EqualTo"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "NotEqual"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "LessThan"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "GreaterThan"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "LessEqual"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(name, "GreaterEqual"), 0) ThenBlock: { ReturnValue(1) }
+        
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SET MEMBERSHIP CHECK (string name in XArray of strings)
+// =============================================================================
+Function.Hoist_InSet {
+    Input: set: Address
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(set, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(name, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        
+        count = XArray.XSize(set)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            entry = XArray.XGet(set, i)
+            IfCondition NotEqual(entry, 0) ThenBlock: {
+                cmp = StringCompare(entry, name)
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    ReturnValue(1)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// TEMP NAME GENERATOR
+// =============================================================================
+Function.Hoist_MakeTempName {
+    Output: Address
+    Body: {
+        num_str = NumberToString(Hoist.temp_counter)
+        Hoist.temp_counter = Add(Hoist.temp_counter, 1)
+        
+        // Build "__hoist_N"
+        prefix = "__hoist_"
+        prefix_len = 8
+        num_len = StringLength(num_str)
+        total_len = Add(prefix_len, num_len)
+        
+        result = Allocate(Add(total_len, 1))
+        
+        // Copy prefix
+        i = 0
+        WhileLoop LessThan(i, prefix_len) {
+            c = GetByte(prefix, i)
+            SetByte(result, i, c)
+            i = Add(i, 1)
+        }
+        
+        // Copy number
+        j = 0
+        WhileLoop LessThan(j, num_len) {
+            c = GetByte(num_str, j)
+            SetByte(result, Add(prefix_len, j), c)
+            j = Add(j, 1)
+        }
+        
+        SetByte(result, total_len, 0)
+        ReturnValue(result)
+    }
+}
