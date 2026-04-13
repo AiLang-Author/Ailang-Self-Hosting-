@@ -1,0 +1,411 @@
+// Library.TF.Train.ailang
+// Pure functions only. No SubRoutines.
+// Extra params beyond 6-input limit are passed via carrier FixedPools
+// defined in ATTN.ailang: TFBackOut, TFBackCtx, TFBackQK, TFBackWA, TFBackWB
+// Caller sets carrier fields before calling. Functions read them directly.
+// Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.TF.Math
+LibraryImport.TF.Vec
+LibraryImport.TF.Mat
+LibraryImport.TF.Act
+LibraryImport.TF.Carriers
+LibraryImport.TF.Float
+
+// =============================================================================
+// SOFTMAX GRADIENT + dWout + dResid
+// Reads from TFBackOut: .Wout .targets .seqln .dmod .vocab
+// =============================================================================
+Function.TFTrain_BackOutProj {
+    Input:  dWout:   Integer
+    Input:  dResid:  Integer
+    Input:  dLogits: Integer
+    Input:  probs:   Integer
+    Input:  resid:   Integer
+    Output: Integer
+    Body: {
+        Wout    = TFBackOut.Wout
+        targets = TFBackOut.targets
+        seqln   = TFBackOut.seqln
+        dmod    = TFBackOut.dmod
+        vocab   = TFBackOut.vocab
+
+        dlogit_row = TF_VecAlloc(vocab)
+        dresid_row = TF_VecAlloc(dmod)
+        prob_row   = TF_VecAlloc(vocab)
+        resid_row  = TF_VecAlloc(dmod)
+
+        DebugAssert(NotEqual(dlogit_row, 0), "TFTrain_BackOutProj: alloc failed")
+
+        pos = 0
+        WhileLoop LessThan(pos, seqln) {
+            tgt = TF_VecGet(targets, pos)
+            col = 0
+            WhileLoop LessThan(col, vocab) {
+                TF_VecSet(prob_row, col, TF_MatGet(probs, pos, col, vocab))
+                col = Add(col, 1)
+            }
+            TFAct_SoftmaxGrad(dlogit_row, prob_row, tgt, vocab)
+            col = 0
+            WhileLoop LessThan(col, vocab) {
+                TF_MatSet(dLogits, pos, col, vocab, TF_VecGet(dlogit_row, col))
+                col = Add(col, 1)
+            }
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                TF_VecSet(resid_row, col, TF_MatGet(resid, pos, col, dmod))
+                col = Add(col, 1)
+            }
+            TF_FOuterAccum(dWout, dlogit_row, resid_row, vocab, dmod)
+            TF_MatTVecMul(dresid_row, Wout, dlogit_row, vocab, dmod)
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                TF_MatSet(dResid, pos, col, dmod, TF_VecGet(dresid_row, col))
+                col = Add(col, 1)
+            }
+            pos = Add(pos, 1)
+        }
+
+        TF_VecFree(dlogit_row, vocab)
+        TF_VecFree(dresid_row, dmod)
+        TF_VecFree(prob_row,   vocab)
+        TF_VecFree(resid_row,  dmod)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// RESIDUAL SPLIT + dV + dScores
+// Reads from TFBackCtx: .attn .vvec .seqln .dmod .scale
+// =============================================================================
+Function.TFTrain_BackAttnCtx {
+    Input:  dCtx:    Integer
+    Input:  dEmb:    Integer
+    Input:  dV:      Integer
+    Input:  dScores: Integer
+    Input:  dResid:  Integer
+    Output: Integer
+    Body: {
+        attn  = TFBackCtx.attn
+        vvec  = TFBackCtx.vvec
+        seqln = TFBackCtx.seqln
+        dmod  = TFBackCtx.dmod
+        scale = TFBackCtx.scale
+
+        dctx_row = TF_VecAlloc(dmod)
+        vrow     = TF_VecAlloc(dmod)
+        dv_accum = TF_VecAlloc(dmod)
+        DebugAssert(NotEqual(dctx_row, 0), "TFTrain_BackAttnCtx: alloc failed")
+
+        // Residual split
+        pos = 0
+        WhileLoop LessThan(pos, seqln) {
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                dv = TF_MatGet(dResid, pos, col, dmod)
+                TF_MatSet(dCtx, pos, col, dmod, dv)
+                TF_MatSet(dEmb, pos, col, dmod, dv)
+                col = Add(col, 1)
+            }
+            pos = Add(pos, 1)
+        }
+
+        // dV - using float accumulation for precision
+        vpos = 0
+        WhileLoop LessThan(vpos, seqln) {
+            TF_VecZero(dv_accum, dmod)
+            ipos = 0
+            WhileLoop LessThan(ipos, seqln) {
+                aw_f = Float_FromInt(TF_MatGet(attn, ipos, vpos, seqln))
+                col = 0
+                WhileLoop LessThan(col, dmod) {
+                    dc_f     = Float_FromInt(TF_MatGet(dCtx, ipos, col, dmod))
+                    old_f    = Float_FromInt(TF_VecGet(dv_accum, col))
+                    prod_f   = Float_Mul(aw_f, dc_f)
+                    scaled_f = Float_Div(prod_f, Float_FromInt(256))
+                    nuw_f    = Float_Add(old_f, scaled_f)
+                    TF_VecSet(dv_accum, col, Float_ToInt(nuw_f))
+                    col = Add(col, 1)
+                }
+                ipos = Add(ipos, 1)
+            }
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                TF_MatSet(dV, vpos, col, dmod, TF_VecGet(dv_accum, col))
+                col = Add(col, 1)
+            }
+            vpos = Add(vpos, 1)
+        }
+
+        // dScores - softmax Jacobian (NOT sigmoid a*(1-a))
+        // For each row i:
+        //   raw[j] = dot(dCtx[i], V[j]) / scale
+        //   wsum   = sum_k( attn[i,k] * raw[k] ) / 256
+        //   dS[i,j] = attn[i,j] * (raw[j] - wsum) / 256
+        f256 = Float_FromInt(256)
+        raw_buf = TF_VecAlloc(seqln)
+        ipos = 0
+        WhileLoop LessThan(ipos, seqln) {
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                TF_VecSet(dctx_row, col, TF_MatGet(dCtx, ipos, col, dmod))
+                col = Add(col, 1)
+            }
+            // Pass 1: compute raw[j] = dot(dCtx[i], V[j]) / scale for all j
+            wsum_f = Float_FromInt(0)
+            jpos = 0
+            WhileLoop LessThan(jpos, seqln) {
+                col = 0
+                WhileLoop LessThan(col, dmod) {
+                    TF_VecSet(vrow, col, TF_MatGet(vvec, jpos, col, dmod))
+                    col = Add(col, 1)
+                }
+                raw_f = Float_Div(Float_FromInt(TF_FDot(dctx_row, vrow, dmod)), Float_FromInt(Multiply(256, scale)))
+                TF_VecSet(raw_buf, jpos, Float_ToInt(raw_f))
+                // Accumulate weighted sum: wsum += attn[i,j] * raw[j] / 256
+                aw_f = Float_FromInt(TF_MatGet(attn, ipos, jpos, seqln))
+                wsum_f = Float_Add(wsum_f, Float_Div(Float_Mul(aw_f, raw_f), f256))
+                jpos = Add(jpos, 1)
+            }
+            // Pass 2: dS[i,j] = attn[i,j] * (raw[j] - wsum) / 256
+            jpos = 0
+            WhileLoop LessThan(jpos, seqln) {
+                aw_f  = Float_FromInt(TF_MatGet(attn, ipos, jpos, seqln))
+                raw_f = Float_FromInt(TF_VecGet(raw_buf, jpos))
+                diff_f = Float_Sub(raw_f, wsum_f)
+                dsc_f  = Float_Div(Float_Mul(aw_f, diff_f), f256)
+                TF_MatSet(dScores, ipos, jpos, seqln, Float_ToInt(dsc_f))
+                jpos = Add(jpos, 1)
+            }
+            ipos = Add(ipos, 1)
+        }
+        TF_VecFree(raw_buf, seqln)
+
+        TF_VecFree(dctx_row, dmod)
+        TF_VecFree(vrow,     dmod)
+        TF_VecFree(dv_accum, dmod)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// dQ dK from dScores
+// Reads from TFBackQK: .seqln .dmod
+// =============================================================================
+Function.TFTrain_BackQK {
+    Input:  dQ:      Integer
+    Input:  dK:      Integer
+    Input:  dScores: Integer
+    Input:  qvec:    Integer
+    Input:  kvec:    Integer
+    Output: Integer
+    Body: {
+        seqln = TFBackQK.seqln
+        dmod  = TFBackQK.dmod
+
+        qrow = TF_VecAlloc(dmod)
+        DebugAssert(NotEqual(qrow, 0), "TFTrain_BackQK: alloc failed")
+
+        TF_MatZero(dQ, seqln, dmod)
+        TF_MatZero(dK, seqln, dmod)
+
+        ipos = 0
+        WhileLoop LessThan(ipos, seqln) {
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                TF_VecSet(qrow, col, TF_MatGet(qvec, ipos, col, dmod))
+                col = Add(col, 1)
+            }
+            jpos = 0
+            WhileLoop LessThan(jpos, seqln) {
+                ds = TF_MatGet(dScores, ipos, jpos, seqln)
+                col = 0
+                WhileLoop LessThan(col, dmod) {
+                    kv     = TF_MatGet(kvec, jpos, col, dmod)
+                    qv     = TF_VecGet(qrow, col)
+                    old_dq = TF_MatGet(dQ,   ipos, col, dmod)
+                    old_dk = TF_MatGet(dK,   jpos, col, dmod)
+                    ndq    = Add(old_dq, Multiply(ds, kv))
+                    ndk    = Add(old_dk, Multiply(ds, qv))
+                    TF_MatSet(dQ, ipos, col, dmod, ndq)
+                    TF_MatSet(dK, jpos, col, dmod, ndk)
+                    col = Add(col, 1)
+                }
+                jpos = Add(jpos, 1)
+            }
+            ipos = Add(ipos, 1)
+        }
+
+        TF_VecFree(qrow, dmod)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// dWq dWk dWv and accumulate dEmb
+// Reads from TFBackWA: .Wq .Wk .Wv .emb .seqln .dmod .dK .dV
+// =============================================================================
+Function.TFTrain_BackWeightsA {
+    Input:  dWq:  Integer
+    Input:  dWk:  Integer
+    Input:  dWv:  Integer
+    Input:  dEmb: Integer
+    Input:  dQ:   Integer
+    Output: Integer
+    Body: {
+        Wq    = TFBackWA.Wq
+        Wk    = TFBackWA.Wk
+        Wv    = TFBackWA.Wv
+        emb   = TFBackWA.emb
+        seqln = TFBackWA.seqln
+        dmod  = TFBackWA.dmod
+        dK    = TFBackWA.dK
+        dV    = TFBackWA.dV
+
+        emb_row = TF_VecAlloc(dmod)
+        dq_row  = TF_VecAlloc(dmod)
+        dk_row  = TF_VecAlloc(dmod)
+        dv_row  = TF_VecAlloc(dmod)
+        tmp_row = TF_VecAlloc(dmod)
+        DebugAssert(NotEqual(emb_row, 0), "TFTrain_BackWeightsA: alloc failed")
+
+        pos = 0
+        WhileLoop LessThan(pos, seqln) {
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                TF_VecSet(emb_row, col, TF_MatGet(emb, pos, col, dmod))
+                TF_VecSet(dq_row,  col, TF_MatGet(dQ,  pos, col, dmod))
+                TF_VecSet(dk_row,  col, TF_MatGet(dK,  pos, col, dmod))
+                TF_VecSet(dv_row,  col, TF_MatGet(dV,  pos, col, dmod))
+                col = Add(col, 1)
+            }
+                TF_FOuterAccum(dWq, dq_row, emb_row, dmod, dmod)
+                TF_FOuterAccum(dWk, dk_row, emb_row, dmod, dmod)
+                TF_FOuterAccum(dWv, dv_row, emb_row, dmod, dmod)
+
+            TF_MatTVecMul(tmp_row, Wq, dq_row, dmod, dmod)
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                old = TF_MatGet(dEmb, pos, col, dmod)
+                TF_MatSet(dEmb, pos, col, dmod, Add(old, TF_VecGet(tmp_row, col)))
+                col = Add(col, 1)
+            }
+            TF_MatTVecMul(tmp_row, Wk, dk_row, dmod, dmod)
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                old = TF_MatGet(dEmb, pos, col, dmod)
+                TF_MatSet(dEmb, pos, col, dmod, Add(old, TF_VecGet(tmp_row, col)))
+                col = Add(col, 1)
+            }
+            TF_MatTVecMul(tmp_row, Wv, dv_row, dmod, dmod)
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                old = TF_MatGet(dEmb, pos, col, dmod)
+                TF_MatSet(dEmb, pos, col, dmod, Add(old, TF_VecGet(tmp_row, col)))
+                col = Add(col, 1)
+            }
+            pos = Add(pos, 1)
+        }
+
+        TF_VecFree(emb_row, dmod)
+        TF_VecFree(dq_row,  dmod)
+        TF_VecFree(dk_row,  dmod)
+        TF_VecFree(dv_row,  dmod)
+        TF_VecFree(tmp_row, dmod)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// dEmbed and dPosEmb from dEmb
+// Reads from TFBackWB: .tokens .seqln .dmod
+// =============================================================================
+Function.TFTrain_BackWeightsB {
+    Input:  dEmbed:  Integer
+    Input:  dPosEmb: Integer
+    Input:  dEmb:    Integer
+    Output: Integer
+    Body: {
+        tokens = TFBackWB.tokens
+        seqln  = TFBackWB.seqln
+        dmod   = TFBackWB.dmod
+
+        pos = 0
+        WhileLoop LessThan(pos, seqln) {
+            tok_off = Multiply(TFElem.Size, pos)
+            tok     = Dereference(Add(tokens, tok_off))
+            col = 0
+            WhileLoop LessThan(col, dmod) {
+                dv     = TF_MatGet(dEmb,    pos, col, dmod)
+                old_te = TF_MatGet(dEmbed,  tok, col, dmod)
+                old_pe = TF_MatGet(dPosEmb, pos, col, dmod)
+                TF_MatSet(dEmbed,  tok, col, dmod, Add(old_te, dv))
+                TF_MatSet(dPosEmb, pos, col, dmod, Add(old_pe, dv))
+                col = Add(col, 1)
+            }
+            pos = Add(pos, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// ACCURACY
+// =============================================================================
+Function.TFTrain_Accuracy {
+    Input:  probs:   Integer
+    Input:  targets: Integer
+    Input:  seqln:   Integer
+    Input:  vocab:   Integer
+    Output: Integer
+    Body: {
+        correct  = 0
+        prob_row = TF_VecAlloc(vocab)
+        pos = 0
+        WhileLoop LessThan(pos, seqln) {
+            col = 0
+            WhileLoop LessThan(col, vocab) {
+                TF_VecSet(prob_row, col, TF_MatGet(probs, pos, col, vocab))
+                col = Add(col, 1)
+            }
+            pred = TF_VecArgMax(prob_row, vocab)
+            tgt  = TF_VecGet(targets, pos)
+            IfCondition EqualTo(pred, tgt) ThenBlock: {
+                correct = Add(correct, 1)
+            }
+            pos = Add(pos, 1)
+        }
+        TF_VecFree(prob_row, vocab)
+        ReturnValue(correct)
+    }
+}
+
+// =============================================================================
+// LOSS
+// =============================================================================
+Function.TFTrain_Loss {
+    Input:  probs:   Integer
+    Input:  targets: Integer
+    Input:  seqln:   Integer
+    Input:  vocab:   Integer
+    Output: Integer
+    Body: {
+        prob_row  = TF_VecAlloc(vocab)
+        step_loss = 0
+        pos = 0
+        WhileLoop LessThan(pos, seqln) {
+            col = 0
+            WhileLoop LessThan(col, vocab) {
+                TF_VecSet(prob_row, col, TF_MatGet(probs, pos, col, vocab))
+                col = Add(col, 1)
+            }
+            tgt  = TF_VecGet(targets, pos)
+            loss = TFAct_CrossEntropy(prob_row, tgt)
+            step_loss = Add(step_loss, loss)
+            pos = Add(pos, 1)
+        }
+        avg = Divide(step_loss, seqln)
+        TF_VecFree(prob_row, vocab)
+        ReturnValue(avg)
+    }
+}
