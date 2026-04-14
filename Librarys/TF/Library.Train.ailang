@@ -58,6 +58,7 @@ Function.TFTrain_BackOutProj {
             }
             TF_FOuterAccum(dWout, dlogit_row, resid_row, vocab, dmod)
             TF_MatTVecMul(dresid_row, Wout, dlogit_row, vocab, dmod)
+       //     TF_VecScale(dresid_row, dresid_row, 1, 256, dmod)
             col = 0
             WhileLoop LessThan(col, dmod) {
                 TF_MatSet(dResid, pos, col, dmod, TF_VecGet(dresid_row, col))
@@ -65,6 +66,9 @@ Function.TFTrain_BackOutProj {
             }
             pos = Add(pos, 1)
         }
+
+        // Scale dWout from Q23 accumulation back down to Q15
+   //     TF_VecScale(dWout, dWout, 1, 256, Multiply(vocab, dmod))
 
         TF_VecFree(dlogit_row, vocab)
         TF_VecFree(dresid_row, dmod)
@@ -91,13 +95,15 @@ Function.TFTrain_BackAttnCtx {
         seqln = TFBackCtx.seqln
         dmod  = TFBackCtx.dmod
         scale = TFBackCtx.scale
+        numheads = TFBackCtx.numheads
 
         dctx_row = TF_VecAlloc(dmod)
         vrow     = TF_VecAlloc(dmod)
         dv_accum = TF_VecAlloc(dmod)
+        headdim  = Divide(dmod, numheads)
         DebugAssert(NotEqual(dctx_row, 0), "TFTrain_BackAttnCtx: alloc failed")
 
-        // Residual split
+        // Residual split — same as before
         pos = 0
         WhileLoop LessThan(pos, seqln) {
             col = 0
@@ -110,22 +116,29 @@ Function.TFTrain_BackAttnCtx {
             pos = Add(pos, 1)
         }
 
-        // dV - using float accumulation for precision
+        // dV — per head slicing
         vpos = 0
         WhileLoop LessThan(vpos, seqln) {
             TF_VecZero(dv_accum, dmod)
             ipos = 0
             WhileLoop LessThan(ipos, seqln) {
-                aw_f = Float_FromInt(TF_MatGet(attn, ipos, vpos, seqln))
-                col = 0
-                WhileLoop LessThan(col, dmod) {
-                    dc_f     = Float_FromInt(TF_MatGet(dCtx, ipos, col, dmod))
-                    old_f    = Float_FromInt(TF_VecGet(dv_accum, col))
-                    prod_f   = Float_Mul(aw_f, dc_f)
-                    scaled_f = Float_Div(prod_f, Float_FromInt(256))
-                    nuw_f    = Float_Add(old_f, scaled_f)
-                    TF_VecSet(dv_accum, col, Float_ToInt(nuw_f))
-                    col = Add(col, 1)
+                h = 0
+                WhileLoop LessThan(h, numheads) {
+                    offset = Multiply(h, headdim)
+                    s_row = Add(Multiply(h, seqln), ipos)
+                    aw_f = Float_FromInt(TF_MatGet(attn, s_row, vpos, seqln))
+                    di = 0
+                    WhileLoop LessThan(di, headdim) {
+                        didx     = Add(offset, di)
+                        dc_f     = Float_FromInt(TF_MatGet(dCtx, ipos, didx, dmod))
+                        old_f    = Float_FromInt(TF_VecGet(dv_accum, didx))
+                        prod_f   = Float_Mul(aw_f, dc_f)
+                        scaled_f = Float_Div(prod_f, Float_FromInt(256))
+                        nuw_f    = Float_Add(old_f, scaled_f)
+                        TF_VecSet(dv_accum, didx, Float_ToInt(nuw_f))
+                        di = Add(di, 1)
+                    }
+                    h = Add(h, 1)
                 }
                 ipos = Add(ipos, 1)
             }
@@ -137,11 +150,7 @@ Function.TFTrain_BackAttnCtx {
             vpos = Add(vpos, 1)
         }
 
-        // dScores - softmax Jacobian (NOT sigmoid a*(1-a))
-        // For each row i:
-        //   raw[j] = dot(dCtx[i], V[j]) / scale
-        //   wsum   = sum_k( attn[i,k] * raw[k] ) / 256
-        //   dS[i,j] = attn[i,j] * (raw[j] - wsum) / 256
+        // dScores — per head, using float for Jacobian
         f256 = Float_FromInt(256)
         raw_buf = TF_VecAlloc(seqln)
         ipos = 0
@@ -151,31 +160,37 @@ Function.TFTrain_BackAttnCtx {
                 TF_VecSet(dctx_row, col, TF_MatGet(dCtx, ipos, col, dmod))
                 col = Add(col, 1)
             }
-            // Pass 1: compute raw[j] = dot(dCtx[i], V[j]) / scale for all j
-            wsum_f = Float_FromInt(0)
-            jpos = 0
-            WhileLoop LessThan(jpos, seqln) {
-                col = 0
-                WhileLoop LessThan(col, dmod) {
-                    TF_VecSet(vrow, col, TF_MatGet(vvec, jpos, col, dmod))
-                    col = Add(col, 1)
+            h = 0
+            WhileLoop LessThan(h, numheads) {
+                offset = Multiply(h, headdim)
+                s_row = Add(Multiply(h, seqln), ipos)
+
+                // Pass 1: raw[j] = dot(dCtx[i], V[j]) over head slice, divided by 256*scale
+                wsum_f = Float_FromInt(0)
+                jpos = 0
+                WhileLoop LessThan(jpos, seqln) {
+                    col = 0
+                    WhileLoop LessThan(col, dmod) {
+                        TF_VecSet(vrow, col, TF_MatGet(vvec, jpos, col, dmod))
+                        col = Add(col, 1)
+                    }
+                    raw_f = Float_Div(Float_FromInt(TF_VecDotOffset(dctx_row, vrow, offset, headdim)), Float_FromInt(Multiply(256, scale)))
+                    TF_VecSet(raw_buf, jpos, Float_ToInt(raw_f))
+                    aw_f = Float_FromInt(TF_MatGet(attn, s_row, jpos, seqln))
+                    wsum_f = Float_Add(wsum_f, Float_Div(Float_Mul(aw_f, raw_f), f256))
+                    jpos = Add(jpos, 1)
                 }
-                raw_f = Float_Div(Float_FromInt(TF_FDot(dctx_row, vrow, dmod)), Float_FromInt(Multiply(256, scale)))
-                TF_VecSet(raw_buf, jpos, Float_ToInt(raw_f))
-                // Accumulate weighted sum: wsum += attn[i,j] * raw[j] / 256
-                aw_f = Float_FromInt(TF_MatGet(attn, ipos, jpos, seqln))
-                wsum_f = Float_Add(wsum_f, Float_Div(Float_Mul(aw_f, raw_f), f256))
-                jpos = Add(jpos, 1)
-            }
-            // Pass 2: dS[i,j] = attn[i,j] * (raw[j] - wsum) / 256
-            jpos = 0
-            WhileLoop LessThan(jpos, seqln) {
-                aw_f  = Float_FromInt(TF_MatGet(attn, ipos, jpos, seqln))
-                raw_f = Float_FromInt(TF_VecGet(raw_buf, jpos))
-                diff_f = Float_Sub(raw_f, wsum_f)
-                dsc_f  = Float_Div(Float_Mul(aw_f, diff_f), f256)
-                TF_MatSet(dScores, ipos, jpos, seqln, Float_ToInt(dsc_f))
-                jpos = Add(jpos, 1)
+                // Pass 2: dS[i,j] = attn[i,j] * (raw[j] - wsum) / 256
+                jpos = 0
+                WhileLoop LessThan(jpos, seqln) {
+                    aw_f  = Float_FromInt(TF_MatGet(attn, s_row, jpos, seqln))
+                    raw_f = Float_FromInt(TF_VecGet(raw_buf, jpos))
+                    diff_f = Float_Sub(raw_f, wsum_f)
+                    dsc_f  = Float_Div(Float_Mul(aw_f, diff_f), f256)
+                    TF_MatSet(dScores, s_row, jpos, seqln, Float_ToInt(dsc_f))
+                    jpos = Add(jpos, 1)
+                }
+                h = Add(h, 1)
             }
             ipos = Add(ipos, 1)
         }
@@ -202,6 +217,8 @@ Function.TFTrain_BackQK {
     Body: {
         seqln = TFBackQK.seqln
         dmod  = TFBackQK.dmod
+        numheads = TFBackQK.numheads
+        headdim = Divide(dmod, numheads)
 
         qrow = TF_VecAlloc(dmod)
         DebugAssert(NotEqual(qrow, 0), "TFTrain_BackQK: alloc failed")
@@ -216,22 +233,29 @@ Function.TFTrain_BackQK {
                 TF_VecSet(qrow, col, TF_MatGet(qvec, ipos, col, dmod))
                 col = Add(col, 1)
             }
-            jpos = 0
-            WhileLoop LessThan(jpos, seqln) {
-                ds = TF_MatGet(dScores, ipos, jpos, seqln)
-                col = 0
-                WhileLoop LessThan(col, dmod) {
-                    kv     = TF_MatGet(kvec, jpos, col, dmod)
-                    qv     = TF_VecGet(qrow, col)
-                    old_dq = TF_MatGet(dQ,   ipos, col, dmod)
-                    old_dk = TF_MatGet(dK,   jpos, col, dmod)
-                    ndq    = Add(old_dq, Multiply(ds, kv))
-                    ndk    = Add(old_dk, Multiply(ds, qv))
-                    TF_MatSet(dQ, ipos, col, dmod, ndq)
-                    TF_MatSet(dK, jpos, col, dmod, ndk)
-                    col = Add(col, 1)
+            h = 0
+            WhileLoop LessThan(h, numheads) {
+                offset = Multiply(h, headdim)
+                s_row = Add(Multiply(h, seqln), ipos)
+                jpos = 0
+                WhileLoop LessThan(jpos, seqln) {
+                    ds = TF_MatGet(dScores, s_row, jpos, seqln)
+                    di = 0
+                    WhileLoop LessThan(di, headdim) {
+                        didx   = Add(offset, di)
+                        kv     = TF_MatGet(kvec, jpos, didx, dmod)
+                        qv     = TF_VecGet(qrow, didx)
+                        old_dq = TF_MatGet(dQ, ipos, didx, dmod)
+                        old_dk = TF_MatGet(dK, jpos, didx, dmod)
+                        ndq    = Add(old_dq, Multiply(ds, kv))
+                        ndk    = Add(old_dk, Multiply(ds, qv))
+                        TF_MatSet(dQ, ipos, didx, dmod, ndq)
+                        TF_MatSet(dK, jpos, didx, dmod, ndk)
+                        di = Add(di, 1)
+                    }
+                    jpos = Add(jpos, 1)
                 }
-                jpos = Add(jpos, 1)
+                h = Add(h, 1)
             }
             ipos = Add(ipos, 1)
         }
@@ -306,6 +330,7 @@ Function.TFTrain_BackWeightsA {
             }
             pos = Add(pos, 1)
         }
+
 
         TF_VecFree(emb_row, dmod)
         TF_VecFree(dq_row,  dmod)
