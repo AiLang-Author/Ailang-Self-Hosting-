@@ -1,0 +1,624 @@
+// Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.ThreadTrampoline.ailang
+// Threading library — ZERO external dependencies.
+// All memory via one 4MB mmap + bump allocator. No Arena, no HashMap,
+// no LinkagePool, no AllocateLinkage, no FreeLinkage.
+
+// NO IMPORTS — fully self-contained.
+
+// =============================================================================
+// CLONE FLAGS (Linux x86-64)
+// =============================================================================
+FixedPool.CloneFlag {
+    "VM":               Initialize=256
+    "FS":               Initialize=512
+    "FILES":            Initialize=1024
+    "SIGHAND":          Initialize=2048
+    "THREAD":           Initialize=65536
+    "SYSVSEM":          Initialize=262144
+    "SETTLS":           Initialize=524288
+    "PARENT_SETTID":    Initialize=1048576
+    "CHILD_CLEARTID":   Initialize=2097152
+}
+
+// =============================================================================
+// MMAP CONSTANTS
+// =============================================================================
+FixedPool.MmapProt {
+    "NONE":  Initialize=0
+    "READ":  Initialize=1
+    "WRITE": Initialize=2
+}
+
+FixedPool.MmapFlag {
+    "PRIVATE":   Initialize=2
+    "ANONYMOUS": Initialize=32
+    "STACK":     Initialize=131072
+}
+
+// =============================================================================
+// FUTEX OPERATIONS
+// =============================================================================
+FixedPool.FutexOp {
+    "WAIT":         Initialize=0
+    "WAKE":         Initialize=1
+    "WAIT_PRIVATE": Initialize=128
+    "WAKE_PRIVATE": Initialize=129
+}
+
+// =============================================================================
+// LINUX SYSCALL NUMBERS (x86-64)
+// =============================================================================
+FixedPool.SysNr {
+    "MMAP":        Initialize=9
+    "MPROTECT":    Initialize=10
+    "MUNMAP":      Initialize=11
+    "SCHED_YIELD": Initialize=24
+    "NANOSLEEP":   Initialize=35
+    "CLONE":       Initialize=56
+    "EXIT":        Initialize=60
+    "GETTID":      Initialize=186
+    "FUTEX":       Initialize=202
+}
+
+// =============================================================================
+// THREAD CONSTANTS
+// =============================================================================
+FixedPool.ThrConst {
+    "STACK_SIZE":   Initialize=65536
+    "GUARD_SIZE":   Initialize=4096
+    "MAX_THREADS":  Initialize=64
+    "CLONE_FLAGS":  Initialize=0
+}
+
+FixedPool.ThrState {
+    "CREATED":  Initialize=0
+    "RUNNING":  Initialize=1
+    "EXITED":   Initialize=2
+    "DETACHED": Initialize=3
+}
+
+// =============================================================================
+// THREADINFO FIELD OFFSETS (each field 8 bytes, total 80 bytes)
+// =============================================================================
+FixedPool.ThrOfs {
+    "TID":          Initialize=0
+    "STATE":        Initialize=8
+    "STACK_BASE":   Initialize=16
+    "STACK_SIZE":   Initialize=24
+    "ENTRY_FUNC":   Initialize=32
+    "USER_DATA":    Initialize=40
+    "EXIT_CODE":    Initialize=48
+    "TID_FUTEX":    Initialize=56
+    "DETACHED":     Initialize=64
+    "NEXT":         Initialize=72
+}
+
+// =============================================================================
+// PRIVATE HEAP — one 4MB mmap, bump allocator
+// =============================================================================
+FixedPool.ThrHeap {
+    "base":     Initialize=0
+    "size":     Initialize=0
+    "offset":   Initialize=0
+}
+
+Function.ThrHeap_Init {
+    Output: Integer
+    Body: {
+        heap_size = 4194304
+        prot = BitwiseOr(MmapProt.READ, MmapProt.WRITE)
+        mflags = BitwiseOr(MmapFlag.PRIVATE, MmapFlag.ANONYMOUS)
+        base = SystemCall(SysNr.MMAP, 0, heap_size, prot, mflags, -1, 0)
+        IfCondition LessThan(base, 0) ThenBlock: {
+            PrintMessage("[ThrHeap] mmap failed\n")
+            ReturnValue(0)
+        }
+        ThrHeap.base = base
+        ThrHeap.size = heap_size
+        ThrHeap.offset = 0
+        ReturnValue(1)
+    }
+}
+
+Function.ThrHeap_Alloc {
+    Input:  bytes: Integer
+    Output: Integer
+    Body: {
+        aligned = BitwiseAnd(Add(bytes, 7), -8)
+        off = ThrHeap.offset
+        new_off = Add(off, aligned)
+        IfCondition GreaterThan(new_off, ThrHeap.size) ThenBlock: {
+            PrintMessage("[ThrHeap] out of memory\n")
+            ReturnValue(0)
+        }
+        ptr = Add(ThrHeap.base, off)
+        ThrHeap.offset = new_off
+        i = 0
+        WhileLoop LessThan(i, aligned) {
+            StoreValue(Add(ptr, i), 0)
+            i = Add(i, 8)
+        }
+        ReturnValue(ptr)
+    }
+}
+
+// =============================================================================
+// SPAWN MAILBOX
+// =============================================================================
+FixedPool.SpawnMailbox {
+    "entry_func":  Initialize=0
+    "user_data":   Initialize=0
+    "info_ptr":    Initialize=0
+    "stack_base":  Initialize=0
+    "ready":       Initialize=0
+    "ack":         Initialize=0
+}
+
+// =============================================================================
+// THREAD REGISTRY — fixed array, linear scan
+// =============================================================================
+FixedPool.ThrRegistry {
+    "slots":        Initialize=0
+    "count":        Initialize=0
+    "initialized":  Initialize=0
+    "spawn_lock":   Initialize=0
+}
+
+Function.Thr_FindSlot {
+    Input:  tid: Integer
+    Output: Integer
+    Body: {
+        slots = ThrRegistry.slots
+        i = 0
+        WhileLoop LessThan(i, ThrConst.MAX_THREADS) {
+            info = Dereference(Add(slots, Multiply(i, 8)))
+            IfCondition NotEqual(info, 0) ThenBlock: {
+                info_tid = Dereference(Add(info, ThrOfs.TID))
+                IfCondition EqualTo(info_tid, tid) ThenBlock: {
+                    ReturnValue(i)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.Thr_FindEmptySlot {
+    Output: Integer
+    Body: {
+        slots = ThrRegistry.slots
+        i = 0
+        WhileLoop LessThan(i, ThrConst.MAX_THREADS) {
+            info = Dereference(Add(slots, Multiply(i, 8)))
+            IfCondition EqualTo(info, 0) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.Thr_GetInfo {
+    Input:  tid: Integer
+    Output: Integer
+    Body: {
+        slot = Thr_FindSlot(tid)
+        IfCondition LessThan(slot, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Dereference(Add(ThrRegistry.slots, Multiply(slot, 8))))
+    }
+}
+
+// =============================================================================
+// INIT
+// =============================================================================
+SubRoutine.Thread_Init {
+    ThrHeap_Init()
+
+    flags = 0
+    flags = BitwiseOr(flags, CloneFlag.VM)
+    flags = BitwiseOr(flags, CloneFlag.FS)
+    flags = BitwiseOr(flags, CloneFlag.FILES)
+    flags = BitwiseOr(flags, CloneFlag.SIGHAND)
+    flags = BitwiseOr(flags, CloneFlag.THREAD)
+    flags = BitwiseOr(flags, CloneFlag.SYSVSEM)
+    flags = BitwiseOr(flags, CloneFlag.SETTLS)
+    flags = BitwiseOr(flags, CloneFlag.PARENT_SETTID)
+    flags = BitwiseOr(flags, CloneFlag.CHILD_CLEARTID)
+    ThrConst.CLONE_FLAGS = flags
+
+    slot_bytes = Multiply(ThrConst.MAX_THREADS, 8)
+    ThrRegistry.slots = ThrHeap_Alloc(slot_bytes)
+    ThrRegistry.count = 0
+    ThrRegistry.spawn_lock = 0
+    ThrRegistry.initialized = 1
+
+    SpawnMailbox.ready = 0
+    SpawnMailbox.ack = 0
+
+    PrintMessage("[Thread] init complete, flags=")
+    PrintNumber(flags)
+    PrintMessage("\n")
+}
+
+// =============================================================================
+// STACK ALLOC / FREE
+// =============================================================================
+Function.Thr_AllocStack {
+    Input:  size: Integer
+    Output: Integer
+    Body: {
+        total = Add(ThrConst.GUARD_SIZE, size)
+        prot = BitwiseOr(MmapProt.READ, MmapProt.WRITE)
+        mflags = BitwiseOr(MmapFlag.PRIVATE, MmapFlag.ANONYMOUS)
+        mflags = BitwiseOr(mflags, MmapFlag.STACK)
+        base = SystemCall(SysNr.MMAP, 0, total, prot, mflags, -1, 0)
+        IfCondition LessThan(base, 0) ThenBlock: {
+            PrintMessage("[Thread] stack mmap failed\n")
+            ReturnValue(0)
+        }
+        SystemCall(SysNr.MPROTECT, base, ThrConst.GUARD_SIZE, MmapProt.NONE, 0, 0, 0)
+        ReturnValue(base)
+    }
+}
+
+Function.Thr_FreeStack {
+    Input:  base: Integer
+    Input:  size: Integer
+    Output: Integer
+    Body: {
+        total = Add(ThrConst.GUARD_SIZE, size)
+        ReturnValue(SystemCall(SysNr.MUNMAP, base, total, 0, 0, 0, 0))
+    }
+}
+
+// =============================================================================
+// CHILD ENTRY POINT
+// =============================================================================
+Function.Thr_ChildEntry {
+    Output: Integer
+    Body: {
+        entry   = SpawnMailbox.entry_func
+        cookie  = SpawnMailbox.user_data
+        info    = SpawnMailbox.info_ptr
+
+        SpawnMailbox.ack = 1
+
+        StoreValue(Add(info, ThrOfs.STATE), ThrState.RUNNING)
+
+        exit_code = CallIndirect(entry, cookie)
+
+        StoreValue(Add(info, ThrOfs.EXIT_CODE), exit_code)
+        StoreValue(Add(info, ThrOfs.STATE), ThrState.EXITED)
+
+        SystemCall(SysNr.EXIT, exit_code, 0, 0, 0, 0, 0)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SPAWN
+// =============================================================================
+Function.Thread_Spawn {
+    Input:  entry_func: Address
+    Input:  user_data:  Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ThrRegistry.initialized, 0) ThenBlock: {
+            PrintMessage("[Thread] not initialized\n")
+            ReturnValue(0)
+        }
+
+        IfCondition GreaterEqual(ThrRegistry.count, ThrConst.MAX_THREADS) ThenBlock: {
+            PrintMessage("[Thread] max threads\n")
+            ReturnValue(0)
+        }
+
+        WhileLoop NotEqual(ThrRegistry.spawn_lock, 0) {
+            SystemCall(SysNr.SCHED_YIELD, 0, 0, 0, 0, 0, 0)
+        }
+        ThrRegistry.spawn_lock = 1
+
+        stack_size = ThrConst.STACK_SIZE
+        stack_base = Thr_AllocStack(stack_size)
+        IfCondition EqualTo(stack_base, 0) ThenBlock: {
+            ThrRegistry.spawn_lock = 0
+            ReturnValue(0)
+        }
+
+        stack_top = Add(stack_base, Add(ThrConst.GUARD_SIZE, stack_size))
+
+        info = ThrHeap_Alloc(80)
+        IfCondition EqualTo(info, 0) ThenBlock: {
+            Thr_FreeStack(stack_base, stack_size)
+            ThrRegistry.spawn_lock = 0
+            ReturnValue(0)
+        }
+
+        StoreValue(Add(info, ThrOfs.STATE), ThrState.CREATED)
+        StoreValue(Add(info, ThrOfs.STACK_BASE), stack_base)
+        StoreValue(Add(info, ThrOfs.STACK_SIZE), stack_size)
+        StoreValue(Add(info, ThrOfs.ENTRY_FUNC), entry_func)
+        StoreValue(Add(info, ThrOfs.USER_DATA), user_data)
+        StoreValue(Add(info, ThrOfs.EXIT_CODE), 0)
+        StoreValue(Add(info, ThrOfs.DETACHED), 0)
+        StoreValue(Add(info, ThrOfs.TID_FUTEX), 0)
+
+        SpawnMailbox.entry_func = entry_func
+        SpawnMailbox.user_data  = user_data
+        SpawnMailbox.info_ptr   = info
+        SpawnMailbox.stack_base = stack_base
+        SpawnMailbox.ack        = 0
+        SpawnMailbox.ready      = 1
+
+        tid_addr       = Add(info, ThrOfs.TID)
+        tid_futex_addr = Add(info, ThrOfs.TID_FUTEX)
+
+        raw_tid = SystemCall(SysNr.CLONE,
+            ThrConst.CLONE_FLAGS,
+            stack_top,
+            tid_addr,
+            tid_futex_addr,
+            0
+        )
+
+        IfCondition EqualTo(raw_tid, 0) ThenBlock: {
+            Thr_ChildEntry()
+            SystemCall(SysNr.EXIT, 255, 0, 0, 0, 0, 0)
+        }
+
+        real_tid = Dereference(tid_addr)
+
+        IfCondition LessThan(real_tid, 0) ThenBlock: {
+            PrintMessage("[Thread] clone failed\n")
+            Thr_FreeStack(stack_base, stack_size)
+            SpawnMailbox.ready = 0
+            ThrRegistry.spawn_lock = 0
+            ReturnValue(0)
+        }
+
+        IfCondition EqualTo(real_tid, 0) ThenBlock: {
+            PrintMessage("[Thread] clone: no tid written\n")
+            Thr_FreeStack(stack_base, stack_size)
+            SpawnMailbox.ready = 0
+            ThrRegistry.spawn_lock = 0
+            ReturnValue(0)
+        }
+
+        WhileLoop EqualTo(SpawnMailbox.ack, 0) {
+            SystemCall(SysNr.SCHED_YIELD, 0, 0, 0, 0, 0, 0)
+        }
+
+        SpawnMailbox.ready = 0
+        SpawnMailbox.ack   = 0
+
+        StoreValue(Add(info, ThrOfs.TID), real_tid)
+        StoreValue(Add(info, ThrOfs.STATE), ThrState.RUNNING)
+
+        slot = Thr_FindEmptySlot()
+        StoreValue(Add(ThrRegistry.slots, Multiply(slot, 8)), info)
+        ThrRegistry.count = Add(ThrRegistry.count, 1)
+
+        ThrRegistry.spawn_lock = 0
+
+        PrintMessage("[Thread] spawned tid=")
+        PrintNumber(real_tid)
+        PrintMessage("\n")
+
+        ReturnValue(real_tid)
+    }
+}
+
+// =============================================================================
+// JOIN
+// =============================================================================
+Function.Thread_Join {
+    Input:  tid: Integer
+    Output: Integer
+    Body: {
+        info = Thr_GetInfo(tid)
+        IfCondition EqualTo(info, 0) ThenBlock: {
+            PrintMessage("[Thread] join: unknown tid\n")
+            ReturnValue(-1)
+        }
+
+        state = Dereference(Add(info, ThrOfs.STATE))
+        IfCondition EqualTo(state, ThrState.EXITED) ThenBlock: {
+            exit_code = Dereference(Add(info, ThrOfs.EXIT_CODE))
+            Thr_Cleanup(tid)
+            ReturnValue(exit_code)
+        }
+
+        futex_addr = Add(info, ThrOfs.TID_FUTEX)
+        cur_val = Dereference(futex_addr)
+        WhileLoop NotEqual(cur_val, 0) {
+            SystemCall(SysNr.FUTEX, futex_addr, FutexOp.WAIT, cur_val, 0, 0, 0)
+            cur_val = Dereference(futex_addr)
+        }
+
+        exit_code = Dereference(Add(info, ThrOfs.EXIT_CODE))
+        Thr_Cleanup(tid)
+        ReturnValue(exit_code)
+    }
+}
+
+// =============================================================================
+// CLEANUP
+// =============================================================================
+Function.Thr_Cleanup {
+    Input:  tid: Integer
+    Output: Integer
+    Body: {
+        slot = Thr_FindSlot(tid)
+        IfCondition LessThan(slot, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        info = Dereference(Add(ThrRegistry.slots, Multiply(slot, 8)))
+
+        sbase = Dereference(Add(info, ThrOfs.STACK_BASE))
+        ssize = Dereference(Add(info, ThrOfs.STACK_SIZE))
+        Thr_FreeStack(sbase, ssize)
+
+        StoreValue(Add(ThrRegistry.slots, Multiply(slot, 8)), 0)
+        ThrRegistry.count = Subtract(ThrRegistry.count, 1)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+Function.Thread_Yield {
+    Output: Integer
+    Body: {
+        ReturnValue(SystemCall(SysNr.SCHED_YIELD, 0, 0, 0, 0, 0, 0))
+    }
+}
+
+Function.Thread_Self {
+    Output: Integer
+    Body: {
+        ReturnValue(SystemCall(SysNr.GETTID, 0, 0, 0, 0, 0, 0))
+    }
+}
+
+Function.Thread_Sleep {
+    Input:  ms: Integer
+    Output: Integer
+    Body: {
+        ts = ThrHeap_Alloc(16)
+        IfCondition EqualTo(ts, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        StoreValue(ts, Divide(ms, 1000))
+        StoreValue(Add(ts, 8), Multiply(Modulo(ms, 1000), 1000000))
+        result = SystemCall(SysNr.NANOSLEEP, ts, 0, 0, 0, 0, 0)
+        ReturnValue(result)
+    }
+}
+
+Function.Thread_Count {
+    Output: Integer
+    Body: {
+        ReturnValue(ThrRegistry.count)
+    }
+}
+
+Function.Thread_IsAlive {
+    Input:  tid: Integer
+    Output: Integer
+    Body: {
+        info = Thr_GetInfo(tid)
+        IfCondition EqualTo(info, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        state = Dereference(Add(info, ThrOfs.STATE))
+        IfCondition EqualTo(state, ThrState.RUNNING) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MUTEX — futex-based
+// =============================================================================
+Function.Mutex_Create {
+    Output: Integer
+    Body: {
+        m = ThrHeap_Alloc(8)
+        ReturnValue(m)
+    }
+}
+
+
+Function.Mutex_Lock {
+    Input:  m: Integer
+    Output: Integer
+    Body: {
+        // Fast path: CAS 0 -> 1 (uncontended)
+        old = AtomicCompareSwap(m, 0, 1)
+        IfCondition EqualTo(old, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // Slow path: contended
+        WhileLoop EqualTo(1, 1) {
+            // Escalate to state 2 if currently 1
+            IfCondition EqualTo(old, 2) ThenBlock: {
+                // Already contended, just wait
+                SystemCall(SysNr.FUTEX, m, FutexOp.WAIT_PRIVATE, 2, 0, 0, 0)
+            } ElseBlock: {
+                // old was 1, try to escalate 1 -> 2
+                old = AtomicCompareSwap(m, 1, 2)
+                IfCondition EqualTo(old, 1) ThenBlock: {
+                    // Escalated, now wait
+                    SystemCall(SysNr.FUTEX, m, FutexOp.WAIT_PRIVATE, 2, 0, 0, 0)
+                }
+                // If old is 0 here, someone unlocked — try acquire below
+            }
+
+            // Try to acquire as state 2 (keep waiter flag)
+            old = AtomicCompareSwap(m, 0, 2)
+            IfCondition EqualTo(old, 0) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+Function.Mutex_Unlock {
+    Input:  m: Integer
+    Output: Integer
+    Body: {
+        // Atomically set to 0 and get old state
+        old = AtomicExchange(m, 0)
+
+        // Only wake if there were waiters (state 2)
+        IfCondition EqualTo(old, 2) ThenBlock: {
+            SystemCall(SysNr.FUTEX, m, FutexOp.WAKE_PRIVATE, 1, 0, 0, 0)
+        }
+
+        ReturnValue(1)
+    }
+}
+
+
+Function.Mutex_Unlock {
+    Input:  m: Integer
+    Output: Integer
+    Body: {
+        StoreValue(m, 0)
+        SystemCall(SysNr.FUTEX, m, FutexOp.WAKE_PRIVATE, 1, 0, 0, 0)
+        ReturnValue(1)
+    }
+}
+
+Function.Mutex_TryLock {
+    Input:  m: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Dereference(m), 0) ThenBlock: {
+            StoreValue(m, 1)
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Mutex_Destroy {
+    Input:  m: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(1)
+    }
+}
