@@ -71,6 +71,16 @@ FixedPool.Patterns {
     "rx_prefix_bc":  Initialize=0   // array of Address: BM table for the regex prefix
     "dfa_ok":        Initialize=0   // DFA available? (1=yes). Only set for single-pattern grep
     "strategy":      Initialize=0   // array of Integer: per-pattern dispatch strategy id (see STRATEGY.*)
+
+    // Batched fast-path hoists for the single-pattern LITERAL_BM case.
+    // When set, ProcessStream inlines the match into its main loop
+    // (no MemoryCopy into line_buf, no LineMatches dispatch, no
+    // Match_LiteralBM call). Saves ~3 function-call overheads per
+    // line plus the per-line line-buffer copy.
+    "fast_literal_ok":   Initialize=0
+    "fast_pat":          Initialize=0   // pointer to pattern bytes
+    "fast_plen":         Initialize=0   // pattern length
+    "fast_first_byte":   Initialize=0   // GetByte(pat, 0)
 }
 
 // Per-pattern dispatch strategy, computed once by CompileAllPatterns.
@@ -586,6 +596,44 @@ Function.Match_WordMatch {
     }
 }
 
+// Tight literal-pattern scan used by ProcessStream's inline fast
+// path. Returns 1 iff `pat[0..plen)` occurs anywhere in `line[0..line_len)`.
+// Pattern pointer, length, and first byte are passed explicitly so
+// ProcessStream's hot loop can keep them in registers across calls.
+// No function-call overhead into LineMatches/Branch/Match_LiteralBM.
+Function.FastLiteralSearch {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pat: Address
+    Input: plen: Integer
+    Input: first_pat: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(plen, line_len) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(plen, 1) ThenBlock: {
+            IfCondition GreaterEqual(MemChr(line, first_pat, line_len), 0) ThenBlock: {
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        max_start = Subtract(line_len, plen)
+        pos = 0
+        WhileLoop LessEqual(pos, max_start) {
+            remaining = Subtract(line_len, pos)
+            off = MemChr(Add(line, pos), first_pat, remaining)
+            IfCondition LessThan(off, 0) ThenBlock: { ReturnValue(0) }
+            cand = Add(pos, off)
+            IfCondition GreaterThan(cand, max_start) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(MemCompare(Add(line, cand), pat, plen), 0) ThenBlock: {
+                ReturnValue(1)
+            }
+            pos = Add(cand, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
 // Returns 1 if `line` matches any pattern per current flags.
 // Per-line dispatch cost: one indexed load of Patterns.strategy +
 // one Branch (2-instruction CMP RAX,imm ; JE per case). All decision
@@ -754,6 +802,21 @@ Function.CompileAllPatterns {
             StoreValue(Add(Patterns.strategy, Multiply(si, 8)), strat)
             si = Add(si, 1)
         }
+
+        // Batched fast-path hoist: a single LITERAL_BM pattern is the
+        // common `-F` / default-mode-literal case. When this fires,
+        // ProcessStream inlines the entire match check into its main
+        // loop and skips the per-line line_buf copy.
+        Patterns.fast_literal_ok = 0
+        IfCondition EqualTo(Patterns.count, 1) ThenBlock: {
+            only_strat = Dereference(Patterns.strategy)
+            IfCondition EqualTo(only_strat, STRATEGY.LITERAL_BM) ThenBlock: {
+                Patterns.fast_pat         = Dereference(Patterns.ptrs)
+                Patterns.fast_plen        = Dereference(Patterns.lens)
+                Patterns.fast_first_byte  = GetByte(Patterns.fast_pat, 0)
+                Patterns.fast_literal_ok  = 1
+            }
+        }
     }
 }
 
@@ -851,20 +914,43 @@ Function.ProcessStream {
                     BreakLoop
                 }
 
-                // Found newline at search_ptr[nl_offset]. Copy line bytes
-                // (exclusive of the newline) into line_buf, clamped.
-                space_left = Subtract(GrepConstants.LINE_MAX, line_len)
-                copy_bytes = nl_offset
-                IfCondition GreaterThan(copy_bytes, space_left) ThenBlock: {
-                    copy_bytes = space_left
-                }
-                IfCondition GreaterThan(copy_bytes, 0) ThenBlock: {
-                    MemoryCopy(Add(line_buf, line_len), search_ptr, copy_bytes)
-                    line_len = Add(line_len, copy_bytes)
+                // Found newline at search_ptr[nl_offset]. Two paths:
+                //
+                //   FAST: fast_literal_ok — single LITERAL_BM pattern, no
+                //   continued line fragment. Search the raw read-buffer
+                //   slice directly (no MemoryCopy into line_buf, no
+                //   LineMatches dispatch). Output emits from the raw
+                //   slice too. This shaves 2 function-call overheads
+                //   and a MemoryCopy per line — on a 536 MB / 6.7 M
+                //   line corpus that's ~540 MB of eliminated copies
+                //   and ~20 M of eliminated calls.
+                //
+                //   SLOW: copy into line_buf and call LineMatches as
+                //   before. Handles multi-pattern, continued lines
+                //   from prior buffer, regex, whole-line, -i, -w.
+                raw_match = 0
+                fast_used = 0
+                IfCondition And(EqualTo(Patterns.fast_literal_ok, 1),
+                                EqualTo(line_len, 0)) ThenBlock: {
+                    raw_match = FastLiteralSearch(search_ptr, nl_offset,
+                                                  Patterns.fast_pat,
+                                                  Patterns.fast_plen,
+                                                  Patterns.fast_first_byte)
+                    fast_used = 1
+                } ElseBlock: {
+                    space_left = Subtract(GrepConstants.LINE_MAX, line_len)
+                    copy_bytes = nl_offset
+                    IfCondition GreaterThan(copy_bytes, space_left) ThenBlock: {
+                        copy_bytes = space_left
+                    }
+                    IfCondition GreaterThan(copy_bytes, 0) ThenBlock: {
+                        MemoryCopy(Add(line_buf, line_len), search_ptr, copy_bytes)
+                        line_len = Add(line_len, copy_bytes)
+                    }
+                    raw_match = LineMatches(line_buf, line_len)
                 }
 
                 line_no = Add(line_no, 1)
-                raw_match = LineMatches(line_buf, line_len)
                 IfCondition EqualTo(GrepConfig.invert, 1) ThenBlock: {
                     IfCondition EqualTo(raw_match, 1) ThenBlock: {
                         effective = 0
@@ -906,7 +992,11 @@ Function.ProcessStream {
                                     OutUInt(line_no)
                                     OutByte(58)
                                 }
-                                OutBytes(line_buf, line_len)
+                                IfCondition EqualTo(fast_used, 1) ThenBlock: {
+                                    OutBytes(search_ptr, nl_offset)
+                                } ElseBlock: {
+                                    OutBytes(line_buf, line_len)
+                                }
                                 OutByte(10)
                             }
                         }
