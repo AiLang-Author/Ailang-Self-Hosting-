@@ -16,6 +16,7 @@ LibraryImport.XArrays
 LibraryImport.Compiler.Frontend.AST.CASTCore
 LibraryImport.Compiler.Frontend.AST.CASTTypes
 LibraryImport.Compiler.Import.CFileMap
+LibraryImport.Compiler.Import.CImportResolver
 
 // =============================================================================
 // ANALYZER3 STATE
@@ -59,13 +60,19 @@ FixedPool.Analyzer3 {
     "loop_dealloc_vars": Initialize=0, CanChange=True    // Vars deallocated in current loop body
     "in_loop_body": Initialize=0, CanChange=True         // Nesting depth inside loops (>0 = in loop)
     "alloc_in_loop_warnings": Initialize=0, CanChange=True
-    
+
+    // Import usage tracking (unused-LibraryImport detection)
+    "imported_modules": Initialize=0, CanChange=True     // XArray of Address (dotted paths from AST)
+    "import_lines": Initialize=0, CanChange=True         // XArray of Integer (combined-source line of the declaration)
+    "module_used": Initialize=0, CanChange=True          // XArray of Integer (0/1 parallel to imported_modules)
+    "unused_import_warnings": Initialize=0, CanChange=True
+
     // Results
     "warnings": Initialize=0, CanChange=True
     "errors": Initialize=0, CanChange=True
     "warning_count": Initialize=0, CanChange=True
     "error_count": Initialize=0, CanChange=True
-    
+
     // Stats
     "shadow_warnings": Initialize=0, CanChange=True
     "uninit_warnings": Initialize=0, CanChange=True
@@ -74,7 +81,7 @@ FixedPool.Analyzer3 {
     "double_dealloc_warnings": Initialize=0, CanChange=True
     "concat_leak_warnings": Initialize=0, CanChange=True
     "recursive_cycles": Initialize=0, CanChange=True
-    
+
     // Config
     "check_shadow": Initialize=0, CanChange=True
     "check_uninit": Initialize=1, CanChange=True
@@ -84,6 +91,7 @@ FixedPool.Analyzer3 {
     "check_concat_leaks": Initialize=1, CanChange=True
     "check_recursion": Initialize=1, CanChange=True
     "check_pools": Initialize=1, CanChange=True
+    "check_unused_imports": Initialize=1, CanChange=True
     "verbose": Initialize=0, CanChange=True
 }
 
@@ -145,6 +153,12 @@ Function.Analyzer3.Init {
         Analyzer3.in_while_loop = 0
         Analyzer3.loop_concat_count = 0
         
+        // Import usage tracking
+        Analyzer3.imported_modules = XArray.XCreate(64)
+        Analyzer3.import_lines = XArray.XCreate(64)
+        Analyzer3.module_used = XArray.XCreate(64)
+        Analyzer3.unused_import_warnings = 0
+
         // Stats
         Analyzer3.shadow_warnings = 0
         Analyzer3.uninit_warnings = 0
@@ -467,9 +481,119 @@ Function.Analyzer3.RecordCall {
     Body: {
         IfCondition EqualTo(caller, 0) ThenBlock: { ReturnValue(0) }
         IfCondition EqualTo(callee, 0) ThenBlock: { ReturnValue(0) }
-        
+
         XArray.XPush(Analyzer3.call_graph_from, caller)
         XArray.XPush(Analyzer3.call_graph_to, callee)
+    }
+}
+
+// =============================================================================
+// IMPORT USAGE TRACKING — cross-references AST LibraryImport declarations
+// against the resolver's per-module symbol tables so we can warn about
+// imports whose symbols are never referenced from user code.
+// =============================================================================
+
+// Returns 1 if the FileMap says `name` is the user's main module (or if the
+// map has no entry — conservatively treat unmapped as main).
+Function.Analyzer3.IsUserMainFile {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(Analyzer3.StrEqual(name, "main"))
+    }
+}
+
+// Register an import declaration seen in the AST.
+Function.Analyzer3.RegisterImport {
+    Input: module_path: Address
+    Input: line: Integer
+    Body: {
+        IfCondition EqualTo(module_path, 0) ThenBlock: { ReturnValue(0) }
+
+        // Deduplicate — Parse may visit the same LibraryImport twice in
+        // rare edge cases (combined imports etc.).
+        count = XArray.XSize(Analyzer3.imported_modules)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = XArray.XGet(Analyzer3.imported_modules, i)
+            IfCondition EqualTo(StringCompare(existing, module_path), 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+
+        XArray.XPush(Analyzer3.imported_modules, module_path)
+        XArray.XPush(Analyzer3.import_lines, line)
+        XArray.XPush(Analyzer3.module_used, 0)
+    }
+}
+
+// Mark the module that owns `sym_name` as used — but only if the reference
+// occurs inside the user's main module. References from library code don't
+// count (the library handles its own imports).
+Function.Analyzer3.MarkModuleUsed {
+    Input: sym_name: Address
+    Input: ref_line: Integer
+    Body: {
+        IfCondition EqualTo(sym_name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Import.last_state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Filter: only references from the user's main file count.
+        IfCondition GreaterThan(ref_line, 0) ThenBlock: {
+            FileMap_Lookup(ref_line)
+            IfCondition NotEqual(FileMap.result_file, 0) ThenBlock: {
+                is_main = Analyzer3.IsUserMainFile(FileMap.result_file)
+                IfCondition EqualTo(is_main, 0) ThenBlock: { ReturnValue(0) }
+            }
+        }
+
+        mod_idx = Import_FindSymbolModule(Import.last_state, sym_name)
+        IfCondition LessThan(mod_idx, 0) ThenBlock: { ReturnValue(0) }
+
+        mod_name = Import_GetModuleNameByIdx(Import.last_state, mod_idx)
+        IfCondition EqualTo(mod_name, 0) ThenBlock: { ReturnValue(0) }
+
+        // Match against our tracked imports. Resolver's loaded_names and
+        // AST's LibraryImport path strings are both the full dotted path,
+        // so direct compare works.
+        count = XArray.XSize(Analyzer3.imported_modules)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            tracked = XArray.XGet(Analyzer3.imported_modules, i)
+            IfCondition EqualTo(StringCompare(tracked, mod_name), 0) ThenBlock: {
+                XArray.XSet(Analyzer3.module_used, i, 1)
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// Post-analysis: emit a warning for each registered import that ended
+// the run with module_used == 0.
+Function.Analyzer3.CheckUnusedImports {
+    Body: {
+        IfCondition EqualTo(Analyzer3.check_unused_imports, 0) ThenBlock: { ReturnValue(0) }
+
+        count = XArray.XSize(Analyzer3.imported_modules)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            used = XArray.XGet(Analyzer3.module_used, i)
+            IfCondition EqualTo(used, 0) ThenBlock: {
+                mod_path = XArray.XGet(Analyzer3.imported_modules, i)
+                line = XArray.XGet(Analyzer3.import_lines, i)
+
+                location = FileMap_Format(line)
+                msg = location
+                msg = StringConcat(msg, ": LibraryImport.")
+                msg = StringConcat(msg, mod_path)
+                msg = StringConcat(msg, " is unused — no symbol from this module is referenced")
+                Analyzer3.AddWarning(msg)
+                Analyzer3.unused_import_warnings = Add(Analyzer3.unused_import_warnings, 1)
+            }
+            i = Add(i, 1)
+        }
     }
 }
 
@@ -885,19 +1009,28 @@ Function.Analyzer3.WalkNode {
             ReturnValue(0)
         }
         
+        // === LIBRARY IMPORT ===
+        IfCondition EqualTo(node_type, AST.LIBRARY_IMPORT) ThenBlock: {
+            import_path = AST_GetData1(node)
+            Analyzer3.RegisterImport(import_path, node_line)
+            ReturnValue(0)
+        }
+
         // === IDENTIFIER (read) ===
         IfCondition EqualTo(node_type, AST.IDENTIFIER) ThenBlock: {
             name = AST_GetData1(node)
             Analyzer3.MarkRead(name, node_line)
+            Analyzer3.MarkModuleUsed(name, node_line)
             ReturnValue(0)
         }
-        
+
         // === FUNCTION CALL ===
         IfCondition EqualTo(node_type, AST.CALL) ThenBlock: {
             func_name = AST_GetData1(node)
-            
+
             // Record in call graph
             Analyzer3.RecordCall(Analyzer3.current_func, func_name)
+            Analyzer3.MarkModuleUsed(func_name, node_line)
             
             IfCondition EqualTo(StringCompare(func_name, "Deallocate"), 0) ThenBlock: {
                 IfCondition GreaterThan(child_count, 0) ThenBlock: {
@@ -1254,16 +1387,20 @@ Function.Analyzer3.Run {
     Output: Integer
     Body: {
         Analyzer3.Init()
-        
+
         // Pass 1: Collect pool definitions
         Analyzer3.CollectPools(ast)
-        
+
         // Pass 2: Walk and analyze
         Analyzer3.WalkNode(ast)
-        
+
         // Post-analysis: Check for recursive cycles
         Analyzer3.DetectRecursiveCycles()
-        
+
+        // Post-analysis: Warn about LibraryImport.X where no symbol from X
+        // was referenced from the user's main file.
+        Analyzer3.CheckUnusedImports()
+
         ReturnValue(1)
     }
 }
