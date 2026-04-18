@@ -13,6 +13,10 @@
 // Library.Regex_Thompson_Fixed.ailang
 // Thompson NFA Regex Engine - BUG FIX
 // Fixed state structure alignment (40 bytes per state, not 24!)
+// Fixed list-node OOB write in CreateList (April 2026).
+
+// Self-contained import — compiler dedups, so callers can also import.
+LibraryImport.Arena
 
 // ============================================================================
 // CONFIGURATION AND CONSTANTS
@@ -83,6 +87,31 @@ FixedPool.MatchState {
     "thread_size": Initialize=0
 }
 
+// Ring-buffer slot pools for parser AST nodes. Replaces per-node
+// Allocate(16|24|32) which — because the Arena rounds every small
+// alloc to a 16-byte-aligned 4KB slab — burned ~4KB per fragment
+// and pushed RSS past 12GB on real grep workloads. Each pool is a
+// single contiguous Allocate, lazily initialized on first compile
+// and re-used across compiles by resetting `head` at Regex_Compile
+// entry. Single-pool design is single-threaded; per-thread pools
+// are a trivial extension (AtomicCompareSwap already exists in the
+// Threading v0.1 library) once we go multithreaded.
+FixedPool.RegexFragPool {
+    "buf":  Initialize=0, CanChange=True
+    "head": Initialize=0, CanChange=True
+    "cap":  Initialize=4096
+}
+FixedPool.RegexListPool {
+    "buf":  Initialize=0, CanChange=True
+    "head": Initialize=0, CanChange=True
+    "cap":  Initialize=4096
+}
+FixedPool.RegexClassPool {
+    "buf":  Initialize=0, CanChange=True
+    "head": Initialize=0, CanChange=True
+    "cap":  Initialize=256
+}
+
 // ============================================================================
 // INITIALIZATION (Must be called before using library)
 // ============================================================================
@@ -112,6 +141,68 @@ SubRoutine.InitializeRegexEngine {
 }
 
 // ============================================================================
+// PARSER NODE POOL ALLOCATORS
+// ============================================================================
+// Hand out the next free slot from a pre-allocated FixedPool-backed
+// slab. Slot storage is reused across compiles — Regex_Compile resets
+// `head` to 0 at entry. Returns 0 on overflow so existing null-checks
+// at every call site continue to work unchanged.
+
+Function.FragAlloc {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(RegexFragPool.buf, 0) ThenBlock: {
+            RegexFragPool.buf = Allocate(Multiply(RegexFragPool.cap, 16))
+            IfCondition EqualTo(RegexFragPool.buf, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+        }
+        IfCondition GreaterEqual(RegexFragPool.head, RegexFragPool.cap) ThenBlock: {
+            ReturnValue(0)
+        }
+        slot = Add(RegexFragPool.buf, Multiply(RegexFragPool.head, 16))
+        RegexFragPool.head = Add(RegexFragPool.head, 1)
+        ReturnValue(slot)
+    }
+}
+
+Function.ListAlloc {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(RegexListPool.buf, 0) ThenBlock: {
+            RegexListPool.buf = Allocate(Multiply(RegexListPool.cap, 24))
+            IfCondition EqualTo(RegexListPool.buf, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+        }
+        IfCondition GreaterEqual(RegexListPool.head, RegexListPool.cap) ThenBlock: {
+            ReturnValue(0)
+        }
+        slot = Add(RegexListPool.buf, Multiply(RegexListPool.head, 24))
+        RegexListPool.head = Add(RegexListPool.head, 1)
+        ReturnValue(slot)
+    }
+}
+
+Function.ClassAlloc {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(RegexClassPool.buf, 0) ThenBlock: {
+            RegexClassPool.buf = Allocate(Multiply(RegexClassPool.cap, 32))
+            IfCondition EqualTo(RegexClassPool.buf, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+        }
+        IfCondition GreaterEqual(RegexClassPool.head, RegexClassPool.cap) ThenBlock: {
+            ReturnValue(0)
+        }
+        slot = Add(RegexClassPool.buf, Multiply(RegexClassPool.head, 32))
+        RegexClassPool.head = Add(RegexClassPool.head, 1)
+        ReturnValue(slot)
+    }
+}
+
+// ============================================================================
 // PUBLIC API
 // ============================================================================
 
@@ -130,7 +221,13 @@ Function.Regex_Compile {
         CompilerState.group_count = 0
         CompilerState.flags = flags
         CompilerState.error = 0
-        
+
+        // Pools are process-lifetime bump allocators: each compile appends
+        // fresh slots without touching earlier compiles' data. Resetting
+        // `head` here would corrupt prior handles — RANGE states hold raw
+        // pointers into RegexClassPool, so overwriting those slots breaks
+        // any regex compiled before this one.
+
         total_size = Multiply(RegexConstants.MAX_STATES, RegexConstants.STATE_SIZE)
         
         RegexState.states = Allocate(total_size)
@@ -153,31 +250,28 @@ Function.Regex_Compile {
             Deallocate(RegexState.states, total_size)
             ReturnValue(0)
         }
-        
+
         IfCondition NotEqual(CompilerState.error, 0) ThenBlock: {
             Deallocate(RegexState.states, total_size)
-            Deallocate(start_frag, 16)
             ReturnValue(0)
         }
-        
+
         match_state = AddState(StateType.MATCH, 0, 0)
         frag_out = Dereference(Add(start_frag, 8))
         PatchList(frag_out, match_state)
-        
+
         handle = Allocate(32)
         IfCondition EqualTo(handle, 0) ThenBlock: {
             Deallocate(RegexState.states, total_size)
-            Deallocate(start_frag, 16)
             ReturnValue(0)
         }
-        
+
         StoreValue(handle, RegexState.states)
         StoreValue(Add(handle, 8), RegexState.num_states)
         frag_start = Dereference(start_frag)
         StoreValue(Add(handle, 16), frag_start)
         StoreValue(Add(handle, 24), CompilerState.group_count)
-        
-        Deallocate(start_frag, 16)
+
         ReturnValue(handle)
     }
 }
@@ -212,88 +306,106 @@ Function.Regex_Match {
             ReturnValue(-1)
         }
         
+        // PERFORMANCE FIX (April 2026): the threads / next_threads buffers
+        // are allocated once and reused across calls. The previous code
+        // Allocate'd 32 KB per call and Deallocate'd at every return —
+        // grep against a 100k-line file did 30M+ Match calls and pushed
+        // RSS over 11 GB. MAX_THREADS and thread_size are compile-time
+        // constants, so the buffers are the same size every call. Caller
+        // can free via Regex_FreeMatchState() when done with all matches.
         threads_size = Multiply(RegexConstants.MAX_THREADS, MatchState.thread_size)
-        
-        MatchState.threads = Allocate(threads_size)
-        MatchState.next_threads = Allocate(threads_size)
-        
+
         IfCondition EqualTo(MatchState.threads, 0) ThenBlock: {
-            ReturnValue(-1)
+            MatchState.threads = Allocate(threads_size)
+            IfCondition EqualTo(MatchState.threads, 0) ThenBlock: {
+                ReturnValue(-1)
+            }
         }
-        
         IfCondition EqualTo(MatchState.next_threads, 0) ThenBlock: {
-            Deallocate(MatchState.threads, threads_size)
-            ReturnValue(-1)
+            MatchState.next_threads = Allocate(threads_size)
+            IfCondition EqualTo(MatchState.next_threads, 0) ThenBlock: {
+                ReturnValue(-1)
+            }
         }
-        
+
         MatchState.thread_count = 0
         MatchState.next_count = 0
-        
+
         AddThread(start_state, start_pos, 0)
-        
+
         WhileLoop LessEqual(MatchState.pos, MatchState.text_len) {
             ch = 0
-            
+
             IfCondition LessThan(MatchState.pos, MatchState.text_len) ThenBlock: {
                 ch = GetByte(text, MatchState.pos)
             }
-            
+
             MatchState.next_count = 0
             i = 0
             WhileLoop LessThan(i, MatchState.thread_count) {
                 thread = GetThread(i)
                 state_id = Dereference(thread)
-                
+
                 result = ProcessState(states, state_id, ch, thread)
-                
+
                 IfCondition EqualTo(result, 1) ThenBlock: {
                     match_len = Subtract(MatchState.pos, start_pos)
-                    Deallocate(MatchState.threads, threads_size)
-                    Deallocate(MatchState.next_threads, threads_size)
                     ReturnValue(match_len)
                 }
-                
+
                 i = Add(i, 1)
             }
-            
+
             IfCondition LessThan(MatchState.pos, MatchState.text_len) ThenBlock: {
                 temp = MatchState.threads
                 MatchState.threads = MatchState.next_threads
                 MatchState.next_threads = temp
                 MatchState.thread_count = MatchState.next_count
-                
+
                 IfCondition EqualTo(MatchState.thread_count, 0) ThenBlock: {
-                    Deallocate(MatchState.threads, threads_size)
-                    Deallocate(MatchState.next_threads, threads_size)
                     ReturnValue(-1)
                 }
             } ElseBlock: {
                 BreakLoop
             }
-            
+
             MatchState.pos = Add(MatchState.pos, 1)
         }
-        
+
         // Check final states
         i = 0
         WhileLoop LessThan(i, MatchState.thread_count) {
             thread = GetThread(i)
             state_id = Dereference(thread)
             state_type = GetStateType(states, state_id)
-            
+
             IfCondition EqualTo(state_type, StateType.MATCH) ThenBlock: {
                 match_len = Subtract(MatchState.pos, start_pos)
-                Deallocate(MatchState.threads, threads_size)
-                Deallocate(MatchState.next_threads, threads_size)
                 ReturnValue(match_len)
             }
-            
+
             i = Add(i, 1)
         }
-        
-        Deallocate(MatchState.threads, threads_size)
-        Deallocate(MatchState.next_threads, threads_size)
+
         ReturnValue(-1)
+    }
+}
+
+// Free the persistent thread buffers. Optional — not calling it is
+// also fine (process exit cleans up). Useful when the caller is
+// done matching and wants to reclaim memory.
+Function.Regex_FreeMatchState {
+    Body: {
+        IfCondition NotEqual(MatchState.threads, 0) ThenBlock: {
+            threads_size = Multiply(RegexConstants.MAX_THREADS, MatchState.thread_size)
+            Deallocate(MatchState.threads, threads_size)
+            MatchState.threads = 0
+        }
+        IfCondition NotEqual(MatchState.next_threads, 0) ThenBlock: {
+            threads_size = Multiply(RegexConstants.MAX_THREADS, MatchState.thread_size)
+            Deallocate(MatchState.next_threads, threads_size)
+            MatchState.next_threads = 0
+        }
     }
 }
 
@@ -349,26 +461,22 @@ Function.ParseAlt {
             
             CompilerState.pos = Add(CompilerState.pos, 1)
             right = ParseSeq()
-            
+
             IfCondition EqualTo(right, 0) ThenBlock: {
-                Deallocate(left, 16)
                 ReturnValue(0)
             }
-            
+
             split = AddState(StateType.SPLIT, 0, 0)
             left_start = Dereference(left)
             right_start = Dereference(right)
             SetStateOut1(split, left_start)
             SetStateOut2(split, right_start)
-            
+
             left_out = Dereference(Add(left, 8))
             right_out = Dereference(Add(right, 8))
             new_out = MergeLists(left_out, right_out)
-            
-            Deallocate(left, 16)
-            Deallocate(right, 16)
-            
-            left = Allocate(16)
+
+            left = FragAlloc()
             IfCondition EqualTo(left, 0) ThenBlock: {
                 ReturnValue(0)
             }
@@ -397,40 +505,34 @@ Function.ParseSeq {
             IfCondition EqualTo(ch, 41) ThenBlock: { BreakLoop }
             
             atom = ParseAtom()
-            
+
             IfCondition EqualTo(atom, 0) ThenBlock: {
-                IfCondition NotEqual(result, 0) ThenBlock: {
-                    Deallocate(result, 16)
-                }
                 ReturnValue(0)
             }
-            
+
             IfCondition EqualTo(result, 0) ThenBlock: {
                 result = atom
             } ElseBlock: {
                 result_out = Dereference(Add(result, 8))
                 atom_start = Dereference(atom)
                 PatchList(result_out, atom_start)
-                
+
                 result_start = Dereference(result)
                 atom_out = Dereference(Add(atom, 8))
-                
-                Deallocate(result, 16)
-                Deallocate(atom, 16)
-                
-                result = Allocate(16)
+
+                result = FragAlloc()
                 IfCondition EqualTo(result, 0) ThenBlock: {
                     ReturnValue(0)
                 }
-                
+
                 StoreValue(result, result_start)
                 StoreValue(Add(result, 8), atom_out)
             }
         }
-        
+
         IfCondition EqualTo(result, 0) ThenBlock: {
             empty = AddState(StateType.EMPTY, 0, 0)
-            result = Allocate(16)
+            result = FragAlloc()
             IfCondition NotEqual(result, 0) ThenBlock: {
                 StoreValue(result, empty)
                 list = CreateList(empty)
@@ -454,7 +556,7 @@ Function.ParseAtom {
         IfCondition EqualTo(ch, 46) ThenBlock: {
             CompilerState.pos = Add(CompilerState.pos, 1)
             state = AddState(StateType.DOT, 0, 0)
-            frag = Allocate(16)
+            frag = FragAlloc()
             IfCondition NotEqual(frag, 0) ThenBlock: {
                 StoreValue(frag, state)
                 list = CreateList(state)
@@ -462,11 +564,11 @@ Function.ParseAtom {
             }
             ReturnValue(ParsePost(frag))
         }
-        
+
         IfCondition EqualTo(ch, 94) ThenBlock: {
             CompilerState.pos = Add(CompilerState.pos, 1)
             state = AddState(StateType.ASSERT_START, 0, 0)
-            frag = Allocate(16)
+            frag = FragAlloc()
             IfCondition NotEqual(frag, 0) ThenBlock: {
                 StoreValue(frag, state)
                 list = CreateList(state)
@@ -474,11 +576,11 @@ Function.ParseAtom {
             }
             ReturnValue(frag)
         }
-        
+
         IfCondition EqualTo(ch, 36) ThenBlock: {
             CompilerState.pos = Add(CompilerState.pos, 1)
             state = AddState(StateType.ASSERT_END, 0, 0)
-            frag = Allocate(16)
+            frag = FragAlloc()
             IfCondition NotEqual(frag, 0) ThenBlock: {
                 StoreValue(frag, state)
                 list = CreateList(state)
@@ -521,7 +623,7 @@ Function.ParseAtom {
             IfCondition EqualTo(ch, 116) ThenBlock: { ch = 9 }
             
             state = AddState(StateType.CHAR, ch, 0)
-            frag = Allocate(16)
+            frag = FragAlloc()
             IfCondition NotEqual(frag, 0) ThenBlock: {
                 StoreValue(frag, state)
                 list = CreateList(state)
@@ -529,11 +631,11 @@ Function.ParseAtom {
             }
             ReturnValue(ParsePost(frag))
         }
-        
+
         // Literal character
         CompilerState.pos = Add(CompilerState.pos, 1)
         state = AddState(StateType.CHAR, ch, 0)
-        frag = Allocate(16)
+        frag = FragAlloc()
         IfCondition NotEqual(frag, 0) ThenBlock: {
             StoreValue(frag, state)
             list = CreateList(state)
@@ -564,20 +666,19 @@ Function.ParsePost {
             SetStateOut1(split, atom_start)
             atom_out = Dereference(Add(atom, 8))
             PatchList(atom_out, split)
-            
+
             out = CreateList(split)
             SetListNext(out, 1)
-            
-            result = Allocate(16)
+
+            result = FragAlloc()
             IfCondition NotEqual(result, 0) ThenBlock: {
                 StoreValue(result, split)
                 StoreValue(Add(result, 8), out)
             }
-            
-            Deallocate(atom, 16)
+
             ReturnValue(result)
         }
-        
+
         IfCondition EqualTo(ch, 43) ThenBlock: {
             CompilerState.pos = Add(CompilerState.pos, 1)
             split = AddState(StateType.SPLIT, 0, 0)
@@ -585,39 +686,37 @@ Function.ParsePost {
             SetStateOut1(split, atom_start)
             atom_out = Dereference(Add(atom, 8))
             PatchList(atom_out, split)
-            
+
             out = CreateList(split)
             SetListNext(out, 1)
-            
-            result = Allocate(16)
+
+            result = FragAlloc()
             IfCondition NotEqual(result, 0) ThenBlock: {
                 StoreValue(result, atom_start)
                 StoreValue(Add(result, 8), out)
             }
-            
-            Deallocate(atom, 16)
+
             ReturnValue(result)
         }
-        
+
         IfCondition EqualTo(ch, 63) ThenBlock: {
             CompilerState.pos = Add(CompilerState.pos, 1)
             split = AddState(StateType.SPLIT, 0, 0)
             atom_start = Dereference(atom)
             SetStateOut1(split, atom_start)
-            
+
             atom_out = Dereference(Add(atom, 8))
             split_out = CreateList(split)
             SetListNext(split_out, 1)
-            
+
             out_list = MergeLists(atom_out, split_out)
-            
-            result = Allocate(16)
+
+            result = FragAlloc()
             IfCondition NotEqual(result, 0) ThenBlock: {
                 StoreValue(result, split)
                 StoreValue(Add(result, 8), out_list)
             }
-            
-            Deallocate(atom, 16)
+
             ReturnValue(result)
         }
         
@@ -637,12 +736,12 @@ Function.ParseClass {
             CompilerState.pos = Add(CompilerState.pos, 1)
         }
         
-        bitmap = Allocate(32)
+        bitmap = ClassAlloc()
         IfCondition EqualTo(bitmap, 0) ThenBlock: {
             CompilerState.error = 1
             ReturnValue(0)
         }
-        
+
         // Initialize bitmap
         i = 0
         WhileLoop LessThan(i, 32) {
@@ -650,26 +749,56 @@ Function.ParseClass {
             i = Add(i, 1)
         }
         
+        // Walk class contents. Recognises ranges of the form X-Y where Y
+        // is not ']', setting every byte in [X,Y] inclusive. A trailing
+        // '-' before ']' is treated as a literal dash (POSIX behaviour).
         WhileLoop 1 {
             IfCondition GreaterEqual(CompilerState.pos, CompilerState.len) ThenBlock: {
                 CompilerState.error = 1
-                Deallocate(bitmap, 32)
                 ReturnValue(0)
             }
-            
+
             ch = GetByte(CompilerState.pattern, CompilerState.pos)
-            
+
             IfCondition EqualTo(ch, 93) ThenBlock: {
                 CompilerState.pos = Add(CompilerState.pos, 1)
                 BreakLoop
             }
-            
+
             CompilerState.pos = Add(CompilerState.pos, 1)
+
+            // Peek: is this the start of a range (X-Y)?
+            IfCondition LessThan(CompilerState.pos, CompilerState.len) ThenBlock: {
+                peek = GetByte(CompilerState.pattern, CompilerState.pos)
+                IfCondition EqualTo(peek, 45) ThenBlock: {
+                    IfCondition LessThan(Add(CompilerState.pos, 1), CompilerState.len) ThenBlock: {
+                        end_ch = GetByte(CompilerState.pattern, Add(CompilerState.pos, 1))
+                        IfCondition NotEqual(end_ch, 93) ThenBlock: {
+                            // Consume '-' and end byte, then fill bitmap.
+                            CompilerState.pos = Add(CompilerState.pos, 2)
+                            IfCondition LessEqual(ch, end_ch) ThenBlock: {
+                                j = ch
+                                WhileLoop LessEqual(j, end_ch) {
+                                    SetBit(bitmap, j)
+                                    j = Add(j, 1)
+                                }
+                            } ElseBlock: {
+                                // Descending range: set both endpoints only.
+                                SetBit(bitmap, ch)
+                                SetBit(bitmap, end_ch)
+                            }
+                            ContinueLoop
+                        }
+                    }
+                }
+            }
+
+            // Not a range — literal byte.
             SetBit(bitmap, ch)
         }
         
         state = AddState(StateType.RANGE, bitmap, negated)
-        frag = Allocate(16)
+        frag = FragAlloc()
         IfCondition NotEqual(frag, 0) ThenBlock: {
             StoreValue(frag, state)
             list = CreateList(state)
@@ -752,15 +881,27 @@ Function.SetStateOut2 {
 // LIST MANAGEMENT
 // ============================================================================
 
+// List node layout (24 bytes):
+//   offset  0: state_id     (8 bytes)
+//   offset  8: next pointer (8 bytes)
+//   offset 16: is_out2 flag (8 bytes)
+//
+// Fix (April 2026): previous layout stored is_out2 at offset 12 with
+// StoreValue (which writes 8 bytes), so bytes 12-19 were written into
+// a 16-byte allocation — a 4-byte OOB write that also clobbered the
+// 'next' pointer's upper half. PatchList then read `is_out2` from
+// offset 12 and got junk, corrupting NFA traversal on any post
+// operator (* + ?) and segfaulting Regex_Compile on simple patterns
+// like "a*".
 Function.CreateList {
     Input: state_id: Integer
     Output: Address
     Body: {
-        list = Allocate(16)
+        list = ListAlloc()
         IfCondition NotEqual(list, 0) ThenBlock: {
             StoreValue(list, state_id)
             StoreValue(Add(list, 8), 0)
-            StoreValue(Add(list, 12), 0)
+            StoreValue(Add(list, 16), 0)
         }
         ReturnValue(list)
     }
@@ -771,7 +912,7 @@ Function.SetListNext {
     Input: is_out2: Integer
     Body: {
         IfCondition NotEqual(list, 0) ThenBlock: {
-            StoreValue(Add(list, 12), is_out2)
+            StoreValue(Add(list, 16), is_out2)
         }
     }
 }
@@ -808,7 +949,7 @@ Function.PatchList {
     Body: {
         WhileLoop NotEqual(list, 0) {
             state_id = Dereference(list)
-            is_out2 = Dereference(Add(list, 12))
+            is_out2 = Dereference(Add(list, 16))
             
             offset = Multiply(state_id, RegexConstants.STATE_SIZE)
             state = Add(RegexState.states, offset)
