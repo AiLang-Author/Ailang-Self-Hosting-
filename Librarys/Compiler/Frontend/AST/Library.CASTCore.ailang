@@ -11,6 +11,65 @@ LibraryImport.XArrays
 LibraryImport.Compiler.Frontend.AST.CASTTypes
 
 // =============================================================================
+// AST NODE POOL — fixed-size (64B) slot allocator for AST nodes.
+//
+// Before this pool every AST_Create did two XArray.XCreate calls (one for
+// the node struct, one for its children list). For a ailang_cli self-
+// compile producing 82,638 AST nodes that was 165,000+ small allocations,
+// each rounded up to an Arena slab class. Peak compile RSS was 1.77 GB.
+//
+// Now the node struct is a plain 64-byte slot handed out from a single
+// up-front pool allocation. Children still use XArray (variable-length,
+// lazy-created on first AST_AddChild so leaf nodes pay nothing). Field
+// access moves from XArray.XGet(node, idx) to Dereference(Add(node,
+// idx*8)) — faster AND smaller.
+//
+// Same invariants as the regex parser pools (RegexFragPool et al in
+// Library.Regex_Thompson.ailang):
+//   * Process-lifetime bump allocator. Never reset `head` between
+//     compiles — any live AST node reference would dangle.
+//   * Returns 0 on cap overflow so callers' null-checks keep working.
+//   * Lazy-init buf on first AST_NodeAlloc call.
+// =============================================================================
+
+FixedPool.ASTNodePool {
+    "buf":  Initialize=0, CanChange=True
+    "head": Initialize=0, CanChange=True
+    "cap":  Initialize=262144      // 256K nodes × 64B = 16 MB reserved
+}
+
+Function.AST_NodeAlloc {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(ASTNodePool.buf, 0) ThenBlock: {
+            ASTNodePool.buf = Allocate(Multiply(ASTNodePool.cap, 64))
+            IfCondition EqualTo(ASTNodePool.buf, 0) ThenBlock: {
+                PrintMessage("[AST] FATAL: pool buf Allocate failed\n")
+                ReturnValue(0)
+            }
+        }
+        IfCondition GreaterEqual(ASTNodePool.head, ASTNodePool.cap) ThenBlock: {
+            PrintMessage("[AST] FATAL: node pool overflow at head=")
+            PrintNumber(ASTNodePool.head)
+            PrintMessage(" cap=")
+            PrintNumber(ASTNodePool.cap)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+        slot = Add(ASTNodePool.buf, Multiply(ASTNodePool.head, 64))
+        ASTNodePool.head = Add(ASTNodePool.head, 1)
+        // Zero the 8 fields. Deterministic starting state matters
+        // because callers rely on "unset" fields reading as 0.
+        i = 0
+        WhileLoop LessThan(i, 64) {
+            SetByte(slot, i, 0)
+            i = Add(i, 1)
+        }
+        ReturnValue(slot)
+    }
+}
+
+// =============================================================================
 // SYMBOL TYPES
 // =============================================================================
 FixedPool.SymType {
@@ -79,32 +138,25 @@ FixedPool.SymFlag {
 // Replace existing AST_Create in Library.CASTCore.ailang
 // =============================================================================
 
+// Pool-backed node. Layout (64 bytes, offsets in bytes):
+//   [0]  TYPE       [32] DATA2
+//   [8]  LINE       [40] DATA3
+//   [16] COL        [48] DATA4
+//   [24] DATA1      [56] CHILDREN (0 = no children yet; lazy XArray
+//                                   on first AST_AddChild)
 Function.AST_Create {
     Input: node_type: Integer
     Output: Address
     Body: {
-        node = XArray.XCreate(8)
-        
-        // Must PUSH to set size, then we can XSet
-        XArray.XPush(node, node_type)              // TYPE - index 0
-        XArray.XPush(node, ASTState.auto_line)     // LINE - index 1  (was 0)
-        XArray.XPush(node, ASTState.auto_col)      // COL - index 2   (was 0)
-        XArray.XPush(node, 0)                       // DATA1 - index 3
-        XArray.XPush(node, 0)                       // DATA2 - index 4
-        XArray.XPush(node, 0)                       // DATA3 - index 5
-        XArray.XPush(node, 0)                       // DATA4 - index 6
-        
-        // Children is another XArray
-        children = XArray.XCreate(ASTState.max_children)
-        XArray.XPush(node, children)               // CHILDREN - index 7
-        
+        node = AST_NodeAlloc()
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+
+        StoreValue(node,          node_type)         // TYPE
+        StoreValue(Add(node,  8), ASTState.auto_line) // LINE
+        StoreValue(Add(node, 16), ASTState.auto_col)  // COL
+        // DATA1..4 and CHILDREN already zeroed by AST_NodeAlloc.
+
         ASTState.node_count = Add(ASTState.node_count, 1)
-        
-        // Register in master list
-        IfCondition NotEqual(ASTState.all_nodes, 0) ThenBlock: {
-            XArray.XPush(ASTState.all_nodes, node)
-        }
-        
         ReturnValue(node)
     }
 }
@@ -117,8 +169,9 @@ Function.AST_CreateAt {
     Output: Address
     Body: {
         node = AST_Create(node_type)
-        XArray.XSet(node, ASTField.LINE, line)
-        XArray.XSet(node, ASTField.COL, col)
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        StoreValue(Add(node,  8), line)  // LINE
+        StoreValue(Add(node, 16), col)   // COL
         ReturnValue(node)
     }
 }
@@ -129,18 +182,18 @@ Function.AST_CreateAt {
 // =============================================================================
 Function.AST_Init {
     Body: {
-        // Free old list if exists
+        // Old all_nodes master list is no longer used — ASTNodePool
+        // tracks every allocated slot in order [0, head) and that's
+        // the enumeration AST_FreeAll walks.
         IfCondition NotEqual(ASTState.all_nodes, 0) ThenBlock: {
             XArray.XDestroy(ASTState.all_nodes)
+            ASTState.all_nodes = 0
         }
-        
-        // Create fresh master list (capacity for ~10000 nodes)
-        ASTState.all_nodes = XArray.XCreate(4096)
         ASTState.node_count = 0
         ASTState.error = 0
         ASTState.error_msg = 0
-        
-        PrintMessage("[AST] Initialized, node tracking enabled\n")
+
+        PrintMessage("[AST] Initialized, pool-backed node storage\n")
     }
 }
 
@@ -149,14 +202,16 @@ Function.AST_Init {
 // FIELD GETTERS
 // =============================================================================
 
+// All field access is offset-based Dereference on the 64-byte pool slot.
+// No XArray bookkeeping. Byte offsets (vs ASTField index × 8):
+//   TYPE=0  LINE=8  COL=16  DATA1=24  DATA2=32  DATA3=40  DATA4=48  CHILDREN=56
+
 Function.AST_GetType {
     Input: node: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        ReturnValue(XArray.XGet(node, ASTField.TYPE))
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(node))
     }
 }
 
@@ -164,10 +219,8 @@ Function.AST_GetLine {
     Input: node: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        ReturnValue(XArray.XGet(node, ASTField.LINE))
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(node, 8)))
     }
 }
 
@@ -175,10 +228,8 @@ Function.AST_GetCol {
     Input: node: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        ReturnValue(XArray.XGet(node, ASTField.COL))
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(node, 16)))
     }
 }
 
@@ -186,10 +237,8 @@ Function.AST_GetData1 {
     Input: node: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        ReturnValue(XArray.XGet(node, ASTField.DATA1))
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(node, 24)))
     }
 }
 
@@ -197,10 +246,8 @@ Function.AST_GetData2 {
     Input: node: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        ReturnValue(XArray.XGet(node, ASTField.DATA2))
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(node, 32)))
     }
 }
 
@@ -208,10 +255,8 @@ Function.AST_GetData3 {
     Input: node: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        ReturnValue(XArray.XGet(node, ASTField.DATA3))
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(node, 40)))
     }
 }
 
@@ -219,10 +264,8 @@ Function.AST_GetData4 {
     Input: node: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        ReturnValue(XArray.XGet(node, ASTField.DATA4))
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(node, 48)))
     }
 }
 
@@ -230,10 +273,8 @@ Function.AST_GetChildren {
     Input: node: Address
     Output: Address
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        ReturnValue(XArray.XGet(node, ASTField.CHILDREN))
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(node, 56)))
     }
 }
 
@@ -245,9 +286,7 @@ Function.AST_SetType {
     Input: node: Address
     Input: value: Integer
     Body: {
-        IfCondition NotEqual(node, 0) ThenBlock: {
-            XArray.XSet(node, ASTField.TYPE, value)
-        }
+        IfCondition NotEqual(node, 0) ThenBlock: { StoreValue(node, value) }
     }
 }
 
@@ -255,9 +294,7 @@ Function.AST_SetLine {
     Input: node: Address
     Input: value: Integer
     Body: {
-        IfCondition NotEqual(node, 0) ThenBlock: {
-            XArray.XSet(node, ASTField.LINE, value)
-        }
+        IfCondition NotEqual(node, 0) ThenBlock: { StoreValue(Add(node, 8), value) }
     }
 }
 
@@ -265,9 +302,7 @@ Function.AST_SetCol {
     Input: node: Address
     Input: value: Integer
     Body: {
-        IfCondition NotEqual(node, 0) ThenBlock: {
-            XArray.XSet(node, ASTField.COL, value)
-        }
+        IfCondition NotEqual(node, 0) ThenBlock: { StoreValue(Add(node, 16), value) }
     }
 }
 
@@ -275,9 +310,7 @@ Function.AST_SetData1 {
     Input: node: Address
     Input: value: Integer
     Body: {
-        IfCondition NotEqual(node, 0) ThenBlock: {
-            XArray.XSet(node, ASTField.DATA1, value)
-        }
+        IfCondition NotEqual(node, 0) ThenBlock: { StoreValue(Add(node, 24), value) }
     }
 }
 
@@ -285,9 +318,7 @@ Function.AST_SetData2 {
     Input: node: Address
     Input: value: Integer
     Body: {
-        IfCondition NotEqual(node, 0) ThenBlock: {
-            XArray.XSet(node, ASTField.DATA2, value)
-        }
+        IfCondition NotEqual(node, 0) ThenBlock: { StoreValue(Add(node, 32), value) }
     }
 }
 
@@ -295,9 +326,7 @@ Function.AST_SetData3 {
     Input: node: Address
     Input: value: Integer
     Body: {
-        IfCondition NotEqual(node, 0) ThenBlock: {
-            XArray.XSet(node, ASTField.DATA3, value)
-        }
+        IfCondition NotEqual(node, 0) ThenBlock: { StoreValue(Add(node, 40), value) }
     }
 }
 
@@ -305,9 +334,7 @@ Function.AST_SetData4 {
     Input: node: Address
     Input: value: Integer
     Body: {
-        IfCondition NotEqual(node, 0) ThenBlock: {
-            XArray.XSet(node, ASTField.DATA4, value)
-        }
+        IfCondition NotEqual(node, 0) ThenBlock: { StoreValue(Add(node, 48), value) }
     }
 }
 
@@ -315,12 +342,21 @@ Function.AST_SetData4 {
 // CHILD NODE MANAGEMENT
 // =============================================================================
 
+// Children list is lazy-created on first AddChild. Leaf nodes never
+// pay the XArray cost. Keeping children as XArrays (vs a pool) because
+// child counts are wildly variable — a Program node may have 500
+// children while a NUMBER node has 0 — and XArray already handles the
+// growable-array case correctly.
 Function.AST_AddChild {
     Input: parent: Address
     Input: child: Address
     Body: {
         IfCondition And(NotEqual(parent, 0), NotEqual(child, 0)) ThenBlock: {
-            children = XArray.XGet(parent, ASTField.CHILDREN)
+            children = Dereference(Add(parent, 56))
+            IfCondition EqualTo(children, 0) ThenBlock: {
+                children = XArray.XCreate(8)
+                StoreValue(Add(parent, 56), children)
+            }
             XArray.XPush(children, child)
         }
     }
@@ -331,13 +367,9 @@ Function.AST_GetChild {
     Input: index: Integer
     Output: Address
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        children = XArray.XGet(node, ASTField.CHILDREN)
-        IfCondition EqualTo(children, 0) ThenBlock: {
-            ReturnValue(0)
-        }
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        children = Dereference(Add(node, 56))
+        IfCondition EqualTo(children, 0) ThenBlock: { ReturnValue(0) }
         ReturnValue(XArray.XGet(children, index))
     }
 }
@@ -346,13 +378,9 @@ Function.AST_GetChildCount {
     Input: node: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        children = XArray.XGet(node, ASTField.CHILDREN)
-        IfCondition EqualTo(children, 0) ThenBlock: {
-            ReturnValue(0)
-        }
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        children = Dereference(Add(node, 56))
+        IfCondition EqualTo(children, 0) ThenBlock: { ReturnValue(0) }
         ReturnValue(XArray.XSize(children))
     }
 }
@@ -363,7 +391,7 @@ Function.AST_SetChild {
     Input: child: Address
     Body: {
         IfCondition NotEqual(node, 0) ThenBlock: {
-            children = XArray.XGet(node, ASTField.CHILDREN)
+            children = Dereference(Add(node, 56))
             IfCondition NotEqual(children, 0) ThenBlock: {
                 XArray.XSet(children, index, child)
             }
@@ -380,11 +408,8 @@ Function.AST_IsType {
     Input: expected: Integer
     Output: Integer
     Body: {
-        IfCondition EqualTo(node, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-        actual = XArray.XGet(node, ASTField.TYPE)
-        IfCondition EqualTo(actual, expected) ThenBlock: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Dereference(node), expected) ThenBlock: {
             ReturnValue(1)
         }
         ReturnValue(0)
@@ -406,25 +431,20 @@ Function.AST_IsNull {
 // NODE CLEANUP
 // =============================================================================
 
+// AST_Free: node slots can't be individually reclaimed from a
+// process-lifetime bump pool. Children XArray *can* be freed though —
+// that's the bigger footprint anyway (XArray carries its own slab
+// allocation). So: destroy the children XArray, leave the node slot
+// as a dead reservation in the pool.
 Function.AST_Free {
     Input: node: Address
     Body: {
         IfCondition NotEqual(node, 0) ThenBlock: {
-            // Free all children recursively
-            children = XArray.XGet(node, ASTField.CHILDREN)
+            children = Dereference(Add(node, 56))
             IfCondition NotEqual(children, 0) ThenBlock: {
-                count = XArray.XSize(children)
-                i = 0
-                WhileLoop LessThan(i, count) {
-                    child = XArray.XGet(children, i)
-                //    AST_Free(child)
-                    i = Add(i, 1)
-                }
                 XArray.XDestroy(children)
+                StoreValue(Add(node, 56), 0)
             }
-            
-            // Free the node itself
-            XArray.XDestroy(node)
             ASTState.node_count = Subtract(ASTState.node_count, 1)
         }
     }
@@ -434,11 +454,11 @@ Function.AST_FreeShallow {
     Input: node: Address
     Body: {
         IfCondition NotEqual(node, 0) ThenBlock: {
-            children = XArray.XGet(node, ASTField.CHILDREN)
+            children = Dereference(Add(node, 56))
             IfCondition NotEqual(children, 0) ThenBlock: {
                 XArray.XDestroy(children)
+                StoreValue(Add(node, 56), 0)
             }
-            XArray.XDestroy(node)
             ASTState.node_count = Subtract(ASTState.node_count, 1)
         }
     }
@@ -450,45 +470,35 @@ Function.AST_FreeShallow {
 // =============================================================================
 Function.AST_FreeAll {
     Body: {
-        IfCondition EqualTo(ASTState.all_nodes, 0) ThenBlock: {
-            PrintMessage("[AST] Warning: all_nodes is null, nothing to free\n")
+        IfCondition EqualTo(ASTNodePool.buf, 0) ThenBlock: {
             ReturnValue(0)
         }
-        
-        count = XArray.XSize(ASTState.all_nodes)
+        count = ASTNodePool.head
         freed = 0
-        
+
         PrintMessage("[AST] Freeing ")
         PrintNumber(count)
-        PrintMessage(" nodes...\n")
-        
-        // Iterate flat list - no recursion needed
+        PrintMessage(" node child-lists...\n")
+
+        // Iterate every slot that was handed out. Node slots themselves
+        // belong to ASTNodePool (process-lifetime bump allocator), so we
+        // can't reclaim them individually — but the children XArrays
+        // each carried their own slab allocation and are worth freeing.
         i = 0
         WhileLoop LessThan(i, count) {
-            node = XArray.XGet(ASTState.all_nodes, i)
-            
-            IfCondition NotEqual(node, 0) ThenBlock: {
-                // Free the children XArray (but NOT the child nodes - they're in the list too)
-                children = XArray.XGet(node, ASTField.CHILDREN)
-                IfCondition NotEqual(children, 0) ThenBlock: {
-                    XArray.XDestroy(children)
-                }
-                
-                // Free the node XArray itself
-                XArray.XDestroy(node)
+            node = Add(ASTNodePool.buf, Multiply(i, 64))
+            children = Dereference(Add(node, 56))
+            IfCondition NotEqual(children, 0) ThenBlock: {
+                XArray.XDestroy(children)
+                StoreValue(Add(node, 56), 0)
                 freed = Add(freed, 1)
             }
-            
             i = Add(i, 1)
         }
-        
-        // Free the master list itself
-        XArray.XDestroy(ASTState.all_nodes)
-        ASTState.all_nodes = 0
+
         ASTState.node_count = 0
-        
         PrintMessage("[AST] Freed ")
         PrintNumber(freed)
-        PrintMessage(" nodes\n")
+        PrintMessage(" child-lists (node slots stay in pool)\n")
     }
 }
