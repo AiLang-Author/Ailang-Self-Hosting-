@@ -64,6 +64,11 @@ seq 1001 2000 > "$BENCH_DIR/paste2.txt"
 printf '        eight spaces\n' > "$BENCH_DIR/bench_unexpand.txt"
 printf 'one\ttwo\tthree\n' > "$BENCH_DIR/bench_expand.txt"
 
+# Small file for startup-dominated benchmarks (AiLang's process-launch is
+# cheaper than GNU's because no libc/locale/PCRE init).
+printf 'alpha\nbeta\ngamma\ndelta\nepsilon\nzeta\neta\ntheta\niota\nkappa\n' \
+    > "$BENCH_DIR/small.txt"
+
 # Result accumulators
 correct_pass=0; correct_fail=0
 perf_wins=(); perf_ties=(); perf_losses=()
@@ -224,9 +229,57 @@ bench "tail -5 (shorthand)" tail  "-5 $BENCH_DIR/bench_test.txt" \
     "tail -5 $BENCH_DIR/bench_test.txt" \
     "/usr/bin/tail -5 $BENCH_DIR/bench_test.txt"
 
-bench "grep ERROR"          grep  "-F ERROR $BENCH_DIR/bench_test.txt" \
+#
+# grep — multiple workloads because AiLang and GNU trade wins case by case.
+# AiLang tends to win on startup-dominated workloads (small files, many
+# invocations in a script); GNU tends to win on bulk processing of big
+# inputs with complex patterns. Report per-scenario; never characterize
+# "grep" as one number.
+#
+bench "grep -F small (100 iter, startup-heavy)" grep  "-F gamma $BENCH_DIR/small.txt" \
+    "grep -F gamma $BENCH_DIR/small.txt" \
+    "/usr/bin/grep -F gamma $BENCH_DIR/small.txt" \
+    100
+
+bench "grep -F literal (100k-line log)"         grep  "-F ERROR $BENCH_DIR/bench_test.txt" \
     "grep -F ERROR $BENCH_DIR/bench_test.txt" \
-    "/usr/bin/grep -F ERROR $BENCH_DIR/bench_test.txt"
+    "/usr/bin/grep -F ERROR $BENCH_DIR/bench_test.txt" \
+    50
+
+bench "grep -F literal (every line)"    grep  "-F INFO $BENCH_DIR/bench_test.txt" \
+    "grep -F INFO $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/grep -F INFO $BENCH_DIR/bench_test.txt" \
+    20
+
+bench "grep -F rare (no match)"         grep  "-F zzz_not_present $BENCH_DIR/bench_test.txt" \
+    "grep -F zzz_not_present $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/grep -F zzz_not_present $BENCH_DIR/bench_test.txt" \
+    50
+
+bench "grep -c count"                   grep  "-c INFO $BENCH_DIR/bench_test.txt" \
+    "grep -c INFO $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/grep -c INFO $BENCH_DIR/bench_test.txt" \
+    50
+
+bench "grep -v invert"                  grep  "-v ERROR $BENCH_DIR/bench_test.txt" \
+    "grep -v ERROR $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/grep -v ERROR $BENCH_DIR/bench_test.txt" \
+    20
+
+bench "grep -i case-insensitive"        grep  "-i error $BENCH_DIR/bench_test.txt" \
+    "grep -i error $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/grep -i error $BENCH_DIR/bench_test.txt" \
+    50
+
+bench "grep regex [0-9]+"               grep  "-E [0-9]+ $BENCH_DIR/bench_test.txt" \
+    "grep -E [0-9]+ $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/grep -E [0-9]+ $BENCH_DIR/bench_test.txt" \
+    20
+
+bench "grep alternation"                grep  "-E ERROR|WARN|FATAL $BENCH_DIR/bench_test.txt" \
+    "grep -E 'ERROR|WARN|FATAL' $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/grep -E 'ERROR|WARN|FATAL' $BENCH_DIR/bench_test.txt" \
+    20
 
 bench "seq 1 10000"         seq   "1 10000" \
     "seq 1 10000" \
