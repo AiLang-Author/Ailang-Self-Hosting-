@@ -1,0 +1,247 @@
+// Library.CEmitTags.ailang
+// Instruction tagging and post-pass peephole optimization.
+// Design and correctness invariants: see EMIT_TAG_DESIGN.md
+// Location: Librarys/Compiler/CodeEmit/Library.CEmitTags.ailang
+
+LibraryImport.XArrays
+LibraryImport.Compiler.CodeEmit.CEmitCore
+
+FixedPool.TagClass {
+    "NONE":        Initialize=0, CanChange=False
+    "STORE_LOCAL": Initialize=1, CanChange=False
+    "LOAD_LOCAL":  Initialize=2, CanChange=False
+    // LABEL is a zero-byte-length marker emitted at every Emit_MarkLabel
+    // call. It breaks the (STORE, LOAD) adjacent-pair pattern in tag-
+    // index space when a jump target lands between them, so the
+    // optimizer can't fuse across a potential back-edge landing site.
+    "LABEL":       Initialize=3, CanChange=False
+}
+
+FixedPool.EmitTag {
+    "tags":     Initialize=0, CanChange=True
+    "enabled":  Initialize=1, CanChange=True
+    "patched":  Initialize=0, CanChange=True
+}
+
+// Tag entry layout (32 bytes):
+//   [0]  code_pos  : byte offset into Emit.code where the instruction begins
+//   [8]  byte_len  : length of the instruction in bytes
+//   [16] tag_class : one of TagClass.*
+//   [24] operand   : class-specific payload (for STORE/LOAD it's the RBP offset)
+
+// =============================================================================
+// LIFECYCLE
+// =============================================================================
+
+Function.EmitTag_Init {
+    Body: {
+        IfCondition NotEqual(EmitTag.tags, 0) ThenBlock: {
+            count = XArray.XSize(EmitTag.tags)
+            i = 0
+            WhileLoop LessThan(i, count) {
+                entry = XArray.XGet(EmitTag.tags, i)
+                IfCondition NotEqual(entry, 0) ThenBlock: {
+                    Deallocate(entry, 32)
+                }
+                i = Add(i, 1)
+            }
+            XArray.XDestroy(EmitTag.tags)
+        }
+        EmitTag.tags = XArray.XCreate(8192)
+        EmitTag.patched = 0
+    }
+}
+
+Function.EmitTag_Free {
+    Body: {
+        IfCondition NotEqual(EmitTag.tags, 0) ThenBlock: {
+            count = XArray.XSize(EmitTag.tags)
+            i = 0
+            WhileLoop LessThan(i, count) {
+                entry = XArray.XGet(EmitTag.tags, i)
+                IfCondition NotEqual(entry, 0) ThenBlock: {
+                    Deallocate(entry, 32)
+                }
+                i = Add(i, 1)
+            }
+            XArray.XDestroy(EmitTag.tags)
+            EmitTag.tags = 0
+        }
+    }
+}
+
+// =============================================================================
+// TAG REGISTRATION
+// =============================================================================
+
+// Called from the X86 emit layer right after a tagged instruction is emitted.
+// Caller captures `pos = Emit.code_size` before the emit bytes and passes
+// `byte_len = Emit.code_size - pos` after.
+Function.EmitTag_Add {
+    Input: code_pos: Integer
+    Input: byte_len: Integer
+    Input: tag_class: Integer
+    Input: operand: Integer
+    Body: {
+        IfCondition EqualTo(EmitTag.enabled, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        entry = Allocate(32)
+        StoreValue(entry, code_pos)
+        StoreValue(Add(entry, 8), byte_len)
+        StoreValue(Add(entry, 16), tag_class)
+        StoreValue(Add(entry, 24), operand)
+        XArray.XPush(EmitTag.tags, entry)
+    }
+}
+
+// Zero-length tag announcing that a label was just marked at the
+// current code position. Called from Emit_MarkLabel. The optimizer
+// treats a LABEL between (STORE_LOCAL, LOAD_LOCAL) in tag-index
+// space as a fuse blocker because the load is a potential jump
+// target — NOPing it would leave any back-edge jumper reading
+// undefined RAX.
+Function.EmitTag_MarkLabel {
+    Input: code_pos: Integer
+    Body: {
+        IfCondition EqualTo(EmitTag.enabled, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(EmitTag.tags, 0) ThenBlock: { ReturnValue(0) }
+        entry = Allocate(32)
+        StoreValue(entry, code_pos)
+        StoreValue(Add(entry, 8), 0)
+        StoreValue(Add(entry, 16), TagClass.LABEL)
+        StoreValue(Add(entry, 24), 0)
+        XArray.XPush(EmitTag.tags, entry)
+    }
+}
+
+// =============================================================================
+// CORRECTNESS PREDICATE
+// =============================================================================
+//
+// Returns 1 iff the store at `entry` and the load at `next` may be fused —
+// i.e. the load is guaranteed redundant because RAX already holds the value
+// that was just stored.
+//
+// Three rules, ALL must hold:
+//   (a) entry is STORE_LOCAL and next is LOAD_LOCAL.
+//   (b) byte-contiguous: next starts exactly where entry ends. This proves
+//       no untagged instruction sat between them and potentially clobbered
+//       RAX (CALL, arithmetic, any other MOV, any label).
+//   (c) same operand: both reference the same RBP offset.
+//
+// The contiguity rule is the load-bearing correctness guard. Tag-space
+// adjacency does NOT imply code-space adjacency — any instruction we
+// don't tag emits untagged bytes between the two tags.
+
+Function.EmitTag_CanFuseStoreLoad {
+    Input: entry: Address
+    Input: next: Address
+    Output: Integer
+    Body: {
+        this_class = Dereference(Add(entry, 16))
+        next_class = Dereference(Add(next, 16))
+        IfCondition NotEqual(this_class, TagClass.STORE_LOCAL) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(next_class, TagClass.LOAD_LOCAL)  ThenBlock: { ReturnValue(0) }
+
+        this_pos = Dereference(entry)
+        this_len = Dereference(Add(entry, 8))
+        next_pos = Dereference(next)
+        IfCondition NotEqual(Add(this_pos, this_len), next_pos) ThenBlock: { ReturnValue(0) }
+
+        this_op = Dereference(Add(entry, 24))
+        next_op = Dereference(Add(next, 24))
+        IfCondition NotEqual(this_op, next_op) ThenBlock: { ReturnValue(0) }
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// OPTIMIZATION PASS
+// =============================================================================
+
+// Overwrite a byte range of Emit.code with single-byte NOPs (0x90).
+// Single-byte NOPs are jump-target-safe: any jump landing at `pos` just
+// falls through to the next real instruction.
+Function.EmitTag_NopBytes {
+    Input: pos: Integer
+    Input: len: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, len) {
+            SetByte(Emit.code, Add(pos, i), 144)
+            i = Add(i, 1)
+        }
+    }
+}
+
+// Walk the tag list once, applying every known peephole pattern.
+// Adding a new pattern: write a small EmitTag_CanFuse<Name> predicate,
+// add a dispatch arm here calling it. Keep this function short.
+Function.EmitTag_Optimize {
+    Body: {
+        IfCondition EqualTo(EmitTag.enabled, 0) ThenBlock: { ReturnValue(0) }
+
+        count = XArray.XSize(EmitTag.tags)
+        IfCondition LessThan(count, 2) ThenBlock: { ReturnValue(0) }
+
+        EmitTag.patched = 0
+        i = 0
+        limit = Subtract(count, 1)
+
+        WhileLoop LessThan(i, limit) {
+            entry = XArray.XGet(EmitTag.tags, i)
+            next  = XArray.XGet(EmitTag.tags, Add(i, 1))
+
+            IfCondition EqualTo(EmitTag_CanFuseStoreLoad(entry, next), 1) ThenBlock: {
+                nop_pos = Dereference(next)
+                nop_len = Dereference(Add(next, 8))
+                EmitTag_NopBytes(nop_pos, nop_len)
+                StoreValue(Add(next, 16), TagClass.NONE)
+                EmitTag.patched = Add(EmitTag.patched, 1)
+            }
+
+            i = Add(i, 1)
+        }
+
+        PrintMessage("[EMIT-OPT] Patched ")
+        PrintNumber(EmitTag.patched)
+        PrintMessage(" redundant loads (of ")
+        PrintNumber(count)
+        PrintMessage(" tags)\n")
+    }
+}
+
+// =============================================================================
+// DEBUG
+// =============================================================================
+
+Function.EmitTag_Dump {
+    Body: {
+        count = XArray.XSize(EmitTag.tags)
+        PrintMessage("[TAGS] Total: ")
+        PrintNumber(count)
+        PrintMessage("\n")
+        i = 0
+        WhileLoop LessThan(i, count) {
+            entry = XArray.XGet(EmitTag.tags, i)
+            code_pos  = Dereference(entry)
+            byte_len  = Dereference(Add(entry, 8))
+            tag_class = Dereference(Add(entry, 16))
+            operand   = Dereference(Add(entry, 24))
+            PrintMessage("[TAG ")
+            PrintNumber(i)
+            PrintMessage("] pos=")
+            PrintNumber(code_pos)
+            PrintMessage(" len=")
+            PrintNumber(byte_len)
+            PrintMessage(" class=")
+            PrintNumber(tag_class)
+            PrintMessage(" operand=")
+            PrintNumber(operand)
+            PrintMessage("\n")
+            i = Add(i, 1)
+        }
+    }
+}
