@@ -26,7 +26,7 @@ echo -e "${BLUE}  running from: $AILANG_ROOT${NC}"
 echo ""
 
 DEST_DIR="AiLang_CoreUtils/dist"
-COMPILER="./ailang6.x"
+COMPILER="./ailang.x"
 
 # List of all utilities to build
 UTILS=(
