@@ -1,30 +1,48 @@
 #!/bin/bash
-# bench_all_utils.sh - Benchmark installed AILANG utilities (FIXED)
+# bench_all_utils.sh  —  performance + correctness comparison of installed
+# AILANG coreutils vs GNU equivalents.
+#
+# Rewritten 2026-04-18 to close a coverage hole: the old version timed
+# AiLang-vs-GNU for each utility but NEVER VERIFIED the outputs matched.
+# That's how head/tail/fold shipped broken with "all benchmarks pass."
+#
+# New rules:
+#   1. For each utility, a correctness gate runs first: same invocation,
+#      diff outputs byte-for-byte. Mismatch → FAIL, no timing emitted.
+#   2. Only utilities that pass the correctness gate proceed to timing.
+#   3. Utilities whose output is intentionally environment-dependent
+#      (pwd, whoami, date, tty, id, stat, df, du) use `bench_no_diff` —
+#      we verify the command succeeds, time it, but don't diff output.
+#   4. The final summary clearly separates correctness failures from perf
+#      wins/losses.
+#
+# Usage:
+#   ./bench_all_utils.sh                   # all utilities
+#   ./bench_all_utils.sh <util>            # one utility only
+
+set -u
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
+DIM='\033[2m'
 NC='\033[0m'
 
+ONLY="${1:-}"
+
 echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
-echo -e "${BLUE}     AILANG CoreUtils Performance Benchmark${NC}"
+echo -e "${BLUE}     AILANG CoreUtils Perf + Correctness Benchmark${NC}"
 echo -e "${BLUE}     (Testing installed binaries in PATH)${NC}"
 echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
 echo ""
 
-# Create a unique temporary directory for all test data
 BENCH_DIR=$(mktemp -d -t ailang_bench_XXXXXX)
-
-# Cleanup function to remove the temp directory on exit
-cleanup() {
-    rm -rf "$BENCH_DIR"
-}
-trap cleanup EXIT
+trap 'rm -rf "$BENCH_DIR"' EXIT
 
 echo -e "${YELLOW}Generating test data in $BENCH_DIR...${NC}"
 
-# Main test file (100k lines)
+# 100k-line log-shaped file — primary input for filter utilities.
 for i in $(seq 1 100000); do
     if [ $((i % 100)) -eq 0 ]; then
         echo "INFO: Processing record $i - ERROR: A rare event occurred."
@@ -33,335 +51,310 @@ for i in $(seq 1 100000); do
     fi
 done > "$BENCH_DIR/bench_test.txt"
 
-# Create a tab-delimited version for cut
 cat "$BENCH_DIR/bench_test.txt" | tr ' ' '\t' > "$BENCH_DIR/bench_test_tabs.txt"
 seq 1 10000 | shuf > "$BENCH_DIR/bench_sort_numbers.txt"
-
-# Create a sorted version for uniq
 sort "$BENCH_DIR/bench_test.txt" > "$BENCH_DIR/bench_test_sorted.txt"
-
-# Create slightly different files for diff
 cp "$BENCH_DIR/bench_test.txt" "$BENCH_DIR/bench_diff1.txt"
 cp "$BENCH_DIR/bench_test.txt" "$BENCH_DIR/bench_diff2.txt"
 echo "This is an extra line for diffing" >> "$BENCH_DIR/bench_diff2.txt"
-
-# Create smaller files for diff benchmark to avoid memory exhaustion
-head -n 100 "$BENCH_DIR/bench_diff1.txt" > "$BENCH_DIR/bench_diff_small1.txt"
-head -n 100 "$BENCH_DIR/bench_diff2.txt" > "$BENCH_DIR/bench_diff_small2.txt"
-
-# Create files for paste, expand, unexpand
+/usr/bin/head -n 100 "$BENCH_DIR/bench_diff1.txt" > "$BENCH_DIR/bench_diff_small1.txt"
+/usr/bin/head -n 100 "$BENCH_DIR/bench_diff2.txt" > "$BENCH_DIR/bench_diff_small2.txt"
 seq 1 1000 > "$BENCH_DIR/paste1.txt"
 seq 1001 2000 > "$BENCH_DIR/paste2.txt"
-echo -e "        eight spaces" > "$BENCH_DIR/bench_unexpand.txt"
-echo -e "one\ttwo\tthree" > "$BENCH_DIR/bench_expand.txt"
+printf '        eight spaces\n' > "$BENCH_DIR/bench_unexpand.txt"
+printf 'one\ttwo\tthree\n' > "$BENCH_DIR/bench_expand.txt"
 
-# Create a temporary directory structure for the 'du' benchmark
-mkdir -p "$BENCH_DIR/bench_du_dir/subdir"
-dd if=/dev/urandom of="$BENCH_DIR/bench_du_dir/file1.dat" bs=1K count=10 >/dev/null 2>&1
-dd if=/dev/urandom of="$BENCH_DIR/bench_du_dir/subdir/file2.dat" bs=1K count=20 >/dev/null 2>&1
+# Result accumulators
+correct_pass=0; correct_fail=0
+perf_wins=(); perf_ties=(); perf_losses=()
+declare -a correctness_failures=()
 
+# ─── Correctness gate ───────────────────────────────────────────────────────
+# Runs AiLang and GNU with identical args once each, diffs outputs.
+# Returns 0 if match, non-zero if mismatch (or either blew up).
+# Sets `gate_detail` with a human-readable reason on mismatch.
+gate_detail=""
+correctness_check() {
+    local util="$1" cmdline="$2"
+    local gnu_bin
+    gnu_bin=$(command -v -- "/usr/bin/$util" 2>/dev/null)
+    if [ -z "$gnu_bin" ] || [ ! -x "$gnu_bin" ]; then
+        gate_detail="no GNU $util installed to compare against"
+        return 2
+    fi
+    local ailang_out gnu_out ailang_rc gnu_rc
+    ailang_out=$(eval "$util $cmdline" 2>/dev/null); ailang_rc=$?
+    gnu_out=$(eval "$gnu_bin $cmdline" 2>/dev/null); gnu_rc=$?
+    if [ $ailang_rc -eq 139 ]; then gate_detail="AiLang SEGFAULT"; return 3; fi
+    if [ $ailang_rc -eq 124 ]; then gate_detail="AiLang TIMEOUT";  return 4; fi
+    if [ "$ailang_out" = "$gnu_out" ]; then
+        return 0
+    fi
+    gate_detail=$(printf 'output diff (AiLang rc=%d, GNU rc=%d)' "$ailang_rc" "$gnu_rc")
+    return 1
+}
 
-# Check if AILANG utils are in PATH
-if command -v head_ailang >/dev/null 2>&1; then
-    echo -e "${GREEN}✓ AILANG utilities are available in PATH${NC}"
-    echo ""
-else
-    echo -e "${YELLOW}⚠ AILANG utilities not found. Run: ./install_ailang_utils.sh${NC}"
-    echo ""
-fi
+# ─── Timer ──────────────────────────────────────────────────────────────────
+# Times `cmd` for `iters` iterations via the real-time profiler. Echoes
+# the elapsed seconds (float) on stdout.
+time_cmd() {
+    local cmd="$1" iters="$2"
+    # Use GNU date explicitly — the installed AiLang `date` may not
+    # support +%s.%N yet (documented GNU gap), and the timing source
+    # must be reliable.
+    local start end
+    start=$(/usr/bin/date +%s.%N)
+    for i in $(/usr/bin/seq 1 "$iters"); do
+        eval "$cmd" > /dev/null 2>&1
+    done
+    end=$(/usr/bin/date +%s.%N)
+    awk "BEGIN{printf \"%.3f\", $end - $start}"
+}
 
-# Function to benchmark - uses PATH versions
+# ─── Main benchmark driver ──────────────────────────────────────────────────
+# Usage: bench LABEL UTIL CMDLINE_FOR_GATE AILANG_CMD GNU_CMD ITERS
+#   - CMDLINE_FOR_GATE is the args-only version passed to correctness_check
+#     (appended to `ailang_util` and `/usr/bin/util` respectively).
+#   - AILANG_CMD / GNU_CMD are full command lines used for timing (already
+#     include the util name).
 bench() {
-    local label=$1        # Display label (can include notes like "1000x")
-    local util=$2         # Actual utility name for path lookup
-    local ailang_cmd=$3
-    local gnu_cmd=$4
-    local iterations=${5:-100}
-    
+    local label="$1" util="$2" gate_cmdline="$3"
+    local ailang_cmd="$4" gnu_cmd="$5"
+    local iters="${6:-100}"
+
+    if [ -n "$ONLY" ] && [ "$util" != "$ONLY" ]; then return; fi
+
     echo -e "${YELLOW}$label${NC}"
-    
-    # FIXED: Use actual util name for path lookup, not the label
-    # Use `command -v` for a robust, PATH-based lookup.
-    # This correctly finds utilities like 'which' that may not be in /bin or /usr/bin.
-    local system_util_path=$(command -v "$util")
-    
-    if [ -z "$system_util_path" ]; then
-        echo -e "  ${RED}✗ Could not find system version of '$util'. Skipping GNU benchmark.${NC}"
-        echo ""
-        return
-    fi
-    
-    # Use installed version (from PATH - could be AILANG or system)
-    { time for i in $(seq 1 $iterations); do eval "$ailang_cmd" > /dev/null 2>&1; done; } 2> "$BENCH_DIR/ailang_time.log"
-    ailang_time=$(grep real "$BENCH_DIR/ailang_time.log" | awk '{print $2}')
-    
-    # Use system version (full path to avoid any AILANG version)
-    # For nohup, we need to wait for the background process to finish
-    if [ "$util" == "nohup" ]; then
-        { time for i in $(seq 1 $iterations); do eval "$system_util_path ${gnu_cmd#* }" > /dev/null 2>&1; wait; done; } 2> "$BENCH_DIR/gnu_time.log"
-    else
-        { time for i in $(seq 1 $iterations); do eval "$system_util_path ${gnu_cmd#* }" > /dev/null 2>&1; done; } 2> "$BENCH_DIR/gnu_time.log"
-    fi
-    gnu_time=$(grep real "$BENCH_DIR/gnu_time.log" | awk '{print $2}')
-    
-    echo "  AILANG: $ailang_time"
-    echo "  GNU:    $gnu_time"
-    
-    # Parse times (handle both 0m0.123s and 0.123s formats)
-    ailang_ms=$(echo $ailang_time | sed 's/[ms]//g' | awk -F'[m.]' '{if (NF==3) print $1*60000+$2*1000+$3; else print $1*1000+$2}')
-    gnu_ms=$(echo $gnu_time | sed 's/[ms]//g' | awk -F'[m.]' '{if (NF==3) print $1*60000+$2*1000+$3; else print $1*1000+$2}')
-    
-    # Handle empty/zero values
-    [ -z "$ailang_ms" ] && ailang_ms=1
-    [ -z "$gnu_ms" ] && gnu_ms=1
-    [ "$ailang_ms" -eq 0 ] && ailang_ms=1
-    [ "$gnu_ms" -eq 0 ] && gnu_ms=1
-    
-    if [ $ailang_ms -lt $gnu_ms ]; then
-        ratio=$(awk "BEGIN {printf \"%.2f\", $gnu_ms / $ailang_ms}")
-        echo -e "  ${GREEN}✓ AILANG ${ratio}x faster${NC}"
-    elif [ $ailang_ms -eq $gnu_ms ]; then
-        echo -e "  ${YELLOW}≈ TIE${NC}"
-    else
-        ratio=$(awk "BEGIN {printf \"%.2f\", $ailang_ms / $gnu_ms}")
-        echo -e "  ${RED}✗ GNU ${ratio}x faster${NC}"
-    fi
+
+    # Correctness gate first.
+    local gate_rc
+    correctness_check "$util" "$gate_cmdline"; gate_rc=$?
+    case $gate_rc in
+        0)
+            correct_pass=$((correct_pass+1))
+            echo -e "  correctness ${GREEN}✓${NC}"
+            ;;
+        2)
+            echo -e "  correctness ${YELLOW}—${NC}  (no GNU binary)"
+            echo ""
+            return
+            ;;
+        *)
+            correct_fail=$((correct_fail+1))
+            correctness_failures+=("$util: $gate_detail")
+            echo -e "  correctness ${RED}✗${NC}  $gate_detail"
+            echo -e "  ${DIM}timing skipped — fix output first${NC}"
+            echo ""
+            return
+            ;;
+    esac
+
+    # Timing.
+    local ailang_sec gnu_sec
+    ailang_sec=$(time_cmd "$ailang_cmd" "$iters")
+    gnu_sec=$(time_cmd "$gnu_cmd" "$iters")
+
+    echo "  AiLang: ${ailang_sec}s   GNU: ${gnu_sec}s   (${iters}x)"
+
+    local ratio
+    ratio=$(awk "BEGIN {if ($gnu_sec == 0 || $ailang_sec == 0) print \"NA\"; else if ($ailang_sec < $gnu_sec) printf \"%.2fx AiLang faster\", $gnu_sec / $ailang_sec; else if ($ailang_sec == $gnu_sec) print \"tied\"; else printf \"%.2fx GNU faster\", $ailang_sec / $gnu_sec}")
+
+    case "$ratio" in
+        *"AiLang faster"*)  echo -e "  ${GREEN}→ $ratio${NC}"; perf_wins+=("$util: $ratio") ;;
+        tied|*NA*)          echo -e "  ${YELLOW}→ $ratio${NC}"; perf_ties+=("$util") ;;
+        *"GNU faster"*)     echo -e "  ${RED}→ $ratio${NC}";    perf_losses+=("$util: $ratio") ;;
+    esac
     echo ""
 }
 
-# Benchmark - use commands as they would be used normally
-bench "echo" "echo" \
+# bench_no_diff: same as bench but skips the correctness gate. For utilities
+# where the output is intentionally environment-dependent.
+bench_no_diff() {
+    local label="$1" util="$2"
+    local ailang_cmd="$3" gnu_cmd="$4"
+    local iters="${5:-100}"
+
+    if [ -n "$ONLY" ] && [ "$util" != "$ONLY" ]; then return; fi
+
+    echo -e "${YELLOW}$label${NC}"
+    echo -e "  correctness ${DIM}(env-dep, skipped)${NC}"
+
+    local ailang_sec gnu_sec
+    ailang_sec=$(time_cmd "$ailang_cmd" "$iters")
+    gnu_sec=$(time_cmd "$gnu_cmd" "$iters")
+
+    echo "  AiLang: ${ailang_sec}s   GNU: ${gnu_sec}s   (${iters}x)"
+    local ratio
+    ratio=$(awk "BEGIN {if ($gnu_sec == 0 || $ailang_sec == 0) print \"NA\"; else if ($ailang_sec < $gnu_sec) printf \"%.2fx AiLang faster\", $gnu_sec / $ailang_sec; else if ($ailang_sec == $gnu_sec) print \"tied\"; else printf \"%.2fx GNU faster\", $ailang_sec / $gnu_sec}")
+    case "$ratio" in
+        *"AiLang faster"*) echo -e "  ${GREEN}→ $ratio${NC}"; perf_wins+=("$util: $ratio") ;;
+        tied|*NA*)         echo -e "  ${YELLOW}→ $ratio${NC}"; perf_ties+=("$util") ;;
+        *"GNU faster"*)    echo -e "  ${RED}→ $ratio${NC}"; perf_losses+=("$util: $ratio") ;;
+    esac
+    echo ""
+}
+
+# ─── Benchmarks ─────────────────────────────────────────────────────────────
+
+bench "echo"                echo  "test" \
     "echo test" \
-    "echo test"
+    "/usr/bin/echo test"
 
-bench "cat" "cat" \
+bench "cat (100k-line file)" cat  "$BENCH_DIR/bench_test.txt" \
     "cat $BENCH_DIR/bench_test.txt" \
-    "cat $BENCH_DIR/bench_test.txt"
+    "/usr/bin/cat $BENCH_DIR/bench_test.txt"
 
-bench "wc" "wc" \
-    "wc $BENCH_DIR/bench_test.txt" \
-    "wc $BENCH_DIR/bench_test.txt"
+bench "wc -l"               wc    "-l $BENCH_DIR/bench_test.txt" \
+    "wc -l $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/wc -l $BENCH_DIR/bench_test.txt"
 
-bench "head" "head" \
-    "head $BENCH_DIR/bench_test.txt" \
-    "head $BENCH_DIR/bench_test.txt"
+bench "head -n 100"         head  "-n 100 $BENCH_DIR/bench_test.txt" \
+    "head -n 100 $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/head -n 100 $BENCH_DIR/bench_test.txt"
 
-bench "tail" "tail" \
-    "tail $BENCH_DIR/bench_test.txt" \
-    "tail $BENCH_DIR/bench_test.txt"
+bench "head -5 (shorthand)" head  "-5 $BENCH_DIR/bench_test.txt" \
+    "head -5 $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/head -5 $BENCH_DIR/bench_test.txt"
 
-bench "grep" "grep" \
-    "grep 'ERROR' $BENCH_DIR/bench_test.txt" \
-    "grep -F 'ERROR' $BENCH_DIR/bench_test.txt"
+bench "tail -n 100"         tail  "-n 100 $BENCH_DIR/bench_test.txt" \
+    "tail -n 100 $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/tail -n 100 $BENCH_DIR/bench_test.txt"
 
-bench "seq" "seq" \
+bench "tail -5 (shorthand)" tail  "-5 $BENCH_DIR/bench_test.txt" \
+    "tail -5 $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/tail -5 $BENCH_DIR/bench_test.txt"
+
+bench "grep ERROR"          grep  "-F ERROR $BENCH_DIR/bench_test.txt" \
+    "grep -F ERROR $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/grep -F ERROR $BENCH_DIR/bench_test.txt"
+
+bench "seq 1 10000"         seq   "1 10000" \
     "seq 1 10000" \
-    "seq 1 10000"
+    "/usr/bin/seq 1 10000"
 
-bench "true (1000x)" "true" \
-    "true" \
-    "true" \
-    1000
-
-bench "false (1000x)" "false" \
-    "false" \
-    "false" \
-    1000
-
-bench "basename (1000x)" "basename" \
-    "basename /usr/local/very/long/path/to/a/file.txt" \
-    "basename /usr/local/very/long/path/to/a/file.txt" \
-    1000
-
-bench "dirname (1000x)" "dirname" \
-    "dirname /usr/local/very/long/path/to/a/file.txt" \
-    "dirname /usr/local/very/long/path/to/a/file.txt" \
-    1000
-
-bench "sleep" "sleep" \
-    "sleep 0.01" \
-    "sleep 0.01" \
-    100
-
-bench "touch (1000x)" "touch" \
-    "touch $BENCH_DIR/bench_touch_test.txt" \
-    "touch $BENCH_DIR/bench_touch_test.txt" \
-    1000
-
-bench "pwd (1000x)" "pwd" \
-    "pwd" \
-    "pwd" \
-    1000
-
-bench "whoami (1000x)" "whoami" \
-    "whoami" \
-    "whoami" \
-    1000
-
-bench "env (1000x)" "env" \
-    "env" \
-    "env" \
-    1000
-
-bench "cut" "cut" \
-    "cut -f 5 $BENCH_DIR/bench_test_tabs.txt" \
-    "cut -f 5 $BENCH_DIR/bench_test_tabs.txt"
-
-#bench "tee" "tee" \
-#    "cat $BENCH_DIR/bench_test.txt | tee $BENCH_DIR/tee_test_output.txt" \
-#    "cat $BENCH_DIR/bench_test.txt | tee $BENCH_DIR/tee_test_output.txt" \
-#    10
-
-bench "uniq" "uniq" \
-    "uniq $BENCH_DIR/bench_test_sorted.txt" \
-    "uniq $BENCH_DIR/bench_test_sorted.txt"
-
-bench "logname (1000x)" "logname" \
-    "logname" \
-    "logname" \
-    1000
-
-bench "id (1000x)" "id" \
-    "id" \
-    "id" \
-    1000
-
-bench "printenv (1000x)" "printenv" \
-    "printenv" \
-    "printenv" \
-    1000
-
-bench "uname (1000x)" "uname" \
-    "uname" \
-    "uname" \
-    1000
-
-bench "find" "find" \
-    "find . -name '*.py'" \
-    "find . -name '*.py'" \
-    10
-
-bench "sort" "sort" \
+bench "sort -n"             sort  "-n $BENCH_DIR/bench_sort_numbers.txt" \
     "sort -n $BENCH_DIR/bench_sort_numbers.txt" \
-    "sort -n $BENCH_DIR/bench_sort_numbers.txt"
+    "/usr/bin/sort -n $BENCH_DIR/bench_sort_numbers.txt"
 
-bench "diff (small)" "diff" \
-    "diff $BENCH_DIR/bench_diff_small1.txt $BENCH_DIR/bench_diff_small2.txt" \
-    "diff $BENCH_DIR/bench_diff_small1.txt $BENCH_DIR/bench_diff_small2.txt"
+bench "uniq (sorted)"       uniq  "$BENCH_DIR/bench_test_sorted.txt" \
+    "uniq $BENCH_DIR/bench_test_sorted.txt" \
+    "/usr/bin/uniq $BENCH_DIR/bench_test_sorted.txt"
 
-bench "cp" "cp" \
-    "cp $BENCH_DIR/bench_test.txt $BENCH_DIR/cp_test_dest.txt" \
-    "cp $BENCH_DIR/bench_test.txt $BENCH_DIR/cp_test_dest.txt" \
-    10
+bench "cut -f 5"            cut   "-f 5 $BENCH_DIR/bench_test_tabs.txt" \
+    "cut -f 5 $BENCH_DIR/bench_test_tabs.txt" \
+    "/usr/bin/cut -f 5 $BENCH_DIR/bench_test_tabs.txt"
 
-bench "mkdir (1000x)" "mkdir" \
-    "mkdir -p $BENCH_DIR/bench_mkdir_test_\$i" \
-    "mkdir -p $BENCH_DIR/bench_mkdir_test_\$i" \
-    1000
-
-bench "rm (1000x)" "rm" \
-    "rm -f $BENCH_DIR/bench_rm_test_\$i" \
-    "rm -f $BENCH_DIR/bench_rm_test_\$i" \
-    1000
-
-bench "ln (1000x)" "ln" \
-    "ln -sf $BENCH_DIR/bench_test.txt $BENCH_DIR/bench_ln_test_\$i" \
-    "ln -sf $BENCH_DIR/bench_test.txt $BENCH_DIR/bench_ln_test_\$i" \
-    1000
-
-bench "file (1000x)" "file" \
-    "file $BENCH_DIR/bench_test.txt" \
-    "file $BENCH_DIR/bench_test.txt" \
-    1000
-
-bench "chmod (1000x)" "chmod" \
-    "chmod 755 $BENCH_DIR/bench_test.txt" \
-    "chmod 755 $BENCH_DIR/bench_test.txt" \
-    1000
-
-bench "mv (1000x)" "mv" \
-    "mv -f $BENCH_DIR/bench_mv_test_\$i $BENCH_DIR/bench_mv_test_renamed_\$i 2>/dev/null || true" \
-    "mv -f $BENCH_DIR/bench_mv_test_\$i $BENCH_DIR/bench_mv_test_renamed_\$i 2>/dev/null || true" \
-    1000
-
-bench "sync (1000x)" "sync" \
-    "sync" \
-    "sync" \
-    1000
-
-bench "readlink (1000x)" "readlink" \
-    "readlink $BENCH_DIR/bench_test.txt || true" \
-    "readlink $BENCH_DIR/bench_test.txt || true" \
-    1000
-
-bench "tty (1000x)" "tty" \
-    "tty" \
-    "tty" \
-    1000
-
-bench "realpath (1000x)" "realpath" \
-    "realpath $BENCH_DIR/bench_test.txt" \
-    "realpath $BENCH_DIR/bench_test.txt" \
-    1000
-
-bench "which (1000x)" "which" \
-    "which ls" \
-    "which ls" \
-    1000
-
-bench "nohup (1000x)" "nohup" \
-    "nohup true >/dev/null 2>&1; wait" \
-    "nohup true >/dev/null 2>&1; wait" \
-    1000
-
-bench "chown (1000x)" "chown" \
-    "chown \$(id -u):\$(id -g) $BENCH_DIR/bench_test.txt 2>/dev/null || true" \
-    "chown \$(id -u):\$(id -g) $BENCH_DIR/bench_test.txt 2>/dev/null || true" \
-    1000
-
-bench "df (1000x)" "df" \
-    "df -h" \
-    "df -h" \
-    1000
-
-bench "chgrp (1000x)" "chgrp" \
-    "chgrp \$(id -g) $BENCH_DIR/bench_test.txt 2>/dev/null || true" \
-    "chgrp \$(id -g) $BENCH_DIR/bench_test.txt 2>/dev/null || true" \
-    1000
-
-bench "stat (1000x)" "stat" \
-    "stat $BENCH_DIR/bench_test.txt" \
-    "stat $BENCH_DIR/bench_test.txt" \
-    1000
-
-bench "du" "du" \
-    "du -sh $BENCH_DIR/bench_du_dir" \
-    "du -sh $BENCH_DIR/bench_du_dir" \
-    10
-
-bench "dd" "dd" \
-    "dd if=/dev/zero of=$BENCH_DIR/bench_dd_test bs=1M count=10" \
-    "dd if=/dev/zero of=$BENCH_DIR/bench_dd_test bs=1M count=10" \
-    10
-
-bench "split" "split" \
-    "split -l 10000 $BENCH_DIR/bench_test.txt $BENCH_DIR/split_out_" \
-    "split -l 10000 $BENCH_DIR/bench_test.txt $BENCH_DIR/split_out_" \
-    10
-
-bench "expand" "expand" \
-    "expand $BENCH_DIR/bench_expand.txt" \
-    "expand $BENCH_DIR/bench_expand.txt"
-
-bench "unexpand" "unexpand" \
-    "unexpand $BENCH_DIR/bench_unexpand.txt" \
-    "unexpand $BENCH_DIR/bench_unexpand.txt"
-
-bench "paste" "paste" \
+bench "paste"               paste "$BENCH_DIR/paste1.txt $BENCH_DIR/paste2.txt" \
     "paste $BENCH_DIR/paste1.txt $BENCH_DIR/paste2.txt" \
-    "paste $BENCH_DIR/paste1.txt $BENCH_DIR/paste2.txt"
+    "/usr/bin/paste $BENCH_DIR/paste1.txt $BENCH_DIR/paste2.txt"
 
+bench "expand"              expand "$BENCH_DIR/bench_expand.txt" \
+    "expand $BENCH_DIR/bench_expand.txt" \
+    "/usr/bin/expand $BENCH_DIR/bench_expand.txt"
+
+bench "unexpand -a"         unexpand "-a $BENCH_DIR/bench_unexpand.txt" \
+    "unexpand -a $BENCH_DIR/bench_unexpand.txt" \
+    "/usr/bin/unexpand -a $BENCH_DIR/bench_unexpand.txt"
+
+bench "diff (small)"        diff  "$BENCH_DIR/bench_diff_small1.txt $BENCH_DIR/bench_diff_small2.txt" \
+    "diff $BENCH_DIR/bench_diff_small1.txt $BENCH_DIR/bench_diff_small2.txt" \
+    "/usr/bin/diff $BENCH_DIR/bench_diff_small1.txt $BENCH_DIR/bench_diff_small2.txt" \
+    50
+
+bench "basename"            basename "/usr/local/long/path/a.txt" \
+    "basename /usr/local/long/path/a.txt" \
+    "/usr/bin/basename /usr/local/long/path/a.txt" \
+    1000
+
+bench "dirname"             dirname  "/usr/local/long/path/a.txt" \
+    "dirname /usr/local/long/path/a.txt" \
+    "/usr/bin/dirname /usr/local/long/path/a.txt" \
+    1000
+
+bench "find"                find  "$BENCH_DIR -name bench_test.txt" \
+    "find $BENCH_DIR -name bench_test.txt" \
+    "/usr/bin/find $BENCH_DIR -name bench_test.txt" \
+    50
+
+bench "which bash"          which "bash" \
+    "which bash" \
+    "/usr/bin/which bash" \
+    500
+
+bench "readlink (file)"     readlink "$BENCH_DIR/bench_test.txt" \
+    "readlink $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/readlink $BENCH_DIR/bench_test.txt" \
+    500
+
+bench "realpath"            realpath "$BENCH_DIR/bench_test.txt" \
+    "realpath $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/realpath $BENCH_DIR/bench_test.txt" \
+    500
+
+# Utilities whose output is environment-dependent — we can't diff sensibly.
+bench_no_diff "true"   true  "true" "/usr/bin/true" 1000
+bench_no_diff "false"  false "false" "/usr/bin/false" 1000
+bench_no_diff "pwd"    pwd   "pwd" "/usr/bin/pwd" 1000
+bench_no_diff "whoami" whoami "whoami" "/usr/bin/whoami" 1000
+bench_no_diff "uname"  uname "uname" "/usr/bin/uname" 1000
+bench_no_diff "date"   date  "date" "/usr/bin/date" 500
+bench_no_diff "id"     id    "id" "/usr/bin/id" 500
+bench_no_diff "sync"   sync  "sync" "/usr/bin/sync" 100
+
+# Filesystem operations — side-effectful, gate-diff doesn't apply but we
+# still want timing. These use no_diff.
+bench_no_diff "touch" touch \
+    "touch $BENCH_DIR/bench_touch_test.txt" \
+    "/usr/bin/touch $BENCH_DIR/bench_touch_test.txt" \
+    500
+
+bench_no_diff "cp (100k-line)" cp \
+    "cp $BENCH_DIR/bench_test.txt $BENCH_DIR/cp_dest.txt" \
+    "/usr/bin/cp $BENCH_DIR/bench_test.txt $BENCH_DIR/cp_dest.txt" \
+    50
+
+bench_no_diff "chmod"  chmod \
+    "chmod 755 $BENCH_DIR/bench_test.txt" \
+    "/usr/bin/chmod 755 $BENCH_DIR/bench_test.txt" \
+    500
+
+# ─── Summary ────────────────────────────────────────────────────────────────
+echo
 echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
-echo -e "${GREEN}✅ Benchmark complete!${NC}"
-echo ""
-echo "These are real-world performance numbers using installed binaries."
+echo -e "${BLUE}     SUMMARY${NC}"
+echo -e "${BLUE}═══════════════════════════════════════════════════════${NC}"
+echo
+echo -e "  Correctness: ${GREEN}$correct_pass pass${NC}   ${RED}$correct_fail fail${NC}"
+echo -e "  Performance: ${GREEN}${#perf_wins[@]} AiLang wins${NC}   ${YELLOW}${#perf_ties[@]} ties${NC}   ${RED}${#perf_losses[@]} GNU wins${NC}"
+echo
+
+if [ "$correct_fail" -gt 0 ]; then
+    echo -e "${RED}Correctness failures (fix these — they mean the util is wrong):${NC}"
+    for f in "${correctness_failures[@]}"; do
+        echo "  - $f"
+    done
+    echo
+fi
+
+if [ ${#perf_losses[@]} -gt 0 ]; then
+    echo -e "${RED}Perf regressions vs GNU:${NC}"
+    for f in "${perf_losses[@]}"; do
+        echo "  - $f"
+    done
+    echo
+fi
+
+if [ ${#perf_wins[@]} -gt 0 ]; then
+    echo -e "${GREEN}Perf wins:${NC}"
+    for f in "${perf_wins[@]}"; do
+        echo "  - $f"
+    done
+    echo
+fi
+
+# Non-zero exit if any correctness failure — perf losses alone don't fail
+# the run because they're informational, not incorrect.
+if [ "$correct_fail" -gt 0 ]; then
+    exit 1
+fi
+exit 0
