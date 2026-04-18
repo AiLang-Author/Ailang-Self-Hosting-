@@ -427,36 +427,161 @@ Function.CompileStmt_ForEvery {
 // =============================================================================
 // SWITCH / BRANCH
 // Branch expr { Case val: { ... } Case val: { ... } Default: { ... } }
-// 
-// Strategy (linear scan - simple, works for all case counts):
-//   1. Compile expression once, push to stack
-//   2. For each case: pop saved value, compare with case value, push back
-//      - If equal, jump to case body
-//   3. After all cases checked, fall through to default (if present) or end
-//   4. Each case body jumps to end_label after execution
+//
+// Two lowering strategies, picked by a one-line scan of case values:
+//
+//   FAST PATH — all Case values are AST.NUMBER literals (the common
+//   case, covers every enum-style dispatch). Expression is compiled
+//   once into RAX, then each case emits exactly `CMP RAX, imm32; JE`
+//   — 2 instructions per case. No stack use, so ReturnValue inside a
+//   Case body tears down the frame with a clean stack automatically.
+//
+//   SLOW PATH — at least one Case value is a non-literal expression
+//   (function call, arithmetic, identifier). Expression is pushed to
+//   the stack so it survives re-evaluation across cases. Each case
+//   peeks the saved value, compiles its value into RAX, compares.
+//   Every landing point pops once before user code runs so a Case-body
+//   ReturnValue still tears down cleanly.
+//
+// Fast path is typically 7x fewer instructions per case than the
+// slow path — that's the measured difference that caused the earlier
+// Branch-vs-IfCondition-chain regression.
 // =============================================================================
+
+// Fast path: all Case values are AST.NUMBER literals.
+// Per case: 2 instructions (CMP RAX, imm32 ; JE label).
+// Expression stays in RAX across all comparisons — no stack, no
+// push/pop. Case bodies run with a clean stack so ReturnValue
+// propagates to the function epilogue naturally.
+Function.CompileStmt_SwitchFast {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        child_count = AST_GetChildCount(node)
+        expr = AST_GetChild(node, 0)
+
+        // Compile expression -> RAX. It stays there across all CMPs.
+        result = Compile_Expression(expr)
+        IfCondition EqualTo(result, 0) ThenBlock: { ReturnValue(0) }
+
+        end_label = Compile_NewLabel()
+
+        // Locate the Default clause (if any) and allocate its label.
+        default_node = 0
+        default_label = 0
+        i = 1
+        WhileLoop LessThan(i, child_count) {
+            case_child = AST_GetChild(node, i)
+            IfCondition EqualTo(AST_GetType(case_child), AST.DEFAULT) ThenBlock: {
+                default_node = case_child
+            }
+            i = Add(i, 1)
+        }
+        IfCondition NotEqual(default_node, 0) ThenBlock: {
+            default_label = Compile_NewLabel()
+        }
+
+        // ----- COMPARISON CHAIN: CMP RAX, imm32 ; JE case_body -----
+        i = 1
+        WhileLoop LessThan(i, child_count) {
+            case_child = AST_GetChild(node, i)
+            IfCondition EqualTo(AST_GetType(case_child), AST.CASE) ThenBlock: {
+                case_value_node = AST_GetChild(case_child, 0)
+                val_str = AST_GetData1(case_value_node)
+                val     = StringToNumber(val_str)
+                case_body_label = Compile_NewLabel()
+
+                Emit_CmpRaxImm32(val)
+                Emit_Je(case_body_label)
+
+                AST_SetData2(case_child, case_body_label)
+            }
+            i = Add(i, 1)
+        }
+
+        // ----- NO MATCH: fall through to default_or_end -----
+        IfCondition NotEqual(default_node, 0) ThenBlock: {
+            Emit_Jmp(default_label)
+        } ElseBlock: {
+            Emit_Jmp(end_label)
+        }
+
+        // ----- CASE BODIES ----- (no stack cleanup needed)
+        i = 1
+        WhileLoop LessThan(i, child_count) {
+            case_child = AST_GetChild(node, i)
+            IfCondition EqualTo(AST_GetType(case_child), AST.CASE) ThenBlock: {
+                case_body_label = AST_GetData2(case_child)
+                Emit_MarkLabel(case_body_label)
+                case_body = AST_GetChild(case_child, 1)
+                IfCondition NotEqual(case_body, 0) ThenBlock: {
+                    result = CompileStmt_Block(case_body)
+                    IfCondition EqualTo(result, 0) ThenBlock: { ReturnValue(0) }
+                }
+                Emit_Jmp(end_label)
+            }
+            i = Add(i, 1)
+        }
+
+        // ----- DEFAULT BODY -----
+        IfCondition NotEqual(default_node, 0) ThenBlock: {
+            Emit_MarkLabel(default_label)
+            default_body = AST_GetChild(default_node, 0)
+            IfCondition NotEqual(default_body, 0) ThenBlock: {
+                result = CompileStmt_Block(default_body)
+                IfCondition EqualTo(result, 0) ThenBlock: { ReturnValue(0) }
+            }
+            // Falls through to end_label.
+        }
+
+        // ----- END -----
+        Emit_MarkLabel(end_label)
+        ReturnValue(1)
+    }
+}
+
 Function.CompileStmt_Switch {
     Input: node: Address
     Output: Integer
     Body: {
         // Get child count: first child is expression, rest are cases/default
         child_count = AST_GetChildCount(node)
-        
+
         IfCondition LessThan(child_count, 1) ThenBlock: {
             PrintMessage("[COMPILE ERROR] Branch with no expression\n")
             Compile.error = 1
             ReturnValue(0)
         }
-        
+
+        // Pre-scan: are all Case values AST.NUMBER literals? If so
+        // we can skip the stack-save dance entirely.
+        all_literal = 1
+        pi = 1
+        WhileLoop LessThan(pi, child_count) {
+            case_child = AST_GetChild(node, pi)
+            IfCondition EqualTo(AST_GetType(case_child), AST.CASE) ThenBlock: {
+                case_value_node = AST_GetChild(case_child, 0)
+                IfCondition NotEqual(AST_GetType(case_value_node), AST.NUMBER) ThenBlock: {
+                    all_literal = 0
+                }
+            }
+            pi = Add(pi, 1)
+        }
+
+        IfCondition EqualTo(all_literal, 1) ThenBlock: {
+            ReturnValue(CompileStmt_SwitchFast(node))
+        }
+
+        // ===== SLOW PATH (non-literal case values) =====
         // Get expression (first child)
         expr = AST_GetChild(node, 0)
-        
+
         // Compile expression -> RAX
         result = Compile_Expression(expr)
         IfCondition EqualTo(result, 0) ThenBlock: {
             ReturnValue(0)
         }
-        
+
         // Push expression value to stack (we'll compare against this repeatedly)
         Emit_PushRax()
         
