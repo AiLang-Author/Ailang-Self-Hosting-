@@ -70,6 +70,22 @@ FixedPool.Patterns {
     "rx_prefix_len": Initialize=0   // array of Integer: prefix length (<2 means unused)
     "rx_prefix_bc":  Initialize=0   // array of Address: BM table for the regex prefix
     "dfa_ok":        Initialize=0   // DFA available? (1=yes). Only set for single-pattern grep
+    "strategy":      Initialize=0   // array of Integer: per-pattern dispatch strategy id (see STRATEGY.*)
+}
+
+// Per-pattern dispatch strategy, computed once by CompileAllPatterns.
+// LineMatches dispatches on this via Branch — constant-time per-line.
+// Order matters for the Branch fast path (literal-integer cases).
+FixedPool.STRATEGY {
+    "EMPTY":              Initialize=0    // plen == 0 — matches every line
+    "WHOLE_LINE":         Initialize=1    // -x
+    "WORD_MATCH":         Initialize=2    // -w
+    "REGEX_PREFIX_BM":    Initialize=3    // regex + literal prefix >= 2 bytes
+    "REGEX_DFA":          Initialize=4    // regex + no prefix + DFA compiled
+    "REGEX_NFA":          Initialize=5    // regex + no prefix + NFA fallback
+    "REGEX_INSENSITIVE":  Initialize=6    // regex with -i (needs lowercased scratch)
+    "LITERAL_BM":         Initialize=7    // plain literal, case-sensitive
+    "LITERAL_INSENSITIVE":Initialize=8    // plain literal with -i
 }
 
 FixedPool.OutBuffer {
@@ -389,7 +405,192 @@ Function.RegexLineSearch {
     }
 }
 
+// Per-pattern strategy bodies. Each returns 1 on match, 0 on no match.
+// Kept as separate functions so LineMatches' Branch dispatch is a thin
+// jump table — each case body is a single function call with inlined
+// arg marshalling. Cleaner to audit, and the compiler's Branch fast
+// path (69b40c94) emits 2 instructions per Case dispatch.
+
+Function.Match_RegexPrefixBM {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        rhandle    = Dereference(Add(Patterns.regex,         Multiply(pi, 8)))
+        rx_pfx     = Dereference(Add(Patterns.rx_prefix,     Multiply(pi, 8)))
+        rx_pfx_len = Dereference(Add(Patterns.rx_prefix_len, Multiply(pi, 8)))
+        rx_pfx_bc  = Dereference(Add(Patterns.rx_prefix_bc,  Multiply(pi, 8)))
+
+        pbm_from = 0
+        pbm_matched = 0
+        WhileLoop LessEqual(pbm_from, Subtract(line_len, rx_pfx_len)) {
+            hit = SearchBoyerMoore(Add(line, pbm_from),
+                                   Subtract(line_len, pbm_from),
+                                   rx_pfx, rx_pfx_len, rx_pfx_bc)
+            IfCondition LessThan(hit, 0) ThenBlock: { BreakLoop }
+            cand = Add(pbm_from, hit)
+            // BM hit → materialize NUL-terminated scratch (Regex_Match reads via StringLength).
+            IfCondition EqualTo(pbm_matched, 0) ThenBlock: {
+                MemoryCopy(Scratch.rx, line, line_len)
+                SetByte(Scratch.rx, line_len, 0)
+                pbm_matched = 1
+            }
+            m = Regex_Match(rhandle, Scratch.rx, cand)
+            IfCondition GreaterEqual(m, 0) ThenBlock: { ReturnValue(1) }
+            pbm_from = Add(cand, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Match_RegexDFA {
+    Input: line: Address
+    Input: line_len: Integer
+    Output: Integer
+    Body: {
+        d = Regex_DFASearch(line, line_len)
+        IfCondition EqualTo(d, 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(d, 0) ThenBlock: { ReturnValue(0) }
+        // d == -1: overflow — fall through to NFA via shared handle.
+        rhandle = Dereference(Patterns.regex)
+        ReturnValue(Regex_Search(rhandle, line, line_len))
+    }
+}
+
+Function.Match_RegexNFA {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        rhandle = Dereference(Add(Patterns.regex, Multiply(pi, 8)))
+        ReturnValue(Regex_Search(rhandle, line, line_len))
+    }
+}
+
+Function.Match_RegexInsensitive {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        rhandle    = Dereference(Add(Patterns.regex,         Multiply(pi, 8)))
+        rx_pfx     = Dereference(Add(Patterns.rx_prefix,     Multiply(pi, 8)))
+        rx_pfx_len = Dereference(Add(Patterns.rx_prefix_len, Multiply(pi, 8)))
+        rx_pfx_bc  = Dereference(Add(Patterns.rx_prefix_bc,  Multiply(pi, 8)))
+        si = 0
+        WhileLoop LessThan(si, line_len) {
+            SetByte(Scratch.rx_lc, si, ToLowerByte(GetByte(line, si)))
+            si = Add(si, 1)
+        }
+        SetByte(Scratch.rx_lc, line_len, 0)
+        ReturnValue(RegexLineSearch(rhandle, Scratch.rx_lc, line_len,
+                                    rx_pfx, rx_pfx_len, rx_pfx_bc))
+    }
+}
+
+Function.Match_LiteralBM {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        pat    = Dereference(Add(Patterns.ptrs,      Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens,      Multiply(pi, 8)))
+        bc_tbl = Dereference(Add(Patterns.bc_tables, Multiply(pi, 8)))
+        search_from = 0
+        WhileLoop LessEqual(search_from, Subtract(line_len, plen)) {
+            found = SearchBoyerMoore(Add(line, search_from),
+                                     Subtract(line_len, search_from),
+                                     pat, plen, bc_tbl)
+            IfCondition LessThan(found, 0) ThenBlock: { BreakLoop }
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Match_LiteralInsensitive {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        pat    = Dereference(Add(Patterns.ptrs,    Multiply(pi, 8)))
+        pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens,    Multiply(pi, 8)))
+        last = Subtract(line_len, plen)
+        pos = 0
+        WhileLoop LessEqual(pos, last) {
+            IfCondition EqualTo(CompareAt(line, line_len, pos, pat, pat_lc, plen), 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            pos = Add(pos, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Match_WholeLine {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        pat    = Dereference(Add(Patterns.ptrs,    Multiply(pi, 8)))
+        pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens,    Multiply(pi, 8)))
+        IfCondition EqualTo(plen, line_len) ThenBlock: {
+            ReturnValue(CompareAt(line, line_len, 0, pat, pat_lc, plen))
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Match_WordMatch {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pi: Integer
+    Output: Integer
+    Body: {
+        pat    = Dereference(Add(Patterns.ptrs,    Multiply(pi, 8)))
+        pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens,    Multiply(pi, 8)))
+        last = Subtract(line_len, plen)
+        pos = 0
+        WhileLoop LessEqual(pos, last) {
+            IfCondition EqualTo(CompareAt(line, line_len, pos, pat, pat_lc, plen), 1) ThenBlock: {
+                left_ok = 0
+                IfCondition EqualTo(pos, 0) ThenBlock: { left_ok = 1 }
+                IfCondition EqualTo(left_ok, 0) ThenBlock: {
+                    IfCondition EqualTo(IsWordChar(GetByte(line, Subtract(pos, 1))), 0) ThenBlock: {
+                        left_ok = 1
+                    }
+                }
+                right_ok = 0
+                end_pos = Add(pos, plen)
+                IfCondition GreaterEqual(end_pos, line_len) ThenBlock: { right_ok = 1 }
+                IfCondition EqualTo(right_ok, 0) ThenBlock: {
+                    IfCondition EqualTo(IsWordChar(GetByte(line, end_pos)), 0) ThenBlock: {
+                        right_ok = 1
+                    }
+                }
+                IfCondition And(EqualTo(left_ok, 1), EqualTo(right_ok, 1)) ThenBlock: {
+                    ReturnValue(1)
+                }
+            }
+            pos = Add(pos, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
 // Returns 1 if `line` matches any pattern per current flags.
+// Per-line dispatch cost: one indexed load of Patterns.strategy +
+// one Branch (2-instruction CMP RAX,imm ; JE per case). All decision
+// logic about whole_line/word_match/case_sensitive/regex/BM/DFA/NFA
+// was resolved once at CompileAllPatterns time.
 Function.LineMatches {
     Input: line: Address
     Input: line_len: Integer
@@ -400,173 +601,20 @@ Function.LineMatches {
 
         pi = 0
         WhileLoop LessThan(pi, pcount) {
-            pat = Dereference(Add(Patterns.ptrs, Multiply(pi, 8)))
-            pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
-            plen = Dereference(Add(Patterns.lens, Multiply(pi, 8)))
-            rhandle = Dereference(Add(Patterns.regex, Multiply(pi, 8)))
-
-            IfCondition EqualTo(plen, 0) ThenBlock: {
-                // Empty pattern matches every line (GNU behavior)
-                ReturnValue(1)
+            strat = Dereference(Add(Patterns.strategy, Multiply(pi, 8)))
+            hit = 0
+            Branch strat {
+                Case 0: { hit = 1 }                                            // EMPTY
+                Case 1: { hit = Match_WholeLine(line, line_len, pi) }          // WHOLE_LINE
+                Case 2: { hit = Match_WordMatch(line, line_len, pi) }          // WORD_MATCH
+                Case 3: { hit = Match_RegexPrefixBM(line, line_len, pi) }      // REGEX_PREFIX_BM
+                Case 4: { hit = Match_RegexDFA(line, line_len) }               // REGEX_DFA
+                Case 5: { hit = Match_RegexNFA(line, line_len, pi) }           // REGEX_NFA
+                Case 6: { hit = Match_RegexInsensitive(line, line_len, pi) }   // REGEX_INSENSITIVE
+                Case 7: { hit = Match_LiteralBM(line, line_len, pi) }          // LITERAL_BM
+                Case 8: { hit = Match_LiteralInsensitive(line, line_len, pi) } // LITERAL_INSENSITIVE
             }
-
-            // Regex path (unless -F). -x and -w are NOT honoured through
-            // the regex engine yet — they still only apply in the literal
-            // branch below. Fall back to literal whenever whole-line or
-            // whole-word is requested so those flags stay correct.
-            //
-            // The scratch buffer (Scratch.rx / Scratch.rx_lc) was allocated
-            // once in InitOut. Here we only fill it for this line, so
-            // there's no per-line Arena traffic.
-            IfCondition And(NotEqual(rhandle, 0),
-                            And(EqualTo(GrepConfig.whole_line, 0),
-                                EqualTo(GrepConfig.word_match, 0))) ThenBlock: {
-                rx_pfx     = Dereference(Add(Patterns.rx_prefix,     Multiply(pi, 8)))
-                rx_pfx_len = Dereference(Add(Patterns.rx_prefix_len, Multiply(pi, 8)))
-                rx_pfx_bc  = Dereference(Add(Patterns.rx_prefix_bc,  Multiply(pi, 8)))
-
-                // Case-sensitive fast paths — no per-line MemoryCopy.
-                // Regex_DFASearch and Regex_Search both accept an explicit
-                // text_len and don't need a NUL terminator, so they can
-                // read the raw line_buf directly.
-                IfCondition EqualTo(GrepConfig.case_insensitive, 0) ThenBlock: {
-                    // Prefix-BM path: BM on raw line; only copy to Scratch.rx
-                    // for Regex_Match verify (needs StringLength → NUL).
-                    IfCondition GreaterEqual(rx_pfx_len, 2) ThenBlock: {
-                        pbm_from = 0
-                        pbm_matched = 0
-                        WhileLoop LessEqual(pbm_from, Subtract(line_len, rx_pfx_len)) {
-                            hit = SearchBoyerMoore(Add(line, pbm_from),
-                                                   Subtract(line_len, pbm_from),
-                                                   rx_pfx, rx_pfx_len, rx_pfx_bc)
-                            IfCondition LessThan(hit, 0) ThenBlock: { BreakLoop }
-                            cand = Add(pbm_from, hit)
-                            IfCondition EqualTo(pbm_matched, 0) ThenBlock: {
-                                MemoryCopy(Scratch.rx, line, line_len)
-                                SetByte(Scratch.rx, line_len, 0)
-                                pbm_matched = 1
-                            }
-                            m = Regex_Match(rhandle, Scratch.rx, cand)
-                            IfCondition GreaterEqual(m, 0) ThenBlock: { ReturnValue(1) }
-                            pbm_from = Add(cand, 1)
-                        }
-                        pi = Add(pi, 1)
-                        ContinueLoop
-                    }
-
-                    // DFA fast path — zero copies. Single-pattern case only
-                    // (Patterns.dfa_ok is 0 for multi-pattern grep).
-                    IfCondition EqualTo(Patterns.dfa_ok, 1) ThenBlock: {
-                        d = Regex_DFASearch(line, line_len)
-                        IfCondition EqualTo(d, 1) ThenBlock: { ReturnValue(1) }
-                        IfCondition EqualTo(d, 0) ThenBlock: {
-                            pi = Add(pi, 1)
-                            ContinueLoop
-                        }
-                        // d == -1: DFA overflow — fall through to NFA.
-                    }
-
-                    // NFA fallback — still no copy needed for Regex_Search.
-                    IfCondition EqualTo(Regex_Search(rhandle, line, line_len), 1) ThenBlock: {
-                        ReturnValue(1)
-                    }
-                    pi = Add(pi, 1)
-                    ContinueLoop
-                }
-
-                // Case-insensitive path — must lowercase the line first,
-                // which we put in Scratch.rx_lc and then hand to the
-                // regular RegexLineSearch (which is allowed to use either
-                // BM-prefix or NFA).
-                si = 0
-                WhileLoop LessThan(si, line_len) {
-                    SetByte(Scratch.rx_lc, si, ToLowerByte(GetByte(line, si)))
-                    si = Add(si, 1)
-                }
-                SetByte(Scratch.rx_lc, line_len, 0)
-                IfCondition EqualTo(RegexLineSearch(rhandle, Scratch.rx_lc, line_len,
-                                                   rx_pfx, rx_pfx_len, rx_pfx_bc), 1) ThenBlock: {
-                    ReturnValue(1)
-                }
-                pi = Add(pi, 1)
-                ContinueLoop
-            }
-
-            IfCondition EqualTo(GrepConfig.whole_line, 1) ThenBlock: {
-                IfCondition EqualTo(plen, line_len) ThenBlock: {
-                    IfCondition EqualTo(CompareAt(line, line_len, 0, pat, pat_lc, plen), 1) ThenBlock: {
-                        ReturnValue(1)
-                    }
-                }
-            } ElseBlock: {
-                // Case-sensitive → Boyer-Moore (skip-ahead).
-                // Case-insensitive → CompareAt sliding window (line isn't
-                // pre-lowercased, so per-byte lower is still needed).
-                IfCondition EqualTo(GrepConfig.case_insensitive, 0) ThenBlock: {
-                    bc_tbl = Dereference(Add(Patterns.bc_tables, Multiply(pi, 8)))
-                    search_from = 0
-                    WhileLoop LessEqual(search_from, Subtract(line_len, plen)) {
-                        found = SearchBoyerMoore(Add(line, search_from),
-                                                 Subtract(line_len, search_from),
-                                                 pat, plen, bc_tbl)
-                        IfCondition LessThan(found, 0) ThenBlock: { BreakLoop }
-                        pos = Add(search_from, found)
-                        IfCondition EqualTo(GrepConfig.word_match, 1) ThenBlock: {
-                            left_ok = 0
-                            IfCondition EqualTo(pos, 0) ThenBlock: { left_ok = 1 }
-                            IfCondition EqualTo(left_ok, 0) ThenBlock: {
-                                IfCondition EqualTo(IsWordChar(GetByte(line, Subtract(pos, 1))), 0) ThenBlock: {
-                                    left_ok = 1
-                                }
-                            }
-                            right_ok = 0
-                            end_pos = Add(pos, plen)
-                            IfCondition GreaterEqual(end_pos, line_len) ThenBlock: { right_ok = 1 }
-                            IfCondition EqualTo(right_ok, 0) ThenBlock: {
-                                IfCondition EqualTo(IsWordChar(GetByte(line, end_pos)), 0) ThenBlock: {
-                                    right_ok = 1
-                                }
-                            }
-                            IfCondition And(EqualTo(left_ok, 1), EqualTo(right_ok, 1)) ThenBlock: {
-                                ReturnValue(1)
-                            }
-                            search_from = Add(pos, 1)
-                        } ElseBlock: {
-                            ReturnValue(1)
-                        }
-                    }
-                } ElseBlock: {
-                    last = Subtract(line_len, plen)
-                    pos = 0
-                    WhileLoop LessEqual(pos, last) {
-                        IfCondition EqualTo(CompareAt(line, line_len, pos, pat, pat_lc, plen), 1) ThenBlock: {
-                            IfCondition EqualTo(GrepConfig.word_match, 1) ThenBlock: {
-                                left_ok = 0
-                                IfCondition EqualTo(pos, 0) ThenBlock: { left_ok = 1 }
-                                IfCondition EqualTo(left_ok, 0) ThenBlock: {
-                                    IfCondition EqualTo(IsWordChar(GetByte(line, Subtract(pos, 1))), 0) ThenBlock: {
-                                        left_ok = 1
-                                    }
-                                }
-                                right_ok = 0
-                                end_pos = Add(pos, plen)
-                                IfCondition GreaterEqual(end_pos, line_len) ThenBlock: { right_ok = 1 }
-                                IfCondition EqualTo(right_ok, 0) ThenBlock: {
-                                    IfCondition EqualTo(IsWordChar(GetByte(line, end_pos)), 0) ThenBlock: {
-                                        right_ok = 1
-                                    }
-                                }
-                                IfCondition And(EqualTo(left_ok, 1), EqualTo(right_ok, 1)) ThenBlock: {
-                                    ReturnValue(1)
-                                }
-                            } ElseBlock: {
-                                ReturnValue(1)
-                            }
-                        }
-                        pos = Add(pos, 1)
-                    }
-                }
-            }
+            IfCondition EqualTo(hit, 1) ThenBlock: { ReturnValue(1) }
             pi = Add(pi, 1)
         }
         ReturnValue(0)
@@ -585,6 +633,7 @@ Function.InitPatterns {
         Patterns.rx_prefix     = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.rx_prefix_len = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.rx_prefix_bc  = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
+        Patterns.strategy      = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.count   = 0
         Patterns.longest = 0
     }
@@ -657,6 +706,53 @@ Function.CompileAllPatterns {
             IfCondition NotEqual(h, 0) ThenBlock: {
                 Patterns.dfa_ok = Regex_DFAInit(h)
             }
+        }
+
+        // Precompute the per-pattern dispatch strategy. This is the
+        // input to LineMatches' Branch — 2 instructions per dispatch
+        // (CMP RAX,imm32 ; JE) on the literal-case fast path, so the
+        // per-line overhead is effectively O(1) regardless of how
+        // many strategies exist.
+        si = 0
+        WhileLoop LessThan(si, Patterns.count) {
+            s_plen   = Dereference(Add(Patterns.lens,          Multiply(si, 8)))
+            s_rhand  = Dereference(Add(Patterns.regex,         Multiply(si, 8)))
+            s_pfxlen = Dereference(Add(Patterns.rx_prefix_len, Multiply(si, 8)))
+            strat = STRATEGY.LITERAL_BM
+            IfCondition EqualTo(s_plen, 0) ThenBlock: {
+                strat = STRATEGY.EMPTY
+            } ElseBlock: {
+                IfCondition EqualTo(GrepConfig.whole_line, 1) ThenBlock: {
+                    strat = STRATEGY.WHOLE_LINE
+                } ElseBlock: {
+                    IfCondition EqualTo(GrepConfig.word_match, 1) ThenBlock: {
+                        strat = STRATEGY.WORD_MATCH
+                    } ElseBlock: {
+                        IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+                            IfCondition NotEqual(s_rhand, 0) ThenBlock: {
+                                strat = STRATEGY.REGEX_INSENSITIVE
+                            } ElseBlock: {
+                                strat = STRATEGY.LITERAL_INSENSITIVE
+                            }
+                        } ElseBlock: {
+                            IfCondition NotEqual(s_rhand, 0) ThenBlock: {
+                                IfCondition GreaterEqual(s_pfxlen, 2) ThenBlock: {
+                                    strat = STRATEGY.REGEX_PREFIX_BM
+                                } ElseBlock: {
+                                    IfCondition EqualTo(Patterns.dfa_ok, 1) ThenBlock: {
+                                        strat = STRATEGY.REGEX_DFA
+                                    } ElseBlock: {
+                                        strat = STRATEGY.REGEX_NFA
+                                    }
+                                }
+                            }
+                            // else: strat stays LITERAL_BM
+                        }
+                    }
+                }
+            }
+            StoreValue(Add(Patterns.strategy, Multiply(si, 8)), strat)
+            si = Add(si, 1)
         }
     }
 }
