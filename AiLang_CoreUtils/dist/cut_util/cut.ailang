@@ -1,0 +1,582 @@
+// cut.ailang — select fields or bytes from each line
+// Flags: -d DELIM, -f LIST (e.g. 1, 1,3, 2-4, 1,3-5),
+//        -c LIST (character/byte ranges, same LIST syntax),
+//        -s (suppress lines without delimiter).
+// Default delimiter is TAB. If no file is given, or file is "-", read stdin.
+// Rewritten April 2026: old version was broken under the new compiler —
+// MemCopy → MemoryCopy, Arena import required, and -d / multi-field support
+// were missing entirely.
+
+LibraryImport.Arena
+
+FixedPool.CutConfig {
+    "delimiter":     Initialize=9     // TAB by default
+    "mode":          Initialize=0     // 0=fields, 1=chars/bytes
+    "suppress":      Initialize=0     // -s
+}
+
+FixedPool.CutConstants {
+    "BUFFER_SIZE":        Initialize=65536
+    "OUTPUT_BUFFER_SIZE": Initialize=65536
+    "MAX_FIELD":          Initialize=4096
+    "MAX_FILES":          Initialize=1000
+    "ARGBUF":             Initialize=8192
+}
+
+// Field-selection bitmap: one byte per slot, 1 = selected.
+FixedPool.CutMask {
+    "mask":       Initialize=0
+    "highest":    Initialize=0   // highest selected slot (1-based)
+    "to_end":     Initialize=0   // set when LIST ends with "N-" (open range)
+    "to_end_from":Initialize=0   // N in "N-"
+}
+
+FixedPool.OutputBuffer {
+    "buffer":   Initialize=0
+    "position": Initialize=0
+}
+
+// === SYSCALL WRAPPERS ===
+
+Function.SysOpen {
+    Input: filename: Address
+    Output: Integer
+    Body: {
+        ReturnValue(SystemCall(2, filename, 0, 0))
+    }
+}
+
+Function.SysRead {
+    Input: fd: Integer
+    Input: buffer: Address
+    Input: count: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(SystemCall(0, fd, buffer, count))
+    }
+}
+
+Function.SysClose {
+    Input: fd: Integer
+    Body: { SystemCall(3, fd) }
+}
+
+Function.SysWrite {
+    Input: fd: Integer
+    Input: buffer: Address
+    Input: count: Integer
+    Body: { SystemCall(1, fd, buffer, count) }
+}
+
+Function.WriteStderr {
+    Input: str: Address
+    Body: {
+        len = StringLength(str)
+        SysWrite(2, str, len)
+    }
+}
+
+Function.WriteStdoutStr {
+    Input: str: Address
+    Body: {
+        len = StringLength(str)
+        SysWrite(1, str, len)
+    }
+}
+
+// === OUTPUT BUFFER ===
+
+Function.InitOutputBuffer {
+    Body: {
+        OutputBuffer.buffer = Allocate(CutConstants.OUTPUT_BUFFER_SIZE)
+        OutputBuffer.position = 0
+    }
+}
+
+Function.FlushOutputBuffer {
+    Body: {
+        IfCondition GreaterThan(OutputBuffer.position, 0) ThenBlock: {
+            SysWrite(1, OutputBuffer.buffer, OutputBuffer.position)
+            OutputBuffer.position = 0
+        }
+    }
+}
+
+Function.BufferBytes {
+    Input: data: Address
+    Input: len: Integer
+    Body: {
+        space = Subtract(CutConstants.OUTPUT_BUFFER_SIZE, OutputBuffer.position)
+        IfCondition LessThan(space, len) ThenBlock: {
+            FlushOutputBuffer()
+        }
+        IfCondition GreaterThan(len, 0) ThenBlock: {
+            MemoryCopy(Add(OutputBuffer.buffer, OutputBuffer.position), data, len)
+            OutputBuffer.position = Add(OutputBuffer.position, len)
+        }
+    }
+}
+
+Function.BufferByte {
+    Input: byte: Integer
+    Body: {
+        IfCondition GreaterEqual(OutputBuffer.position, CutConstants.OUTPUT_BUFFER_SIZE) ThenBlock: {
+            FlushOutputBuffer()
+        }
+        SetByte(OutputBuffer.buffer, OutputBuffer.position, byte)
+        OutputBuffer.position = Add(OutputBuffer.position, 1)
+    }
+}
+
+// === HELPERS ===
+
+Function.StringLen {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        n = 0
+        WhileLoop NotEqual(GetByte(str, n), 0) {
+            n = Add(n, 1)
+        }
+        ReturnValue(n)
+    }
+}
+
+Function.StrEqual {
+    Input: a: Address
+    Input: b: Address
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop 1 {
+            ca = GetByte(a, i)
+            cb = GetByte(b, i)
+            IfCondition NotEqual(ca, cb) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(ca, 0) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Parse leading decimal digits from buffer[pos..] until a non-digit.
+// Returns the value; sets OutputConsumed side-effect via out_pos pool slot.
+FixedPool.ParseIntState { "last_pos": Initialize=0 }
+
+Function.ParseUInt {
+    Input: buffer: Address
+    Input: pos: Integer
+    Input: limit: Integer
+    Output: Integer
+    Body: {
+        v = 0
+        p = pos
+        WhileLoop LessThan(p, limit) {
+            ch = GetByte(buffer, p)
+            IfCondition Or(LessThan(ch, 48), GreaterThan(ch, 57)) ThenBlock: {
+                BreakLoop
+            }
+            v = Add(Multiply(v, 10), Subtract(ch, 48))
+            p = Add(p, 1)
+        }
+        ParseIntState.last_pos = p
+        ReturnValue(v)
+    }
+}
+
+// Bitmap-style mask using the CutMask pool. We store 1-bit per field in a
+// separate Allocate'd buffer so we can address up to MAX_FIELD fields.
+FixedPool.FieldBits { "bits": Initialize=0 }
+
+Function.InitFieldMask {
+    Body: {
+        FieldBits.bits = Allocate(CutConstants.MAX_FIELD)
+        i = 0
+        WhileLoop LessThan(i, CutConstants.MAX_FIELD) {
+            SetByte(FieldBits.bits, i, 0)
+            i = Add(i, 1)
+        }
+        CutMask.highest = 0
+        CutMask.to_end = 0
+        CutMask.to_end_from = 0
+    }
+}
+
+Function.MarkField {
+    Input: n: Integer
+    Body: {
+        IfCondition And(GreaterThan(n, 0), LessThan(n, CutConstants.MAX_FIELD)) ThenBlock: {
+            SetByte(FieldBits.bits, n, 1)
+            IfCondition GreaterThan(n, CutMask.highest) ThenBlock: {
+                CutMask.highest = n
+            }
+        }
+    }
+}
+
+Function.FieldSelected {
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition And(GreaterThan(CutMask.to_end, 0), GreaterEqual(n, CutMask.to_end_from)) ThenBlock: {
+            ReturnValue(1)
+        }
+        IfCondition GreaterEqual(n, CutConstants.MAX_FIELD) ThenBlock: { ReturnValue(0) }
+        ReturnValue(GetByte(FieldBits.bits, n))
+    }
+}
+
+// Parse a LIST like "1,3,5-7,9-" into the field mask.
+// Syntax:  N | N-M | N- | -M
+Function.ParseFieldList {
+    Input: list: Address
+    Output: Integer
+    Body: {
+        len = StringLen(list)
+        p = 0
+        WhileLoop LessThan(p, len) {
+            // Leading dash means "from 1 to M"
+            IfCondition EqualTo(GetByte(list, p), 45) ThenBlock: {
+                p = Add(p, 1)
+                m = ParseUInt(list, p, len)
+                p = ParseIntState.last_pos
+                j = 1
+                WhileLoop LessEqual(j, m) {
+                    MarkField(j)
+                    j = Add(j, 1)
+                }
+            } ElseBlock: {
+                n = ParseUInt(list, p, len)
+                p = ParseIntState.last_pos
+                IfCondition And(LessThan(p, len), EqualTo(GetByte(list, p), 45)) ThenBlock: {
+                    // Range
+                    p = Add(p, 1)
+                    IfCondition Or(GreaterEqual(p, len), EqualTo(GetByte(list, p), 44)) ThenBlock: {
+                        // N- (open)
+                        CutMask.to_end = 1
+                        CutMask.to_end_from = n
+                        IfCondition GreaterThan(n, CutMask.highest) ThenBlock: {
+                            CutMask.highest = n
+                        }
+                    } ElseBlock: {
+                        m2 = ParseUInt(list, p, len)
+                        p = ParseIntState.last_pos
+                        j = n
+                        WhileLoop LessEqual(j, m2) {
+                            MarkField(j)
+                            j = Add(j, 1)
+                        }
+                    }
+                } ElseBlock: {
+                    MarkField(n)
+                }
+            }
+            // Skip optional comma
+            IfCondition And(LessThan(p, len), EqualTo(GetByte(list, p), 44)) ThenBlock: {
+                p = Add(p, 1)
+            }
+        }
+        ReturnValue(1)
+    }
+}
+
+// === CORE LOGIC ===
+
+// Emit a line of fields according to the mask.
+// `line` points at the line body, `len` is its length (no trailing newline).
+Function.EmitFields {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: delim: Integer
+    Body: {
+        // First, detect whether the line has a delimiter at all. POSIX says
+        // a line without the delim is passed through unchanged unless -s is
+        // set, in which case it's dropped.
+        has_delim = 0
+        scan = 0
+        WhileLoop LessThan(scan, line_len) {
+            IfCondition EqualTo(GetByte(line, scan), delim) ThenBlock: {
+                has_delim = 1
+                BreakLoop
+            }
+            scan = Add(scan, 1)
+        }
+
+        IfCondition EqualTo(has_delim, 0) ThenBlock: {
+            IfCondition EqualTo(CutConfig.suppress, 0) ThenBlock: {
+                BufferBytes(line, line_len)
+                BufferByte(10)
+            }
+        } ElseBlock: {
+            // Line has the delimiter — emit selected fields, joined by delim.
+            field_idx = 1
+            field_start = 0
+            pos = 0
+            emitted = 0
+
+            WhileLoop LessEqual(pos, line_len) {
+                IfCondition Or(EqualTo(pos, line_len), EqualTo(GetByte(line, pos), delim)) ThenBlock: {
+                    IfCondition EqualTo(FieldSelected(field_idx), 1) ThenBlock: {
+                        IfCondition GreaterThan(emitted, 0) ThenBlock: {
+                            BufferByte(delim)
+                        }
+                        seg_len = Subtract(pos, field_start)
+                        IfCondition GreaterThan(seg_len, 0) ThenBlock: {
+                            BufferBytes(Add(line, field_start), seg_len)
+                        }
+                        emitted = Add(emitted, 1)
+                    }
+                    IfCondition LessThan(pos, line_len) ThenBlock: {
+                        field_idx = Add(field_idx, 1)
+                        field_start = Add(pos, 1)
+                    }
+                }
+                pos = Add(pos, 1)
+            }
+            BufferByte(10)
+        }
+    }
+}
+
+// Emit characters/bytes according to the mask (-c / -b mode).
+Function.EmitChars {
+    Input: line: Address
+    Input: line_len: Integer
+    Body: {
+        pos = 0
+        WhileLoop LessThan(pos, line_len) {
+            n = Add(pos, 1)
+            IfCondition EqualTo(FieldSelected(n), 1) ThenBlock: {
+                BufferByte(GetByte(line, pos))
+            }
+            pos = Add(pos, 1)
+        }
+        BufferByte(10)
+    }
+}
+
+// Stream a file descriptor, split into lines, dispatch per mode.
+Function.ProcessFd {
+    Input: fd: Integer
+    Body: {
+        buffer = Allocate(CutConstants.BUFFER_SIZE)
+        line_buf = Allocate(CutConstants.BUFFER_SIZE)
+        line_len = 0
+
+        WhileLoop 1 {
+            n = SysRead(fd, buffer, CutConstants.BUFFER_SIZE)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+
+            i = 0
+            WhileLoop LessThan(i, n) {
+                ch = GetByte(buffer, i)
+                IfCondition EqualTo(ch, 10) ThenBlock: {
+                    IfCondition EqualTo(CutConfig.mode, 0) ThenBlock: {
+                        EmitFields(line_buf, line_len, CutConfig.delimiter)
+                    } ElseBlock: {
+                        EmitChars(line_buf, line_len)
+                    }
+                    line_len = 0
+                } ElseBlock: {
+                    IfCondition LessThan(line_len, CutConstants.BUFFER_SIZE) ThenBlock: {
+                        SetByte(line_buf, line_len, ch)
+                        line_len = Add(line_len, 1)
+                    }
+                }
+                i = Add(i, 1)
+            }
+        }
+
+        // Trailing partial line (no final newline)
+        IfCondition GreaterThan(line_len, 0) ThenBlock: {
+            IfCondition EqualTo(CutConfig.mode, 0) ThenBlock: {
+                EmitFields(line_buf, line_len, CutConfig.delimiter)
+            } ElseBlock: {
+                EmitChars(line_buf, line_len)
+            }
+        }
+
+        Deallocate(line_buf, CutConstants.BUFFER_SIZE)
+        Deallocate(buffer, CutConstants.BUFFER_SIZE)
+    }
+}
+
+// === ARG PARSING ===
+// Reads /proc/self/cmdline (NUL-separated argv) into an Allocate'd buffer.
+
+Function.LoadCmdline {
+    Output: Address
+    Body: {
+        fd = SystemCall(257, -100, "/proc/self/cmdline", 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(CutConstants.ARGBUF)
+        n = SystemCall(0, fd, buf, CutConstants.ARGBUF)
+        SystemCall(3, fd)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, CutConstants.ARGBUF)
+            ReturnValue(0)
+        }
+        ReturnValue(buf)
+    }
+}
+
+// Returns pointer to next argv slot, advancing *pos past the NUL.
+// When the end is reached, returns 0.
+FixedPool.ArgPos { "pos": Initialize=0 }
+
+Function.NextArg {
+    Input: buf: Address
+    Input: limit: Integer
+    Output: Address
+    Body: {
+        p = ArgPos.pos
+        IfCondition GreaterEqual(p, limit) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(GetByte(buf, p), 0) ThenBlock: { ReturnValue(0) }
+        start = p
+        WhileLoop And(LessThan(p, limit), NotEqual(GetByte(buf, p), 0)) {
+            p = Add(p, 1)
+        }
+        // Advance past the NUL for next call
+        ArgPos.pos = Add(p, 1)
+        ReturnValue(Add(buf, start))
+    }
+}
+
+Function.PrintUsage {
+    Body: {
+        WriteStdoutStr("Usage: cut -f LIST [-d DELIM] [-s] [FILE]...\n")
+        WriteStdoutStr("       cut -c LIST [FILE]...\n")
+        WriteStdoutStr("       cut -b LIST [FILE]...\n")
+        WriteStdoutStr("Select portions of each line of FILE(s) and print on stdout.\n")
+        WriteStdoutStr("With no FILE, or when FILE is -, read standard input.\n")
+    }
+}
+
+SubRoutine.Main {
+    InitOutputBuffer()
+    InitFieldMask()
+
+    buf = LoadCmdline()
+    IfCondition EqualTo(buf, 0) ThenBlock: {
+        WriteStderr("cut: could not read /proc/self/cmdline\n")
+        SystemCall(60, 1)
+    }
+
+    // Gather file paths (pointers into cmdline buffer, not copied)
+    files = Allocate(Multiply(CutConstants.MAX_FILES, 8))
+    file_count = 0
+    list_str = 0
+    have_list = 0
+
+    ArgPos.pos = 0
+    // Skip argv[0]
+    prog = NextArg(buf, CutConstants.ARGBUF)
+
+    WhileLoop 1 {
+        arg = NextArg(buf, CutConstants.ARGBUF)
+        IfCondition EqualTo(arg, 0) ThenBlock: { BreakLoop }
+
+        a0 = GetByte(arg, 0)
+        a1 = GetByte(arg, 1)
+
+        IfCondition And(EqualTo(a0, 45), NotEqual(a1, 0)) ThenBlock: {
+            // -d: delimiter (either -dX or -d X)
+            IfCondition EqualTo(a1, 100) ThenBlock: {
+                IfCondition NotEqual(GetByte(arg, 2), 0) ThenBlock: {
+                    CutConfig.delimiter = GetByte(arg, 2)
+                } ElseBlock: {
+                    nxt = NextArg(buf, CutConstants.ARGBUF)
+                    IfCondition EqualTo(nxt, 0) ThenBlock: {
+                        WriteStderr("cut: option -d requires an argument\n")
+                        SystemCall(60, 1)
+                    }
+                    CutConfig.delimiter = GetByte(nxt, 0)
+                }
+                ContinueLoop
+            }
+            // -f / -c / -b: field or char list
+            IfCondition Or(Or(EqualTo(a1, 102), EqualTo(a1, 99)), EqualTo(a1, 98)) ThenBlock: {
+                CutConfig.mode = 0
+                IfCondition Or(EqualTo(a1, 99), EqualTo(a1, 98)) ThenBlock: {
+                    CutConfig.mode = 1
+                }
+                IfCondition NotEqual(GetByte(arg, 2), 0) ThenBlock: {
+                    list_str = Add(arg, 2)
+                } ElseBlock: {
+                    list_str = NextArg(buf, CutConstants.ARGBUF)
+                    IfCondition EqualTo(list_str, 0) ThenBlock: {
+                        WriteStderr("cut: option requires an argument\n")
+                        SystemCall(60, 1)
+                    }
+                }
+                ParseFieldList(list_str)
+                have_list = 1
+                ContinueLoop
+            }
+            // -s
+            IfCondition EqualTo(a1, 115) ThenBlock: {
+                CutConfig.suppress = 1
+                ContinueLoop
+            }
+            // -h / --help
+            IfCondition EqualTo(a1, 104) ThenBlock: {
+                PrintUsage()
+                SystemCall(60, 0)
+            }
+            // lone "-" means stdin
+            IfCondition EqualTo(a1, 0) ThenBlock: {
+                StoreValue(Add(files, Multiply(file_count, 8)), arg)
+                file_count = Add(file_count, 1)
+                ContinueLoop
+            }
+            WriteStderr("cut: unknown option\n")
+            SystemCall(60, 1)
+        } ElseBlock: {
+            // Positional = file
+            StoreValue(Add(files, Multiply(file_count, 8)), arg)
+            file_count = Add(file_count, 1)
+        }
+    }
+
+    IfCondition EqualTo(have_list, 0) ThenBlock: {
+        WriteStderr("cut: you must specify a list of fields (-f), chars (-c), or bytes (-b)\n")
+        SystemCall(60, 1)
+    }
+
+    exit_code = 0
+    IfCondition EqualTo(file_count, 0) ThenBlock: {
+        ProcessFd(0)
+    } ElseBlock: {
+        i = 0
+        WhileLoop LessThan(i, file_count) {
+            fpath = Dereference(Add(files, Multiply(i, 8)))
+            // "-" → stdin
+            IfCondition And(EqualTo(GetByte(fpath, 0), 45), EqualTo(GetByte(fpath, 1), 0)) ThenBlock: {
+                ProcessFd(0)
+            } ElseBlock: {
+                fd = SysOpen(fpath)
+                IfCondition LessThan(fd, 0) ThenBlock: {
+                    WriteStderr("cut: ")
+                    WriteStderr(fpath)
+                    WriteStderr(": cannot open\n")
+                    exit_code = 1
+                } ElseBlock: {
+                    ProcessFd(fd)
+                    SysClose(fd)
+                }
+            }
+            i = Add(i, 1)
+        }
+    }
+
+    FlushOutputBuffer()
+    Deallocate(OutputBuffer.buffer, CutConstants.OUTPUT_BUFFER_SIZE)
+    Deallocate(FieldBits.bits, CutConstants.MAX_FIELD)
+    Deallocate(files, Multiply(CutConstants.MAX_FILES, 8))
+    Deallocate(buf, CutConstants.ARGBUF)
+
+    SystemCall(60, exit_code)
+}
+
+RunTask(Main)
