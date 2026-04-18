@@ -1336,3 +1336,439 @@ Function.Not2 {
         ReturnValue(0)
     }
 }
+
+// ============================================================================
+// LAZY DFA
+// ============================================================================
+// Converts the Thompson NFA to a lazily-constructed DFA for unanchored
+// matching. A "DFA state" is a canonicalized NFA state set (bitset of
+// 4096 bits = 512 bytes), interned in `DFA.sets_buf`. For each DFA state
+// a 256-entry transition table (`DFA.trans_buf`) caches the resulting
+// DFA state ID on input byte b — computed on first encounter, reused
+// forever after. An "accept" flag (`DFA.match_buf`) marks DFA states
+// whose NFA state set contains StateType.MATCH so the driver can return
+// on transition into one.
+//
+// Unanchored semantics: after moving on byte b we union the start
+// state's epsilon-closure into the new set before interning, so any
+// text position is a valid match start. We do this by keeping
+// `DFA.start_closure` — computed once per DFA_Init — and OR-ing it
+// into the scratch bitset on every transition.
+//
+// Caveats / bailouts:
+//   * If the compiled regex contains ASSERT_START or ASSERT_END, we
+//     bail — positional semantics can't be DFA'd without specializing
+//     by position. Caller falls back to Regex_Search.
+//   * If we exceed DFA.cap DFA states during lazy construction
+//     (pathological pattern), we set DFA.overflow=1 and bail. Caller
+//     falls back to Regex_Search for the current line and all further
+//     lines until DFA_Init is called again.
+
+FixedPool.DFA {
+    "cap":           Initialize=1024            // max DFA states
+    "count":         Initialize=0,   CanChange=True
+    "set_size":      Initialize=512             // 4096 bits / 8
+    "sets_buf":      Initialize=0,   CanChange=True
+    "trans_buf":     Initialize=0,   CanChange=True
+    "match_buf":     Initialize=0,   CanChange=True
+    "scratch_set":   Initialize=0,   CanChange=True
+    "start_closure": Initialize=0,   CanChange=True
+    "regex":         Initialize=0,   CanChange=True
+    "overflow":      Initialize=0,   CanChange=True
+}
+
+// === bitset helpers ===
+
+Function.DFA_GetSet {
+    Input: id: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(DFA.sets_buf, Multiply(id, DFA.set_size)))
+    }
+}
+
+Function.DFA_GetTrans {
+    Input: id: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(DFA.trans_buf, Multiply(id, 2048)))
+    }
+}
+
+Function.DFA_ClearSet {
+    Input: bs: Address
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, DFA.set_size) {
+            SetByte(bs, i, 0)
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.DFA_SetBit {
+    Input: bs: Address
+    Input: state_id: Integer
+    Body: {
+        byte_off = Divide(state_id, 8)
+        bit_off  = Modulo(state_id, 8)
+        v = GetByte(bs, byte_off)
+        mask = LeftShift(1, bit_off)
+        SetByte(bs, byte_off, BitwiseOr(v, mask))
+    }
+}
+
+Function.DFA_TestBit {
+    Input: bs: Address
+    Input: state_id: Integer
+    Output: Integer
+    Body: {
+        byte_off = Divide(state_id, 8)
+        bit_off  = Modulo(state_id, 8)
+        v = GetByte(bs, byte_off)
+        mask = LeftShift(1, bit_off)
+        ReturnValue(BitwiseAnd(v, mask))
+    }
+}
+
+Function.DFA_CopySet {
+    Input: dst: Address
+    Input: src: Address
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, DFA.set_size) {
+            SetByte(dst, i, GetByte(src, i))
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.DFA_UnionSet {
+    Input: dst: Address
+    Input: src: Address
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, DFA.set_size) {
+            SetByte(dst, i, BitwiseOr(GetByte(dst, i), GetByte(src, i)))
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.DFA_SetsEqual {
+    Input: a: Address
+    Input: b: Address
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, DFA.set_size) {
+            IfCondition NotEqual(GetByte(a, i), GetByte(b, i)) ThenBlock: {
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// === epsilon closure over an NFA state set (in-place) ===
+// Expands SPLIT/EMPTY states: any bit set that names a SPLIT state
+// also sets the bits for out1/out2; any EMPTY sets the bit for out1.
+// Keep iterating over all 4096 bits until a full pass adds nothing.
+Function.DFA_EpsilonClose {
+    Input: bs: Address
+    Body: {
+        states = RegexState.states
+        num_states = RegexState.num_states
+        changed = 1
+        WhileLoop EqualTo(changed, 1) {
+            changed = 0
+            sid = 0
+            WhileLoop LessThan(sid, num_states) {
+                IfCondition NotEqual(DFA_TestBit(bs, sid), 0) ThenBlock: {
+                    offset = Multiply(sid, RegexConstants.STATE_SIZE)
+                    t = Dereference(Add(states, offset))
+                    IfCondition EqualTo(t, StateType.SPLIT) ThenBlock: {
+                        o1 = Dereference(Add(Add(states, offset), 24))
+                        o2 = Dereference(Add(Add(states, offset), 32))
+                        IfCondition GreaterEqual(o1, 0) ThenBlock: {
+                            IfCondition EqualTo(DFA_TestBit(bs, o1), 0) ThenBlock: {
+                                DFA_SetBit(bs, o1)
+                                changed = 1
+                            }
+                        }
+                        IfCondition GreaterEqual(o2, 0) ThenBlock: {
+                            IfCondition EqualTo(DFA_TestBit(bs, o2), 0) ThenBlock: {
+                                DFA_SetBit(bs, o2)
+                                changed = 1
+                            }
+                        }
+                    }
+                    IfCondition EqualTo(t, StateType.EMPTY) ThenBlock: {
+                        o1 = Dereference(Add(Add(states, offset), 24))
+                        IfCondition GreaterEqual(o1, 0) ThenBlock: {
+                            IfCondition EqualTo(DFA_TestBit(bs, o1), 0) ThenBlock: {
+                                DFA_SetBit(bs, o1)
+                                changed = 1
+                            }
+                        }
+                    }
+                }
+                sid = Add(sid, 1)
+            }
+        }
+    }
+}
+
+// Compute `DFA.match_buf[id]` — 1 if the set contains any MATCH state.
+Function.DFA_SetHasMatch {
+    Input: bs: Address
+    Output: Integer
+    Body: {
+        states = RegexState.states
+        num_states = RegexState.num_states
+        sid = 0
+        WhileLoop LessThan(sid, num_states) {
+            IfCondition NotEqual(DFA_TestBit(bs, sid), 0) ThenBlock: {
+                offset = Multiply(sid, RegexConstants.STATE_SIZE)
+                t = Dereference(Add(states, offset))
+                IfCondition EqualTo(t, StateType.MATCH) ThenBlock: {
+                    ReturnValue(1)
+                }
+            }
+            sid = Add(sid, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Intern a (canonicalized, epsilon-closed) bitset as a DFA state.
+// Returns existing DFA state ID if the set already exists; otherwise
+// allocates a new one (copies bs into sets_buf, initializes trans row
+// to all -1, sets match flag). Returns -1 on cap overflow.
+Function.DFA_InternSet {
+    Input: bs: Address
+    Output: Integer
+    Body: {
+        // Linear probe for existing state. Cap=1024; in practice the
+        // count stays small so this is cheap per-miss and free per-hit
+        // after the first occurrence.
+        i = 0
+        WhileLoop LessThan(i, DFA.count) {
+            existing = DFA_GetSet(i)
+            IfCondition EqualTo(DFA_SetsEqual(existing, bs), 1) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+
+        IfCondition GreaterEqual(DFA.count, DFA.cap) ThenBlock: {
+            DFA.overflow = 1
+            ReturnValue(-1)
+        }
+
+        new_id = DFA.count
+        DFA_CopySet(DFA_GetSet(new_id), bs)
+
+        // Init transitions row to -1.
+        trans = DFA_GetTrans(new_id)
+        j = 0
+        WhileLoop LessThan(j, 256) {
+            StoreValue(Add(trans, Multiply(j, 8)), -1)
+            j = Add(j, 1)
+        }
+
+        // Has-match flag.
+        SetByte(DFA.match_buf, new_id, DFA_SetHasMatch(bs))
+
+        DFA.count = Add(DFA.count, 1)
+        ReturnValue(new_id)
+    }
+}
+
+// Compute transition from DFA state `from_id` on input byte `b`.
+// Stores result in transitions table. Returns new DFA state id, or
+// -1 on overflow.
+Function.DFA_ComputeTransition {
+    Input: from_id: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: {
+        DFA_ClearSet(DFA.scratch_set)
+
+        // Apply byte-consuming transitions for each NFA state in from.
+        from_set = DFA_GetSet(from_id)
+        states = RegexState.states
+        num_states = RegexState.num_states
+        sid = 0
+        WhileLoop LessThan(sid, num_states) {
+            IfCondition NotEqual(DFA_TestBit(from_set, sid), 0) ThenBlock: {
+                offset = Multiply(sid, RegexConstants.STATE_SIZE)
+                t     = Dereference(Add(states, offset))
+                data1 = Dereference(Add(Add(states, offset), 8))
+                data2 = Dereference(Add(Add(states, offset), 16))
+                o1    = Dereference(Add(Add(states, offset), 24))
+
+                matched = 0
+                IfCondition EqualTo(t, StateType.CHAR) ThenBlock: {
+                    IfCondition EqualTo(data1, b) ThenBlock: { matched = 1 }
+                }
+                IfCondition EqualTo(t, StateType.RANGE) ThenBlock: {
+                    hit = TestBit(data1, b)
+                    IfCondition EqualTo(data2, 1) ThenBlock: { hit = Not2(hit) }
+                    IfCondition NotEqual(hit, 0) ThenBlock: { matched = 1 }
+                }
+                IfCondition EqualTo(t, StateType.DOT) ThenBlock: {
+                    IfCondition NotEqual(b, 10) ThenBlock: { matched = 1 }
+                }
+
+                IfCondition And(EqualTo(matched, 1), GreaterEqual(o1, 0)) ThenBlock: {
+                    DFA_SetBit(DFA.scratch_set, o1)
+                }
+            }
+            sid = Add(sid, 1)
+        }
+
+        // Unanchored semantics: keep start_closure alive at every pos.
+        DFA_UnionSet(DFA.scratch_set, DFA.start_closure)
+
+        // Epsilon-close, intern, remember in transitions table.
+        DFA_EpsilonClose(DFA.scratch_set)
+        new_id = DFA_InternSet(DFA.scratch_set)
+
+        trans = DFA_GetTrans(from_id)
+        StoreValue(Add(trans, Multiply(b, 8)), new_id)
+        ReturnValue(new_id)
+    }
+}
+
+// Detect whether the regex contains any ASSERT_START/ASSERT_END
+// states — if so, bail out of DFA construction.
+Function.DFA_HasAssertions {
+    Output: Integer
+    Body: {
+        states = RegexState.states
+        num_states = RegexState.num_states
+        sid = 0
+        WhileLoop LessThan(sid, num_states) {
+            offset = Multiply(sid, RegexConstants.STATE_SIZE)
+            t = Dereference(Add(states, offset))
+            IfCondition EqualTo(t, StateType.ASSERT_START) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(t, StateType.ASSERT_END) ThenBlock: { ReturnValue(1) }
+            sid = Add(sid, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Initialize DFA for a given compiled regex. Returns 1 on success,
+// 0 if the regex has assertions (caller must fall back to Regex_Search).
+Function.Regex_DFAInit {
+    Input: regex: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(regex, 0) ThenBlock: { ReturnValue(0) }
+
+        // Publish states/num_states into RegexState so the helpers
+        // above can walk them without taking handle args.
+        RegexState.states     = Dereference(regex)
+        RegexState.num_states = Dereference(Add(regex, 8))
+        start_state           = Dereference(Add(regex, 16))
+
+        IfCondition EqualTo(DFA_HasAssertions(), 1) ThenBlock: { ReturnValue(0) }
+
+        // Lazy-allocate on first DFA init. Buffers are reused across
+        // subsequent Regex_DFAInit calls for different regexes.
+        IfCondition EqualTo(DFA.sets_buf, 0) ThenBlock: {
+            DFA.sets_buf    = Allocate(Multiply(DFA.cap, DFA.set_size))
+            IfCondition EqualTo(DFA.sets_buf, 0) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition EqualTo(DFA.trans_buf, 0) ThenBlock: {
+            DFA.trans_buf   = Allocate(Multiply(DFA.cap, 2048))
+            IfCondition EqualTo(DFA.trans_buf, 0) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition EqualTo(DFA.match_buf, 0) ThenBlock: {
+            DFA.match_buf   = Allocate(DFA.cap)
+            IfCondition EqualTo(DFA.match_buf, 0) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition EqualTo(DFA.scratch_set, 0) ThenBlock: {
+            DFA.scratch_set = Allocate(DFA.set_size)
+            IfCondition EqualTo(DFA.scratch_set, 0) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition EqualTo(DFA.start_closure, 0) ThenBlock: {
+            DFA.start_closure = Allocate(DFA.set_size)
+            IfCondition EqualTo(DFA.start_closure, 0) ThenBlock: { ReturnValue(0) }
+        }
+
+        DFA.count    = 0
+        DFA.overflow = 0
+        DFA.regex    = regex
+
+        // Build start closure: epsilon-closure of {start_state}.
+        DFA_ClearSet(DFA.start_closure)
+        DFA_SetBit(DFA.start_closure, start_state)
+        DFA_EpsilonClose(DFA.start_closure)
+
+        // State 0 = the start closure (unanchored, so start state is
+        // already included every byte).
+        DFA_CopySet(DFA.scratch_set, DFA.start_closure)
+        initial_id = DFA_InternSet(DFA.scratch_set)
+        IfCondition LessThan(initial_id, 0) ThenBlock: { ReturnValue(0) }
+
+        ReturnValue(1)
+    }
+}
+
+// Unanchored single-pass search via lazy DFA. Returns 1 if the regex
+// matches anywhere in `text[0..text_len)`, 0 otherwise. Caller must
+// have already called Regex_DFAInit on this regex. On DFA overflow
+// this function returns -1 — caller should fall back to Regex_Search.
+//
+// Hot-loop perf: DFA_GetTrans/DFA_GetSet etc. are inlined here
+// (trans_base is the raw byte address of the transitions table, and
+// `trans_base + (cur * 2048) + (b * 8)` is the transition slot) so
+// the per-byte path is one Dereference + one GetByte + a conditional.
+// This eliminated ~50ns of AILANG function-call overhead that
+// dominated the old per-byte cost on long inputs.
+Function.Regex_DFASearch {
+    Input: text: Address
+    Input: text_len: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(text, 0) ThenBlock: { ReturnValue(0) }
+
+        trans_base = DFA.trans_buf
+        match_base = DFA.match_buf
+
+        // State 0 is always the start closure (built in Regex_DFAInit).
+        cur = 0
+        IfCondition NotEqual(GetByte(match_base, cur), 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        i = 0
+        WhileLoop LessThan(i, text_len) {
+            b = GetByte(text, i)
+            slot = Add(Add(trans_base, Multiply(cur, 2048)), Multiply(b, 8))
+            next_id = Dereference(slot)
+            IfCondition LessThan(next_id, 0) ThenBlock: {
+                next_id = DFA_ComputeTransition(cur, b)
+                IfCondition LessThan(next_id, 0) ThenBlock: {
+                    ReturnValue(-1)
+                }
+                // trans_buf may have been reallocated on growth
+                // (it isn't today, but keep this defensive reload so
+                // the invariant holds if cap ever becomes dynamic).
+                trans_base = DFA.trans_buf
+                match_base = DFA.match_buf
+            }
+            cur = next_id
+            IfCondition NotEqual(GetByte(match_base, cur), 0) ThenBlock: {
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+
+        ReturnValue(0)
+    }
+}

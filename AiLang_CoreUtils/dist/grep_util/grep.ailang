@@ -69,6 +69,7 @@ FixedPool.Patterns {
     "rx_prefix":     Initialize=0   // array of Address: literal prefix extracted from regex (or 0)
     "rx_prefix_len": Initialize=0   // array of Integer: prefix length (<2 means unused)
     "rx_prefix_bc":  Initialize=0   // array of Address: BM table for the regex prefix
+    "dfa_ok":        Initialize=0   // DFA available? (1=yes). Only set for single-pattern grep
 }
 
 FixedPool.OutBuffer {
@@ -253,6 +254,14 @@ Function.BuildBadCharTable {
 
 // Boyer-Moore search. Returns match start position in [0, line_len),
 // or -1 on no match. Case-sensitive; caller gates on GrepConfig.
+//
+// Tried a MemChr-anchored variant (find next last_pat via SIMD, then
+// MemCompare to verify) — it's faster when the pattern's last byte is
+// rare, but typical code/prose text is dense in common bytes (vowels,
+// 'n', 't', 's'). Benchmarks showed a 10-40% regression on realistic
+// patterns (e.g. "Function"), so we kept the classic BM outer loop.
+// Single-byte patterns still shortcut to MemChr since there's no
+// verify step to spoil the SIMD win.
 Function.SearchBoyerMoore {
     Input: line: Address
     Input: line_len: Integer
@@ -264,7 +273,6 @@ Function.SearchBoyerMoore {
         IfCondition GreaterThan(plen, line_len) ThenBlock: { ReturnValue(-1) }
         IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(-1) }
         IfCondition EqualTo(plen, 1) ThenBlock: {
-            // MemChr is SIMD-accelerated; use it for single-byte patterns.
             ReturnValue(MemChr(line, GetByte(pat, 0), line_len))
         }
 
@@ -361,10 +369,18 @@ Function.RegexLineSearch {
             ReturnValue(0)
         }
 
-        // Slow path (no prefix: alternation, class-led, star-led, etc.).
-        // Use single-pass unanchored Regex_Search — O(line_len × states)
-        // instead of O(line_len × line_len × states) from the old
-        // per-position Regex_Match loop.
+        // No-prefix path — three tiers in order of speed:
+        //   1. Lazy DFA: single pattern + no ^/$ anchors. O(1) table
+        //      lookup per byte. Returns -1 on DFA state overflow, in
+        //      which case we fall through to the NFA.
+        //   2. Regex_Search: single-pass unanchored NFA.
+        // Multi-pattern grep or patterns with assertions skip straight
+        // to Regex_Search (dfa_ok == 0).
+        IfCondition EqualTo(Patterns.dfa_ok, 1) ThenBlock: {
+            d = Regex_DFASearch(scratch, line_len)
+            IfCondition GreaterEqual(d, 0) ThenBlock: { ReturnValue(d) }
+            // -1: overflow, fall through.
+        }
         ReturnValue(Regex_Search(handle, scratch, line_len))
     }
 }
@@ -405,56 +421,68 @@ Function.LineMatches {
                 rx_pfx_len = Dereference(Add(Patterns.rx_prefix_len, Multiply(pi, 8)))
                 rx_pfx_bc  = Dereference(Add(Patterns.rx_prefix_bc,  Multiply(pi, 8)))
 
-                // Fast path: if we have a usable prefix (>=2 bytes) and aren't
-                // case-insensitive, run BM directly on the raw line first.
-                // No BM hit → no prefix possible → no match possible → skip
-                // the per-line MemoryCopy into Scratch.rx entirely. Only
-                // when BM hits do we materialize the NUL-terminated scratch
-                // and hand it to Regex_Match.
-                IfCondition And(EqualTo(GrepConfig.case_insensitive, 0),
-                                GreaterEqual(rx_pfx_len, 2)) ThenBlock: {
-                    pbm_from = 0
-                    pbm_matched = 0
-                    WhileLoop LessEqual(pbm_from, Subtract(line_len, rx_pfx_len)) {
-                        hit = SearchBoyerMoore(Add(line, pbm_from),
-                                               Subtract(line_len, pbm_from),
-                                               rx_pfx, rx_pfx_len, rx_pfx_bc)
-                        IfCondition LessThan(hit, 0) ThenBlock: { BreakLoop }
-                        cand = Add(pbm_from, hit)
-                        // Materialize scratch once, reuse across verify tries.
-                        IfCondition EqualTo(pbm_matched, 0) ThenBlock: {
-                            MemoryCopy(Scratch.rx, line, line_len)
-                            SetByte(Scratch.rx, line_len, 0)
-                            pbm_matched = 1
+                // Case-sensitive fast paths — no per-line MemoryCopy.
+                // Regex_DFASearch and Regex_Search both accept an explicit
+                // text_len and don't need a NUL terminator, so they can
+                // read the raw line_buf directly.
+                IfCondition EqualTo(GrepConfig.case_insensitive, 0) ThenBlock: {
+                    // Prefix-BM path: BM on raw line; only copy to Scratch.rx
+                    // for Regex_Match verify (needs StringLength → NUL).
+                    IfCondition GreaterEqual(rx_pfx_len, 2) ThenBlock: {
+                        pbm_from = 0
+                        pbm_matched = 0
+                        WhileLoop LessEqual(pbm_from, Subtract(line_len, rx_pfx_len)) {
+                            hit = SearchBoyerMoore(Add(line, pbm_from),
+                                                   Subtract(line_len, pbm_from),
+                                                   rx_pfx, rx_pfx_len, rx_pfx_bc)
+                            IfCondition LessThan(hit, 0) ThenBlock: { BreakLoop }
+                            cand = Add(pbm_from, hit)
+                            IfCondition EqualTo(pbm_matched, 0) ThenBlock: {
+                                MemoryCopy(Scratch.rx, line, line_len)
+                                SetByte(Scratch.rx, line_len, 0)
+                                pbm_matched = 1
+                            }
+                            m = Regex_Match(rhandle, Scratch.rx, cand)
+                            IfCondition GreaterEqual(m, 0) ThenBlock: { ReturnValue(1) }
+                            pbm_from = Add(cand, 1)
                         }
-                        m = Regex_Match(rhandle, Scratch.rx, cand)
-                        IfCondition GreaterEqual(m, 0) ThenBlock: { ReturnValue(1) }
-                        pbm_from = Add(cand, 1)
+                        pi = Add(pi, 1)
+                        ContinueLoop
+                    }
+
+                    // DFA fast path — zero copies. Single-pattern case only
+                    // (Patterns.dfa_ok is 0 for multi-pattern grep).
+                    IfCondition EqualTo(Patterns.dfa_ok, 1) ThenBlock: {
+                        d = Regex_DFASearch(line, line_len)
+                        IfCondition EqualTo(d, 1) ThenBlock: { ReturnValue(1) }
+                        IfCondition EqualTo(d, 0) ThenBlock: {
+                            pi = Add(pi, 1)
+                            ContinueLoop
+                        }
+                        // d == -1: DFA overflow — fall through to NFA.
+                    }
+
+                    // NFA fallback — still no copy needed for Regex_Search.
+                    IfCondition EqualTo(Regex_Search(rhandle, line, line_len), 1) ThenBlock: {
+                        ReturnValue(1)
                     }
                     pi = Add(pi, 1)
                     ContinueLoop
                 }
 
-                // Slow path (no prefix, or -i): prep scratch up-front and
-                // run the full linear regex scan.
-                IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
-                    si = 0
-                    WhileLoop LessThan(si, line_len) {
-                        SetByte(Scratch.rx_lc, si, ToLowerByte(GetByte(line, si)))
-                        si = Add(si, 1)
-                    }
-                    SetByte(Scratch.rx_lc, line_len, 0)
-                    IfCondition EqualTo(RegexLineSearch(rhandle, Scratch.rx_lc, line_len,
-                                                       rx_pfx, rx_pfx_len, rx_pfx_bc), 1) ThenBlock: {
-                        ReturnValue(1)
-                    }
-                } ElseBlock: {
-                    MemoryCopy(Scratch.rx, line, line_len)
-                    SetByte(Scratch.rx, line_len, 0)
-                    IfCondition EqualTo(RegexLineSearch(rhandle, Scratch.rx, line_len,
-                                                       rx_pfx, rx_pfx_len, rx_pfx_bc), 1) ThenBlock: {
-                        ReturnValue(1)
-                    }
+                // Case-insensitive path — must lowercase the line first,
+                // which we put in Scratch.rx_lc and then hand to the
+                // regular RegexLineSearch (which is allowed to use either
+                // BM-prefix or NFA).
+                si = 0
+                WhileLoop LessThan(si, line_len) {
+                    SetByte(Scratch.rx_lc, si, ToLowerByte(GetByte(line, si)))
+                    si = Add(si, 1)
+                }
+                SetByte(Scratch.rx_lc, line_len, 0)
+                IfCondition EqualTo(RegexLineSearch(rhandle, Scratch.rx_lc, line_len,
+                                                   rx_pfx, rx_pfx_len, rx_pfx_bc), 1) ThenBlock: {
+                    ReturnValue(1)
                 }
                 pi = Add(pi, 1)
                 ContinueLoop
@@ -612,6 +640,19 @@ Function.CompileAllPatterns {
                 StoreValue(Add(Patterns.bc_tables, Multiply(bi, 8)), tbl)
             }
             bi = Add(bi, 1)
+        }
+
+        // Lazy DFA: only useful for single-pattern grep (the shared
+        // DFA buffer can't be multiplexed across patterns without a
+        // per-handle rebuild on every line). Try to init; if the
+        // regex has ^/$ anchors DFA_Init returns 0 and we stay on
+        // Regex_Search for the no-prefix path.
+        Patterns.dfa_ok = 0
+        IfCondition EqualTo(Patterns.count, 1) ThenBlock: {
+            h = Dereference(Patterns.regex)
+            IfCondition NotEqual(h, 0) ThenBlock: {
+                Patterns.dfa_ok = Regex_DFAInit(h)
+            }
         }
     }
 }
