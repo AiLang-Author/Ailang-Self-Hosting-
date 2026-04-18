@@ -4,6 +4,12 @@
 # Compile Time + Runtime + Startup Time
 # ============================================
 
+# Run from AiLangSH root regardless of invocation directory.
+# Checked-in sources live under Benchmarks/{AiLang,C,Rust}/;
+# heredoc-generated scratch (*.zig, *.go, *.rs) lands in CWD.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.." || { echo "Cannot cd to repo root"; exit 1; }
+
 echo "=========================================="
 echo "PRIME SIEVE BENCHMARK - 1,000,000"
 echo "$(uname -a)"
@@ -115,19 +121,19 @@ echo "=========================================="
 echo ""
 
 echo "--- AILang ---"
-time ./ailang.x primetest.ailang primes_ailang.x > /dev/null 2>&1
+time ./ailang.x Benchmarks/AiLang/primetest.ailang primes_ailang.x > /dev/null 2>&1
 echo ""
 
 echo "--- C (gcc -O0) ---"
-time gcc -O0 -o primes_c_o0 primetestC.c
+time gcc -O0 -o primes_c_o0 Benchmarks/C/primetestC.c
 echo ""
 
 echo "--- C (gcc -O2) ---"
-time gcc -O2 -o primes_c_o2 primetestC.c
+time gcc -O2 -o primes_c_o2 Benchmarks/C/primetestC.c
 echo ""
 
 echo "--- C (gcc -O3) ---"
-time gcc -O3 -o primes_c_o3 primetestC.c
+time gcc -O3 -o primes_c_o3 Benchmarks/C/primetestC.c
 echo ""
 
 echo "--- Zig (ReleaseFast) ---"

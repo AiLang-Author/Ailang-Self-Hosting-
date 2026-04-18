@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # bench_primes_silent.sh - Silent benchmark (summary only, no warnings)
 
+# Run from AiLangSH root regardless of invocation dir.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.." || { echo "Cannot cd to repo root"; exit 1; }
+
 # Explicit paths for all system utilities
 GREP=/usr/bin/grep
 AWK=/usr/bin/awk

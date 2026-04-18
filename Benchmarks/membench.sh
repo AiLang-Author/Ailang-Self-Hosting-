@@ -4,6 +4,12 @@
 # Benchmarks 3 & 5 from ChatGPT's challenge
 # ============================================
 
+# Run from AiLangSH root regardless of invocation dir. Source files are
+# regenerated via heredoc each run and land in CWD (= repo root).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$SCRIPT_DIR/.." || { echo "Cannot cd to repo root"; exit 1; }
+
+
 echo "=========================================="
 echo "MEMORY & ALLOCATION BENCHMARKS"
 echo "$(uname -a)"
