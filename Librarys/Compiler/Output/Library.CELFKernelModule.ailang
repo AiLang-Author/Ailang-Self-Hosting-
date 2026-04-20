@@ -1,0 +1,670 @@
+// Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.CELFKernelModule.ailang
+// ELF64 relocatable object builder for Linux kernel modules (.ko)
+// Location: Librarys/Compiler/Output/Library.CELFKernelModule.ailang
+//
+// ARCHITECTURE:
+//   Produces ET_REL (relocatable) ELF with:
+//     .text      — executable code (init_module, cleanup_module, user code)
+//     .data      — initialized data (strings, tables)
+//     .modinfo   — module metadata ("license=GPL")
+//     .symtab    — symbol table (exports + unresolved kernel symbols)
+//     .strtab    — string table for symbol names
+//     .rela.text — relocations for kernel API calls
+//     .shstrtab  — section name strings
+//
+//   No program headers. No virtual addresses. Kernel loader resolves
+//   all relocations at insmod time.
+//
+// WIRING:
+//   Will be called from Output_BuildKernelModule (compiler flag --ko)
+//   Uses existing ELF buffer management from CELFBuilder
+
+LibraryImport.XArrays
+LibraryImport.Compiler.Output.CELFTypes
+LibraryImport.Compiler.Output.CELFBuilder
+
+// =============================================================================
+// RELOCATION TYPES (x86-64)
+// =============================================================================
+FixedPool.RelocType {
+    "R_X86_64_NONE":      Initialize=0
+    "R_X86_64_64":        Initialize=1
+    "R_X86_64_PC32":      Initialize=2
+    "R_X86_64_GOT32":     Initialize=3
+    "R_X86_64_PLT32":     Initialize=4
+    "R_X86_64_32":        Initialize=10
+    "R_X86_64_32S":       Initialize=11
+}
+
+// =============================================================================
+// KERNEL MODULE STATE
+// =============================================================================
+FixedPool.KMod {
+    "strtab":         Initialize=0, CanChange=True
+    "strtab_size":    Initialize=0, CanChange=True
+    "strtab_cap":     Initialize=0, CanChange=True
+    "sym_count":      Initialize=0, CanChange=True
+    "sym_buffer":     Initialize=0, CanChange=True
+    "sym_cap":        Initialize=0, CanChange=True
+    "rela_count":     Initialize=0, CanChange=True
+    "rela_buffer":    Initialize=0, CanChange=True
+    "rela_cap":       Initialize=0, CanChange=True
+    "first_global":   Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// KMOD INIT / FREE
+// =============================================================================
+Function.KMod_Init {
+    Body: {
+        KMod.strtab_cap = 1024
+        KMod.strtab = Allocate(KMod.strtab_cap)
+        KMod.strtab_size = 0
+
+        // First byte of strtab must be null
+        SetByte(KMod.strtab, 0, 0)
+        KMod.strtab_size = 1
+
+        KMod.sym_cap = 960
+        KMod.sym_buffer = Allocate(KMod.sym_cap)
+        KMod.sym_count = 0
+
+        KMod.rela_cap = 480
+        KMod.rela_buffer = Allocate(KMod.rela_cap)
+        KMod.rela_count = 0
+
+        KMod.first_global = 0
+    }
+}
+
+Function.KMod_Free {
+    Body: {
+        IfCondition NotEqual(KMod.strtab, 0) ThenBlock: {
+            Deallocate(KMod.strtab, KMod.strtab_cap)
+            KMod.strtab = 0
+        }
+        IfCondition NotEqual(KMod.sym_buffer, 0) ThenBlock: {
+            Deallocate(KMod.sym_buffer, KMod.sym_cap)
+            KMod.sym_buffer = 0
+        }
+        IfCondition NotEqual(KMod.rela_buffer, 0) ThenBlock: {
+            Deallocate(KMod.rela_buffer, KMod.rela_cap)
+            KMod.rela_buffer = 0
+        }
+    }
+}
+
+// =============================================================================
+// STRING TABLE HELPERS
+// =============================================================================
+Function.KMod_AddString {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        offset = KMod.strtab_size
+        i = 0
+        done = 0
+        WhileLoop EqualTo(done, 0) {
+            c = GetByte(str, i)
+            SetByte(KMod.strtab, KMod.strtab_size, c)
+            KMod.strtab_size = Add(KMod.strtab_size, 1)
+            IfCondition EqualTo(c, 0) ThenBlock: {
+                done = 1
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(offset)
+    }
+}
+
+// =============================================================================
+// SYMBOL TABLE HELPERS
+// =============================================================================
+
+// Write a single 24-byte symbol entry into sym_buffer
+Function.KMod_AddSymbol {
+    Input: name_offset: Integer
+    Input: binding: Integer
+    Input: sym_type: Integer
+    Input: section_idx: Integer
+    Input: value: Integer
+    Input: size: Integer
+    Body: {
+        base = Multiply(KMod.sym_count, Sym.SIZE)
+
+        // st_name (4 bytes)
+        buf = KMod.sym_buffer
+        SetByte(buf, Add(base, 0), BitwiseAnd(name_offset, 255))
+        SetByte(buf, Add(base, 1), BitwiseAnd(RightShift(name_offset, 8), 255))
+        SetByte(buf, Add(base, 2), BitwiseAnd(RightShift(name_offset, 16), 255))
+        SetByte(buf, Add(base, 3), BitwiseAnd(RightShift(name_offset, 24), 255))
+
+        // st_info (1 byte) = (binding << 4) | type
+        info = BitwiseOr(LeftShift(binding, 4), sym_type)
+        SetByte(buf, Add(base, 4), info)
+
+        // st_other (1 byte)
+        SetByte(buf, Add(base, 5), 0)
+
+        // st_shndx (2 bytes)
+        SetByte(buf, Add(base, 6), BitwiseAnd(section_idx, 255))
+        SetByte(buf, Add(base, 7), BitwiseAnd(RightShift(section_idx, 8), 255))
+
+        // st_value (8 bytes)
+        j = 0
+        WhileLoop LessThan(j, 8) {
+            bval = BitwiseAnd(RightShift(value, Multiply(j, 8)), 255)
+            SetByte(buf, Add(base, Add(8, j)), bval)
+            j = Add(j, 1)
+        }
+
+        // st_size (8 bytes)
+        j = 0
+        WhileLoop LessThan(j, 8) {
+            bval = BitwiseAnd(RightShift(size, Multiply(j, 8)), 255)
+            SetByte(buf, Add(base, Add(16, j)), bval)
+            j = Add(j, 1)
+        }
+
+        KMod.sym_count = Add(KMod.sym_count, 1)
+    }
+}
+
+// =============================================================================
+// RELOCATION HELPERS
+// =============================================================================
+
+// Write a single 24-byte RELA entry into rela_buffer
+Function.KMod_AddRela {
+    Input: offset: Integer
+    Input: sym_idx: Integer
+    Input: rela_type: Integer
+    Input: addend: Integer
+    Body: {
+        base = Multiply(KMod.rela_count, Rela.SIZE)
+        buf = KMod.rela_buffer
+
+        // r_offset (8 bytes)
+        j = 0
+        WhileLoop LessThan(j, 8) {
+            bval = BitwiseAnd(RightShift(offset, Multiply(j, 8)), 255)
+            SetByte(buf, Add(base, j), bval)
+            j = Add(j, 1)
+        }
+
+        // r_info (8 bytes) = (sym_idx << 32) | type
+        // Low 4 bytes = type
+        SetByte(buf, Add(base, 8), BitwiseAnd(rela_type, 255))
+        SetByte(buf, Add(base, 9), BitwiseAnd(RightShift(rela_type, 8), 255))
+        SetByte(buf, Add(base, 10), BitwiseAnd(RightShift(rela_type, 16), 255))
+        SetByte(buf, Add(base, 11), BitwiseAnd(RightShift(rela_type, 24), 255))
+        // High 4 bytes = sym_idx
+        SetByte(buf, Add(base, 12), BitwiseAnd(sym_idx, 255))
+        SetByte(buf, Add(base, 13), BitwiseAnd(RightShift(sym_idx, 8), 255))
+        SetByte(buf, Add(base, 14), BitwiseAnd(RightShift(sym_idx, 16), 255))
+        SetByte(buf, Add(base, 15), BitwiseAnd(RightShift(sym_idx, 24), 255))
+
+        // r_addend (8 bytes)
+        j = 0
+        WhileLoop LessThan(j, 8) {
+            bval = BitwiseAnd(RightShift(addend, Multiply(j, 8)), 255)
+            SetByte(buf, Add(base, Add(16, j)), bval)
+            j = Add(j, 1)
+        }
+
+        KMod.rela_count = Add(KMod.rela_count, 1)
+    }
+}
+
+// =============================================================================
+// SECTION HEADER WRITE HELPER
+// Works around the 6-param function limit by passing extra fields via FixedPool
+// =============================================================================
+FixedPool.SHWrite {
+    "link":      Initialize=0, CanChange=True
+    "info":      Initialize=0, CanChange=True
+    "addralign": Initialize=0, CanChange=True
+    "entsize":   Initialize=0, CanChange=True
+}
+
+Function.KMod_WriteSectionHeader {
+    Input: sh_name: Integer
+    Input: sh_type: Integer
+    Input: sh_flags: Integer
+    Input: sh_addr: Integer
+    Input: sh_offset: Integer
+    Input: sh_size: Integer
+    Body: {
+        ELF_WriteDWord(sh_name)
+        ELF_WriteDWord(sh_type)
+        ELF_WriteQWord(sh_flags)
+        ELF_WriteQWord(sh_addr)
+        ELF_WriteQWord(sh_offset)
+        ELF_WriteQWord(sh_size)
+        ELF_WriteDWord(SHWrite.link)
+        ELF_WriteDWord(SHWrite.info)
+        ELF_WriteQWord(SHWrite.addralign)
+        ELF_WriteQWord(SHWrite.entsize)
+    }
+}
+
+// =============================================================================
+// MAIN BUILD FUNCTION — Phase 1: Minimal .ko (no printk)
+// =============================================================================
+Function.ELF_BuildKernelModule {
+    Input: code: Address
+    Input: code_size: Integer
+    Input: data: Address
+    Input: data_size: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[KO] Building kernel module...\n")
+
+        KMod_Init()
+
+        // =====================================================================
+        // Build .modinfo content: "license=GPL\0"
+        // =====================================================================
+        modinfo_str = "license=GPL"
+        modinfo_size = 12
+
+        // =====================================================================
+        // Build section name string table (.shstrtab)
+        // =====================================================================
+        shstrtab = Allocate(128)
+        shstrtab_size = 0
+
+        // [0] = null byte
+        SetByte(shstrtab, 0, 0)
+        shstrtab_size = 1
+
+        // Helper: write string into shstrtab, return offset
+        // .text
+        shname_text = shstrtab_size
+        shstrtab_size = KMod_WriteString(shstrtab, shstrtab_size, ".text")
+
+        // .data
+        shname_data = shstrtab_size
+        shstrtab_size = KMod_WriteString(shstrtab, shstrtab_size, ".data")
+
+        // .modinfo
+        shname_modinfo = shstrtab_size
+        shstrtab_size = KMod_WriteString(shstrtab, shstrtab_size, ".modinfo")
+
+        // .symtab
+        shname_symtab = shstrtab_size
+        shstrtab_size = KMod_WriteString(shstrtab, shstrtab_size, ".symtab")
+
+        // .strtab
+        shname_strtab = shstrtab_size
+        shstrtab_size = KMod_WriteString(shstrtab, shstrtab_size, ".strtab")
+
+        // .rela.text
+        shname_rela = shstrtab_size
+        shstrtab_size = KMod_WriteString(shstrtab, shstrtab_size, ".rela.text")
+
+        // .shstrtab
+        shname_shstrtab = shstrtab_size
+        shstrtab_size = KMod_WriteString(shstrtab, shstrtab_size, ".shstrtab")
+
+        // =====================================================================
+        // Build symbol table
+        // =====================================================================
+        // [0] null symbol — required
+        KMod_AddSymbol(0, STBind.LOCAL, STType.NOTYPE, SHIndex.UNDEF, 0, 0)
+
+        // [1] .text section symbol
+        text_sec_name = KMod_AddString(".text")
+        KMod_AddSymbol(text_sec_name, STBind.LOCAL, STType.SECTION, 1, 0, 0)
+
+        // Mark first global (symbols after this are GLOBAL)
+        KMod.first_global = KMod.sym_count
+
+        // [2] init_module — offset 0 in .text
+        init_name = KMod_AddString("init_module")
+        KMod_AddSymbol(init_name, STBind.GLOBAL, STType.FUNC, 1, 0, 0)
+
+        // [3] cleanup_module — offset after init code
+        // init_module is: 31 C0 C3 = 3 bytes
+        cleanup_name = KMod_AddString("cleanup_module")
+        KMod_AddSymbol(cleanup_name, STBind.GLOBAL, STType.FUNC, 1, 3, 0)
+
+        // =====================================================================
+        // Calculate sizes
+        // =====================================================================
+        symtab_size = Multiply(KMod.sym_count, Sym.SIZE)
+        rela_size = Multiply(KMod.rela_count, Rela.SIZE)
+
+        // =====================================================================
+        // Calculate layout offsets
+        // Everything after the 64-byte ELF header
+        // =====================================================================
+        elf_hdr_end = ELFHdr.SIZE
+
+        // .text
+        text_offset = elf_hdr_end
+        text_end = Add(text_offset, code_size)
+
+        // .data (aligned to 8)
+        data_offset = BitwiseAnd(Add(text_end, 7), -8)
+        data_end = Add(data_offset, data_size)
+
+        // .modinfo (aligned to 1)
+        modinfo_offset = data_end
+        modinfo_end = Add(modinfo_offset, modinfo_size)
+
+        // .symtab (aligned to 8)
+        symtab_offset = BitwiseAnd(Add(modinfo_end, 7), -8)
+        symtab_end = Add(symtab_offset, symtab_size)
+
+        // .strtab (aligned to 1)
+        strtab_offset = symtab_end
+        strtab_end = Add(strtab_offset, KMod.strtab_size)
+
+        // .rela.text (aligned to 8)
+        rela_offset = BitwiseAnd(Add(strtab_end, 7), -8)
+        rela_end = Add(rela_offset, rela_size)
+
+        // .shstrtab (aligned to 1)
+        shstrtab_offset = rela_end
+        shstrtab_end = Add(shstrtab_offset, shstrtab_size)
+
+        // Section header table (aligned to 8)
+        shdr_offset = BitwiseAnd(Add(shstrtab_end, 7), -8)
+        shdr_count = 8
+        shdr_total = Multiply(shdr_count, SHdr.SIZE)
+
+        total_size = Add(shdr_offset, shdr_total)
+
+        PrintMessage("[KO] Layout:\n")
+        PrintMessage("  .text:     offset=")
+        PrintNumber(text_offset)
+        PrintMessage(" size=")
+        PrintNumber(code_size)
+        PrintMessage("\n  .data:     offset=")
+        PrintNumber(data_offset)
+        PrintMessage(" size=")
+        PrintNumber(data_size)
+        PrintMessage("\n  .modinfo:  offset=")
+        PrintNumber(modinfo_offset)
+        PrintMessage("\n  .symtab:   offset=")
+        PrintNumber(symtab_offset)
+        PrintMessage(" syms=")
+        PrintNumber(KMod.sym_count)
+        PrintMessage("\n  .strtab:   offset=")
+        PrintNumber(strtab_offset)
+        PrintMessage("\n  .shstrtab: offset=")
+        PrintNumber(shstrtab_offset)
+        PrintMessage("\n  shdrs:     offset=")
+        PrintNumber(shdr_offset)
+        PrintMessage("\n  total:     ")
+        PrintNumber(total_size)
+        PrintMessage(" bytes\n")
+
+        // =====================================================================
+        // Write ELF header
+        // =====================================================================
+        // Reuse ELF_WriteHeader but we need to patch e_type to REL
+        // Instead, write it manually for full control
+        // =====================================================================
+
+        // e_ident[0..3]: magic
+        ELF_WriteByte(127)
+        ELF_WriteByte(69)
+        ELF_WriteByte(76)
+        ELF_WriteByte(70)
+
+        // e_ident[4]: 64-bit
+        ELF_WriteByte(2)
+        // e_ident[5]: little endian
+        ELF_WriteByte(1)
+        // e_ident[6]: version
+        ELF_WriteByte(1)
+        // e_ident[7]: OS ABI (ELFOSABI_NONE)
+        ELF_WriteByte(0)
+        // e_ident[8..15]: padding
+        ELF_WriteZeros(8)
+
+        // e_type: ET_REL = 1
+        ELF_WriteWord(ELFType.REL)
+        // e_machine: x86-64
+        ELF_WriteWord(ELFMachine.X86_64)
+        // e_version
+        ELF_WriteDWord(1)
+        // e_entry: 0 (no entry point)
+        ELF_WriteQWord(0)
+        // e_phoff: 0 (no program headers)
+        ELF_WriteQWord(0)
+        // e_shoff: section header offset
+        ELF_WriteQWord(shdr_offset)
+        // e_flags
+        ELF_WriteDWord(0)
+        // e_ehsize
+        ELF_WriteWord(ELFHdr.SIZE)
+        // e_phentsize
+        ELF_WriteWord(0)
+        // e_phnum: 0
+        ELF_WriteWord(0)
+        // e_shentsize
+        ELF_WriteWord(SHdr.SIZE)
+        // e_shnum
+        ELF_WriteWord(shdr_count)
+        // e_shstrndx: section 7
+        ELF_WriteWord(7)
+
+        // =====================================================================
+        // Write .text
+        // =====================================================================
+        ELF_WriteBytes(code, code_size)
+
+        // Pad to .data
+        WhileLoop LessThan(ELF.buffer_size, data_offset) {
+            ELF_WriteByte(0)
+        }
+
+        // =====================================================================
+        // Write .data
+        // =====================================================================
+        IfCondition GreaterThan(data_size, 0) ThenBlock: {
+            ELF_WriteBytes(data, data_size)
+        }
+
+        // Pad to .modinfo
+        WhileLoop LessThan(ELF.buffer_size, modinfo_offset) {
+            ELF_WriteByte(0)
+        }
+
+        // =====================================================================
+        // Write .modinfo
+        // =====================================================================
+        ELF_WriteBytes(modinfo_str, modinfo_size)
+
+        // Pad to .symtab
+        WhileLoop LessThan(ELF.buffer_size, symtab_offset) {
+            ELF_WriteByte(0)
+        }
+
+        // =====================================================================
+        // Write .symtab
+        // =====================================================================
+        ELF_WriteBytes(KMod.sym_buffer, symtab_size)
+
+        // Pad to .strtab
+        WhileLoop LessThan(ELF.buffer_size, strtab_offset) {
+            ELF_WriteByte(0)
+        }
+
+        // =====================================================================
+        // Write .strtab
+        // =====================================================================
+        ELF_WriteBytes(KMod.strtab, KMod.strtab_size)
+
+        // Pad to .rela.text
+        WhileLoop LessThan(ELF.buffer_size, rela_offset) {
+            ELF_WriteByte(0)
+        }
+
+        // =====================================================================
+        // Write .rela.text (empty for Phase 1)
+        // =====================================================================
+        IfCondition GreaterThan(rela_size, 0) ThenBlock: {
+            ELF_WriteBytes(KMod.rela_buffer, rela_size)
+        }
+
+        // Pad to .shstrtab
+        WhileLoop LessThan(ELF.buffer_size, shstrtab_offset) {
+            ELF_WriteByte(0)
+        }
+
+        // =====================================================================
+        // Write .shstrtab
+        // =====================================================================
+        ELF_WriteBytes(shstrtab, shstrtab_size)
+
+        // Pad to section headers
+        WhileLoop LessThan(ELF.buffer_size, shdr_offset) {
+            ELF_WriteByte(0)
+        }
+
+        // =====================================================================
+        // Write section headers
+        // =====================================================================
+
+        // [0] SHN_UNDEF — null entry
+        SHWrite.link = 0
+        SHWrite.info = 0
+        SHWrite.addralign = 0
+        SHWrite.entsize = 0
+        KMod_WriteSectionHeader(0, SHType.NULL, 0, 0, 0, 0)
+
+        // [1] .text
+        SHWrite.link = 0
+        SHWrite.info = 0
+        SHWrite.addralign = 16
+        SHWrite.entsize = 0
+        text_flags = BitwiseOr(SHFlags.ALLOC, SHFlags.EXECINSTR)
+        KMod_WriteSectionHeader(shname_text, SHType.PROGBITS, text_flags,
+            0, text_offset, code_size)
+
+        // [2] .data
+        SHWrite.link = 0
+        SHWrite.info = 0
+        SHWrite.addralign = 8
+        SHWrite.entsize = 0
+        data_flags = BitwiseOr(SHFlags.ALLOC, SHFlags.WRITE)
+        KMod_WriteSectionHeader(shname_data, SHType.PROGBITS, data_flags,
+            0, data_offset, data_size)
+
+        // [3] .modinfo
+        SHWrite.link = 0
+        SHWrite.info = 0
+        SHWrite.addralign = 1
+        SHWrite.entsize = 0
+        KMod_WriteSectionHeader(shname_modinfo, SHType.PROGBITS, SHFlags.ALLOC,
+            0, modinfo_offset, modinfo_size)
+
+        // [4] .symtab — sh_link=5 (.strtab), sh_info=first_global
+        SHWrite.link = 5
+        SHWrite.info = KMod.first_global
+        SHWrite.addralign = 8
+        SHWrite.entsize = Sym.SIZE
+        KMod_WriteSectionHeader(shname_symtab, SHType.SYMTAB, 0,
+            0, symtab_offset, symtab_size)
+
+        // [5] .strtab
+        SHWrite.link = 0
+        SHWrite.info = 0
+        SHWrite.addralign = 1
+        SHWrite.entsize = 0
+        KMod_WriteSectionHeader(shname_strtab, SHType.STRTAB, 0,
+            0, strtab_offset, KMod.strtab_size)
+
+        // [6] .rela.text — sh_link=4 (.symtab), sh_info=1 (.text section)
+        SHWrite.link = 4
+        SHWrite.info = 1
+        SHWrite.addralign = 8
+        SHWrite.entsize = Rela.SIZE
+        KMod_WriteSectionHeader(shname_rela, SHType.RELA, 0,
+            0, rela_offset, rela_size)
+
+        // [7] .shstrtab
+        SHWrite.link = 0
+        SHWrite.info = 0
+        SHWrite.addralign = 1
+        SHWrite.entsize = 0
+        KMod_WriteSectionHeader(shname_shstrtab, SHType.STRTAB, 0,
+            0, shstrtab_offset, shstrtab_size)
+
+        // =====================================================================
+        // Cleanup
+        // =====================================================================
+        Deallocate(shstrtab, 128)
+        KMod_Free()
+
+        PrintMessage("[KO] Build complete: ")
+        PrintNumber(ELF.buffer_size)
+        PrintMessage(" bytes\n")
+
+        PrintMessage("[KO] About to return 1\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// HELPER: Write null-terminated string into buffer, return new offset
+// =============================================================================
+Function.KMod_WriteString {
+    Input: buf: Address
+    Input: offset: Integer
+    Input: str: Address
+    Output: Integer
+    Body: {
+        i = 0
+        pos = offset
+        done = 0
+        WhileLoop EqualTo(done, 0) {
+            c = GetByte(str, i)
+            SetByte(buf, pos, c)
+            pos = Add(pos, 1)
+            IfCondition EqualTo(c, 0) ThenBlock: {
+                done = 1
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(pos)
+    }
+}
+
+// =============================================================================
+// OUTPUT: Build and write .ko from emit buffers
+// =============================================================================
+Function.Output_BuildKernelModule {
+    Input: filename: Address
+    Output: Integer
+    Body: {
+        PrintMessage("\n[OUTPUT] === Building Kernel Module ===\n")
+
+        ELF_Init()
+
+        result = ELF_BuildKernelModule(Emit.code, Emit.code_size, Emit.data, Emit.data_size)
+
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            PrintMessage("[OUTPUT] ERROR: KO build failed\n")
+            ELF_Free()
+            ReturnValue(0)
+        }
+
+        result = Output_WriteExecutable(filename)
+
+        ELF_Free()
+
+        IfCondition EqualTo(result, 1) ThenBlock: {
+            PrintMessage("[OUTPUT] === Kernel Module Complete ===\n\n")
+        }
+
+        ReturnValue(result)
+    }
+}

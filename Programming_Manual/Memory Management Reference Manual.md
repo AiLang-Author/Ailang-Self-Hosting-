@@ -2,666 +2,462 @@
 
 ## Overview
 
-AI Lang provides a sophisticated memory management system designed for high-performance native compilation. The system combines stack allocation, heap management, and specialized pool types to offer both safety and efficiency without garbage collection overhead.
+AILang provides direct memory control with no garbage collector and no
+hidden allocation. Every allocation is explicit. Every deallocation is
+explicit. Memory behavior is deterministic and auditable.
 
-**Key Features:**
-- Direct memory control with automatic allocation
-- Multiple pool types for different use cases
-- Type-safe LinkagePool system for structured data
-- Zero-overhead access patterns
-- Explicit allocation and deallocation
-
----
-
-## Table of Contents
-
-1. [Memory Architecture](#memory-architecture)
-2. [Pool Types](#pool-types)
-3. [Variables and Stack Allocation](#variables-and-stack-allocation)
-4. [Heap Allocation](#heap-allocation)
-5. [LinkagePool System](#linkagepool-system)
-6. [Memory Access Patterns](#memory-access-patterns)
-7. [Best Practices](#best-practices)
-8. [Performance Considerations](#performance-considerations)
-9. [Common Patterns](#common-patterns)
-10. [Troubleshooting](#troubleshooting)
+The allocator is slab-based (`Library.Arena`) — requests route to
+fixed-size pools rather than going directly to the kernel. This
+eliminates most syscall overhead for the small, frequent allocations
+common in compiler and systems work. See `Library.Arena` for internals.
 
 ---
 
-## Memory Architecture
+## Register Map
 
-### Register Usage
+AILang uses a fixed register allocation strategy. Understanding it
+matters when writing syscall wrappers or inline assembly.
 
-AI Lang uses a well-defined register allocation strategy:
+| Register | Role |
+|----------|------|
+| RAX | Return values, temporary computations |
+| RBX | General purpose, preserved across calls |
+| RCX | Loop counters, temporaries |
+| RDX | Secondary computations |
+| RSI | Source pointers, string ops |
+| RDI | Destination pointers, string ops |
+| RBP | Stack frame base pointer |
+| RSP | Stack pointer |
+| R8–R9 | 7th and 8th function parameters |
+| R10–R11 | Temporary values |
+| R12–R13 | Preserved temporaries |
+| R14 | Reserved |
+| **R15** | **Pool table base — NEVER modify** |
+
+**R15 is reserved.** The compiler uses R15 as the base pointer for all
+`FixedPool` variable access. Writing to R15 in any user code, syscall
+wrapper, or inline assembly will corrupt all pool variable access.
+
+---
+
+## Memory Layout
 
 ```
-RAX - Return values, temporary computations
-RBX - General purpose, preserved across calls
-RCX - Loop counters, temporary values
-RDX - Secondary computations
-RSI - String operations, source pointers
-RDI - String operations, destination pointers
-RBP - Stack frame base pointer
-RSP - Stack pointer
-R8-R9 - Function parameters (7th and 8th)
-R10-R11 - Temporary values
-R12-R13 - Preserved temporaries
-R14 - Reserved for future use
-R15 - Pool table base pointer (FixedPool access)
-```
-
-**Critical:** R15 is reserved for the pool table. Never modify R15 in user code.
-
-### Memory Regions
-
-```
-┌─────────────────────────────────┐ High addresses
-│         Stack                    │ ← RSP, RBP
-│    (local variables, frames)     │
+High addresses
+┌─────────────────────────────────┐
+│           Stack                 │  ← RSP / RBP
+│   (local variables, frames)     │
 ├─────────────────────────────────┤
-│         Heap                     │
-│    (DynamicPool, Allocate)       │
+│           Heap                  │
+│   (Allocate / Arena slabs)      │
 ├─────────────────────────────────┤
-│      Pool Table                  │ ← R15
-│    (FixedPool variables)         │
+│        Pool Table               │  ← R15
+│   (FixedPool variables)         │
 ├─────────────────────────────────┤
-│      Data Section                │
-│  (strings, constants, LinkagePools)│
+│        Data Section             │
+│   (string literals, constants)  │
 ├─────────────────────────────────┤
-│      Code Section                │
-│    (compiled machine code)       │
-└─────────────────────────────────┘ Low addresses
+│        Code Section             │
+│   (compiled machine code)       │
+└─────────────────────────────────┘
+Low addresses
 ```
 
 ---
 
 ## Pool Types
 
-AI Lang provides four specialized pool types for different memory management strategies.
+AILang has six pool types. Each has a specific purpose. Using the right
+pool type is the primary memory management decision in AILang code.
 
 ### FixedPool
 
-**Purpose:** Static, globally accessible variables with O(1) access time.
+Global, static, O(1) access. The most common pool type.
 
-**Characteristics:**
-- Allocated once at program startup via mmap
-- Stored in R15-relative addressing
-- Page-aligned (4KB minimum)
-- Zero-initialized automatically
-- Maximum 131,072 variables (1MB limit)
-
-**Declaration:**
 ```ailang
 FixedPool.Config {
-    "max_connections": Initialize=100
-    "timeout": Initialize=30
     "buffer_size": Initialize=4096
-    "enabled": Initialize=1
+    "max_retries": Initialize=3
+    "debug_mode":  Initialize=0
 }
+
+// Read
+size = Config.buffer_size
+
+// Write
+Config.debug_mode = 1
 ```
 
-**Access:**
-```ailang
-// Reading
-current_timeout = Config.timeout
+**Compiled to:** `MOV RAX, [R15 + offset]` (read) /
+`MOV [R15 + offset], RAX` (write) — single instruction, no indirection.
 
-// Writing
-Config.timeout = 60
+**Use when:** Global state, configuration, counters, statistics, flags.
+Maximum 131,072 variables (1 MB pool table limit).
 
-// The compiler generates:
-// MOV RAX, [R15 + offset]  // Read
-// MOV [R15 + offset], RAX  // Write
-```
+Each variable occupies exactly 8 bytes, addressed as `[R15 + index*8]`.
 
-**Memory Layout:**
-```
-R15 → [var_0: 8 bytes][var_1: 8 bytes][var_2: 8 bytes]...
-```
-
-Each variable occupies exactly 8 bytes, addressed as `[R15 + index * 8]`.
-
-**Use Cases:**
-- Configuration values
-- Global state
-- Counters and statistics
-- Flags and settings
+---
 
 ### DynamicPool
 
-**Purpose:** Heap-allocated, growable collections with dynamic sizing.
+Heap-allocated, growable. Two-instruction access (load pointer, then
+access field).
 
-**Characteristics:**
-- Allocated via mmap on first use
-- Can grow beyond initial capacity
-- Stored on heap with pointer on stack
-- Includes header (16 bytes: capacity + size)
-
-**Declaration:**
 ```ailang
 DynamicPool.Cache {
     "entries": Initialize=0
-    "hits": Initialize=0
-    "misses": Initialize=0
+    "hits":    Initialize=0
+    "misses":  Initialize=0
 }
-```
 
-**Memory Layout:**
-```
-Stack: [pointer to heap] (8 bytes)
-           ↓
-Heap:  [capacity: 8][size: 8][entries: 8][hits: 8][misses: 8]
-       ←─ header ─→  ←───────── data ──────────→
-```
-
-**Access Pattern:**
-```ailang
-Cache.entries = 100
+Cache.entries = Add(Cache.entries, 1)
 hits = Cache.hits
-
-// The compiler generates:
-// 1. Load heap pointer from stack: MOV RAX, [RBP-offset]
-// 2. Access member: MOV RBX, [RAX + member_offset]
 ```
 
-**Use Cases:**
-- Growing data structures
-- Dynamic collections
-- Cache systems
-- Temporary working sets
+**Memory layout:**
+```
+Stack: [pointer to heap block]
+           ↓
+Heap:  [capacity: 8][size: 8][field0: 8][field1: 8]...
+       ←── header ──→ ←──────── data ────────→
+```
+
+**Use when:** Data that grows dynamically, lifetime spans multiple
+functions, growable collections.
+
+---
 
 ### TemporalPool
 
-**Purpose:** Scoped allocations with automatic lifetime management.
+Scope-bound. Lifetime tied to the function or block that declares it.
+Freed automatically on scope exit.
 
-**Characteristics:**
-- Lifetime tied to scope (function/block)
-- Automatic deallocation on scope exit
-- Fast allocation (no fragmentation concerns)
-- Ideal for temporary computations
-
-**Declaration:**
 ```ailang
-TemporalPool.Workspace {
-    "temp_buffer": Initialize=0
-    "scratch_space": Initialize=0
-}
-```
-
-**Lifetime:**
-```ailang
-Function.ProcessData {
+Function.Process.Compress {
     Body: {
-        // TemporalPool allocated here
-        Workspace.temp_buffer = Allocate(1024)
-        
-        // Use the buffer
-        ProcessWithBuffer(Workspace.temp_buffer)
-        
-        // Automatically freed when function returns
+        TemporalPool.Workspace {
+            "scratch": Initialize=0
+            "offset":  Initialize=0
+        }
+
+        Workspace.scratch = Allocate(1024)
+        // ... use scratch ...
+        // Freed automatically on return
     }
 }
 ```
 
-**Use Cases:**
-- Function-local temporary storage
-- Intermediate computation buffers
-- Short-lived data structures
+**Use when:** Function-local temporaries, intermediate computation
+buffers, short-lived working sets.
+
+---
 
 ### LinkagePool
 
-**Purpose:** Structured, type-safe data blocks for inter-function communication.
+Structured, typed data blocks for passing complex data between
+functions. Fields have names, types, and optional direction constraints.
 
-**Characteristics:**
-- Defined structure with named fields
-- Type tracking by compiler
-- Field-level access with dot notation
-- Allocated via AllocateLinkage()
-- Supports both integers and strings
-
-**Declaration:**
 ```ailang
-LinkagePool.Person {
-    "name": Initialize=""
-    "age": Initialize=0
-    "id": Initialize=0
-    "active": Initialize=1
+LinkagePool.Request {
+    "method":   Initialize=0
+    "path":     Initialize=0
+    "body_len": Initialize=0
+    "status":   Initialize=0
 }
-```
 
-**Usage:**
-```ailang
-// Allocate
-person = AllocateLinkage(LinkagePool.Person)
+// Allocate an instance
+req = AllocateLinkage(LinkagePool.Request)
 
-// Access with dot notation
-person.name = "Alice"
-person.age = 30
-person.id = 12345
-person.active = 1
+// Access fields with dot notation
+req.method   = 1
+req.path     = path_ptr
+req.body_len = 256
 
 // Read fields
-current_age = person.age
+method = req.method
 ```
 
-**Memory Layout:**
-```
-[name_ptr: 8][age: 8][id: 8][active: 8]
-```
+**Field memory layout:** Each field occupies 8 bytes, contiguous from
+the allocation base. Field names are compile-time — no runtime lookup.
 
-See the **LinkagePool Reference Manual** for complete details.
-
----
-
-## Variables and Stack Allocation
-
-### Automatic Stack Variables
-
-Regular variables are allocated on the stack automatically:
-
-```ailang
-x = 10        // Stack allocation at [RBP-8]
-y = 20        // Stack allocation at [RBP-16]
-z = Add(x, y) // Stack allocation at [RBP-24]
-```
-
-**Stack Frame:**
-```
-RBP → [saved RBP]
-      [return address]
-      [x: 8 bytes]      ← RBP-8
-      [y: 8 bytes]      ← RBP-16
-      [z: 8 bytes]      ← RBP-24
-RSP → [top of stack]
-```
-
-### Variable Scope
-
-Variables have lexical scoping:
-
-```ailang
-x = 10  // Outer scope
-
-IfCondition True ThenBlock: {
-    y = 20  // Inner scope
-    z = Add(x, y)  // Can access outer x
-}
-
-// y is no longer accessible here
-```
-
----
-
-## Heap Allocation
-
-### Allocate() Function
-
-Allocate memory dynamically on the heap:
-
-```ailang
-// Allocate 1024 bytes
-buffer = Allocate(1024)
-
-// Use the buffer
-StoreValue(buffer, 42)
-value = Dereference(buffer)
-
-// Free when done
-Deallocate(buffer, 1024)
-```
-
-**Compiled to:**
-```asm
-; Allocate
-MOV RAX, 9              ; sys_mmap
-MOV RDI, 0              ; addr = NULL
-MOV RSI, 1024           ; length
-MOV RDX, 3              ; PROT_READ | PROT_WRITE
-MOV R10, 0x22           ; MAP_PRIVATE | MAP_ANONYMOUS
-MOV R8, -1              ; fd = -1
-MOV R9, 0               ; offset = 0
-SYSCALL
-```
-
-### Memory Operations
-
-**StoreValue** - Write to memory:
-```ailang
-ptr = Allocate(64)
-StoreValue(ptr, 100)           // Store at base
-StoreValue(Add(ptr, 8), 200)   // Store at offset 8
-```
-
-**Dereference** - Read from memory:
-```ailang
-value1 = Dereference(ptr)
-value2 = Dereference(Add(ptr, 8))
-```
-
-**Pointer Arithmetic:**
-```ailang
-// Calculate offset
-offset = Multiply(index, 8)
-element_ptr = Add(base_ptr, offset)
-
-// Access element
-element = Dereference(element_ptr)
-```
-
----
-
-## LinkagePool System
-
-LinkagePools provide structured, type-safe data blocks. See the **LinkagePool Reference Manual** for comprehensive documentation.
-
-### Quick Reference
-
-```ailang
-// Define structure
-LinkagePool.Config {
-    "host": Initialize=""
-    "port": Initialize=8080
-    "max_conn": Initialize=100
-}
-
-// Allocate instance
-config = AllocateLinkage(LinkagePool.Config)
-
-// Access fields
-config.host = "localhost"
-config.port = 3000
-config.max_conn = 50
-
-// Read fields
-current_port = config.port
-```
-
-### Type Safety
-
-The compiler tracks LinkagePool types:
+**Type safety:** The compiler tracks which `LinkagePool` type each
+variable holds. Accessing a field that doesn't belong to the type is a
+compile error:
 
 ```ailang
 LinkagePool.TypeA { "field1": Initialize=0 }
 LinkagePool.TypeB { "field2": Initialize=0 }
 
 a = AllocateLinkage(LinkagePool.TypeA)
-b = AllocateLinkage(LinkagePool.TypeB)
+a.field1 = 10   // valid
+a.field2 = 20   // COMPILE ERROR: field2 not in TypeA
+```
 
-a.field1 = 10  // ✓ Valid
-a.field2 = 20  // ✗ Compile error: field2 not in TypeA
+**Use when:** Structured data passed between functions, typed records,
+inter-module communication.
+
+---
+
+### Other Pool Types
+
+These pool types exist in the keyword table and parser for specialized
+subsystems. They follow the same declaration syntax as `FixedPool`.
+
+| Type | Purpose |
+|------|---------|
+| `NeuralPool` | Neural network layer state |
+| `KernelPool` | Kernel module interface data |
+| `ActorPool` | Actor-model message passing |
+| `SecurityPool` | Cryptographic / security state |
+| `ConstrainedPool` | Range-validated fields |
+| `FilePool` | File I/O state |
+
+---
+
+## Heap Allocation Primitives
+
+### `Allocate(size)` / `Deallocate(ptr, size)`
+
+```ailang
+buf = Allocate(1024)
+// ... use buf ...
+Deallocate(buf, 1024)
+```
+
+Routes through `Library.Arena`'s slab allocator. Sizes ≤ 4096 bytes
+hit a slab pool (O(1), no syscall after warmup). Sizes > 4096 go to
+the general arena (one `mmap` per overflow chunk).
+
+**Critical:** The `size` passed to `Deallocate` must exactly match the
+`size` passed to `Allocate`. The slab router uses this value to select
+the correct pool. A mismatched size routes to the wrong slab and
+corrupts the free list.
+
+```ailang
+// CORRECT
+buf = Allocate(256)
+Deallocate(buf, 256)   // same size
+
+// WRONG — corrupts allocator
+buf = Allocate(256)
+Deallocate(buf, 0)     // wrong size
+```
+
+### `Arena_Reset()`
+
+Resets all slabs to empty without releasing kernel memory. Subsequent
+allocations reuse the same physical pages. Overflow chunks are released;
+initial chunks are kept. Much cheaper than `FreeAll` + `Init`.
+
+```ailang
+// Between compiler passes, grep files, etc.
+Arena_Reset()
 ```
 
 ---
 
-## Memory Access Patterns
+## Raw Memory Operations
 
-### Sequential Access
-
-Optimal for cache performance:
-
-```ailang
-// Process array sequentially
-i = 0
-WhileLoop LessThan(i, count) {
-    offset = Multiply(i, 8)
-    element_ptr = Add(base_ptr, offset)
-    value = Dereference(element_ptr)
-    
-    // Process value
-    ProcessElement(value)
-    
-    i = Add(i, 1)
-}
-```
-
-### Strided Access
-
-Access with fixed stride:
+| Primitive | Description |
+|-----------|-------------|
+| `Dereference(ptr)` | Read 8-byte value at `ptr` |
+| `StoreValue(ptr, val)` | Write 8-byte value to `ptr` |
+| `GetByte(ptr, offset)` | Read 1 byte at `ptr + offset` |
+| `SetByte(ptr, offset, val)` | Write 1 byte at `ptr + offset` |
+| `MemoryCopy(dst, src, n)` | Copy `n` bytes (SSE2-vectorized) |
+| `MemorySet(ptr, val, n)` | Fill `n` bytes with `val` |
+| `MemChr(ptr, byte, n)` | Find byte in `n` bytes, returns offset or -1 (SSE2) |
+| `MemCompare(a, b, n)` | Compare `n` bytes, returns 0 if equal (SSE2) |
+| `AddressOf(var)` | Get address of a variable |
 
 ```ailang
-// Every 4th element
-i = 0
-WhileLoop LessThan(i, count) {
-    offset = Multiply(i, 32)  // 4 * 8 bytes
-    element_ptr = Add(base_ptr, offset)
-    value = Dereference(element_ptr)
-    
-    i = Add(i, 1)
-}
-```
+// Array element access (8-byte elements)
+offset  = Multiply(i, 8)
+element = Dereference(Add(base_ptr, offset))
 
-### Structure Access
+// Struct-style manual layout
+StoreValue(ptr, id)              // field 0 at offset 0
+StoreValue(Add(ptr, 8), age)     // field 1 at offset 8
+StoreValue(Add(ptr, 16), score)  // field 2 at offset 16
 
-Access fields in a structure:
-
-```ailang
-// Manual structure (without LinkagePool)
-person_ptr = Allocate(32)
-
-// Store fields
-StoreValue(person_ptr, 12345)           // ID at offset 0
-StoreValue(Add(person_ptr, 8), 30)      // Age at offset 8
-StoreValue(Add(person_ptr, 16), 50000)  // Salary at offset 16
-
-// Read fields
-person_id = Dereference(person_ptr)
-person_age = Dereference(Add(person_ptr, 8))
-person_salary = Dereference(Add(person_ptr, 16))
+id    = Dereference(ptr)
+age   = Dereference(Add(ptr, 8))
+score = Dereference(Add(ptr, 16))
 ```
 
 ---
 
 ## Best Practices
 
-### 1. Choose the Right Pool Type
+### Choose the right pool type
 
-**Use FixedPool when:**
-- Data is global and persistent
-- Access patterns are random
-- Fast O(1) access is critical
-- Memory size is predictable
+| Need | Pool |
+|------|------|
+| Global config / counters / flags | `FixedPool` |
+| Growable collections | `DynamicPool` |
+| Function-local temporaries | `TemporalPool` |
+| Typed structured data | `LinkagePool` |
+| Raw buffers / byte arrays | `Allocate()` |
 
-**Use DynamicPool when:**
-- Data size grows dynamically
-- Lifetime spans multiple functions
-- You need structured collections
-
-**Use TemporalPool when:**
-- Data is temporary
-- Lifetime is scope-bound
-- Frequent allocation/deallocation
-
-**Use LinkagePool when:**
-- Structured data with named fields
-- Passing complex data between functions
-- Type safety is important
-
-### 2. Memory Hygiene
-
-Always deallocate heap memory:
+### Always pair Allocate with Deallocate
 
 ```ailang
-// Good
-buffer = Allocate(1024)
-ProcessData(buffer)
-Deallocate(buffer, 1024)
-
-// Bad - memory leak
-buffer = Allocate(1024)
-ProcessData(buffer)
-// Missing Deallocate!
+buf = Allocate(1024)
+// work
+Deallocate(buf, 1024)
 ```
 
-### 3. Align Allocations
+For cleanup safety, use `Arena_Reset()` at natural boundaries (between
+files, between passes) rather than tracking every individual allocation.
 
-For optimal cache performance, align large allocations:
-
-```ailang
-// Align to 64 bytes (cache line)
-requested_size = 1000
-aligned_size = Add(requested_size, 63)
-aligned_size = Divide(aligned_size, 64)
-aligned_size = Multiply(aligned_size, 64)
-
-buffer = Allocate(aligned_size)
-```
-
-### 4. Minimize Pointer Chasing
-
-Group related data together:
+### Null-check before dereferencing
 
 ```ailang
-// Bad - three separate allocations
-name = AllocateString("Alice")
-age = 30
-id = 12345
-
-// Good - single LinkagePool
-person = AllocateLinkage(LinkagePool.Person)
-person.name = "Alice"
-person.age = 30
-person.id = 12345
-```
-
-### 5. Use FixedPool for Counters
-
-FixedPools are ideal for statistics:
-
-```ailang
-FixedPool.Stats {
-    "requests": Initialize=0
-    "errors": Initialize=0
-    "total_time": Initialize=0
+IfCondition NotEqual(ptr, 0) ThenBlock: {
+    val = Dereference(ptr)
 }
+```
 
-// Fast increment
-Stats.requests = Add(Stats.requests, 1)
+### Bounds-check before array access
+
+```ailang
+IfCondition LessThan(index, array_size) ThenBlock: {
+    offset  = Multiply(index, 8)
+    element = Dereference(Add(array_ptr, offset))
+}
+```
+
+### Zero pointer after free
+
+```ailang
+Deallocate(buf, size)
+buf = 0
+```
+
+Prevents use-after-free bugs from being silently successful.
+
+### Align large allocations to cache lines
+
+For buffers accessed in hot loops, align to 64 bytes:
+
+```ailang
+// Round up to 64-byte cache line boundary
+aligned = Multiply(Divide(Add(size, 63), 64), 64)
+buf = Allocate(aligned)
 ```
 
 ---
 
-## Performance Considerations
+## Performance Notes
 
-### FixedPool Performance
+### FixedPool is the fastest access in AILang
 
-**Fastest access pattern in AI Lang:**
-- Single instruction: `MOV RAX, [R15 + offset]`
-- No pointer chasing
-- No cache misses (after warmup)
-- Ideal for hot paths
+Single instruction: `MOV RAX, [R15 + offset]`. No pointer chasing, no
+cache miss after warmup. Use FixedPool for anything in a hot path.
 
-### DynamicPool Performance
+### DynamicPool costs one extra indirection
 
-**Two-step access:**
-1. Load pointer from stack: `MOV RAX, [RBP-offset]`
-2. Access member: `MOV RBX, [RAX + member_offset]`
+Two instructions: load heap pointer from stack, then access field.
+One potential cache miss if the heap block is cold.
 
-**Cost:** One extra memory access, potential cache miss
+### Allocate cost scales with size
 
-### Heap Allocation Cost
+- **≤ 4096 bytes:** O(1) slab — free list pop or bump pointer. No
+  syscall after initial chunk setup.
+- **> 4096 bytes:** One `mmap` syscall per overflow chunk (~0.005 µs
+  in C, ~0.010 µs in AILang). Frequent large allocations in tight
+  loops are the primary memory performance bottleneck — use
+  `Arena_Reset()` to amortize.
 
-**Allocate() overhead:**
-- System call (mmap): ~100-500 CPU cycles
-- Amortize by allocating larger blocks
-- Reuse buffers when possible
+### MemoryCopy / MemChr / MemCompare are SSE2-vectorized
 
-**Deallocate() overhead:**
-- System call (munmap): ~100-500 CPU cycles
-- Consider keeping pools for frequent allocations
-
-### Cache Optimization
-
-**Cache line size:** 64 bytes
-
-```ailang
-// Bad - false sharing
-FixedPool.Counters {
-    "thread1_count": Initialize=0  // offset 0
-    "thread2_count": Initialize=0  // offset 8
-    // Both in same cache line - contention!
-}
-
-// Good - pad to separate cache lines
-FixedPool.Counters {
-    "thread1_count": Initialize=0     // offset 0
-    "pad1": Initialize=0               // offset 8
-    "pad2": Initialize=0               // offset 16
-    // ... 7 more padding entries
-    "thread2_count": Initialize=0     // offset 64
-    // Different cache lines - no contention
-}
-```
+These operate in 16-byte strides. Prefer them over byte-by-byte loops
+for any buffer operation on more than a few bytes.
 
 ---
 
 ## Common Patterns
 
-### Buffer Management
+### Ping-pong buffers (grep pattern)
 
 ```ailang
 FixedPool.Buffers {
-    "read_buffer": Initialize=0
-    "write_buffer": Initialize=0
-    "buffer_size": Initialize=4096
+    "read_buf":  Initialize=0
+    "write_buf": Initialize=0
+    "buf_size":  Initialize=1048576   // 1 MiB
 }
 
-SubRoutine.InitializeBuffers {
-    Buffers.read_buffer = Allocate(Buffers.buffer_size)
-    Buffers.write_buffer = Allocate(Buffers.buffer_size)
+SubRoutine.InitBuffers {
+    Buffers.read_buf  = Allocate(Buffers.buf_size)
+    Buffers.write_buf = Allocate(Buffers.buf_size)
 }
 
-SubRoutine.CleanupBuffers {
-    Deallocate(Buffers.read_buffer, Buffers.buffer_size)
-    Deallocate(Buffers.write_buffer, Buffers.buffer_size)
+// Swap without copying
+SubRoutine.SwapBuffers {
+    tmp = Buffers.read_buf
+    Buffers.read_buf  = Buffers.write_buf
+    Buffers.write_buf = tmp
 }
 ```
 
-### Ring Buffer
+### Manual ring buffer
 
 ```ailang
-FixedPool.RingBuffer {
-    "buffer": Initialize=0
-    "head": Initialize=0
-    "tail": Initialize=0
-    "size": Initialize=256
+FixedPool.Ring {
+    "buf":   Initialize=0
+    "head":  Initialize=0
+    "tail":  Initialize=0
+    "size":  Initialize=256
     "count": Initialize=0
 }
 
-SubRoutine.RingBufferPush {
-    // Input: value (global)
-    
-    IfCondition LessThan(RingBuffer.count, RingBuffer.size) ThenBlock: {
-        // Calculate offset
-        offset = Multiply(RingBuffer.tail, 8)
-        write_ptr = Add(RingBuffer.buffer, offset)
-        
-        // Store value
-        StoreValue(write_ptr, value)
-        
-        // Update tail
-        RingBuffer.tail = Modulo(Add(RingBuffer.tail, 1), RingBuffer.size)
-        RingBuffer.count = Add(RingBuffer.count, 1)
+SubRoutine.RingPush {
+    // assumes: value is set by caller
+    IfCondition LessThan(Ring.count, Ring.size) ThenBlock: {
+        offset = Multiply(Ring.tail, 8)
+        StoreValue(Add(Ring.buf, offset), value)
+        Ring.tail  = Modulo(Add(Ring.tail, 1), Ring.size)
+        Ring.count = Add(Ring.count, 1)
+    }
+}
+
+SubRoutine.RingPop {
+    // sets: value for caller
+    IfCondition GreaterThan(Ring.count, 0) ThenBlock: {
+        offset = Multiply(Ring.head, 8)
+        value = Dereference(Add(Ring.buf, offset))
+        Ring.head  = Modulo(Add(Ring.head, 1), Ring.size)
+        Ring.count = Subtract(Ring.count, 1)
     }
 }
 ```
 
-### Memory Pool
+### Bump allocator (arena within arena)
 
 ```ailang
-FixedPool.MemoryPool {
-    "pool_base": Initialize=0
-    "pool_size": Initialize=1048576  // 1MB
-    "next_free": Initialize=0
+FixedPool.Bump {
+    "base":  Initialize=0
+    "next":  Initialize=0
+    "limit": Initialize=0
 }
 
-SubRoutine.PoolAllocate {
-    // Input: size (global)
-    // Output: allocated (global)
-    
-    allocated = 0
-    
-    IfCondition LessEqual(Add(MemoryPool.next_free, size), MemoryPool.pool_size) ThenBlock: {
-        allocated = Add(MemoryPool.pool_base, MemoryPool.next_free)
-        MemoryPool.next_free = Add(MemoryPool.next_free, size)
+SubRoutine.BumpInit {
+    Bump.base  = Allocate(65536)
+    Bump.next  = Bump.base
+    Bump.limit = Add(Bump.base, 65536)
+}
+
+Function.BumpAlloc {
+    Input:  size: Integer
+    Output: Address
+    Body: {
+        aligned = Multiply(Divide(Add(size, 7), 8), 8)
+        IfCondition GreaterThan(Add(Bump.next, aligned), Bump.limit) ThenBlock: {
+            ReturnValue(0)
+        }
+        ptr = Bump.next
+        Bump.next = Add(Bump.next, aligned)
+        ReturnValue(ptr)
     }
 }
 ```
@@ -670,108 +466,41 @@ SubRoutine.PoolAllocate {
 
 ## Troubleshooting
 
-### Common Issues
+### Segmentation fault (SIGSEGV)
 
-#### Memory Leaks
+- Dereferencing `0` — check for null before `Dereference`
+- Out-of-bounds array access — check index against size
+- Use-after-free — zero the pointer after `Deallocate`
+- Wrong `Deallocate` size routed to wrong slab — verify sizes match
 
-**Symptom:** Program memory usage grows over time
+### Memory leak / RSS growth
 
-**Cause:** Missing Deallocate() calls
+- Missing `Deallocate` — pair every `Allocate`
+- Or: use `Arena_Reset()` at natural boundaries instead of tracking
+  individual allocations
 
-**Solution:**
-```ailang
-// Use Try-Finally to ensure cleanup
-TryBlock: {
-    buffer = Allocate(1024)
-    ProcessData(buffer)
-} FinallyBlock: {
-    Deallocate(buffer, 1024)
-}
-```
+### Pool table overflow (compiler error)
 
-#### Segmentation Faults
+More than 131,072 `FixedPool` variables. Move large collections to
+`DynamicPool` or `Allocate`.
 
-**Symptom:** Program crashes with SIGSEGV
+### Corrupted allocator (crash on Deallocate)
 
-**Causes:**
-1. Accessing freed memory
-2. Null pointer dereference
-3. Out of bounds access
-
-**Solutions:**
-```ailang
-// Check pointer validity
-IfCondition NotEqual(ptr, 0) ThenBlock: {
-    value = Dereference(ptr)
-}
-
-// Bounds checking
-IfCondition LessThan(index, array_size) ThenBlock: {
-    offset = Multiply(index, 8)
-    element = Dereference(Add(array_ptr, offset))
-}
-```
-
-#### Pool Table Overflow
-
-**Symptom:** Compiler error: "Too many pool variables"
-
-**Cause:** More than 131,072 FixedPool variables
-
-**Solution:** Use DynamicPool or LinkagePool for large collections
-
-#### Double Free
-
-**Symptom:** Corruption or crash on Deallocate()
-
-**Cause:** Calling Deallocate() twice on same pointer
-
-**Solution:**
-```ailang
-// Set to zero after freeing
-Deallocate(buffer, size)
-buffer = 0
-
-// Check before freeing
-IfCondition NotEqual(buffer, 0) ThenBlock: {
-    Deallocate(buffer, size)
-    buffer = 0
-}
-```
+Almost always a size mismatch: `Allocate(256)` paired with
+`Deallocate(ptr, 512)`. The slab router uses the size to find the free
+list. Wrong size → wrong slab → corrupted free list pointer.
 
 ---
 
-## Summary
+## See Also
 
-AI Lang's memory management system provides:
-
-✓ **Direct Control** - Explicit allocation and deallocation  
-✓ **Type Safety** - LinkagePool system with field tracking  
-✓ **High Performance** - Zero-overhead abstractions  
-✓ **Flexibility** - Multiple pool types for different needs  
-✓ **Simplicity** - Clear, readable syntax  
-
-### Memory Type Decision Matrix
-
-| Requirement | Pool Type |
-|-------------|-----------|
-| Global state | FixedPool |
-| Growing collections | DynamicPool |
-| Temporary data | TemporalPool |
-| Structured data | LinkagePool |
-| Raw buffers | Allocate() |
-
-### Key Takeaways
-
-1. Use FixedPool for performance-critical global state
-2. Use DynamicPool for growable collections
-3. Use TemporalPool for scoped temporary data
-4. Use LinkagePool for structured inter-function communication
-5. Always pair Allocate() with Deallocate()
-6. Check pointers before dereferencing
-7. Align large allocations to cache lines
+`Library.Arena`,
+`AILang Language Introduction`,
+`AILang Operators Reference`
 
 ---
 
-**Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering**  
-**AI Lang Compiler - Memory Management Reference Manual**
+## Copyright
+
+Copyright (c) 2025–2026 Sean Collins, 2 Paws Machine and Engineering.
+Licensed under the Sean Collins Software License (SCSL).

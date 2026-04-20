@@ -336,6 +336,12 @@ Function.TVG_ReadUnit {
 // =============================================================================
 // COORDINATE SCALING — separate X and Y for aspect ratio
 // =============================================================================
+// TVG_ScaleX / TVG_ScaleY return 256× fixed-point pixel coordinates
+// so we don't drop the fractional part at scale-down. Downstream code
+// (edge list, scanfill) treats all coords as 256× fp; the fraction
+// flows through to the coverage-AA calculation where it becomes real
+// edge softness. Pre-multiplying the numerator by 256 keeps precision
+// without needing Float_Div (integer math handles it).
 Function.TVG_ScaleX {
     Input:  coord: Integer
     Output: Integer
@@ -345,7 +351,7 @@ Function.TVG_ScaleX {
         IfCondition EqualTo(w, 0) ThenBlock: { ReturnValue(0) }
         denom = ShiftLeft(w, sb)
         IfCondition EqualTo(denom, 0) ThenBlock: { ReturnValue(0) }
-        num = Multiply(coord, RastState.surf_w)
+        num = Multiply(Multiply(coord, RastState.surf_w), 256)
         ReturnValue(Divide(num, denom))
     }
 }
@@ -359,7 +365,7 @@ Function.TVG_ScaleY {
         IfCondition EqualTo(h, 0) ThenBlock: { ReturnValue(0) }
         denom = ShiftLeft(h, sb)
         IfCondition EqualTo(denom, 0) ThenBlock: { ReturnValue(0) }
-        num = Multiply(coord, RastState.surf_h)
+        num = Multiply(Multiply(coord, RastState.surf_h), 256)
         ReturnValue(Divide(num, denom))
     }
 }
@@ -386,14 +392,98 @@ Function.TVG_PackColor {
 }
 
 // =============================================================================
+// STROKE STATE — toggled on inside OL_* commands so TVG_AddEdge emits
+// a thickened quad (four raw edges) instead of a single edge. This
+// turns the outline commands into actual strokes rather than treating
+// them as degenerate fills.
+// =============================================================================
+FixedPool.StrokeState {
+    "active":     Initialize=0
+    "half_width": Initialize=0    // 256× fixed-point, min 128 (0.5px)
+}
+
+// =============================================================================
 // EDGE BUILDER
 // =============================================================================
+// TVG_AddEdge_Raw: append a single edge to the list. Never checks
+// stroke mode — used by stroke quads + by anywhere that really wants
+// one literal edge regardless of StrokeState.
+Function.TVG_AddEdge_Raw {
+    Input: x0: Integer
+    Input: y0: Integer
+    Input: x1: Integer
+    Input: y1: Integer
+    Body: {
+        ec = RastState.edge_count
+        IfCondition GreaterEqual(ec, RastConst.MAX_EDGES) ThenBlock: { ReturnValue(0) }
+        edges = RastState.edges
+        off = Multiply(ec, RastConst.EDGE_SIZE)
+        ep  = Add(edges, off)
+        StoreValue(Add(ep, RastConst.EDGE_X0_OFS), x0)
+        StoreValue(Add(ep, RastConst.EDGE_Y0_OFS), y0)
+        StoreValue(Add(ep, RastConst.EDGE_X1_OFS), x1)
+        StoreValue(Add(ep, RastConst.EDGE_Y1_OFS), y1)
+        RastState.edge_count = Add(ec, 1)
+        ReturnValue(0)
+    }
+}
+
+// TVG_StrokeEmit: given a line segment and a half-width, emit four
+// edges forming a thin quad centered on the segment.
+// Uses ISqrt on the squared length — coords are 256× fp so the input
+// to ISqrt is 65536× pixel², and ISqrt returns 256× pixel length.
+Function.TVG_StrokeEmit {
+    Input: x0: Integer
+    Input: y0: Integer
+    Input: x1: Integer
+    Input: y1: Integer
+    Input: hw: Integer   // half-width, 256× fp
+    Body: {
+        dx = Subtract(x1, x0)
+        dy = Subtract(y1, y0)
+        len_sq = Add(Multiply(dx, dx), Multiply(dy, dy))
+        IfCondition EqualTo(len_sq, 0) ThenBlock: { ReturnValue(0) }
+
+        // length in 256× fp = ISqrt(len_sq).
+        len_fp = ISqrt(len_sq)
+        IfCondition EqualTo(len_fp, 0) ThenBlock: { ReturnValue(0) }
+
+        // Perpendicular unit × half-width, in 256× fp.
+        //   perp_x = -dy * hw / len
+        //   perp_y =  dx * hw / len
+        // Numerator is (256×)(256×) = 65536× ; divide by 256× len
+        // leaves 256× fp. Matches coord units.
+        px = Divide(Multiply(Subtract(0, dy), hw), len_fp)
+        py = Divide(Multiply(dx, hw), len_fp)
+
+        // Four quad corners.
+        ax = Add(x0, px)  ay = Add(y0, py)
+        bx = Add(x1, px)  by = Add(y1, py)
+        cx = Subtract(x1, px)  cy = Subtract(y1, py)
+        dx_c = Subtract(x0, px)  dy_c = Subtract(y0, py)
+
+        // Emit edges clockwise: A→B→C→D→A.
+        TVG_AddEdge_Raw(ax, ay, bx, by)
+        TVG_AddEdge_Raw(bx, by, cx, cy)
+        TVG_AddEdge_Raw(cx, cy, dx_c, dy_c)
+        TVG_AddEdge_Raw(dx_c, dy_c, ax, ay)
+        ReturnValue(0)
+    }
+}
+
+// TVG_AddEdge: dispatcher. Most callers just want "append an edge";
+// when StrokeState is active, turn each incoming edge into a stroked
+// quad instead.
 Function.TVG_AddEdge {
     Input: x0: Integer
     Input: y0: Integer
     Input: x1: Integer
     Input: y1: Integer
     Body: {
+        IfCondition EqualTo(StrokeState.active, 1) ThenBlock: {
+            TVG_StrokeEmit(x0, y0, x1, y1, StrokeState.half_width)
+            ReturnValue(0)
+        }
         ec = RastState.edge_count
         IfCondition GreaterEqual(ec, RastConst.MAX_EDGES) ThenBlock: { ReturnValue(0) }
         off = Multiply(ec, RastConst.EDGE_SIZE)
@@ -508,7 +598,25 @@ Function.TVG_FlattenCubic {
             md = d1
             IfCondition GreaterThan(d2, md) ThenBlock: { md = d2 }
 
-            IfCondition Or(GreaterEqual(sd, 8), LessThan(md, 16384)) ThenBlock: {
+            // Flatness gate with two tightenings vs. the original:
+            //   depth cap 8 → 12  (up to 4096 segments if genuinely
+            //     needed — small icons can't afford to hit the cap
+            //     and emit a straight line across a gently curving
+            //     spline, which was a visible source of faceting)
+            //   threshold 16384 → 4096  (tighter by 4× in squared
+            //     distance = 2× tighter linear flatness, about
+            //     0.125 pixel²). Subdivision is cheap compared to
+            //     one sloppy-looking curve on every game icon.
+            //
+            // md is in 65536× fp units (ScaleX/Y 256× × flatten's
+            // internal 256× = 2^16 coord scale, md = diff² = 2^32).
+            // Shift right 16 to bring the comparison back to the
+            // integer-pixel² domain of the original code.
+            md_cmp = ShiftRight(md, 16)
+            IfCondition Or(GreaterEqual(sd, 12), LessThan(md_cmp, 4096)) ThenBlock: {
+                // Flatten output goes to TVG_AddEdge as 256× fp — one
+                // divide by 256 brings the 65536×-internal coords to
+                // the 256× fp units that AddEdge + ScanFill expect.
                 fa0 = Divide(sx0, 256)
                 fb0 = Divide(sy0, 256)
                 fa1 = Divide(sx1, 256)
@@ -618,26 +726,49 @@ Function.TVG_BlendPixel {
         sg = BitwiseAnd(sg, 255)
         sb = BitwiseAnd(color, 255)
 
-        // src-over: out = src*sa + dst*(255-sa) / 255
+        // Gamma-2.0 approximation for blending in linear space.
+        // True sRGB's 2.4 exponent would need pow(); gamma-2.0
+        // (square/sqrt) captures most of the quality win at zero
+        // floating-point cost — edges between saturated colors stop
+        // picking up the dark halo that sRGB-space blending produces.
         inv_sa = Subtract(255, sa)
 
-        t1 = Multiply(sr, sa)
-        t2 = Multiply(dr, inv_sa)
-        or_val = Divide(Add(t1, t2), 255)
+        sr_lin = Divide(Multiply(sr, sr), 255)
+        sg_lin = Divide(Multiply(sg, sg), 255)
+        sb_lin = Divide(Multiply(sb, sb), 255)
+        dr_lin = Divide(Multiply(dr, dr), 255)
+        dg_lin = Divide(Multiply(dg, dg), 255)
+        db_lin = Divide(Multiply(db, db), 255)
 
-        t1 = Multiply(sg, sa)
-        t2 = Multiply(dg, inv_sa)
-        og = Divide(Add(t1, t2), 255)
+        // src-over in linear space.
+        t1 = Multiply(sr_lin, sa)
+        t2 = Multiply(dr_lin, inv_sa)
+        or_lin = Divide(Add(t1, t2), 255)
 
-        t1 = Multiply(sb, sa)
-        t2 = Multiply(db, inv_sa)
-        ob = Divide(Add(t1, t2), 255)
+        t1 = Multiply(sg_lin, sa)
+        t2 = Multiply(dg_lin, inv_sa)
+        og_lin = Divide(Add(t1, t2), 255)
 
+        t1 = Multiply(sb_lin, sa)
+        t2 = Multiply(db_lin, inv_sa)
+        ob_lin = Divide(Add(t1, t2), 255)
+
+        // Alpha stays in sRGB space — it's coverage, not light.
         t1 = Multiply(sa, 255)
         t2 = Multiply(da, inv_sa)
         oa = Divide(Add(t1, t2), 255)
 
-        // Write blended pixel
+        // Back to sRGB: sqrt(lin * 255).
+        or_val = ISqrt(Multiply(or_lin, 255))
+        og     = ISqrt(Multiply(og_lin, 255))
+        ob     = ISqrt(Multiply(ob_lin, 255))
+
+        // Clamp (ISqrt rounding can hit 256 edge in corner cases).
+        IfCondition GreaterThan(or_val, 255) ThenBlock: { or_val = 255 }
+        IfCondition GreaterThan(og, 255)     ThenBlock: { og = 255 }
+        IfCondition GreaterThan(ob, 255)     ThenBlock: { ob = 255 }
+
+        // Write blended pixel.
         SetByte(pix_ptr, 0, ob)
         SetByte(pix_ptr, 1, og)
         SetByte(pix_ptr, 2, or_val)
@@ -649,6 +780,14 @@ Function.TVG_BlendPixel {
 // =============================================================================
 // SCANLINE FILL — with alpha blending
 // =============================================================================
+// TVG_ScanFill — coverage-based horizontal anti-aliasing.
+//
+// Edge intersections are kept as 256× fixed-point so we don't lose
+// the fractional part at span boundaries. For each fill span the
+// leftmost and rightmost pixels get proportional coverage instead of
+// full opacity; interior pixels get full coverage like before.
+// Sample at pixel center (y = row + 0.5) so edges land consistently
+// relative to the scanline rather than the row's top.
 Function.TVG_ScanFill {
     Input: r: Integer
     Input: g: Integer
@@ -661,16 +800,15 @@ Function.TVG_ScanFill {
         ec    = RastState.edge_count
         edges = RastState.edges
         color = TVG_PackColor(r, g, b, a)
-        use_blend = 0
-        IfCondition LessThan(a, 255) ThenBlock: { use_blend = 1 }
         use_grad = GradState.active
-        // Gradients always need blending (colors vary per pixel)
-        IfCondition EqualTo(use_grad, 1) ThenBlock: { use_blend = 1 }
+        sw_fp = Multiply(sw, 256)
 
         row = 0
         WhileLoop LessThan(row, sh) {
             xs_buf = Allocate(512)
             xs_cnt = 0
+            // Sample at row center (row + 0.5) in 256× fixed-point.
+            row_fp = Add(Multiply(row, 256), 128)
             ei = 0
             WhileLoop LessThan(ei, ec) {
                 off = Multiply(ei, RastConst.EDGE_SIZE)
@@ -683,21 +821,25 @@ Function.TVG_ScanFill {
                     tmp = ey0  ey0 = ey1  ey1 = tmp
                     tmp = ex0  ex0 = ex1  ex1 = tmp
                 }
-                IfCondition And(LessEqual(ey0, row), LessThan(row, ey1)) ThenBlock: {
+                // ey0/ey1/ex0/ex1 are all 256× fixed-point (courtesy
+                // of TVG_ScaleX/Y); row_fp is also 256×, so comparisons
+                // and interpolation stay in fp units throughout.
+                IfCondition And(LessEqual(ey0, row_fp), LessThan(row_fp, ey1)) ThenBlock: {
                     dy = Subtract(ey1, ey0)
                     IfCondition NotEqual(dy, 0) ThenBlock: {
                         dx = Subtract(ex1, ex0)
-                        dr = Subtract(row, ey0)
-                        num = Multiply(dx, dr)
-                        xi = Add(ex0, Divide(num, dy))
+                        dr_fp = Subtract(row_fp, ey0)
+                        num = Multiply(dx, dr_fp)
+                        // xi_fp = ex0 + (dx * dr_fp) / dy, all 256× fp.
+                        xi_fp = Add(ex0, Divide(num, dy))
                         off2 = Multiply(xs_cnt, 8)
-                        StoreValue(Add(xs_buf, off2), xi)
+                        StoreValue(Add(xs_buf, off2), xi_fp)
                         xs_cnt = Add(xs_cnt, 1)
                     }
                 }
                 ei = Add(ei, 1)
             }
-            // Bubble sort intersections
+            // Bubble sort intersections (ascending).
             si = 0
             WhileLoop LessThan(si, xs_cnt) {
                 sj = Add(si, 1)
@@ -714,33 +856,60 @@ Function.TVG_ScanFill {
                 }
                 si = Add(si, 1)
             }
-            // Fill pairs
+            // Fill pairs with coverage at the span boundaries.
             lim = Subtract(xs_cnt, 1)
             pi = 0
             WhileLoop LessThan(pi, lim) {
                 oa = Multiply(pi, 8)
                 pi2 = Add(pi, 1)
                 ob = Multiply(pi2, 8)
-                xa = Dereference(Add(xs_buf, oa))
-                xb = Dereference(Add(xs_buf, ob))
-                IfCondition LessThan(xa, 0) ThenBlock: { xa = 0 }
-                IfCondition GreaterThan(xb, sw) ThenBlock: { xb = sw }
-                px = xa
-                IfCondition EqualTo(use_blend, 0) ThenBlock: {
-                    WhileLoop LessThan(px, xb) {
-                        Draw_Pix_Pixel(surf, px, row, color)
-                        px = Add(px, 1)
+                xa_fp = Dereference(Add(xs_buf, oa))
+                xb_fp = Dereference(Add(xs_buf, ob))
+                IfCondition LessThan(xa_fp, 0) ThenBlock: { xa_fp = 0 }
+                IfCondition GreaterThan(xb_fp, sw_fp) ThenBlock: { xb_fp = sw_fp }
+
+                xa_int = Divide(xa_fp, 256)
+                xa_frac = Subtract(xa_fp, Multiply(xa_int, 256))
+                xb_int = Divide(xb_fp, 256)
+                xb_frac = Subtract(xb_fp, Multiply(xb_int, 256))
+
+                IfCondition EqualTo(xa_int, xb_int) ThenBlock: {
+                    // Sub-pixel span — one pixel, coverage = width in fracs.
+                    cov = Subtract(xb_frac, xa_frac)
+                    IfCondition GreaterThan(cov, 0) ThenBlock: {
+                        pcolor = color
+                        IfCondition EqualTo(use_grad, 1) ThenBlock: {
+                            pcolor = TVG_GradPixel(xa_int, row)
+                        }
+                        TVG_ScanFill_EmitPixel(surf, xa_int, row, pcolor, a, cov)
                     }
-                }
-                IfCondition EqualTo(use_blend, 1) ThenBlock: {
-                    px = xa
-                    WhileLoop LessThan(px, xb) {
+                } ElseBlock: {
+                    // Left boundary pixel: coverage = 256 - xa_frac.
+                    left_cov = Subtract(256, xa_frac)
+                    IfCondition GreaterThan(left_cov, 0) ThenBlock: {
+                        pcolor = color
+                        IfCondition EqualTo(use_grad, 1) ThenBlock: {
+                            pcolor = TVG_GradPixel(xa_int, row)
+                        }
+                        TVG_ScanFill_EmitPixel(surf, xa_int, row, pcolor, a, left_cov)
+                    }
+                    // Interior pixels: full coverage.
+                    px = Add(xa_int, 1)
+                    WhileLoop LessThan(px, xb_int) {
                         pcolor = color
                         IfCondition EqualTo(use_grad, 1) ThenBlock: {
                             pcolor = TVG_GradPixel(px, row)
                         }
-                        TVG_BlendPixel(surf, px, row, pcolor)
+                        TVG_ScanFill_EmitPixel(surf, px, row, pcolor, a, 256)
                         px = Add(px, 1)
+                    }
+                    // Right boundary pixel: coverage = xb_frac.
+                    IfCondition GreaterThan(xb_frac, 0) ThenBlock: {
+                        pcolor = color
+                        IfCondition EqualTo(use_grad, 1) ThenBlock: {
+                            pcolor = TVG_GradPixel(xb_int, row)
+                        }
+                        TVG_ScanFill_EmitPixel(surf, xb_int, row, pcolor, a, xb_frac)
                     }
                 }
                 pi = Add(pi, 2)
@@ -748,6 +917,34 @@ Function.TVG_ScanFill {
             Deallocate(xs_buf, 512)
             row = Add(row, 1)
         }
+        ReturnValue(0)
+    }
+}
+
+// Helper: write one pixel with coverage (0..256 where 256 = full).
+// Modulates source alpha by coverage, routes through TVG_BlendPixel.
+// Opaque + full coverage takes the fast Draw_Pix_Pixel path.
+Function.TVG_ScanFill_EmitPixel {
+    Input: surf:  Integer
+    Input: px:    Integer
+    Input: row:   Integer
+    Input: color: Integer
+    Input: a:     Integer
+    Input: cov:   Integer
+    Body: {
+        IfCondition And(EqualTo(a, 255), EqualTo(cov, 256)) ThenBlock: {
+            Draw_Pix_Pixel(surf, px, row, color)
+            ReturnValue(0)
+        }
+        eff_a = Divide(Multiply(a, cov), 256)
+        IfCondition GreaterThan(eff_a, 255) ThenBlock: { eff_a = 255 }
+        IfCondition LessThan(eff_a, 0) ThenBlock: { eff_a = 0 }
+        // Replace the alpha byte of `color` (bits 24..31).
+        rgb_mask = 16777215
+        color_rgb = BitwiseAnd(color, rgb_mask)
+        alpha_shifted = Multiply(eff_a, 16777216)
+        new_color = BitwiseOr(color_rgb, alpha_shifted)
+        TVG_BlendPixel(surf, px, row, new_color)
         ReturnValue(0)
     }
 }
@@ -1486,7 +1683,15 @@ Function.TVG_Render {
                     TVG_CmdFillPath(count, color)
                 }
 
-                // cmd 8 = OUTLINE FILL POLYGON
+                // OL_* = "fill AND stroke the same path".
+                // Strategy: snapshot the TVG read position after
+                // consuming the header, parse the path once in fill
+                // mode with fill_color, rewind to the snapshot, parse
+                // again in stroke mode with line_color. Both passes
+                // see identical path data; their edge lists are
+                // rasterized in sequence inside the respective
+                // TVG_CmdFill* functions.
+
                 IfCondition EqualTo(cmd_id, TVGCmd.OL_POLY) ThenBlock: {
                     ol_byte    = TVG_ReadByte()
                     ol_count   = BitwiseAnd(ol_byte, 63)
@@ -1494,12 +1699,24 @@ Function.TVG_Render {
                     t          = ShiftRight(ol_byte, 6)
                     sec_kind   = BitwiseAnd(t, 3)
                     fill_color = TVG_ReadStyle(style_kind)
-                    TVG_ReadStyle(sec_kind)
-                    TVG_ReadUnit()
+                    line_color = TVG_ReadStyle(sec_kind)
+                    lw_raw = TVG_ReadUnit()
+                    lw_fp = TVG_ScaleX(lw_raw)
+                    hw = Divide(lw_fp, 2)
+                    IfCondition LessThan(hw, 128) ThenBlock: { hw = 128 }
+                    // Snapshot position AFTER header parsing so both
+                    // passes read the path body from the same offset.
+                    body_pos = TVGParse.pos
+                    // Fill pass.
                     TVG_CmdFillPolygon(ol_count, fill_color)
+                    // Rewind + stroke pass.
+                    TVGParse.pos = body_pos
+                    StrokeState.active = 1
+                    StrokeState.half_width = hw
+                    TVG_CmdFillPolygon(ol_count, line_color)
+                    StrokeState.active = 0
                 }
 
-                // cmd 9 = OUTLINE FILL RECTANGLES
                 IfCondition EqualTo(cmd_id, TVGCmd.OL_RECT) ThenBlock: {
                     ol_byte    = TVG_ReadByte()
                     ol_count   = BitwiseAnd(ol_byte, 63)
@@ -1507,12 +1724,20 @@ Function.TVG_Render {
                     t          = ShiftRight(ol_byte, 6)
                     sec_kind   = BitwiseAnd(t, 3)
                     fill_color = TVG_ReadStyle(style_kind)
-                    TVG_ReadStyle(sec_kind)
-                    TVG_ReadUnit()
+                    line_color = TVG_ReadStyle(sec_kind)
+                    lw_raw = TVG_ReadUnit()
+                    lw_fp = TVG_ScaleX(lw_raw)
+                    hw = Divide(lw_fp, 2)
+                    IfCondition LessThan(hw, 128) ThenBlock: { hw = 128 }
+                    body_pos = TVGParse.pos
                     TVG_CmdFillRects(ol_count, fill_color)
+                    TVGParse.pos = body_pos
+                    StrokeState.active = 1
+                    StrokeState.half_width = hw
+                    TVG_CmdFillRects(ol_count, line_color)
+                    StrokeState.active = 0
                 }
 
-                // cmd 10 = OUTLINE FILL PATH
                 IfCondition EqualTo(cmd_id, TVGCmd.OL_PATH) ThenBlock: {
                     ol_byte    = TVG_ReadByte()
                     ol_count   = BitwiseAnd(ol_byte, 63)
@@ -1520,9 +1745,18 @@ Function.TVG_Render {
                     t          = ShiftRight(ol_byte, 6)
                     sec_kind   = BitwiseAnd(t, 3)
                     fill_color = TVG_ReadStyle(style_kind)
-                    TVG_ReadStyle(sec_kind)
-                    TVG_ReadUnit()
+                    line_color = TVG_ReadStyle(sec_kind)
+                    lw_raw = TVG_ReadUnit()
+                    lw_fp = TVG_ScaleX(lw_raw)
+                    hw = Divide(lw_fp, 2)
+                    IfCondition LessThan(hw, 128) ThenBlock: { hw = 128 }
+                    body_pos = TVGParse.pos
                     TVG_CmdFillPath(ol_count, fill_color)
+                    TVGParse.pos = body_pos
+                    StrokeState.active = 1
+                    StrokeState.half_width = hw
+                    TVG_CmdFillPath(ol_count, line_color)
+                    StrokeState.active = 0
                 }
 
                 // Unknown — stop

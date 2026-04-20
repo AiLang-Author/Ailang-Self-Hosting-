@@ -1,1878 +1,588 @@
-# AILANG Concurrency and Systems Programming Manual
+# Library.ThreadTrampoline(ailang)
 
-## Table of Contents
-1. [Overview](#overview)
-2. [Actor Model Programming](#actor-model-programming)
-3. [Task Management and Scheduling](#task-management-and-scheduling)
-4. [Concurrent Execution Patterns](#concurrent-execution-patterns)
-5. [Inter-Actor Communication](#inter-actor-communication)
-6. [Systems Programming Primitives](#systems-programming-primitives)
-7. [Real-Time and Scheduling](#real-time-and-scheduling)
-8. [Memory Synchronization](#memory-synchronization)
-9. [Performance and Optimization](#performance-and-optimization)
-10. [Real-World Applications](#real-world-applications)
+## NAME
 
-## Overview
+`Library.ThreadTrampoline` — POSIX-style threading with futex mutex
 
-AILANG provides a sophisticated concurrency model based on the Actor pattern, combined with systems programming capabilities for low-level control and real-time applications. The language enables safe, scalable concurrent programming while maintaining direct hardware access for performance-critical systems.
+## SYNOPSIS
 
-### Concurrency Philosophy
-- **Actor Model**: Isolated actors with message passing
-- **No Shared State**: Each actor maintains its own state
-- **Cooperative Scheduling**: Explicit yielding for deterministic behavior
-- **Systems Integration**: Direct system calls and hardware access
-- **Deterministic Execution**: Predictable behavior for real-time systems
-
-### Key Features
-- **LoopActor**: Independent execution contexts
-- **Message Passing**: Safe inter-actor communication
-- **Task Management**: SubRoutine system for reusable logic
-- **Scheduling Primitives**: Cooperative multitasking
-- **Systems Access**: Low-level hardware and OS integration
-
-## Actor Model Programming
-
-### Actor Declaration and Structure
-
-**Basic Actor Syntax:**
 ```ailang
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.ActorName {
-    // Actor initialization
-    local_state = initial_value
-    
-    // Actor main logic
-    WhileLoop actor_condition {
-        // Process messages/work
-        // Update local state
-    }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.ActorNameLogic {
-    // Actor logic here
-}
-// Call with: RunTask(ActorNameLogic)
-*/
-    
-    // Actor cleanup
-}
+LibraryImport.ThreadTrampoline
 ```
 
-**Simple Actor Example:**
-```ailang
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.Counter {
-    count = 0
-    running = 1
-    
-    WhileLoop EqualTo(running, 1) {
-        count = Add(count, 1)
-        PrintMessage("Counter:")
-        PrintNumber(count)
-        
-        // Exit condition
-        IfCondition GreaterEqual(count, 10) ThenBlock {
-            running = 0
-        }
+> Self-contained. No other imports required — uses its own private
+> 4 MB heap, not `Library.Arena`.
 
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.CounterLogic {
-    // Actor logic here
-}
-// Call with: RunTask(CounterLogic)
-*/
-    }
-    
-    PrintMessage("Counter actor finished")
-}
+---
+
+## DESCRIPTION
+
+`Library.ThreadTrampoline` provides kernel threads via Linux `clone()`
+with shared address space (`CLONE_VM`). Threads share all memory with
+the parent process. Synchronization is provided by a futex-based mutex.
+
+The library is fully self-contained by design — it allocates its own
+4 MB `mmap` heap with a bump allocator and free list. This means it
+can be used in low-level contexts where `Library.Arena` is not yet
+initialized, and avoids any allocator contention between threads.
+
+**Supported operations:** spawn, join, yield, sleep, self-query,
+alive-check, mutex create/lock/unlock/trylock/destroy.
+
+**Platform:** Linux x86-64 only. Syscall numbers are hardcoded for
+the Linux ABI. Haiku support is not implemented.
+
+---
+
+## INITIALIZATION
+
+### `Thread_Init`
+
+```ailang
+RunTask(Thread_Init)
 ```
 
-### Actor Lifecycle Management
+Must be called once before any other threading function. Initializes
+the private heap, thread registry, spawn mailbox, and computes the
+`clone()` flag set. Call from the main thread before spawning.
 
-**Actor States:**
 ```ailang
-// Actors can be in different states:
-// - READY: Available for execution
-// - RUNNING: Currently executing
-// - BLOCKED: Waiting for resources
-// - SUSPENDED: Temporarily halted
-// - DEAD: Finished execution
+SubRoutine.Main {
+    Thread_Init()
+    // ... spawn threads
+}
+RunTask(Main)
 ```
 
-**Actor Management Functions:**
+---
+
+## THREAD LIFECYCLE
+
+### `Thread_Spawn`
+
 ```ailang
-// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn(actor_name)  // TODO: Implement scheduler          // Create actor instance
-LoopSuspend(handle)                     // Suspend actor execution
-LoopResume(handle)                      // Resume suspended actor
-state = LoopGetState(handle)            // Get current actor state
-current = LoopGetCurrent()              // Get current actor handle
-LoopSetPriority(handle, priority)       // Set scheduling priority
+tid = Thread_Spawn(entry_func, user_data)
 ```
 
-**Complete Actor Management Example:**
+Spawns a new thread that calls `entry_func(user_data)`. Returns the
+thread ID (positive integer) on success, `0` on failure.
+
+`entry_func` must have the signature:
+
 ```ailang
-// Define a worker actor
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.WorkerActor {
-    task_count = 0
-    max_tasks = 5
-    
-    PrintMessage("Worker actor started")
-    
-    WhileLoop LessThan(task_count, max_tasks) {
-        PrintMessage("Processing task:")
-        PrintNumber(task_count)
-        
-        // Simulate work
-        work_units = 0
-        WhileLoop LessThan(work_units, 3) {
-            work_units = Add(work_units, 1)
-        }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.WorkerActorLogic {
-    // Actor logic here
-}
-// Call with: RunTask(WorkerActorLogic)
-*/
-        
-        task_count = Add(task_count, 1)
-        
-        // Yield to other actors periodically
-        IfCondition EqualTo(Modulo(task_count, 2), 0) ThenBlock {
-            LoopYield()
-        }
-    }
-    
-    PrintMessage("Worker actor complete")
-}
-
-// Spawn and manage the actor
-worker_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("WorkerActor")  // TODO: Implement scheduler
-IfCondition NotEqual(worker_handle, 0) ThenBlock {
-    PrintMessage("Worker spawned successfully")
-    
-    // Check actor state
-    state = LoopGetState(worker_handle)
-    PrintMessage("Worker state:")
-    PrintNumber(state)
-    
-    // Let actor run
-    LoopYield()
-}
-```
-
-### Multiple Actor Coordination
-
-**Producer-Consumer Pattern:**
-```ailang
-// Shared state (in real implementation, use message passing)
-FixedPool.SharedBuffer {
-    "items": Initialize=0        // Array for items
-    "count": Initialize=0        // Current item count
-    "capacity": Initialize=10    // Buffer capacity
-    "producer_done": Initialize=0
-}
-
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.Producer {
-    PrintMessage("Producer started")
-    
-    // Initialize shared buffer
-    SharedBuffer.items = ArrayCreate(SharedBuffer.capacity)
-    
-    produced = 0
-    max_items = 8
-    
-    WhileLoop LessThan(produced, max_items) {
-        // Wait if buffer is full
-        WhileLoop GreaterEqual(SharedBuffer.count, SharedBuffer.capacity) {
-            LoopYield()  // Let consumer run
-        }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.ProducerLogic {
-    // Actor logic here
-}
-// Call with: RunTask(ProducerLogic)
-*/
-        
-        // Produce item
-        item_value = Multiply(produced, 10)
-        ArraySet(SharedBuffer.items, SharedBuffer.count, item_value)
-        SharedBuffer.count = Add(SharedBuffer.count, 1)
-        
-        PrintMessage("Produced item:")
-        PrintNumber(item_value)
-        
-        produced = Add(produced, 1)
-        LoopYield()  // Let consumer process
-    }
-    
-    SharedBuffer.producer_done = 1
-    PrintMessage("Producer finished")
-}
-
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.Consumer {
-    PrintMessage("Consumer started")
-    
-    consumed = 0
-    
-    WhileLoop EqualTo(SharedBuffer.producer_done, 0) {
-        // Wait for items
-        WhileLoop And(EqualTo(SharedBuffer.count, 0), 
-                     EqualTo(SharedBuffer.producer_done, 0)) {
-            LoopYield()  // Let producer run
-        }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.ConsumerLogic {
-    // Actor logic here
-}
-// Call with: RunTask(ConsumerLogic)
-*/
-        
-        // Consume item if available
-        IfCondition GreaterThan(SharedBuffer.count, 0) ThenBlock {
-            SharedBuffer.count = Subtract(SharedBuffer.count, 1)
-            item = ArrayGet(SharedBuffer.items, SharedBuffer.count)
-            
-            PrintMessage("Consumed item:")
-            PrintNumber(item)
-            
-            consumed = Add(consumed, 1)
-        }
-        
-        LoopYield()  // Be cooperative
-    }
-    
-    // Consume remaining items
-    WhileLoop GreaterThan(SharedBuffer.count, 0) {
-        SharedBuffer.count = Subtract(SharedBuffer.count, 1)
-        item = ArrayGet(SharedBuffer.items, SharedBuffer.count)
-        PrintMessage("Final consumed:")
-        PrintNumber(item)
-        consumed = Add(consumed, 1)
-    }
-    
-    PrintMessage("Consumer finished, total consumed:")
-    PrintNumber(consumed)
-}
-
-// Spawn both actors
-producer_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("Producer")  // TODO: Implement scheduler
-consumer_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("Consumer")  // TODO: Implement scheduler
-
-// Run cooperative scheduler
-scheduler_running = 1
-WhileLoop EqualTo(scheduler_running, 1) {
-    LoopYield()  // Execute next actor
-    
-    // Check if both are done (simplified)
-    IfCondition And(EqualTo(SharedBuffer.producer_done, 1),
-                   EqualTo(SharedBuffer.count, 0)) ThenBlock {
-        scheduler_running = 0
-    }
-}
-
-PrintMessage("All actors completed")
-```
-
-## Task Management and Scheduling
-
-### SubRoutine System
-
-**SubRoutine Declaration:**
-```ailang
-SubRoutine.TaskName {
-    // Reusable logic
-    // Can access global variables
-    // Can call other subroutines
-}
-
-// Execute with RunTask
-RunTask(TaskName)
-```
-
-**SubRoutine Examples:**
-```ailang
-// Utility subroutines
-SubRoutine.LogMessage {
-    PrintMessage("[LOG] System operation completed")
-}
-
-SubRoutine.IncrementCounter {
-    global_counter = Add(global_counter, 1)
-}
-
-SubRoutine.ValidateSystem {
-    IfCondition EqualTo(system_ready, 1) ThenBlock {
-        PrintMessage("System validation passed")
-    } ElseBlock {
-        PrintMessage("System validation failed")
-        error_count = Add(error_count, 1)
-    }
-}
-
-// Complex subroutine with parameters (using global state)
-SubRoutine.ProcessData {
-    // Expects: input_data, operation_type
-    IfCondition EqualTo(operation_type, 1) ThenBlock {
-        // Type 1 processing
-        result_data = Multiply(input_data, 2)
-    } ElseBlock {
-        // Type 2 processing  
-        result_data = Add(input_data, 100)
-    }
-    
-    RunTask(LogMessage)
-}
-
-// Usage
-global_counter = 0
-error_count = 0
-system_ready = 1
-
-RunTask(ValidateSystem)
-RunTask(IncrementCounter)
-RunTask(IncrementCounter)
-
-PrintMessage("Counter value:")
-PrintNumber(global_counter)
-
-// Process data
-input_data = 15
-operation_type = 1
-RunTask(ProcessData)
-PrintMessage("Processed result:")
-PrintNumber(result_data)
-```
-
-### Cooperative Scheduling
-
-**Manual Scheduling:**
-```ailang
-Function.CooperativeScheduler {
-    Input: max_cycles: Integer
+Function.MyWorker {
+    Input:  cookie: Integer
     Output: Integer
     Body: {
-        cycle_count = 0
-        
-        WhileLoop LessThan(cycle_count, max_cycles) {
-            // Give each actor a time slice
-            LoopYield()
-            
-            cycle_count = Add(cycle_count, 1)
-            
-            // Optional: Check for completion conditions
-            IfCondition AllActorsComplete() ThenBlock {
-                ReturnValue(cycle_count)
+        // ... do work ...
+        ReturnValue(result)
+    }
+}
+```
+
+The return value of `entry_func` becomes the thread's exit code,
+retrievable via `Thread_Join`.
+
+Pass the function address with `AddressOf`:
+
+```ailang
+tid = Thread_Spawn(AddressOf(MyWorker), 42)
+```
+
+**Limits:** Maximum 64 concurrent threads (`ThrConst.MAX_THREADS`).
+Each thread gets a 64 KB stack (`ThrConst.STACK_SIZE`) with a 4 KB
+guard page below it. Stack overflows hit the guard page and segfault
+rather than silently corrupting memory.
+
+**Thread safety:** `Thread_Spawn` is serialized via a spin lock
+(`ThrRegistry.spawn_lock`). Concurrent spawn calls from multiple
+threads are safe but will serialize.
+
+---
+
+### `Thread_Join`
+
+```ailang
+exit_code = Thread_Join(tid)
+```
+
+Blocks until the thread with the given `tid` exits. Returns the
+thread's exit code (the value it passed to `ReturnValue`). Returns
+`-1` if the `tid` is unknown.
+
+Internally uses `futex(FUTEX_WAIT)` — the calling thread sleeps in
+the kernel rather than spinning. After join, the thread's stack is
+freed and its registry slot is returned to the free list.
+
+```ailang
+tid = Thread_Spawn(AddressOf(Worker_Double), 21)
+ec  = Thread_Join(tid)    // → 42
+```
+
+---
+
+### `Thread_Self`
+
+```ailang
+tid = Thread_Self()
+```
+
+Returns the calling thread's TID via `gettid()` syscall (186).
+Works correctly from any thread including the main thread.
+
+---
+
+### `Thread_IsAlive`
+
+```ailang
+alive = Thread_IsAlive(tid)
+```
+
+Returns `1` if the thread is in `RUNNING` state, `0` otherwise
+(unknown tid, `CREATED`, `EXITED`, or `DETACHED`).
+
+---
+
+### `Thread_Count`
+
+```ailang
+count = Thread_Count()
+```
+
+Returns the number of currently registered (non-cleaned-up) threads.
+Decrements when `Thread_Join` completes cleanup.
+
+---
+
+### `Thread_Yield`
+
+```ailang
+result = Thread_Yield()
+```
+
+Yields the processor via `sched_yield()` syscall (24). Returns `0`
+on success. Use in spin-wait loops to avoid burning CPU:
+
+```ailang
+WhileLoop EqualTo(some_flag, 0) {
+    Thread_Yield()
+}
+```
+
+---
+
+### `Thread_Sleep`
+
+```ailang
+result = Thread_Sleep(ms)
+```
+
+Sleeps for `ms` milliseconds using `nanosleep()` syscall (35).
+Returns `0` on success, `-1` if interrupted by a signal.
+
+```ailang
+Thread_Sleep(200)    // sleep 200ms
+```
+
+If called from a registered thread, reuses the 16-byte `timespec`
+buffer embedded in the thread's info block (`ThrOfs.TS_BUF`) to
+avoid an allocation. If called from an unregistered thread (e.g.
+main before `Thread_Init`), allocates from the private heap.
+
+---
+
+## MUTEX
+
+Futex-based mutex with three states: `0` = unlocked, `1` = locked
+(no waiters), `2` = locked (waiters sleeping in kernel). This is the
+standard Linux two-phase mutex — fast path is a single
+`AtomicCompareSwap` with no syscall; slow path sleeps via
+`futex(FUTEX_WAIT_PRIVATE)`.
+
+### `Mutex_Create`
+
+```ailang
+m = Mutex_Create()
+```
+
+Allocates an 8-byte mutex from the private heap. Returns the mutex
+address. Store it somewhere accessible to all threads that need it
+(a `FixedPool` field works well).
+
+```ailang
+FixedPool.Shared {
+    "mutex": Initialize=0
+}
+
+// In main, before spawning:
+Shared.mutex = Mutex_Create()
+```
+
+---
+
+### `Mutex_Lock`
+
+```ailang
+result = Mutex_Lock(m)
+```
+
+Acquires the mutex. Blocks if already held. Returns `1` on success.
+Fast path: one `AtomicCompareSwap`, no syscall. Slow path: sleeps
+via `futex(FUTEX_WAIT_PRIVATE)`.
+
+---
+
+### `Mutex_Unlock`
+
+```ailang
+result = Mutex_Unlock(m)
+```
+
+Releases the mutex. If there are waiters (`state == 2`), wakes one
+via `futex(FUTEX_WAKE_PRIVATE)`. Returns `1`.
+
+---
+
+### `Mutex_TryLock`
+
+```ailang
+result = Mutex_TryLock(m)
+```
+
+Non-blocking lock attempt. Returns `1` if acquired, `0` if already
+held. Never blocks.
+
+---
+
+### `Mutex_Destroy`
+
+```ailang
+result = Mutex_Destroy(m)
+```
+
+Currently a no-op — mutex memory is reclaimed when the private heap
+is released at process exit. Returns `1`.
+
+---
+
+## THREAD STATES
+
+| State | Value | Meaning |
+|-------|-------|---------|
+| `CREATED` | 0 | Allocated, not yet running |
+| `RUNNING` | 1 | Active |
+| `EXITED` | 2 | Returned from entry function |
+| `DETACHED` | 3 | Reserved for future use |
+
+---
+
+## THREADINFO LAYOUT
+
+Each thread has a 96-byte info block in the private heap:
+
+| Offset | Field | Description |
+|--------|-------|-------------|
+| 0 | `TID` | Kernel thread ID |
+| 8 | `STATE` | Current state |
+| 16 | `STACK_BASE` | Base address of mmap'd stack |
+| 24 | `STACK_SIZE` | Stack size (default 64 KB) |
+| 32 | `ENTRY_FUNC` | Entry function address |
+| 40 | `USER_DATA` | Cookie passed to entry function |
+| 48 | `EXIT_CODE` | Return value from entry function |
+| 56 | `TID_FUTEX` | Futex word for join wait |
+| 64 | `DETACHED` | Detach flag (reserved) |
+| 72 | `NEXT` | Free list link |
+| 80 | `TS_BUF` | 16-byte nanosleep timespec buffer |
+
+---
+
+## IMPORTANT NOTES
+
+### Arena is not thread-safe
+
+`Library.Arena` uses global `FixedPool` state with no locking.
+Do not call `Allocate()` / `Deallocate()` from worker threads.
+Use the private heap (`ThrHeap_Alloc`) or pre-allocate before
+spawning:
+
+```ailang
+// WRONG — Arena not thread-safe
+Function.BadWorker {
+    Input: cookie: Integer
+    Output: Integer
+    Body: {
+        buf = Allocate(256)    // race condition
+        ReturnValue(0)
+    }
+}
+
+// RIGHT — pre-allocate before spawn
+buf = Allocate(256)
+tid = Thread_Spawn(AddressOf(GoodWorker), buf)
+```
+
+### PrintMessage / PrintNumber are not thread-safe
+
+`write()` syscalls from multiple threads can interleave. Either
+protect output with a mutex or avoid printing from worker threads
+entirely. The test harness intentionally avoids output from workers
+for this reason.
+
+### FixedPool variables are shared
+
+Because threads share address space (`CLONE_VM`), all `FixedPool`
+variables are visible to all threads. This is intentional — it is
+the primary communication mechanism. Protect shared mutable state
+with a mutex.
+
+---
+
+## CONSTANTS
+
+```ailang
+ThrConst.MAX_THREADS    // 64     — max concurrent threads
+ThrConst.STACK_SIZE     // 65536  — 64 KB per thread stack
+ThrConst.GUARD_SIZE     // 4096   — guard page below each stack
+ThrHeap.size            // 4194304 — 4 MB private heap
+```
+
+`MAX_THREADS` and `ThrHeap.size` are matched constraints. At 96 bytes
+per threadinfo block plus 64 KB stack per thread, 64 threads consumes
+roughly `64 × (96 + 65536)` ≈ 4.2 MB — which is right at the heap
+ceiling. Raising `MAX_THREADS` without also raising `ThrHeap.size`
+will cause silent heap exhaustion at spawn time. If you genuinely need
+more than 64 threads, increase both together.
+
+In practice most programs run 4–10 threads. Workloads that need
+hundreds of concurrent execution contexts typically use a thread pool
+with a work queue rather than one thread per task — in which case
+64 worker threads is more than sufficient regardless of task count.
+
+---
+
+## COMPLETE EXAMPLE
+
+```ailang
+LibraryImport.ThreadTrampoline
+
+FixedPool.State {
+    "mutex":   Initialize=0
+    "counter": Initialize=0
+}
+
+Function.Worker {
+    Input:  n: Integer
+    Output: Integer
+    Body: {
+        Mutex_Lock(State.mutex)
+        State.counter = Add(State.counter, n)
+        Mutex_Unlock(State.mutex)
+        ReturnValue(n)
+    }
+}
+
+SubRoutine.Main {
+    Thread_Init()
+    State.mutex = Mutex_Create()
+
+    tid1 = Thread_Spawn(AddressOf(Worker), 10)
+    tid2 = Thread_Spawn(AddressOf(Worker), 20)
+    tid3 = Thread_Spawn(AddressOf(Worker), 30)
+
+    Thread_Join(tid1)
+    Thread_Join(tid2)
+    Thread_Join(tid3)
+
+    PrintMessage("counter: ")
+    PrintNumber(State.counter)    // → 60
+    PrintMessage("\n")
+}
+
+RunTask(Main)
+```
+
+---
+
+## RING BUFFER MAILBOX PATTERN
+
+For most real workloads the right architecture is **not** one thread
+per task. It is a small fixed pool of worker threads reading from a
+shared ring buffer mailbox. This is how grep keeps memory and thread
+pressure near zero while processing millions of lines — the reader
+fills slots, the worker drains them, and neither side allocates.
+
+### Why this matters
+
+Naive threading: spawn a thread per unit of work → thread count grows
+with load → memory grows with thread count → OS scheduler thrashes.
+
+Ring buffer pattern: fixed thread count regardless of load → memory
+stays flat → scheduler sees a constant number of runnable threads.
+
+### Structure
+
+```
+Producer thread(s)          Worker thread(s)
+      │                           │
+      ▼                           ▼
+ ┌─────────────────────────────────────┐
+ │         Ring Buffer Mailbox         │
+ │  [slot0][slot1][slot2]...[slot7]    │
+ │   head ──────────────────► tail     │
+ │   count tracks occupancy           │
+ └─────────────────────────────────────┘
+```
+
+The mailbox lives in a `FixedPool` — globally visible to all threads
+via `CLONE_VM`, zero allocation in the hot path, single-instruction
+access per field.
+
+### Minimal implementation
+
+```ailang
+FixedPool.Mailbox {
+    "head":  Initialize=0
+    "tail":  Initialize=0
+    "count": Initialize=0
+    "mutex": Initialize=0
+    "slot0": Initialize=0
+    "slot1": Initialize=0
+    "slot2": Initialize=0
+    "slot3": Initialize=0
+    "slot4": Initialize=0
+    "slot5": Initialize=0
+    "slot6": Initialize=0
+    "slot7": Initialize=0
+}
+
+SubRoutine.Mailbox_Init {
+    Mailbox.mutex = Mutex_Create()
+}
+
+SubRoutine.Mailbox_Send {
+    // Input: send_value
+    Mutex_Lock(Mailbox.mutex)
+    IfCondition LessThan(Mailbox.count, 8) ThenBlock: {
+        tail_pos = Mailbox.tail
+        Branch tail_pos {
+            Case 0: { Mailbox.slot0 = send_value }
+            Case 1: { Mailbox.slot1 = send_value }
+            Case 2: { Mailbox.slot2 = send_value }
+            Case 3: { Mailbox.slot3 = send_value }
+            Case 4: { Mailbox.slot4 = send_value }
+            Case 5: { Mailbox.slot5 = send_value }
+            Case 6: { Mailbox.slot6 = send_value }
+            Case 7: { Mailbox.slot7 = send_value }
+        }
+        Mailbox.tail  = Modulo(Add(tail_pos, 1), 8)
+        Mailbox.count = Add(Mailbox.count, 1)
+    }
+    Mutex_Unlock(Mailbox.mutex)
+}
+
+SubRoutine.Mailbox_Receive {
+    // Output: received  (-1 if empty)
+    received = -1
+    Mutex_Lock(Mailbox.mutex)
+    IfCondition GreaterThan(Mailbox.count, 0) ThenBlock: {
+        head_pos = Mailbox.head
+        Branch head_pos {
+            Case 0: { received = Mailbox.slot0 }
+            Case 1: { received = Mailbox.slot1 }
+            Case 2: { received = Mailbox.slot2 }
+            Case 3: { received = Mailbox.slot3 }
+            Case 4: { received = Mailbox.slot4 }
+            Case 5: { received = Mailbox.slot5 }
+            Case 6: { received = Mailbox.slot6 }
+            Case 7: { received = Mailbox.slot7 }
+        }
+        Mailbox.head  = Modulo(Add(head_pos, 1), 8)
+        Mailbox.count = Subtract(Mailbox.count, 1)
+    }
+    Mutex_Unlock(Mailbox.mutex)
+}
+```
+
+### Worker loop pattern
+
+```ailang
+Function.Worker {
+    Input:  cookie: Integer
+    Output: Integer
+    Body: {
+        WhileLoop EqualTo(1, 1) {
+            RunTask(Mailbox_Receive)
+            IfCondition EqualTo(received, -1) ThenBlock: {
+                // Nothing ready — yield and retry
+                Thread_Yield()
+                ContinueLoop
             }
-        }
-        
-        ReturnValue(cycle_count)
-    }
-}
-
-// Usage
-cycles_run = CooperativeScheduler(100)
-PrintMessage("Scheduler ran for cycles:")
-PrintNumber(cycles_run)
-```
-
-**Priority-Based Scheduling:**
-```ailang
-FixedPool.SchedulerState {
-    "high_priority_queue": Initialize=0
-    "normal_priority_queue": Initialize=0  
-    "low_priority_queue": Initialize=0
-    "current_priority": Initialize=1
-}
-
-Function.PriorityScheduler {
-    Body: {
-        // Initialize priority queues
-        SchedulerState.high_priority_queue = ArrayCreate(10)
-        SchedulerState.normal_priority_queue = ArrayCreate(20)
-        SchedulerState.low_priority_queue = ArrayCreate(30)
-        
-        running = 1
-        
-        WhileLoop EqualTo(running, 1) {
-            // Schedule high priority first
-            IfCondition GreaterThan(GetQueueSize(SchedulerState.high_priority_queue), 0) ThenBlock {
-                SchedulerState.current_priority = 3
-                RunNextActor(SchedulerState.high_priority_queue)
-            } ElseBlock {
-                // Then normal priority
-                IfCondition GreaterThan(GetQueueSize(SchedulerState.normal_priority_queue), 0) ThenBlock {
-                    SchedulerState.current_priority = 2
-                    RunNextActor(SchedulerState.normal_priority_queue)
-                } ElseBlock {
-                    // Finally low priority
-                    IfCondition GreaterThan(GetQueueSize(SchedulerState.low_priority_queue), 0) ThenBlock {
-                        SchedulerState.current_priority = 1
-                        RunNextActor(SchedulerState.low_priority_queue)
-                    } ElseBlock {
-                        // No actors to run
-                        running = 0
-                    }
-                }
+            IfCondition EqualTo(received, -2) ThenBlock: {
+                // Sentinel: shutdown signal
+                BreakLoop
             }
-            
-            // Prevent infinite loops
-            LoopYield()
+            // Process the message
+            ProcessItem(received)
         }
+        ReturnValue(0)
     }
 }
 ```
 
-## Concurrent Execution Patterns
+### Shutdown
 
-### LoopMain - Primary Execution Context
+Send one sentinel value per worker thread to unblock their loops:
 
-**Main Event Loop:**
 ```ailang
-LoopMain.Application {
-    PrintMessage("Application main loop started")
-    
-    // Initialize application state
-    app_running = 1
-    frame_count = 0
-    
-    // Main application loop
-    WhileLoop EqualTo(app_running, 1) {
-        // Process frame
-        ProcessFrame(frame_count)
-        
-        // Update frame counter
-        frame_count = Add(frame_count, 1)
-        
-        // Yield to other actors
-        LoopYield()
-        
-        // Check exit condition
-        IfCondition GreaterEqual(frame_count, 100) ThenBlock {
-            app_running = 0
-        }
-    }
-    
-    PrintMessage("Application main loop finished")
-}
-
-SubRoutine.ProcessFrame {
-    // Expects: frame_count as global
-    PrintMessage("Processing frame:")
-    PrintNumber(frame_count)
-    
-    // Simulate frame processing work
-    work = 0
-    WhileLoop LessThan(work, 3) {
-        work = Add(work, 1)
+SubRoutine.Mailbox_Shutdown {
+    // Send -2 sentinel once per worker
+    i = 0
+    WhileLoop LessThan(i, num_workers) {
+        send_value = -2
+        RunTask(Mailbox_Send)
+        i = Add(i, 1)
     }
 }
 ```
 
-### LoopStart - Initialization Context
+### Properties
 
-**System Initialization:**
-```ailang
-// NOTE: LoopStart blocks don't auto-execute
-LoopStart.SystemInit {
-    PrintMessage("System initialization starting...")
-    
-    // Initialize global systems
-    system_memory = Allocate(65536)  // 64KB system buffer
-    system_ready = 0
-    error_count = 0
-    
-    // Initialize subsystems
-    RunTask(InitializeMemoryManager)
-    RunTask(InitializeFileSystem)
-    RunTask(InitializeNetwork)
-    
-    // Mark system as ready
-    system_ready = 1
-    
-    PrintMessage("System initialization complete")
-}
-// Put initialization code in main flow or use:
-// RunTask(InitializationSubroutine)
+- **FIFO ordering** — messages dequeued in send order
+- **Bounded** — fixed 8-slot capacity, no allocation on send
+- **Overflow-safe** — send to a full mailbox is a no-op (or spin,
+  depending on your backpressure strategy)
+- **Zero hot-path allocation** — `FixedPool` fields, mutex is
+  pre-allocated at init
+- **Flat memory** — 3 + 8 = 11 `FixedPool` fields total regardless
+  of message volume
 
-SubRoutine.InitializeMemoryManager {
-    PrintMessage("  Memory manager initialized")
-    // Setup memory pools, allocators, etc.
-}
+### Capacity
 
-SubRoutine.InitializeFileSystem {
-    PrintMessage("  File system initialized")
-    // Mount file systems, check disk space, etc.
-}
+8 slots is enough for most producer/consumer pairs. If the producer
+consistently outpaces the consumer the right fix is adding workers,
+not enlarging the mailbox. A larger mailbox just hides the imbalance.
 
-SubRoutine.InitializeNetwork {
-    PrintMessage("  Network stack initialized") 
-    // Initialize network interfaces, protocols, etc.
-}
-```
+For higher capacity, declare more slots and change the `Branch` range
+and `Modulo` divisor to match. The pattern scales linearly — 16 slots,
+32 slots, etc.
 
-### LoopShadow - Background Processing
+---
 
-**Background Monitoring:**
-```ailang
-// NOTE: LoopShadow blocks don't execute (like LoopActor)
-LoopShadow.SystemMonitor {
-    PrintMessage("Background system monitor started")
-    
-    monitor_cycles = 0
-    max_cycles = 20
-    
-    WhileLoop LessThan(monitor_cycles, max_cycles) {
-        // Monitor system health
-        RunTask(CheckMemoryUsage)
-        RunTask(CheckCPULoad)
-        RunTask(CheckDiskSpace)
-        
-        monitor_cycles = Add(monitor_cycles, 1)
-        
-        // Background tasks run less frequently
-        LoopYield()
-        LoopYield()  // Extra yield for lower priority
-    }
-// Use SubRoutine for background tasks
-    
-    PrintMessage("Background monitor finished")
-}
+## SEE ALSO
 
-SubRoutine.CheckMemoryUsage {
-    // Simulated memory check
-    memory_used = 75  // Percentage
-    IfCondition GreaterThan(memory_used, 80) ThenBlock {
-        PrintMessage("  WARNING: High memory usage")
-    }
-}
+`AILang Language Introduction`,
+`Memory Management Reference Manual`,
+`Library.Arena`
 
-SubRoutine.CheckCPULoad {
-    // Simulated CPU check  
-    cpu_load = 45  // Percentage
-    IfCondition GreaterThan(cpu_load, 90) ThenBlock {
-        PrintMessage("  WARNING: High CPU load")
-    }
-}
+---
 
-SubRoutine.CheckDiskSpace {
-    // Simulated disk check
-    disk_free = 20  // Percentage free
-    IfCondition LessThan(disk_free, 10) ThenBlock {
-        PrintMessage("  WARNING: Low disk space")
-    }
-}
-```
+## VERSION
 
-## Inter-Actor Communication
+Initial release. Self-contained by design — no Arena dependency,
+no HashMap, no LinkagePool. Private 4 MB heap avoids allocator
+contention between threads.
 
-### Message Passing Simulation
+## COPYRIGHT
 
-**Message Queue Implementation:**
-```ailang
-FixedPool.MessageSystem {
-    "message_queue": Initialize=0
-    "queue_head": Initialize=0
-    "queue_tail": Initialize=0
-    "queue_size": Initialize=0
-    "max_messages": Initialize=50
-}
-
-Function.InitializeMessageSystem {
-    Output: Integer
-    Body: {
-        MessageSystem.message_queue = ArrayCreate(MessageSystem.max_messages)
-        MessageSystem.queue_head = 0
-        MessageSystem.queue_tail = 0
-        MessageSystem.queue_size = 0
-        ReturnValue(1)
-    }
-}
-
-Function.SendMessage {
-    Input: recipient_id: Integer, message_type: Integer, data: Integer
-    Output: Integer
-    Body: {
-        // Check if queue is full
-        IfCondition GreaterEqual(MessageSystem.queue_size, MessageSystem.max_messages) ThenBlock {
-            PrintMessage("Message queue full!")
-            ReturnValue(0)  // Failure
-        }
-        
-        // Encode message: [recipient, type, data]
-        message = Add(Add(Multiply(recipient_id, 1000000), 
-                         Multiply(message_type, 1000)), data)
-        
-        // Add to queue
-        ArraySet(MessageSystem.message_queue, MessageSystem.queue_tail, message)
-        MessageSystem.queue_tail = Modulo(Add(MessageSystem.queue_tail, 1), 
-                                         MessageSystem.max_messages)
-        MessageSystem.queue_size = Add(MessageSystem.queue_size, 1)
-        
-        ReturnValue(1)  // Success
-    }
-}
-
-Function.ReceiveMessage {
-    Input: actor_id: Integer
-    Output: Integer
-    Body: {
-        // Check if queue is empty
-        IfCondition EqualTo(MessageSystem.queue_size, 0) ThenBlock {
-            ReturnValue(0)  // No messages
-        }
-        
-        // Look for messages for this actor
-        i = MessageSystem.queue_head
-        messages_checked = 0
-        
-        WhileLoop LessThan(messages_checked, MessageSystem.queue_size) {
-            message = ArrayGet(MessageSystem.message_queue, i)
-            recipient = Divide(message, 1000000)
-            
-            IfCondition EqualTo(recipient, actor_id) ThenBlock {
-                // Extract message data
-                remainder = Modulo(message, 1000000)
-                message_type = Divide(remainder, 1000)
-                data = Modulo(remainder, 1000)
-                
-                // Remove from queue (simplified - just mark as 0)
-                ArraySet(MessageSystem.message_queue, i, 0)
-                MessageSystem.queue_size = Subtract(MessageSystem.queue_size, 1)
-                
-                // Return encoded message type and data
-                ReturnValue(Add(Multiply(message_type, 1000), data))
-            }
-            
-            i = Modulo(Add(i, 1), MessageSystem.max_messages)
-            messages_checked = Add(messages_checked, 1)
-        }
-        
-        ReturnValue(0)  // No messages for this actor
-    }
-}
-
-// Actors using message system
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.Sender {
-    actor_id = 1
-    
-    PrintMessage("Sender actor started")
-    
-    // Send several messages
-    SendMessage(2, 100, 42)    // To actor 2, type 100, data 42
-    SendMessage(2, 101, 84)    // To actor 2, type 101, data 84
-    SendMessage(3, 200, 99)    // To actor 3, type 200, data 99
-    
-    PrintMessage("Sender sent all messages")
-}
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.SenderLogic {
-    // Actor logic here
-}
-// Call with: RunTask(SenderLogic)
-*/
-
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.Receiver {
-    actor_id = 2
-    
-    PrintMessage("Receiver actor started")
-    
-    messages_received = 0
-    max_messages = 2
-    
-    WhileLoop LessThan(messages_received, max_messages) {
-        message = ReceiveMessage(actor_id)
-        
-        IfCondition NotEqual(message, 0) ThenBlock {
-            message_type = Divide(message, 1000)
-            data = Modulo(message, 1000)
-            
-            PrintMessage("Received message type:")
-            PrintNumber(message_type)
-            PrintMessage("With data:")
-            PrintNumber(data)
-            
-            messages_received = Add(messages_received, 1)
-        }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.ReceiverLogic {
-    // Actor logic here
-}
-// Call with: RunTask(ReceiverLogic)
-*/ ElseBlock {
-            // No messages, yield and try again
-            LoopYield()
-        }
-    }
-    
-    PrintMessage("Receiver finished")
-}
-
-// Initialize and run
-InitializeMessageSystem()
-
-// Spawn actors
-sender_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("Sender")  // TODO: Implement scheduler
-receiver_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("Receiver")  // TODO: Implement scheduler
-
-// Run scheduler
-scheduler_steps = 0
-WhileLoop LessThan(scheduler_steps, 20) {
-    LoopYield()
-    scheduler_steps = Add(scheduler_steps, 1)
-}
-```
-
-## Systems Programming Primitives
-
-### Low-Level System Access
-
-**Hardware Register Access (Conceptual):**
-```ailang
-// Note: These are conceptual - actual implementation depends on target system
-Function.ReadSystemRegister {
-    Input: register_id: Integer
-    Output: Integer
-    Body: {
-        // In real implementation, this would use inline assembly
-        // or system calls to read hardware registers
-        
-        // Simulated register values
-        IfCondition EqualTo(register_id, 1) ThenBlock {
-            ReturnValue(0x12345678)  // CPU ID
-        } ElseBlock {
-            IfCondition EqualTo(register_id, 2) ThenBlock {
-                ReturnValue(0x87654321)  // Status register
-            } ElseBlock {
-                ReturnValue(0)  // Unknown register
-            }
-        }
-    }
-}
-
-Function.WriteSystemRegister {
-    Input: register_id: Integer, value: Integer
-    Output: Integer
-    Body: {
-        // In real implementation, this would write to hardware
-        PrintMessage("Writing to register:")
-        PrintNumber(register_id)
-        PrintMessage("Value:")
-        PrintNumber(value)
-        
-        ReturnValue(1)  // Success
-    }
-}
-
-// System information gathering
-cpu_id = ReadSystemRegister(1)
-status_reg = ReadSystemRegister(2)
-
-PrintMessage("CPU ID:")
-PrintNumber(cpu_id)
-PrintMessage("Status Register:")
-PrintNumber(status_reg)
-
-// Configure system
-WriteSystemRegister(3, 0x1000)  // Set configuration register
-```
-
-### Memory Management Integration
-
-**System-Level Memory Management:**
-```ailang
-Function.SystemMemoryManager {
-    Body: {
-        // Initialize memory pools for different purposes
-        
-        // Kernel memory pool
-        kernel_pool = Allocate(1048576)  // 1MB for kernel
-        IfCondition EqualTo(kernel_pool, 0) ThenBlock {
-            PrintMessage("FATAL: Cannot allocate kernel memory")
-            HaltSystem()
-        }
-        
-        // User space pool
-        user_pool = Allocate(4194304)    // 4MB for user space
-        
-        // Device driver pool
-        driver_pool = Allocate(524288)   // 512KB for drivers
-        
-        // Set up memory regions
-        SetupMemoryRegion(kernel_pool, 1048576, 1)  // Type 1: Kernel
-        SetupMemoryRegion(user_pool, 4194304, 2)    // Type 2: User
-        SetupMemoryRegion(driver_pool, 524288, 3)   // Type 3: Driver
-        
-        PrintMessage("System memory manager initialized")
-    }
-}
-
-Function.SetupMemoryRegion {
-    Input: base_address: Address, size: Integer, region_type: Integer
-    Output: Integer
-    Body: {
-        PrintMessage("Memory region setup:")
-        PrintMessage("  Base:")
-        PrintNumber(base_address)
-        PrintMessage("  Size:")
-        PrintNumber(size)
-        PrintMessage("  Type:")
-        PrintNumber(region_type)
-        
-        // In real implementation, this would set up page tables,
-        // protection bits, etc.
-        
-        ReturnValue(1)
-    }
-}
-
-Function.HaltSystem {
-    Body: {
-        PrintMessage("System halted")
-        // In real implementation, this would halt the CPU
-    }
-}
-
-// Initialize system memory
-SystemMemoryManager()
-```
-
-### Interrupt Simulation
-
-**Interrupt Handler Framework:**
-```ailang
-FixedPool.InterruptSystem {
-    "interrupt_table": Initialize=0
-    "interrupt_count": Initialize=0
-    "pending_interrupts": Initialize=0
-    "interrupt_enabled": Initialize=1
-}
-
-Function.InitializeInterruptSystem {
-    Output: Integer
-    Body: {
-        InterruptSystem.interrupt_table = ArrayCreate(256)  // 256 interrupt vectors
-        InterruptSystem.pending_interrupts = ArrayCreate(32)  // Pending queue
-        InterruptSystem.interrupt_count = 0
-        
-        // Set up common interrupt handlers
-        SetInterruptHandler(0, TimerInterrupt)
-        SetInterruptHandler(1, KeyboardInterrupt)
-        SetInterruptHandler(2, NetworkInterrupt)
-        
-        PrintMessage("Interrupt system initialized")
-        ReturnValue(1)
-    }
-}
-
-Function.SetInterruptHandler {
-    Input: interrupt_number: Integer, handler_id: Integer
-    Output: Integer
-    Body: {
-        ArraySet(InterruptSystem.interrupt_table, interrupt_number, handler_id)
-        ReturnValue(1)
-    }
-}
-
-Function.TriggerInterrupt {
-    Input: interrupt_number: Integer
-    Output: Integer
-    Body: {
-        IfCondition EqualTo(InterruptSystem.interrupt_enabled, 0) ThenBlock {
-            // Interrupts disabled, queue for later
-            ArraySet(InterruptSystem.pending_interrupts, 
-                    InterruptSystem.interrupt_count, interrupt_number)
-            InterruptSystem.interrupt_count = Add(InterruptSystem.interrupt_count, 1)
-            ReturnValue(0)
-        }
-        
-        // Get handler
-        handler_id = ArrayGet(InterruptSystem.interrupt_table, interrupt_number)
-        IfCondition NotEqual(handler_id, 0) ThenBlock {
-            ProcessInterrupt(handler_id, interrupt_number)
-            ReturnValue(1)
-        }
-        
-        ReturnValue(0)  // No handler
-    }
-}
-
-Function.ProcessInterrupt {
-    Input: handler_id: Integer, interrupt_number: Integer
-    Output: Integer
-    Body: {
-        PrintMessage("Processing interrupt:")
-        PrintNumber(interrupt_number)
-        
-        IfCondition EqualTo(handler_id, TimerInterrupt) ThenBlock {
-            RunTask(HandleTimerInterrupt)
-        } ElseBlock {
-            IfCondition EqualTo(handler_id, KeyboardInterrupt) ThenBlock {
-                RunTask(HandleKeyboardInterrupt)
-            } ElseBlock {
-                IfCondition EqualTo(handler_id, NetworkInterrupt) ThenBlock {
-                    RunTask(HandleNetworkInterrupt)
-                }
-            }
-        }
-        
-        ReturnValue(1)
-    }
-}
-
-// Interrupt handler constants
-TimerInterrupt = 100
-KeyboardInterrupt = 101
-NetworkInterrupt = 102
-
-// Interrupt handler subroutines
-SubRoutine.HandleTimerInterrupt {
-    PrintMessage("  Timer interrupt handled")
-    // Update system clock, schedule tasks, etc.
-}
-
-SubRoutine.HandleKeyboardInterrupt {
-    PrintMessage("  Keyboard interrupt handled")
-    // Read keyboard input, update input buffer
-}
-
-SubRoutine.HandleNetworkInterrupt {
-    PrintMessage("  Network interrupt handled")
-    // Process network packets, update buffers
-}
-
-// Usage
-InitializeInterruptSystem()
-
-// Simulate interrupts
-TriggerInterrupt(0)  // Timer
-TriggerInterrupt(1)  // Keyboard
-TriggerInterrupt(2)  // Network
-```
-
-## Real-Time and Scheduling
-
-### Deadline-Based Scheduling
-
-**Real-Time Task Management:**
-```ailang
-FixedPool.RealTimeScheduler {
-    "task_queue": Initialize=0
-    "current_time": Initialize=0
-    "max_tasks": Initialize=20
-    "active_tasks": Initialize=0
-}
-
-Function.InitializeRealTimeScheduler {
-    Output: Integer
-    Body: {
-        RealTimeScheduler.task_queue = ArrayCreate(RealTimeScheduler.max_tasks)
-        RealTimeScheduler.current_time = 0
-        RealTimeScheduler.active_tasks = 0
-        
-        PrintMessage("Real-time scheduler initialized")
-        ReturnValue(1)
-    }
-}
-
-Function.ScheduleTask {
-    Input: task_id: Integer, deadline: Integer, priority: Integer
-    Output: Integer
-    Body: {
-        IfCondition GreaterEqual(RealTimeScheduler.active_tasks, 
-                                RealTimeScheduler.max_tasks) ThenBlock {
-            PrintMessage("Task queue full!")
-            ReturnValue(0)
-        }
-        
-        // Encode task: [task_id, deadline, priority]
-        encoded_task = Add(Add(Multiply(task_id, 1000000),
-                              Multiply(deadline, 1000)), priority)
-        
-        ArraySet(RealTimeScheduler.task_queue, RealTimeScheduler.active_tasks, encoded_task)
-        RealTimeScheduler.active_tasks = Add(RealTimeScheduler.active_tasks, 1)
-        
-        PrintMessage("Scheduled task:")
-        PrintNumber(task_id)
-        PrintMessage("Deadline:")
-        PrintNumber(deadline)
-        
-        ReturnValue(1)
-    }
-}
-
-Function.ExecuteScheduledTasks {
-    Output: Integer
-    Body: {
-        executed_tasks = 0
-        
-        i = 0
-        WhileLoop LessThan(i, RealTimeScheduler.active_tasks) {
-            task = ArrayGet(RealTimeScheduler.task_queue, i)
-            task_id = Divide(task, 1000000)
-            remainder = Modulo(task, 1000000)
-            deadline = Divide(remainder, 1000)
-            priority = Modulo(remainder, 1000)
-            
-            // Check if deadline is met
-            IfCondition LessEqual(deadline, RealTimeScheduler.current_time) ThenBlock {
-                PrintMessage("Executing overdue task:")
-                PrintNumber(task_id)
-                
-                ExecuteTask(task_id, priority)
-                executed_tasks = Add(executed_tasks, 1)
-                
-                // Remove from queue (simplified)
-                ArraySet(RealTimeScheduler.task_queue, i, 0)
-            } ElseBlock {
-                // Check if task should run now based on priority
-                time_to_deadline = Subtract(deadline, RealTimeScheduler.current_time)
-                IfCondition And(LessEqual(time_to_deadline, priority),
-                               GreaterThan(priority, 5)) ThenBlock {
-                    PrintMessage("Executing high priority task:")
-                    PrintNumber(task_id)
-                    
-                    ExecuteTask(task_id, priority)
-                    executed_tasks = Add(executed_tasks, 1)
-                    
-                    ArraySet(RealTimeScheduler.task_queue, i, 0)
-                }
-            }
-            
-            i = Add(i, 1)
-        }
-        
-        ReturnValue(executed_tasks)
-    }
-}
-
-Function.ExecuteTask {
-    Input: task_id: Integer, priority: Integer
-    Output: Integer
-    Body: {
-        // Route to specific task handlers
-        IfCondition EqualTo(task_id, 1) ThenBlock {
-            RunTask(CriticalSystemTask)
-        } ElseBlock {
-            IfCondition EqualTo(task_id, 2) ThenBlock {
-                RunTask(NetworkProcessingTask)
-            } ElseBlock {
-                IfCondition EqualTo(task_id, 3) ThenBlock {
-                    RunTask(UserInterfaceTask)
-                } ElseBlock {
-                    PrintMessage("Unknown task ID:")
-                    PrintNumber(task_id)
-                }
-            }
-        }
-        
-        ReturnValue(1)
-    }
-}
-
-SubRoutine.CriticalSystemTask {
-    PrintMessage("  Critical system task executed")
-    // Handle critical system operations
-}
-
-SubRoutine.NetworkProcessingTask {
-    PrintMessage("  Network processing task executed") 
-    // Process network data
-}
-
-SubRoutine.UserInterfaceTask {
-    PrintMessage("  User interface task executed")
-    // Update user interface
-}
-
-// Usage
-InitializeRealTimeScheduler()
-
-// Schedule tasks with different deadlines and priorities
-ScheduleTask(1, 10, 9)  // Critical task, deadline=10, priority=9
-ScheduleTask(2, 15, 5)  // Network task, deadline=15, priority=5  
-ScheduleTask(3, 20, 3)  // UI task, deadline=20, priority=3
-
-// Simulate time progression and task execution
-time_steps = 25
-WhileLoop LessThan(RealTimeScheduler.current_time, time_steps) {
-    PrintMessage("Time:")
-    PrintNumber(RealTimeScheduler.current_time)
-    
-    executed = ExecuteScheduledTasks()
-    PrintMessage("Tasks executed:")
-    PrintNumber(executed)
-    
-    RealTimeScheduler.current_time = Add(RealTimeScheduler.current_time, 2)
-}
-```
-
-## Memory Synchronization
-
-### Atomic Operations Simulation
-
-**Lock-Free Data Structures:**
-```ailang
-FixedPool.AtomicCounter {
-    "value": Initialize=0
-    "lock": Initialize=0
-}
-
-Function.AtomicIncrement {
-    Input: counter_address: Address
-    Output: Integer
-    Body: {
-        // Simulate atomic increment
-        // In real implementation, this would use hardware atomic instructions
-        
-        // Busy wait for lock
-        WhileLoop NotEqual(AtomicCounter.lock, 0) {
-            // Spin wait (yield to prevent infinite loop in simulation)
-            LoopYield()
-        }
-        
-        // Acquire lock
-        AtomicCounter.lock = 1
-        
-        // Critical section
-        old_value = AtomicCounter.value
-        AtomicCounter.value = Add(AtomicCounter.value, 1)
-        
-        // Release lock
-        AtomicCounter.lock = 0
-        
-        ReturnValue(old_value)
-    }
-}
-
-Function.AtomicRead {
-    Output: Integer
-    Body: {
-        // Atomic read (usually doesn't need locking for aligned reads)
-        value = AtomicCounter.value
-        ReturnValue(value)
-    }
-}
-
-// Test atomic operations with multiple actors
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.AtomicTester1 {
-    PrintMessage("Atomic tester 1 started")
-    
-    iterations = 0
-    WhileLoop LessThan(iterations, 5) {
-        old_val = AtomicIncrement(0)  // Address not used in simulation
-        PrintMessage("Actor 1 incremented, old value:")
-        PrintNumber(old_val)
-        
-        iterations = Add(iterations, 1)
-        LoopYield()  // Let other actors run
-    }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.AtomicTester1Logic {
-    // Actor logic here
-}
-// Call with: RunTask(AtomicTester1Logic)
-*/
-    
-    PrintMessage("Atomic tester 1 finished")
-}
-
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.AtomicTester2 {
-    PrintMessage("Atomic tester 2 started")
-    
-    iterations = 0
-    WhileLoop LessThan(iterations, 5) {
-        old_val = AtomicIncrement(0)
-        PrintMessage("Actor 2 incremented, old value:")
-        PrintNumber(old_val)
-        
-        iterations = Add(iterations, 1)
-        LoopYield()
-    }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.AtomicTester2Logic {
-    // Actor logic here
-}
-// Call with: RunTask(AtomicTester2Logic)
-*/
-    
-    PrintMessage("Atomic tester 2 finished")
-}
-
-// Run atomic test
-tester1_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("AtomicTester1")  // TODO: Implement scheduler
-tester2_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("AtomicTester2")  // TODO: Implement scheduler
-
-// Run for several cycles
-cycles = 0
-WhileLoop LessThan(cycles, 20) {
-    LoopYield()
-    cycles = Add(cycles, 1)
-}
-
-final_value = AtomicRead()
-PrintMessage("Final atomic counter value:")
-PrintNumber(final_value)
-PrintMessage("Expected: 10")
-```
-
-## Performance and Optimization
-
-### Actor Pool Management
-
-**Actor Pooling for Performance:**
-```ailang
-FixedPool.ActorPool {
-    "pool": Initialize=0
-    "pool_size": Initialize=20
-    "active_count": Initialize=0
-    "free_list": Initialize=0
-    "next_free": Initialize=0
-}
-
-Function.InitializeActorPool {
-    Output: Integer
-    Body: {
-        ActorPool.pool = ArrayCreate(ActorPool.pool_size)
-        ActorPool.free_list = ArrayCreate(ActorPool.pool_size)
-        
-        // Initialize free list
-        i = 0
-        WhileLoop LessThan(i, ActorPool.pool_size) {
-            ArraySet(ActorPool.free_list, i, i)
-            i = Add(i, 1)
-        }
-        
-        ActorPool.next_free = ActorPool.pool_size
-        ActorPool.active_count = 0
-        
-        PrintMessage("Actor pool initialized")
-        ReturnValue(1)
-    }
-}
-
-Function.AllocateActor {
-    Output: Integer
-    Body: {
-        IfCondition EqualTo(ActorPool.next_free, 0) ThenBlock {
-            PrintMessage("Actor pool exhausted!")
-            ReturnValue(-1)
-        }
-        
-        // Get free slot
-        ActorPool.next_free = Subtract(ActorPool.next_free, 1)
-        slot = ArrayGet(ActorPool.free_list, ActorPool.next_free)
-        
-        ActorPool.active_count = Add(ActorPool.active_count, 1)
-        
-        PrintMessage("Allocated actor slot:")
-        PrintNumber(slot)
-        
-        ReturnValue(slot)
-    }
-}
-
-Function.FreeActor {
-    Input: slot: Integer
-    Output: Integer
-    Body: {
-        IfCondition GreaterEqual(ActorPool.next_free, ActorPool.pool_size) ThenBlock {
-            PrintMessage("Free list overflow!")
-            ReturnValue(0)
-        }
-        
-        // Return to free list
-        ArraySet(ActorPool.free_list, ActorPool.next_free, slot)
-        ActorPool.next_free = Add(ActorPool.next_free, 1)
-        ActorPool.active_count = Subtract(ActorPool.active_count, 1)
-        
-        PrintMessage("Freed actor slot:")
-        PrintNumber(slot)
-        
-        ReturnValue(1)
-    }
-}
-
-// Usage
-InitializeActorPool()
-
-// Allocate several actors
-actor1 = AllocateActor()
-actor2 = AllocateActor()
-actor3 = AllocateActor()
-
-PrintMessage("Active actors:")
-PrintNumber(ActorPool.active_count)
-
-// Free some actors
-FreeActor(actor2)
-FreeActor(actor1)
-
-PrintMessage("Active actors after free:")
-PrintNumber(ActorPool.active_count)
-
-// Reallocate (should reuse freed slots)
-actor4 = AllocateActor()
-PrintMessage("Reallocated actor (reused slot):")
-PrintNumber(actor4)
-```
-
-## Working Implementation Patterns
-
-### Currently Working Pattern: SubRoutine-based Concurrency
-```ailang
-// Define "actors" as SubRoutines
-SubRoutine.Worker1 {
-    // Worker logic
-    PrintMessage("Worker1 executing")
-}
-
-SubRoutine.Worker2 {
-    // Worker logic  
-    PrintMessage("Worker2 executing")
-}
-
-// Use LoopMain for scheduler (LoopMain WORKS - executes inline)
-LoopMain.Scheduler {
-    cycles = 0
-    WhileLoop LessThan(cycles, 10) {
-        // Round-robin scheduling
-        IfCondition EqualTo(Modulo(cycles, 2), 0) ThenBlock {
-            RunTask(Worker1)
-        } ElseBlock {
-            RunTask(Worker2)
-        }
-        cycles = Add(cycles, 1)
-    }
-}
-```
-
-## Real-World Applications
-
-### Web Server Architecture
-
-**Concurrent Web Server Simulation:**
-```ailang
-FixedPool.WebServer {
-    "connection_pool": Initialize=0
-    "active_connections": Initialize=0
-    "max_connections": Initialize=10
-    "requests_processed": Initialize=0
-}
-
-Function.InitializeWebServer {
-    Output: Integer
-    Body: {
-        WebServer.connection_pool = ArrayCreate(WebServer.max_connections)
-        WebServer.active_connections = 0
-        WebServer.requests_processed = 0
-        
-        PrintMessage("Web server initialized")
-        PrintMessage("Max connections:")
-        PrintNumber(WebServer.max_connections)
-        
-        ReturnValue(1)
-    }
-}
-
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.ConnectionListener {
-    PrintMessage("Connection listener started")
-    
-    simulated_requests = 15  // Simulate 15 incoming connections
-    request_id = 1
-    
-    WhileLoop LessThan(request_id, simulated_requests) {
-        IfCondition LessThan(WebServer.active_connections, WebServer.max_connections) ThenBlock {
-            // Accept connection
-            connection_slot = WebServer.active_connections
-            ArraySet(WebServer.connection_pool, connection_slot, request_id)
-            WebServer.active_connections = Add(WebServer.active_connections, 1)
-            
-            PrintMessage("Accepted connection:")
-            PrintNumber(request_id)
-            
-            // Spawn worker to handle request
-            SpawnWorker(request_id, connection_slot)
-        }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.ConnectionListenerLogic {
-    // Actor logic here
-}
-// Call with: RunTask(ConnectionListenerLogic)
-*/ ElseBlock {
-            PrintMessage("Connection rejected - server full")
-        }
-        
-        request_id = Add(request_id, 1)
-        LoopYield()  // Let workers process
-    }
-    
-    PrintMessage("Connection listener finished")
-}
-
-Function.SpawnWorker {
-    Input: request_id: Integer, slot: Integer
-    Output: Integer
-    Body: {
-        // In real implementation, would spawn actual worker actor
-        PrintMessage("Worker spawned for request:")
-        PrintNumber(request_id)
-        
-        // Simulate processing
-        ProcessHTTPRequest(request_id, slot)
-        
-        ReturnValue(1)
-    }
-}
-
-Function.ProcessHTTPRequest {
-    Input: request_id: Integer, slot: Integer
-    Output: Integer
-    Body: {
-        PrintMessage("Processing HTTP request:")
-        PrintNumber(request_id)
-        
-        // Simulate request processing time
-        work_units = 0
-        processing_time = Modulo(request_id, 3)  // Variable processing time
-        
-        WhileLoop LessEqual(work_units, processing_time) {
-            work_units = Add(work_units, 1)
-            LoopYield()  // Cooperative processing
-        }
-        
-        // Complete request
-        WebServer.requests_processed = Add(WebServer.requests_processed, 1)
-        WebServer.active_connections = Subtract(WebServer.active_connections, 1)
-        
-        PrintMessage("Request completed:")
-        PrintNumber(request_id)
-        
-        ReturnValue(1)
-    }
-}
-
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.ServerMonitor {
-    PrintMessage("Server monitor started")
-    
-    monitor_cycles = 0
-    max_cycles = 25
-    
-    WhileLoop LessThan(monitor_cycles, max_cycles) {
-        PrintMessage("Server status - Active:")
-        PrintNumber(WebServer.active_connections)
-        PrintMessage("Processed:")
-        PrintNumber(WebServer.requests_processed)
-        
-        monitor_cycles = Add(monitor_cycles, 1)
-        LoopYield()
-        LoopYield()  // Monitor runs less frequently
-    }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.ServerMonitorLogic {
-    // Actor logic here
-}
-// Call with: RunTask(ServerMonitorLogic)
-*/
-    
-    PrintMessage("Server monitor finished")
-}
-
-// Initialize and run web server
-InitializeWebServer()
-
-// Spawn server components
-listener_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("ConnectionListener")  // TODO: Implement scheduler
-monitor_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("ServerMonitor")  // TODO: Implement scheduler
-
-// Run server
-server_cycles = 0
-WhileLoop LessThan(server_cycles, 50) {
-    LoopYield()
-    server_cycles = Add(server_cycles, 1)
-}
-
-PrintMessage("Web server simulation complete")
-PrintMessage("Final stats - Processed:")
-PrintNumber(WebServer.requests_processed)
-```
-
-### Operating System Kernel Simulation
-
-**Microkernel Architecture:**
-```ailang
-// NOTE: LoopStart blocks don't auto-execute
-LoopStart.KernelInit {
-    PrintMessage("Kernel initialization starting...")
-    
-    // Initialize core kernel subsystems
-    RunTask(InitializeMemoryManager)
-    RunTask(InitializeProcessManager)  
-    RunTask(InitializeDeviceManager)
-    RunTask(InitializeFileSystem)
-    
-    kernel_ready = 1
-    PrintMessage("Kernel initialization complete")
-}
-// Put initialization code in main flow or use:
-// RunTask(InitializationSubroutine)
-
-SubRoutine.InitializeMemoryManager {
-    PrintMessage("  Memory manager: OK")
-    memory_manager_ready = 1
-}
-
-SubRoutine.InitializeProcessManager {
-    PrintMessage("  Process manager: OK")
-    process_manager_ready = 1
-}
-
-SubRoutine.InitializeDeviceManager {
-    PrintMessage("  Device manager: OK")
-    device_manager_ready = 1
-}
-
-SubRoutine.InitializeFileSystem {
-    PrintMessage("  File system: OK")
-    filesystem_ready = 1
-}
-
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.ProcessScheduler {
-    PrintMessage("Process scheduler started")
-    
-    // Simulate process scheduling
-    process_queue = ArrayCreate(10)
-    active_processes = 0
-    
-    // Add some processes to queue
-    ArraySet(process_queue, 0, 101)  // Process ID 101
-    ArraySet(process_queue, 1, 102)  // Process ID 102
-    ArraySet(process_queue, 2, 103)  // Process ID 103
-    active_processes = 3
-    
-    scheduler_cycles = 0
-    max_cycles = 10
-    
-    WhileLoop LessThan(scheduler_cycles, max_cycles) {
-        current_process = scheduler_cycles % active_processes
-        pid = ArrayGet(process_queue, current_process)
-        
-        PrintMessage("Scheduling process:")
-        PrintNumber(pid)
-        
-        // Give process time slice
-        ExecuteProcess(pid)
-        
-        scheduler_cycles = Add(scheduler_cycles, 1)
-        LoopYield()
-    }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.ProcessSchedulerLogic {
-    // Actor logic here
-}
-// Call with: RunTask(ProcessSchedulerLogic)
-*/
-    
-    PrintMessage("Process scheduler finished")
-}
-
-Function.ExecuteProcess {
-    Input: process_id: Integer
-    Output: Integer
-    Body: {
-        // Simulate process execution
-        PrintMessage("  Executing process:")
-        PrintNumber(process_id)
-        
-        // Process does some work
-        work = 0
-        WhileLoop LessThan(work, 2) {
-            work = Add(work, 1)
-        }
-        
-        ReturnValue(1)
-    }
-}
-
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.DeviceDriver {
-    PrintMessage("Device driver started")
-    
-    device_interrupts = 0
-    max_interrupts = 5
-    
-    WhileLoop LessThan(device_interrupts, max_interrupts) {
-        PrintMessage("Handling device interrupt:")
-        PrintNumber(device_interrupts)
-        
-        // Process device I/O
-        RunTask(ProcessDeviceIO)
-        
-        device_interrupts = Add(device_interrupts, 1)
-        LoopYield()
-    }
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.DeviceDriverLogic {
-    // Actor logic here
-}
-// Call with: RunTask(DeviceDriverLogic)
-*/
-    
-    PrintMessage("Device driver finished")
-}
-
-SubRoutine.ProcessDeviceIO {
-    PrintMessage("  Device I/O processed")
-    // Handle hardware device communication
-}
-
-LoopMain.KernelMain {
-    PrintMessage("Kernel main loop started")
-    
-    // Wait for initialization
-    WhileLoop EqualTo(kernel_ready, 0) {
-        LoopYield()
-    }
-    
-    PrintMessage("Kernel fully operational")
-    
-    // Main kernel loop
-    kernel_cycles = 0
-    max_kernel_cycles = 20
-    
-    WhileLoop LessThan(kernel_cycles, max_kernel_cycles) {
-        // Handle system calls, interrupts, etc.
-        RunTask(ProcessSystemCalls)
-        
-        kernel_cycles = Add(kernel_cycles, 1)
-        LoopYield()
-    }
-    
-    PrintMessage("Kernel main loop finished")
-}
-
-SubRoutine.ProcessSystemCalls {
-    // Handle pending system calls from user processes
-    // (Simulated)
-}
-
-// Global kernel state
-kernel_ready = 0
-memory_manager_ready = 0
-process_manager_ready = 0
-device_manager_ready = 0
-filesystem_ready = 0
-
-// Spawn kernel components
-scheduler_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("ProcessScheduler")  // TODO: Implement scheduler
-driver_// LoopSpawn not yet functional - use manual scheduling
-// handle = LoopSpawn("DeviceDriver")  // TODO: Implement scheduler
-
-// Run kernel
-kernel_runtime = 0
-WhileLoop LessThan(kernel_runtime, 40) {
-    LoopYield()
-    kernel_runtime = Add(kernel_runtime, 1)
-}
-
-PrintMessage("Kernel simulation complete")
-```
-
-This comprehensive manual provides everything needed to build sophisticated concurrent and systems-level applications in AILANG, from basic actor patterns to complex operating system simulations. The language's unique combination of actor-model concurrency with low-level systems access makes it ideal for embedded systems, real-time applications, and systems programming tasks.
-
-
-
-# AILANG Concurrency - Implementation Status
-
-## Current State (as of testing)
-
-### ✅ WORKING Features
-
-#### LoopMain
-- **Status**: Fully functional
-- **Behavior**: Executes inline in main program flow
-- **Use case**: Can be used to implement schedulers, event loops, main program logic
-```ailang
-LoopMain.Application {
-    // This code executes directly
-    PrintMessage("This will run")
-}
-```
-
-#### SubRoutine / RunTask
-- **Status**: Fully functional
-- **Behavior**: Callable code blocks
-- **Use case**: Reusable logic, can simulate actors
-```ailang
-SubRoutine.Worker {
-    // Reusable logic
-}
-RunTask(Worker)  // Executes the subroutine
-```
-
-#### FixedPool
-- **Status**: Fully functional
-- **Behavior**: Structured data storage
-- **Use case**: Shared state, message passing simulation
-
-### ⚠️ PARSED BUT NOT EXECUTED
-
-#### LoopActor
-- **Status**: Parsed, compiled as subroutine with skip jump, never executes
-- **Issue**: Skip jump prevents execution, no runtime scheduler to invoke
-- **Workaround**: Use SubRoutines to simulate actors
-```ailang
-// NOTE: LoopActor blocks are parsed but not executed (scheduler not implemented)
-// Use SubRoutine pattern below for working equivalent
-LoopActor.MyActor {
-    // This code is compiled but never runs
-    // Needs scheduler implementation
-}
-
-// Working equivalent using SubRoutine:
-/*
-SubRoutine.MyActorLogic {
-    // Actor logic here
-}
-// Call with: RunTask(MyActorLogic)
-*/
-```
-
-#### LoopStart
-- **Status**: Parsed, stored but not executed
-- **Issue**: No initialization hook to run these blocks
-- **Workaround**: Put initialization code directly in main flow or LoopMain
-
-#### LoopShadow  
-- **Status**: Parsed, compiled with skip jump, never executes
-- **Issue**: Similar to LoopActor - unreachable code
-- **Workaround**: Use SubRoutines for background tasks
-
-#### LoopSpawn
-- **Status**: Function exists but implementation incomplete
-- **Issue**: May not properly spawn actors
-- **Workaround**: Manual scheduling with SubRoutines
-
-### 📝 Implementation Notes
-
-The concurrency primitives are architecturally sound but need a scheduler implementation to activate them. The compiler generates proper code structures:
-
-1. **LoopActor** compiles to labeled subroutines with skip jumps
-2. **LoopMain** executes inline (working as designed)
-3. **LoopStart/LoopShadow** are recognized but lack execution triggers
-
-### 🔧 Recommended Patterns
-
-Until full actor support is implemented, use these patterns:
-
-#### Pattern 1: SubRoutine-based Actors
-```ailang
-// Define "actors" as SubRoutines
-SubRoutine.Actor1 {
-    // Actor logic
-}
-
-SubRoutine.Actor2 {
-    // Actor logic
-}
-
-// Scheduler in LoopMain
-LoopMain.Scheduler {
-    cycles = 0
-    WhileLoop LessThan(cycles, 10) {
-        IfCondition EqualTo(Modulo(cycles, 2), 0) ThenBlock {
-            RunTask(Actor1)
-        } ElseBlock {
-            RunTask(Actor2)
-        }
-        cycles = Add(cycles, 1)
-    }
-}
-```
-
-#### Pattern 2: Message Passing with FixedPool
-```ailang
-FixedPool.Messages {
-    "queue": Initialize=0
-    "head": Initialize=0
-    "tail": Initialize=0
-}
-
-// Simulate message passing between SubRoutine "actors"
-```
-
-### 🚧 Future Work Needed
-
-1. **Scheduler Runtime**: Implement a scheduler that can invoke LoopActor subroutines
-2. **Remove Skip Jumps**: Or add mechanism to jump into actor code
-3. **LoopSpawn Implementation**: Complete the spawn function to return valid handles
-4. **LoopStart Hook**: Add initialization phase before main execution
-5. **LoopYield Support**: Implement cooperative yielding between actors
-
-### 📢 Patches Welcome!
-
-The foundation is solid - the compiler generates the right structures. What's needed is the runtime scheduler to orchestrate execution. Key areas for contribution:
-
-- Scheduler implementation (can be in AILANG itself using LoopMain)
-- Runtime support for actor handle management
-- Yield/resume mechanism implementation
-- Message passing infrastructure
-
-The primitives are there, they just need to be wired together!
+Copyright (c) 2025–2026 Sean Collins, 2 Paws Machine and Engineering.
+Licensed under the Sean Collins Software License (SCSL).

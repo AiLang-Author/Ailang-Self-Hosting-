@@ -1065,6 +1065,131 @@ function activate(context) {
             ev.waitUntil(Promise.resolve(edits));
         }
     }));
+
+    // ─── Shorthand Display Mode ──────────────────────────────────────
+    // When ailang.editor.shorthandDisplay is true, visually render canonical
+    // keywords (GreaterThan, FixedPool, ...) as their shorthand (GT, FP, ...)
+    // WITHOUT modifying the file. The disk stays canonical.
+    //
+    // Config:
+    //   ailang.editor.shorthandDisplay     boolean
+    //   ailang.editor.shorthandCustomMap   { "Canonical": "SHORT" }  per-user overrides
+
+    const shorthandDecoration = vscode.window.createTextEditorDecorationType({
+        // Collapse the canonical text to zero width; the `before` pseudo-element
+        // (set per-range in renderOptions) paints the shorthand in its place.
+        textDecoration: 'none; display: inline-block; width: 0; overflow: hidden;'
+    });
+
+    function buildEffectiveShortMap() {
+        const config = vscode.workspace.getConfiguration('ailang.editor');
+        const customMap = config.get('shorthandCustomMap', {}) || {};
+        // Start from REVERSE_ALIASES (canonical -> [shorts]), pick first as default.
+        const map = {};
+        Object.entries(REVERSE_ALIASES).forEach(([canon, shorts]) => {
+            map[canon] = shorts[0];
+        });
+        // User overrides win.
+        Object.entries(customMap).forEach(([canon, short]) => {
+            if (typeof short === 'string' && short.length > 0) map[canon] = short;
+        });
+        return map;
+    }
+
+    function applyShorthandDecorations(editor) {
+        if (!editor || editor.document.languageId !== 'ailang') return;
+
+        const config = vscode.workspace.getConfiguration('ailang.editor');
+        const enabled = config.get('shorthandDisplay', false);
+
+        if (!enabled) {
+            editor.setDecorations(shorthandDecoration, []);
+            return;
+        }
+
+        const shortMap = buildEffectiveShortMap();
+        const canonicals = Object.keys(shortMap);
+        if (canonicals.length === 0) {
+            editor.setDecorations(shorthandDecoration, []);
+            return;
+        }
+        // Longest first so GreaterEqual matches before GreaterThan, etc.
+        canonicals.sort((a, b) => b.length - a.length);
+
+        const text = editor.document.getText();
+        const pattern = new RegExp('\\b(' + canonicals.join('|') + ')\\b', 'g');
+        const decorations = [];
+        let match;
+        while ((match = pattern.exec(text)) !== null) {
+            const canon = match[1];
+            const short = shortMap[canon];
+            if (!short) continue;
+
+            // Skip inside strings / line comments.
+            const startPos = editor.document.positionAt(match.index);
+            const lineText = editor.document.lineAt(startPos.line).text;
+            const col = startPos.character;
+            const beforeMatch = lineText.substring(0, col);
+            const quoteCount = (beforeMatch.match(/"/g) || []).length;
+            if (quoteCount % 2 !== 0) continue;
+            if (beforeMatch.includes('//')) continue;
+
+            const endPos = editor.document.positionAt(match.index + canon.length);
+            decorations.push({
+                range: new vscode.Range(startPos, endPos),
+                renderOptions: {
+                    before: {
+                        contentText: short,
+                        fontWeight: 'bold',
+                        color: new vscode.ThemeColor('editor.foreground')
+                    }
+                },
+                hoverMessage: 'Shorthand for `' + canon + '` — toggle with "AILang: Toggle Shorthand Display"'
+            });
+        }
+
+        editor.setDecorations(shorthandDecoration, decorations);
+    }
+
+    function refreshAllShorthandDecorations() {
+        vscode.window.visibleTextEditors.forEach(applyShorthandDecorations);
+    }
+
+    // Command: Toggle Shorthand Display
+    context.subscriptions.push(vscode.commands.registerCommand('ailang.toggleShorthand', () => {
+        const config = vscode.workspace.getConfiguration('ailang.editor');
+        const current = config.get('shorthandDisplay', false);
+        config.update('shorthandDisplay', !current, vscode.ConfigurationTarget.Global).then(() => {
+            refreshAllShorthandDecorations();
+            vscode.window.showInformationMessage(
+                'AILang shorthand display: ' + (!current ? 'ON' : 'OFF')
+            );
+        });
+    }));
+
+    // Re-apply on editor switch / document change / config change.
+    context.subscriptions.push(
+        vscode.window.onDidChangeActiveTextEditor(applyShorthandDecorations)
+    );
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeTextDocument(ev => {
+            // Only refresh the editor(s) showing the changed doc.
+            vscode.window.visibleTextEditors.forEach(ed => {
+                if (ed.document === ev.document) applyShorthandDecorations(ed);
+            });
+        })
+    );
+    context.subscriptions.push(
+        vscode.workspace.onDidChangeConfiguration(ev => {
+            if (ev.affectsConfiguration('ailang.editor.shorthandDisplay') ||
+                ev.affectsConfiguration('ailang.editor.shorthandCustomMap')) {
+                refreshAllShorthandDecorations();
+            }
+        })
+    );
+
+    // Initial pass over already-open editors.
+    refreshAllShorthandDecorations();
 }
 
 // =============================================================================
