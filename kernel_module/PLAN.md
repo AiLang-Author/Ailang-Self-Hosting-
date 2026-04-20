@@ -39,7 +39,7 @@ This reduces AiLang's relocation-emission scope to exactly one reloc type (`R_X8
 | C shim | `kernel_module/shim/ail_shim.c` | DONE. Hosts kernel-side glue + wrappers. |
 | Shim header | `kernel_module/shim/ail_shim.h` | DONE. Documents stable ABI surface. |
 | Shim Makefile | `kernel_module/shim/Makefile` | DONE. kbuild dance; merges shim.o + payload.o. |
-| .ko emitter | `Librarys/Compiler/Output/Library.CELFKernelModule.ailang` | EXTEND. Accept reloc + extern + export arrays; emit real `.rela.text` + UND symtab entries. |
+| .ko emitter | `Librarys/Compiler/Link/OS/Linux/Library.ELFKernelModule.ailang` | EXTEND. Accept reloc + extern + export arrays; emit real `.rela.text` + UND symtab entries. |
 | Parser | `Librarys/Compiler/Frontend/Parser/Library.CParserDeclarations.ailang` | EXTEND. Add `ExternalKernelFunction.<name>` declaration. |
 | Lexer | `Librarys/Compiler/Frontend/Lexer/*` | EXTEND. New keyword `ExternalKernelFunction`. |
 | AST | wherever AST node kinds live | EXTEND. New node `AST.EXTERN_KFUNC`. |
@@ -226,7 +226,7 @@ Files that will be created:
 - (possibly) `Librarys/Library.KernelShim.ailang` — library of all `ExternalKernelFunction` declarations that mirror `ail_shim.h`. Consumers `LibraryImport.KernelShim`. This keeps the shim surface in one place instead of scattered through test files.
 
 Files that will be modified (minor, local changes only):
-- `Librarys/Compiler/Output/Library.CELFKernelModule.ailang` — extended signature + reloc/symtab writers.
+- `Librarys/Compiler/Link/OS/Linux/Library.ELFKernelModule.ailang` — extended signature + reloc/symtab writers.
 - `Librarys/Compiler/Frontend/Lexer/*` — new keyword.
 - `Librarys/Compiler/Frontend/Parser/Library.CParserDeclarations.ailang` — new parse rule.
 - `Librarys/Compiler/Compile/Modules/Library.CCompileFunc.ailang` (or wherever `call` is emitted) — reloc record on extern calls.
