@@ -37,13 +37,15 @@
 
 **Bisect results:**
 - **Step 1 (Option B):** Commented out `EventRouter_Push` in `Win_ToolbarEvent:160-163`. Toolbar buttons render and highlight normally. **NO CRASH.** → Bug is downstream of toolbar event handler.
-- **Step 2 (Option A):** Re-enabled `EventRouter_Push`. Commented out all four `Menu_Show(...)` calls in `EventRouter_Internal:348-371`. Actions still match and print `(NO-OP)`. **PENDING TEST.**
-- If crash returns → bug is in `Menu_Show` (AKSlot_Alloc, Surface_Create, tree build, render, SwapOut).
-- If no crash → bug is in EventRouter plumbing (`EventRouter_Push`, `_Drain`, `_Dispatch`).
+- **Step 2 (Option A):** Re-enabled `EventRouter_Push`. Commented out all four `Menu_Show(...)` calls in `EventRouter_Internal:348-371`. Actions still match and print `(NO-OP)`. **NO CRASH.** → Bug is inside `Menu_Show`.
+- **Step 3 (bisect Menu_Show):** Re-enabled all four `Menu_Show` calls in EventRouter. Added early-return inside `Menu_Show` (Menu.ailang:~298) AFTER `AKSlot_Alloc` + `AKSlot_SwapIn` + tree build (`Menu_BuildFile/Edit/View/Help`) but BEFORE `Surface_Create` / `Menu_Render` / `MenuState` storage. Early-return does `AKSlot_SwapOut` + `AKSlot_Free` to clean up. **PENDING TEST.**
+  - If freeze → bug is in: `AKSlot_Alloc`, `AKSlot_SwapIn`, tree build (`AK_CreateNode`, `AK_Set`, `Menu_BuildFile/Edit/View/Help`), or the early `AKSlot_SwapOut`.
+  - If no freeze → bug is in: `Menu_ComputeHeight`, `Surface_Create`, `Menu_Render`, or `AKSlot_SwapOut` (the real one at line 335).
 
 **Current state of code:**
-- `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` is RE-ENABLED (restored).
-- `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls COMMENTED OUT, prints `(NO-OP)` instead.
+- `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` is RE-ENABLED (restored to normal).
+- `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls RE-ENABLED (restored to normal).
+- `Library.Menu.ailang:~298` — early-return inserted after tree build, before `Surface_Create`. Cleans up AKSlot before returning 0.
 
 ### DebugLog_Push Full Instrumentation (2026-04-22)
 
