@@ -23,6 +23,28 @@
 - Main loop: Evdev_Poll -> DrainInput -> AK_DrawDirty -> Win_RenderDirty -> EventRouter_Drain -> DebugLog_Render -> Win_BlitAll -> sleep(16ms).
 - Bare `AK_EventMouse` calls on main context (lines 944, 1004, 1041 of SysDisplay) are harmless — main root==-1, hit test returns -1, event handlers bail early.
 
+### Bisecting Toolbar Freeze (2026-04-22, in progress)
+
+**Symptom:** Hard freeze (not segfault) when clicking toolbar menu buttons (File/Edit/View/Help). System hangs unrecoverably.
+
+**Bisection strategy:** Disable parts of the click dispatch path to isolate which stage freezes.
+
+**Click dispatch path (full):**
+1. `SysDisplay_DrainInput` (SysDisplay:999-1007) → `Win_ToolbarHitTest` → `Win_ToolbarEvent`
+2. `Win_ToolbarEvent` (WinToolbar:92-171) → `AKSlot_SwapIn` → `AK_EventMouse` → redraw → `AKSlot_SwapOut` → `EventRouter_Push`
+3. `EventRouter_Drain` → `EventRouter_Internal` (EventRouter:348-371) → string-matches `"menu:file/edit/view/help"` → `Menu_Show(id, win)`
+4. `Menu_Show` (Menu:219-370) → `AKSlot_Alloc` → `AKSlot_SwapIn` → build tree → `Surface_Create` → render → `AKSlot_SwapOut`
+
+**Bisect results:**
+- **Step 1 (Option B):** Commented out `EventRouter_Push` in `Win_ToolbarEvent:160-163`. Toolbar buttons render and highlight normally. **NO CRASH.** → Bug is downstream of toolbar event handler.
+- **Step 2 (Option A):** Re-enabled `EventRouter_Push`. Commented out all four `Menu_Show(...)` calls in `EventRouter_Internal:348-371`. Actions still match and print `(NO-OP)`. **PENDING TEST.**
+- If crash returns → bug is in `Menu_Show` (AKSlot_Alloc, Surface_Create, tree build, render, SwapOut).
+- If no crash → bug is in EventRouter plumbing (`EventRouter_Push`, `_Drain`, `_Dispatch`).
+
+**Current state of code:**
+- `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` is RE-ENABLED (restored).
+- `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls COMMENTED OUT, prints `(NO-OP)` instead.
+
 ### DebugLog_Push Full Instrumentation (2026-04-22)
 
 **Purpose:** Trace a hard freeze on toolbar button click (File/Edit/Help). Ring buffer captures last ~256 tags before hang.
