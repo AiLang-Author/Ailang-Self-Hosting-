@@ -1,0 +1,546 @@
+// Library.Dialog.ailang
+// Generic dialog system — window + Auckland context lifecycle.
+//
+// Dialogs are windows with their own AK context. The caller builds
+// content by swapping in the context. This library handles:
+//   - Window creation at font-derived sizes
+//   - Auckland context create/destroy
+//   - Save/swap/render/restore (the common boilerplate)
+//   - Mouse event routing into the dialog's context
+//   - Close/cleanup
+//
+// Usage:
+//   slot = Dialog_Create("My Dialog", dlg_w, dlg_h)
+//   Dialog_SwapIn(slot)       // AKSlot_SwapIn(ak_slot)
+//   ... build Auckland tree ...
+//   Dialog_SwapOut(slot)      // AKSlot_SwapOut()
+//   Dialog_Render(slot)       // measure + layout + draw
+//
+// Event routing:
+//   Dialog_Event(slot, mx, my, mouse_ev)  // returns fired action or 0
+//
+// Copyright © 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Auckland
+LibraryImport.AucklandEvent
+LibraryImport.AKSlot
+LibraryImport.WinManager
+LibraryImport.WinToolbar
+LibraryImport.EventRouter
+LibraryImport.Fonts
+LibraryImport.TextRegion
+LibraryImport.DSurfaceTypes
+LibraryImport.DSurface
+LibraryImport.DDrawPixel
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.DialogConst {
+    "MAX_DIALOGS":  Initialize=4
+    "ENTRY_SIZE":   Initialize=48
+}
+
+// Per-dialog entry: [win_idx(8), ak_slot(8), font_size(8), flags(8),
+//                    content_node(8), reserved(8)]
+FixedPool.DialogFields {
+    "WIN_IDX":      Initialize=0
+    "AK_SLOT":      Initialize=8
+    "FONT_SIZE":    Initialize=16
+    "FLAGS":        Initialize=24
+    "CONTENT_NODE": Initialize=32
+    "RESERVED":     Initialize=40
+}
+
+FixedPool.DialogFlags {
+    "ACTIVE":       Initialize=1
+    "MODAL":        Initialize=2
+}
+
+FixedPool.DialogTable {
+    "data":         Initialize=0
+    "count":        Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// INIT
+// =============================================================================
+Function.Dialog_Init {
+    Output: Integer
+    Body: {
+        sz = Multiply(DialogConst.MAX_DIALOGS, DialogConst.ENTRY_SIZE)
+        buf = Allocate(sz)
+        IfCondition EqualTo(buf, 0) ThenBlock: {
+            PrintMessage("[Dialog] alloc fail\n")
+            ReturnValue(0)
+        }
+        i = 0
+        WhileLoop LessThan(i, sz) {
+            SetByte(buf, i, 0)
+            i = Add(i, 1)
+        }
+
+        // Initialize all slots as inactive
+        s = 0
+        WhileLoop LessThan(s, DialogConst.MAX_DIALOGS) {
+            base = Add(buf, Multiply(s, DialogConst.ENTRY_SIZE))
+            StoreValue(Add(base, DialogFields.WIN_IDX), -1)
+            StoreValue(Add(base, DialogFields.AK_SLOT), -1)
+            StoreValue(Add(base, DialogFields.FLAGS), 0)
+            s = Add(s, 1)
+        }
+
+        DialogTable.data = buf
+        DialogTable.count = 0
+        PrintMessage("[Dialog] initialized\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+Function.Dialog_EntryPtr {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(DialogTable.data, Multiply(slot, DialogConst.ENTRY_SIZE)))
+    }
+}
+
+Function.Dialog_GetWinIdx {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        base = Dialog_EntryPtr(slot)
+        ReturnValue(Dereference(Add(base, DialogFields.WIN_IDX)))
+    }
+}
+
+Function.Dialog_GetSlot {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        base = Dialog_EntryPtr(slot)
+        ReturnValue(Dereference(Add(base, DialogFields.AK_SLOT)))
+    }
+}
+
+Function.Dialog_GetFontSize {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        base = Dialog_EntryPtr(slot)
+        ReturnValue(Dereference(Add(base, DialogFields.FONT_SIZE)))
+    }
+}
+
+Function.Dialog_IsActive {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        base = Dialog_EntryPtr(slot)
+        flags = Dereference(Add(base, DialogFields.FLAGS))
+        ReturnValue(BitwiseAnd(flags, DialogFlags.ACTIVE))
+    }
+}
+
+Function.Dialog_SetContentNode {
+    Input: slot: Integer
+    Input: node: Integer
+    Body: {
+        base = Dialog_EntryPtr(slot)
+        StoreValue(Add(base, DialogFields.CONTENT_NODE), node)
+    }
+}
+
+Function.Dialog_GetContentNode {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        base = Dialog_EntryPtr(slot)
+        ReturnValue(Dereference(Add(base, DialogFields.CONTENT_NODE)))
+    }
+}
+
+
+// =============================================================================
+// SIZING HELPERS — same as FileDialog, now shared
+// =============================================================================
+Function.Dialog_CalcRowHeight {
+    Input: fs: Integer
+    Output: Integer
+    Body: {
+        third = Divide(fs, 3)
+        IfCondition LessThan(third, 2) ThenBlock: { third = 2 }
+        ReturnValue(Add(fs, third))
+    }
+}
+
+Function.Dialog_CalcPad {
+    Input: fs: Integer
+    Output: Integer
+    Body: {
+        p = Divide(fs, 3)
+        IfCondition LessThan(p, 2) ThenBlock: { p = 2 }
+        ReturnValue(p)
+    }
+}
+
+Function.Dialog_CalcGap {
+    Input: fs: Integer
+    Output: Integer
+    Body: {
+        g = Divide(fs, 4)
+        IfCondition LessThan(g, 2) ThenBlock: { g = 2 }
+        ReturnValue(g)
+    }
+}
+
+
+// =============================================================================
+// CREATE — allocate a dialog slot, create window + AK context
+//
+// title:     window title string
+// canvas_w:  content area width (caller computes from font_size)
+// canvas_h:  content area height
+// font_size: base font size for this dialog
+//
+// Returns slot index (0..MAX_DIALOGS-1), or -1 on failure.
+// =============================================================================
+Function.Dialog_Create {
+    Input: title: Address
+    Input: canvas_w: Integer
+    Input: canvas_h: Integer
+    Input: font_size: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("DLG.new", 7)
+        PrintMessage("[Dialog] Create start\n")
+
+        // Find a free slot
+        slot = -1
+        si = 0
+        WhileLoop LessThan(si, DialogConst.MAX_DIALOGS) {
+            active = Dialog_IsActive(si)
+            IfCondition EqualTo(active, 0) ThenBlock: {
+                IfCondition LessThan(slot, 0) ThenBlock: {
+                    slot = si
+                }
+            }
+            si = Add(si, 1)
+        }
+        IfCondition LessThan(slot, 0) ThenBlock: {
+            PrintMessage("[Dialog] no free slots\n")
+            DebugLog_Push("DLG!slot", 8)
+            ReturnValue(-1)
+        }
+        PrintMessage("[Dialog] got slot=")
+        PrintNumber(slot)
+        PrintMessage("\n")
+
+        // Create window with dialog background color
+        win_idx = Win_Create(canvas_w, canvas_h, WinColor.DIALOG, title)
+        IfCondition LessThan(win_idx, 0) ThenBlock: {
+            PrintMessage("[Dialog] Win_Create failed\n")
+            DebugLog_Push("DLG!win", 7)
+            ReturnValue(-1)
+        }
+        DebugLog_Push("DLG.win", 7)
+        PrintMessage("[Dialog] win=")
+        PrintNumber(win_idx)
+        PrintMessage(" creating toolbar\n")
+
+        Win_CreateToolbarDefault(win_idx)
+        DebugLog_Push("DLG.tb", 6)
+        WinMgr_SetTB(win_idx, -1)
+
+        // Allocate AK slot for dialog
+        ak_slot = AKSlot_Alloc()
+        IfCondition LessThan(ak_slot, 0) ThenBlock: {
+            PrintMessage("[Dialog] AKSlot_Alloc failed\n")
+            DebugLog_Push("DLG!ak", 6)
+            Win_Close(win_idx)
+            ReturnValue(-1)
+        }
+        DebugLog_Push("DLG.ak", 6)
+
+        // Store in slot
+        base = Dialog_EntryPtr(slot)
+        StoreValue(Add(base, DialogFields.WIN_IDX), win_idx)
+        StoreValue(Add(base, DialogFields.AK_SLOT), ak_slot)
+        StoreValue(Add(base, DialogFields.FONT_SIZE), font_size)
+        StoreValue(Add(base, DialogFields.FLAGS), DialogFlags.ACTIVE)
+        StoreValue(Add(base, DialogFields.CONTENT_NODE), -1)
+
+        DialogTable.count = Add(DialogTable.count, 1)
+
+        PrintMessage("[Dialog] created slot=")
+        PrintNumber(slot)
+        PrintMessage(" win=")
+        PrintNumber(win_idx)
+        PrintMessage(" ak=")
+        PrintNumber(ak_slot)
+        PrintMessage(" size=")
+        PrintNumber(canvas_w)
+        PrintMessage("x")
+        PrintNumber(canvas_h)
+        PrintMessage("\n")
+        DebugLog_Push("DLG.ok", 6)
+
+        ReturnValue(slot)
+    }
+}
+
+
+// =============================================================================
+// SWAP IN — save main context, load dialog context
+//
+// After calling this, all AKTree.* / AKExtraTable.* / AKEvent.* refer
+// to the dialog's tree. Build nodes, modify, whatever you need.
+// Call Dialog_SwapOut when done.
+// =============================================================================
+Function.Dialog_SwapIn {
+    Input: slot: Integer
+    Body: {
+        base = Dialog_EntryPtr(slot)
+        ak_slot = Dereference(Add(base, DialogFields.AK_SLOT))
+        AKSlot_SwapIn(ak_slot)
+    }
+}
+
+
+// =============================================================================
+// SWAP OUT — save dialog context, restore main context
+// =============================================================================
+Function.Dialog_SwapOut {
+    Input: slot: Integer
+    Body: {
+        AKSlot_SwapOut()
+    }
+}
+
+
+// =============================================================================
+// RENDER — measure, layout, draw the dialog tree into its window
+// =============================================================================
+Function.Dialog_Render {
+    Input: slot: Integer
+    Body: {
+        PrintMessage("[DR] Render slot=")
+        PrintNumber(slot)
+        PrintMessage("\n")
+
+        win_idx = Dialog_GetWinIdx(slot)
+        IfCondition LessThan(win_idx, 0) ThenBlock: {
+            PrintMessage("[DR] bad win_idx\n")
+            ReturnValue(0)
+        }
+
+        content = WinMgr_GetContent(win_idx)
+        IfCondition LessEqual(content, 0) ThenBlock: {
+            PrintMessage("[DR] no content surf\n")
+            ReturnValue(0)
+        }
+
+        cw = Win_GetCanvasW(win_idx)
+        ch = Win_GetCanvasH(win_idx)
+
+        PrintMessage("[DR] content=")
+        PrintNumber(content)
+        PrintMessage(" cw=")
+        PrintNumber(cw)
+        PrintMessage(" ch=")
+        PrintNumber(ch)
+        PrintMessage("\n")
+
+        // Just fill for now - no AK drawing
+        Draw_Pix_FillRect(content, 0, 0, cw, ch, WinColor.DIALOG)
+
+        PrintMessage("[DR] done (no draw)\n")
+
+        SysDisplayState.dirty = 1
+    }
+}
+
+
+// =============================================================================
+// EVENT — route a mouse event into the dialog's Auckland context
+//
+// Same pattern as Win_ToolbarEvent: swap in, route, swap out, read
+// fired action, push to EventRouter.
+//
+// mx, my: mouse position relative to window content area
+// mouse_ev: AKMouseEv.DOWN / .UP / .MOVE
+//
+// Returns 1 if the surface was redrawn.
+// =============================================================================
+Function.Dialog_Event {
+    Input: slot: Integer
+    Input: mx: Integer
+    Input: my: Integer
+    Input: mouse_ev: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("DE.in", 5)
+        win_idx = Dialog_GetWinIdx(slot)
+        IfCondition LessThan(win_idx, 0) ThenBlock: { ReturnValue(0) }
+
+        ak_slot = Dialog_GetSlot(slot)
+        IfCondition LessThan(ak_slot, 0) ThenBlock: { ReturnValue(0) }
+
+        content = WinMgr_GetContent(win_idx)
+        IfCondition LessEqual(content, 0) ThenBlock: { ReturnValue(0) }
+
+        // Full event path — swap, event, dirty redraw, read action, swap out, push
+        cw = Win_GetCanvasW(win_idx)
+        ch = Win_GetCanvasH(win_idx)
+        fs = Dialog_GetFontSize(slot)
+
+        Dialog_SwapIn(slot)
+        AKEvent.action_callback = AddressOf(EventRouter_NoOpCallback)
+        DebugLog_Push("DE.ev", 5)
+        AK_EventMouse(mx, my, mouse_ev)
+        DebugLog_Push("DE.ev.ok", 8)
+
+        // Redraw dirty nodes into content surface
+        drew = 0
+        IfCondition GreaterThan(AKEvent.dirty_count, 0) ThenBlock: {
+            DebugLog_Push("DE.draw", 7)
+            PrintMessage("[DE] dirty=")
+            PrintNumber(AKEvent.dirty_count)
+            PrintMessage(" drawing...\n")
+            VFont_RasterAll(fs)
+            Draw_Pix_FillRect(content, 0, 0, cw, ch, WinColor.DIALOG)
+            PrintMessage("[DE] AK_Draw...\n")
+            AK_Draw(content, cw, ch)
+            DebugLog_Push("DE.drw.ok", 9)
+            PrintMessage("[DE] AK_Draw done\n")
+            VFont_RasterAll(18)
+            drew = 1
+        }
+
+        // Read fired action from focus_node on UP
+        fired_ptr = 0
+        fired_len = 0
+        IfCondition EqualTo(mouse_ev, AKMouseEv.UP) ThenBlock: {
+            fn = AKEvent.focus_node
+            IfCondition GreaterEqual(fn, 0) ThenBlock: {
+                ap = AK_ExtraGet(fn, AKExtra.ACTION_PTR)
+                al = AK_ExtraGet(fn, AKExtra.ACTION_LEN)
+                IfCondition And(NotEqual(ap, 0), GreaterThan(al, 0)) ThenBlock: {
+                    fired_ptr = ap
+                    fired_len = al
+                }
+            }
+        }
+
+        Dialog_SwapOut(slot)
+
+        // Push action to EventRouter
+        IfCondition NotEqual(fired_ptr, 0) ThenBlock: {
+            PrintMessage("[DLG_EVT] pushing action ptr=")
+            PrintNumber(fired_ptr)
+            PrintMessage(" len=")
+            PrintNumber(fired_len)
+            PrintMessage(" win=")
+            PrintNumber(win_idx)
+            PrintMessage("\n")
+            EventRouter_Push(fired_ptr, fired_len, win_idx)
+        }
+
+        ReturnValue(drew)
+    }
+}
+
+
+// =============================================================================
+// NOTIFY REORDER — called after Win_BringToFront(old_idx) moves to new_idx.
+// Updates all stored dialog win_idx to match the new window order.
+// =============================================================================
+Function.Dialog_NotifyReorder {
+    Input: old_idx: Integer
+    Input: new_idx: Integer
+    Body: {
+        si = 0
+        WhileLoop LessThan(si, DialogConst.MAX_DIALOGS) {
+            active = Dialog_IsActive(si)
+            IfCondition NotEqual(active, 0) ThenBlock: {
+                dw = Dialog_GetWinIdx(si)
+                IfCondition EqualTo(dw, old_idx) ThenBlock: {
+                    // This dialog's window moved to new_idx
+                    base = Dialog_EntryPtr(si)
+                    StoreValue(Add(base, DialogFields.WIN_IDX), new_idx)
+                } ElseBlock: {
+                    // Windows between old_idx+1..new_idx shifted down by 1
+                    IfCondition And(GreaterThan(dw, old_idx), LessEqual(dw, new_idx)) ThenBlock: {
+                        base = Dialog_EntryPtr(si)
+                        StoreValue(Add(base, DialogFields.WIN_IDX), Subtract(dw, 1))
+                    }
+                }
+            }
+            si = Add(si, 1)
+        }
+    }
+}
+
+// =============================================================================
+// FIND BY WIN — look up dialog slot by window index
+// Returns slot, or -1 if not a dialog window.
+// =============================================================================
+Function.Dialog_FindByWin {
+    Input: win_idx: Integer
+    Output: Integer
+    Body: {
+        si = 0
+        WhileLoop LessThan(si, DialogConst.MAX_DIALOGS) {
+            active = Dialog_IsActive(si)
+            IfCondition NotEqual(active, 0) ThenBlock: {
+                dw = Dialog_GetWinIdx(si)
+                IfCondition EqualTo(dw, win_idx) ThenBlock: {
+                    ReturnValue(si)
+                }
+            }
+            si = Add(si, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+
+// =============================================================================
+// CLOSE — destroy dialog window and context, free slot
+// =============================================================================
+Function.Dialog_Close {
+    Input: slot: Integer
+    Body: {
+        IfCondition LessThan(slot, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(slot, DialogConst.MAX_DIALOGS) ThenBlock: { ReturnValue(0) }
+
+        base = Dialog_EntryPtr(slot)
+
+        win_idx = Dereference(Add(base, DialogFields.WIN_IDX))
+        ak_slot = Dereference(Add(base, DialogFields.AK_SLOT))
+
+        IfCondition GreaterEqual(win_idx, 0) ThenBlock: {
+            Win_Close(win_idx)
+        }
+        IfCondition GreaterEqual(ak_slot, 0) ThenBlock: {
+            AKSlot_Free(ak_slot)
+        }
+
+        // Clear slot
+        StoreValue(Add(base, DialogFields.WIN_IDX), -1)
+        StoreValue(Add(base, DialogFields.AK_SLOT), -1)
+        StoreValue(Add(base, DialogFields.FLAGS), 0)
+        StoreValue(Add(base, DialogFields.CONTENT_NODE), -1)
+
+        DialogTable.count = Subtract(DialogTable.count, 1)
+        SysDisplayState.dirty = 1
+
+        PrintMessage("[Dialog] closed slot=")
+        PrintNumber(slot)
+        PrintMessage("\n")
+    }
+}
