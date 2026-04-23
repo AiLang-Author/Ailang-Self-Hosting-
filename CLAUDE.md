@@ -39,14 +39,15 @@
 - **Step 1 (Option B):** Commented out `EventRouter_Push` in `Win_ToolbarEvent:160-163`. Toolbar buttons render and highlight normally. **NO CRASH.** → Bug is downstream of toolbar event handler.
 - **Step 2 (Option A):** Re-enabled `EventRouter_Push`. Commented out all four `Menu_Show(...)` calls in `EventRouter_Internal:348-371`. Actions still match and print `(NO-OP)`. **NO CRASH.** → Bug is inside `Menu_Show`.
 - **Step 3 (bisect Menu_Show):** Re-enabled all four `Menu_Show` calls in EventRouter. Added early-return inside `Menu_Show` (Menu.ailang:~298) AFTER `AKSlot_Alloc` + `AKSlot_SwapIn` + tree build (`Menu_BuildFile/Edit/View/Help`) but BEFORE `Surface_Create` / `Menu_Render` / `MenuState` storage. Early-return does `AKSlot_SwapOut` + `AKSlot_Free` to clean up. **FREEZE.** → Bug is in upper half: `AKSlot_Alloc`, `AKSlot_SwapIn`, tree build, or early `AKSlot_SwapOut`.
-- **Step 4 (split upper half):** Moved early-return UP to Menu.ailang:261 — right after `AKSlot_SwapIn(ak_slot)`, BEFORE any tree build (`AK_CreateNode`, `AK_Set`, etc). Does `AKSlot_SwapOut` + `AKSlot_Free` immediately. **PENDING TEST.**
-  - If freeze → bug is in: `AKSlot_Alloc`, `AKSlot_SwapIn`, `AKSlot_SwapOut`, or `AKSlot_Free` (pure slot machinery). Or the swap corrupts state causing infinite loop in next main-loop iteration (`AK_DrawDirty`, `Win_RenderDirty`, `Win_BlitAll`).
-  - If no freeze → bug is in tree build: `AK_CreateNode`, `AK_Set`, `AK_ExtraSet`, `AK_AddChild`, `AK_SetRoot`, `Menu_BuildFile/Edit/View/Help`. Likely a corrupted sibling link causing infinite walk in `AK_DrawDirty` or `AK_DrawDirtyWalk`.
+- **Step 4 (split upper half):** Moved early-return to Menu.ailang:261 — right after `AKSlot_SwapIn(ak_slot)`, BEFORE any tree build. Does `AKSlot_SwapOut` + `AKSlot_Free` immediately. **NO FREEZE.** → Slot machinery (Alloc/SwapIn/SwapOut/Free) is clean. Bug is in tree build.
+- **Step 5 (split tree build):** Early-return at Menu.ailang:~293 — AFTER root PANEL node creation (`AK_CreateNode(AKTag.PANEL)` + 10× `AK_Set` + 3× `AK_ExtraSet` + `AK_SetRoot`) but BEFORE `Menu_BuildFile/Edit/View/Help` dispatch. **PENDING TEST.**
+  - If freeze → bug is in root node setup: `AK_CreateNode`, `AK_Set`, `AK_ExtraSet`, or `AK_SetRoot` corrupts something. Possibly the PANEL extra alloc or AK_SetRoot interaction with main context on swap-out.
+  - If no freeze → bug is in child building: `Menu_Build*` → `Menu_AddItem` → `AK_CreateNode` + `AK_AddChild` (sibling walk). Most likely `AK_AddChild` corrupts a sibling link that causes infinite walk in `AK_DrawDirtyWalk` on next frame.
 
 **Current state of code:**
-- `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` is RE-ENABLED (normal).
+- `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` RE-ENABLED (normal).
 - `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls RE-ENABLED (normal).
-- `Library.Menu.ailang:261-267` — early-return inserted AFTER `AKSlot_SwapIn`, BEFORE tree build. Old early-return at ~298 REMOVED.
+- `Library.Menu.ailang:~293` — early-return inserted AFTER root PANEL + AK_SetRoot, BEFORE Menu_Build* dispatch.
 
 ### DebugLog_Push Full Instrumentation (2026-04-22)
 
