@@ -60,10 +60,11 @@ This runs in the MENU slot context (menu's node buffer). After `AKSlot_SwapOut`,
 - `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls RE-ENABLED (normal).
 - `Library.Menu.ailang:~293` — early-return inserted AFTER root PANEL + AK_SetRoot, BEFORE Menu_Build* dispatch.
 
-**Next bisect options:**
-- A) Let only ONE `Menu_Build*` run (e.g. `Menu_BuildHelp` — fewest items, 1 node) then early-return. Confirms the issue is from `Menu_AddItem` + `AK_AddChild`.
-- B) Remove all `DebugLog_Push` calls from `AK_Set`/`AK_Get`/`AK_Ptr`/`AK_ExtraPtr` (the hot-path leaf functions) to test if sheer DebugLog volume is the cause.
-- C) Call `Menu_BuildFile` but comment out all `AK_AddChild` calls inside `Menu_AddItem` / `Menu_AddSeparator` — nodes get created but never linked.
+**Step 6 (option A — smallest builder):** Chose option A. Runs `Menu_BuildHelp(root)` only (1 item: "About" button → 1× `Menu_AddItem` → 1× `AK_CreateNode(AKTag.BUTTON)` + 7× `AK_Set`/`AK_ExtraSet` + 1× `AK_AddChild`), then early-return with `AKSlot_SwapOut` + `AKSlot_Free`. **PENDING TEST.**
+  - If freeze → even a single `AK_AddChild` (or the `AK_CreateNode` for a BUTTON child) corrupts state. Likely the node/extra alloc in menu slot, or `AK_AddChild` sibling walk on the root's child list. Could also be the ~30 `DebugLog_Push` calls from the single item build.
+  - If no freeze → bug requires multiple children (sibling chain corruption only manifests with ≥2 nodes linked). Next step: try `Menu_BuildEdit` (2 items) or `Menu_BuildFile` (6 items + 2 separators).
+
+**If chat dies from freeze:** Resume from commit. The early-return is at Menu.ailang:~293 (after `AK_SetRoot`, runs `Menu_BuildHelp(root)`, then bails). WinToolbar and EventRouter are normal. To continue bisecting: if step 6 froze, comment out `AK_AddChild` in `Menu_AddItem`/`Menu_AddSeparator` to test node creation without linking. If step 6 was clean, try a larger builder.
 
 ### DebugLog_Push Full Instrumentation (2026-04-22)
 
