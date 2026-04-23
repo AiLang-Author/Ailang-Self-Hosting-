@@ -62,17 +62,19 @@ This runs in the MENU slot context (menu's node buffer). After `AKSlot_SwapOut`,
 
 **Step 6 result — FREEZE.** Even a single `Menu_BuildHelp(root)` (1 "About" button) causes hang. Narrows to: 1× `AK_CreateNode(BUTTON)` + 7× `AK_Set`/`AK_ExtraSet` + 1× `AK_AddChild`.
 
-**Step 7 (bisect inside Menu_AddItem):** Commented out `AK_AddChild(parent, btn)` in `Menu_AddItem` (line 79). Node is created and all properties set, but never linked into parent's child list. `Menu_BuildHelp(root)` still runs, early-return still active. **PENDING TEST.**
-  - If no freeze → `AK_AddChild` confirmed as the sole culprit. The sibling chain walk or NEXT_SIBLING/FIRST_CHILD write corrupts state. Next: inspect `AK_AddChild` in Auckland.ailang:607-633 for the actual bug (likely writes to wrong buffer, or sibling walk hits stale data from a previous slot).
-  - If freeze → `AK_CreateNode` or `AK_Set`/`AK_ExtraSet` on the child BUTTON node is the problem. Next: comment out all `AK_Set`/`AK_ExtraSet` calls in `Menu_AddItem`, leaving only `AK_CreateNode`.
+**Step 7 result — FREEZE.** `AK_AddChild` commented out, but all `AK_Set`/`AK_ExtraSet` still run on the child BUTTON node. Still freezes. → `AK_AddChild` is NOT the sole culprit. Problem is in `AK_CreateNode(AKTag.BUTTON)` or the `AK_Set`/`AK_ExtraSet` calls on the child node.
+
+**Step 8 (strip AK_Set/AK_ExtraSet from Menu_AddItem):** Commented out ALL `AK_Set` and `AK_ExtraSet` calls in `Menu_AddItem` (lines 70-78). Only `AK_CreateNode(AKTag.BUTTON)` remains. `AK_AddChild` still commented out. Early-return still active after `Menu_BuildHelp(root)`. **PENDING TEST.**
+  - If no freeze → one of the `AK_Set`/`AK_ExtraSet` calls on the child BUTTON is the trigger. Next: binary search which call — re-enable first half of AK_Set/AK_ExtraSet calls.
+  - If freeze → `AK_CreateNode(AKTag.BUTTON)` alone causes the hang. Since `AK_CreateNode` internally does ~30 `AK_Set` calls for defaults + `AK_AllocExtra` for BUTTON tag, the bug is inside `AK_CreateNode` itself. Next: test with `AK_CreateNode(AKTag.BOX)` (no extra alloc) to isolate whether `AK_AllocExtra` is the problem.
 
 **Current state of code:**
 - `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` RE-ENABLED (normal).
 - `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls RE-ENABLED (normal).
 - `Library.Menu.ailang:~293` — early-return AFTER `Menu_BuildHelp(root)`, BEFORE other builders.
-- `Library.Menu.ailang:79` — `AK_AddChild(parent, btn)` COMMENTED OUT in `Menu_AddItem`.
+- `Library.Menu.ailang:68-80` — `Menu_AddItem` only calls `AK_CreateNode(AKTag.BUTTON)`. All `AK_Set`, `AK_ExtraSet`, `AK_AddChild` COMMENTED OUT.
 
-**If chat dies from freeze:** Resume from this commit. `AK_AddChild` is commented out in `Menu_AddItem:79`. Early-return is at Menu.ailang:~293. If step 7 froze, the problem is `AK_CreateNode`/`AK_Set`/`AK_ExtraSet` on the child node — next step: strip those out too. If step 7 was clean, `AK_AddChild` is confirmed — inspect Auckland.ailang:607-633.
+**If chat dies from freeze:** Resume from this commit. Only `AK_CreateNode(AKTag.BUTTON)` runs in `Menu_AddItem`. If step 8 froze, try `AK_CreateNode(AKTag.BOX)` instead (no extra alloc). If step 8 was clean, binary-search the `AK_Set`/`AK_ExtraSet` calls.
 
 ### DebugLog_Push Full Instrumentation (2026-04-22)
 
