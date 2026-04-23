@@ -17,6 +17,17 @@
 
 **Tag convention:** `"<module>.<fn>"` or `"<module>.<fn>.X"`, max 9 chars. Second arg = string length.
 
+## Completed: HBOX MIN_W Layout Fix (2026-04-23)
+
+Fixed deskbar rendering corruption (duplicated glyphs, overlapping zones, clipped right edge, invisible separators). Root cause: `AK_LayoutNode` HBOX pass and `AK_MeasureNode` used `AKF.WIDTH` for base width calculation, but deskbar buttons only set `AKF.MIN_W`. All buttons contributed 0 to space distribution, so the center GROW zone absorbed the full width and left/right zones collapsed to 0.
+
+**Fix:** Added `MIN_W` fallback in 3 sites in `Library.Auckland.ailang`:
+- `AK_MeasureNode` HBOX child width accumulation (+ symmetric MIN_H for VBOX)
+- `AK_LayoutNode` HBOX first pass (total_base accumulation)
+- `AK_LayoutNode` HBOX second pass (per-child base_w for positioning)
+
+When `WIDTH=0` and `MIN_W>0`, MIN_W is used as the effective base width. This is correct CSS-like behavior — MIN_W should be the floor for layout space reservation.
+
 ## Completed: Framebuffer Bounds Checking (2026-04-22)
 
 Added full 4-edge framebuffer clamping to `Win_BlitOne`, `Win_BlitClamped`, and `Win_DrawBorderFB` in `Library.WinRender.ailang`. Prevents segfaults when windows are partially off-screen.
