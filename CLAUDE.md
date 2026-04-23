@@ -17,6 +17,10 @@
 
 **Tag convention:** `"<module>.<fn>"` or `"<module>.<fn>.X"`, max 9 chars. Second arg = string length.
 
+## Completed: Canvas Background Color on Resize (2026-04-23)
+
+Expanded canvas area showed dark green (`WinColor.WINDOW = 0xFF1A2A1A`) instead of matching the window's actual background. Fix: sample the background color from the old content surface's top-left pixel before filling the new surface. Expanded area now matches the window's original background color.
+
 ## Completed: Preserve Canvas Content on Window Resize (2026-04-23)
 
 Canvas drawing was lost on resize because `Win_UpdateResize` in `Library.WinInput.ailang` created a new content surface filled with solid background but never copied the old surface content. Fix: `Surface_BlitOpaque(new_content, old_content, 0, 0)` after background fill, before destroying old surface. Old content is preserved at top-left; new area gets background fill.
