@@ -40,14 +40,30 @@
 - **Step 2 (Option A):** Re-enabled `EventRouter_Push`. Commented out all four `Menu_Show(...)` calls in `EventRouter_Internal:348-371`. Actions still match and print `(NO-OP)`. **NO CRASH.** → Bug is inside `Menu_Show`.
 - **Step 3 (bisect Menu_Show):** Re-enabled all four `Menu_Show` calls in EventRouter. Added early-return inside `Menu_Show` (Menu.ailang:~298) AFTER `AKSlot_Alloc` + `AKSlot_SwapIn` + tree build (`Menu_BuildFile/Edit/View/Help`) but BEFORE `Surface_Create` / `Menu_Render` / `MenuState` storage. Early-return does `AKSlot_SwapOut` + `AKSlot_Free` to clean up. **FREEZE.** → Bug is in upper half: `AKSlot_Alloc`, `AKSlot_SwapIn`, tree build, or early `AKSlot_SwapOut`.
 - **Step 4 (split upper half):** Moved early-return to Menu.ailang:261 — right after `AKSlot_SwapIn(ak_slot)`, BEFORE any tree build. Does `AKSlot_SwapOut` + `AKSlot_Free` immediately. **NO FREEZE.** → Slot machinery (Alloc/SwapIn/SwapOut/Free) is clean. Bug is in tree build.
-- **Step 5 (split tree build):** Early-return at Menu.ailang:~293 — AFTER root PANEL node creation (`AK_CreateNode(AKTag.PANEL)` + 10× `AK_Set` + 3× `AK_ExtraSet` + `AK_SetRoot`) but BEFORE `Menu_BuildFile/Edit/View/Help` dispatch. **PENDING TEST.**
-  - If freeze → bug is in root node setup: `AK_CreateNode`, `AK_Set`, `AK_ExtraSet`, or `AK_SetRoot` corrupts something. Possibly the PANEL extra alloc or AK_SetRoot interaction with main context on swap-out.
-  - If no freeze → bug is in child building: `Menu_Build*` → `Menu_AddItem` → `AK_CreateNode` + `AK_AddChild` (sibling walk). Most likely `AK_AddChild` corrupts a sibling link that causes infinite walk in `AK_DrawDirtyWalk` on next frame.
+- **Step 5 (split tree build):** Early-return at Menu.ailang:~293 — AFTER root PANEL node creation (`AK_CreateNode(AKTag.PANEL)` + 10× `AK_Set` + 3× `AK_ExtraSet` + `AK_SetRoot`) but BEFORE `Menu_BuildFile/Edit/View/Help` dispatch. **NO FREEZE.** → Root node setup (`AK_CreateNode`, `AK_Set`, `AK_ExtraSet`, `AK_SetRoot`) is clean. Bug is in child building.
+
+**Narrowed to:** `Menu_BuildFile/Edit/View/Help` → `Menu_AddItem` → `AK_CreateNode` + `AK_AddChild`. Most likely `AK_AddChild` corrupts a `NEXT_SIBLING` link creating a cycle, which causes `AK_DrawDirtyWalk` (or similar sibling walk) to spin forever on the next main-loop frame. The freeze is NOT inside Menu_Show — it's on the next iteration when the main context walks a corrupted tree.
+
+**Key suspect — `AK_AddChild` (Auckland.ailang:607-633):**
+```
+- Sets child.PARENT = parent
+- If parent has no children: parent.FIRST_CHILD = child
+- If parent has children: walks sibling chain to last, sets last.NEXT_SIBLING = child
+- Increments parent.CHILD_COUNT
+```
+This runs in the MENU slot context (menu's node buffer). After `AKSlot_SwapOut`, main globals are restored. The menu slot is then freed. So the menu tree itself can't cause a walk — BUT if AK_AddChild (or AK_CreateNode) accidentally writes to a GLOBAL that isn't slot-scoped, it could corrupt the main tree.
+
+**Also suspect:** `DebugLog_Push` is called from every `AK_Set`, `AK_Get`, `AK_CreateNode`, `AK_AddChild`, `AK_ExtraSet`, `AK_AllocExtra`, `AK_Ptr`, `AK_ExtraPtr` — potentially 200+ calls during a single menu build. If `DebugLog_Push` itself corrupts memory or overflows, that could be the trigger.
 
 **Current state of code:**
 - `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` RE-ENABLED (normal).
 - `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls RE-ENABLED (normal).
 - `Library.Menu.ailang:~293` — early-return inserted AFTER root PANEL + AK_SetRoot, BEFORE Menu_Build* dispatch.
+
+**Next bisect options:**
+- A) Let only ONE `Menu_Build*` run (e.g. `Menu_BuildHelp` — fewest items, 1 node) then early-return. Confirms the issue is from `Menu_AddItem` + `AK_AddChild`.
+- B) Remove all `DebugLog_Push` calls from `AK_Set`/`AK_Get`/`AK_Ptr`/`AK_ExtraPtr` (the hot-path leaf functions) to test if sheer DebugLog volume is the cause.
+- C) Call `Menu_BuildFile` but comment out all `AK_AddChild` calls inside `Menu_AddItem` / `Menu_AddSeparator` — nodes get created but never linked.
 
 ### DebugLog_Push Full Instrumentation (2026-04-22)
 
