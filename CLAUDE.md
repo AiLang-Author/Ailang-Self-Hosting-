@@ -17,6 +17,10 @@
 
 **Tag convention:** `"<module>.<fn>"` or `"<module>.<fn>.X"`, max 9 chars. Second arg = string length.
 
+## Completed: Preserve Canvas Content on Window Resize (2026-04-23)
+
+Canvas drawing was lost on resize because `Win_UpdateResize` in `Library.WinInput.ailang` created a new content surface filled with solid background but never copied the old surface content. Fix: `Surface_BlitOpaque(new_content, old_content, 0, 0)` after background fill, before destroying old surface. Old content is preserved at top-left; new area gets background fill.
+
 ## Completed: Toolbar Re-render on Window Resize (2026-04-23)
 
 Text disappeared from toolbars during window resize because `Win_UpdateResize` in `Library.WinInput.ailang` recreated the toolbar surface (blank solid fill) but never re-rendered the Auckland tree into it. There was a `// TODO: Phase C` comment where the call should have been. Fix: call `Win_RedrawToolbar(idx)` after surface recreation — this re-solves layout for new dimensions and draws text/buttons into the new surface.
