@@ -17,6 +17,16 @@
 
 **Tag convention:** `"<module>.<fn>"` or `"<module>.<fn>.X"`, max 9 chars. Second arg = string length.
 
+## Completed: TextRegion Pool Exhaustion Fix (2026-04-23)
+
+Text disappeared on 2nd/3rd windows because the global TextRegion pool (32 slots) was a bump allocator that never freed handles. Each `AK_DestroyContext` (menus, dialogs) and `AK_ResetContext` (deskbar refresh) leaked all TR_HANDLEs — once 32 slots consumed, `TextRegion_Create` returned -1 and text rendering stopped.
+
+**Fix:**
+- `Library.TextRegion.ailang`: Added free stack (`TRState.free_stack`, `TRState.free_top`). `TextRegion_Create` checks free stack before bumping count. New `TextRegion_Free(handle)` pushes handle onto free stack. Pool size increased 32 → 256 for headroom.
+- `Library.Auckland.ailang`: New `AK_FreeContextTR(ctx)` iterates a context's extra table and calls `TextRegion_Free` for each valid `TR_HANDLE`. Called from both `AK_DestroyContext` and `AK_ResetContext` **before** buffer zeroing/dealloc.
+
+**Result:** TR handles are recycled when contexts are destroyed or reset. Pool no longer leaks.
+
 ## Completed: HBOX MIN_W Layout Fix (2026-04-23)
 
 Fixed deskbar rendering corruption (duplicated glyphs, overlapping zones, clipped right edge, invisible separators). Root cause: `AK_LayoutNode` HBOX pass and `AK_MeasureNode` used `AKF.WIDTH` for base width calculation, but deskbar buttons only set `AKF.MIN_W`. All buttons contributed 0 to space distribution, so the center GROW zone absorbed the full width and left/right zones collapsed to 0.
