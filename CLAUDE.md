@@ -91,6 +91,77 @@ PaneDecorator_ThemeInit()  // copies Theme.* → WinColor.*
 
 **Last commit:** `b5b613a` on `ak-context-refactor` — all theming work saved
 
-## Next Up: Deskbar Rewrite and Expansion
+## In Progress: Deskbar Rewrite (2026-04-23)
 
-User queued this as the next major task after theming.
+Full plan at: `.claude/plans/transient-sauteeing-pike.md`
+
+### Vision
+
+Rewrite placeholder deskbar into full system bar with 3 zones:
+- **Left**: App launchers from PostgreSQL `services` table
+- **Center**: Live window list (click to focus, auto-refreshes on create/close/focus)
+- **Right**: System tray (user label, About dialog)
+
+PostgreSQL is the backbone — `services` table already exists with binary_path/args/enabled/priority. Convention: `binary_path = "internal:action.name"` fires EventRouter action, otherwise fork/exec.
+
+### Phase Plan
+
+1. **Phase 1**: Three-zone layout + window list + `AK_ResetContext` + refresh triggers
+2. **Phase 2**: PostgreSQL service loading + dynamic launchers + `svc.N` routing + `display_name` column + default service seeds
+3. **Phase 3**: About dialog (new `Library.AboutDialog.ailang`)
+4. **Phase 4**: Fork/exec service launching (SystemCall 57/59)
+
+### Key Technical Decisions
+
+- **`AK_ResetContext(ctx)`** needed in Library.Auckland.ailang — zeros node+extra buffers without dealloc/realloc. Critical for tree rebuild on window list refresh.
+- **Refresh trigger**: `DeskbarState.needs_refresh = 1` set in `Win_Create`/`Win_Close`/`Win_Focus`, checked in main loop after `EventRouter_Drain`
+- **Pre-allocated action strings**: `"wf.1"` through `"wf.7"` avoid allocation per refresh (max 8 windows)
+- **Service ID actions**: `"svc.N"` where N is services.id from postgres
+- **Internal actions**: services with `binary_path = "internal:win.new"` strip prefix and push to EventRouter
+
+### New Theme Colors Added
+
+- `deskbar_win_bg`, `deskbar_win_fg`, `deskbar_win_act_bg`, `deskbar_sep`
+
+### New UIScale Dimensions Added
+
+- `deskbar_win_btn_w` (96px default)
+
+### PostgreSQL Tables Used
+
+- `services` — app registry (name, display_name, binary_path, enabled, priority)
+- `service_status` — runtime PID tracking (service_id, pid, state, started_at)
+- `users` — user info for system tray label
+
+### Files Modified Per Phase
+
+| Phase | New Files | Modified Files |
+|-------|-----------|----------------|
+| 1 | — | Auckland, Deskbar, EventRouter, SysDisplay, WinManager, UITheme, UIScale, ui.cfg |
+| 2 | — | Deskbar, EventRouter, SysDisplay |
+| 3 | Library.AboutDialog.ailang | EventRouter, SysDisplay |
+| 4 | — | Deskbar |
+
+**Last commit:** `826e151` on `ak-context-refactor` — all prior work saved
+
+## Completed: Screenshot PPM Support (2026-04-23)
+
+Added PPM (P6) output mode to `Library.Screenshot.ailang` alongside existing BMP. PPM chosen because Claude Code's Read tool segfaults on BMP files but handles PNG/JPG/PPM reliably.
+
+### Files
+
+- **`Librarys/Library.Screenshot.ailang`** (NEW) — `Screenshot_Save()` (BMP) + `Screenshot_SavePPM()` (PPM P6) + `SS_WriteDecimal()` helper
+- **`Librarys/Library.EventRouter.ailang`** — `sys.screenshot` action now calls both `Screenshot_SavePPM()` then `Screenshot_Save()`
+
+### Output Files
+
+- `/tmp/screenshot.ppm` — PPM P6 binary (RGB, top-to-bottom, no padding, no compression). Use this for Claude Code viewing.
+- `/tmp/screenshot.bmp` — 24-bit BMP (BGR, bottom-up, padded). Fallback for standard image viewers.
+
+### PPM Format Notes
+
+- Header: ASCII `"P6\n{width} {height}\n255\n"` followed by raw RGB bytes
+- Pixel conversion: BGRA (framebuffer) → RGB (swap B↔R, drop alpha)
+- Rows: top-to-bottom (no reversal needed unlike BMP)
+- No row padding required
+- To convert for external use: `convert /tmp/screenshot.ppm /tmp/screenshot.png`
