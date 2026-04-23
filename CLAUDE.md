@@ -68,17 +68,40 @@ This runs in the MENU slot context (menu's node buffer). After `AKSlot_SwapOut`,
 
 **Note on AK_AllocExtra:** NOT a malloc — it's a counter bump into a pre-allocated 65536-byte slab (512 slots × 128 bytes). Only ONE caller in entire codebase: `AK_CreateNode:597`. Only called for tags BUTTON(>=10), PANEL(3), WINDOW(1), TABS(5), TAB(6). No AKTag.BOX exists — using GROUP(2) instead (no extra alloc, same 30 AK_Set defaults).
 
-**Step 9 (swap BUTTON→GROUP in Menu_AddItem):** Changed `AK_CreateNode(AKTag.BUTTON)` to `AK_CreateNode(AKTag.GROUP)` in `Menu_AddItem:70`. GROUP = 2, skips `AK_AllocExtra` entirely. All AK_Set/AK_ExtraSet/AK_AddChild still commented out. Early-return still active after `Menu_BuildHelp(root)`. **PENDING TEST.**
-  - If no freeze → `AK_AllocExtra` (second call in menu slot) is the trigger. Investigate: does the extra counter or pointer corrupt something when a second extra is allocated?
-  - If freeze → the ~30 default `AK_Set` calls in `AK_CreateNode` are enough to trigger it. Extra alloc is irrelevant. Next: early-return inside `AK_CreateNode` before the default AK_Set calls to test if just bumping `AKTree.count` is the issue.
+**Step 9 result — FREEZE.** Swapped `AK_CreateNode(AKTag.BUTTON)` to `AK_CreateNode(AKTag.GROUP)` in `Menu_AddItem:70`. GROUP = 2, skips `AK_AllocExtra` entirely. All AK_Set/AK_ExtraSet/AK_AddChild still commented out. **Still freezes.** → `AK_AllocExtra` is NOT the cause. The ~30 default `AK_Set` calls inside `AK_CreateNode` (or just bumping `AKTree.count`) are enough.
+
+**Eliminated by bisection (steps 1-9):**
+- EventRouter_Push — clean (step 1)
+- Menu_Show call site — clean (step 2)
+- AKSlot_Alloc/SwapIn/SwapOut/Free — clean in isolation (step 4)
+- Root PANEL node (AK_CreateNode + AK_Set + AK_ExtraSet + AK_SetRoot) — clean (step 5)
+- AK_AddChild — not sole cause (step 7)
+- AK_Set/AK_ExtraSet on child node — not sole cause (step 8)
+- AK_AllocExtra — not the cause (step 9)
+
+**What remains:** The second `AK_CreateNode` call in the menu slot. Node idx=1, writes to `AKTree.data + 256`. Freeze is on next frame in `AK_DrawDirtyWalk`, not inside Menu_Show.
+
+**Investigated and ruled out:**
+- `CanChange=True` missing on `AKTree.*` fields: compiler emits fresh memory loads (`MOV RAX, [R15+offset]`) regardless of CanChange. No caching, no inlining. CanChange is parsed but never consulted during codegen.
+- Deskbar `AKCtx_SwapIn`/`AKSlot_SwapIn` conflict: both systems touch the same globals (`AKTree.*`, `AKExtraTable.*`, `AKEvent.*`), but Deskbar hotzone is screen-bottom while toolbar is screen-top — they can't fire on the same click event. Sequential in single-threaded loop.
+- Bare `AK_EventMouse` calls on main context: harmless — `AKTree.root == -1` triggers early-out in `AK_HitTest`.
+
+**Step 10 (tree dump + block draw):** Instead of early-return, dump tree state at three points:
+1. Main tree snapshot from slot 0 BEFORE `Menu_BuildHelp`
+2. Menu tree (every node's TAG/PARENT/FIRST_CHILD/NEXT_SIBLING/DIRTY) AFTER build
+3. Cross-check: is `slot0.data == AKTree.data`? (same buffer = writes hit main tree)
+4. Main tree dump (first 16 nodes) AFTER `AKSlot_SwapOut` restores main context
+5. `SysDisplayState.running = 0` to exit cleanly
+6. `AK_DrawDirty` commented out in main loop to prevent freeze
 
 **Current state of code:**
 - `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` RE-ENABLED (normal).
 - `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls RE-ENABLED (normal).
-- `Library.Menu.ailang:~293` — early-return AFTER `Menu_BuildHelp(root)`, BEFORE other builders.
 - `Library.Menu.ailang:70` — `Menu_AddItem` calls `AK_CreateNode(AKTag.GROUP)` (not BUTTON). All `AK_Set`, `AK_ExtraSet`, `AK_AddChild` COMMENTED OUT.
+- `Library.Menu.ailang:~289-370` — tree dump + SwapOut + exit instead of early-return.
+- `Library.SysDisplay.ailang:~1139` — `AK_DrawDirty` COMMENTED OUT.
 
-**If chat dies from freeze:** Resume from this commit. `AK_CreateNode(AKTag.GROUP)` runs in `Menu_AddItem` (no extra alloc). If step 9 froze, the bug is in the 30 default `AK_Set` calls — try early-return inside `AK_CreateNode` itself. If step 9 was clean, `AK_AllocExtra` is the culprit.
+**If chat dies:** Resume from this commit. Run the binary, click a toolbar menu button, read stdout for `[DUMP]` lines. Key line: `*** SAME BUFFER ***` means menu writes are landing on the main tree.
 
 ### DebugLog_Push Full Instrumentation (2026-04-22)
 
