@@ -64,17 +64,21 @@ This runs in the MENU slot context (menu's node buffer). After `AKSlot_SwapOut`,
 
 **Step 7 result — FREEZE.** `AK_AddChild` commented out, but all `AK_Set`/`AK_ExtraSet` still run on the child BUTTON node. Still freezes. → `AK_AddChild` is NOT the sole culprit. Problem is in `AK_CreateNode(AKTag.BUTTON)` or the `AK_Set`/`AK_ExtraSet` calls on the child node.
 
-**Step 8 (strip AK_Set/AK_ExtraSet from Menu_AddItem):** Commented out ALL `AK_Set` and `AK_ExtraSet` calls in `Menu_AddItem` (lines 70-78). Only `AK_CreateNode(AKTag.BUTTON)` remains. `AK_AddChild` still commented out. Early-return still active after `Menu_BuildHelp(root)`. **PENDING TEST.**
-  - If no freeze → one of the `AK_Set`/`AK_ExtraSet` calls on the child BUTTON is the trigger. Next: binary search which call — re-enable first half of AK_Set/AK_ExtraSet calls.
-  - If freeze → `AK_CreateNode(AKTag.BUTTON)` alone causes the hang. Since `AK_CreateNode` internally does ~30 `AK_Set` calls for defaults + `AK_AllocExtra` for BUTTON tag, the bug is inside `AK_CreateNode` itself. Next: test with `AK_CreateNode(AKTag.BOX)` (no extra alloc) to isolate whether `AK_AllocExtra` is the problem.
+**Step 8 result — FREEZE.** `AK_CreateNode(AKTag.BUTTON)` alone (no AK_Set/AK_ExtraSet/AK_AddChild) causes hang. Since BUTTON tag >= 10, `AK_CreateNode` calls `AK_AllocExtra` internally. The root PANEL also called `AK_AllocExtra` (step 5, no freeze), so the second extra alloc in the same slot session is suspect.
+
+**Note on AK_AllocExtra:** NOT a malloc — it's a counter bump into a pre-allocated 65536-byte slab (512 slots × 128 bytes). Only ONE caller in entire codebase: `AK_CreateNode:597`. Only called for tags BUTTON(>=10), PANEL(3), WINDOW(1), TABS(5), TAB(6). No AKTag.BOX exists — using GROUP(2) instead (no extra alloc, same 30 AK_Set defaults).
+
+**Step 9 (swap BUTTON→GROUP in Menu_AddItem):** Changed `AK_CreateNode(AKTag.BUTTON)` to `AK_CreateNode(AKTag.GROUP)` in `Menu_AddItem:70`. GROUP = 2, skips `AK_AllocExtra` entirely. All AK_Set/AK_ExtraSet/AK_AddChild still commented out. Early-return still active after `Menu_BuildHelp(root)`. **PENDING TEST.**
+  - If no freeze → `AK_AllocExtra` (second call in menu slot) is the trigger. Investigate: does the extra counter or pointer corrupt something when a second extra is allocated?
+  - If freeze → the ~30 default `AK_Set` calls in `AK_CreateNode` are enough to trigger it. Extra alloc is irrelevant. Next: early-return inside `AK_CreateNode` before the default AK_Set calls to test if just bumping `AKTree.count` is the issue.
 
 **Current state of code:**
 - `Library.WinToolbar.ailang:160-163` — `EventRouter_Push` RE-ENABLED (normal).
 - `Library.EventRouter.ailang:348-371` — all four `Menu_Show` calls RE-ENABLED (normal).
 - `Library.Menu.ailang:~293` — early-return AFTER `Menu_BuildHelp(root)`, BEFORE other builders.
-- `Library.Menu.ailang:68-80` — `Menu_AddItem` only calls `AK_CreateNode(AKTag.BUTTON)`. All `AK_Set`, `AK_ExtraSet`, `AK_AddChild` COMMENTED OUT.
+- `Library.Menu.ailang:70` — `Menu_AddItem` calls `AK_CreateNode(AKTag.GROUP)` (not BUTTON). All `AK_Set`, `AK_ExtraSet`, `AK_AddChild` COMMENTED OUT.
 
-**If chat dies from freeze:** Resume from this commit. Only `AK_CreateNode(AKTag.BUTTON)` runs in `Menu_AddItem`. If step 8 froze, try `AK_CreateNode(AKTag.BOX)` instead (no extra alloc). If step 8 was clean, binary-search the `AK_Set`/`AK_ExtraSet` calls.
+**If chat dies from freeze:** Resume from this commit. `AK_CreateNode(AKTag.GROUP)` runs in `Menu_AddItem` (no extra alloc). If step 9 froze, the bug is in the 30 default `AK_Set` calls — try early-return inside `AK_CreateNode` itself. If step 9 was clean, `AK_AllocExtra` is the culprit.
 
 ### DebugLog_Push Full Instrumentation (2026-04-22)
 
