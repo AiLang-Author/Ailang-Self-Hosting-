@@ -17,6 +17,10 @@
 
 **Tag convention:** `"<module>.<fn>"` or `"<module>.<fn>.X"`, max 9 chars. Second arg = string length.
 
+## Completed: Toolbar Re-render on Window Resize (2026-04-23)
+
+Text disappeared from toolbars during window resize because `Win_UpdateResize` in `Library.WinInput.ailang` recreated the toolbar surface (blank solid fill) but never re-rendered the Auckland tree into it. There was a `// TODO: Phase C` comment where the call should have been. Fix: call `Win_RedrawToolbar(idx)` after surface recreation — this re-solves layout for new dimensions and draws text/buttons into the new surface.
+
 ## Completed: TextRegion Pool Exhaustion Fix (2026-04-23)
 
 Text disappeared on 2nd/3rd windows because the global TextRegion pool (32 slots) was a bump allocator that never freed handles. Each `AK_DestroyContext` (menus, dialogs) and `AK_ResetContext` (deskbar refresh) leaked all TR_HANDLEs — once 32 slots consumed, `TextRegion_Create` returned -1 and text rendering stopped.
