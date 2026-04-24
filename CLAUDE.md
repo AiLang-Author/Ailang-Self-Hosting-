@@ -261,3 +261,40 @@ Added PPM (P6) output mode to `Library.Screenshot.ailang` alongside existing BMP
 - Rows: top-to-bottom (no reversal needed unlike BMP)
 - No row padding required
 - To convert for external use: `convert /tmp/screenshot.ppm /tmp/screenshot.png`
+
+## Completed: Stack Leak Fix for >6-Arg Function Calls (2026-04-24)
+
+`CompileFunc_UserCall` in `Library.CCompileFunc.ailang` had a stack leak for function calls with more than 6 arguments. SysV AMD64 passes args 1-6 in registers (RDI, RSI, RDX, RCX, R8, R9); args 7+ go on the stack and the **caller** must clean them up. The compiler pushed all N args, popped 6 into registers, but never cleaned up the remaining (N-6) stack-passed args after the call returned. Each >6-arg call leaked `(N-6)*8` bytes off the caller's stack frame.
+
+**Symptom:** SIGSEGV (`si_addr=0x98`) after returning from functions containing >6-arg calls. The leaked stack bytes shifted where the epilogue's `POP R12; POP RBX` read from, filling R12 (used for RSP preservation at call sites) with garbage. Next function call did `MOV R12, RSP; AND RSP, -16; CALL` — the CALL tried to push a return address to the corrupt RSP (~0xA0) → segfault.
+
+**Root cause site:** `CompileFunc_UserCall` in `Librarys/Compiler/Compile/Modules/Library.CCompileFunc.ailang:669-671`. After `MOV RSP, R12` restore, no cleanup of stack-passed arguments.
+
+**Fix:** Added `ADD RSP, (arg_count - 6) * 8` after the `MOV RSP, R12` restore when `arg_count > 6`.
+
+**Affected call sites across codebase (examples):**
+- `SystemCall(9, 0, size, 3, 34, -1, 0)` — 7 args (mmap, in Arena, Framebuffer, ThreadTrampoline, compiler import)
+- `VInst_DrawString(inst, surf, ptr, len, x, y, color)` — 7 args (Fonts, WinRender)
+- `Item_RegisterFull(...)` — 12 args (Item system)
+- `Char_SetLevelGains(...)` — 9 args (Character system, 45+ call sites)
+- `Enc_RegisterZone(...)` — 8 args (Encounter system)
+
+**Also fixed:** `TestCode/test_offscreen_render.ailang` passed 8 args to `Menu_AddItem` (which takes 6) — removed the extra `iw, ih` arguments.
+
+**Validation:**
+- 3-generation bootstrap: all byte-identical (`6c84e377...`)
+- 86/86 smoke tests pass (1 pre-existing `logname` env failure)
+- `test_offscreen_render.x` runs all 4 render tests cleanly (toolbar, menu, deskbar, file dialog)
+
+**Commit:** on `ak-context-refactor`. `ailang.x` updated to gen3 with fix.
+
+### Test Program: test_offscreen_render.ailang
+
+Build & run (no framebuffer needed):
+```
+./ailang.x TestCode/test_offscreen_render.ailang test_offscreen.x
+./test_offscreen.x
+# Check /tmp/ak_*.ppm for rendered output
+```
+
+Tests: FileDialog (real Dialog_Create/Win_Create/FD_BuildTree chain), Deskbar, Toolbar, Menu. Dumps surfaces to PPM. Requires PostgreSQL (ailang_system db, user bob).
