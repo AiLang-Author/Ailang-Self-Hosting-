@@ -177,6 +177,46 @@ PostgreSQL is the backbone — `services` table already exists with binary_path/
 
 **Last commit:** `826e151` on `ak-context-refactor` — all prior work saved
 
+## Completed: CLD Fix for REP MOVSB/STOSB (2026-04-23)
+
+`MemoryCopy` and `MemorySet` emitted `REP MOVSB` / `REP STOSB` without a preceding `CLD` instruction. If the CPU direction flag (DF) was set by anything earlier in execution, these instructions copy backwards, corrupting memory. Caused hard crash/lockup when clicking NEW in deskbar (window creation triggers `FB_FlipFast` → `MemoryCopy` on multi-MB framebuffer).
+
+**Root cause:** `CompileMem_MemoryCopy` and `CompileMem_MemorySet` in `Library.CCompileMem.ailang` emitted `0xF3 0xA4` (REP MOVSB) and `0xF3 0xAA` (REP STOSB) without `0xFC` (CLD) first. The `X86_Cld` emitter existed in `Library.CEmitX86Sys.ailang` but had no arch-dispatch wrapper and was never called.
+
+**Fix (2 files):**
+- `Librarys/Compiler/CodeEmit/Library.CEmitCoreArch.ailang` — Added `Emit_Cld` wrapper function that calls `X86_Cld()` (emits `0xFC`)
+- `Librarys/Compiler/Compile/Modules/Library.CCompileMem.ailang` — Added `Emit_Cld()` before `Emit_RepMovsb()` in `CompileMem_MemoryCopy` and before `Emit_RepStosb()` in `CompileMem_MemorySet`
+
+**Validation:**
+- 3-generation bootstrap: all byte-identical (`c8f06ee8...`)
+- 57/57 CoreUtils build pass
+- 86/86 smoke tests pass (1 pre-existing `logname` env failure)
+- grep (uses `memchar` → `MemoryCopy`) passes all tests
+
+**Note:** `RepMovsq`, `RepStosq`, `RepeCmpsb`, `RepneScasb` exist in emit layer but are never called from any compile module — no fix needed there.
+
+**Commit:** `ce0c420` on `ak-context-refactor`. `ailang.x` updated to gen3 with fix.
+
+## In Progress: MemoryCopy Rollout (2026-04-23)
+
+Incrementally replacing byte-by-byte copy loops with `MemoryCopy` across 5 sites. Going one at a time to isolate any issues. All depend on CLD fix (`ce0c420`).
+
+| # | File | Function | Status |
+|---|------|----------|--------|
+| 1 | Library.Framebuffer.ailang | `FB_Flip`, `FB_FlipFast` | Done (commit `f311746`) |
+| 2 | Library.SurfaceBlit.ailang | `Surface_BlitOpaque` | Done (commit `8bb9323`) |
+| 3 | Library.WinRender.ailang | `Win_BlitOne`, `Win_BlitClamped` | Done (pending test) |
+| 4 | Library.Deskbar.ailang | `Deskbar_Draw` | Pending |
+| 5 | Library.DDrawPixel.ailang | `Draw_Pix_FillRect` | Pending (different — `DPix_PutPixel` → `StoreValue`, not MemoryCopy) |
+
+**Site 2 detail (SurfaceBlit):** Replaced 4-channel `GetByte`/`SetByte` inner loop (per-pixel BGRA copy) with per-row `MemoryCopy(dr_ptr, sr_ptr, row_bytes)`. Also folded `sx_start`/`dst_x` pixel offsets into the row pointer calculation (matching the original c99bee4 approach).
+
+## Completed: MemoryCopy in FB_Flip/FB_FlipFast (2026-04-23)
+
+Replaced byte-by-byte and 8-byte-chunk framebuffer copy loops in `FB_Flip` and `FB_FlipFast` (`Library.Framebuffer.ailang`) with single `MemoryCopy(FB.fb_ptr, FB.back_buffer, FB.size)` calls. This was commit `f311746` — a conservative re-application of the performance optimization after the full rollout in `c99bee4` was reverted (`16e1075`). Only the framebuffer flip functions were changed; SurfaceBlit/WinRender/DDrawPixel/Deskbar kept their byte-by-byte loops.
+
+**Depends on:** CLD fix above (`ce0c420`) — without CLD, MemoryCopy can corrupt memory.
+
 ## Completed: Screenshot PPM Support (2026-04-23)
 
 Added PPM (P6) output mode to `Library.Screenshot.ailang` alongside existing BMP. PPM chosen because Claude Code's Read tool segfaults on BMP files but handles PNG/JPG/PPM reliably.
