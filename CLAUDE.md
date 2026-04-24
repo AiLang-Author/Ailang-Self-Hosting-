@@ -197,15 +197,34 @@ PostgreSQL is the backbone — `services` table already exists with binary_path/
 
 **Commit:** `ce0c420` on `ak-context-refactor`. `ailang.x` updated to gen3 with fix.
 
+## Completed: Register Save/Restore for REP MOVSB/STOSB (2026-04-23)
+
+`REP MOVSB` destroys RSI, RDI, RCX. `REP STOSB` destroys RDI, RCX. `CompileMem_MemoryCopy` and `CompileMem_MemorySet` emitted these inline without saving/restoring the clobbered registers. If the register allocator placed any loop variable in RSI/RDI/RCX, the next loop iteration used garbage values — computing wild pointers into unmapped memory → hard lockup.
+
+**Symptom:** Site 3 MemoryCopy rollout (`Win_BlitOne`/`Win_BlitClamped` row loop) caused system lockup. Sites 1-2 worked by luck (register allocator didn't place loop vars in clobbered regs, or no loop at all).
+
+**Fix (1 file):**
+- `Librarys/Compiler/Compile/Modules/Library.CCompileMem.ailang`:
+  - `CompileMem_MemoryCopy`: Added `Emit_PushRsi/Rdi/Rcx` before arg compilation, `Emit_PopRcx/Rdi/Rsi` after `REP MOVSB`
+  - `CompileMem_MemorySet`: Added `Emit_PushRdi/Rcx` before arg compilation, `Emit_PopRcx/Rdi` after `REP STOSB`
+
+**Validation:**
+- 3-generation bootstrap: all byte-identical (`bc74bd2b...`)
+- 57/57 CoreUtils build pass
+- 86/86 smoke tests pass (1 pre-existing `logname` env failure)
+- grep (uses `memchar` → `MemoryCopy`) passes all tests
+
+**Commit:** on `ak-context-refactor`. `ailang.x` to be updated to gen3 with fix.
+
 ## In Progress: MemoryCopy Rollout (2026-04-23)
 
-Incrementally replacing byte-by-byte copy loops with `MemoryCopy` across 5 sites. Going one at a time to isolate any issues. All depend on CLD fix (`ce0c420`).
+Incrementally replacing byte-by-byte copy loops with `MemoryCopy` across 5 sites. Going one at a time to isolate any issues. Depend on CLD fix (`ce0c420`) + register save/restore fix.
 
 | # | File | Function | Status |
 |---|------|----------|--------|
 | 1 | Library.Framebuffer.ailang | `FB_Flip`, `FB_FlipFast` | Done (commit `f311746`) |
 | 2 | Library.SurfaceBlit.ailang | `Surface_BlitOpaque` | Done (commit `8bb9323`) |
-| 3 | Library.WinRender.ailang | `Win_BlitOne`, `Win_BlitClamped` | Done (pending test) |
+| 3 | Library.WinRender.ailang | `Win_BlitOne`, `Win_BlitClamped` | Done (commit `3c21636`, crashed pre-reg-fix, needs retest) |
 | 4 | Library.Deskbar.ailang | `Deskbar_Draw` | Pending |
 | 5 | Library.DDrawPixel.ailang | `Draw_Pix_FillRect` | Pending (different — `DPix_PutPixel` → `StoreValue`, not MemoryCopy) |
 
