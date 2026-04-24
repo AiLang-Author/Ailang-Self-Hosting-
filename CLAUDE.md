@@ -224,11 +224,15 @@ Incrementally replacing byte-by-byte copy loops with `MemoryCopy` across 5 sites
 |---|------|----------|--------|
 | 1 | Library.Framebuffer.ailang | `FB_Flip`, `FB_FlipFast` | Done (commit `f311746`) |
 | 2 | Library.SurfaceBlit.ailang | `Surface_BlitOpaque` | Done (commit `8bb9323`) |
-| 3 | Library.WinRender.ailang | `Win_BlitOne`, `Win_BlitClamped` | Done (commit `3c21636`, crashed pre-reg-fix, needs retest) |
+| 3 | Library.WinRender.ailang | `Win_BlitOne`, `Win_BlitClamped` | Flattened + MemoryCopy (needs retest) |
 | 4 | Library.Deskbar.ailang | `Deskbar_Draw` | Pending |
 | 5 | Library.DDrawPixel.ailang | `Draw_Pix_FillRect` | Pending (different — `DPix_PutPixel` → `StoreValue`, not MemoryCopy) |
 
 **Site 2 detail (SurfaceBlit):** Replaced 4-channel `GetByte`/`SetByte` inner loop (per-pixel BGRA copy) with per-row `MemoryCopy(dr_ptr, sr_ptr, row_bytes)`. Also folded `sx_start`/`dst_x` pixel offsets into the row pointer calculation (matching the original c99bee4 approach).
+
+**Site 3 detail (WinRender):** Original commit `3c21636` crashed (lockup) even after register save/restore fix (`4917789`). Root cause: deeply nested address expressions (4 levels of `Add(Multiply(Add(...)))`) triggered the peephole optimizer (`Library.CCompilerOptimizer.ailang`) which can mishandle complex recursive expression trees. Fix: flattened all address computations into intermediate local variables (max 2-level nesting), matching the proven `Surface_BlitOpaque` pattern. Each loop iteration now computes `sry`, `dry`, `sr_off`, `dr_off`, `src_row`, `dst_row` as separate flat assignments before calling `MemoryCopy(dst_row, src_row, row_bytes)`.
+
+**Optimizer note:** The peephole optimizer has a potential bug — `Multiply(1, x)` where left operand is literal 1 returns without emitting `MOV RAX, RBX`, leaving RAX=1 instead of x (line ~199 of CCompilerOptimizer.ailang). Not the cause of this lockup but a real latent bug.
 
 ## Completed: MemoryCopy in FB_Flip/FB_FlipFast (2026-04-23)
 
