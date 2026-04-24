@@ -224,8 +224,8 @@ Incrementally replacing byte-by-byte copy loops with `MemoryCopy` across 5 sites
 |---|------|----------|--------|
 | 1 | Library.Framebuffer.ailang | `FB_Flip`, `FB_FlipFast` | Done (commit `f311746`) |
 | 2 | Library.SurfaceBlit.ailang | `Surface_BlitOpaque` | Done (commit `8bb9323`) |
-| 3 | Library.WinRender.ailang | `Win_BlitOne`, `Win_BlitClamped` | Flattened + MemoryCopy (needs retest) |
-| 4 | Library.Deskbar.ailang | `Deskbar_Draw` | Pending |
+| 3 | Library.WinRender.ailang | `Win_BlitOne`, `Win_BlitClamped` | Reverted to byte-by-byte (MemoryCopy itself works; crash was VInst_DrawString 7-arg bug) |
+| 4 | Library.Deskbar.ailang | `Deskbar_Draw` | Done (commit `400a3d0`, uses MemoryCopy in row loop) |
 | 5 | Library.DDrawPixel.ailang | `Draw_Pix_FillRect` | Pending (different — `DPix_PutPixel` → `StoreValue`, not MemoryCopy) |
 
 **Site 2 detail (SurfaceBlit):** Replaced 4-channel `GetByte`/`SetByte` inner loop (per-pixel BGRA copy) with per-row `MemoryCopy(dr_ptr, sr_ptr, row_bytes)`. Also folded `sx_start`/`dst_x` pixel offsets into the row pointer calculation (matching the original c99bee4 approach).
@@ -298,3 +298,48 @@ Build & run (no framebuffer needed):
 ```
 
 Tests: FileDialog (real Dialog_Create/Win_Create/FD_BuildTree chain), Deskbar, Toolbar, Menu. Dumps surfaces to PPM. Requires PostgreSQL (ailang_system db, user bob).
+
+## Completed: VInst_DrawString 7-Arg Fix (2026-04-24)
+
+`VInst_DrawString` was the **only function in the entire codebase with 7 parameters**, violating the compiler's deliberate 6-register limit (no spill by design). The 7th arg (`color`) went on the stack, which the compiler's `CompileFunc_UserCall` cannot handle correctly — `AND RSP, -16` alignment mispositions stack-passed arguments before `CALL`, so the callee reads garbage for arg 7+.
+
+**Symptom:** Desktop renders one frame then locks up. Every `Win_DrawTabBar` call invoked `VInst_DrawString(inst, surf, title_ptr, title_len, text_x, text_y, text_color)` with 7 args, corrupting the stack on every window tab render.
+
+**Root cause:** `VInst_DrawString` in `Library.Fonts.ailang` had 7 `Input:` lines. The compiler's 6-arg limit is intentional (enforced by `analyzer.x` arity checker). The >6-arg codegen path was never designed for production use.
+
+**Fix:** Moved `color` from a 7th parameter to `FontState.draw_color` (FixedPool global). Callers set the global before calling.
+
+**Files changed (2):**
+- `Librarys/Library.Fonts.ailang`:
+  - Added `"draw_color": Initialize=0, CanChange=True` to `FixedPool.FontState`
+  - `VInst_DrawString`: removed `Input: color: Integer` (7→6 params), body reads `color = FontState.draw_color`
+  - `VFont_DrawString` wrapper: sets `FontState.draw_color = color` before calling `VInst_DrawString`
+  - Removed unused `em` variable in `VInst_DrawString`
+- `Librarys/Library.WinRender.ailang`:
+  - `Win_DrawTabBar` line 419: `FontState.draw_color = Theme.tab_text` then `VInst_DrawString(inst, surf, title_ptr, title_len, text_x, text_y)`
+
+**Also in this working tree (uncommitted):**
+- `Win_BlitOne`/`Win_BlitClamped` reverted from MemoryCopy back to byte-by-byte (MemoryCopy itself is correct; the lockup was always this 7-arg bug, not MemoryCopy)
+- `FB_FontDefineChar` refactored from 10 args to 2 args (char + packed 64-bit int) — eliminates another >6-arg call site
+
+**How the crash was found:**
+1. `./analyzer.x Main.ailang` reported `Excessive arity: 1` → `VInst_DrawString` has 7 params
+2. Test programs confirmed: 7-arg functions SEGFAULT, identical logic with ≤6 args PASSES
+3. `test_offscreen_render.x` (exercises real library pipeline including `VInst_DrawString`) passes with the fix
+
+**Validation:**
+- `./analyzer.x Main.ailang` → `Excessive arity: 0`
+- 3-generation bootstrap: all byte-identical (`6c84e377...`)
+- 86/86 smoke tests pass (1 pre-existing `logname` env failure)
+- `test_offscreen_render.x` all 4 render tests pass (toolbar, menu, deskbar, file dialog)
+- Main.ailang compiles successfully
+
+**Design note:** The 6-arg limit is deliberate — the compiler targets SysV AMD64's 6 register args (RDI, RSI, RDX, RCX, R8, R9) with no spill. The `analyzer.x` arity checker exists specifically to catch violations. Any function needing >6 values should use FixedPool globals for the extras.
+
+**Test programs created during debugging (in TestCode/):**
+- `test_memcopy_blit.ailang` — 6 MemoryCopy isolation tests (all pass)
+- `test_deskbar_blit.ailang` — 5 real Surface API + MemoryCopy tests (all pass)
+- `test_real_blit.ailang` — 7-arg reproduction case (SEGFAULT, proves >6-arg bug)
+- `test_real_blit2.ailang` — same logic with ≤6 args + globals (passes)
+- `test_real_blit3.ailang` — exact real-code function signatures (passes)
+- `test_blit_loop.ailang` — minimal blit loop (passes)
