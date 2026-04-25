@@ -343,3 +343,97 @@ Tests: FileDialog (real Dialog_Create/Win_Create/FD_BuildTree chain), Deskbar, T
 - `test_real_blit2.ailang` — same logic with ≤6 args + globals (passes)
 - `test_real_blit3.ailang` — exact real-code function signatures (passes)
 - `test_blit_loop.ailang` — minimal blit loop (passes)
+
+## Completed: VFont_UseSize — Font Instance Caching Fix (2026-04-24)
+
+Main.ailang and library callers used `VFont_FlushCache() + VFont_RasterAll(size)` to switch between font sizes. This destroyed all ~94 cached glyph surfaces and re-rasterized them from TVG vectors on every switch — hundreds of arena alloc/free cycles per size change. With 6+ switches during startup alone (~752 surface create/destroy ops), the arena allocator accumulated corruption, causing SIGSEGV (`si_addr=0x786500000000`) during the 4th rasterization pass inside `App_WriteContent`.
+
+**Root cause:** The font system was designed with instance caching (`VFont_CreateInstance` deduplicates by face+size) but callers destroyed the cache before switching, defeating the purpose. Fonts should only be re-rasterized on actual resize/DPI-change events, not on every text operation.
+
+**Fix: `VFont_UseSize(size)`** — new function in `Library.Fonts.ailang`. Calls `VFont_CreateInstance(face, size)` which returns the existing cached instance if one already exists, or creates a new one on first use. Sets it as `FontState.default_inst`. No flushing. Instances stay alive for the lifetime of the program.
+
+**Also added:** `UIScale.font_doc` (default 16px) to config system — replaces hardcoded `16` in document text rendering. Configurable via `config/ui.cfg` key `font_doc`.
+
+### Files Changed
+
+| File | Change |
+|------|--------|
+| `Library.Fonts.ailang` | Added `VFont_UseSize(size)` after `VFont_FlushCache` |
+| `Library.UIScale.ailang` | Added `font_doc` field (Initialize=16) + config loading |
+| `Main.ailang` | All `VFont_FlushCache()+VFont_RasterAll(N)` → `VFont_UseSize(UIScale.font_doc/font_body)` |
+| `Library.WinToolbar.ailang` | `VFont_RasterAll` → `VFont_UseSize` |
+| `Library.Menu.ailang` | Same |
+| `Library.Dialog.ailang` | Same (4 sites) |
+| `Library.SysDisplay.ailang` | Same (3 sites: debug overlay, DebugLog restore, desktop init) |
+
+### Font Instance Lifecycle (after fix)
+
+- `VFont_UseSize(18)` — first call: creates instance 0, rasterizes 94 glyphs from TVG
+- `VFont_UseSize(16)` — first call: creates instance 1, rasterizes 94 glyphs from TVG
+- `VFont_UseSize(18)` — cache hit: returns existing instance 0 (instant, no work)
+- `VFont_UseSize(16)` — cache hit: returns existing instance 1 (instant, no work)
+- 500 subsequent switches: all cache hits, zero re-rasterization
+
+### VFont_FlushCache — When to Use
+
+`VFont_FlushCache` still exists for legitimate cache invalidation: DPI changes, font file reload, window scaling events. It should **never** be called just to switch between sizes — that's what `VFont_UseSize` is for.
+
+### Validation
+
+- Main.ailang compiles cleanly
+- Headless test (FB bypass to heap): completes full init, creates document window, draws deskbar — exit 124 (event loop timeout), not 139 (crash)
+- `test_offscreen_render.x`: all 4 render tests pass (toolbar, menu, deskbar, file dialog)
+- Font switching stress test: 500 rapid switches across 5 sizes + 20 drawing round-trips — PASS
+
+## Completed: TVG Rasterizer Hardening (2026-04-24)
+
+Structural improvements to `Library.VIF.ailang` made during crash investigation. All changes are defensive — the crash turned out to be the flush/raster churn, not TVG bugs, but these are good engineering:
+
+### Function Split: TVG_CmdFillPath
+
+Original `TVG_CmdFillPath` had 33+ local variables (well over the 6-register limit). Split the inner segment parsing loop into 4 helper functions to reduce register pressure:
+
+- `TVG_ReadSegCmd` — dispatches LINE, HORIZ, VERT, CLOSE, and calls helpers
+- `TVG_ReadSegCubic` — CUBIC bezier segments
+- `TVG_ReadSegQuad` — QUAD bezier (converted to cubic) segments
+- `TVG_ReadSegArc` — ARC_CIRC and ARC_ELLIP segments
+
+Uses `FixedPool.PathCursor` (x, y, first_x, first_y) to pass cursor state between functions without parameters.
+
+### Bounds Checks Added
+
+- `TVG_BlendPixel`: `Surface_InBounds(surf, px, py)` check before raw pointer math
+- `TVG_ScanFill`: null checks for `surf`, `edges`; dimension validation for `sw`, `sh`
+- `TVG_ScanFill`: `xs_cnt < 63` overflow guard on intersection buffer
+
+### Debug Prints Removed
+
+Removed all verbose diagnostic prints added during investigation (segment coordinates, color channel dumps, edge counts, TVG header dumps, per-command tracing, render-complete messages). Kept only legitimate error messages (`[TVG] ScanFill: null surf`, `[TVG] bad version`, `[TVG] unknown cmd`, etc.).
+
+## Current State (2026-04-24)
+
+### What's Working
+
+- Full display server init pipeline: Arena → SysDisplay → Fonts → UIConfig → UITheme → UIScale → Framebuffer → Compositor → Auckland → Deskbar → Menus → Dialogs → Documents
+- Font instance caching: instances created once per face+size, reused on subsequent `VFont_UseSize` calls
+- TVG vector font rasterization with hardened bounds checks
+- All test programs pass: `test_offscreen_render.x` (4 render tests), font stress test (500 switches)
+- Headless mode works (FB bypass to heap buffer in `Library.Framebuffer.ailang` — currently reverted, re-apply for headless testing)
+- 86/86 smoke tests pass, 57/57 CoreUtils build
+
+### Ready to Test on Real Framebuffer
+
+Compile and run from TTY console:
+```
+./ailang.x Main.ailang SysDisplay.x
+# Switch to TTY: Ctrl+Alt+F2
+./SysDisplay.x
+# ESC to quit
+```
+
+### Pending Work
+
+- **MemoryCopy rollout site 5** (`Library.DDrawPixel.ailang` — `Draw_Pix_FillRect`): Different pattern (per-pixel `DPix_PutPixel` → `StoreValue`, not byte copy), needs separate approach
+- **Deskbar rewrite phases 2-4**: PostgreSQL service loading, About dialog, fork/exec launching
+- **SSE optimizations**: Future performance work, one site at a time
+- **Library.FramebufferBypass**: User suggested making the headless FB bypass into a separate library for clean switching between real FB and heap buffer
