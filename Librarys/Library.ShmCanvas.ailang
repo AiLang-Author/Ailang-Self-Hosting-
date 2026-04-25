@@ -1,0 +1,286 @@
+// Library.ShmCanvas.ailang
+// App-side shared memory canvas helper for IPC pixel streaming.
+//
+// Creates a /dev/shm file, mmaps it, and provides functions to
+// attach/present/destroy the canvas via the IPC protocol.
+// The display server mmaps the same file — zero-copy pixel sharing.
+//
+// Pixel format: BGRA 32-bit little-endian (native framebuffer format).
+// Pitch = width × 4 (no padding).
+//
+// Usage:
+//   buf = ShmCanvas_Create(win_id, 640, 480)
+//   ShmCanvas_Attach(sock, win_id, 640, 480)
+//   // write pixels to buf: offset = (y * w + x) * 4, BGRA byte order
+//   ShmCanvas_Present(sock, win_id)
+//   ShmCanvas_Destroy(win_id)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.ShmCanvasState {
+    "buf":      Initialize=0
+    "size":     Initialize=0
+    "path":     Initialize=0
+    "width":    Initialize=0
+    "height":   Initialize=0
+}
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.ShmSys {
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_MMAP":      Initialize=9
+    "SYS_MUNMAP":    Initialize=11
+    "SYS_FTRUNCATE": Initialize=77
+    "SYS_UNLINK":    Initialize=87
+}
+
+FixedPool.ShmFlags {
+    "O_RDWR":        Initialize=2
+    "O_CREAT_RDWR":  Initialize=66
+    "MODE_0666":     Initialize=438
+    "PROT_RW":       Initialize=3
+    "MAP_SHARED":    Initialize=1
+}
+
+// =============================================================================
+// INT TO STRING — convert win_id to decimal digits for path building
+// =============================================================================
+Function.ShmCanvas_NumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// BUILD SHM PATH — "/dev/shm/ailang_canvas_<win_id>"
+// =============================================================================
+Function.ShmCanvas_BuildPath {
+    Input: win_id: Integer
+    Output: Integer
+    Body: {
+        prefix = "/dev/shm/ailang_canvas_"
+        prefix_len = 22
+        num_buf = Allocate(16)
+        nlen = ShmCanvas_NumToStr(win_id, num_buf)
+
+        path = Allocate(Add(prefix_len, Add(nlen, 1)))
+        MemoryCopy(path, prefix, prefix_len)
+        MemoryCopy(Add(path, prefix_len), num_buf, nlen)
+        SetByte(path, Add(prefix_len, nlen), 0)
+        Deallocate(num_buf, 16)
+        ReturnValue(path)
+    }
+}
+
+// =============================================================================
+// CREATE — allocate shared memory file, mmap it, return pixel buffer pointer
+// =============================================================================
+Function.ShmCanvas_Create {
+    Input: win_id: Integer
+    Input: w:      Integer
+    Input: h:      Integer
+    Output: Integer
+    Body: {
+        path = ShmCanvas_BuildPath(win_id)
+        ShmCanvasState.path   = path
+        ShmCanvasState.width  = w
+        ShmCanvasState.height = h
+
+        shm_size = Multiply(Multiply(w, h), 4)
+        ShmCanvasState.size = shm_size
+
+        // open(path, O_CREAT|O_RDWR, 0666)
+        fd = SystemCall(ShmSys.SYS_OPEN, path, ShmFlags.O_CREAT_RDWR, ShmFlags.MODE_0666)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[ShmCanvas] open failed: ")
+            PrintString(path)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        // ftruncate(fd, size)
+        SystemCall(ShmSys.SYS_FTRUNCATE, fd, shm_size, 0, 0, 0, 0)
+
+        // mmap(0, size, PROT_RW, MAP_SHARED, fd, 0)
+        buf = SystemCall(ShmSys.SYS_MMAP, 0, shm_size, ShmFlags.PROT_RW, ShmFlags.MAP_SHARED, fd, 0)
+
+        // close fd — mapping persists
+        SystemCall(ShmSys.SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+
+        IfCondition LessThan(buf, 0) ThenBlock: {
+            PrintMessage("[ShmCanvas] mmap failed\n")
+            ReturnValue(0)
+        }
+
+        ShmCanvasState.buf = buf
+
+        PrintMessage("[ShmCanvas] created: ")
+        PrintString(path)
+        PrintMessage(" ")
+        PrintNumber(w)
+        PrintMessage("x")
+        PrintNumber(h)
+        PrintMessage(" (")
+        PrintNumber(shm_size)
+        PrintMessage(" bytes)\n")
+
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// ATTACH — tell display server to mmap our shared memory canvas
+// =============================================================================
+Function.ShmCanvas_Attach {
+    Input: sock:   Integer
+    Input: win_id: Integer
+    Input: w:      Integer
+    Input: h:      Integer
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "canvas.attach")
+        JSON.SetNumber(req, "win_id", win_id)
+        JSON.SetString(req, "shm_path", ShmCanvasState.path)
+        JSON.SetNumber(req, "w", w)
+        JSON.SetNumber(req, "h", h)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+// =============================================================================
+// PRESENT — signal display server that a new frame is ready
+// =============================================================================
+Function.ShmCanvas_Present {
+    Input: sock:   Integer
+    Input: win_id: Integer
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "canvas.present")
+        JSON.SetNumber(req, "win_id", win_id)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+// =============================================================================
+// DESTROY — munmap, unlink shm file, cleanup
+// =============================================================================
+Function.ShmCanvas_Destroy {
+    Input: win_id: Integer
+    Body: {
+        buf  = ShmCanvasState.buf
+        size = ShmCanvasState.size
+        path = ShmCanvasState.path
+
+        // munmap
+        IfCondition GreaterThan(buf, 0) ThenBlock: {
+            SystemCall(ShmSys.SYS_MUNMAP, buf, size, 0, 0, 0, 0)
+        }
+
+        // unlink shm file
+        IfCondition NotEqual(path, 0) ThenBlock: {
+            SystemCall(ShmSys.SYS_UNLINK, path, 0, 0, 0, 0, 0)
+        }
+
+        ShmCanvasState.buf  = 0
+        ShmCanvasState.size = 0
+        ShmCanvasState.path = 0
+
+        PrintMessage("[ShmCanvas] destroyed\n")
+    }
+}
+
+// =============================================================================
+// PIXEL HELPERS
+// =============================================================================
+
+// Set a pixel at (x, y) to BGRA color value
+Function.ShmCanvas_SetPixel {
+    Input: x:     Integer
+    Input: y:     Integer
+    Input: color: Integer
+    Body: {
+        w = ShmCanvasState.width
+        off = Multiply(Add(Multiply(y, w), x), 4)
+        ptr = Add(ShmCanvasState.buf, off)
+        StoreValue(ptr, color, "dword")
+    }
+}
+
+// Fill entire canvas with a BGRA color
+Function.ShmCanvas_Clear {
+    Input: color: Integer
+    Body: {
+        buf  = ShmCanvasState.buf
+        w    = ShmCanvasState.width
+        h    = ShmCanvasState.height
+        total = Multiply(w, h)
+        i = 0
+        WhileLoop LessThan(i, total) {
+            StoreValue(Add(buf, Multiply(i, 4)), color, "dword")
+            i = Add(i, 1)
+        }
+    }
+}
+
+// Fill a rectangle with a BGRA color
+Function.ShmCanvas_FillRect {
+    Input: rx:    Integer
+    Input: ry:    Integer
+    Input: rw:    Integer
+    Input: rh:    Integer
+    Input: color: Integer
+    Body: {
+        buf = ShmCanvasState.buf
+        stride = ShmCanvasState.width
+        cy = ry
+        ey = Add(ry, rh)
+        WhileLoop LessThan(cy, ey) {
+            cx = rx
+            ex = Add(rx, rw)
+            WhileLoop LessThan(cx, ex) {
+                off = Multiply(Add(Multiply(cy, stride), cx), 4)
+                StoreValue(Add(buf, off), color, "dword")
+                cx = Add(cx, 1)
+            }
+            cy = Add(cy, 1)
+        }
+    }
+}

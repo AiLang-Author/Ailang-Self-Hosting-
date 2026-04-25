@@ -72,6 +72,28 @@ Calculator maintains `expr_buf` (64 bytes) + `expr_len` in `CalcState`. Digits a
 | 04-25 | Toolbar button width fix | `toolbar_btn_w` 48→60 in ui.cfg, "About" no longer truncated |
 | 04-25 | About dialog | `Library.AboutDialog.ailang` — system info, copyright, close button |
 | 04-25 | APP_DEVELOPMENT.md | Full app development guide with toolbar, expression buffer, headless testing |
+| 04-25 | input.key IPC message | Display server forwards keyboard events to IPC app windows via `IPCBroker_SendKey` |
+| 04-25 | Grep IPC app | Hardware keyboard capture, regex+fixed search, file buttons, result streaming |
+| 04-25 | KeyMap library | Scancode-to-character mapping tables for keyboard input |
+| 04-25 | TextBuffer library | Multi-line text buffer with cursor, insert, delete, Enter/line-split |
+| 04-25 | File dialog | Full file browser with directory traversal, file type filtering |
+| 04-25 | Shared memory canvas | Zero-copy pixel streaming: app mmaps `/dev/shm`, server blits from same mapping |
+| 04-25 | Canvas demo | Animated BGRA gradient proves shm pipeline end-to-end |
+| 04-25 | Video player adapter | fork/exec ffmpeg, pipe() + dup2() stdout capture, raw BGRA → shm canvas, SIGSTOP/SIGCONT |
+
+## Shared Memory Canvas System
+
+Zero-copy pixel streaming for IPC apps. Both processes mmap the same `/dev/shm/ailang_canvas_<win_id>` file with `MAP_SHARED`. App writes BGRA pixels directly, display server blits from the shared mapping. JSON socket carries control messages only, never pixel data.
+
+**IPC messages:** `canvas.attach` (win_id, shm_path, w, h), `canvas.present` (win_id), `canvas.detach` (win_id)
+
+**Server side** (`Library.IPCBroker.ailang`): `canvas.attach` handler opens shm file, mmaps it, creates surface header pointing to shared memory. `Win_BlitAll` checks `Canvas_GetActive(i)` and substitutes the canvas surface.
+
+**App side** (`Library.ShmCanvas.ailang`): `ShmCanvas_Create(win_id, w, h)` creates shm file, ftruncate, mmap. `ShmCanvas_Present(sock, win_id)` sends JSON. Pixel helpers: `ShmCanvas_SetPixel`, `ShmCanvas_Clear`, `ShmCanvas_FillRect`.
+
+**Canvas state** (`Library.WinManager.ailang`): Per-window `CanvasState` table (8 entries × 32 bytes): ACTIVE, SHM_PTR, SHM_SIZE, SURF fields.
+
+**Video player pattern:** fork/exec ffmpeg with `-f rawvideo -pix_fmt bgra -s 640x480 pipe:1`, capture stdout via pipe()+dup2(), read frames directly into shm buffer, present each frame. SIGSTOP/SIGCONT for pause/resume.
 
 ## IPC Pipeline Architecture
 
@@ -88,6 +110,15 @@ Full plan at: `.claude/plans/playful-cuddling-puffin.md`
 | `Testcode/calc_ipc.ailang` | Standalone IPC calculator client |
 | `config/calculator.html` | Calculator layout with `toolbar="about"` |
 | `APP_DEVELOPMENT.md` | Application development guide |
+| `Librarys/Library.ShmCanvas.ailang` | App-side shared memory canvas — create/attach/present/destroy shm pixel buffers |
+| `Librarys/Library.KeyMap.ailang` | Keycode-to-character mapping for keyboard input |
+| `Librarys/Library.TextBuffer.ailang` | Multi-line text buffer with cursor, insert, delete, line split |
+| `Testcode/grep_ipc.ailang` | Grep IPC client — pattern search with keyboard capture |
+| `Testcode/canvas_demo.ailang` | Animated gradient demo — proves shm canvas pipeline |
+| `Testcode/videoplayer.ailang` | Video player — fork/exec ffmpeg, pipe raw BGRA frames to shm canvas |
+| `config/grep.html` | Grep window layout — textfield, file buttons, checkboxes, results panel |
+| `config/canvas_demo.html` | Canvas demo window — black panel for pixel streaming |
+| `config/videoplayer.html` | Video player window — canvas + transport controls (play/pause/stop/open) |
 
 ### PostgreSQL Services Table
 
@@ -102,7 +133,7 @@ CREATE TABLE IF NOT EXISTS services (
 )
 ```
 
-Seeded services: notepad (`internal:win.new`), files (`internal:app.files`), calculator (`./calc_ipc.x`).
+Seeded services: notepad (`internal:win.new`), files (`internal:app.files`), calculator (`./calc_ipc.x`), grep (`./grep_ipc.x`), canvas_demo (`./canvas_demo.x`), videoplayer (`./videoplayer.x`).
 
 Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts), `windows` (state persistence), `encryption_keys` (per-service keys), `service_status` (runtime state — not yet populated).
 
@@ -112,39 +143,56 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 
 - Full display server pipeline: init, rendering, input, window management, compositing
 - IPC Broker: embedded Unix socket server, non-blocking poll, client routing, JSON protocol
+- IPC `input.key` messages: display server forwards keyboard events to IPC app windows
 - Start Menu: popup panel, Home button, PostgreSQL service list, system items
 - Calculator: standalone IPC app, expression buffer display, 10/10 tests
+- Grep IPC app: hardware keyboard capture, regex/fixed search, file selection, results streaming
+- Shared memory canvas: zero-copy pixel streaming via `/dev/shm`, app writes BGRA, server blits
+- Canvas demo: animated gradient proves shm pipeline end-to-end
+- Video player: fork/exec ffmpeg, pipe stdout raw BGRA frames to shm canvas, SIGSTOP/SIGCONT pause
 - HTML toolbar system: `toolbar="about|file|full|none"`, per-app toolbar presets
 - About dialog: system info, copyright, close button
+- File dialog: full file browser with directory traversal
+- TextBuffer: multi-line text editing with cursor management
+- KeyMap: scancode-to-character translation tables
 - System action routing: toolbar Close/About work on IPC app windows
 - FB_InitHeadless: test binaries opt into headless mode, real FB is default
-- 34-step headless stress test: resize + debug + start menu + IPC + calc
-- 0 analyzer errors, 10/10 calc tests, 34/34 headless tests
+- 71-step headless stress test: resize + debug + start menu + IPC + calc + about + filedialog + notepad + keyboard
+- 0 analyzer errors, 10/10 calc tests, all headless tests pass
 
 ### Build & Run
 
 ```
-./ailang.x Main.ailang SysDisplay.x    # build display server
-./ailang.x Testcode/calc_ipc.ailang calc_ipc.x  # build calculator
-./ailang.x Calc.ailang Calc.x          # build calc standalone tests
-./ailang.x TestCode/test_main.ailang test_main.x  # build headless tests
-./SysDisplay.x                         # run on TTY (Ctrl+Alt+F2)
-./Calc.x                               # run calc unit tests
-./test_main.x                          # run headless integration tests
+./ailang.x Main.ailang SysDisplay.x                    # build display server
+./ailang.x Testcode/calc_ipc.ailang calc_ipc.x         # build calculator
+./ailang.x Testcode/grep_ipc.ailang grep_ipc.x         # build grep
+./ailang.x Testcode/canvas_demo.ailang canvas_demo.x   # build canvas demo
+./ailang.x Testcode/videoplayer.ailang videoplayer.x   # build video player
+./ailang.x Calc.ailang Calc.x                          # build calc standalone tests
+./ailang.x TestCode/test_main.ailang test_main.x       # build headless tests
+./SysDisplay.x                                          # run on TTY (Ctrl+Alt+F2)
+./Calc.x                                                # run calc unit tests
+./test_main.x                                           # run headless integration tests
 ```
 
 ### Test Programs
 
-- `test_main.ailang` — 34-step headless test (resize, debug, start menu, IPC, calc)
+- `test_main.ailang` — 71-step headless test (resize, debug, start menu, IPC, calc, about, filedialog, notepad, keyboard, stress)
 - `calc_ipc.ailang` — standalone IPC calculator client
+- `grep_ipc.ailang` — grep IPC client with keyboard capture and regex search
+- `canvas_demo.ailang` — animated gradient via shm canvas pipeline
+- `videoplayer.ailang` — ffmpeg video player via fork/exec + pipe + shm canvas
 - `Calc.ailang` — standalone calculator unit tests (10/10)
 - `test_offscreen_render.ailang` — 4 render tests (toolbar, menu, deskbar, file dialog)
+- `test_filedialog.ailang` — file dialog integration tests
 
 ### Pending Work
 
+- **Video player testing** — test on TTY2 with real video file, debug any pipe/frame issues
+- **ffmpeg command pipe** — modified ffmpeg with control pipe for seek/jump (user downloading from git)
+- **Video player seek** — FF/RW buttons need command pipe or restart-with-offset approach
+- **Grep file dialog** — replace hardcoded file list with proper file browser dialog
 - **Scientific calculator** — trig, log, parentheses, full algebra expressions
-- **Canvas buffer stream** — mechanism for video output / rich content
-- **Keyboard event capture** — Plan A: display server maps number/operator keys to button actions
 - **App installer CLI** — tool for registering apps in PostgreSQL (future: checksums, malware check, permissions)
 - **Start Menu UI** — Windows XP/7 side navigation, categories, running-app indicators
 - **Encryption at rest** — login gates master key, per-service keys from `encryption_keys` table

@@ -1,0 +1,881 @@
+// grep_ipc.ailang
+// GUI grep utility — IPC client for the AiLang display server.
+// Hardware keyboard capture for pattern entry via input.key IPC messages.
+// File target buttons, option checkboxes, results panel.
+// Launched from Start Menu — no CLI arguments needed.
+//
+// Protocol:
+//   1. Connect to /tmp/ailang_display.sock
+//   2. Register as "grep" service
+//   3. Create window with config/grep.html
+//   4. Service loop: key capture, file select, checkbox toggles, search
+//
+// Build: ./ailang.x Testcode/grep_ipc.ailang grep_ipc.x
+// Run:   Launched from Start Menu "Grep Search" or: ./grep_ipc.x
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.XArrays
+LibraryImport.HashMap
+LibraryImport.Regex_Thompson
+
+// ============================================================================
+// STATE
+// ============================================================================
+FixedPool.GrepIPCState {
+    "running":     Initialize=1
+    "win_id":      Initialize=0
+    "msg_count":   Initialize=0
+    "sock":        Initialize=0
+}
+
+// Grep options — toggled by checkbox actions
+FixedPool.GrepOpt {
+    "case_insensitive": Initialize=0
+    "invert":           Initialize=0
+    "line_numbers":     Initialize=0
+    "count_only":       Initialize=0
+    "fixed":            Initialize=0
+    "word_match":       Initialize=0
+}
+
+// Pattern buffer — built via hardware keyboard (input.key)
+FixedPool.GrepPat {
+    "buf":     Initialize=0
+    "len":     Initialize=0
+    "max":     Initialize=128
+}
+
+// File target — selected via file buttons
+FixedPool.GrepFile {
+    "path":    Initialize=0
+    "idx":     Initialize=0
+}
+
+// File target table — 12 preset files
+FixedPool.GrepFileTable {
+    "paths":   Initialize=0
+    "count":   Initialize=12
+}
+
+// ============================================================================
+// SYSCALL WRAPPERS
+// ============================================================================
+Function.GrepSysOpen {
+    Input: filename: Address
+    Output: Integer
+    Body: { ReturnValue(SystemCall(2, filename, 0, 0)) }
+}
+
+Function.GrepSysRead {
+    Input: fd: Integer
+    Input: buffer: Address
+    Input: count: Integer
+    Output: Integer
+    Body: { ReturnValue(SystemCall(0, fd, buffer, count)) }
+}
+
+Function.GrepSysClose {
+    Input: fd: Integer
+    Body: { SystemCall(3, fd) }
+}
+
+// ============================================================================
+// CASE / MATCH HELPERS
+// ============================================================================
+Function.GrepToLower {
+    Input: c: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(c, 65), LessEqual(c, 90)) ThenBlock: {
+            ReturnValue(Add(c, 32))
+        }
+        ReturnValue(c)
+    }
+}
+
+Function.GrepIsWordChar {
+    Input: c: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(c, 48), LessEqual(c, 57)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(c, 65), LessEqual(c, 90)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(c, 97), LessEqual(c, 122)) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 95) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// SUBSTRING SEARCH — MemChr anchored
+// ============================================================================
+Function.GrepSearch {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pat: Address
+    Input: plen: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(plen, line_len) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(plen, 1) ThenBlock: {
+            ReturnValue(MemChr(line, GetByte(pat, 0), line_len))
+        }
+        first_pat = GetByte(pat, 0)
+        max_start = Subtract(line_len, plen)
+        pos = 0
+        WhileLoop LessEqual(pos, max_start) {
+            remaining = Subtract(line_len, pos)
+            off = MemChr(Add(line, pos), first_pat, remaining)
+            IfCondition LessThan(off, 0) ThenBlock: { ReturnValue(-1) }
+            cand = Add(pos, off)
+            IfCondition GreaterThan(cand, max_start) ThenBlock: { ReturnValue(-1) }
+            IfCondition EqualTo(MemCompare(Add(line, cand), pat, plen), 0) ThenBlock: {
+                ReturnValue(cand)
+            }
+            pos = Add(cand, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.GrepSearchCI {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pat_lc: Address
+    Input: plen: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(plen, line_len) ThenBlock: { ReturnValue(-1) }
+        last = Subtract(line_len, plen)
+        pos = 0
+        WhileLoop LessEqual(pos, last) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, plen) {
+                c = GrepToLower(GetByte(line, Add(pos, j)))
+                IfCondition NotEqual(c, GetByte(pat_lc, j)) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: { ReturnValue(pos) }
+            pos = Add(pos, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// ============================================================================
+// LINE MATCH
+// ============================================================================
+Function.GrepLineMatch {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: pat: Address
+    Input: pat_lc: Address
+    Input: plen: Integer
+    Input: regex_h: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(1) }
+
+        // Word match (-w)
+        IfCondition EqualTo(GrepOpt.word_match, 1) ThenBlock: {
+            last = Subtract(line_len, plen)
+            wp = 0
+            WhileLoop LessEqual(wp, last) {
+                sub_ok = 0
+                IfCondition EqualTo(GrepOpt.case_insensitive, 1) ThenBlock: {
+                    wj = 0
+                    wmatch = 1
+                    WhileLoop LessThan(wj, plen) {
+                        c = GrepToLower(GetByte(line, Add(wp, wj)))
+                        IfCondition NotEqual(c, GetByte(pat_lc, wj)) ThenBlock: { wmatch = 0  BreakLoop }
+                        wj = Add(wj, 1)
+                    }
+                    sub_ok = wmatch
+                } ElseBlock: {
+                    IfCondition EqualTo(MemCompare(Add(line, wp), pat, plen), 0) ThenBlock: { sub_ok = 1 }
+                }
+                IfCondition EqualTo(sub_ok, 1) ThenBlock: {
+                    left_ok = 0
+                    IfCondition EqualTo(wp, 0) ThenBlock: { left_ok = 1 }
+                    IfCondition EqualTo(left_ok, 0) ThenBlock: {
+                        IfCondition EqualTo(GrepIsWordChar(GetByte(line, Subtract(wp, 1))), 0) ThenBlock: { left_ok = 1 }
+                    }
+                    right_ok = 0
+                    end_p = Add(wp, plen)
+                    IfCondition GreaterEqual(end_p, line_len) ThenBlock: { right_ok = 1 }
+                    IfCondition EqualTo(right_ok, 0) ThenBlock: {
+                        IfCondition EqualTo(GrepIsWordChar(GetByte(line, end_p)), 0) ThenBlock: { right_ok = 1 }
+                    }
+                    IfCondition And(EqualTo(left_ok, 1), EqualTo(right_ok, 1)) ThenBlock: { ReturnValue(1) }
+                }
+                wp = Add(wp, 1)
+            }
+            ReturnValue(0)
+        }
+
+        // Regex mode (not -F)
+        IfCondition EqualTo(GrepOpt.fixed, 0) ThenBlock: {
+            IfCondition NotEqual(regex_h, 0) ThenBlock: {
+                scratch = Allocate(Add(line_len, 1))
+                IfCondition EqualTo(GrepOpt.case_insensitive, 1) ThenBlock: {
+                    ri = 0
+                    WhileLoop LessThan(ri, line_len) {
+                        SetByte(scratch, ri, GrepToLower(GetByte(line, ri)))
+                        ri = Add(ri, 1)
+                    }
+                } ElseBlock: {
+                    MemoryCopy(scratch, line, line_len)
+                }
+                SetByte(scratch, line_len, 0)
+                result = Regex_Search(regex_h, scratch, line_len)
+                Deallocate(scratch, Add(line_len, 1))
+                ReturnValue(result)
+            }
+        }
+
+        // Fixed string search
+        IfCondition EqualTo(GrepOpt.case_insensitive, 1) ThenBlock: {
+            found = GrepSearchCI(line, line_len, pat_lc, plen)
+        } ElseBlock: {
+            found = GrepSearch(line, line_len, pat, plen)
+        }
+        IfCondition GreaterEqual(found, 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// NUMBER TO STRING
+// ============================================================================
+Function.GrepNumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// ============================================================================
+// IPC SEND HELPERS
+// ============================================================================
+Function.GrepSendAddLine {
+    Input: sock: Integer
+    Input: text: Address
+    Input: color: Integer
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.addline")
+        JSON.SetNumber(req, "win_id", GrepIPCState.win_id)
+        JSON.SetString(req, "text", text)
+        IfCondition NotEqual(color, 0) ThenBlock: {
+            JSON.SetNumber(req, "color", color)
+        }
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+Function.GrepSendClear {
+    Input: sock: Integer
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.clear")
+        JSON.SetNumber(req, "win_id", GrepIPCState.win_id)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+Function.GrepSendSetLabel {
+    Input: sock: Integer
+    Input: id: Address
+    Input: text: Address
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.setlabel")
+        JSON.SetNumber(req, "win_id", GrepIPCState.win_id)
+        JSON.SetString(req, "id", id)
+        JSON.SetString(req, "text", text)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+// ============================================================================
+// PATTERN BUFFER — on-screen keyboard appends here
+// ============================================================================
+Function.GrepPatAppend {
+    Input: ch: Integer
+    Body: {
+        IfCondition GreaterEqual(GrepPat.len, GrepPat.max) ThenBlock: { ReturnValue(0) }
+        SetByte(GrepPat.buf, GrepPat.len, ch)
+        GrepPat.len = Add(GrepPat.len, 1)
+        SetByte(GrepPat.buf, GrepPat.len, 0)
+    }
+}
+
+Function.GrepPatBackspace {
+    Body: {
+        IfCondition GreaterThan(GrepPat.len, 0) ThenBlock: {
+            GrepPat.len = Subtract(GrepPat.len, 1)
+            SetByte(GrepPat.buf, GrepPat.len, 0)
+        }
+    }
+}
+
+Function.GrepPatClear {
+    Body: {
+        GrepPat.len = 0
+        SetByte(GrepPat.buf, 0, 0)
+    }
+}
+
+// ============================================================================
+// FILE TARGET TABLE
+// ============================================================================
+Function.GrepInitFileTable {
+    Body: {
+        GrepFileTable.paths = Allocate(96)
+        StoreValue(Add(GrepFileTable.paths, 0),  "Main.ailang")
+        StoreValue(Add(GrepFileTable.paths, 8),  "Librarys/Library.Auckland.ailang")
+        StoreValue(Add(GrepFileTable.paths, 16), "Librarys/Library.AucklandBind.ailang")
+        StoreValue(Add(GrepFileTable.paths, 24), "Librarys/Library.AucklandEvent.ailang")
+        StoreValue(Add(GrepFileTable.paths, 32), "Librarys/Library.HTMLParse.ailang")
+        StoreValue(Add(GrepFileTable.paths, 40), "Librarys/Library.SysDisplay.ailang")
+        StoreValue(Add(GrepFileTable.paths, 48), "Librarys/Library.WinManager.ailang")
+        StoreValue(Add(GrepFileTable.paths, 56), "Librarys/Library.IPCBroker.ailang")
+        StoreValue(Add(GrepFileTable.paths, 64), "Librarys/Library.EventRouter.ailang")
+        StoreValue(Add(GrepFileTable.paths, 72), "Librarys/Library.FileDialog.ailang")
+        StoreValue(Add(GrepFileTable.paths, 80), "Librarys/Library.Deskbar.ailang")
+        StoreValue(Add(GrepFileTable.paths, 88), "AiLang_CoreUtils/dist/grep_util/grep.ailang")
+    }
+}
+
+Function.GrepSelectFile {
+    Input: idx: Integer
+    Body: {
+        IfCondition GreaterEqual(idx, GrepFileTable.count) ThenBlock: { ReturnValue(0) }
+        GrepFile.idx = idx
+        GrepFile.path = Dereference(Add(GrepFileTable.paths, Multiply(idx, 8)))
+        GrepSendSetLabel(GrepIPCState.sock, "filepath", GrepFile.path)
+    }
+}
+
+// ============================================================================
+// RUN GREP — execute search and stream results via IPC
+// ============================================================================
+Function.GrepRunSearch {
+    Input: sock: Integer
+    Body: {
+        pat = GrepPat.buf
+        plen = GrepPat.len
+        filepath = GrepFile.path
+
+        IfCondition EqualTo(plen, 0) ThenBlock: {
+            GrepSendSetLabel(sock, "status", "Error: empty pattern")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(filepath, 0) ThenBlock: {
+            GrepSendSetLabel(sock, "status", "Error: no file selected")
+            ReturnValue(0)
+        }
+
+        GrepSendClear(sock)
+        GrepSendSetLabel(sock, "status", "Searching...")
+
+        // Build lowercase pattern for -i
+        pat_lc = Allocate(Add(plen, 1))
+        li = 0
+        WhileLoop LessThan(li, plen) {
+            SetByte(pat_lc, li, GrepToLower(GetByte(pat, li)))
+            li = Add(li, 1)
+        }
+        SetByte(pat_lc, plen, 0)
+
+        // Compile regex if not -F
+        regex_h = 0
+        IfCondition EqualTo(GrepOpt.fixed, 0) ThenBlock: {
+            IfCondition EqualTo(GrepOpt.case_insensitive, 1) ThenBlock: {
+                regex_h = Regex_Compile(pat_lc, 0)
+            } ElseBlock: {
+                regex_h = Regex_Compile(pat, 0)
+            }
+        }
+
+        fd = GrepSysOpen(filepath)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            GrepSendSetLabel(sock, "status", "Error: cannot open file")
+            Deallocate(pat_lc, Add(plen, 1))
+            ReturnValue(0)
+        }
+
+        buf_sz = 131072
+        read_buf = Allocate(buf_sz)
+        line_max = 4096
+        line_buf = Allocate(line_max)
+        line_len = 0
+        line_no = 0
+        match_count = 0
+        result_count = 0
+        max_results = 200
+
+        WhileLoop 1 {
+            n = GrepSysRead(fd, read_buf, buf_sz)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+
+            i = 0
+            WhileLoop LessThan(i, n) {
+                remaining = Subtract(n, i)
+                search_ptr = Add(read_buf, i)
+                nl_offset = MemChr(search_ptr, 10, remaining)
+
+                IfCondition EqualTo(nl_offset, -1) ThenBlock: {
+                    space = Subtract(line_max, line_len)
+                    copy = remaining
+                    IfCondition GreaterThan(copy, space) ThenBlock: { copy = space }
+                    IfCondition GreaterThan(copy, 0) ThenBlock: {
+                        MemoryCopy(Add(line_buf, line_len), search_ptr, copy)
+                        line_len = Add(line_len, copy)
+                    }
+                    BreakLoop
+                }
+
+                space = Subtract(line_max, line_len)
+                copy = nl_offset
+                IfCondition GreaterThan(copy, space) ThenBlock: { copy = space }
+                IfCondition GreaterThan(copy, 0) ThenBlock: {
+                    MemoryCopy(Add(line_buf, line_len), search_ptr, copy)
+                    line_len = Add(line_len, copy)
+                }
+
+                line_no = Add(line_no, 1)
+
+                raw = GrepLineMatch(line_buf, line_len, pat, pat_lc, plen, regex_h)
+                IfCondition EqualTo(GrepOpt.invert, 1) ThenBlock: {
+                    IfCondition EqualTo(raw, 1) ThenBlock: { effective = 0 } ElseBlock: { effective = 1 }
+                } ElseBlock: {
+                    effective = raw
+                }
+
+                IfCondition EqualTo(effective, 1) ThenBlock: {
+                    match_count = Add(match_count, 1)
+                    IfCondition EqualTo(GrepOpt.count_only, 0) ThenBlock: {
+                        IfCondition LessThan(result_count, max_results) ThenBlock: {
+                            out = Allocate(Add(line_len, 32))
+                            out_pos = 0
+
+                            IfCondition EqualTo(GrepOpt.line_numbers, 1) ThenBlock: {
+                                num_buf = Allocate(16)
+                                nlen = GrepNumToStr(line_no, num_buf)
+                                MemoryCopy(Add(out, out_pos), num_buf, nlen)
+                                out_pos = Add(out_pos, nlen)
+                                SetByte(out, out_pos, 58)
+                                out_pos = Add(out_pos, 1)
+                                Deallocate(num_buf, 16)
+                            }
+
+                            disp_len = line_len
+                            IfCondition GreaterThan(disp_len, 200) ThenBlock: { disp_len = 200 }
+                            MemoryCopy(Add(out, out_pos), line_buf, disp_len)
+                            out_pos = Add(out_pos, disp_len)
+                            SetByte(out, out_pos, 0)
+
+                            GrepSendAddLine(sock, out, 9498256)
+                            Deallocate(out, Add(line_len, 32))
+                            result_count = Add(result_count, 1)
+                        }
+                    }
+                }
+
+                line_len = 0
+                i = Add(i, Add(nl_offset, 1))
+            }
+        }
+
+        // Trailing line
+        IfCondition GreaterThan(line_len, 0) ThenBlock: {
+            line_no = Add(line_no, 1)
+            raw = GrepLineMatch(line_buf, line_len, pat, pat_lc, plen, regex_h)
+            IfCondition EqualTo(GrepOpt.invert, 1) ThenBlock: {
+                IfCondition EqualTo(raw, 1) ThenBlock: { effective = 0 } ElseBlock: { effective = 1 }
+            } ElseBlock: {
+                effective = raw
+            }
+            IfCondition EqualTo(effective, 1) ThenBlock: {
+                match_count = Add(match_count, 1)
+                IfCondition And(EqualTo(GrepOpt.count_only, 0),
+                                LessThan(result_count, max_results)) ThenBlock: {
+                    out = Allocate(Add(line_len, 32))
+                    out_pos = 0
+                    IfCondition EqualTo(GrepOpt.line_numbers, 1) ThenBlock: {
+                        num_buf = Allocate(16)
+                        nlen = GrepNumToStr(line_no, num_buf)
+                        MemoryCopy(Add(out, out_pos), num_buf, nlen)
+                        out_pos = Add(out_pos, nlen)
+                        SetByte(out, out_pos, 58)
+                        out_pos = Add(out_pos, 1)
+                        Deallocate(num_buf, 16)
+                    }
+                    disp_len = line_len
+                    IfCondition GreaterThan(disp_len, 200) ThenBlock: { disp_len = 200 }
+                    MemoryCopy(Add(out, out_pos), line_buf, disp_len)
+                    out_pos = Add(out_pos, disp_len)
+                    SetByte(out, out_pos, 0)
+                    GrepSendAddLine(sock, out, 9498256)
+                    Deallocate(out, Add(line_len, 32))
+                    result_count = Add(result_count, 1)
+                }
+            }
+        }
+
+        GrepSysClose(fd)
+        Deallocate(read_buf, buf_sz)
+        Deallocate(line_buf, line_max)
+        Deallocate(pat_lc, Add(plen, 1))
+
+        // Count-only mode
+        IfCondition EqualTo(GrepOpt.count_only, 1) ThenBlock: {
+            cnt_buf = Allocate(64)
+            MemoryCopy(cnt_buf, "Count: ", 7)
+            num_buf = Allocate(16)
+            nlen = GrepNumToStr(match_count, num_buf)
+            MemoryCopy(Add(cnt_buf, 7), num_buf, nlen)
+            SetByte(cnt_buf, Add(7, nlen), 0)
+            GrepSendClear(sock)
+            GrepSendAddLine(sock, cnt_buf, 14737632)
+            Deallocate(num_buf, 16)
+            Deallocate(cnt_buf, 64)
+        }
+
+        // Status summary
+        status = Allocate(128)
+        MemoryCopy(status, "Done: ", 6)
+        num_buf = Allocate(16)
+        nlen = GrepNumToStr(match_count, num_buf)
+        MemoryCopy(Add(status, 6), num_buf, nlen)
+        sp = Add(6, nlen)
+        MemoryCopy(Add(status, sp), " matches in ", 12)
+        sp = Add(sp, 12)
+        nlen2 = GrepNumToStr(line_no, num_buf)
+        MemoryCopy(Add(status, sp), num_buf, nlen2)
+        sp = Add(sp, nlen2)
+        MemoryCopy(Add(status, sp), " lines", 6)
+        sp = Add(sp, 6)
+        SetByte(status, sp, 0)
+        GrepSendSetLabel(sock, "status", status)
+        Deallocate(num_buf, 16)
+        Deallocate(status, 128)
+
+        IfCondition GreaterEqual(result_count, max_results) ThenBlock: {
+            GrepSendAddLine(sock, "... (truncated, max 200 shown)", 14737632)
+        }
+    }
+}
+
+// ============================================================================
+// KEY HANDLER — hardware keyboard via input.key IPC message
+// ============================================================================
+Function.GrepHandleKey {
+    Input: sock:    Integer
+    Input: keycode: Integer
+    Input: ch:      Integer
+    Input: shift:   Integer
+    Body: {
+        // Backspace (scancode 14)
+        IfCondition EqualTo(keycode, 14) ThenBlock: {
+            GrepPatBackspace()
+            ReturnValue(1)
+        }
+
+        // Enter (scancode 28) — trigger search
+        IfCondition EqualTo(keycode, 28) ThenBlock: {
+            GrepRunSearch(sock)
+            ReturnValue(1)
+        }
+
+        // Printable ASCII characters
+        IfCondition GreaterThan(ch, 31) ThenBlock: {
+            IfCondition LessThan(ch, 127) ThenBlock: {
+                GrepPatAppend(ch)
+                ReturnValue(1)
+            }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// ACTION HANDLER
+// ============================================================================
+Function.GrepHandleAction {
+    Input: sock: Integer
+    Input: action: Address
+    Input: action_len: Integer
+    Body: {
+        IfCondition LessThan(action_len, 3) ThenBlock: { ReturnValue(0) }
+        c0 = GetByte(action, 0)
+        c1 = GetByte(action, 1)
+        IfCondition NotEqual(c0, 103) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c1, 46) ThenBlock: { ReturnValue(0) }
+
+        c2 = GetByte(action, 2)
+
+        // ---- Pattern clear (Clr button, if present) ----
+        cmp = StringCompare(action, "g.pclr")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            GrepPatClear()
+            ReturnValue(1)
+        }
+
+        // ---- File target buttons: "g.f0" through "g.fb" ----
+        IfCondition EqualTo(c2, 102) ThenBlock: {
+            // 'f' = 102: file select "g.f?"
+            IfCondition GreaterEqual(action_len, 4) ThenBlock: {
+                fc = GetByte(action, 3)
+                fidx = -1
+                // '0'-'9' = 48-57
+                IfCondition And(GreaterEqual(fc, 48), LessEqual(fc, 57)) ThenBlock: {
+                    fidx = Subtract(fc, 48)
+                }
+                // 'a' = 97 -> idx 10
+                IfCondition EqualTo(fc, 97) ThenBlock: { fidx = 10 }
+                // 'b' = 98 -> idx 11
+                IfCondition EqualTo(fc, 98) ThenBlock: { fidx = 11 }
+                IfCondition GreaterEqual(fidx, 0) ThenBlock: {
+                    GrepSelectFile(fidx)
+                }
+                ReturnValue(1)
+            }
+        }
+
+        // ---- Checkbox toggles ----
+        cmp = StringCompare(action, "g.ci")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(GrepOpt.case_insensitive, 0) ThenBlock: {
+                GrepOpt.case_insensitive = 1
+            } ElseBlock: {
+                GrepOpt.case_insensitive = 0
+            }
+            ReturnValue(1)
+        }
+
+        cmp = StringCompare(action, "g.inv")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(GrepOpt.invert, 0) ThenBlock: {
+                GrepOpt.invert = 1
+            } ElseBlock: {
+                GrepOpt.invert = 0
+            }
+            ReturnValue(1)
+        }
+
+        cmp = StringCompare(action, "g.ln")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(GrepOpt.line_numbers, 0) ThenBlock: {
+                GrepOpt.line_numbers = 1
+            } ElseBlock: {
+                GrepOpt.line_numbers = 0
+            }
+            ReturnValue(1)
+        }
+
+        cmp = StringCompare(action, "g.cnt")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(GrepOpt.count_only, 0) ThenBlock: {
+                GrepOpt.count_only = 1
+            } ElseBlock: {
+                GrepOpt.count_only = 0
+            }
+            ReturnValue(1)
+        }
+
+        cmp = StringCompare(action, "g.fix")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(GrepOpt.fixed, 0) ThenBlock: {
+                GrepOpt.fixed = 1
+            } ElseBlock: {
+                GrepOpt.fixed = 0
+            }
+            ReturnValue(1)
+        }
+
+        cmp = StringCompare(action, "g.wm")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(GrepOpt.word_match, 0) ThenBlock: {
+                GrepOpt.word_match = 1
+            } ElseBlock: {
+                GrepOpt.word_match = 0
+            }
+            ReturnValue(1)
+        }
+
+        // ---- Search / Clear ----
+        cmp = StringCompare(action, "g.run")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            GrepRunSearch(sock)
+            ReturnValue(1)
+        }
+
+        cmp = StringCompare(action, "g.clr")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            GrepSendClear(sock)
+            GrepSendSetLabel(sock, "status", "Ready")
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// MAIN — no CLI args needed, launched from Start Menu
+// ============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Grep IPC Client\n")
+    PrintMessage("============================================\n\n")
+
+    // Init pattern buffer with default "Function"
+    GrepPat.buf = Allocate(Add(GrepPat.max, 1))
+    MemoryCopy(GrepPat.buf, "Function", 8)
+    SetByte(GrepPat.buf, 8, 0)
+    GrepPat.len = 8
+
+    // Init file table
+    GrepInitFileTable()
+    GrepFile.path = Dereference(GrepFileTable.paths)
+    GrepFile.idx = 0
+
+    // Connect to display server
+    sock_path = "/tmp/ailang_display.sock"
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[GrepIPC] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[GrepIPC] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[GrepIPC] Connected to display server\n")
+    GrepIPCState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"grep\"}")
+    PrintMessage("[GrepIPC] Sent register\n")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Grep Search\",\"w\":640,\"h\":360,\"html\":\"config/grep.html\"}")
+    PrintMessage("[GrepIPC] Sent window.create\n")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[GrepIPC] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        GrepIPCState.win_id = wid
+        PrintMessage("[GrepIPC] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    PrintMessage("[GrepIPC] Ready — pattern='Function' file='Main.ailang'\n\n")
+
+    // Service loop
+    WhileLoop EqualTo(GrepIPCState.running, 1) {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: {
+            PrintMessage("[GrepIPC] Connection closed\n")
+            GrepIPCState.running = 0
+        } ElseBlock: {
+            GrepIPCState.msg_count = Add(GrepIPCState.msg_count, 1)
+
+            pmsg = ParseJSON(msg)
+            IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                mobj = JSON.AsObject(pmsg)
+                method = JSON.GetString(mobj, "method")
+
+                IfCondition NotEqual(method, 0) ThenBlock: {
+                    cmp_closed = StringCompare(method, "window.closed")
+                    IfCondition EqualTo(cmp_closed, 0) ThenBlock: {
+                        PrintMessage("[GrepIPC] Window closed\n")
+                        GrepIPCState.running = 0
+                    }
+
+                    cmp_action = StringCompare(method, "input.action")
+                    IfCondition EqualTo(cmp_action, 0) ThenBlock: {
+                        action = JSON.GetString(mobj, "action")
+                        IfCondition NotEqual(action, 0) ThenBlock: {
+                            action_len = JSON.GetNumber(mobj, "action_len")
+                            GrepHandleAction(sock, action, action_len)
+                        }
+                    }
+
+                    cmp_key = StringCompare(method, "input.key")
+                    IfCondition EqualTo(cmp_key, 0) ThenBlock: {
+                        kc = JSON.GetNumber(mobj, "keycode")
+                        kch = JSON.GetNumber(mobj, "char")
+                        ksh = JSON.GetNumber(mobj, "shift")
+                        GrepHandleKey(sock, kc, kch, ksh)
+                    }
+                }
+                JSON.Free(pmsg)
+            }
+        }
+    }
+
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  GrepIPC handled ")
+    PrintNumber(GrepIPCState.msg_count)
+    PrintMessage(" messages\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)

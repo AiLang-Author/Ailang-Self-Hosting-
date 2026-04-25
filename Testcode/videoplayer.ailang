@@ -1,0 +1,681 @@
+// videoplayer.ailang
+// IPC video player — decodes media via ffmpeg, renders frames into
+// a shared memory canvas for the display server to blit.
+//
+// Architecture:
+//   - fork/exec ffmpeg with: -f rawvideo -pix_fmt bgra -s WxH pipe:1
+//   - pipe() + dup2() capture ffmpeg's stdout
+//   - Read loop: read frame_size bytes from pipe into shm canvas buffer
+//   - canvas.present each frame to display server
+//   - SIGSTOP/SIGCONT for pause/resume, SIGTERM for stop
+//
+// Protocol:
+//   1. Connect to /tmp/ailang_display.sock
+//   2. Register as "videoplayer"
+//   3. Create window with config/videoplayer.html
+//   4. Create shm canvas 640x480
+//   5. On v.play:  fork ffmpeg → pipe → read frames → present
+//   6. On v.paus:  kill(pid, SIGSTOP)
+//   7. On v.play (resume): kill(pid, SIGCONT)
+//   8. On v.stop:  kill(pid, SIGTERM), close pipe
+//   9. On window.closed: cleanup, exit
+//
+// Build: ./ailang.x Testcode/videoplayer.ailang videoplayer.x
+// Run:   ./videoplayer.x  (after SysDisplay.x is running)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.HashMap
+LibraryImport.ShmCanvas
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.VPSys {
+    "SYS_READ":      Initialize=0
+    "SYS_CLOSE":     Initialize=3
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_KILL":      Initialize=62
+    "SYS_WAIT4":     Initialize=61
+    "SYS_NANOSLEEP": Initialize=35
+}
+
+FixedPool.VPSignal {
+    "SIGTERM":  Initialize=15
+    "SIGSTOP":  Initialize=19
+    "SIGCONT":  Initialize=18
+    "WNOHANG":  Initialize=1
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.VPState {
+    "running":    Initialize=1
+    "win_id":     Initialize=0
+    "sock":       Initialize=0
+    "canvas_w":   Initialize=640
+    "canvas_h":   Initialize=480
+    "ffmpeg_pid": Initialize=0
+    "pipe_rd":    Initialize=-1
+    "playing":    Initialize=0
+    "paused":     Initialize=0
+    "frame_num":  Initialize=0
+    "file_path":  Initialize=0
+}
+
+// =============================================================================
+// DEFAULT TEST FILE — user can override via v.open
+// =============================================================================
+FixedPool.VPFiles {
+    "default": Initialize=0
+}
+
+// =============================================================================
+// NUMBER TO STRING
+// =============================================================================
+Function.VP_NumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// FORMAT TIME — seconds to "MM:SS" string
+// =============================================================================
+Function.VP_FormatTime {
+    Input: secs: Integer
+    Input: buf: Address
+    Body: {
+        m = Divide(secs, 60)
+        s = Modulo(secs, 60)
+        // MM
+        SetByte(buf, 0, Add(48, Divide(m, 10)))
+        SetByte(buf, 1, Add(48, Modulo(m, 10)))
+        SetByte(buf, 2, 58)
+        // SS
+        SetByte(buf, 3, Add(48, Divide(s, 10)))
+        SetByte(buf, 4, Add(48, Modulo(s, 10)))
+        SetByte(buf, 5, 0)
+    }
+}
+
+// =============================================================================
+// IPC HELPERS
+// =============================================================================
+Function.VP_SetLabel {
+    Input: sock: Integer
+    Input: id: Address
+    Input: text: Address
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.setlabel")
+        JSON.SetNumber(req, "win_id", VPState.win_id)
+        JSON.SetString(req, "id", id)
+        JSON.SetString(req, "text", text)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+// =============================================================================
+// READ EXACT — read exactly n bytes from fd (handles partial reads)
+// =============================================================================
+Function.VP_ReadExact {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: total: Integer
+    Output: Integer
+    Body: {
+        got = 0
+        WhileLoop LessThan(got, total) {
+            remain = Subtract(total, got)
+            n = SystemCall(VPSys.SYS_READ, fd, Add(buf, got), remain)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                // EOF or error
+                ReturnValue(-1)
+            }
+            got = Add(got, n)
+        }
+        ReturnValue(got)
+    }
+}
+
+// =============================================================================
+// BUILD FFMPEG ARGV
+// =============================================================================
+// ffmpeg -i <file> -f rawvideo -pix_fmt bgra -s 640x480 -v quiet pipe:1
+//
+// argv layout in memory: array of 12 pointers (11 args + NULL)
+//   [0] "/usr/bin/ffmpeg"
+//   [1] "-i"
+//   [2] <filepath>
+//   [3] "-f"
+//   [4] "rawvideo"
+//   [5] "-pix_fmt"
+//   [6] "bgra"
+//   [7] "-s"
+//   [8] "640x480"
+//   [9] "-v"
+//  [10] "quiet"
+//  [11] "pipe:1"
+//  [12] NULL
+Function.VP_BuildArgv {
+    Input: filepath: Address
+    Output: Integer
+    Body: {
+        argv = Allocate(104)
+        StoreValue(Add(argv, 0),  "/usr/bin/ffmpeg")
+        StoreValue(Add(argv, 8),  "-i")
+        StoreValue(Add(argv, 16), filepath)
+        StoreValue(Add(argv, 24), "-f")
+        StoreValue(Add(argv, 32), "rawvideo")
+        StoreValue(Add(argv, 40), "-pix_fmt")
+        StoreValue(Add(argv, 48), "bgra")
+        StoreValue(Add(argv, 56), "-s")
+        StoreValue(Add(argv, 64), "640x480")
+        StoreValue(Add(argv, 72), "-v")
+        StoreValue(Add(argv, 80), "quiet")
+        StoreValue(Add(argv, 88), "pipe:1")
+        StoreValue(Add(argv, 96), 0)
+        ReturnValue(argv)
+    }
+}
+
+// =============================================================================
+// LAUNCH FFMPEG — fork, pipe, dup2, execve
+// =============================================================================
+Function.VP_LaunchFFmpeg {
+    Input: filepath: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(filepath, 0) ThenBlock: {
+            PrintMessage("[VP] No file path set\n")
+            ReturnValue(-1)
+        }
+
+        // Create pipe: pipefds[0]=read, pipefds[1]=write
+        pipefds = Allocate(8)
+        pr = SystemCall(VPSys.SYS_PIPE, pipefds, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            PrintMessage("[VP] pipe() failed\n")
+            Deallocate(pipefds, 8)
+            ReturnValue(-1)
+        }
+
+        // pipe() fills two 4-byte ints
+        read_fd  = Dereference(pipefds, "dword")
+        write_fd = Dereference(Add(pipefds, 4), "dword")
+        Deallocate(pipefds, 8)
+
+        PrintMessage("[VP] pipe created: read_fd=")
+        PrintNumber(read_fd)
+        PrintMessage(" write_fd=")
+        PrintNumber(write_fd)
+        PrintMessage("\n")
+
+        // Fork
+        pid = SystemCall(VPSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[VP] fork() failed\n")
+            SystemCall(VPSys.SYS_CLOSE, read_fd, 0, 0, 0, 0)
+            SystemCall(VPSys.SYS_CLOSE, write_fd, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // ===== CHILD PROCESS =====
+            // Close read end
+            SystemCall(VPSys.SYS_CLOSE, read_fd, 0, 0, 0, 0)
+
+            // dup2(write_fd, 1) — redirect stdout to pipe write end
+            SystemCall(VPSys.SYS_DUP2, write_fd, 1, 0, 0, 0)
+
+            // Close original write_fd (now stdout IS the write end)
+            SystemCall(VPSys.SYS_CLOSE, write_fd, 0, 0, 0, 0)
+
+            // Build argv and exec ffmpeg
+            argv = VP_BuildArgv(filepath)
+            SystemCall(VPSys.SYS_EXECVE, "/usr/bin/ffmpeg", argv, 0)
+
+            // If execve returns, something went wrong
+            PrintMessage("[VP] execve failed!\n")
+            SystemCall(VPSys.SYS_EXIT, 1, 0, 0, 0, 0)
+        }
+
+        // ===== PARENT PROCESS =====
+        // Close write end (only ffmpeg writes)
+        SystemCall(VPSys.SYS_CLOSE, write_fd, 0, 0, 0, 0)
+
+        VPState.pipe_rd    = read_fd
+        VPState.ffmpeg_pid = pid
+        VPState.playing    = 1
+        VPState.paused     = 0
+        VPState.frame_num  = 0
+
+        PrintMessage("[VP] ffmpeg launched pid=")
+        PrintNumber(pid)
+        PrintMessage(" reading from fd=")
+        PrintNumber(read_fd)
+        PrintMessage("\n")
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// STOP FFMPEG — send SIGTERM, close pipe, reap child
+// =============================================================================
+Function.VP_StopFFmpeg {
+    Body: {
+        pid = VPState.ffmpeg_pid
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            // If paused, resume first so it can receive SIGTERM
+            IfCondition EqualTo(VPState.paused, 1) ThenBlock: {
+                SystemCall(VPSys.SYS_KILL, pid, VPSignal.SIGCONT, 0, 0, 0)
+            }
+            SystemCall(VPSys.SYS_KILL, pid, VPSignal.SIGTERM, 0, 0, 0)
+
+            // Reap child (WNOHANG — non-blocking)
+            status_buf = Allocate(8)
+            SystemCall(VPSys.SYS_WAIT4, pid, status_buf, VPSignal.WNOHANG, 0, 0, 0)
+            Deallocate(status_buf, 8)
+
+            PrintMessage("[VP] ffmpeg stopped pid=")
+            PrintNumber(pid)
+            PrintMessage("\n")
+        }
+
+        rd = VPState.pipe_rd
+        IfCondition GreaterEqual(rd, 0) ThenBlock: {
+            SystemCall(VPSys.SYS_CLOSE, rd, 0, 0, 0, 0)
+        }
+
+        VPState.ffmpeg_pid = 0
+        VPState.pipe_rd    = -1
+        VPState.playing    = 0
+        VPState.paused     = 0
+    }
+}
+
+// =============================================================================
+// READ ONE FRAME — read w*h*4 bytes from pipe into shm canvas
+// =============================================================================
+Function.VP_ReadFrame {
+    Output: Integer
+    Body: {
+        rd = VPState.pipe_rd
+        IfCondition LessThan(rd, 0) ThenBlock: { ReturnValue(-1) }
+
+        buf = ShmCanvasState.buf
+        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(-1) }
+
+        frame_size = Multiply(Multiply(VPState.canvas_w, VPState.canvas_h), 4)
+
+        n = VP_ReadExact(rd, buf, frame_size)
+        IfCondition LessThan(n, 0) ThenBlock: {
+            // EOF — video finished
+            ReturnValue(-1)
+        }
+
+        VPState.frame_num = Add(VPState.frame_num, 1)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// POLL IPC MESSAGES — non-blocking check for actions/keys/close
+// =============================================================================
+Function.VP_PollMessages {
+    Input: sock: Integer
+    Body: {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: { ReturnValue(0) }
+
+        pmsg = ParseJSON(msg)
+        IfCondition NotEqual(pmsg, 0) ThenBlock: {
+            mobj = JSON.AsObject(pmsg)
+            method = JSON.GetString(mobj, "method")
+            IfCondition NotEqual(method, 0) ThenBlock: {
+
+                cmp = StringCompare(method, "window.closed")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    PrintMessage("[VP] Window closed\n")
+                    VP_StopFFmpeg()
+                    VPState.running = 0
+                }
+
+                cmp = StringCompare(method, "input.action")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    action = JSON.GetString(mobj, "action")
+                    IfCondition NotEqual(action, 0) ThenBlock: {
+                        VP_HandleAction(sock, action)
+                    }
+                }
+
+                cmp = StringCompare(method, "input.key")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    kc = JSON.GetNumber(mobj, "keycode")
+                    VP_HandleKey(sock, kc)
+                }
+            }
+            JSON.Free(pmsg)
+        }
+    }
+}
+
+// =============================================================================
+// ACTION HANDLER
+// =============================================================================
+Function.VP_HandleAction {
+    Input: sock: Integer
+    Input: action: Address
+    Body: {
+        // v.play — start or resume
+        cmp = StringCompare(action, "v.play")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(VPState.paused, 1) ThenBlock: {
+                // Resume
+                SystemCall(VPSys.SYS_KILL, VPState.ffmpeg_pid, VPSignal.SIGCONT, 0, 0, 0)
+                VPState.paused = 0
+                VP_SetLabel(sock, "status", "Playing")
+                PrintMessage("[VP] Resumed\n")
+            } ElseBlock: {
+                IfCondition EqualTo(VPState.playing, 0) ThenBlock: {
+                    // Start fresh
+                    fpath = VPState.file_path
+                    IfCondition EqualTo(fpath, 0) ThenBlock: {
+                        VP_SetLabel(sock, "status", "No file loaded")
+                        ReturnValue(0)
+                    }
+                    r = VP_LaunchFFmpeg(fpath)
+                    IfCondition LessThan(r, 0) ThenBlock: {
+                        VP_SetLabel(sock, "status", "Launch failed")
+                        ReturnValue(0)
+                    }
+                    VP_SetLabel(sock, "status", "Playing")
+                    PrintMessage("[VP] Playing: ")
+                    PrintString(fpath)
+                    PrintMessage("\n")
+                }
+            }
+            ReturnValue(1)
+        }
+
+        // v.paus — pause
+        cmp = StringCompare(action, "v.paus")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition And(EqualTo(VPState.playing, 1), EqualTo(VPState.paused, 0)) ThenBlock: {
+                SystemCall(VPSys.SYS_KILL, VPState.ffmpeg_pid, VPSignal.SIGSTOP, 0, 0, 0)
+                VPState.paused = 1
+                VP_SetLabel(sock, "status", "Paused")
+                PrintMessage("[VP] Paused\n")
+            }
+            ReturnValue(1)
+        }
+
+        // v.stop — stop playback
+        cmp = StringCompare(action, "v.stop")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            VP_StopFFmpeg()
+            // Clear canvas to black
+            ShmCanvas_Clear(4278190080)
+            ShmCanvas_Present(sock, VPState.win_id)
+            VP_SetLabel(sock, "status", "Stopped")
+            VP_SetLabel(sock, "pos", "00:00")
+            PrintMessage("[VP] Stopped\n")
+            ReturnValue(1)
+        }
+
+        // v.open — set file path (hardcoded demo for now)
+        cmp = StringCompare(action, "v.open")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            // Stop current playback if any
+            IfCondition EqualTo(VPState.playing, 1) ThenBlock: {
+                VP_StopFFmpeg()
+            }
+            // For now: cycle through demo paths
+            // TODO: integrate file dialog when ready
+            VPState.file_path = VPFiles.default
+            VP_SetLabel(sock, "status", "File loaded")
+            PrintMessage("[VP] File set: ")
+            IfCondition NotEqual(VPState.file_path, 0) ThenBlock: {
+                PrintString(VPState.file_path)
+            }
+            PrintMessage("\n")
+            ReturnValue(1)
+        }
+
+        // v.ff — not implemented yet (needs seek support)
+        cmp = StringCompare(action, "v.ff")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            VP_SetLabel(sock, "status", "FF: needs seek")
+            ReturnValue(1)
+        }
+
+        // v.rw — not implemented yet (needs seek support)
+        cmp = StringCompare(action, "v.rw")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            VP_SetLabel(sock, "status", "RW: needs seek")
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// KEY HANDLER — keyboard shortcuts
+// =============================================================================
+Function.VP_HandleKey {
+    Input: sock: Integer
+    Input: keycode: Integer
+    Body: {
+        // Space (scancode 57) — toggle play/pause
+        IfCondition EqualTo(keycode, 57) ThenBlock: {
+            IfCondition EqualTo(VPState.paused, 1) ThenBlock: {
+                VP_HandleAction(sock, "v.play")
+            } ElseBlock: {
+                IfCondition EqualTo(VPState.playing, 1) ThenBlock: {
+                    VP_HandleAction(sock, "v.paus")
+                } ElseBlock: {
+                    VP_HandleAction(sock, "v.play")
+                }
+            }
+            ReturnValue(1)
+        }
+
+        // S key (scancode 31) — stop
+        IfCondition EqualTo(keycode, 31) ThenBlock: {
+            VP_HandleAction(sock, "v.stop")
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Video Player — ffmpeg + Shared Memory Canvas\n")
+    PrintMessage("============================================\n\n")
+
+    // Default demo file — user should place a video at this path
+    VPFiles.default = "/home/bob/test_video.mp4"
+    VPState.file_path = VPFiles.default
+
+    // Connect to display server
+    sock_path = "/tmp/ailang_display.sock"
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[VP] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[VP] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[VP] Connected to display server\n")
+    VPState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"videoplayer\"}")
+    PrintMessage("[VP] Sent register\n")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Video Player\",\"w\":660,\"h\":540,\"html\":\"config/videoplayer.html\"}")
+    PrintMessage("[VP] Sent window.create\n")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[VP] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        VPState.win_id = wid
+        PrintMessage("[VP] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Create shared memory canvas
+    cw = VPState.canvas_w
+    ch = VPState.canvas_h
+    wid = VPState.win_id
+    buf = ShmCanvas_Create(wid, cw, ch)
+    IfCondition EqualTo(buf, 0) ThenBlock: {
+        PrintMessage("[VP] ShmCanvas_Create failed\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    // Attach canvas to window
+    ShmCanvas_Attach(sock, wid, cw, ch)
+    PrintMessage("[VP] Canvas attached\n")
+
+    // Clear to black initially
+    ShmCanvas_Clear(4278190080)
+    ShmCanvas_Present(sock, wid)
+
+    // Set socket non-blocking for frame loop
+    Socket.SetNonBlock(sock)
+
+    // Allocate timespec for frame pacing: ~33ms (~30fps for video)
+    ts = Allocate(16)
+    StoreValue(ts, 0)
+    StoreValue(Add(ts, 8), 33333333)
+
+    // Allocate timespec for idle sleep: 50ms
+    ts_idle = Allocate(16)
+    StoreValue(ts_idle, 0)
+    StoreValue(Add(ts_idle, 8), 50000000)
+
+    PrintMessage("[VP] Ready — press Play or Space\n\n")
+
+    // Main loop
+    WhileLoop EqualTo(VPState.running, 1) {
+
+        IfCondition And(EqualTo(VPState.playing, 1), EqualTo(VPState.paused, 0)) ThenBlock: {
+            // ===== PLAYING: read frames from ffmpeg =====
+            r = VP_ReadFrame()
+            IfCondition LessThan(r, 0) ThenBlock: {
+                // EOF or error — playback finished
+                VP_StopFFmpeg()
+                VP_SetLabel(sock, "status", "Finished")
+                PrintMessage("[VP] Playback finished after ")
+                PrintNumber(VPState.frame_num)
+                PrintMessage(" frames\n")
+            } ElseBlock: {
+                // Present frame
+                ShmCanvas_Present(sock, wid)
+
+                // Update position every 30 frames (~1 sec at 30fps)
+                IfCondition EqualTo(Modulo(VPState.frame_num, 30), 0) ThenBlock: {
+                    secs = Divide(VPState.frame_num, 30)
+                    tbuf = Allocate(8)
+                    VP_FormatTime(secs, tbuf)
+                    VP_SetLabel(sock, "pos", tbuf)
+                    Deallocate(tbuf, 8)
+                }
+
+                // Log every 300 frames
+                IfCondition EqualTo(Modulo(VPState.frame_num, 300), 0) ThenBlock: {
+                    PrintMessage("[VP] frame=")
+                    PrintNumber(VPState.frame_num)
+                    PrintMessage("\n")
+                }
+
+                // Frame pacing
+                SystemCall(VPSys.SYS_NANOSLEEP, ts, 0)
+            }
+        } ElseBlock: {
+            // ===== IDLE or PAUSED: sleep longer to save CPU =====
+            SystemCall(VPSys.SYS_NANOSLEEP, ts_idle, 0)
+        }
+
+        // Poll for IPC messages (actions, keys, close)
+        VP_PollMessages(sock)
+    }
+
+    // Cleanup
+    VP_StopFFmpeg()
+    ShmCanvas_Destroy(wid)
+    Deallocate(ts, 16)
+    Deallocate(ts_idle, 16)
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  Video Player finished after ")
+    PrintNumber(VPState.frame_num)
+    PrintMessage(" frames\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)

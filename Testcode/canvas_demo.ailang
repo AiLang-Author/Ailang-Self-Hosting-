@@ -1,0 +1,213 @@
+// canvas_demo.ailang
+// Shared memory canvas demo — IPC client that renders an animated
+// color gradient directly to a window's pixel buffer via /dev/shm.
+//
+// Proves the zero-copy canvas pipeline: app writes pixels to shared
+// memory, display server blits them to the framebuffer.
+//
+// Protocol:
+//   1. Connect to /tmp/ailang_display.sock
+//   2. Register as "canvas_demo"
+//   3. Create window 640×480 with config/canvas_demo.html
+//   4. Create /dev/shm/ailang_canvas_<win_id>, mmap it
+//   5. Send canvas.attach to display server (server mmaps same file)
+//   6. Animation loop: write pixels, send canvas.present, sleep 16ms
+//   7. On window.closed: canvas.detach, cleanup, exit
+//
+// Build: ./ailang.x Testcode/canvas_demo.ailang canvas_demo.x
+// Run:   ./canvas_demo.x  (after SysDisplay.x is running)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.HashMap
+LibraryImport.ShmCanvas
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.DemoState {
+    "running":   Initialize=1
+    "win_id":    Initialize=0
+    "sock":      Initialize=0
+    "frame":     Initialize=0
+    "canvas_w":  Initialize=640
+    "canvas_h":  Initialize=480
+}
+
+// =============================================================================
+// RENDER FRAME — animated gradient (shifts each frame)
+// =============================================================================
+Function.Demo_RenderFrame {
+    Input: frame: Integer
+    Body: {
+        buf = ShmCanvasState.buf
+        w   = DemoState.canvas_w
+        h   = DemoState.canvas_h
+
+        y = 0
+        WhileLoop LessThan(y, h) {
+            x = 0
+            WhileLoop LessThan(x, w) {
+                // BGRA gradient: red shifts with x+frame, green with y, blue fixed
+                r = BitwiseAnd(Add(x, frame), 255)
+                g = BitwiseAnd(Add(y, Divide(frame, 2)), 255)
+                b = BitwiseAnd(Subtract(255, BitwiseAnd(Add(x, y), 255)), 255)
+
+                // Pack BGRA (little-endian): byte0=B, byte1=G, byte2=R, byte3=A
+                color = BitwiseOr(b, BitwiseOr(ShiftLeft(g, 8), BitwiseOr(ShiftLeft(r, 16), ShiftLeft(255, 24))))
+
+                off = Multiply(Add(Multiply(y, w), x), 4)
+                StoreValue(Add(buf, off), color, "dword")
+                x = Add(x, 1)
+            }
+            y = Add(y, 1)
+        }
+    }
+}
+
+// =============================================================================
+// HANDLE SERVER MESSAGES — check for window.closed
+// =============================================================================
+Function.Demo_PollMessages {
+    Input: sock: Integer
+    Body: {
+        // Non-blocking: set socket to non-block via Socket.SetNonBlock
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: { ReturnValue(0) }
+
+        pmsg = ParseJSON(msg)
+        IfCondition NotEqual(pmsg, 0) ThenBlock: {
+            mobj = JSON.AsObject(pmsg)
+            method = JSON.GetString(mobj, "method")
+            IfCondition NotEqual(method, 0) ThenBlock: {
+                cmp = StringCompare(method, "window.closed")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    PrintMessage("[CanvasDemo] Window closed\n")
+                    DemoState.running = 0
+                }
+            }
+            JSON.Free(pmsg)
+        }
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Canvas Demo — Shared Memory Pixel Streaming\n")
+    PrintMessage("============================================\n\n")
+
+    // Connect to display server
+    sock_path = "/tmp/ailang_display.sock"
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[CanvasDemo] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[CanvasDemo] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[CanvasDemo] Connected to display server\n")
+    DemoState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"canvas_demo\"}")
+    PrintMessage("[CanvasDemo] Sent register\n")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Canvas Demo\",\"w\":640,\"h\":480,\"html\":\"config/canvas_demo.html\"}")
+    PrintMessage("[CanvasDemo] Sent window.create\n")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[CanvasDemo] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        DemoState.win_id = wid
+        PrintMessage("[CanvasDemo] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Create shared memory canvas
+    cw = DemoState.canvas_w
+    ch = DemoState.canvas_h
+    wid = DemoState.win_id
+    buf = ShmCanvas_Create(wid, cw, ch)
+    IfCondition EqualTo(buf, 0) ThenBlock: {
+        PrintMessage("[CanvasDemo] ShmCanvas_Create failed\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    // Tell display server to attach canvas
+    ShmCanvas_Attach(sock, wid, cw, ch)
+    PrintMessage("[CanvasDemo] Canvas attached\n")
+
+    // Set socket non-blocking for animation loop
+    Socket.SetNonBlock(sock)
+
+    // Allocate timespec for nanosleep: 16ms (~60Hz)
+    ts = Allocate(16)
+    StoreValue(ts, 0)
+    StoreValue(Add(ts, 8), 16666666)
+
+    PrintMessage("[CanvasDemo] Starting animation loop...\n")
+
+    // Animation loop
+    WhileLoop EqualTo(DemoState.running, 1) {
+        // Render a frame
+        Demo_RenderFrame(DemoState.frame)
+
+        // Signal display server
+        ShmCanvas_Present(sock, wid)
+
+        DemoState.frame = Add(DemoState.frame, 1)
+
+        // Print progress every 60 frames
+        IfCondition EqualTo(Modulo(DemoState.frame, 60), 0) ThenBlock: {
+            PrintMessage("[CanvasDemo] frame=")
+            PrintNumber(DemoState.frame)
+            PrintMessage("\n")
+        }
+
+        // Check for window.closed
+        Demo_PollMessages(sock)
+
+        // Sleep ~16ms
+        SystemCall(35, ts, 0)
+    }
+
+    // Cleanup
+    ShmCanvas_Destroy(wid)
+    Deallocate(ts, 16)
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  Canvas Demo finished after ")
+    PrintNumber(DemoState.frame)
+    PrintMessage(" frames\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)
