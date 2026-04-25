@@ -1,0 +1,360 @@
+// calc_ipc.ailang
+// Standalone IPC calculator — connects to display server,
+// requests a window, handles button clicks via IPC messaging.
+//
+// The display server has ZERO calculator knowledge.
+// All arithmetic is handled here via Library.Calculator (Calc_JsonHandle).
+//
+// Protocol:
+//   1. Connect to /tmp/ailang_display.sock
+//   2. Send {"method":"register","service":"calculator"}
+//   3. Send {"method":"window.create","title":"Calculator","w":280,"h":380,"html":"config/calculator.html"}
+//   4. Receive {"method":"window.created","win_id":N}
+//   5. Service loop:
+//      - Receive {"method":"input.action","action":"c.5",...}
+//      - Dispatch to Calc_JsonHandle
+//      - Send {"method":"window.update","win_id":N,"display":"42"}
+//   6. On {"method":"window.closed"} → exit
+//
+// Build: ./ailang.x Testcode/calc_ipc.ailang calc_ipc.x
+// Run:   ./calc_ipc.x  (after SysDisplay.x is running)
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.XArrays
+LibraryImport.HashMap
+LibraryImport.Calculator
+
+FixedPool.CalcIPCState {
+    "running":     Initialize=1
+    "win_id":      Initialize=0
+    "msg_count":   Initialize=0
+}
+
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Calculator IPC Client\n")
+    PrintMessage("============================================\n\n")
+
+    sock_path = "/tmp/ailang_display.sock"
+
+    // Connect to display server
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[CalcIPC] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[CalcIPC] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[CalcIPC] Connected to display server\n")
+
+    // Step 1: Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"calculator\"}")
+    PrintMessage("[CalcIPC] Sent register\n")
+
+    // Step 2: Request window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Calculator\",\"w\":280,\"h\":380,\"html\":\"config/calculator.html\"}")
+    PrintMessage("[CalcIPC] Sent window.create\n")
+
+    // Step 3: Wait for window.created response
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[CalcIPC] No response to window.create\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        CalcIPCState.win_id = wid
+        PrintMessage("[CalcIPC] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Step 4: Reset calculator state
+    Calc_JsonHandle("{\"method\":\"clear\"}", 18)
+    PrintMessage("[CalcIPC] Calculator reset\n")
+    PrintMessage("[CalcIPC] Waiting for input...\n\n")
+
+    // Step 5: Service loop — receive actions, dispatch to calculator
+    WhileLoop EqualTo(CalcIPCState.running, 1) {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: {
+            PrintMessage("[CalcIPC] Connection closed\n")
+            CalcIPCState.running = 0
+        } ElseBlock: {
+            CalcIPCState.msg_count = Add(CalcIPCState.msg_count, 1)
+
+            // Parse the message
+            pmsg = ParseJSON(msg)
+            IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                mobj = JSON.AsObject(pmsg)
+                method = JSON.GetString(mobj, "method")
+
+                IfCondition NotEqual(method, 0) ThenBlock: {
+                    // Check for window.closed
+                    cmp_closed = StringCompare(method, "window.closed")
+                    IfCondition EqualTo(cmp_closed, 0) ThenBlock: {
+                        PrintMessage("[CalcIPC] Window closed by user\n")
+                        CalcIPCState.running = 0
+                    }
+
+                    // Check for input.action
+                    cmp_action = StringCompare(method, "input.action")
+                    IfCondition EqualTo(cmp_action, 0) ThenBlock: {
+                        action = JSON.GetString(mobj, "action")
+                        IfCondition NotEqual(action, 0) ThenBlock: {
+                            action_len = JSON.GetNumber(mobj, "action_len")
+
+                            // Build calculator JSON from action string
+                            calc_json = CalcIPC_ActionToJSON(action, action_len)
+                            IfCondition NotEqual(calc_json, 0) ThenBlock: {
+                                calc_len = StringLength(calc_json)
+                                calc_resp = Calc_JsonHandle(calc_json, calc_len)
+
+                                IfCondition NotEqual(calc_resp, 0) ThenBlock: {
+                                    // Extract display value from calc response
+                                    cr_parsed = ParseJSON(calc_resp)
+                                    IfCondition NotEqual(cr_parsed, 0) ThenBlock: {
+                                        cr_obj = JSON.AsObject(cr_parsed)
+                                        disp = JSON.GetString(cr_obj, "display")
+                                        IfCondition NotEqual(disp, 0) ThenBlock: {
+                                            // Send window.update
+                                            update = CalcIPC_BuildUpdate(CalcIPCState.win_id, disp)
+                                            Socket.SendMsg(sock, update)
+                                        }
+                                        JSON.Free(cr_parsed)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                JSON.Free(pmsg)
+            }
+        }
+    }
+
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  CalcIPC handled ")
+    PrintNumber(CalcIPCState.msg_count)
+    PrintMessage(" messages\n")
+    PrintMessage("============================================\n")
+}
+
+// =============================================================================
+// ACTION TO JSON — convert Auckland action string to calculator JSON
+//
+// Auckland action strings from calculator.html:
+//   "c.0" - "c.9" → digit 0-9
+//   "c.add"       → operator 1
+//   "c.sub"       → operator 2
+//   "c.mul"       → operator 3
+//   "c.div"       → operator 4
+//   "c.eq"        → equals
+//   "c.clr"       → clear
+//   "c.neg"       → negate
+//   "c.pct"       → percent
+// =============================================================================
+Function.CalcIPC_ActionToJSON {
+    Input: action: Address
+    Input: action_len: Integer
+    Output: Address
+    Body: {
+        // All actions start with "c."
+        IfCondition LessThan(action_len, 3) ThenBlock: { ReturnValue(0) }
+
+        c0 = GetByte(action, 0)
+        c1 = GetByte(action, 1)
+        IfCondition NotEqual(c0, 99) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c1, 46) ThenBlock: { ReturnValue(0) }
+
+        // Get the part after "c."
+        c2 = GetByte(action, 2)
+
+        // Digit? '0'=48 .. '9'=57
+        IfCondition GreaterEqual(c2, 48) ThenBlock: {
+            IfCondition LessEqual(c2, 57) ThenBlock: {
+                digit = Subtract(c2, 48)
+                // Build {"method":"digit","value":N}
+                buf = Allocate(32)
+                MemoryCopy(buf, "{\"method\":\"digit\",\"value\":", 25)
+                SetByte(buf, 25, Add(48, digit))
+                SetByte(buf, 26, 125)
+                SetByte(buf, 27, 0)
+                ReturnValue(buf)
+            }
+        }
+
+        // Check multi-char actions (3+ chars after "c.")
+        IfCondition EqualTo(action_len, 5) ThenBlock: {
+            // "c.add", "c.sub", "c.mul", "c.div"
+            c3 = GetByte(action, 3)
+            c4 = GetByte(action, 4)
+
+            // "add" = 97,100,100
+            IfCondition EqualTo(c2, 97) ThenBlock: {
+                IfCondition EqualTo(c3, 100) ThenBlock: {
+                    IfCondition EqualTo(c4, 100) ThenBlock: {
+                        ReturnValue("{\"method\":\"operator\",\"op\":1}")
+                    }
+                }
+            }
+            // "sub" = 115,117,98
+            IfCondition EqualTo(c2, 115) ThenBlock: {
+                IfCondition EqualTo(c3, 117) ThenBlock: {
+                    IfCondition EqualTo(c4, 98) ThenBlock: {
+                        ReturnValue("{\"method\":\"operator\",\"op\":2}")
+                    }
+                }
+            }
+            // "mul" = 109,117,108
+            IfCondition EqualTo(c2, 109) ThenBlock: {
+                IfCondition EqualTo(c3, 117) ThenBlock: {
+                    IfCondition EqualTo(c4, 108) ThenBlock: {
+                        ReturnValue("{\"method\":\"operator\",\"op\":3}")
+                    }
+                }
+            }
+            // "div" = 100,105,118
+            IfCondition EqualTo(c2, 100) ThenBlock: {
+                IfCondition EqualTo(c3, 105) ThenBlock: {
+                    IfCondition EqualTo(c4, 118) ThenBlock: {
+                        ReturnValue("{\"method\":\"operator\",\"op\":4}")
+                    }
+                }
+            }
+        }
+
+        // "c.eq" = 4 chars
+        IfCondition EqualTo(action_len, 4) ThenBlock: {
+            c3 = GetByte(action, 3)
+            // "eq" = 101,113
+            IfCondition EqualTo(c2, 101) ThenBlock: {
+                IfCondition EqualTo(c3, 113) ThenBlock: {
+                    ReturnValue("{\"method\":\"equals\"}")
+                }
+            }
+        }
+
+        // "c.clr" = 5 chars
+        IfCondition EqualTo(action_len, 5) ThenBlock: {
+            c3 = GetByte(action, 3)
+            c4 = GetByte(action, 4)
+            // "clr" = 99,108,114
+            IfCondition EqualTo(c2, 99) ThenBlock: {
+                IfCondition EqualTo(c3, 108) ThenBlock: {
+                    IfCondition EqualTo(c4, 114) ThenBlock: {
+                        ReturnValue("{\"method\":\"clear\"}")
+                    }
+                }
+            }
+        }
+
+        // "c.neg" = 5 chars
+        IfCondition EqualTo(action_len, 5) ThenBlock: {
+            c3 = GetByte(action, 3)
+            c4 = GetByte(action, 4)
+            // "neg" = 110,101,103
+            IfCondition EqualTo(c2, 110) ThenBlock: {
+                IfCondition EqualTo(c3, 101) ThenBlock: {
+                    IfCondition EqualTo(c4, 103) ThenBlock: {
+                        ReturnValue("{\"method\":\"negate\"}")
+                    }
+                }
+            }
+        }
+
+        // "c.pct" = 5 chars
+        IfCondition EqualTo(action_len, 5) ThenBlock: {
+            c3 = GetByte(action, 3)
+            c4 = GetByte(action, 4)
+            // "pct" = 112,99,116
+            IfCondition EqualTo(c2, 112) ThenBlock: {
+                IfCondition EqualTo(c3, 99) ThenBlock: {
+                    IfCondition EqualTo(c4, 116) ThenBlock: {
+                        ReturnValue("{\"method\":\"percent\"}")
+                    }
+                }
+            }
+        }
+
+        PrintMessage("[CalcIPC] Unknown action: ")
+        PrintString(action)
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// BUILD UPDATE — construct {"method":"window.update","win_id":N,"display":"..."}
+// =============================================================================
+Function.CalcIPC_BuildUpdate {
+    Input: win_id: Integer
+    Input: display: Address
+    Output: Address
+    Body: {
+        // Build JSON string manually
+        // {"method":"window.update","win_id":N,"display":"..."}
+        buf = Allocate(128)
+        pos = 0
+
+        // {"method":"window.update","win_id":
+        prefix = "{\"method\":\"window.update\",\"win_id\":"
+        plen = StringLength(prefix)
+        MemoryCopy(buf, prefix, plen)
+        pos = plen
+
+        // Write win_id as decimal
+        IfCondition LessThan(win_id, 10) ThenBlock: {
+            SetByte(buf, pos, Add(48, win_id))
+            pos = Add(pos, 1)
+        } ElseBlock: {
+            // Two digits max for win_id
+            d10 = Divide(win_id, 10)
+            d1 = Subtract(win_id, Multiply(d10, 10))
+            SetByte(buf, pos, Add(48, d10))
+            pos = Add(pos, 1)
+            SetByte(buf, pos, Add(48, d1))
+            pos = Add(pos, 1)
+        }
+
+        // ,"display":"
+        mid = ",\"display\":\""
+        mlen = StringLength(mid)
+        MemoryCopy(Add(buf, pos), mid, mlen)
+        pos = Add(pos, mlen)
+
+        // Copy display value
+        dlen = StringLength(display)
+        IfCondition GreaterThan(dlen, 30) ThenBlock: { dlen = 30 }
+        MemoryCopy(Add(buf, pos), display, dlen)
+        pos = Add(pos, dlen)
+
+        // "}
+        SetByte(buf, pos, 34)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 125)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 0)
+
+        ReturnValue(buf)
+    }
+}
+
+RunTask(Main)

@@ -5,9 +5,13 @@
 - **AKContext system:** Explicit `LinkagePool.AKContext` handles. Each context (main window, toolbar, deskbar, menu, dialog) owns its own node buffer, extra table, and event state. `AK_CreateContext()` allocates, all AK_* functions take `ctx` as first param.
 - Toolbar actions fire on UP (not DOWN). Action string -> EventRouter queue -> `EventRouter_Drain` in main loop dispatches.
 - `Menu_Show` creates its own AKContext, builds tree, renders to surface, destroys context. Surface stored in MenuState. `Menu_Blit` called from `Win_BlitAll`.
-- Main loop: Evdev_Poll -> DrainInput -> AK_DrawDirty -> Win_RenderDirty -> EventRouter_Drain -> DebugLog_Render -> Win_BlitAll -> sleep(16ms).
+- Main loop: Evdev_Poll -> DrainInput -> Win_RenderDirty -> EventRouter_Drain -> IPCBroker_Poll -> Deskbar_Refresh -> DebugLog_Render -> Win_BlitAll -> sleep(16ms).
 - Deskbar has its own AKContext stored in `DeskbarState.ak_ctx`. No global swap needed.
 - Each window toolbar has its own AKContext stored via `WinMgr_SetToolbarCtx(idx, ctx)`.
+- **IPC Broker** (`Library.IPCBroker.ailang`): Embedded in display server. Unix socket at `/tmp/ailang_display.sock`. Non-blocking `poll(0)` once per frame. 8-client max. Client table: 8 entries × 24 bytes (fd, service_id, win_idx). `WinView_SetJobPtr(win_idx, ci+1)` — stores client index +1 so 0 = no IPC client. Protocol: 4-byte BE length prefix + JSON payload. Methods: `register`, `window.create`, `window.update` (app→server); `window.created`, `window.closed`, `input.action` (server→app).
+- **Start Menu** (`Library.StartMenu.ailang`): Windows XP/7-style popup panel above deskbar. Follows Menu pattern: own AKContext, own surface, positioned overlay. Opened by "Home" button in deskbar left zone (action `app.home`). Lists services from PostgreSQL cache + system items (About, Screenshot, Quit). Blitted in `Win_BlitAll` after deskbar, before dropdown menus.
+- **EventRouter IPC routing**: Priority 1 in `EventRouter_Dispatch` — if `WinView_GetJobPtr(source_win) > 0`, route action through `IPCBroker_RouteAction` instead of internal handlers. Display server has zero app-specific code.
+- **Init sequence**: `SysDisplay_Init → EventRouter_Init → Dialog_Init → Menu_Init → Deskbar_Init → IPCBroker_Init → StartMenu_Init → HTML_Init → PageSurface_Init → Doc_Init`
 
 ### Compiler Constraints
 
@@ -211,33 +215,44 @@ New intrinsics in `Library.CCompileMem.ailang`:
 
 **WinView defaults**: `WinView_Init` and `WinView_Clear` both set `DOC_HANDLE = -1` and `PAGE_HANDLE = -1`, so windows without documents are safely skipped by the `>= 0` check.
 
-## In Progress: Deskbar Rewrite
+## IPC Pipeline Architecture (2026-04-25)
 
-Full plan at: `.claude/plans/transient-sauteeing-pike.md`
+Full plan at: `.claude/plans/playful-cuddling-puffin.md`
 
-### Vision
+### Design
 
-Rewrite placeholder deskbar into full system bar with 3 zones:
-- **Left**: App launchers from PostgreSQL `services` table
-- **Center**: Live window list (click to focus, auto-refreshes on create/close/focus)
-- **Right**: System tray (user label, About dialog)
+- Display server IS the broker — no separate process
+- Apps are standalone binaries, connect to `/tmp/ailang_display.sock`
+- PostgreSQL for service discovery only (what apps exist, how to launch them)
+- Encryption layered in later via seed key from PostgreSQL
 
-### Phase Plan
+### Files
 
-1. **Phase 1**: Three-zone layout + window list + `AK_ResetContext` + refresh triggers
-2. **Phase 2**: PostgreSQL service loading + dynamic launchers + `svc.N` routing
-3. **Phase 3**: About dialog (new `Library.AboutDialog.ailang`)
-4. **Phase 4**: Fork/exec service launching (SystemCall 57/59)
+| File | Purpose |
+|------|---------|
+| `Librarys/Library.IPCBroker.ailang` | Embedded IPC broker (~430 lines) — socket, poll, client table, message dispatch, window create/update, action relay |
+| `Librarys/Library.StartMenu.ailang` | Start Menu panel (~300 lines) — Windows XP/7 style, own AKContext/surface overlay |
+| `Librarys/Library.Socket.ailang` | Added `Socket.SetNonBlock(fd)` — fcntl F_SETFL O_NONBLOCK |
+| `Testcode/calc_ipc.ailang` | Standalone IPC calculator client (~270 lines) — connects to display server, handles actions |
 
-### Key Technical Decisions
+### Key Integration Points
 
-- `AK_ResetContext(ctx)` zeros node+extra buffers without dealloc/realloc
-- Refresh trigger: `DeskbarState.needs_refresh = 1` set in `Win_Create`/`Win_Close`/`Win_Focus`
-- Pre-allocated action strings: `"wf.1"` through `"wf.7"` (max 8 windows)
-- Theme colors: `deskbar_win_bg/fg`, `deskbar_win_act_bg`, `deskbar_sep`
-- UIScale: `deskbar_win_btn_w` (96px default)
+- `Main.ailang`: `LibraryImport.IPCBroker`, `LibraryImport.StartMenu`, `IPCBroker_Init()`, `StartMenu_Init()` in init sequence
+- `Library.SysDisplay.ailang`: `IPCBroker_Poll()` in main loop after `EventRouter_Drain()`, `StartMenu_Close()` + `IPCBroker_Shutdown()` in shutdown, StartMenu hit test/event routing in `SysDisplay_DrainInput` for MOUSE_DOWN and MOUSE_UP
+- `Library.EventRouter.ailang`: Priority 1 IPC routing in `EventRouter_Dispatch` (checks `WinView_GetJobPtr`), `app.home` handler calls `StartMenu_Toggle()`, `StartMenu_Close()` in quit handler
+- `Library.WinManager.ailang`: `Win_Close` sends `IPCBroker_NotifyWindowClosed` before destroying IPC-owned windows
+- `Library.WinRender.ailang`: `StartMenu_Blit()` in `Win_BlitAll` after deskbar, before dropdown menus
+- `Library.Deskbar.ailang`: "Home" button replaces `Deskbar_BuildLaunchers()` in left zone
 
-## Current State (2026-04-24)
+### Deskbar Rewrite Status
+
+- **Phase 1**: DONE — Three-zone layout + window list + AK_ResetContext + refresh triggers
+- **Phase 2**: DONE — PostgreSQL service loading + dynamic launchers + svc.N routing
+- **Phase 3**: DONE — About dialog (Library.AboutDialog.ailang)
+- **Phase 4**: DONE — Fork/exec service launching (SystemCall 57/59)
+- **Phase 5**: DONE — Home button replaces launchers, Start Menu popup
+
+## Current State (2026-04-25)
 
 ### What's Working
 
@@ -255,7 +270,12 @@ Rewrite placeholder deskbar into full system bar with 3 zones:
 - Document content redraws on resize (PageSurface_Resize + App_RefreshDocWindow on Win_ApplyResize)
 - Window resize: 350+ cycles tested headless (grow, shrink, oscillate, batched, edge drag)
 - F12 debug overlay: 19-step headless stress test (toggle, open/close windows, resize, rapid cycling)
-- 86/86 smoke tests pass, 57/57 CoreUtils build
+- IPC Broker: embedded in display server, listens on Unix socket, accepts clients, routes JSON messages
+- Start Menu: Windows XP/7 popup panel above deskbar, Home button, app list from PostgreSQL + system items
+- IPC window routing: EventRouter dispatches actions to IPC apps, Win_Close notifies app on close
+- calc_ipc.x: standalone calculator binary communicates with display server over IPC
+- 34-step headless stress test: resize (9) + debug overlay (10) + start menu (4) + IPC broker (9) + calc pipeline (2)
+- 86/86 smoke tests pass, 57/57 CoreUtils build, 10/10 calculator tests pass
 
 ### Build & Run
 
@@ -268,7 +288,8 @@ Rewrite placeholder deskbar into full system bar with 3 zones:
 
 ### Test Programs (TestCode/)
 
-- `test_main.ailang` — full system headless test: resize stress (9 steps) + F12 debug overlay stress (10 steps)
+- `test_main.ailang` — full system headless test: resize (9 steps) + F12 debug (10 steps) + Start Menu (4 steps) + IPC broker (9 steps) + calc pipeline (2 steps) = 34 total
+- `calc_ipc.ailang` — standalone IPC calculator client (connects to display server, handles button actions over Unix socket)
 - `test_offscreen_render.ailang` — 4 render tests (toolbar, menu, deskbar, file dialog)
 
 ### Tools
@@ -278,8 +299,9 @@ Rewrite placeholder deskbar into full system bar with 3 zones:
 
 ### Pending Work
 
+- **IPC Phase 4**: Service status tracking in PostgreSQL (state='running'/'stopped'), child process reaping (waitpid WNOHANG), StartMenu visual indicators for running apps
+- **Real hardware testing**: IPC pipeline needs live testing on TTY (headless passes 34/34, real framebuffer + evdev may surface timing/blocking issues)
 - Performance hunting: profile and optimize remaining hot paths before threading
-- SSE2 optimization Phase 1 remaining: RenderFB_Flush/FlushRect (#1,#2 — CRITICAL per-frame), AK_ResetContext (#3), FB_ClearBuffer (#4), VIF buffer init (#8)
+- SSE2 optimization Phase 1 remaining: FB_ClearBuffer (#4)
 - SSE2 phases 2-3 (compiler integer SSE2 emit + intrinsics)
-- Deskbar rewrite phases 2-4 (PostgreSQL services, About dialog, fork/exec)
 - Display bug hunting (more issues likely lurking)
