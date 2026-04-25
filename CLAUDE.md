@@ -74,6 +74,8 @@ PaneDecorator_ThemeInit()  // copies Theme.* -> WinColor.*
 | 04-24 | FB_FillRectFast optimization | StoreValue dword + MemoryCopy rows (was 4 SetByte per pixel) |
 | 04-24 | FB_HLine/VLine optimization | StoreValue dword per pixel (was FB_Write32 = 4 SetByte + DebugLog_Push) |
 | 04-24 | Deskbar_DrawHotzone optimization | StoreValue dword per pixel (was 4 SetByte per pixel) |
+| 04-24 | Doc_WriteText clipping fix | TextRegion height = remaining space from cursor to content bottom (was full content height) |
+| 04-24 | App_BlitPageToWindow MemoryCopy | Main.ailang byte-by-byte blit -> MemoryCopy per row |
 
 ## MemoryCopy Rollout Status
 
@@ -169,6 +171,12 @@ New intrinsics in `Library.CCompileMem.ailang`:
 **Root cause**: `border=0xFFFFFFFF` (white) in config/ui.cfg — identical to default canvas/document backgrounds.
 
 **Fix**: Changed to `border=0xFF4A4A50` (dark gunmetal gray) — highly distinctive, unlikely to match any canvas color.
+
+### Bug 5: Doc_WriteText TextRegion clipping extends past page (FIXED)
+
+**Root cause**: `Doc_WriteText` (Library.Document.ailang:345-350) created each TextRegion with `ch = PageSurface_GetContentH(page)` — the full content area height (e.g. 468px). This height was used regardless of the cursor's current Y position. When cursor was at Y=200, the TextRegion had bounds `(16, 200, 588, 468)`, computing `bottom_edge = 200 + 468 = 668` — far past the actual page surface boundary (500px). While `Surface_BlitTinted` clips at the surface edge, the TextRegion's internal layout believed it had 468px of room below the cursor, causing incorrect wrapping and overflow calculations.
+
+**Fix**: Changed `ch` to compute remaining space from cursor to the bottom content edge: `ch = (content_y + content_h) - cy`. For example: cursor at Y=200, content_y=16, content_h=468 → `ch = (16+468) - 200 = 284`. The TextRegion now correctly knows how much vertical room remains. Returns early if `ch <= 0` (cursor past content bottom).
 
 ## In Progress: Deskbar Rewrite
 
