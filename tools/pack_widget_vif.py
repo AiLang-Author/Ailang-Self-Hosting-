@@ -41,35 +41,28 @@ def read_tvg_dimensions(tvg_data):
     # For simplicity with icon packs, we'll read from the header
     # but fall back to 15x15 (standard icon size) if parsing fails
     try:
-        # Byte 0-1: magic 0x72 0x56
-        # Byte 2: scale(4 bits) | color_type(2 bits) | coord_range(2 bits)
+        # TinyVG v1 layout:
+        #   Byte 0-1: magic 0x72 0x56
+        #   Byte 2:   version (1)
+        #   Byte 3:   flags: scale(4) | color_enc(2) | coord_range(2)
+        #   Then: width, height (size depends on coord_range)
+        #   Then: color_count (varuint)
         if tvg_data[0] != 0x72 or tvg_data[1] != 0x56:
             return 15, 15
-        info = tvg_data[2]
-        coord_range = info & 0x03
-        # coord_range: 0=uint8, 1=uint16, 2=uint32
-        pos = 3
-        # Read color count (varuint)
-        color_count = 0
-        shift = 0
-        while pos < len(tvg_data):
-            b = tvg_data[pos]
-            color_count |= (b & 0x7F) << shift
-            pos += 1
-            if not (b & 0x80):
-                break
-            shift += 7
+        flags = tvg_data[3]
+        coord_range = (flags >> 6) & 0x03
+        pos = 4
         # Read width and height based on coord_range
-        if coord_range == 0:
-            w = tvg_data[pos] + 1
-            h = tvg_data[pos + 1] + 1
-        elif coord_range == 1:
-            w = struct.unpack_from('<H', tvg_data, pos)[0] + 1
-            h = struct.unpack_from('<H', tvg_data, pos + 2)[0] + 1
+        if coord_range == 0:  # i16
+            w = struct.unpack_from('<h', tvg_data, pos)[0]
+            h = struct.unpack_from('<h', tvg_data, pos + 2)[0]
+        elif coord_range == 1:  # i32
+            w = struct.unpack_from('<i', tvg_data, pos)[0]
+            h = struct.unpack_from('<i', tvg_data, pos + 4)[0]
         else:
-            w = struct.unpack_from('<I', tvg_data, pos)[0] + 1
-            h = struct.unpack_from('<I', tvg_data, pos + 4)[0] + 1
-        return w, h
+            w = 15
+            h = 15
+        return abs(w), abs(h)
     except (IndexError, struct.error):
         return 15, 15
 
