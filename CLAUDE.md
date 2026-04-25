@@ -77,6 +77,7 @@ PaneDecorator_ThemeInit()  // copies Theme.* -> WinColor.*
 | 04-24 | Doc_WriteText clipping fix | TextRegion height = remaining space from cursor to content bottom (was full content height) |
 | 04-24 | App_BlitPageToWindow MemoryCopy | Main.ailang byte-by-byte blit -> MemoryCopy per row |
 | 04-24 | MemoryCopy/MemorySet rollout | 15 sites: RenderFB_Flush/FlushRect, AK_ResetContext, VIF_Init ×3, VFont_Init ×2, VFont_LoadFace, FB_Init ×2, TextRegion_Init, Dialog_Init, Doc_Init, CursorBitmap ×2 |
+| 04-24 | Doc content redraw on resize | PageSurface_Resize + App_RefreshDocWindow — page resized, cursor reset, text re-rendered, re-blitted on Win_ApplyResize |
 
 ## MemoryCopy Rollout Status
 
@@ -196,6 +197,20 @@ New intrinsics in `Library.CCompileMem.ailang`:
 
 **Fix**: Changed `ch` to compute remaining space from cursor to the bottom content edge: `ch = (content_y + content_h) - cy`. For example: cursor at Y=200, content_y=16, content_h=468 → `ch = (16+468) - 200 = 284`. The TextRegion now correctly knows how much vertical room remains. Returns early if `ch <= 0` (cursor past content bottom).
 
+### Bug 6: Document canvas text not redrawing on window resize (FIXED)
+
+**Root cause**: `Win_UpdateResize` (Library.WinInput.ailang:293-442) creates new content surfaces on every mouse move during resize, copies old pixels via `Surface_BlitOpaque`, but the document's **page surface** (in PageTable) is never resized and `Doc_WriteText` is never called again. Expanded areas show only the background color fill. The page surface retains its original dimensions from `App_CreateDocWindow` forever.
+
+**Fix** (4 files):
+1. **Library.PageSurface.ailang** — Added `PageSurface_Resize(page, w, h)`: destroys old surface, creates new one at new dimensions, fills white, updates PageTable metadata in-place (no slot leak).
+2. **Main.ailang (App_CreateDocWindow)** — Now stores doc/page handles per-window via `WinView_SetDocHandle(win_idx, doc)` / `WinView_SetPageHandle(win_idx, page)`. These accessors already existed in WinManager but were unused.
+3. **Main.ailang (App_RefreshDocWindow)** — New function: reads doc/page from WinView, calls `PageSurface_Resize` to match new canvas dims, restores 16px margins, resets doc cursor to (0,0), calls `App_WriteContent(doc)` to re-render all text, calls `App_BlitPageToWindow` to copy page to content surface.
+4. **Library.WinInput.ailang (Win_ApplyResize)** — On mouse UP, checks `WinView_GetDocHandle(idx) >= 0` and calls `App_RefreshDocWindow(idx)`. This defers re-rendering to mouse release (not every pixel of drag), matching standard window manager behavior.
+
+**Why mouse UP not every mouse move**: `Win_UpdateResize` already recreates surfaces on every move (expensive). Adding full doc re-render per move would add VFont_UseSize + 11× Doc_WriteText + TextRegion_Create/Render/Measure + MemoryCopy blit per pixel of drag. Deferring to UP means the user sees bg color in expanded areas during drag, then text appears on release.
+
+**WinView defaults**: `WinView_Init` and `WinView_Clear` both set `DOC_HANDLE = -1` and `PAGE_HANDLE = -1`, so windows without documents are safely skipped by the `>= 0` check.
+
 ## In Progress: Deskbar Rewrite
 
 Full plan at: `.claude/plans/transient-sauteeing-pike.md`
@@ -237,6 +252,7 @@ Rewrite placeholder deskbar into full system bar with 3 zones:
 - TextRegion handles freed on resize (AK_FreeContextTR) — no more stale clipping
 - F12 debug overlay: own surface (dbg_surf), composited after windows, TR freed on toggle-off
 - Border color: gunmetal 0xFF4A4A50 (visible on any canvas)
+- Document content redraws on resize (PageSurface_Resize + App_RefreshDocWindow on Win_ApplyResize)
 - Window resize: 350+ cycles tested headless (grow, shrink, oscillate, batched, edge drag)
 - F12 debug overlay: 19-step headless stress test (toggle, open/close windows, resize, rapid cycling)
 - 86/86 smoke tests pass, 57/57 CoreUtils build
