@@ -76,6 +76,7 @@ PaneDecorator_ThemeInit()  // copies Theme.* -> WinColor.*
 | 04-24 | Deskbar_DrawHotzone optimization | StoreValue dword per pixel (was 4 SetByte per pixel) |
 | 04-24 | Doc_WriteText clipping fix | TextRegion height = remaining space from cursor to content bottom (was full content height) |
 | 04-24 | App_BlitPageToWindow MemoryCopy | Main.ailang byte-by-byte blit -> MemoryCopy per row |
+| 04-24 | MemoryCopy/MemorySet rollout | 15 sites: RenderFB_Flush/FlushRect, AK_ResetContext, VIF_Init ×3, VFont_Init ×2, VFont_LoadFace, FB_Init ×2, TextRegion_Init, Dialog_Init, Doc_Init, CursorBitmap ×2 |
 
 ## MemoryCopy Rollout Status
 
@@ -91,6 +92,16 @@ PaneDecorator_ThemeInit()  // copies Theme.* -> WinColor.*
 | 8 | Library.Framebuffer.ailang | `FB_HLine` | Done (StoreValue dword per pixel) |
 | 9 | Library.Framebuffer.ailang | `FB_VLine` | Done (StoreValue dword per pixel) |
 | 10 | Library.Deskbar.ailang | `Deskbar_DrawHotzone` | Done (StoreValue dword per pixel) |
+| 11 | Library.DRenderFB.ailang | `RenderFB_Flush` | Done (MemoryCopy per row) |
+| 12 | Library.DRenderFB.ailang | `RenderFB_FlushRect` | Done (MemoryCopy per row) |
+| 13 | Library.Auckland.ailang | `AK_ResetContext` | Done (MemorySet ×2) |
+| 14 | Library.VIF.ailang | `VIF_Init` | Done (MemorySet ×3) |
+| 15 | Library.Fonts.ailang | `VFont_Init`, `VFont_LoadFace` | Done (MemorySet ×3) |
+| 16 | Library.Framebuffer.ailang | `FB_Init` | Done (MemorySet ×2) |
+| 17 | Library.TextRegion.ailang | `TextRegion_Init` | Done (MemorySet) |
+| 18 | Library.Dialog.ailang | `Dialog_Init` | Done (MemorySet) |
+| 19 | Library.Document.ailang | `Doc_Init` | Done (MemorySet) |
+| 20 | Library.CursorBitmap.ailang | `CursorBitmap_AllocMasks` | Done (MemorySet ×2) |
 
 ## SSE2 Optimization Plan (In Progress)
 
@@ -98,15 +109,22 @@ PaneDecorator_ThemeInit()  // copies Theme.* -> WinColor.*
 
 | # | File | Function | Lines | Current | Target | Status |
 |---|------|----------|-------|---------|--------|--------|
-| 1 | Library.DRenderFB.ailang | `RenderFB_Flush` | 107-111 | GetByte/SetByte per byte | MemoryCopy per row | Pending |
-| 2 | Library.DRenderFB.ailang | `RenderFB_FlushRect` | 173-177 | GetByte/SetByte per byte | MemoryCopy per row | Pending |
-| 3 | Library.Auckland.ailang | `AK_ResetContext` | 320-326 | SetByte per byte (two loops) | MemorySet zero fill | Pending |
+| 1 | Library.DRenderFB.ailang | `RenderFB_Flush` | 107-111 | GetByte/SetByte per byte | MemoryCopy per row | Done |
+| 2 | Library.DRenderFB.ailang | `RenderFB_FlushRect` | 173-177 | GetByte/SetByte per byte | MemoryCopy per row | Done |
+| 3 | Library.Auckland.ailang | `AK_ResetContext` | 320-326 | SetByte per byte (two loops) | MemorySet zero fill | Done |
 | 4 | Library.Framebuffer.ailang | `FB_ClearBuffer` | 414-418 | FB_Write32 per pixel | MemorySet or StoreValue+MemoryCopy | Pending |
 | 5 | Library.Framebuffer.ailang | `FB_FillRectFast` | 717-731 | SetByte x4 per pixel | StoreValue dword + MemoryCopy rows | Done |
 | 6 | Library.Framebuffer.ailang | `FB_HLine` | 614-618 | SetByte x4 per pixel | StoreValue dword per pixel | Done |
 | 7 | Library.Framebuffer.ailang | `FB_VLine` | 651-655 | SetByte x4 per pixel | StoreValue dword per pixel | Done |
-| 8 | Library.VIF.ailang | Buffer zero-init | 221,232,243 | SetByte per byte | MemorySet zero fill | Pending |
+| 8 | Library.VIF.ailang | Buffer zero-init | 221,232,243 | SetByte per byte | MemorySet zero fill | Done |
 | 9 | TestCode/test_main.ailang | `App_BlitPageToWindow` | 418-421 | GetByte/SetByte per byte | MemoryCopy per row | Done |
+| 10 | Library.Fonts.ailang | `VFont_Init` | 170,178 | SetByte per byte (two loops) | MemorySet zero fill | Done |
+| 11 | Library.Fonts.ailang | `VFont_LoadFace` | 334 | SetByte per byte | MemorySet zero fill | Done |
+| 12 | Library.Framebuffer.ailang | `FB_Init` | 183-192 | SetByte per byte (two loops) | MemorySet zero fill | Done |
+| 13 | Library.TextRegion.ailang | `TextRegion_Init` | 72 | SetByte per byte | MemorySet zero fill | Done |
+| 14 | Library.Dialog.ailang | `Dialog_Init` | 81-85 | SetByte per byte | MemorySet zero fill | Done |
+| 15 | Library.Document.ailang | `Doc_Init` | 58-62 | SetByte per byte | MemorySet zero fill | Done |
+| 16 | Library.CursorBitmap.ailang | `CursorBitmap_AllocMasks` | 87-92 | SetByte per byte (two masks) | MemorySet zero fill × 2 | Done |
 
 ### Phase 2: Add integer SSE2 emit functions to compiler
 
@@ -127,8 +145,8 @@ New intrinsics in `Library.CCompileMem.ailang`:
 
 ### Impact Priority (highest first)
 
-1. **RenderFB_Flush/FlushRect** — called per-frame for surface->FB copy, currently 1 byte at a time (CRITICAL)
-2. **FB_FillRectFast** — used for direct FB rectangle fills, 4 SetByte per pixel
+1. **RenderFB_Flush/FlushRect** — called per-frame for surface->FB copy, now MemoryCopy per row (DONE)
+2. **FB_FillRectFast** — used for direct FB rectangle fills, now StoreValue dword + MemoryCopy (DONE)
 3. **FB_HLine/VLine** — used for line drawing, 4 SetByte per pixel
 4. **AK_ResetContext** — called on deskbar refresh, zero-fills two buffers byte-by-byte
 5. **FB_ClearBuffer** — buffer initialization
