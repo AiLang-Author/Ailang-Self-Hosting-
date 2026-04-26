@@ -48,6 +48,7 @@ FixedPool.CSys {
     "SYS_WRITE":     Initialize=1
     "SYS_OPEN":      Initialize=2
     "SYS_CLOSE":     Initialize=3
+    "SYS_STAT":      Initialize=4
     "SYS_FSTAT":     Initialize=5
     "SYS_MMAP":      Initialize=9
     "SYS_MUNMAP":    Initialize=11
@@ -61,6 +62,9 @@ FixedPool.CSys {
     "SYS_FCNTL":     Initialize=72
     "SYS_NANOSLEEP": Initialize=35
     "SYS_UNLINK":    Initialize=87
+    "SYS_GETUID":    Initialize=102
+    "SYS_SETUID":    Initialize=105
+    "SYS_SETGID":    Initialize=106
     "SYS_SETSID":    Initialize=112
 }
 
@@ -107,6 +111,8 @@ FixedPool.ChromeState {
     "xvfb_fb_ptr":  Initialize=0
     "xvfb_fb_fd":   Initialize=-1
     "xvfb_fb_size": Initialize=0
+    "xvfb_w":       Initialize=1920
+    "xvfb_h":       Initialize=1080
 }
 
 // XWD header: 160 byte header + 256 colors * 12 bytes = 3232 byte pixel offset
@@ -114,6 +120,12 @@ FixedPool.XvfbConst {
     "PIXEL_OFFSET": Initialize=3232
     "SYS_MKDIR":    Initialize=83
     "DIR_MODE":     Initialize=493
+}
+
+// PID file constants — O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644 = 420
+FixedPool.CPid {
+    "O_WRCREAT": Initialize=577
+    "FMODE":     Initialize=420
 }
 
 // =============================================================================
@@ -154,6 +166,133 @@ Function.Chrome_NumToStr {
 }
 
 // =============================================================================
+// PID FILE — write PID to /tmp/<name>.pid for crash recovery
+// =============================================================================
+Function.Chrome_WritePidFile {
+    Input: path: Address
+    Input: pid: Integer
+    Body: {
+        fd = SystemCall(CSys.SYS_OPEN, path, CPid.O_WRCREAT, CPid.FMODE)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(16)
+        nlen = Chrome_NumToStr(pid, buf)
+        SetByte(buf, nlen, 10)
+        SystemCall(CSys.SYS_WRITE, fd, buf, Add(nlen, 1), 0, 0)
+        SystemCall(CSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        Deallocate(buf, 16)
+    }
+}
+
+// =============================================================================
+// PID FILE — read PID from file, returns 0 on failure
+// =============================================================================
+Function.Chrome_ReadPidFile {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        fd = SystemCall(CSys.SYS_OPEN, path, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(16)
+        MemorySet(buf, 0, 16)
+        nr = SystemCall(CSys.SYS_READ, fd, buf, 15, 0, 0)
+        SystemCall(CSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(nr, 0) ThenBlock: {
+            Deallocate(buf, 16)
+            ReturnValue(0)
+        }
+        pid = 0
+        i = 0
+        WhileLoop LessThan(i, nr) {
+            ch = GetByte(buf, i)
+            IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: {
+                pid = Add(Multiply(pid, 10), Subtract(ch, 48))
+            } ElseBlock: {
+                IfCondition GreaterThan(pid, 0) ThenBlock: { i = nr }
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 16)
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// KILL STALE PID — try SIGKILL, report EPERM (can't kill root-owned orphan)
+// Returns: 1=killed, 0=no such process, -1=permission denied
+// =============================================================================
+Function.Chrome_KillStalePid {
+    Input: pid: Integer
+    Input: label: Address
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(pid, 1) ThenBlock: { ReturnValue(0) }
+        kr = SystemCall(CSys.SYS_KILL, pid, 9, 0, 0, 0)
+        IfCondition EqualTo(kr, 0) ThenBlock: {
+            PrintMessage("[Chrome] Killed stale ")
+            PrintMessage(label)
+            PrintMessage(" pid=")
+            PrintNumber(pid)
+            PrintMessage("\n")
+            ReturnValue(1)
+        }
+        // -1 = EPERM (permission denied — root-owned process)
+        neg_one = Subtract(0, 1)
+        IfCondition EqualTo(kr, neg_one) ThenBlock: {
+            PrintMessage("[Chrome] ERROR: Stale ")
+            PrintMessage(label)
+            PrintMessage(" pid=")
+            PrintNumber(pid)
+            PrintMessage(" owned by another user. Run: sudo kill -9 ")
+            PrintNumber(pid)
+            PrintMessage("\n")
+            ReturnValue(-1)
+        }
+        // -3 = ESRCH (no such process) — already dead, fine
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// REMOVE PID FILES — called from StopAll
+// =============================================================================
+Function.Chrome_RemovePidFiles {
+    Body: {
+        SystemCall(CSys.SYS_UNLINK, "/tmp/chrome_ailang_xvfb.pid", 0, 0, 0, 0)
+        SystemCall(CSys.SYS_UNLINK, "/tmp/chrome_ailang_browser.pid", 0, 0, 0, 0)
+        SystemCall(CSys.SYS_UNLINK, "/tmp/chrome_ailang_xdotool.pid", 0, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// DROP PRIVILEGES — if running as root, drop to owner of /home/bob
+// Called in child fork BEFORE execve. stat() gets real user's UID/GID,
+// then setgid + setuid. Prevents Electron "don't run as root" refusal.
+// x86-64 struct stat: st_uid at offset 28 (dword), st_gid at offset 32 (dword)
+// =============================================================================
+Function.Chrome_DropPriv {
+    Body: {
+        uid = SystemCall(CSys.SYS_GETUID, 0, 0, 0, 0, 0)
+        IfCondition NotEqual(uid, 0) ThenBlock: { ReturnValue(0) }
+
+        sb = Allocate(144)
+        sr = SystemCall(CSys.SYS_STAT, "/home/bob", sb, 0, 0, 0)
+        IfCondition LessThan(sr, 0) ThenBlock: {
+            Deallocate(sb, 144)
+            ReturnValue(0)
+        }
+
+        ruid = Dereference(Add(sb, 28), "dword")
+        rgid = Dereference(Add(sb, 32), "dword")
+        Deallocate(sb, 144)
+
+        IfCondition EqualTo(ruid, 0) ThenBlock: { ReturnValue(0) }
+
+        SystemCall(CSys.SYS_SETGID, rgid, 0, 0, 0, 0)
+        SystemCall(CSys.SYS_SETUID, ruid, 0, 0, 0, 0)
+    }
+}
+
+// =============================================================================
 // BUILD SIZE STRING — "WxH" from canvas_w and canvas_h
 // =============================================================================
 Function.Chrome_BuildSizeStr {
@@ -183,8 +322,8 @@ Function.Chrome_BuildXvfbSize {
         buf = Allocate(32)
         w_tmp = Allocate(12)
         h_tmp = Allocate(12)
-        wlen = Chrome_NumToStr(ChromeState.canvas_w, w_tmp)
-        hlen = Chrome_NumToStr(ChromeState.canvas_h, h_tmp)
+        wlen = Chrome_NumToStr(ChromeState.xvfb_w, w_tmp)
+        hlen = Chrome_NumToStr(ChromeState.xvfb_h, h_tmp)
         off = 0
         MemoryCopy(buf, w_tmp, wlen)
         off = wlen
@@ -213,8 +352,8 @@ Function.Chrome_BuildWinSize {
         buf = Allocate(24)
         w_tmp = Allocate(12)
         h_tmp = Allocate(12)
-        wlen = Chrome_NumToStr(ChromeState.canvas_w, w_tmp)
-        hlen = Chrome_NumToStr(ChromeState.canvas_h, h_tmp)
+        wlen = Chrome_NumToStr(ChromeState.xvfb_w, w_tmp)
+        hlen = Chrome_NumToStr(ChromeState.xvfb_h, h_tmp)
         off = 0
         MemoryCopy(buf, w_tmp, wlen)
         off = wlen
@@ -272,42 +411,82 @@ Function.Chrome_ShellExec {
 }
 
 // =============================================================================
-// CLEANUP STALE — kill ALL orphaned Xvfb/chrome/xdotool + remove lock files
-// If chrome_ipc crashes, child processes stay running as orphans.
-// Chrome spawns ~13 subprocesses (renderer, gpu, utility, zygote, crashpad).
-// Strategy: kill twice with 200ms gap to catch reparented orphans.
+// KILL PROCESS GROUP — kill(-pgid, SIGKILL) to kill entire session group
+// Since Chrome/Xvfb children call setsid(), their PID = PGID.
+// This kills ONLY our sandboxed processes, never the desktop Chrome.
+// =============================================================================
+Function.Chrome_KillGroup {
+    Input: pid: Integer
+    Body: {
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            // kill(-pid, 9) = SIGKILL entire process group rooted at pid
+            neg_pid = Subtract(0, pid)
+            SystemCall(CSys.SYS_KILL, neg_pid, 9, 0, 0, 0)
+        }
+    }
+}
+
+// =============================================================================
+// CLEANUP STALE — kill orphaned processes from prior crash using PID files.
+// PID files give us exact PIDs — no broad pkill that could hit desktop apps.
+// If kill fails with EPERM (root-owned orphan), prints sudo command for user.
 // =============================================================================
 Function.Chrome_CleanupStaleXvfb {
     Body: {
-        PrintMessage("[Chrome] Killing orphaned processes...\n")
+        PrintMessage("[Chrome] Checking for orphaned processes...\n")
+        had_error = 0
 
-        // First pass: kill orphaned Chrome + Xvfb + xdotool
-        // Use /opt/google/chrome/chrome to avoid matching chrome_ipc.x (ourselves!)
-        Chrome_ShellExec("pkill -9 -f /opt/google/chrome/chrome 2>/dev/null; pkill -9 -f chrome_crashpad 2>/dev/null; pkill -9 Xvfb 2>/dev/null; pkill -9 xdotool 2>/dev/null")
+        // 1. Kill stale Chrome browser (process group — kills all subprocesses)
+        cpid = Chrome_ReadPidFile("/tmp/chrome_ailang_browser.pid")
+        IfCondition GreaterThan(cpid, 1) ThenBlock: {
+            // Kill entire process group (setsid'd, so PID=PGID)
+            Chrome_KillGroup(cpid)
+            cr = Chrome_KillStalePid(cpid, "Chrome")
+            neg_one = Subtract(0, 1)
+            IfCondition EqualTo(cr, neg_one) ThenBlock: { had_error = 1 }
+        }
 
-        // Wait 200ms for processes to die + children to get reparented to init
+        // 2. Kill stale xdotool
+        dpid = Chrome_ReadPidFile("/tmp/chrome_ailang_xdotool.pid")
+        IfCondition GreaterThan(dpid, 1) ThenBlock: {
+            Chrome_KillStalePid(dpid, "xdotool")
+        }
+
+        // 3. Kill stale Xvfb (must be last — Xvfb holds the display lock)
+        xpid = Chrome_ReadPidFile("/tmp/chrome_ailang_xvfb.pid")
+        IfCondition GreaterThan(xpid, 1) ThenBlock: {
+            xr = Chrome_KillStalePid(xpid, "Xvfb")
+            neg_one = Subtract(0, 1)
+            IfCondition EqualTo(xr, neg_one) ThenBlock: { had_error = 1 }
+        }
+
+        // Wait 200ms for processes to die
         ts = Allocate(16)
         StoreValue(ts, 0)
         StoreValue(Add(ts, 8), 200000000)
         SystemCall(CSys.SYS_NANOSLEEP, ts, 0)
-
-        // Second pass: catch any survivors (orphaned children from first pass)
-        Chrome_ShellExec("pkill -9 -f /opt/google/chrome/chrome 2>/dev/null; pkill -9 Xvfb 2>/dev/null")
-
-        // Wait another 100ms
-        StoreValue(Add(ts, 8), 100000000)
-        SystemCall(CSys.SYS_NANOSLEEP, ts, 0)
         Deallocate(ts, 16)
+
+        // Remove PID files
+        Chrome_RemovePidFiles()
 
         // Remove stale lock/socket/framebuffer files
         SystemCall(CSys.SYS_UNLINK, "/tmp/.X99-lock", 0, 0, 0, 0)
         SystemCall(CSys.SYS_UNLINK, "/tmp/.X11-unix/X99", 0, 0, 0, 0)
         SystemCall(CSys.SYS_UNLINK, "/tmp/chrome_fb/Xvfb_screen0", 0, 0, 0, 0)
+        Chrome_ShellExec("rmdir /tmp/chrome_fb 2>/dev/null")
 
-        // Remove Chrome profile locks from prior crash
-        Chrome_ShellExec("rm -f /tmp/chrome_ailang_profile/SingletonLock /tmp/chrome_ailang_profile/SingletonSocket /tmp/chrome_ailang_profile/SingletonCookie 2>/dev/null")
+        // Remove entire Chrome profile dir — may be root-owned from prior
+        // session. DropPriv makes Chrome run as bob, so it must own its profile.
+        // Chrome will recreate it fresh on next launch.
+        Chrome_ShellExec("rm -rf /tmp/chrome_ailang_profile 2>/dev/null")
 
-        PrintMessage("[Chrome] Cleaned up stale processes and files\n")
+        IfCondition EqualTo(had_error, 1) ThenBlock: {
+            PrintMessage("[Chrome] WARNING: Some processes could not be killed (see above)\n")
+            PrintMessage("[Chrome] Kill them manually, then restart chrome_ipc.x\n")
+        } ElseBlock: {
+            PrintMessage("[Chrome] Cleanup complete\n")
+        }
     }
 }
 
@@ -328,6 +507,8 @@ Function.Chrome_LaunchXvfb {
 
         IfCondition EqualTo(pid, 0) ThenBlock: {
             // ===== CHILD =====
+            Chrome_DropPriv()
+
             // Ensure /tmp/chrome_fb/ exists (separate from VSCode's fbdir)
             SystemCall(XvfbConst.SYS_MKDIR, "/tmp/chrome_fb", XvfbConst.DIR_MODE)
 
@@ -350,6 +531,7 @@ Function.Chrome_LaunchXvfb {
 
         // ===== PARENT =====
         ChromeState.xvfb_pid = pid
+        Chrome_WritePidFile("/tmp/chrome_ailang_xvfb.pid", pid)
         PrintMessage("[Chrome] Xvfb launched pid=")
         PrintNumber(pid)
         PrintMessage("\n")
@@ -388,32 +570,34 @@ Function.Chrome_LaunchBrowser {
 
         IfCondition EqualTo(pid, 0) ThenBlock: {
             // ===== CHILD =====
+            Chrome_DropPriv()
             // New session so Chrome's children don't inherit our terminal
             SystemCall(CSys.SYS_SETSID)
 
-            // 21 args + null = 22 * 8 = 176
-            argv = Allocate(176)
+            // 22 args + null = 23 * 8 = 184
+            argv = Allocate(184)
             StoreValue(Add(argv, 0),   "/usr/bin/google-chrome-stable")
             StoreValue(Add(argv, 8),   dd_arg)
             StoreValue(Add(argv, 16),  "--no-sandbox")
             StoreValue(Add(argv, 24),  "--disable-gpu")
             StoreValue(Add(argv, 32),  ws_arg)
             StoreValue(Add(argv, 40),  "--window-position=0,0")
-            StoreValue(Add(argv, 48),  "--no-first-run")
-            StoreValue(Add(argv, 56),  "--disable-sync")
-            StoreValue(Add(argv, 64),  "--disable-extensions")
-            StoreValue(Add(argv, 72),  "--disable-background-networking")
-            StoreValue(Add(argv, 80),  "--disable-default-apps")
-            StoreValue(Add(argv, 88),  "--mute-audio")
-            StoreValue(Add(argv, 96),  "--disable-translate")
-            StoreValue(Add(argv, 104), "--user-data-dir=/tmp/chrome_ailang_profile")
-            StoreValue(Add(argv, 112), "--disable-dev-shm-usage")
-            StoreValue(Add(argv, 120), "--disable-features=MediaDrmPreprovisioning")
-            StoreValue(Add(argv, 128), "--autoplay-policy=no-user-gesture-required")
-            StoreValue(Add(argv, 136), "--crash-dumps-dir=/tmp")
-            StoreValue(Add(argv, 144), "--disable-breakpad")
-            StoreValue(Add(argv, 152), "about:blank")
-            StoreValue(Add(argv, 160), 0)
+            StoreValue(Add(argv, 48),  "--start-maximized")
+            StoreValue(Add(argv, 56),  "--no-first-run")
+            StoreValue(Add(argv, 64),  "--disable-sync")
+            StoreValue(Add(argv, 72),  "--disable-extensions")
+            StoreValue(Add(argv, 80),  "--disable-background-networking")
+            StoreValue(Add(argv, 88),  "--disable-default-apps")
+            StoreValue(Add(argv, 96),  "--mute-audio")
+            StoreValue(Add(argv, 104), "--disable-translate")
+            StoreValue(Add(argv, 112), "--user-data-dir=/tmp/chrome_ailang_profile")
+            StoreValue(Add(argv, 120), "--disable-dev-shm-usage")
+            StoreValue(Add(argv, 128), "--disable-features=MediaDrmPreprovisioning")
+            StoreValue(Add(argv, 136), "--autoplay-policy=no-user-gesture-required")
+            StoreValue(Add(argv, 144), "--crash-dumps-dir=/tmp")
+            StoreValue(Add(argv, 152), "--disable-breakpad")
+            StoreValue(Add(argv, 160), "about:blank")
+            StoreValue(Add(argv, 168), 0)
 
             // envp: DISPLAY=:99 HOME PATH
             envp = Allocate(40)
@@ -434,6 +618,7 @@ Function.Chrome_LaunchBrowser {
 
         // ===== PARENT =====
         ChromeState.chrome_pid = pid
+        Chrome_WritePidFile("/tmp/chrome_ailang_browser.pid", pid)
         PrintMessage("[Chrome] Chrome launched pid=")
         PrintNumber(pid)
         PrintMessage("\n")
@@ -500,8 +685,26 @@ Function.Chrome_CopyFrame {
         dst = ShmCanvasState.buf
         IfCondition EqualTo(dst, 0) ThenBlock: { ReturnValue(-1) }
 
-        fsize = ChromeState.frame_size
-        MemoryCopy(dst, Add(src, XvfbConst.PIXEL_OFFSET), fsize)
+        vw = ChromeState.canvas_w
+        vh = ChromeState.canvas_h
+        src_stride = Multiply(ChromeState.xvfb_w, 4)
+        dst_stride = Multiply(vw, 4)
+        src_base = Add(src, XvfbConst.PIXEL_OFFSET)
+
+        // Fast path: full-width viewport, single copy
+        IfCondition EqualTo(vw, ChromeState.xvfb_w) ThenBlock: {
+            MemoryCopy(dst, src_base, Multiply(dst_stride, vh))
+            ReturnValue(1)
+        }
+
+        // Row-by-row copy for partial-width viewport
+        row = 0
+        WhileLoop LessThan(row, vh) {
+            src_row = Add(src_base, Multiply(row, src_stride))
+            dst_row = Add(dst, Multiply(row, dst_stride))
+            MemoryCopy(dst_row, src_row, dst_stride)
+            row = Add(row, 1)
+        }
         ReturnValue(1)
     }
 }
@@ -523,6 +726,8 @@ Function.Chrome_KillChild {
 
 // =============================================================================
 // STOP ALL — kill xdotool, chrome, xvfb in reverse order, unmap framebuffer
+// Uses process group kills (kill -PGID) to only kill OUR sandboxed processes.
+// NEVER uses broad pkill that could hit desktop Chrome.
 // =============================================================================
 Function.Chrome_StopAll {
     Body: {
@@ -540,9 +745,13 @@ Function.Chrome_StopAll {
             ChromeState.xdotool_pid = 0
         }
 
+        // Kill Chrome's entire process group (renderer, gpu, zygote, crashpad, etc.)
+        // Chrome did setsid() so chrome_pid IS the PGID. kill(-pgid, 9) kills the group.
         IfCondition GreaterThan(ChromeState.chrome_pid, 0) ThenBlock: {
+            Chrome_KillGroup(ChromeState.chrome_pid)
+            // Also SIGTERM the lead process for clean exit
             Chrome_KillChild(ChromeState.chrome_pid)
-            PrintMessage("[Chrome] Chrome stopped pid=")
+            PrintMessage("[Chrome] Chrome group killed pid=")
             PrintNumber(ChromeState.chrome_pid)
             PrintMessage("\n")
             ChromeState.chrome_pid = 0
@@ -566,9 +775,22 @@ Function.Chrome_StopAll {
             ChromeState.xvfb_pid = 0
         }
 
-        // Sweep: pkill any Chrome subprocesses that survived SIGTERM
-        // Chrome spawns ~13 child processes that may outlive the parent
-        Chrome_ShellExec("pkill -9 -f /opt/google/chrome/chrome 2>/dev/null; pkill -9 -f chrome_crashpad 2>/dev/null")
+        // Wait 100ms for process group to fully die
+        ts = Allocate(16)
+        StoreValue(ts, 0)
+        StoreValue(Add(ts, 8), 100000000)
+        SystemCall(CSys.SYS_NANOSLEEP, ts, 0)
+        Deallocate(ts, 16)
+
+        // Reap zombies
+        status = Allocate(8)
+        reap = 0
+        WhileLoop LessThan(reap, 5) {
+            wr = SystemCall(CSys.SYS_WAIT4, -1, status, CSig.WNOHANG, 0, 0, 0)
+            IfCondition LessEqual(wr, 0) ThenBlock: { reap = 5 }
+            reap = Add(reap, 1)
+        }
+        Deallocate(status, 8)
 
         // Clean up Xvfb files so next launch starts clean
         SystemCall(CSys.SYS_UNLINK, "/tmp/.X99-lock", 0, 0, 0, 0)
@@ -577,6 +799,9 @@ Function.Chrome_StopAll {
 
         // Clean up Chrome profile locks (prevents "Chrome is already running" on restart)
         Chrome_ShellExec("rm -f /tmp/chrome_ailang_profile/SingletonLock /tmp/chrome_ailang_profile/SingletonSocket /tmp/chrome_ailang_profile/SingletonCookie 2>/dev/null")
+
+        // Remove PID files (clean exit — no orphans to find next time)
+        Chrome_RemovePidFiles()
 
         ChromeState.capturing = 0
         PrintMessage("[Chrome] All processes stopped, files cleaned\n")
@@ -647,7 +872,7 @@ Function.Chrome_LaunchAll {
         }
 
         // 6. Mmap Xvfb framebuffer (replaces ffmpeg — zero-copy pixel access)
-        ChromeState.frame_size = Multiply(Multiply(ChromeState.canvas_w, ChromeState.canvas_h), 4)
+        ChromeState.frame_size = Multiply(Multiply(ChromeState.xvfb_w, ChromeState.xvfb_h), 4)
         mr = Chrome_MmapFB()
         IfCondition LessThan(mr, 0) ThenBlock: {
             PrintMessage("[Chrome] Failed to mmap Xvfb framebuffer\n")
@@ -694,6 +919,7 @@ Function.Chrome_LaunchXdotool {
 
         IfCondition EqualTo(pid, 0) ThenBlock: {
             // ===== CHILD =====
+            Chrome_DropPriv()
             SystemCall(CSys.SYS_CLOSE, xdt_write, 0, 0, 0, 0)
             // dup2(xdt_read, 0) — stdin = command pipe
             SystemCall(CSys.SYS_DUP2, xdt_read, 0, 0, 0, 0)
@@ -721,6 +947,7 @@ Function.Chrome_LaunchXdotool {
         SystemCall(CSys.SYS_CLOSE, xdt_read, 0, 0, 0, 0)
         ChromeState.xdotool_pid = pid
         ChromeState.xdotool_wr  = xdt_write
+        Chrome_WritePidFile("/tmp/chrome_ailang_xdotool.pid", pid)
 
         PrintMessage("[Chrome] xdotool pipe launched pid=")
         PrintNumber(pid)
@@ -855,9 +1082,32 @@ Function.Chrome_XdotoolMouseUp {
 }
 
 // =============================================================================
+// SCROLL WHEEL — xdotool click 4 (up) or click 5 (down)
+// delta: positive = scroll up, negative = scroll down
+// =============================================================================
+Function.Chrome_XdotoolScroll {
+    Input: delta: Integer
+    Body: {
+        wr = ChromeState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+
+        // "click 4\n" (up) or "click 5\n" (down)
+        buf = ChromeState.cmd_buf
+        MemoryCopy(buf, "click ", 6)
+        IfCondition GreaterThan(delta, 0) ThenBlock: {
+            SetByte(buf, 6, 52)
+        } ElseBlock: {
+            SetByte(buf, 6, 53)
+        }
+        SetByte(buf, 7, 10)
+        SystemCall(CSys.SYS_WRITE, wr, buf, 8, 0, 0)
+    }
+}
+
+// =============================================================================
 // HANDLE MOUSE — dispatch IPC mouse event to xdotool
-// ev: 0=MOVE, 1=DOWN, 2=UP (matches AKMouseEv)
-// button: 0=left, 1=right, 2=middle
+// ev: 0=MOVE, 1=DOWN, 2=UP, 3=SCROLL (matches AKMouseEv + scroll)
+// button: 0=left, 1=right, 2=middle (for DOWN/UP), delta (for SCROLL)
 //
 // MOVE events are deferred — we store the latest position and flush once
 // per main loop tick via Chrome_FlushMouse(). This coalesces 10-60 moves
@@ -892,6 +1142,14 @@ Function.Chrome_HandleMouse {
         // UP — release button at current position
         IfCondition EqualTo(ev, 2) ThenBlock: {
             Chrome_XdotoolMouseUp(button)
+            ReturnValue(0)
+        }
+
+        // SCROLL — button field carries wheel delta
+        IfCondition EqualTo(ev, 3) ThenBlock: {
+            Chrome_XdotoolMouseMove(mx, my)
+            ChromeState.mouse_dirty = 0
+            Chrome_XdotoolScroll(button)
             ReturnValue(0)
         }
     }
@@ -1082,7 +1340,51 @@ Function.Chrome_HandleAction {
 }
 
 // =============================================================================
-// HANDLE RESIZE — kill all 3, recreate canvas, relaunch all 3
+// XDOTOOL WINDOW RESIZE — resize the app window inside Xvfb
+// Sends: search --onlyvisible --name "" windowsize %@ W H
+// =============================================================================
+Function.Chrome_XdotoolResize {
+    Input: w: Integer
+    Input: h: Integer
+    Body: {
+        wr = ChromeState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+
+        buf = ChromeState.cmd_buf
+
+        // Build: "windowsize --sync 2 W H\n"
+        // Window ID 2 = first real window in Xvfb (root=1, chrome=2)
+        MemoryCopy(buf, "windowsize --sync 2 ", 20)
+        off = 20
+
+        // Append width
+        w_tmp = Allocate(12)
+        wlen = Chrome_NumToStr(w, w_tmp)
+        MemoryCopy(Add(buf, off), w_tmp, wlen)
+        off = Add(off, wlen)
+        Deallocate(w_tmp, 12)
+
+        // Space
+        SetByte(buf, off, 32)
+        off = Add(off, 1)
+
+        // Append height
+        h_tmp = Allocate(12)
+        hlen = Chrome_NumToStr(h, h_tmp)
+        MemoryCopy(Add(buf, off), h_tmp, hlen)
+        off = Add(off, hlen)
+        Deallocate(h_tmp, 12)
+
+        // Newline
+        SetByte(buf, off, 10)
+        off = Add(off, 1)
+
+        SystemCall(CSys.SYS_WRITE, wr, buf, off, 0, 0)
+    }
+}
+
+// =============================================================================
+// HANDLE RESIZE — viewport-only, processes stay alive
 // =============================================================================
 Function.Chrome_HandleResize {
     Input: sock: Integer
@@ -1095,7 +1397,7 @@ Function.Chrome_HandleResize {
             ReturnValue(0)
         }
 
-        PrintMessage("[Chrome] Resize: ")
+        PrintMessage("[Chrome] Viewport resize: ")
         PrintNumber(ChromeState.canvas_w)
         PrintMessage("x")
         PrintNumber(ChromeState.canvas_h)
@@ -1105,17 +1407,16 @@ Function.Chrome_HandleResize {
         PrintNumber(new_h)
         PrintMessage("\n")
 
-        // Stop everything
-        Chrome_StopAll()
+        // Clamp to Xvfb backing resolution
+        IfCondition GreaterThan(new_w, ChromeState.xvfb_w) ThenBlock: { new_w = ChromeState.xvfb_w }
+        IfCondition GreaterThan(new_h, ChromeState.xvfb_h) ThenBlock: { new_h = ChromeState.xvfb_h }
 
-        // Destroy old canvas
+        // Destroy old canvas only — processes untouched
         ShmCanvas_Destroy(ChromeState.win_id)
 
-        // Update dimensions
         ChromeState.canvas_w = new_w
         ChromeState.canvas_h = new_h
 
-        // Create new canvas
         wid = ChromeState.win_id
         buf = ShmCanvas_Create(wid, new_w, new_h)
         IfCondition EqualTo(buf, 0) ThenBlock: {
@@ -1127,8 +1428,10 @@ Function.Chrome_HandleResize {
         ShmCanvas_Clear(4278190080)
         ShmCanvas_Present(sock, wid)
 
-        // Relaunch all processes at new resolution
-        Chrome_LaunchAll()
+        // Tell Chrome to resize inside Xvfb
+        Chrome_XdotoolResize(new_w, new_h)
+
+        PrintMessage("[Chrome] Viewport resized — processes untouched\n")
     }
 }
 
@@ -1287,8 +1590,19 @@ SubRoutine.Main {
         pobj = JSON.AsObject(parsed)
         wid = JSON.GetNumber(pobj, "win_id")
         ChromeState.win_id = wid
+
+        // Read screen dimensions from display server
+        sw = JSON.GetNumber(pobj, "screen_w")
+        sh = JSON.GetNumber(pobj, "screen_h")
+        IfCondition GreaterThan(sw, 0) ThenBlock: { ChromeState.xvfb_w = sw }
+        IfCondition GreaterThan(sh, 0) ThenBlock: { ChromeState.xvfb_h = sh }
+
         PrintMessage("[Chrome] Window created, win_id=")
         PrintNumber(wid)
+        PrintMessage(" screen=")
+        PrintNumber(ChromeState.xvfb_w)
+        PrintMessage("x")
+        PrintNumber(ChromeState.xvfb_h)
         PrintMessage("\n")
         JSON.Free(parsed)
     }

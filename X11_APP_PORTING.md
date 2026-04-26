@@ -161,21 +161,73 @@ If your app needs mouse input, use `ShmCanvas_AttachCapture` instead of `ShmCanv
 
 If your app is keyboard-only (e.g., terminal), use `ShmCanvas_Attach` (no capture).
 
-### 7. Configure Cleanup
+### 7. Configure Privilege Drop
 
-The `CleanupStale` function kills orphaned processes from prior crashes. Update the pkill patterns:
+The display server (`SysDisplay.x`) runs as root on TTY2. Child processes inherit root, which causes problems:
+- Electron/VS Code refuses to run as root
+- Created files (fbdir, profiles) are root-owned, making cleanup fail for non-root
+- Broader security risk
+
+Add a `DropPriv()` function and call it in **every** child fork before `execve`:
 
 ```ailang
-// Kill orphaned app processes — use a unique match pattern
-Vsc_ShellExec("pkill -9 -f 'myapp.*--display=:97' 2>/dev/null")
-
-// Kill Xvfb on our display
-Vsc_ShellExec("pkill -9 -f 'Xvfb :97' 2>/dev/null")
+Function.MyApp_DropPriv {
+    Body: {
+        uid = SystemCall(MASys.SYS_GETUID, 0, 0, 0, 0, 0)
+        IfCondition NotEqual(uid, 0) ThenBlock: { ReturnValue(0) }  // not root, skip
+        sb = Allocate(144)   // struct stat
+        sr = SystemCall(MASys.SYS_STAT, "/home/bob", sb, 0, 0, 0)
+        IfCondition LessThan(sr, 0) ThenBlock: {
+            Deallocate(sb, 144)
+            ReturnValue(0)
+        }
+        ruid = Dereference(Add(sb, 28), "dword")   // st_uid
+        rgid = Dereference(Add(sb, 32), "dword")   // st_gid
+        Deallocate(sb, 144)
+        IfCondition EqualTo(ruid, 0) ThenBlock: { ReturnValue(0) }  // home owned by root, skip
+        SystemCall(MASys.SYS_SETGID, rgid, 0, 0, 0, 0)   // setgid first!
+        SystemCall(MASys.SYS_SETUID, ruid, 0, 0, 0, 0)
+    }
+}
 ```
 
-**Critical:** Use specific match patterns to avoid killing other apps or yourself.
+Required syscall constants: `SYS_STAT=4`, `SYS_GETUID=102`, `SYS_SETUID=105`, `SYS_SETGID=106`.
 
-### 8. Register in PostgreSQL
+Call `MyApp_DropPriv()` as the **first line** inside each `IfCondition EqualTo(pid, 0)` block (Xvfb fork, app fork, xdotool fork).
+
+### 8. Configure Cleanup
+
+The `CleanupStale` function kills orphaned processes from prior crashes. Use PID files for reliable, targeted cleanup — **never** use broad `pkill` patterns (they kill desktop instances of the same app).
+
+**PID file system:**
+```ailang
+// Write PID file after fork
+MyApp_WritePidFile("/tmp/myapp_ailang_xvfb.pid", pid)
+MyApp_WritePidFile("/tmp/myapp_ailang_app.pid", pid)
+MyApp_WritePidFile("/tmp/myapp_ailang_xdotool.pid", pid)
+
+// In CleanupStale — read PID files and kill targeted processes
+pid = MyApp_ReadPidFile("/tmp/myapp_ailang_app.pid")
+IfCondition GreaterThan(pid, 1) ThenBlock: {
+    MyApp_KillGroup(pid)       // kill process group (setsid'd children)
+    MyApp_KillStalePid(pid, "MyApp")
+}
+// ... repeat for xdotool and xvfb PIDs ...
+
+MyApp_RemovePidFiles()   // clean up PID files
+
+// Remove fbdir and lock files
+SystemCall(MASys.SYS_UNLINK, "/tmp/myapp_fb/Xvfb_screen0", 0, 0, 0, 0)
+MyApp_ShellExec("rmdir /tmp/myapp_fb 2>/dev/null")
+SystemCall(MASys.SYS_UNLINK, "/tmp/.X97-lock", 0, 0, 0, 0)
+SystemCall(MASys.SYS_UNLINK, "/tmp/.X11-unix/X97", 0, 0, 0, 0)
+```
+
+**Process group kill** (`KillGroup`): Children call `setsid()`, so their PID equals their PGID. `kill(-pid, SIGKILL)` kills the entire group without touching desktop apps.
+
+**EPERM handling**: If a stale process is root-owned and we're running as user, `KillStalePid` prints an actionable error message: `"Run: sudo kill -9 <pid>"`.
+
+### 9. Register in PostgreSQL
 
 ```sql
 INSERT INTO services (name, binary_path, display_name, enabled)
@@ -184,7 +236,7 @@ VALUES ('myapp', './myapp_ipc.x', 'My App', true);
 
 This makes the app appear in the Start Menu.
 
-### 9. Build and Test
+### 10. Build and Test
 
 ```bash
 # Build
@@ -203,10 +255,13 @@ StoreValue(Add(argv, 0),  "/usr/bin/appname")
 StoreValue(Add(argv, 8),  "--no-sandbox")
 StoreValue(Add(argv, 16), "--disable-gpu")
 StoreValue(Add(argv, 24), "--disable-updates")
-StoreValue(Add(argv, 32), "--unity-launch")
+StoreValue(Add(argv, 32), "--new-window")
+StoreValue(Add(argv, 40), "--user-data-dir=/tmp/myapp_ailang_profile")
+StoreValue(Add(argv, 48), "--disable-dev-shm-usage")
+StoreValue(Add(argv, 56), "--disable-breakpad")
 ```
 
-Startup wait: 3 seconds. All Electron apps share the same flag pattern.
+Startup wait: 3 seconds. **Do NOT** use `--unity-launch` — it causes Electron to join the existing desktop instance instead of rendering in Xvfb. Use `--user-data-dir` to force an independent instance. `DropPriv()` is required — Electron refuses to run as root.
 
 ### GTK Apps (GIMP, Inkscape, etc.)
 
@@ -275,11 +330,14 @@ Startup wait: 500ms. No special flags needed.
 | Black screen | Increase startup wait time (app not ready before mmap) |
 | Input not working | Verify xdotool is installed, check DISPLAY in envp |
 | App crashes on start | Try `--no-sandbox --disable-gpu` flags |
-| Stale processes after crash | Kill manually: `sudo pkill -9 -f 'Xvfb :N'` |
+| Stale processes after crash | Check PID files in `/tmp/*_ailang_*.pid`, kill manually if EPERM |
 | Both Chrome and VSCode black | Each needs its own `-fbdir` directory |
-| Xvfb won't start | Check for stale `/tmp/.XN-lock` files |
+| Xvfb won't start | Check for stale `/tmp/.XN-lock` files, remove them |
 | Mouse feels laggy | Mouse moves are coalesced — this is by design |
 | Electron "GPU process isn't usable" | Add `--disable-gpu` to argv |
+| Electron refuses to run as root | Add `DropPriv()` call before execve in child fork |
+| App kills desktop instance | Use PID file cleanup, never broad `pkill` |
+| Root-owned fbdir won't clean | `sudo rm -rf /tmp/<app>_fb`, then restart |
 
 ## File Naming Convention
 
