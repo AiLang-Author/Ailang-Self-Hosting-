@@ -21,6 +21,8 @@ LibraryImport.Compiler.Frontend.AST.CASTTypes
 LibraryImport.Compiler.Frontend.AST.CASTCore
 LibraryImport.Compiler.CodeEmit.CEmitCoreArch
 LibraryImport.Compiler.Compile.Modules.CCompileScope
+// Needed for extern-call relocs in -kmod mode (see CompileFunc_ExternCall)
+LibraryImport.Compiler.Output.CELFKernelModule
 
 // =============================================================================
 // Library.CCompileFunc.ailang
@@ -602,13 +604,28 @@ Function.CompileFunc_UserCall {
         IfCondition EqualTo(node, 0) ThenBlock: {
             ReturnValue(0)
         }
-        
+
         // Get function name
         func_name = AST_GetData1(node)
-        
+
+        // Extern (kernel-module ABI) call?  In -kmod mode, route to the
+        // PLT32-reloc path. In ET_EXEC mode, calling an extern is a
+        // compile error — there's no linker to resolve the symbol.
+        ext_idx = Compile_FindExtern(func_name)
+        IfCondition GreaterEqual(ext_idx, 0) ThenBlock: {
+            IfCondition EqualTo(Compile.kmod_mode, 1) ThenBlock: {
+                ReturnValue(CompileFunc_ExternCall(node))
+            }
+            PrintMessage("[COMPILE] ERROR: call to ExternalKernelFunction '")
+            PrintMessage(func_name)
+            PrintMessage("' is only valid when compiling with -kmod\n")
+            Compile.error = 1
+            ReturnValue(0)
+        }
+
         // Look up the function label
         func_label = Compile_FindFunction(func_name)
-        
+
         IfCondition LessThan(func_label, 0) ThenBlock: {
             ReturnValue(0)
         }
@@ -1134,5 +1151,119 @@ Function.Compile_RegisterFunction {
         StoreValue(entry, name)
         StoreValue(Add(entry, 8), label)
         XArray.XPush(Compile.functions, entry)
+    }
+}
+
+// =============================================================================
+// EXTERN KERNEL FUNCTION REGISTRY
+//
+// Compile.externs is parallel to Compile.functions but holds names only;
+// extern calls have no local label — codegen emits a PLT32 reloc and
+// the .ko's linker (insmod) resolves the symbol against the C shim.
+// =============================================================================
+Function.Compile_RegisterExtern {
+    Input: name: Address
+    Body: {
+        XArray.XPush(Compile.externs, name)
+    }
+}
+
+// Returns the 0-based index of `name` in Compile.externs, or -1 if absent.
+Function.Compile_FindExtern {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        count = XArray.XSize(Compile.externs)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            stored = XArray.XGet(Compile.externs, i)
+            IfCondition EqualTo(StringCompare(name, stored), 0) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// EXTERN CALL EMISSION (kmod-mode only)
+//
+// Mirrors the SysV AMD64 arg-loading + R12 stack dance of CompileFunc_UserCall,
+// but the call instruction is a 5-byte placeholder (E8 00 00 00 00) backed by
+// an R_X86_64_PLT32 relocation. insmod patches the 4-byte displacement to
+// reach the C-shim implementation at module load time.
+//
+// Addend = -4 because the rel32 displacement is measured from the END of
+// the operand (the byte after the displacement), not from the start of the
+// instruction. Get this wrong and every extern call lands 4 bytes off.
+// =============================================================================
+Function.CompileFunc_ExternCall {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        func_name = AST_GetData1(node)
+        arg_count = AST_GetChildCount(node)
+
+        IfCondition EqualTo(arg_count, 1) ThenBlock: {
+            arg = AST_GetChild(node, 0)
+            Compile_Expression(arg)
+            Emit_MovRdiRax()
+        } ElseBlock: {
+            IfCondition GreaterThan(arg_count, 1) ThenBlock: {
+                i = Subtract(arg_count, 1)
+                WhileLoop GreaterEqual(i, 0) {
+                    arg = AST_GetChild(node, i)
+                    Compile_Expression(arg)
+                    Emit_PushRax()
+                    i = Subtract(i, 1)
+                }
+                IfCondition GreaterEqual(arg_count, 1) ThenBlock: { Emit_PopRdi() }
+                IfCondition GreaterEqual(arg_count, 2) ThenBlock: { Emit_PopRsi() }
+                IfCondition GreaterEqual(arg_count, 3) ThenBlock: { Emit_PopRdx() }
+                IfCondition GreaterEqual(arg_count, 4) ThenBlock: { Emit_PopRcx() }
+                IfCondition GreaterEqual(arg_count, 5) ThenBlock: { Emit_PopR8()  }
+                IfCondition GreaterEqual(arg_count, 6) ThenBlock: { Emit_PopR9()  }
+            }
+        }
+
+        // R12 saves RSP across the call (mirrors local-call path).
+        Emit_MovRegReg(Reg.R12, Reg.RSP)
+        Emit_AndRspImm8(240)
+
+        // Stage the extern in the kmod export table (idempotent: dedup by name
+        // via Compile_FindExtern, which already gave us the parser-side index;
+        // KMod_StageExtern does its own append, so we look up first to dedup
+        // across multiple call sites to the same extern).
+        kmod_xidx = KMod_FindOrStageExtern(func_name)
+
+        // Emit `call rel32` placeholder. The 4 zero bytes are the
+        // displacement that insmod will patch.
+        Emit_Byte(232)            // E8 — call near, rel32
+        reloc_off = Emit_GetPosition()
+        Emit_Byte(0)
+        Emit_Byte(0)
+        Emit_Byte(0)
+        Emit_Byte(0)
+
+        KMod_StageReloc(reloc_off, kmod_xidx, RelocType.R_X86_64_PLT32, -4)
+
+        Emit_MovRegReg(Reg.RSP, Reg.R12)
+
+        IfCondition GreaterThan(arg_count, 6) ThenBlock: {
+            stack_args = Subtract(arg_count, 6)
+            stack_bytes = Multiply(stack_args, 8)
+            Emit_AddRspImm32(stack_bytes)
+        }
+
+        Compile.nodes_compiled = Add(Compile.nodes_compiled, 1)
+        ReturnValue(1)
     }
 }
