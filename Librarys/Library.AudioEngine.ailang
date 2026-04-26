@@ -1,0 +1,798 @@
+// Library.AudioEngine.ailang
+// Direct ALSA kernel interface — no userspace library, just syscalls.
+// Opens /dev/snd/pcmC0D0p, configures S16LE 48kHz stereo via ioctl,
+// exposes write functions for PCM data.
+//
+// 3-bus mixer architecture:
+//   - Master bus: final output to hardware, master volume
+//   - App bus: per-application audio (video player, etc.)
+//   - System bus: system event sounds (notifications, UI)
+//
+// Mix formula per sample:
+//   out = clamp16( (app_sample * app_vol + sys_sample * sys_vol) / 256 * master_vol / 256 )
+//
+// Volume: 0-1024 fixed-point (256 = 1.0x unity, 512 = 2.0x, 768 = 3.0x, 1024 = 4.0x)
+// Most media is mastered well below 0dBFS — gain >1.0x is required for normal listening.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// =============================================================================
+// ALSA IOCTL CONSTANTS — verified from kernel headers on x86_64
+// =============================================================================
+FixedPool.AlsaIoctl {
+    "HW_PARAMS":     Initialize=3261088017
+    "HW_REFINE":     Initialize=3261088016
+    "SW_PARAMS":     Initialize=3230155027
+    "PREPARE":       Initialize=16704
+    "START":         Initialize=16706
+    "DRAIN":         Initialize=16708
+    "DROP":          Initialize=16707
+    "WRITEI_FRAMES": Initialize=1075331408
+}
+
+// =============================================================================
+// ALSA STRUCT SIZES & OFFSETS
+// =============================================================================
+FixedPool.AlsaSize {
+    "HW_PARAMS":  Initialize=608
+    "SW_PARAMS":  Initialize=136
+    "XFERI":      Initialize=24
+    "MASK":       Initialize=32
+    "INTERVAL":   Initialize=12
+}
+
+// hw_params field offsets
+FixedPool.HWP {
+    "FLAGS":         Initialize=0
+    "MASK_ACCESS":   Initialize=4
+    "MASK_FORMAT":   Initialize=36
+    "MASK_SUBFMT":   Initialize=68
+    "INTV_BASE":     Initialize=260
+    "INTV_CHANNELS": Initialize=284
+    "INTV_RATE":     Initialize=296
+    "INTV_PERSIZE":  Initialize=320
+    "INTV_PERIODS":  Initialize=344
+    "INTV_BUFSIZE":  Initialize=368
+    "RMASK":         Initialize=512
+    "CMASK":         Initialize=516
+    "INFO":          Initialize=520
+    "RATE_NUM":      Initialize=528
+    "RATE_DEN":      Initialize=532
+    "FIFO_SIZE":     Initialize=536
+}
+
+// sw_params field offsets
+FixedPool.SWP {
+    "TSTAMP_MODE":      Initialize=0
+    "PERIOD_STEP":      Initialize=4
+    "AVAIL_MIN":        Initialize=16
+    "START_THRESHOLD":  Initialize=32
+    "STOP_THRESHOLD":   Initialize=40
+    "SILENCE_THRESHOLD": Initialize=48
+    "SILENCE_SIZE":     Initialize=56
+    "BOUNDARY":         Initialize=64
+}
+
+// xferi struct offsets
+FixedPool.XFR {
+    "RESULT": Initialize=0
+    "BUF":    Initialize=8
+    "FRAMES": Initialize=16
+}
+
+// PCM format/access constants
+FixedPool.AlsaFmt {
+    "ACCESS_RW_INTERLEAVED": Initialize=3
+    "FORMAT_S16_LE":         Initialize=2
+    "SUBFORMAT_STD":         Initialize=0
+}
+
+// =============================================================================
+// AUDIO ENGINE STATE
+// =============================================================================
+FixedPool.AudioState {
+    "fd":          Initialize=-1
+    "initialized": Initialize=0
+    "sample_rate": Initialize=48000
+    "channels":    Initialize=2
+    "period_size": Initialize=1024
+    "buffer_size": Initialize=4096
+    "frame_bytes": Initialize=4
+}
+
+// =============================================================================
+// MIXER STATE — 3-bus architecture
+// =============================================================================
+FixedPool.MixerState {
+    "master_vol":     Initialize=256
+    "app_vol":        Initialize=256
+    "sys_vol":        Initialize=256
+    "mix_buf":        Initialize=0
+    "mix_size":       Initialize=0
+    "mix_pending":    Initialize=0
+    "samples_written": Initialize=0
+}
+
+// Bus ring buffers
+FixedPool.AppBus {
+    "buf":        Initialize=0
+    "size":       Initialize=0
+    "write_pos":  Initialize=0
+    "read_pos":   Initialize=0
+}
+
+FixedPool.SysBus {
+    "buf":        Initialize=0
+    "size":       Initialize=0
+    "write_pos":  Initialize=0
+    "read_pos":   Initialize=0
+}
+
+// =============================================================================
+// SYSCALL WRAPPERS
+// =============================================================================
+FixedPool.AudioSys {
+    "SYS_OPEN":   Initialize=2
+    "SYS_CLOSE":  Initialize=3
+    "SYS_WRITE":  Initialize=1
+    "SYS_IOCTL":  Initialize=16
+    "SYS_FCNTL":  Initialize=72
+}
+
+FixedPool.AudioFcntl {
+    "F_GETFL":    Initialize=3
+    "F_SETFL":    Initialize=4
+    "O_NONBLOCK": Initialize=2048
+}
+
+// =============================================================================
+// SET INTERVAL — helper to set min/max/integer on a 12-byte snd_interval
+// =============================================================================
+Function.Audio_SetInterval {
+    Input: hwp:  Address
+    Input: off:  Integer
+    Input: val:  Integer
+    Body: {
+        ptr = Add(hwp, off)
+        StoreValue(ptr, val, "dword")
+        StoreValue(Add(ptr, 4), val, "dword")
+        StoreValue(Add(ptr, 8), 4, "dword")
+    }
+}
+
+// =============================================================================
+// SET INTERVAL RANGE — set min and max separately
+// =============================================================================
+Function.Audio_SetIntervalRange {
+    Input: hwp:  Address
+    Input: off:  Integer
+    Input: vmin: Integer
+    Input: vmax: Integer
+    Body: {
+        ptr = Add(hwp, off)
+        StoreValue(ptr, vmin, "dword")
+        StoreValue(Add(ptr, 4), vmax, "dword")
+        StoreValue(Add(ptr, 8), 4, "dword")
+    }
+}
+
+// =============================================================================
+// SET MASK BIT — set a single bit in a 32-byte snd_mask
+// =============================================================================
+Function.Audio_SetMaskBit {
+    Input: hwp:  Address
+    Input: off:  Integer
+    Input: bit:  Integer
+    Body: {
+        word_idx = Divide(bit, 32)
+        bit_idx  = Modulo(bit, 32)
+        ptr = Add(hwp, Add(off, Multiply(word_idx, 4)))
+        old = Dereference(ptr, "dword")
+        new_val = BitwiseOr(old, ShiftLeft(1, bit_idx))
+        StoreValue(ptr, new_val, "dword")
+    }
+}
+
+// =============================================================================
+// OPEN DEVICE — open /dev/snd/pcmC0D0p
+// =============================================================================
+Function.Audio_OpenDevice {
+    Output: Integer
+    Body: {
+        // O_RDWR|O_NONBLOCK = 2050 — non-blocking open so we fail fast
+        // if PipeWire/PulseAudio holds the device instead of hanging forever
+        fd = SystemCall(AudioSys.SYS_OPEN, "/dev/snd/pcmC0D0p", 2050, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[Audio] Failed to open /dev/snd/pcmC0D0p (fd=")
+            PrintNumber(fd)
+            PrintMessage(")\n")
+            ReturnValue(-1)
+        }
+        AudioState.fd = fd
+        PrintMessage("[Audio] Opened /dev/snd/pcmC0D0p fd=")
+        PrintNumber(fd)
+        PrintMessage("\n")
+        ReturnValue(fd)
+    }
+}
+
+// =============================================================================
+// CONFIGURE HW PARAMS — S16LE, 48kHz, stereo, period=1024, buffer=4096
+// =============================================================================
+Function.Audio_ConfigureHW {
+    Output: Integer
+    Body: {
+        fd = AudioState.fd
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(-1) }
+
+        // Allocate and zero-fill hw_params (608 bytes)
+        hwp = Allocate(608)
+        MemorySet(hwp, 0, 608)
+
+        // CRITICAL: Initialize ALL intervals to full range {min=0, max=UINT_MAX}
+        // A zeroed interval means "empty range" which causes EINVAL.
+        // 12 intervals starting at offset 260, each 12 bytes.
+        iidx = 0
+        WhileLoop LessThan(iidx, 12) {
+            ioff = Add(HWP.INTV_BASE, Multiply(iidx, 12))
+            StoreValue(Add(hwp, ioff), 0, "dword")
+            StoreValue(Add(hwp, Add(ioff, 4)), 4294967295, "dword")
+            StoreValue(Add(hwp, Add(ioff, 8)), 0, "dword")
+            iidx = Add(iidx, 1)
+        }
+
+        // Initialize ALL masks to all-1s (any value allowed)
+        // 3 masks × 32 bytes each starting at offset 4
+        MemorySet(Add(hwp, HWP.MASK_ACCESS), 255, 32)
+        MemorySet(Add(hwp, HWP.MASK_FORMAT), 255, 32)
+        MemorySet(Add(hwp, HWP.MASK_SUBFMT), 255, 32)
+
+        // Set rmask = 0xFFFFFFFF (request all params)
+        StoreValue(Add(hwp, HWP.RMASK), 4294967295, "dword")
+
+        // Now constrain the masks we care about:
+        // ACCESS mask: only bit 3 = RW_INTERLEAVED
+        MemorySet(Add(hwp, HWP.MASK_ACCESS), 0, 32)
+        Audio_SetMaskBit(hwp, HWP.MASK_ACCESS, AlsaFmt.ACCESS_RW_INTERLEAVED)
+
+        // FORMAT mask: only bit 2 = S16_LE
+        MemorySet(Add(hwp, HWP.MASK_FORMAT), 0, 32)
+        Audio_SetMaskBit(hwp, HWP.MASK_FORMAT, AlsaFmt.FORMAT_S16_LE)
+
+        // SUBFORMAT mask: only bit 0 = STD
+        MemorySet(Add(hwp, HWP.MASK_SUBFMT), 0, 32)
+        Audio_SetMaskBit(hwp, HWP.MASK_SUBFMT, AlsaFmt.SUBFORMAT_STD)
+
+        // Constrain intervals: exact values
+        Audio_SetInterval(hwp, HWP.INTV_CHANNELS, AudioState.channels)
+        Audio_SetInterval(hwp, HWP.INTV_RATE, AudioState.sample_rate)
+
+        // Period and buffer: prefer larger for fewer writes, less stutter
+        // period=1024 frames (21ms), buffer=8192 frames (170ms), 4-8 periods
+        Audio_SetIntervalRange(hwp, HWP.INTV_PERSIZE, 1024, 4096)
+        Audio_SetIntervalRange(hwp, HWP.INTV_BUFSIZE, 8192, 65536)
+        Audio_SetIntervalRange(hwp, HWP.INTV_PERIODS, 4, 16)
+
+        // ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hwp)
+        r = SystemCall(AudioSys.SYS_IOCTL, fd, AlsaIoctl.HW_PARAMS, hwp, 0, 0)
+        IfCondition LessThan(r, 0) ThenBlock: {
+            PrintMessage("[Audio] HW_PARAMS ioctl failed (")
+            PrintNumber(r)
+            PrintMessage(")\n")
+            Deallocate(hwp, 608)
+            ReturnValue(-1)
+        }
+
+        // Read back actual period/buffer size from kernel response
+        actual_period = Dereference(Add(hwp, HWP.INTV_PERSIZE), "dword")
+        actual_buffer = Dereference(Add(hwp, HWP.INTV_BUFSIZE), "dword")
+        actual_rate   = Dereference(Add(hwp, HWP.RATE_NUM), "dword")
+
+        AudioState.period_size = actual_period
+        AudioState.buffer_size = actual_buffer
+        // frame_bytes = channels * 2 (S16LE = 2 bytes per sample)
+        AudioState.frame_bytes = Multiply(AudioState.channels, 2)
+
+        PrintMessage("[Audio] HW configured: ")
+        PrintNumber(actual_rate)
+        PrintMessage("Hz stereo S16LE period=")
+        PrintNumber(actual_period)
+        PrintMessage(" buffer=")
+        PrintNumber(actual_buffer)
+        PrintMessage("\n")
+
+        Deallocate(hwp, 608)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CONFIGURE SW PARAMS — start threshold, avail_min
+// =============================================================================
+Function.Audio_ConfigureSW {
+    Output: Integer
+    Body: {
+        fd = AudioState.fd
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(-1) }
+
+        swp = Allocate(136)
+        MemorySet(swp, 0, 136)
+
+        // start_threshold = buffer_size (start when buffer is full)
+        StoreValue(Add(swp, SWP.START_THRESHOLD), AudioState.buffer_size)
+
+        // stop_threshold = buffer_size
+        StoreValue(Add(swp, SWP.STOP_THRESHOLD), AudioState.buffer_size)
+
+        // avail_min = period_size (wake when one period is available)
+        StoreValue(Add(swp, SWP.AVAIL_MIN), AudioState.period_size)
+
+        // period_step = 1
+        StoreValue(Add(swp, SWP.PERIOD_STEP), 1, "dword")
+
+        r = SystemCall(AudioSys.SYS_IOCTL, fd, AlsaIoctl.SW_PARAMS, swp, 0, 0)
+        IfCondition LessThan(r, 0) ThenBlock: {
+            PrintMessage("[Audio] SW_PARAMS ioctl failed (")
+            PrintNumber(r)
+            PrintMessage(")\n")
+            Deallocate(swp, 136)
+            ReturnValue(-1)
+        }
+
+        PrintMessage("[Audio] SW configured\n")
+        Deallocate(swp, 136)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PREPARE — prepare device for playback
+// =============================================================================
+Function.Audio_Prepare {
+    Output: Integer
+    Body: {
+        fd = AudioState.fd
+        r = SystemCall(AudioSys.SYS_IOCTL, fd, AlsaIoctl.PREPARE, 0, 0, 0)
+        IfCondition LessThan(r, 0) ThenBlock: {
+            PrintMessage("[Audio] PREPARE failed (")
+            PrintNumber(r)
+            PrintMessage(")\n")
+            ReturnValue(-1)
+        }
+        PrintMessage("[Audio] Prepared\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// WRITE FRAMES — write interleaved S16LE samples to device
+// =============================================================================
+Function.Audio_WriteFrames {
+    Input: buf:    Address
+    Input: frames: Integer
+    Output: Integer
+    Body: {
+        fd = AudioState.fd
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(-1) }
+
+        // Build snd_xferi struct (24 bytes)
+        xfr = Allocate(24)
+        StoreValue(Add(xfr, XFR.RESULT), 0)
+        StoreValue(Add(xfr, XFR.BUF), buf)
+        StoreValue(Add(xfr, XFR.FRAMES), frames)
+
+        r = SystemCall(AudioSys.SYS_IOCTL, fd, AlsaIoctl.WRITEI_FRAMES, xfr, 0, 0)
+
+        written = Dereference(Add(xfr, XFR.RESULT))
+        Deallocate(xfr, 24)
+
+        IfCondition LessThan(r, 0) ThenBlock: {
+            // EAGAIN (-11) = device busy, try again later (non-blocking)
+            IfCondition EqualTo(r, -11) ThenBlock: {
+                ReturnValue(0)
+            }
+            // EPIPE (-32) = underrun, need to re-prepare
+            IfCondition EqualTo(r, -32) ThenBlock: {
+                PrintMessage("[Audio] Underrun — re-preparing\n")
+                Audio_Prepare()
+                ReturnValue(0)
+            }
+            ReturnValue(r)
+        }
+        ReturnValue(written)
+    }
+}
+
+// =============================================================================
+// DRAIN — wait for all pending frames to play
+// =============================================================================
+Function.Audio_Drain {
+    Body: {
+        fd = AudioState.fd
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            SystemCall(AudioSys.SYS_IOCTL, fd, AlsaIoctl.DRAIN, 0, 0, 0)
+        }
+    }
+}
+
+// =============================================================================
+// DROP — immediately stop playback and discard buffer
+// =============================================================================
+Function.Audio_Drop {
+    Body: {
+        fd = AudioState.fd
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            SystemCall(AudioSys.SYS_IOCTL, fd, AlsaIoctl.DROP, 0, 0, 0)
+        }
+    }
+}
+
+// =============================================================================
+// CLOSE — close device, free resources
+// =============================================================================
+Function.Audio_Close {
+    Body: {
+        fd = AudioState.fd
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            Audio_Drain()
+            SystemCall(AudioSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            AudioState.fd = -1
+            PrintMessage("[Audio] Device closed\n")
+        }
+        AudioState.initialized = 0
+    }
+}
+
+// =============================================================================
+// MIXER — INIT RING BUFFERS
+// =============================================================================
+Function.Mixer_Init {
+    Body: {
+        // Ring buffers: 65536 bytes each (~340ms at 48kHz stereo S16LE)
+        // Matches ALSA hardware buffer request for consistent buffering
+        ring_size = 65536
+        AppBus.buf  = Allocate(ring_size)
+        AppBus.size = ring_size
+        AppBus.write_pos = 0
+        AppBus.read_pos  = 0
+        MemorySet(AppBus.buf, 0, ring_size)
+
+        SysBus.buf  = Allocate(ring_size)
+        SysBus.size = ring_size
+        SysBus.write_pos = 0
+        SysBus.read_pos  = 0
+        MemorySet(SysBus.buf, 0, ring_size)
+
+        // Mix output buffer: one period worth of frames
+        // period_size * frame_bytes = 1024 * 4 = 4096 bytes
+        mix_sz = Multiply(AudioState.period_size, AudioState.frame_bytes)
+        MixerState.mix_buf  = Allocate(mix_sz)
+        MixerState.mix_size = mix_sz
+        MemorySet(MixerState.mix_buf, 0, mix_sz)
+
+        PrintMessage("[Mixer] Init: ring=")
+        PrintNumber(ring_size)
+        PrintMessage(" mix=")
+        PrintNumber(mix_sz)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// MIXER — RING BUFFER AVAILABLE BYTES
+// =============================================================================
+Function.Mixer_Available {
+    Input: wp: Integer
+    Input: rp: Integer
+    Input: sz: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(wp, rp) ThenBlock: {
+            ReturnValue(Subtract(wp, rp))
+        }
+        ReturnValue(Add(Subtract(sz, rp), wp))
+    }
+}
+
+// =============================================================================
+// MIXER — WRITE TO APP BUS (apps call this to submit PCM)
+// =============================================================================
+Function.Mixer_AppWrite {
+    Input: data: Address
+    Input: bytes: Integer
+    Body: {
+        buf  = AppBus.buf
+        sz   = AppBus.size
+        wp   = AppBus.write_pos
+        i = 0
+        WhileLoop LessThan(i, bytes) {
+            SetByte(buf, wp, GetByte(data, i))
+            wp = Modulo(Add(wp, 1), sz)
+            i = Add(i, 1)
+        }
+        AppBus.write_pos = wp
+    }
+}
+
+// =============================================================================
+// MIXER — WRITE TO SYSTEM BUS (system sounds)
+// =============================================================================
+Function.Mixer_SysWrite {
+    Input: data: Address
+    Input: bytes: Integer
+    Body: {
+        buf  = SysBus.buf
+        sz   = SysBus.size
+        wp   = SysBus.write_pos
+        i = 0
+        WhileLoop LessThan(i, bytes) {
+            SetByte(buf, wp, GetByte(data, i))
+            wp = Modulo(Add(wp, 1), sz)
+            i = Add(i, 1)
+        }
+        SysBus.write_pos = wp
+    }
+}
+
+// =============================================================================
+// MIXER — READ SAMPLE FROM RING BUFFER (S16LE, returns signed 16-bit)
+// =============================================================================
+Function.Mixer_ReadSample {
+    Input: bus_buf:  Address
+    Input: bus_rp:   Integer
+    Input: bus_size: Integer
+    Output: Integer
+    Body: {
+        lo = GetByte(bus_buf, bus_rp)
+        hi = GetByte(bus_buf, Modulo(Add(bus_rp, 1), bus_size))
+        val = BitwiseOr(lo, ShiftLeft(hi, 8))
+        // Sign extend from 16-bit
+        IfCondition GreaterEqual(val, 32768) ThenBlock: {
+            val = Subtract(val, 65536)
+        }
+        ReturnValue(val)
+    }
+}
+
+// =============================================================================
+// MIXER — CLAMP TO S16 RANGE
+// =============================================================================
+Function.Mixer_Clamp16 {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(val, 32767) ThenBlock: { ReturnValue(32767) }
+        IfCondition LessThan(val, -32768) ThenBlock: { ReturnValue(-32768) }
+        ReturnValue(val)
+    }
+}
+
+// =============================================================================
+// MIXER — MIX ONE PERIOD into mix_buf from ring buffers
+// Returns 1 if a period was mixed, 0 if not enough data
+// =============================================================================
+Function.Mixer_MixOnePeriod {
+    Output: Integer
+    Body: {
+        period = AudioState.period_size
+        fbytes = AudioState.frame_bytes
+
+        app_avail = Mixer_Available(AppBus.write_pos, AppBus.read_pos, AppBus.size)
+        sys_avail = Mixer_Available(SysBus.write_pos, SysBus.read_pos, SysBus.size)
+
+        // Need a full period of audio on the app bus before mixing.
+        // Partial periods cause zero-padding → audible aliasing/buzzing.
+        period_bytes = Multiply(period, fbytes)
+        IfCondition LessThan(app_avail, period_bytes) ThenBlock: {
+            // Not enough app audio — check system bus as fallback
+            IfCondition LessThan(sys_avail, period_bytes) ThenBlock: {
+                ReturnValue(0)
+            }
+        }
+
+        mix  = MixerState.mix_buf
+        mvol = MixerState.master_vol
+        avol = MixerState.app_vol
+        svol = MixerState.sys_vol
+
+        total_samples = Multiply(period, AudioState.channels)
+        app_rp = AppBus.read_pos
+        sys_rp = SysBus.read_pos
+
+        i = 0
+        WhileLoop LessThan(i, total_samples) {
+            app_s = 0
+            IfCondition GreaterEqual(app_avail, 2) ThenBlock: {
+                app_s = Mixer_ReadSample(AppBus.buf, app_rp, AppBus.size)
+                app_rp = Modulo(Add(app_rp, 2), AppBus.size)
+                app_avail = Subtract(app_avail, 2)
+            }
+
+            sys_s = 0
+            IfCondition GreaterEqual(sys_avail, 2) ThenBlock: {
+                sys_s = Mixer_ReadSample(SysBus.buf, sys_rp, SysBus.size)
+                sys_rp = Modulo(Add(sys_rp, 2), SysBus.size)
+                sys_avail = Subtract(sys_avail, 2)
+            }
+
+            mixed = Divide(Add(Multiply(app_s, avol), Multiply(sys_s, svol)), 256)
+            mixed = Divide(Multiply(mixed, mvol), 256)
+            mixed = Mixer_Clamp16(mixed)
+
+            IfCondition LessThan(mixed, 0) ThenBlock: {
+                mixed = Add(mixed, 65536)
+            }
+
+            off = Multiply(i, 2)
+            SetByte(mix, off, BitwiseAnd(mixed, 255))
+            SetByte(mix, Add(off, 1), BitwiseAnd(ShiftRight(mixed, 8), 255))
+
+            i = Add(i, 1)
+        }
+
+        AppBus.read_pos = app_rp
+        SysBus.read_pos = sys_rp
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// MIXER — DRAIN: mix and write as many periods as possible
+// Loops until ring buffer is empty or ALSA returns EAGAIN
+// =============================================================================
+Function.Mixer_DrainTick {
+    Output: Integer
+    Body: {
+        fd = AudioState.fd
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        periods_written = 0
+        period = AudioState.period_size
+
+        // Write up to 8 periods per drain call
+        WhileLoop LessThan(periods_written, 8) {
+            // If we have a pending mixed period from a previous EAGAIN, retry it
+            IfCondition EqualTo(MixerState.mix_pending, 0) ThenBlock: {
+                got = Mixer_MixOnePeriod()
+                IfCondition EqualTo(got, 0) ThenBlock: {
+                    // No more data in ring buffers
+                    ReturnValue(periods_written)
+                }
+                MixerState.mix_pending = 1
+            }
+            r = Audio_WriteFrames(MixerState.mix_buf, period)
+            IfCondition LessEqual(r, 0) ThenBlock: {
+                // EAGAIN or error — keep mix_pending=1 so we retry next call
+                ReturnValue(periods_written)
+            }
+            MixerState.mix_pending = 0
+            periods_written = Add(periods_written, 1)
+            // Audio clock: track total frames pushed to hardware.
+            // Apps use this to sync video frame presentation.
+            MixerState.samples_written = Add(MixerState.samples_written, period)
+        }
+        ReturnValue(periods_written)
+    }
+}
+
+// =============================================================================
+// MIXER — AUDIO CLOCK: returns total frames written to ALSA since last reset
+// This is the master clock for A/V sync. Audio hardware crystal = truth.
+// =============================================================================
+Function.Mixer_GetSamplesWritten {
+    Output: Integer
+    Body: {
+        ReturnValue(MixerState.samples_written)
+    }
+}
+
+Function.Mixer_ResetClock {
+    Body: {
+        MixerState.samples_written = 0
+    }
+}
+
+// =============================================================================
+// VOLUME CONTROL
+// =============================================================================
+Function.Mixer_SetMasterVol {
+    Input: vol: Integer
+    Body: {
+        IfCondition LessThan(vol, 0) ThenBlock: { vol = 0 }
+        IfCondition GreaterThan(vol, 1024) ThenBlock: { vol = 1024 }
+        MixerState.master_vol = vol
+    }
+}
+
+Function.Mixer_SetAppVol {
+    Input: vol: Integer
+    Body: {
+        IfCondition LessThan(vol, 0) ThenBlock: { vol = 0 }
+        IfCondition GreaterThan(vol, 1024) ThenBlock: { vol = 1024 }
+        MixerState.app_vol = vol
+    }
+}
+
+Function.Mixer_SetSysVol {
+    Input: vol: Integer
+    Body: {
+        IfCondition LessThan(vol, 0) ThenBlock: { vol = 0 }
+        IfCondition GreaterThan(vol, 1024) ThenBlock: { vol = 1024 }
+        MixerState.sys_vol = vol
+    }
+}
+
+// =============================================================================
+// INIT — full audio engine startup
+// =============================================================================
+Function.Audio_Init {
+    Output: Integer
+    Body: {
+        PrintMessage("[Audio] Initializing ALSA engine...\n")
+
+        r = Audio_OpenDevice()
+        IfCondition LessThan(r, 0) ThenBlock: { ReturnValue(-1) }
+
+        r = Audio_ConfigureHW()
+        IfCondition LessThan(r, 0) ThenBlock: {
+            Audio_Close()
+            ReturnValue(-1)
+        }
+
+        r = Audio_ConfigureSW()
+        IfCondition LessThan(r, 0) ThenBlock: {
+            Audio_Close()
+            ReturnValue(-1)
+        }
+
+        r = Audio_Prepare()
+        IfCondition LessThan(r, 0) ThenBlock: {
+            Audio_Close()
+            ReturnValue(-1)
+        }
+
+        // Clear O_NONBLOCK — writes should block to pace with hardware clock.
+        // The open() used O_NONBLOCK to fail fast if device was busy,
+        // but now that we're configured, blocking writes give us natural
+        // audio clocking without underrun/EAGAIN cycling.
+        fd = AudioState.fd
+        fl = SystemCall(AudioSys.SYS_FCNTL, fd, AudioFcntl.F_GETFL, 0, 0, 0)
+        clean_fl = BitwiseAnd(fl, BitwiseNot(AudioFcntl.O_NONBLOCK))
+        SystemCall(AudioSys.SYS_FCNTL, fd, AudioFcntl.F_SETFL, clean_fl, 0, 0)
+
+        Mixer_Init()
+        AudioState.initialized = 1
+
+        PrintMessage("[Audio] Engine ready: 48kHz stereo S16LE → /dev/snd/pcmC0D0p\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SHUTDOWN — drain, close, free
+// =============================================================================
+Function.Audio_Shutdown {
+    Body: {
+        IfCondition EqualTo(AudioState.initialized, 0) ThenBlock: { ReturnValue(0) }
+
+        Audio_Close()
+
+        IfCondition NotEqual(AppBus.buf, 0) ThenBlock: {
+            Deallocate(AppBus.buf, AppBus.size)
+            AppBus.buf = 0
+        }
+        IfCondition NotEqual(SysBus.buf, 0) ThenBlock: {
+            Deallocate(SysBus.buf, SysBus.size)
+            SysBus.buf = 0
+        }
+        IfCondition NotEqual(MixerState.mix_buf, 0) ThenBlock: {
+            Deallocate(MixerState.mix_buf, MixerState.mix_size)
+            MixerState.mix_buf = 0
+        }
+
+        PrintMessage("[Audio] Shutdown complete\n")
+    }
+}

@@ -80,6 +80,25 @@ Calculator maintains `expr_buf` (64 bytes) + `expr_len` in `CalcState`. Digits a
 | 04-25 | Shared memory canvas | Zero-copy pixel streaming: app mmaps `/dev/shm`, server blits from same mapping |
 | 04-25 | Canvas demo | Animated BGRA gradient proves shm pipeline end-to-end |
 | 04-25 | Video player adapter | fork/exec ffmpeg, pipe() + dup2() stdout capture, raw BGRA → shm canvas, SIGSTOP/SIGCONT |
+| 04-26 | Audio engine volume fix | Max gain 256→1024 (4x), ffmpeg `-af volume=2.0` pre-boost, fixed 27x gain stacking |
+| 04-26 | Second-replay audio fix | `Audio_Drop` leaves ALSA in SETUP state — added `Audio_Prepare` + ring buffer reset |
+| 04-26 | Audio-driven frame sync | `Mixer_GetSamplesWritten` audio clock, video presents only when `audio_pos/1600 >= frames_presented`, frame drop/hold |
+
+## Audio Engine & A/V Sync
+
+Direct ALSA kernel interface — no PulseAudio, no PipeWire, just syscalls to `/dev/snd/pcmC0D0p`. PipeWire/Pulse disabled: `systemctl --user disable --now pipewire.socket pipewire-pulse.socket`.
+
+**Format:** S16LE, 48kHz, stereo. Period 1024-4096 frames, buffer 8192-65536 frames.
+
+**3-bus mixer:** App bus (video/media), System bus (UI sounds), Master volume. Ring buffers (65536 bytes each). Mix formula: `out = clamp16((app_s * app_vol + sys_s * sys_vol) / 256 * master_vol / 256)`. Volume range 0-1024 (256 = unity, 1024 = 4x gain).
+
+**Gain chain:** ffmpeg `-af volume=2.0` (float precision pre-boost) → app_vol 256 (unity) → master_vol 256 (unity, user-adjustable via Up/Down keys). Total default: 2x. Max possible: 2 × 4 × 4 = 32x.
+
+**Audio-driven frame sync:** ALSA hardware crystal = master clock. `Mixer_DrainTick` increments `samples_written` per period pushed to hardware. Video player calculates `expected_frame = audio_pos / 1600` (= samples / (48000/30fps)). Present when `expected >= presented`, drop frames if behind by >2, hold if ahead.
+
+**Replay fix:** `Audio_Drop()` → ALSA SETUP state. Must call `Audio_Prepare()` + reset ring buffer positions + clear `mix_pending` + `Mixer_ResetClock()` before next playback.
+
+**Key bindings (video player):** Space=play/pause, S=stop, Up/Down=volume ±64 (range 0-1024), M=mute/unmute.
 
 ## Shared Memory Canvas System
 
@@ -137,7 +156,7 @@ Seeded services: notepad (`internal:win.new`), files (`internal:app.files`), cal
 
 Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts), `windows` (state persistence), `encryption_keys` (per-service keys), `service_status` (runtime state — not yet populated).
 
-## Current State (2026-04-25)
+## Current State (2026-04-26)
 
 ### What's Working
 
@@ -149,7 +168,10 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 - Grep IPC app: hardware keyboard capture, regex/fixed search, file selection, results streaming
 - Shared memory canvas: zero-copy pixel streaming via `/dev/shm`, app writes BGRA, server blits
 - Canvas demo: animated gradient proves shm pipeline end-to-end
-- Video player: fork/exec ffmpeg, pipe stdout raw BGRA frames to shm canvas, SIGSTOP/SIGCONT pause
+- Video player: fork/exec ffmpeg, dual-pipe (video+audio), shm canvas, SIGSTOP/SIGCONT pause
+- Audio engine: direct ALSA kernel interface (`/dev/snd/pcmC0D0p`), 3-bus mixer, S16LE 48kHz stereo
+- Audio-driven frame sync: `samples_written` audio clock, video holds/drops frames to match audio position
+- Volume control: 0-1024 range (256=unity, 1024=4x), ffmpeg `-af volume=2.0` pre-boost, Up/Down/M keys
 - HTML toolbar system: `toolbar="about|file|full|none"`, per-app toolbar presets
 - About dialog: system info, copyright, close button
 - File dialog: full file browser with directory traversal
@@ -159,6 +181,7 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 - FB_InitHeadless: test binaries opt into headless mode, real FB is default
 - 71-step headless stress test: resize + debug + start menu + IPC + calc + about + filedialog + notepad + keyboard
 - 0 analyzer errors, 10/10 calc tests, all headless tests pass
+- SysDisplay.x binary: ~665KB total (display server + audio engine + all libraries)
 
 ### Build & Run
 
@@ -188,7 +211,8 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 
 ### Pending Work
 
-- **Video player testing** — test on TTY2 with real video file, debug any pipe/frame issues
+- **Audio fine-tuning** — test volume/clipping on TTY2 with various media files, dial in gain chain
+- **Audio engine split** — extract AudioEngine from display server into standalone audio.ailang service
 - **ffmpeg command pipe** — modified ffmpeg with control pipe for seek/jump (user downloading from git)
 - **Video player seek** — FF/RW buttons need command pipe or restart-with-offset approach
 - **Grep file dialog** — replace hardcoded file list with proper file browser dialog

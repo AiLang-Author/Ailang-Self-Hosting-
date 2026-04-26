@@ -1,12 +1,15 @@
 // videoplayer.ailang
-// IPC video player — decodes media via ffmpeg, renders frames into
-// a shared memory canvas for the display server to blit.
+// IPC video player — decodes media via ffmpeg, renders video frames into
+// a shared memory canvas + routes audio through the 3-bus ALSA mixer.
 //
 // Architecture:
-//   - fork/exec ffmpeg with: -f rawvideo -pix_fmt bgra -s WxH pipe:1
-//   - pipe() + dup2() capture ffmpeg's stdout
-//   - Read loop: read frame_size bytes from pipe into shm canvas buffer
-//   - canvas.present each frame to display server
+//   - fork/exec ffmpeg with TWO pipes:
+//       stdout (pipe:1)  → raw BGRA video frames
+//       fd 4   (pipe:4)  → raw S16LE 48kHz stereo PCM audio
+//   - Both pipes non-blocking. -re flag paces ffmpeg at native rate.
+//   - Steady 2ms tick services BOTH audio and video every iteration.
+//   - Audio: pipe → ring buffer → mixer → ALSA (steady feed, never starved)
+//   - Video: accumulate partial reads → present when full frame ready
 //   - SIGSTOP/SIGCONT for pause/resume, SIGTERM for stop
 //
 // Protocol:
@@ -14,11 +17,12 @@
 //   2. Register as "videoplayer"
 //   3. Create window with config/videoplayer.html
 //   4. Create shm canvas 640x480
-//   5. On v.play:  fork ffmpeg → pipe → read frames → present
-//   6. On v.paus:  kill(pid, SIGSTOP)
-//   7. On v.play (resume): kill(pid, SIGCONT)
-//   8. On v.stop:  kill(pid, SIGTERM), close pipe
-//   9. On window.closed: cleanup, exit
+//   5. Init ALSA audio engine (graceful fallback to video-only)
+//   6. On v.play:  fork ffmpeg → 2 pipes → read frames + audio → present
+//   7. On v.paus:  kill(pid, SIGSTOP)
+//   8. On v.play (resume): kill(pid, SIGCONT)
+//   9. On v.stop:  kill(pid, SIGTERM), close pipes, Audio_Drop
+//  10. On window.closed: cleanup, Audio_Shutdown, exit
 //
 // Build: ./ailang.x Testcode/videoplayer.ailang videoplayer.x
 // Run:   ./videoplayer.x  (after SysDisplay.x is running)
@@ -31,6 +35,7 @@ LibraryImport.StringUtils
 LibraryImport.JSON
 LibraryImport.HashMap
 LibraryImport.ShmCanvas
+LibraryImport.AudioEngine
 
 // =============================================================================
 // SYSCALL CONSTANTS
@@ -38,14 +43,22 @@ LibraryImport.ShmCanvas
 FixedPool.VPSys {
     "SYS_READ":      Initialize=0
     "SYS_CLOSE":     Initialize=3
+    "SYS_IOCTL":     Initialize=16
     "SYS_PIPE":      Initialize=22
     "SYS_DUP2":      Initialize=33
+    "SYS_FCNTL":     Initialize=72
     "SYS_FORK":      Initialize=57
     "SYS_EXECVE":    Initialize=59
     "SYS_EXIT":      Initialize=60
     "SYS_KILL":      Initialize=62
     "SYS_WAIT4":     Initialize=61
-    "SYS_NANOSLEEP": Initialize=35
+    "SYS_NANOSLEEP":   Initialize=35
+}
+
+FixedPool.VPFcntl {
+    "F_GETFL":      Initialize=3
+    "F_SETFL":      Initialize=4
+    "O_NONBLOCK":   Initialize=2048
 }
 
 FixedPool.VPSignal {
@@ -59,17 +72,26 @@ FixedPool.VPSignal {
 // STATE
 // =============================================================================
 FixedPool.VPState {
-    "running":    Initialize=1
-    "win_id":     Initialize=0
-    "sock":       Initialize=0
-    "canvas_w":   Initialize=640
-    "canvas_h":   Initialize=480
-    "ffmpeg_pid": Initialize=0
-    "pipe_rd":    Initialize=-1
-    "playing":    Initialize=0
-    "paused":     Initialize=0
-    "frame_num":  Initialize=0
-    "file_path":  Initialize=0
+    "running":      Initialize=1
+    "win_id":       Initialize=0
+    "sock":         Initialize=0
+    "canvas_w":     Initialize=640
+    "canvas_h":     Initialize=480
+    "ffmpeg_pid":   Initialize=0
+    "pipe_rd":      Initialize=-1
+    "audio_pipe_rd": Initialize=-1
+    "playing":      Initialize=0
+    "paused":       Initialize=0
+    "frame_num":    Initialize=0
+    "file_path":    Initialize=0
+    "audio_buf":    Initialize=0
+    "audio_ok":     Initialize=0
+    "frame_size":     Initialize=0
+    "vid_got":        Initialize=0
+    "vid_fps":        Initialize=30
+    "vid_ready":      Initialize=0
+    "frames_presented": Initialize=0
+    "frames_dropped":   Initialize=0
 }
 
 // =============================================================================
@@ -151,25 +173,50 @@ Function.VP_SetLabel {
 }
 
 // =============================================================================
-// READ EXACT — read exactly n bytes from fd (handles partial reads)
+// READ VIDEO TICK — non-blocking partial frame accumulation.
+// Called every 2ms tick. Reads whatever bytes are available from the video
+// pipe and accumulates into the canvas buffer.
+// Returns:  1 = full frame ready (present it)
+//           0 = partial (more data needed, keep ticking)
+//          -1 = EOF / pipe closed (playback finished)
 // =============================================================================
-Function.VP_ReadExact {
-    Input: fd: Integer
-    Input: buf: Address
-    Input: total: Integer
+Function.VP_ReadVideoTick {
     Output: Integer
     Body: {
-        got = 0
-        WhileLoop LessThan(got, total) {
-            remain = Subtract(total, got)
-            n = SystemCall(VPSys.SYS_READ, fd, Add(buf, got), remain)
-            IfCondition LessEqual(n, 0) ThenBlock: {
-                // EOF or error
+        rd = VPState.pipe_rd
+        IfCondition LessThan(rd, 0) ThenBlock: { ReturnValue(-1) }
+
+        buf = ShmCanvasState.buf
+        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(-1) }
+
+        fsize = VPState.frame_size
+        got = VPState.vid_got
+
+        // Read whatever is available (non-blocking, may return EAGAIN)
+        WhileLoop LessThan(got, fsize) {
+            remain = Subtract(fsize, got)
+            // Cap each read to 65536 to keep the tick short
+            IfCondition GreaterThan(remain, 65536) ThenBlock: {
+                remain = 65536
+            }
+            n = SystemCall(VPSys.SYS_READ, rd, Add(buf, got), remain)
+            IfCondition EqualTo(n, 0) ThenBlock: {
+                // EOF — pipe closed
+                VPState.vid_got = 0
                 ReturnValue(-1)
+            }
+            IfCondition LessThan(n, 0) ThenBlock: {
+                // EAGAIN — no more data right now
+                VPState.vid_got = got
+                ReturnValue(0)
             }
             got = Add(got, n)
         }
-        ReturnValue(got)
+
+        // Full frame accumulated
+        VPState.vid_got = 0
+        VPState.frame_num = Add(VPState.frame_num, 1)
+        ReturnValue(1)
     }
 }
 
@@ -197,26 +244,78 @@ Function.VP_BuildSizeStr {
 // =============================================================================
 // BUILD FFMPEG ARGV
 // =============================================================================
-// ffmpeg -i <file> -f rawvideo -pix_fmt bgra -s WxH -v quiet pipe:1
-Function.VP_BuildArgv {
+// Video-only: ffmpeg -re -i <file> -f rawvideo -pix_fmt bgra -s WxH -v quiet pipe:1
+// -re reads input at native rate — this paces raw pipe output to the file's fps.
+Function.VP_BuildArgvVideoOnly {
     Input: filepath: Address
     Output: Integer
     Body: {
         size_str = VP_BuildSizeStr()
-        argv = Allocate(104)
+        // 14 arg pointers + null = 15 * 8 = 120 bytes
+        argv = Allocate(120)
         StoreValue(Add(argv, 0),  "/usr/bin/ffmpeg")
-        StoreValue(Add(argv, 8),  "-i")
-        StoreValue(Add(argv, 16), filepath)
-        StoreValue(Add(argv, 24), "-f")
-        StoreValue(Add(argv, 32), "rawvideo")
-        StoreValue(Add(argv, 40), "-pix_fmt")
-        StoreValue(Add(argv, 48), "bgra")
-        StoreValue(Add(argv, 56), "-s")
-        StoreValue(Add(argv, 64), size_str)
-        StoreValue(Add(argv, 72), "-v")
-        StoreValue(Add(argv, 80), "quiet")
-        StoreValue(Add(argv, 88), "pipe:1")
-        StoreValue(Add(argv, 96), 0)
+        StoreValue(Add(argv, 8),  "-re")
+        StoreValue(Add(argv, 16), "-i")
+        StoreValue(Add(argv, 24), filepath)
+        StoreValue(Add(argv, 32), "-an")
+        StoreValue(Add(argv, 40), "-f")
+        StoreValue(Add(argv, 48), "rawvideo")
+        StoreValue(Add(argv, 56), "-pix_fmt")
+        StoreValue(Add(argv, 64), "bgra")
+        StoreValue(Add(argv, 72), "-s")
+        StoreValue(Add(argv, 80), size_str)
+        StoreValue(Add(argv, 88), "-v")
+        StoreValue(Add(argv, 96), "quiet")
+        StoreValue(Add(argv, 104), "pipe:1")
+        StoreValue(Add(argv, 112), 0)
+        ReturnValue(argv)
+    }
+}
+
+// Video + Audio:
+// ffmpeg -re -i <file> -map 0:v -f rawvideo -pix_fmt bgra -s WxH pipe:1
+//        -map 0:a -af volume=3.0 -f s16le -ar 48000 -ac 2 pipe:4  -v quiet
+// -re reads input at native rate — paces BOTH video and audio output.
+// -af volume=2.0 pre-boosts audio at decode stage in float precision (clean).
+// Most media is mastered well below 0dBFS. Software mixer stays near unity;
+// user adjusts master_vol (Up/Down keys) from there.
+Function.VP_BuildArgvAV {
+    Input: filepath: Address
+    Output: Integer
+    Body: {
+        size_str = VP_BuildSizeStr()
+        // 26 arg pointers + null terminator = 27 * 8 = 216 bytes
+        argv = Allocate(216)
+        StoreValue(Add(argv, 0),   "/usr/bin/ffmpeg")
+        StoreValue(Add(argv, 8),   "-re")
+        StoreValue(Add(argv, 16),  "-i")
+        StoreValue(Add(argv, 24),  filepath)
+        // Video output: stdout
+        StoreValue(Add(argv, 32),  "-map")
+        StoreValue(Add(argv, 40),  "0:v:0")
+        StoreValue(Add(argv, 48),  "-f")
+        StoreValue(Add(argv, 56),  "rawvideo")
+        StoreValue(Add(argv, 64),  "-pix_fmt")
+        StoreValue(Add(argv, 72),  "bgra")
+        StoreValue(Add(argv, 80),  "-s")
+        StoreValue(Add(argv, 88),  size_str)
+        StoreValue(Add(argv, 96),  "pipe:1")
+        // Audio output: fd 4, with volume pre-boost
+        StoreValue(Add(argv, 104), "-map")
+        StoreValue(Add(argv, 112), "0:a:0?")
+        StoreValue(Add(argv, 120), "-af")
+        StoreValue(Add(argv, 128), "volume=2.0")
+        StoreValue(Add(argv, 136), "-f")
+        StoreValue(Add(argv, 144), "s16le")
+        StoreValue(Add(argv, 152), "-ar")
+        StoreValue(Add(argv, 160), "48000")
+        StoreValue(Add(argv, 168), "-ac")
+        StoreValue(Add(argv, 176), "2")
+        StoreValue(Add(argv, 184), "pipe:4")
+        // Quiet mode
+        StoreValue(Add(argv, 192), "-v")
+        StoreValue(Add(argv, 200), "quiet")
+        StoreValue(Add(argv, 208), 0)
         ReturnValue(argv)
     }
 }
@@ -233,48 +332,78 @@ Function.VP_LaunchFFmpeg {
             ReturnValue(-1)
         }
 
-        // Create pipe: pipefds[0]=read, pipefds[1]=write
+        // Create video pipe: pipefds[0]=read, pipefds[1]=write
         pipefds = Allocate(8)
         pr = SystemCall(VPSys.SYS_PIPE, pipefds, 0, 0, 0, 0)
         IfCondition LessThan(pr, 0) ThenBlock: {
-            PrintMessage("[VP] pipe() failed\n")
+            PrintMessage("[VP] video pipe() failed\n")
             Deallocate(pipefds, 8)
             ReturnValue(-1)
         }
+        vid_read  = Dereference(pipefds, "dword")
+        vid_write = Dereference(Add(pipefds, 4), "dword")
 
-        // pipe() fills two 4-byte ints
-        read_fd  = Dereference(pipefds, "dword")
-        write_fd = Dereference(Add(pipefds, 4), "dword")
+        // Create audio pipe ONLY if audio engine is available
+        aud_read  = -1
+        aud_write = -1
+        have_audio = VPState.audio_ok
+        IfCondition EqualTo(have_audio, 1) ThenBlock: {
+            pr2 = SystemCall(VPSys.SYS_PIPE, pipefds, 0, 0, 0, 0)
+            IfCondition GreaterEqual(pr2, 0) ThenBlock: {
+                aud_read  = Dereference(pipefds, "dword")
+                aud_write = Dereference(Add(pipefds, 4), "dword")
+            } ElseBlock: {
+                PrintMessage("[VP] audio pipe() failed, video only\n")
+                have_audio = 0
+            }
+        }
         Deallocate(pipefds, 8)
 
-        PrintMessage("[VP] pipe created: read_fd=")
-        PrintNumber(read_fd)
-        PrintMessage(" write_fd=")
-        PrintNumber(write_fd)
+        PrintMessage("[VP] pipes: vid_rd=")
+        PrintNumber(vid_read)
+        PrintMessage(" vid_wr=")
+        PrintNumber(vid_write)
+        IfCondition EqualTo(have_audio, 1) ThenBlock: {
+            PrintMessage(" aud_rd=")
+            PrintNumber(aud_read)
+            PrintMessage(" aud_wr=")
+            PrintNumber(aud_write)
+        }
         PrintMessage("\n")
 
         // Fork
         pid = SystemCall(VPSys.SYS_FORK, 0, 0, 0, 0, 0)
         IfCondition LessThan(pid, 0) ThenBlock: {
             PrintMessage("[VP] fork() failed\n")
-            SystemCall(VPSys.SYS_CLOSE, read_fd, 0, 0, 0, 0)
-            SystemCall(VPSys.SYS_CLOSE, write_fd, 0, 0, 0, 0)
+            SystemCall(VPSys.SYS_CLOSE, vid_read, 0, 0, 0, 0)
+            SystemCall(VPSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
+            IfCondition EqualTo(have_audio, 1) ThenBlock: {
+                SystemCall(VPSys.SYS_CLOSE, aud_read, 0, 0, 0, 0)
+                SystemCall(VPSys.SYS_CLOSE, aud_write, 0, 0, 0, 0)
+            }
             ReturnValue(-1)
         }
 
         IfCondition EqualTo(pid, 0) ThenBlock: {
             // ===== CHILD PROCESS =====
-            // Close read end
-            SystemCall(VPSys.SYS_CLOSE, read_fd, 0, 0, 0, 0)
+            // Close parent's read ends
+            SystemCall(VPSys.SYS_CLOSE, vid_read, 0, 0, 0, 0)
 
-            // dup2(write_fd, 1) — redirect stdout to pipe write end
-            SystemCall(VPSys.SYS_DUP2, write_fd, 1, 0, 0, 0)
+            // dup2(vid_write, 1) — stdout = video pipe
+            SystemCall(VPSys.SYS_DUP2, vid_write, 1, 0, 0, 0)
+            SystemCall(VPSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
 
-            // Close original write_fd (now stdout IS the write end)
-            SystemCall(VPSys.SYS_CLOSE, write_fd, 0, 0, 0, 0)
+            IfCondition EqualTo(have_audio, 1) ThenBlock: {
+                SystemCall(VPSys.SYS_CLOSE, aud_read, 0, 0, 0, 0)
+                // dup2(aud_write, 4) — fd 4 = audio pipe
+                SystemCall(VPSys.SYS_DUP2, aud_write, 4, 0, 0, 0)
+                SystemCall(VPSys.SYS_CLOSE, aud_write, 0, 0, 0, 0)
+                argv = VP_BuildArgvAV(filepath)
+            } ElseBlock: {
+                argv = VP_BuildArgvVideoOnly(filepath)
+            }
 
-            // Build argv and exec ffmpeg
-            argv = VP_BuildArgv(filepath)
+            // exec ffmpeg
             SystemCall(VPSys.SYS_EXECVE, "/usr/bin/ffmpeg", argv, 0)
 
             // If execve returns, something went wrong
@@ -283,19 +412,44 @@ Function.VP_LaunchFFmpeg {
         }
 
         // ===== PARENT PROCESS =====
-        // Close write end (only ffmpeg writes)
-        SystemCall(VPSys.SYS_CLOSE, write_fd, 0, 0, 0, 0)
+        // Close write ends (only ffmpeg writes)
+        SystemCall(VPSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
 
-        VPState.pipe_rd    = read_fd
-        VPState.ffmpeg_pid = pid
-        VPState.playing    = 1
-        VPState.paused     = 0
-        VPState.frame_num  = 0
+        IfCondition EqualTo(have_audio, 1) ThenBlock: {
+            SystemCall(VPSys.SYS_CLOSE, aud_write, 0, 0, 0, 0)
+            // Make audio pipe non-blocking so we can drain without stalling
+            flags = SystemCall(VPSys.SYS_FCNTL, aud_read, VPFcntl.F_GETFL, 0, 0, 0)
+            SystemCall(VPSys.SYS_FCNTL, aud_read, VPFcntl.F_SETFL, BitwiseOr(flags, VPFcntl.O_NONBLOCK), 0, 0)
+        }
+
+        // Video pipe also non-blocking — -re paces ffmpeg, we tick at 2ms
+        vflags = SystemCall(VPSys.SYS_FCNTL, vid_read, VPFcntl.F_GETFL, 0, 0, 0)
+        SystemCall(VPSys.SYS_FCNTL, vid_read, VPFcntl.F_SETFL, BitwiseOr(vflags, VPFcntl.O_NONBLOCK), 0, 0)
+
+        VPState.pipe_rd       = vid_read
+        VPState.audio_pipe_rd = aud_read
+        VPState.ffmpeg_pid    = pid
+        VPState.playing       = 1
+        VPState.paused        = 0
+        VPState.frame_num     = 0
+        VPState.vid_ready     = 0
+        VPState.frames_presented = 0
+        VPState.frames_dropped   = 0
+        VPState.frame_size    = Multiply(Multiply(VPState.canvas_w, VPState.canvas_h), 4)
+
+        // Reset audio clock — this is the A/V sync master
+        Mixer_ResetClock()
 
         PrintMessage("[VP] ffmpeg launched pid=")
         PrintNumber(pid)
-        PrintMessage(" reading from fd=")
-        PrintNumber(read_fd)
+        PrintMessage(" vid_fd=")
+        PrintNumber(vid_read)
+        IfCondition EqualTo(have_audio, 1) ThenBlock: {
+            PrintMessage(" aud_fd=")
+            PrintNumber(aud_read)
+        } ElseBlock: {
+            PrintMessage(" (video only)")
+        }
         PrintMessage("\n")
 
         ReturnValue(pid)
@@ -330,35 +484,85 @@ Function.VP_StopFFmpeg {
             SystemCall(VPSys.SYS_CLOSE, rd, 0, 0, 0, 0)
         }
 
-        VPState.ffmpeg_pid = 0
-        VPState.pipe_rd    = -1
-        VPState.playing    = 0
-        VPState.paused     = 0
+        ard = VPState.audio_pipe_rd
+        IfCondition GreaterEqual(ard, 0) ThenBlock: {
+            SystemCall(VPSys.SYS_CLOSE, ard, 0, 0, 0, 0)
+        }
+
+        // Drop any pending audio immediately, then re-prepare for next playback.
+        // Audio_Drop() leaves ALSA in SETUP state — WRITEI_FRAMES will return
+        // -EBADFD (-77) unless we re-prepare. Also flush ring buffers so stale
+        // PCM from previous file doesn't bleed into the next one.
+        IfCondition EqualTo(VPState.audio_ok, 1) ThenBlock: {
+            Audio_Drop()
+            Audio_Prepare()
+            AppBus.write_pos = 0
+            AppBus.read_pos  = 0
+            MixerState.mix_pending = 0
+            Mixer_ResetClock()
+        }
+
+        VPState.ffmpeg_pid    = 0
+        VPState.pipe_rd       = -1
+        VPState.audio_pipe_rd = -1
+        VPState.playing       = 0
+        VPState.paused        = 0
+        VPState.vid_got       = 0
+        VPState.vid_ready     = 0
+        VPState.frames_presented = 0
+        VPState.frames_dropped   = 0
     }
 }
 
 // =============================================================================
-// READ ONE FRAME — read w*h*4 bytes from pipe into shm canvas
+// DRAIN AUDIO — read available audio from pipe, feed to mixer
+// Non-blocking read: returns immediately if no data.
+// Reads up to 4096 bytes per call (one period worth).
 // =============================================================================
-Function.VP_ReadFrame {
-    Output: Integer
+Function.VP_DrainAudio {
     Body: {
-        rd = VPState.pipe_rd
-        IfCondition LessThan(rd, 0) ThenBlock: { ReturnValue(-1) }
+        ard = VPState.audio_pipe_rd
+        IfCondition LessThan(ard, 0) ThenBlock: {
+            Mixer_DrainTick()
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(VPState.audio_ok, 0) ThenBlock: { ReturnValue(0) }
 
-        buf = ShmCanvasState.buf
-        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(-1) }
-
-        frame_size = Multiply(Multiply(VPState.canvas_w, VPState.canvas_h), 4)
-
-        n = VP_ReadExact(rd, buf, frame_size)
-        IfCondition LessThan(n, 0) ThenBlock: {
-            // EOF — video finished
-            ReturnValue(-1)
+        abuf = VPState.audio_buf
+        // Loop: drain ALL available audio from pipe (non-blocking)
+        // Use done flag to break out — MUST fall through to Mixer_DrainTick
+        total_read = 0
+        done = 0
+        WhileLoop And(LessThan(total_read, 131072), EqualTo(done, 0)) {
+            n = SystemCall(VPSys.SYS_READ, ard, abuf, 16384, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                // EAGAIN or EOF — pipe empty, exit loop
+                done = 1
+            } ElseBlock: {
+                Mixer_AppWrite(abuf, n)
+                total_read = Add(total_read, n)
+            }
         }
 
-        VPState.frame_num = Add(VPState.frame_num, 1)
-        ReturnValue(0)
+        // Debug: log first few ticks
+        IfCondition LessThan(VPState.frame_num, 5) ThenBlock: {
+            PrintMessage("[VP-DBG] audio read=")
+            PrintNumber(total_read)
+            PrintMessage(" ring_wp=")
+            PrintNumber(AppBus.write_pos)
+            PrintMessage(" ring_rp=")
+            PrintNumber(AppBus.read_pos)
+            PrintMessage("\n")
+        }
+
+        // ALWAYS push ring buffer → ALSA. This is the critical line.
+        pw = Mixer_DrainTick()
+
+        IfCondition LessThan(VPState.frame_num, 5) ThenBlock: {
+            PrintMessage("[VP-DBG] periods_written=")
+            PrintNumber(pw)
+            PrintMessage("\n")
+        }
     }
 }
 
@@ -584,6 +788,38 @@ Function.VP_HandleKey {
             ReturnValue(1)
         }
 
+        // Up arrow (scancode 103) — master volume up (step=64, range 0-1024)
+        IfCondition EqualTo(keycode, 103) ThenBlock: {
+            newvol = Add(MixerState.master_vol, 64)
+            Mixer_SetMasterVol(newvol)
+            PrintMessage("[VP] Master vol=")
+            PrintNumber(MixerState.master_vol)
+            PrintMessage("/1024\n")
+            ReturnValue(1)
+        }
+
+        // Down arrow (scancode 108) — master volume down (step=64, range 0-1024)
+        IfCondition EqualTo(keycode, 108) ThenBlock: {
+            newvol = Subtract(MixerState.master_vol, 64)
+            Mixer_SetMasterVol(newvol)
+            PrintMessage("[VP] Master vol=")
+            PrintNumber(MixerState.master_vol)
+            PrintMessage("/1024\n")
+            ReturnValue(1)
+        }
+
+        // M key (scancode 50) — mute/unmute toggle
+        IfCondition EqualTo(keycode, 50) ThenBlock: {
+            IfCondition EqualTo(MixerState.master_vol, 0) ThenBlock: {
+                Mixer_SetMasterVol(256)
+                PrintMessage("[VP] Unmuted (256/1024)\n")
+            } ElseBlock: {
+                Mixer_SetMasterVol(0)
+                PrintMessage("[VP] Muted\n")
+            }
+            ReturnValue(1)
+        }
+
         ReturnValue(0)
     }
 }
@@ -665,59 +901,161 @@ SubRoutine.Main {
     ShmCanvas_Clear(4278190080)
     ShmCanvas_Present(sock, wid)
 
+    // Initialize audio engine
+    ar = Audio_Init()
+    IfCondition GreaterEqual(ar, 0) ThenBlock: {
+        VPState.audio_ok = 1
+        PrintMessage("[VP] Audio engine ready\n")
+    } ElseBlock: {
+        VPState.audio_ok = 0
+        PrintMessage("[VP] Audio unavailable — video only\n")
+    }
+
+    // Allocate audio read buffer (16384 bytes = multiple periods)
+    VPState.audio_buf = Allocate(16384)
+
     // Set socket non-blocking for frame loop
     Socket.SetNonBlock(sock)
 
-    // Allocate timespec for frame pacing: ~33ms (~30fps for video)
-    ts = Allocate(16)
-    StoreValue(ts, 0)
-    StoreValue(Add(ts, 8), 33333333)
+    // Allocate timespec for tick sleep: 2ms
+    // This is the heartbeat — both audio and video are serviced every tick.
+    ts_tick = Allocate(16)
+    StoreValue(ts_tick, 0)
+    StoreValue(Add(ts_tick, 8), 2000000)
 
     // Allocate timespec for idle sleep: 50ms
     ts_idle = Allocate(16)
     StoreValue(ts_idle, 0)
     StoreValue(Add(ts_idle, 8), 50000000)
 
-    PrintMessage("[VP] Ready — press Play or Space\n\n")
+    PrintMessage("[VP] Keys: Space=play/pause S=stop M=mute Up/Down=volume\n")
 
-    // Main loop
+    // Auto-play default file on startup
+    IfCondition NotEqual(VPState.file_path, 0) ThenBlock: {
+        PrintMessage("[VP] Auto-playing: ")
+        PrintString(VPState.file_path)
+        PrintMessage("\n")
+        VP_LaunchFFmpeg(VPState.file_path)
+    }
+
+    PrintMessage("[VP] Entering main loop\n\n")
+
+    // ===== MAIN LOOP — AUDIO-DRIVEN FRAME SYNC =====
+    //
+    // Audio is the master clock. The ALSA sound card's crystal oscillator
+    // runs at exactly 48kHz — it's the most accurate clock in the system.
+    //
+    // Strategy:
+    //   1. AUDIO FIRST: drain pipe → ring buffer → mixer → ALSA. Every tick.
+    //      Mixer_DrainTick increments samples_written — this IS the clock.
+    //   2. VIDEO FOLLOWS: accumulate frames from pipe, but only PRESENT when
+    //      the audio clock says it's time:
+    //        expected_frame = (samples_written * fps) / sample_rate
+    //      If video is behind: drop frames to catch up.
+    //      If video is ahead: hold current frame until audio catches up.
+    //   3. This ensures audio never glitches (highest priority) and video
+    //      tracks audio position exactly. Dropped frames are invisible;
+    //      audio pops are not.
+    //
+    // Tick rate: 2ms. -re paces ffmpeg at native rate, audio clock paces us.
+    //
     WhileLoop EqualTo(VPState.running, 1) {
 
         IfCondition And(EqualTo(VPState.playing, 1), EqualTo(VPState.paused, 0)) ThenBlock: {
-            // ===== PLAYING: read frames from ffmpeg =====
-            r = VP_ReadFrame()
-            IfCondition LessThan(r, 0) ThenBlock: {
-                // EOF or error — playback finished
-                VP_StopFFmpeg()
-                VP_SetLabel(sock, "status", "Finished")
-                PrintMessage("[VP] Playback finished after ")
-                PrintNumber(VPState.frame_num)
-                PrintMessage(" frames\n")
-            } ElseBlock: {
-                // Present frame
-                ShmCanvas_Present(sock, wid)
+            // ===== PLAYING =====
 
-                // Update position every 30 frames (~1 sec at 30fps)
-                IfCondition EqualTo(Modulo(VPState.frame_num, 30), 0) ThenBlock: {
-                    secs = Divide(VPState.frame_num, 30)
-                    tbuf = Allocate(8)
-                    VP_FormatTime(secs, tbuf)
-                    VP_SetLabel(sock, "pos", tbuf)
-                    Deallocate(tbuf, 8)
+            // STEP 1: Audio — drain pipe into ring buffer, push to ALSA.
+            // This is the MASTER CLOCK. It must run first, every tick.
+            VP_DrainAudio()
+
+            // STEP 2: Video — accumulate partial reads from pipe.
+            // Keep reading frames even if we won't present yet.
+            IfCondition EqualTo(VPState.vid_ready, 0) ThenBlock: {
+                vr = VP_ReadVideoTick()
+                IfCondition EqualTo(vr, 1) ThenBlock: {
+                    // Full frame accumulated in canvas buffer — mark ready
+                    VPState.vid_ready = 1
                 }
-
-                // Log every 300 frames
-                IfCondition EqualTo(Modulo(VPState.frame_num, 300), 0) ThenBlock: {
-                    PrintMessage("[VP] frame=")
-                    PrintNumber(VPState.frame_num)
-                    PrintMessage("\n")
+                IfCondition EqualTo(vr, -1) ThenBlock: {
+                    // EOF or error — playback finished
+                    VP_StopFFmpeg()
+                    VP_SetLabel(sock, "status", "Finished")
+                    PrintMessage("[VP] Playback finished: ")
+                    PrintNumber(VPState.frames_presented)
+                    PrintMessage(" presented, ")
+                    PrintNumber(VPState.frames_dropped)
+                    PrintMessage(" dropped\n")
                 }
-
-                // Frame pacing
-                SystemCall(VPSys.SYS_NANOSLEEP, ts, 0)
             }
+
+            // STEP 3: Audio-driven presentation decision.
+            // Ask the audio clock what frame we SHOULD be showing.
+            IfCondition EqualTo(VPState.vid_ready, 1) ThenBlock: {
+                audio_pos = Mixer_GetSamplesWritten()
+                // expected_frame = (audio_pos * fps) / sample_rate
+                // = (audio_pos * 30) / 48000
+                // Simplify: (audio_pos * 30) / 48000 = audio_pos / 1600
+                expected_frame = Divide(audio_pos, 1600)
+
+                presented = VPState.frames_presented
+
+                IfCondition GreaterEqual(expected_frame, presented) ThenBlock: {
+                    // Audio clock says it's time (or past time) — present
+                    ShmCanvas_Present(sock, wid)
+                    VPState.frames_presented = Add(presented, 1)
+                    VPState.vid_ready = 0
+
+                    // If we're behind by more than 1 frame, drop-read to catch up
+                    IfCondition GreaterThan(expected_frame, Add(presented, 2)) ThenBlock: {
+                        // Drop frames: read and discard until we catch up
+                        drop_target = Subtract(expected_frame, Add(presented, 1))
+                        dropped = 0
+                        WhileLoop LessThan(dropped, drop_target) {
+                            dr = VP_ReadVideoTick()
+                            IfCondition EqualTo(dr, 1) ThenBlock: {
+                                dropped = Add(dropped, 1)
+                            } ElseBlock: {
+                                // No more frames available or EOF — stop dropping
+                                dropped = drop_target
+                            }
+                        }
+                        VPState.frames_dropped = Add(VPState.frames_dropped, dropped)
+                    }
+
+                    // Update position display every 30 presented frames
+                    fp = VPState.frames_presented
+                    IfCondition EqualTo(Modulo(fp, 30), 0) ThenBlock: {
+                        // Use audio clock for time display (more accurate)
+                        secs = Divide(audio_pos, 48000)
+                        tbuf = Allocate(8)
+                        VP_FormatTime(secs, tbuf)
+                        VP_SetLabel(sock, "pos", tbuf)
+                        Deallocate(tbuf, 8)
+                    }
+
+                    // Log every 300 presented frames
+                    IfCondition EqualTo(Modulo(fp, 300), 0) ThenBlock: {
+                        PrintMessage("[VP] presented=")
+                        PrintNumber(fp)
+                        PrintMessage(" dropped=")
+                        PrintNumber(VPState.frames_dropped)
+                        PrintMessage(" audio_pos=")
+                        PrintNumber(audio_pos)
+                        PrintMessage("\n")
+                    }
+                }
+                // else: video ahead of audio — hold frame, wait for audio
+            }
+
+            // Steady tick — 2ms heartbeat
+            SystemCall(VPSys.SYS_NANOSLEEP, ts_tick, 0)
+
         } ElseBlock: {
-            // ===== IDLE or PAUSED: sleep longer to save CPU =====
+            // ===== IDLE or PAUSED =====
+            // Still drain audio during pause so ALSA buffer doesn't underrun
+            IfCondition EqualTo(VPState.audio_ok, 1) ThenBlock: {
+                Mixer_DrainTick()
+            }
             SystemCall(VPSys.SYS_NANOSLEEP, ts_idle, 0)
         }
 
@@ -728,7 +1066,11 @@ SubRoutine.Main {
     // Cleanup
     VP_StopFFmpeg()
     ShmCanvas_Destroy(wid)
-    Deallocate(ts, 16)
+    IfCondition EqualTo(VPState.audio_ok, 1) ThenBlock: {
+        Audio_Shutdown()
+    }
+    Deallocate(VPState.audio_buf, 16384)
+    Deallocate(ts_tick, 16)
     Deallocate(ts_idle, 16)
     Socket.Close(sock)
 
