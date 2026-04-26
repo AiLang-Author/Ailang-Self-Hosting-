@@ -1,0 +1,1320 @@
+// chrome_ipc.ailang
+// Sandboxed Chrome browser — runs Chrome inside Xvfb, captures via ffmpeg
+// x11grab, streams raw BGRA frames through ShmCanvas to the display server.
+//
+// Architecture:
+//   Manages 3 child processes:
+//     1. Xvfb :99 -screen 0 WxHx24 -ac     (virtual X server)
+//     2. google-chrome --display=:99 ...      (browser, isolated from real FB)
+//     3. ffmpeg -f x11grab -i :99 pipe:1      (captures as raw BGRA frames)
+//
+//   Frame loop (same as videoplayer):
+//     - Read raw BGRA frames from ffmpeg stdout pipe
+//     - Frames land directly in shm canvas buffer
+//     - ShmCanvas_Present() -> server blits
+//
+//   Input forwarding:
+//     - input.key -> fork/exec xdotool key/type on :99
+//     - input.action -> toolbar: back/fwd/reload/close
+//
+// Security model:
+//   - Chrome runs in its own X session, never sees /dev/fb0
+//   - No GPU access (--disable-gpu), software rendering only
+//   - --no-first-run --disable-sync --disable-extensions
+//   - --mute-audio (no audio capture initially)
+//
+// Prerequisites: sudo apt install xvfb xdotool google-chrome-stable
+//
+// Build: ./ailang.x Testcode/chrome_ipc.ailang chrome_ipc.x
+// Run:   ./chrome_ipc.x  (after SysDisplay.x is running)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.HashMap
+LibraryImport.ShmCanvas
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.CSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_CLOSE":     Initialize=3
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_KILL":      Initialize=62
+    "SYS_WAIT4":     Initialize=61
+    "SYS_FCNTL":     Initialize=72
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_SETSID":    Initialize=112
+}
+
+FixedPool.CFcntl {
+    "F_GETFL":    Initialize=3
+    "F_SETFL":    Initialize=4
+    "O_NONBLOCK": Initialize=2048
+}
+
+FixedPool.CSig {
+    "SIGTERM":  Initialize=15
+    "SIGSTOP":  Initialize=19
+    "SIGCONT":  Initialize=18
+    "WNOHANG":  Initialize=1
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.ChromeState {
+    "running":      Initialize=1
+    "win_id":       Initialize=0
+    "sock":         Initialize=0
+    "canvas_w":     Initialize=1024
+    "canvas_h":     Initialize=700
+    "xvfb_pid":     Initialize=0
+    "chrome_pid":   Initialize=0
+    "ffmpeg_pid":   Initialize=0
+    "pipe_rd":      Initialize=-1
+    "frame_size":   Initialize=0
+    "frame_got":    Initialize=0
+    "display_num":  Initialize=99
+    "capturing":    Initialize=0
+    "mouse_skip":   Initialize=0
+    "pending_mx":   Initialize=0
+    "pending_my":   Initialize=0
+    "mouse_dirty":  Initialize=0
+}
+
+// =============================================================================
+// KEYMAP — scancode to X11 keysym name for xdotool
+// We store keysym strings for special keys; printable chars use xdotool type.
+// =============================================================================
+
+// =============================================================================
+// NUM TO STRING
+// =============================================================================
+Function.Chrome_NumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// BUILD SIZE STRING — "WxH" from canvas_w and canvas_h
+// =============================================================================
+Function.Chrome_BuildSizeStr {
+    Output: Integer
+    Body: {
+        buf = Allocate(24)
+        w_tmp = Allocate(12)
+        h_tmp = Allocate(12)
+        wlen = Chrome_NumToStr(ChromeState.canvas_w, w_tmp)
+        hlen = Chrome_NumToStr(ChromeState.canvas_h, h_tmp)
+        MemoryCopy(buf, w_tmp, wlen)
+        SetByte(buf, wlen, 120)
+        MemoryCopy(Add(buf, Add(wlen, 1)), h_tmp, hlen)
+        SetByte(buf, Add(Add(wlen, 1), hlen), 0)
+        Deallocate(w_tmp, 12)
+        Deallocate(h_tmp, 12)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// BUILD XVFB SIZE — "WxHx24" from canvas_w and canvas_h
+// =============================================================================
+Function.Chrome_BuildXvfbSize {
+    Output: Integer
+    Body: {
+        buf = Allocate(32)
+        w_tmp = Allocate(12)
+        h_tmp = Allocate(12)
+        wlen = Chrome_NumToStr(ChromeState.canvas_w, w_tmp)
+        hlen = Chrome_NumToStr(ChromeState.canvas_h, h_tmp)
+        off = 0
+        MemoryCopy(buf, w_tmp, wlen)
+        off = wlen
+        SetByte(buf, off, 120)
+        off = Add(off, 1)
+        MemoryCopy(Add(buf, off), h_tmp, hlen)
+        off = Add(off, hlen)
+        // "x24"
+        SetByte(buf, off, 120)
+        SetByte(buf, Add(off, 1), 50)
+        SetByte(buf, Add(off, 2), 52)
+        off = Add(off, 3)
+        SetByte(buf, off, 0)
+        Deallocate(w_tmp, 12)
+        Deallocate(h_tmp, 12)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// BUILD CHROME WINDOW SIZE — "W,H" for --window-size=W,H
+// =============================================================================
+Function.Chrome_BuildWinSize {
+    Output: Integer
+    Body: {
+        buf = Allocate(24)
+        w_tmp = Allocate(12)
+        h_tmp = Allocate(12)
+        wlen = Chrome_NumToStr(ChromeState.canvas_w, w_tmp)
+        hlen = Chrome_NumToStr(ChromeState.canvas_h, h_tmp)
+        off = 0
+        MemoryCopy(buf, w_tmp, wlen)
+        off = wlen
+        SetByte(buf, off, 44)
+        off = Add(off, 1)
+        MemoryCopy(Add(buf, off), h_tmp, hlen)
+        off = Add(off, hlen)
+        SetByte(buf, off, 0)
+        Deallocate(w_tmp, 12)
+        Deallocate(h_tmp, 12)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// BUILD DISPLAY STRING — ":99" (or whatever display_num is)
+// =============================================================================
+Function.Chrome_BuildDisplayStr {
+    Output: Integer
+    Body: {
+        buf = Allocate(8)
+        SetByte(buf, 0, 58)
+        nbuf = Allocate(8)
+        nlen = Chrome_NumToStr(ChromeState.display_num, nbuf)
+        MemoryCopy(Add(buf, 1), nbuf, nlen)
+        SetByte(buf, Add(1, nlen), 0)
+        Deallocate(nbuf, 8)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// LAUNCH XVFB — fork/exec Xvfb :99 -screen 0 WxHx24 -ac
+// =============================================================================
+Function.Chrome_LaunchXvfb {
+    Output: Integer
+    Body: {
+        disp_str = Chrome_BuildDisplayStr()
+        size_str = Chrome_BuildXvfbSize()
+
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[Chrome] Xvfb fork failed\n")
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // ===== CHILD =====
+            // Xvfb :99 -screen 0 WxHx24 -ac
+            argv = Allocate(56)
+            StoreValue(Add(argv, 0),  "/usr/bin/Xvfb")
+            StoreValue(Add(argv, 8),  disp_str)
+            StoreValue(Add(argv, 16), "-screen")
+            StoreValue(Add(argv, 24), "0")
+            StoreValue(Add(argv, 32), size_str)
+            StoreValue(Add(argv, 40), "-ac")
+            StoreValue(Add(argv, 48), 0)
+
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/Xvfb", argv, 0)
+            PrintMessage("[Chrome] Xvfb execve failed\n")
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        // ===== PARENT =====
+        ChromeState.xvfb_pid = pid
+        PrintMessage("[Chrome] Xvfb launched pid=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// LAUNCH CHROME — fork/exec google-chrome with sandboxed flags
+// =============================================================================
+Function.Chrome_LaunchBrowser {
+    Output: Integer
+    Body: {
+        disp_str = Chrome_BuildDisplayStr()
+        win_size = Chrome_BuildWinSize()
+
+        // Build --window-size=W,H
+        ws_arg = Allocate(48)
+        MemoryCopy(ws_arg, "--window-size=", 14)
+        wsl = StringLength(win_size)
+        MemoryCopy(Add(ws_arg, 14), win_size, wsl)
+        SetByte(ws_arg, Add(14, wsl), 0)
+
+        // Build --display=:99
+        dd_arg = Allocate(24)
+        MemoryCopy(dd_arg, "--display=", 10)
+        dsl = StringLength(disp_str)
+        MemoryCopy(Add(dd_arg, 10), disp_str, dsl)
+        SetByte(dd_arg, Add(10, dsl), 0)
+
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[Chrome] Chrome fork failed\n")
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // ===== CHILD =====
+            // New session so Chrome's children don't inherit our terminal
+            SystemCall(CSys.SYS_SETSID)
+
+            // 16 args + null = 17 * 8 = 136
+            argv = Allocate(136)
+            StoreValue(Add(argv, 0),   "/usr/bin/google-chrome-stable")
+            StoreValue(Add(argv, 8),   dd_arg)
+            StoreValue(Add(argv, 16),  "--no-sandbox")
+            StoreValue(Add(argv, 24),  "--disable-gpu")
+            StoreValue(Add(argv, 32),  ws_arg)
+            StoreValue(Add(argv, 40),  "--window-position=0,0")
+            StoreValue(Add(argv, 48),  "--no-first-run")
+            StoreValue(Add(argv, 56),  "--disable-sync")
+            StoreValue(Add(argv, 64),  "--disable-extensions")
+            StoreValue(Add(argv, 72),  "--disable-background-networking")
+            StoreValue(Add(argv, 80),  "--disable-default-apps")
+            StoreValue(Add(argv, 88),  "--mute-audio")
+            StoreValue(Add(argv, 96),  "--disable-translate")
+            StoreValue(Add(argv, 104), "--user-data-dir=/tmp/chrome_ailang_profile")
+            StoreValue(Add(argv, 112), "about:blank")
+            StoreValue(Add(argv, 120), 0)
+
+            // envp: DISPLAY=:99 HOME PATH
+            envp = Allocate(40)
+            // Build DISPLAY=:99
+            denv = Allocate(24)
+            MemoryCopy(denv, "DISPLAY=", 8)
+            MemoryCopy(Add(denv, 8), disp_str, Add(dsl, 1))
+            StoreValue(Add(envp, 0),  denv)
+            StoreValue(Add(envp, 8),  "HOME=/home/bob")
+            StoreValue(Add(envp, 16), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            StoreValue(Add(envp, 24), "LANG=en_US.UTF-8")
+            StoreValue(Add(envp, 32), 0)
+
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/google-chrome-stable", argv, envp)
+            PrintMessage("[Chrome] Chrome execve failed\n")
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        // ===== PARENT =====
+        ChromeState.chrome_pid = pid
+        PrintMessage("[Chrome] Chrome launched pid=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// LAUNCH FFMPEG — fork/exec ffmpeg -f x11grab, pipe stdout to parent
+// =============================================================================
+Function.Chrome_LaunchFFmpeg {
+    Output: Integer
+    Body: {
+        disp_str = Chrome_BuildDisplayStr()
+        size_str = Chrome_BuildSizeStr()
+
+        // Create pipe for video frames
+        pipefds = Allocate(8)
+        pr = SystemCall(CSys.SYS_PIPE, pipefds, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            PrintMessage("[Chrome] pipe() failed\n")
+            Deallocate(pipefds, 8)
+            ReturnValue(-1)
+        }
+        vid_read  = Dereference(pipefds, "dword")
+        vid_write = Dereference(Add(pipefds, 4), "dword")
+        Deallocate(pipefds, 8)
+
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[Chrome] ffmpeg fork failed\n")
+            SystemCall(CSys.SYS_CLOSE, vid_read, 0, 0, 0, 0)
+            SystemCall(CSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // ===== CHILD =====
+            SystemCall(CSys.SYS_CLOSE, vid_read, 0, 0, 0, 0)
+
+            // dup2(vid_write, 1) — stdout = frame pipe
+            SystemCall(CSys.SYS_DUP2, vid_write, 1, 0, 0, 0)
+            SystemCall(CSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
+
+            // ffmpeg -f x11grab -draw_mouse 1 -video_size WxH -framerate 30 -i :99
+            //        -vf format=bgra -f rawvideo -pix_fmt bgra pipe:1 -v quiet
+            // 22 args + null = 23 * 8 = 184
+            argv = Allocate(184)
+            StoreValue(Add(argv, 0),   "/usr/bin/ffmpeg")
+            StoreValue(Add(argv, 8),   "-f")
+            StoreValue(Add(argv, 16),  "x11grab")
+            StoreValue(Add(argv, 24),  "-draw_mouse")
+            StoreValue(Add(argv, 32),  "1")
+            StoreValue(Add(argv, 40),  "-video_size")
+            StoreValue(Add(argv, 48),  size_str)
+            StoreValue(Add(argv, 56),  "-framerate")
+            StoreValue(Add(argv, 64),  "30")
+            StoreValue(Add(argv, 72),  "-i")
+            StoreValue(Add(argv, 80),  disp_str)
+            StoreValue(Add(argv, 88),  "-vf")
+            StoreValue(Add(argv, 96),  "format=bgra")
+            StoreValue(Add(argv, 104), "-f")
+            StoreValue(Add(argv, 112), "rawvideo")
+            StoreValue(Add(argv, 120), "-pix_fmt")
+            StoreValue(Add(argv, 128), "bgra")
+            StoreValue(Add(argv, 136), "-v")
+            StoreValue(Add(argv, 144), "quiet")
+            StoreValue(Add(argv, 152), "pipe:1")
+            StoreValue(Add(argv, 160), 0)
+
+            // envp: need DISPLAY for x11grab
+            envp = Allocate(24)
+            denv = Allocate(24)
+            MemoryCopy(denv, "DISPLAY=", 8)
+            ddl = StringLength(disp_str)
+            MemoryCopy(Add(denv, 8), disp_str, Add(ddl, 1))
+            StoreValue(Add(envp, 0), denv)
+            StoreValue(Add(envp, 8), "HOME=/home/bob")
+            StoreValue(Add(envp, 16), 0)
+
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/ffmpeg", argv, envp)
+            PrintMessage("[Chrome] ffmpeg execve failed\n")
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        // ===== PARENT =====
+        SystemCall(CSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
+
+        // Make read end non-blocking
+        vflags = SystemCall(CSys.SYS_FCNTL, vid_read, CFcntl.F_GETFL, 0, 0, 0)
+        SystemCall(CSys.SYS_FCNTL, vid_read, CFcntl.F_SETFL, BitwiseOr(vflags, CFcntl.O_NONBLOCK), 0, 0)
+
+        ChromeState.pipe_rd    = vid_read
+        ChromeState.ffmpeg_pid = pid
+        ChromeState.frame_size = Multiply(Multiply(ChromeState.canvas_w, ChromeState.canvas_h), 4)
+        ChromeState.frame_got  = 0
+        ChromeState.capturing  = 1
+
+        PrintMessage("[Chrome] ffmpeg launched pid=")
+        PrintNumber(pid)
+        PrintMessage(" vid_fd=")
+        PrintNumber(vid_read)
+        PrintMessage(" frame_size=")
+        PrintNumber(ChromeState.frame_size)
+        PrintMessage("\n")
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// READ FRAME TICK — non-blocking partial frame accumulation (same as VP)
+// Returns:  1 = full frame ready
+//           0 = partial (more data needed)
+//          -1 = EOF / pipe closed
+// =============================================================================
+Function.Chrome_ReadFrameTick {
+    Output: Integer
+    Body: {
+        rd = ChromeState.pipe_rd
+        IfCondition LessThan(rd, 0) ThenBlock: { ReturnValue(-1) }
+
+        buf = ShmCanvasState.buf
+        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(-1) }
+
+        fsize = ChromeState.frame_size
+        got = ChromeState.frame_got
+
+        WhileLoop LessThan(got, fsize) {
+            remain = Subtract(fsize, got)
+            IfCondition GreaterThan(remain, 65536) ThenBlock: {
+                remain = 65536
+            }
+            n = SystemCall(CSys.SYS_READ, rd, Add(buf, got), remain)
+            IfCondition EqualTo(n, 0) ThenBlock: {
+                ChromeState.frame_got = 0
+                ReturnValue(-1)
+            }
+            IfCondition LessThan(n, 0) ThenBlock: {
+                ChromeState.frame_got = got
+                ReturnValue(0)
+            }
+            got = Add(got, n)
+        }
+
+        // Full frame ready
+        ChromeState.frame_got = 0
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// KILL PROCESS — SIGTERM + waitpid helper
+// =============================================================================
+Function.Chrome_KillChild {
+    Input: pid: Integer
+    Body: {
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            SystemCall(CSys.SYS_KILL, pid, CSig.SIGTERM, 0, 0, 0)
+            status = Allocate(8)
+            SystemCall(CSys.SYS_WAIT4, pid, status, CSig.WNOHANG, 0, 0, 0)
+            Deallocate(status, 8)
+        }
+    }
+}
+
+// =============================================================================
+// STOP ALL — kill ffmpeg, chrome, xvfb in reverse order, close pipe
+// =============================================================================
+Function.Chrome_StopAll {
+    Body: {
+        // Kill in reverse order: ffmpeg first, then chrome, then xvfb
+        IfCondition GreaterThan(ChromeState.ffmpeg_pid, 0) ThenBlock: {
+            Chrome_KillChild(ChromeState.ffmpeg_pid)
+            PrintMessage("[Chrome] ffmpeg stopped pid=")
+            PrintNumber(ChromeState.ffmpeg_pid)
+            PrintMessage("\n")
+            ChromeState.ffmpeg_pid = 0
+        }
+
+        IfCondition GreaterThan(ChromeState.chrome_pid, 0) ThenBlock: {
+            Chrome_KillChild(ChromeState.chrome_pid)
+            PrintMessage("[Chrome] Chrome stopped pid=")
+            PrintNumber(ChromeState.chrome_pid)
+            PrintMessage("\n")
+            ChromeState.chrome_pid = 0
+        }
+
+        IfCondition GreaterThan(ChromeState.xvfb_pid, 0) ThenBlock: {
+            Chrome_KillChild(ChromeState.xvfb_pid)
+            PrintMessage("[Chrome] Xvfb stopped pid=")
+            PrintNumber(ChromeState.xvfb_pid)
+            PrintMessage("\n")
+            ChromeState.xvfb_pid = 0
+        }
+
+        // Close pipe
+        rd = ChromeState.pipe_rd
+        IfCondition GreaterEqual(rd, 0) ThenBlock: {
+            SystemCall(CSys.SYS_CLOSE, rd, 0, 0, 0, 0)
+        }
+
+        ChromeState.pipe_rd   = -1
+        ChromeState.frame_got = 0
+        ChromeState.capturing = 0
+    }
+}
+
+// =============================================================================
+// LAUNCH ALL — start Xvfb, wait, start Chrome, wait, start ffmpeg
+// =============================================================================
+Function.Chrome_LaunchAll {
+    Body: {
+        ts_wait = Allocate(16)
+
+        // 1. Launch Xvfb
+        xr = Chrome_LaunchXvfb()
+        IfCondition LessThan(xr, 0) ThenBlock: {
+            PrintMessage("[Chrome] Failed to fork Xvfb — is Xvfb installed? (sudo apt install xvfb)\n")
+            Deallocate(ts_wait, 16)
+            // NOT fatal — keep window alive with black canvas
+            ReturnValue(0)
+        }
+
+        // 2. Wait 500ms for Xvfb to initialize
+        StoreValue(ts_wait, 0)
+        StoreValue(Add(ts_wait, 8), 500000000)
+        SystemCall(CSys.SYS_NANOSLEEP, ts_wait, 0)
+        PrintMessage("[Chrome] Xvfb startup wait complete\n")
+
+        // Check if Xvfb already died (binary not found?)
+        xcheck = Allocate(8)
+        xw = SystemCall(CSys.SYS_WAIT4, ChromeState.xvfb_pid, xcheck, CSig.WNOHANG, 0, 0, 0)
+        Deallocate(xcheck, 8)
+        IfCondition EqualTo(xw, ChromeState.xvfb_pid) ThenBlock: {
+            PrintMessage("[Chrome] Xvfb exited immediately — is /usr/bin/Xvfb installed? (sudo apt install xvfb)\n")
+            ChromeState.xvfb_pid = 0
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        // 3. Launch Chrome
+        cr = Chrome_LaunchBrowser()
+        IfCondition LessThan(cr, 0) ThenBlock: {
+            PrintMessage("[Chrome] Failed to fork Chrome — is google-chrome-stable installed?\n")
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        // 4. Wait 2s for Chrome to render first frame
+        StoreValue(ts_wait, 2)
+        StoreValue(Add(ts_wait, 8), 0)
+        SystemCall(CSys.SYS_NANOSLEEP, ts_wait, 0)
+        PrintMessage("[Chrome] Chrome startup wait complete\n")
+
+        // Check if Chrome already died
+        ccheck = Allocate(8)
+        cw = SystemCall(CSys.SYS_WAIT4, ChromeState.chrome_pid, ccheck, CSig.WNOHANG, 0, 0, 0)
+        Deallocate(ccheck, 8)
+        IfCondition EqualTo(cw, ChromeState.chrome_pid) ThenBlock: {
+            PrintMessage("[Chrome] Chrome exited immediately — check google-chrome-stable\n")
+            ChromeState.chrome_pid = 0
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        // 5. Launch ffmpeg capture
+        fr = Chrome_LaunchFFmpeg()
+        IfCondition LessThan(fr, 0) ThenBlock: {
+            PrintMessage("[Chrome] Failed to fork ffmpeg\n")
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        Deallocate(ts_wait, 16)
+        PrintMessage("[Chrome] All 3 processes running\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// BUILD XDOTOOL ENVP — creates envp with DISPLAY=:NN for xdotool subcommands
+// xdotool key/type/mousemove/mousedown/mouseup do NOT accept --display flag,
+// they use DISPLAY env var via XOpenDisplay().
+// =============================================================================
+Function.Chrome_BuildXdotoolEnvp {
+    Output: Integer
+    Body: {
+        disp_str = Chrome_BuildDisplayStr()
+        dsl = StringLength(disp_str)
+
+        // Build "DISPLAY=:99"
+        denv = Allocate(24)
+        MemoryCopy(denv, "DISPLAY=", 8)
+        MemoryCopy(Add(denv, 8), disp_str, Add(dsl, 1))
+
+        envp = Allocate(16)
+        StoreValue(Add(envp, 0), denv)
+        StoreValue(Add(envp, 8), 0)
+        ReturnValue(envp)
+    }
+}
+
+// =============================================================================
+// FORWARD KEY VIA XDOTOOL — fork/exec xdotool key <keysym>
+// =============================================================================
+Function.Chrome_XdotoolKey {
+    Input: keysym: Address
+    Body: {
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            argv = Allocate(32)
+            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
+            StoreValue(Add(argv, 8),  "key")
+            StoreValue(Add(argv, 16), keysym)
+            StoreValue(Add(argv, 24), 0)
+
+            envp = Chrome_BuildXdotoolEnvp()
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// FORWARD PRINTABLE CHAR VIA XDOTOOL TYPE
+// =============================================================================
+Function.Chrome_XdotoolType {
+    Input: ch: Integer
+    Body: {
+        // Build single-char string
+        cbuf = Allocate(4)
+        SetByte(cbuf, 0, ch)
+        SetByte(cbuf, 1, 0)
+
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            argv = Allocate(32)
+            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
+            StoreValue(Add(argv, 8),  "type")
+            StoreValue(Add(argv, 16), cbuf)
+            StoreValue(Add(argv, 24), 0)
+
+            envp = Chrome_BuildXdotoolEnvp()
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// XDOTOOL MOUSEMOVE — fork/exec xdotool mousemove X Y
+// =============================================================================
+Function.Chrome_XdotoolMouseMove {
+    Input: mx: Integer
+    Input: my: Integer
+    Body: {
+        // Build X and Y as strings
+        xbuf = Allocate(12)
+        ybuf = Allocate(12)
+        Chrome_NumToStr(mx, xbuf)
+        Chrome_NumToStr(my, ybuf)
+
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            argv = Allocate(40)
+            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
+            StoreValue(Add(argv, 8),  "mousemove")
+            StoreValue(Add(argv, 16), xbuf)
+            StoreValue(Add(argv, 24), ybuf)
+            StoreValue(Add(argv, 32), 0)
+
+            envp = Chrome_BuildXdotoolEnvp()
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// XDOTOOL MOUSEDOWN — fork/exec xdotool mousedown BUTTON
+// Button mapping: IPC 0=left,1=right,2=mid → xdotool 1=left,2=mid,3=right
+// =============================================================================
+Function.Chrome_XdotoolMouseDown {
+    Input: button: Integer
+    Body: {
+        // Map button: 0→1(left), 1→3(right), 2→2(middle)
+        xbtn = 1
+        IfCondition EqualTo(button, 1) ThenBlock: { xbtn = 3 }
+        IfCondition EqualTo(button, 2) ThenBlock: { xbtn = 2 }
+
+        bbuf = Allocate(4)
+        Chrome_NumToStr(xbtn, bbuf)
+
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            argv = Allocate(32)
+            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
+            StoreValue(Add(argv, 8),  "mousedown")
+            StoreValue(Add(argv, 16), bbuf)
+            StoreValue(Add(argv, 24), 0)
+
+            envp = Chrome_BuildXdotoolEnvp()
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// XDOTOOL MOUSEUP — fork/exec xdotool mouseup BUTTON
+// =============================================================================
+Function.Chrome_XdotoolMouseUp {
+    Input: button: Integer
+    Body: {
+        // Map button: 0→1(left), 1→3(right), 2→2(middle)
+        xbtn = 1
+        IfCondition EqualTo(button, 1) ThenBlock: { xbtn = 3 }
+        IfCondition EqualTo(button, 2) ThenBlock: { xbtn = 2 }
+
+        bbuf = Allocate(4)
+        Chrome_NumToStr(xbtn, bbuf)
+
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            argv = Allocate(32)
+            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
+            StoreValue(Add(argv, 8),  "mouseup")
+            StoreValue(Add(argv, 16), bbuf)
+            StoreValue(Add(argv, 24), 0)
+
+            envp = Chrome_BuildXdotoolEnvp()
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// HANDLE MOUSE — dispatch IPC mouse event to xdotool
+// ev: 0=MOVE, 1=DOWN, 2=UP (matches AKMouseEv)
+// button: 0=left, 1=right, 2=middle
+//
+// MOVE events are deferred — we store the latest position and flush once
+// per main loop tick via Chrome_FlushMouse(). This coalesces 10-60 moves
+// per frame into a single fork/exec xdotool call.
+// DOWN/UP fire immediately (with a move to the click position first).
+// =============================================================================
+Function.Chrome_HandleMouse {
+    Input: mx: Integer
+    Input: my: Integer
+    Input: ev: Integer
+    Input: button: Integer
+    Body: {
+        // Don't forward if Chrome isn't running
+        IfCondition EqualTo(ChromeState.chrome_pid, 0) ThenBlock: { ReturnValue(0) }
+
+        // MOVE — defer, just store latest position
+        IfCondition EqualTo(ev, 0) ThenBlock: {
+            ChromeState.pending_mx = mx
+            ChromeState.pending_my = my
+            ChromeState.mouse_dirty = 1
+            ReturnValue(0)
+        }
+
+        // DOWN — flush pending move first, then press button
+        IfCondition EqualTo(ev, 1) ThenBlock: {
+            Chrome_XdotoolMouseMove(mx, my)
+            ChromeState.mouse_dirty = 0
+            Chrome_XdotoolMouseDown(button)
+            ReturnValue(0)
+        }
+
+        // UP — release button at current position
+        IfCondition EqualTo(ev, 2) ThenBlock: {
+            Chrome_XdotoolMouseUp(button)
+            ReturnValue(0)
+        }
+    }
+}
+
+// =============================================================================
+// FLUSH MOUSE — send one coalesced mousemove per tick if dirty
+// Called from main loop, not from message handler
+// =============================================================================
+Function.Chrome_FlushMouse {
+    Body: {
+        IfCondition EqualTo(ChromeState.mouse_dirty, 1) ThenBlock: {
+            Chrome_XdotoolMouseMove(ChromeState.pending_mx, ChromeState.pending_my)
+            ChromeState.mouse_dirty = 0
+        }
+    }
+}
+
+// =============================================================================
+// HANDLE KEY — translate IPC keycode to xdotool command
+// =============================================================================
+Function.Chrome_HandleKey {
+    Input: keycode: Integer
+    Input: ch: Integer
+    Input: shift: Integer
+    Input: ctrl: Integer
+    Body: {
+        // Don't forward if Chrome isn't running
+        IfCondition EqualTo(ChromeState.chrome_pid, 0) ThenBlock: { ReturnValue(0) }
+
+        // Ctrl combos → xdotool key
+        IfCondition EqualTo(ctrl, 1) ThenBlock: {
+            // Ctrl+L (38) → focus URL bar
+            IfCondition EqualTo(keycode, 38) ThenBlock: {
+                Chrome_XdotoolKey("ctrl+l")
+                ReturnValue(0)
+            }
+            // Ctrl+T (20) → new tab
+            IfCondition EqualTo(keycode, 20) ThenBlock: {
+                Chrome_XdotoolKey("ctrl+t")
+                ReturnValue(0)
+            }
+            // Ctrl+W (17) → close tab
+            IfCondition EqualTo(keycode, 17) ThenBlock: {
+                Chrome_XdotoolKey("ctrl+w")
+                ReturnValue(0)
+            }
+            // Ctrl+R (19) → reload
+            IfCondition EqualTo(keycode, 19) ThenBlock: {
+                Chrome_XdotoolKey("ctrl+r")
+                ReturnValue(0)
+            }
+            // Ctrl+C (46) → copy
+            IfCondition EqualTo(keycode, 46) ThenBlock: {
+                Chrome_XdotoolKey("ctrl+c")
+                ReturnValue(0)
+            }
+            // Ctrl+V (47) → paste
+            IfCondition EqualTo(keycode, 47) ThenBlock: {
+                Chrome_XdotoolKey("ctrl+v")
+                ReturnValue(0)
+            }
+            ReturnValue(0)
+        }
+
+        // Arrow keys
+        IfCondition EqualTo(keycode, 103) ThenBlock: {
+            Chrome_XdotoolKey("Up")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(keycode, 108) ThenBlock: {
+            Chrome_XdotoolKey("Down")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(keycode, 105) ThenBlock: {
+            Chrome_XdotoolKey("Left")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(keycode, 106) ThenBlock: {
+            Chrome_XdotoolKey("Right")
+            ReturnValue(0)
+        }
+
+        // Enter (28)
+        IfCondition EqualTo(keycode, 28) ThenBlock: {
+            Chrome_XdotoolKey("Return")
+            ReturnValue(0)
+        }
+
+        // Backspace (14)
+        IfCondition EqualTo(keycode, 14) ThenBlock: {
+            Chrome_XdotoolKey("BackSpace")
+            ReturnValue(0)
+        }
+
+        // Tab (15)
+        IfCondition EqualTo(keycode, 15) ThenBlock: {
+            Chrome_XdotoolKey("Tab")
+            ReturnValue(0)
+        }
+
+        // Escape (1)
+        IfCondition EqualTo(keycode, 1) ThenBlock: {
+            Chrome_XdotoolKey("Escape")
+            ReturnValue(0)
+        }
+
+        // Space (57)
+        IfCondition EqualTo(keycode, 57) ThenBlock: {
+            Chrome_XdotoolKey("space")
+            ReturnValue(0)
+        }
+
+        // Delete (111)
+        IfCondition EqualTo(keycode, 111) ThenBlock: {
+            Chrome_XdotoolKey("Delete")
+            ReturnValue(0)
+        }
+
+        // Home (102)
+        IfCondition EqualTo(keycode, 102) ThenBlock: {
+            Chrome_XdotoolKey("Home")
+            ReturnValue(0)
+        }
+
+        // End (107)
+        IfCondition EqualTo(keycode, 107) ThenBlock: {
+            Chrome_XdotoolKey("End")
+            ReturnValue(0)
+        }
+
+        // PageUp (104)
+        IfCondition EqualTo(keycode, 104) ThenBlock: {
+            Chrome_XdotoolKey("Page_Up")
+            ReturnValue(0)
+        }
+
+        // PageDown (109)
+        IfCondition EqualTo(keycode, 109) ThenBlock: {
+            Chrome_XdotoolKey("Page_Down")
+            ReturnValue(0)
+        }
+
+        // F5 (63) → reload
+        IfCondition EqualTo(keycode, 63) ThenBlock: {
+            Chrome_XdotoolKey("F5")
+            ReturnValue(0)
+        }
+
+        // Printable character → xdotool type
+        IfCondition And(GreaterEqual(ch, 32), LessEqual(ch, 126)) ThenBlock: {
+            Chrome_XdotoolType(ch)
+            ReturnValue(0)
+        }
+    }
+}
+
+// =============================================================================
+// HANDLE ACTION — toolbar button actions
+// =============================================================================
+Function.Chrome_HandleAction {
+    Input: sock: Integer
+    Input: action: Address
+    Body: {
+        cmp = StringCompare(action, "c.back")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Chrome_XdotoolKey("alt+Left")
+            PrintMessage("[Chrome] Back\n")
+            ReturnValue(1)
+        }
+
+        cmp = StringCompare(action, "c.fwd")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Chrome_XdotoolKey("alt+Right")
+            PrintMessage("[Chrome] Forward\n")
+            ReturnValue(1)
+        }
+
+        cmp = StringCompare(action, "c.reload")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Chrome_XdotoolKey("F5")
+            PrintMessage("[Chrome] Reload\n")
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// HANDLE RESIZE — kill all 3, recreate canvas, relaunch all 3
+// =============================================================================
+Function.Chrome_HandleResize {
+    Input: sock: Integer
+    Input: new_w: Integer
+    Input: new_h: Integer
+    Body: {
+        IfCondition LessEqual(new_w, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(new_h, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition And(EqualTo(new_w, ChromeState.canvas_w), EqualTo(new_h, ChromeState.canvas_h)) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        PrintMessage("[Chrome] Resize: ")
+        PrintNumber(ChromeState.canvas_w)
+        PrintMessage("x")
+        PrintNumber(ChromeState.canvas_h)
+        PrintMessage(" -> ")
+        PrintNumber(new_w)
+        PrintMessage("x")
+        PrintNumber(new_h)
+        PrintMessage("\n")
+
+        // Stop everything
+        Chrome_StopAll()
+
+        // Destroy old canvas
+        ShmCanvas_Destroy(ChromeState.win_id)
+
+        // Update dimensions
+        ChromeState.canvas_w = new_w
+        ChromeState.canvas_h = new_h
+
+        // Create new canvas
+        wid = ChromeState.win_id
+        buf = ShmCanvas_Create(wid, new_w, new_h)
+        IfCondition EqualTo(buf, 0) ThenBlock: {
+            PrintMessage("[Chrome] ShmCanvas_Create failed after resize\n")
+            ReturnValue(0)
+        }
+
+        ShmCanvas_AttachCapture(sock, wid, new_w, new_h)
+        ShmCanvas_Clear(4278190080)
+        ShmCanvas_Present(sock, wid)
+
+        // Relaunch all processes at new resolution
+        Chrome_LaunchAll()
+    }
+}
+
+// =============================================================================
+// CHECK CHILDREN — reap any dead xdotool children (fire-and-forget)
+// Also check if critical processes (Xvfb, Chrome) died
+// =============================================================================
+Function.Chrome_CheckChildren {
+    Body: {
+        // Reap zombies from xdotool fire-and-forget forks + check critical processes
+        status = Allocate(8)
+
+        // Loop reaping — there can be multiple dead children (xdotool fire-and-forget)
+        reap_pass = 0
+        WhileLoop LessThan(reap_pass, 8) {
+            wr = SystemCall(CSys.SYS_WAIT4, -1, status, CSig.WNOHANG, 0, 0, 0)
+            // No more children to reap
+            IfCondition LessEqual(wr, 0) ThenBlock: {
+                reap_pass = 8
+            } ElseBlock: {
+                // Check if reaped child was one of our critical processes
+                IfCondition EqualTo(wr, ChromeState.xvfb_pid) ThenBlock: {
+                    PrintMessage("[Chrome] Xvfb exited — display lost\n")
+                    ChromeState.xvfb_pid = 0
+                    ChromeState.capturing = 0
+                    // NOT fatal: keep window alive, user sees black canvas
+                }
+                IfCondition EqualTo(wr, ChromeState.chrome_pid) ThenBlock: {
+                    PrintMessage("[Chrome] Chrome exited\n")
+                    ChromeState.chrome_pid = 0
+                    // NOT fatal: keep window alive
+                }
+                IfCondition EqualTo(wr, ChromeState.ffmpeg_pid) ThenBlock: {
+                    PrintMessage("[Chrome] ffmpeg capture exited\n")
+                    ChromeState.ffmpeg_pid = 0
+                    ChromeState.capturing = 0
+                }
+            }
+            reap_pass = Add(reap_pass, 1)
+        }
+
+        Deallocate(status, 8)
+    }
+}
+
+// =============================================================================
+// POLL IPC MESSAGES
+// =============================================================================
+Function.Chrome_PollMessages {
+    Input: sock: Integer
+    Body: {
+        // Drain up to 32 pending messages per tick (mouse events flood at 60Hz)
+        poll_pass = 0
+        WhileLoop LessThan(poll_pass, 32) {
+            msg = Socket.RecvMsg(sock)
+            IfCondition EqualTo(msg, 0) ThenBlock: {
+                poll_pass = 32
+            } ElseBlock: {
+                pmsg = ParseJSON(msg)
+                IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                    mobj = JSON.AsObject(pmsg)
+                    method = JSON.GetString(mobj, "method")
+                    IfCondition NotEqual(method, 0) ThenBlock: {
+
+                        cmp = StringCompare(method, "window.closed")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            PrintMessage("[Chrome] Window closed\n")
+                            Chrome_StopAll()
+                            ChromeState.running = 0
+                            poll_pass = 32
+                        }
+
+                        cmp = StringCompare(method, "input.key")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            kc = JSON.GetNumber(mobj, "keycode")
+                            kch = JSON.GetNumber(mobj, "char")
+                            ksh = JSON.GetNumber(mobj, "shift")
+                            kct = JSON.GetNumber(mobj, "ctrl")
+                            Chrome_HandleKey(kc, kch, ksh, kct)
+                        }
+
+                        cmp = StringCompare(method, "input.mouse")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            mmx = JSON.GetNumber(mobj, "x")
+                            mmy = JSON.GetNumber(mobj, "y")
+                            mev = JSON.GetNumber(mobj, "event")
+                            mbtn = JSON.GetNumber(mobj, "button")
+                            Chrome_HandleMouse(mmx, mmy, mev, mbtn)
+                        }
+
+                        cmp = StringCompare(method, "input.action")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            action = JSON.GetString(mobj, "action")
+                            IfCondition NotEqual(action, 0) ThenBlock: {
+                                Chrome_HandleAction(sock, action)
+                            }
+                        }
+
+                        cmp = StringCompare(method, "window.resized")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            rw = JSON.GetNumber(mobj, "width")
+                            rh = JSON.GetNumber(mobj, "height")
+                            Chrome_HandleResize(sock, rw, rh)
+                        }
+                    }
+                    JSON.Free(pmsg)
+                }
+            }
+            poll_pass = Add(poll_pass, 1)
+        }
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Chrome Browser — Xvfb + ffmpeg + ShmCanvas\n")
+    PrintMessage("============================================\n\n")
+
+    // Connect to display server
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[Chrome] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, "/tmp/ailang_display.sock")
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[Chrome] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[Chrome] Connected to display server\n")
+    ChromeState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"chrome\"}")
+    PrintMessage("[Chrome] Sent register\n")
+
+    // Create window (1024x700 content = canvas, system toolbar="about" added by WM)
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Chrome\",\"w\":1024,\"h\":700,\"html\":\"config/chrome.html\"}")
+    PrintMessage("[Chrome] Sent window.create\n")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[Chrome] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        ChromeState.win_id = wid
+        PrintMessage("[Chrome] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Create shared memory canvas (1024x708 = window minus toolbar)
+    cw = ChromeState.canvas_w
+    ch = ChromeState.canvas_h
+    wid = ChromeState.win_id
+    buf = ShmCanvas_Create(wid, cw, ch)
+    IfCondition EqualTo(buf, 0) ThenBlock: {
+        PrintMessage("[Chrome] ShmCanvas_Create failed\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    ShmCanvas_AttachCapture(sock, wid, cw, ch)
+    PrintMessage("[Chrome] Canvas attached (mouse capture)\n")
+
+    // Clear to black
+    ShmCanvas_Clear(4278190080)
+    ShmCanvas_Present(sock, wid)
+
+    // Set socket non-blocking before launch (launch may take a while)
+    Socket.SetNonBlock(sock)
+
+    // Launch Xvfb → Chrome → ffmpeg
+    lr = Chrome_LaunchAll()
+    IfCondition EqualTo(lr, 0) ThenBlock: {
+        PrintMessage("[Chrome] Child processes failed — window stays open with black canvas\n")
+        PrintMessage("[Chrome] Install prerequisites: sudo apt install xvfb xdotool\n")
+    }
+
+    // Tick timespecs — 5ms for responsive mouse, 30fps frames arrive every 33ms
+    ts_tick = Allocate(16)
+    StoreValue(ts_tick, 0)
+    StoreValue(Add(ts_tick, 8), 5000000)
+
+    ts_idle = Allocate(16)
+    StoreValue(ts_idle, 0)
+    StoreValue(Add(ts_idle, 8), 50000000)
+
+    PrintMessage("[Chrome] Entering main loop (30fps capture)\n\n")
+
+    // ===== MAIN LOOP =====
+    WhileLoop EqualTo(ChromeState.running, 1) {
+
+        IfCondition EqualTo(ChromeState.capturing, 1) ThenBlock: {
+            // Read frame data from ffmpeg pipe
+            vr = Chrome_ReadFrameTick()
+            IfCondition EqualTo(vr, 1) ThenBlock: {
+                // Full frame — present to display server
+                ShmCanvas_Present(sock, wid)
+            }
+            IfCondition EqualTo(vr, -1) ThenBlock: {
+                // EOF — ffmpeg died or was killed
+                PrintMessage("[Chrome] ffmpeg EOF\n")
+                ChromeState.capturing = 0
+            }
+
+            SystemCall(CSys.SYS_NANOSLEEP, ts_tick, 0)
+        } ElseBlock: {
+            // Idle — not capturing
+            SystemCall(CSys.SYS_NANOSLEEP, ts_idle, 0)
+        }
+
+        // Poll IPC messages
+        Chrome_PollMessages(sock)
+
+        // Flush coalesced mouse move (one xdotool per tick max)
+        Chrome_FlushMouse()
+
+        // Check/reap children
+        Chrome_CheckChildren()
+    }
+
+    // Cleanup
+    Chrome_StopAll()
+    ShmCanvas_Destroy(wid)
+    Deallocate(ts_tick, 16)
+    Deallocate(ts_idle, 16)
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  Chrome Browser finished\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)

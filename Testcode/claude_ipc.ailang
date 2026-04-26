@@ -1,0 +1,2561 @@
+// terminal_ipc.ailang
+// IPC terminal emulator — fork/exec /bin/bash via Linux PTY, render with
+// embedded 8x16 bitmap font on ShmCanvas, forward keyboard via PTY master fd.
+//
+// Architecture:
+//   - Open /dev/ptmx (PTY master), unlock, get slave path /dev/pts/N
+//   - Fork: child does setsid + open slave + TIOCSCTTY + dup2(0/1/2) + execve bash
+//   - Parent: non-blocking reads from master fd, feeds VT100 parser
+//   - Parser writes chars+attrs into 80x24 cell grid
+//   - TermFont renders grid to ShmCanvas every dirty tick
+//   - Keyboard input from IPC → translated → written to PTY master
+//
+// Build: ./ailang.x Testcode/terminal_ipc.ailang terminal_ipc.x
+// Run:   ./terminal_ipc.x  (after SysDisplay.x is running)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.HashMap
+LibraryImport.ShmCanvas
+LibraryImport.TermFont
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.TSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_IOCTL":     Initialize=16
+    "SYS_DUP2":      Initialize=33
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_KILL":      Initialize=62
+    "SYS_WAIT4":     Initialize=61
+    "SYS_FCNTL":     Initialize=72
+    "SYS_SETSID":    Initialize=112
+    "SYS_NANOSLEEP": Initialize=35
+}
+
+FixedPool.TFcntl {
+    "F_GETFL":    Initialize=3
+    "F_SETFL":    Initialize=4
+    "O_NONBLOCK": Initialize=2048
+    "O_RDWR":     Initialize=2
+    "O_NOCTTY":   Initialize=256
+}
+
+FixedPool.TIoctl {
+    "TIOCSPTLCK":  Initialize=1074025521
+    "TIOCGPTN":    Initialize=2147767344
+    "TIOCSCTTY":   Initialize=21518
+    "TIOCSWINSZ":  Initialize=21524
+}
+
+FixedPool.TSig {
+    "SIGTERM":  Initialize=15
+    "WNOHANG":  Initialize=1
+}
+
+// =============================================================================
+// TERMINAL DIMENSIONS
+// =============================================================================
+FixedPool.TermDim {
+    "COLS":      Initialize=100
+    "ROWS":      Initialize=37
+    "CHAR_W":    Initialize=8
+    "CHAR_H":    Initialize=16
+    "CANVAS_W":  Initialize=800
+    "CANVAS_H":  Initialize=592
+    "GRID_SIZE": Initialize=3700
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.TermState {
+    "running":        Initialize=1
+    "win_id":         Initialize=0
+    "sock":           Initialize=0
+    "master_fd":      Initialize=-1
+    "bash_pid":       Initialize=0
+    "cursor_row":     Initialize=0
+    "cursor_col":     Initialize=0
+    "dirty":          Initialize=1
+    "ctrl_held":      Initialize=0
+    "saved_row":      Initialize=0
+    "saved_col":      Initialize=0
+    "cursor_visible": Initialize=1
+    "autowrap":       Initialize=1
+    "app_cursor":     Initialize=0
+    "scroll_top":     Initialize=0
+    "scroll_bot":     Initialize=23
+}
+
+// =============================================================================
+// ALTERNATE SCREEN BUFFER — saved state when ESC[?1049h is active
+// =============================================================================
+FixedPool.AltScreen {
+    "active":     Initialize=0
+    "main_chars": Initialize=0
+    "main_fg":    Initialize=0
+    "main_bg":    Initialize=0
+    "main_row":   Initialize=0
+    "main_col":   Initialize=0
+    "main_gsz":   Initialize=0
+}
+
+// =============================================================================
+// VT100 PARSER STATE
+// =============================================================================
+FixedPool.TermParser {
+    "state":       Initialize=0
+    "param_buf":   Initialize=0
+    "param_count": Initialize=0
+    "utf8_acc":    Initialize=0
+    "utf8_rem":    Initialize=0
+}
+
+// Parser states
+FixedPool.TPState {
+    "NORMAL":   Initialize=0
+    "ESC":      Initialize=1
+    "CSI":      Initialize=2
+    "OSC":      Initialize=3
+}
+
+// =============================================================================
+// SGR (Select Graphic Rendition) attributes
+// =============================================================================
+FixedPool.TermSGR {
+    "fg":         Initialize=0xFFAAAAAA
+    "bg":         Initialize=0xFF000000
+    "bold":       Initialize=0
+    "reverse":    Initialize=0
+    "default_fg": Initialize=0xFFAAAAAA
+    "default_bg": Initialize=0xFF000000
+}
+
+// =============================================================================
+// GRID STORAGE — character codes + foreground + background per cell
+//
+// chars:   1920 bytes  (80*24, one byte per cell)
+// fg_arr:  1920 bytes  (80*24, one byte per cell, palette index)
+// bg_arr:  1920 bytes  (80*24, one byte per cell, palette index)
+// =============================================================================
+FixedPool.TermGrid {
+    "chars":   Initialize=0
+    "fg_arr":  Initialize=0
+    "bg_arr":  Initialize=0
+}
+
+// =============================================================================
+// SCROLLBACK BUFFER — ring buffer of saved lines
+//
+// scroll_chars/fg/bg: ring buffers, each max_lines * buf_cols bytes
+// write_pos:  next ring slot to write (wraps at max_lines)
+// line_count: how many lines stored (capped at max_lines)
+// scroll_off: how many lines scrolled back from bottom (0 = live view)
+// buf_cols:   column width the buffers were allocated at
+// =============================================================================
+FixedPool.TermScroll {
+    "scroll_chars": Initialize=0
+    "scroll_fg":    Initialize=0
+    "scroll_bg":    Initialize=0
+    "max_lines":    Initialize=1000
+    "write_pos":    Initialize=0
+    "line_count":   Initialize=0
+    "scroll_off":   Initialize=0
+    "buf_cols":     Initialize=0
+}
+
+// =============================================================================
+// SCROLLBAR APPEARANCE
+// =============================================================================
+FixedPool.ScrollbarConst {
+    "WIDTH":       Initialize=12
+    "TRACK_COLOR": Initialize=0xFF222222
+    "THUMB_COLOR": Initialize=0xFF666666
+    "MIN_THUMB":   Initialize=16
+}
+
+// =============================================================================
+// 16-COLOR ANSI PALETTE — BGRA dwords
+// Standard 8 + Bright 8
+// =============================================================================
+FixedPool.Palette {
+    "c0":   Initialize=0xFF000000
+    "c1":   Initialize=0xFF0000AA
+    "c2":   Initialize=0xFF00AA00
+    "c3":   Initialize=0xFF00AAAA
+    "c4":   Initialize=0xFFAA0000
+    "c5":   Initialize=0xFFAA00AA
+    "c6":   Initialize=0xFFAA5500
+    "c7":   Initialize=0xFFAAAAAA
+    "c8":   Initialize=0xFF555555
+    "c9":   Initialize=0xFF5555FF
+    "c10":  Initialize=0xFF55FF55
+    "c11":  Initialize=0xFF55FFFF
+    "c12":  Initialize=0xFFFF5555
+    "c13":  Initialize=0xFFFF55FF
+    "c14":  Initialize=0xFFFFFF55
+    "c15":  Initialize=0xFFFFFFFF
+}
+
+// =============================================================================
+// PALETTE LOOKUP — get BGRA dword from palette index (0-15)
+// =============================================================================
+Function.Term_PaletteLookup {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(idx, 0)  ThenBlock: { ReturnValue(Palette.c0) }
+        IfCondition EqualTo(idx, 1)  ThenBlock: { ReturnValue(Palette.c1) }
+        IfCondition EqualTo(idx, 2)  ThenBlock: { ReturnValue(Palette.c2) }
+        IfCondition EqualTo(idx, 3)  ThenBlock: { ReturnValue(Palette.c3) }
+        IfCondition EqualTo(idx, 4)  ThenBlock: { ReturnValue(Palette.c4) }
+        IfCondition EqualTo(idx, 5)  ThenBlock: { ReturnValue(Palette.c5) }
+        IfCondition EqualTo(idx, 6)  ThenBlock: { ReturnValue(Palette.c6) }
+        IfCondition EqualTo(idx, 7)  ThenBlock: { ReturnValue(Palette.c7) }
+        IfCondition EqualTo(idx, 8)  ThenBlock: { ReturnValue(Palette.c8) }
+        IfCondition EqualTo(idx, 9)  ThenBlock: { ReturnValue(Palette.c9) }
+        IfCondition EqualTo(idx, 10) ThenBlock: { ReturnValue(Palette.c10) }
+        IfCondition EqualTo(idx, 11) ThenBlock: { ReturnValue(Palette.c11) }
+        IfCondition EqualTo(idx, 12) ThenBlock: { ReturnValue(Palette.c12) }
+        IfCondition EqualTo(idx, 13) ThenBlock: { ReturnValue(Palette.c13) }
+        IfCondition EqualTo(idx, 14) ThenBlock: { ReturnValue(Palette.c14) }
+        IfCondition EqualTo(idx, 15) ThenBlock: { ReturnValue(Palette.c15) }
+        ReturnValue(Palette.c7)
+    }
+}
+
+// =============================================================================
+// FILL DWORD — fill an array with a 4-byte value (like MemorySet but for dwords)
+// Used for clearing fg/bg arrays that store BGRA dwords per cell.
+// =============================================================================
+Function.Term_FillDword {
+    Input: ptr: Address
+    Input: value: Integer
+    Input: count: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, count) {
+            StoreValue(Add(ptr, Multiply(i, 4)), value, "dword")
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// 6-LEVEL TO 8-BIT — map xterm 6x6x6 cube index (0-5) to 8-bit value
+// 0→0, 1→95, 2→135, 3→175, 4→215, 5→255
+// =============================================================================
+Function.Term_6to8 {
+    Input: v: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(v, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Add(55, Multiply(v, 40)))
+    }
+}
+
+// =============================================================================
+// COLOR 6x6x6 CUBE — convert cube index (0-215) to BGRA dword
+// =============================================================================
+Function.Term_Color6Cube {
+    Input: ci: Integer
+    Output: Integer
+    Body: {
+        ri = Divide(ci, 36)
+        gi = Divide(Modulo(ci, 36), 6)
+        bi = Modulo(ci, 6)
+        r = Term_6to8(ri)
+        g = Term_6to8(gi)
+        // Reuse ri for blue value to stay within variable budget
+        ri = Term_6to8(bi)
+        ReturnValue(BitwiseOr(0xFF000000, BitwiseOr(ri, BitwiseOr(ShiftLeft(g, 8), ShiftLeft(r, 16)))))
+    }
+}
+
+// =============================================================================
+// COLOR 256 — convert xterm 256-color index to BGRA dword
+// 0-15:    standard 16 ANSI colors (palette lookup)
+// 16-231:  6x6x6 RGB cube
+// 232-255: 24-step grayscale ramp
+// =============================================================================
+Function.Term_Color256 {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(idx, 16) ThenBlock: {
+            ReturnValue(Term_PaletteLookup(idx))
+        }
+        IfCondition GreaterEqual(idx, 232) ThenBlock: {
+            v = Add(8, Multiply(Subtract(idx, 232), 10))
+            ReturnValue(BitwiseOr(0xFF000000, BitwiseOr(v, BitwiseOr(ShiftLeft(v, 8), ShiftLeft(v, 16)))))
+        }
+        // 16-231: 6x6x6 cube
+        ReturnValue(Term_Color6Cube(Subtract(idx, 16)))
+    }
+}
+
+// =============================================================================
+// READ RGB — read 3 consecutive CSI params as R,G,B and pack to BGRA dword
+// =============================================================================
+Function.Term_ReadRGB {
+    Input: params: Address
+    Input: start: Integer
+    Output: Integer
+    Body: {
+        r = Dereference(Add(params, Multiply(start, 8)))
+        g = Dereference(Add(params, Multiply(Add(start, 1), 8)))
+        b = Dereference(Add(params, Multiply(Add(start, 2), 8)))
+        ReturnValue(BitwiseOr(0xFF000000, BitwiseOr(b, BitwiseOr(ShiftLeft(g, 8), ShiftLeft(r, 16)))))
+    }
+}
+
+// =============================================================================
+// SGR SET FG EXTENDED — handle ESC[38;5;N and ESC[38;2;R;G;B
+// Returns new param index (how far to advance i)
+// =============================================================================
+Function.Term_SGR_SetFgExt {
+    Input: params: Address
+    Input: i: Integer
+    Input: count: Integer
+    Output: Integer
+    Body: {
+        // Need at least 2 more params (sub-command + value)
+        IfCondition GreaterEqual(Add(i, 2), count) ThenBlock: { ReturnValue(i) }
+        sub = Dereference(Add(params, Multiply(Add(i, 1), 8)))
+
+        // 38;5;N — 256-color
+        IfCondition EqualTo(sub, 5) ThenBlock: {
+            ci = Dereference(Add(params, Multiply(Add(i, 2), 8)))
+            TermSGR.fg = Term_Color256(ci)
+            ReturnValue(Add(i, 2))
+        }
+
+        // 38;2;R;G;B — truecolor
+        IfCondition EqualTo(sub, 2) ThenBlock: {
+            IfCondition GreaterEqual(Add(i, 4), count) ThenBlock: { ReturnValue(i) }
+            TermSGR.fg = Term_ReadRGB(params, Add(i, 2))
+            ReturnValue(Add(i, 4))
+        }
+        ReturnValue(i)
+    }
+}
+
+// =============================================================================
+// SGR SET BG EXTENDED — handle ESC[48;5;N and ESC[48;2;R;G;B
+// =============================================================================
+Function.Term_SGR_SetBgExt {
+    Input: params: Address
+    Input: i: Integer
+    Input: count: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(Add(i, 2), count) ThenBlock: { ReturnValue(i) }
+        sub = Dereference(Add(params, Multiply(Add(i, 1), 8)))
+
+        // 48;5;N — 256-color
+        IfCondition EqualTo(sub, 5) ThenBlock: {
+            ci = Dereference(Add(params, Multiply(Add(i, 2), 8)))
+            TermSGR.bg = Term_Color256(ci)
+            ReturnValue(Add(i, 2))
+        }
+
+        // 48;2;R;G;B — truecolor
+        IfCondition EqualTo(sub, 2) ThenBlock: {
+            IfCondition GreaterEqual(Add(i, 4), count) ThenBlock: { ReturnValue(i) }
+            TermSGR.bg = Term_ReadRGB(params, Add(i, 2))
+            ReturnValue(Add(i, 4))
+        }
+        ReturnValue(i)
+    }
+}
+
+// =============================================================================
+// GRID HELPERS
+// =============================================================================
+Function.Term_GridClear {
+    Body: {
+        sz = TermDim.GRID_SIZE
+        Term_FillDword(TermGrid.chars, 32, sz)
+        Term_FillDword(TermGrid.fg_arr, TermSGR.default_fg, sz)
+        Term_FillDword(TermGrid.bg_arr, TermSGR.default_bg, sz)
+        TermState.cursor_row = 0
+        TermState.cursor_col = 0
+        TermState.dirty = 1
+    }
+}
+
+Function.Term_GridSetCell {
+    Input: row: Integer
+    Input: col: Integer
+    Input: ch:  Integer
+    Input: fg:  Integer
+    Input: bg:  Integer
+    Body: {
+        off = Add(Multiply(row, TermDim.COLS), col)
+        boff = Multiply(off, 4)
+        StoreValue(Add(TermGrid.chars, boff), ch, "dword")
+        StoreValue(Add(TermGrid.fg_arr, boff), fg, "dword")
+        StoreValue(Add(TermGrid.bg_arr, boff), bg, "dword")
+    }
+}
+
+// =============================================================================
+// SCROLLBACK INIT — allocate ring buffers for scrollback history
+// =============================================================================
+Function.Term_ScrollInit {
+    Body: {
+        cols = TermDim.COLS
+        max = TermScroll.max_lines
+        buf_sz = Multiply(max, cols)
+        buf_bytes = Multiply(buf_sz, 4)
+
+        TermScroll.scroll_chars = Allocate(buf_bytes)
+        TermScroll.scroll_fg    = Allocate(buf_bytes)
+        TermScroll.scroll_bg    = Allocate(buf_bytes)
+
+        Term_FillDword(TermScroll.scroll_chars, 32, buf_sz)
+        Term_FillDword(TermScroll.scroll_fg, TermSGR.default_fg, buf_sz)
+        Term_FillDword(TermScroll.scroll_bg, TermSGR.default_bg, buf_sz)
+
+        TermScroll.buf_cols   = cols
+        TermScroll.write_pos  = 0
+        TermScroll.line_count = 0
+        TermScroll.scroll_off = 0
+    }
+}
+
+// =============================================================================
+// SCROLLBACK FREE — deallocate ring buffers
+// =============================================================================
+Function.Term_ScrollFree {
+    Body: {
+        buf_bytes = Multiply(Multiply(TermScroll.max_lines, TermScroll.buf_cols), 4)
+        IfCondition GreaterThan(buf_bytes, 0) ThenBlock: {
+            IfCondition NotEqual(TermScroll.scroll_chars, 0) ThenBlock: {
+                Deallocate(TermScroll.scroll_chars, buf_bytes)
+                Deallocate(TermScroll.scroll_fg,    buf_bytes)
+                Deallocate(TermScroll.scroll_bg,    buf_bytes)
+                TermScroll.scroll_chars = 0
+                TermScroll.scroll_fg    = 0
+                TermScroll.scroll_bg    = 0
+            }
+        }
+    }
+}
+
+// =============================================================================
+// SCROLLBACK SAVE LINE — save top row (row 0) into ring buffer before scroll
+// =============================================================================
+Function.Term_ScrollSaveLine {
+    Body: {
+        cols = TermScroll.buf_cols
+        wp = TermScroll.write_pos
+        max = TermScroll.max_lines
+        off = Multiply(wp, cols)
+        boff = Multiply(off, 4)
+        bsz = Multiply(cols, 4)
+
+        // Copy grid row 0 into ring buffer at write_pos (all 4 bytes/cell)
+        MemoryCopy(Add(TermScroll.scroll_chars, boff), TermGrid.chars, bsz)
+        MemoryCopy(Add(TermScroll.scroll_fg, boff), TermGrid.fg_arr, bsz)
+        MemoryCopy(Add(TermScroll.scroll_bg, boff), TermGrid.bg_arr, bsz)
+
+        // Advance write_pos (ring wrap)
+        wp = Add(wp, 1)
+        IfCondition GreaterEqual(wp, max) ThenBlock: { wp = 0 }
+        TermScroll.write_pos = wp
+
+        // Increment line_count (cap at max_lines)
+        lc = Add(TermScroll.line_count, 1)
+        IfCondition GreaterThan(lc, max) ThenBlock: { lc = max }
+        TermScroll.line_count = lc
+    }
+}
+
+// =============================================================================
+// SCROLL UP — move rows 1..23 to 0..22, clear row 23
+// =============================================================================
+Function.Term_ScrollUp {
+    Body: {
+        Term_ScrollRegionUp()
+    }
+}
+
+// =============================================================================
+// SCROLL DOWN — move rows 0..22 to 1..23, clear row 0
+// =============================================================================
+Function.Term_ScrollDown {
+    Body: {
+        Term_ScrollRegionDown()
+    }
+}
+
+// =============================================================================
+// CLEAR LINE — clear one row (or part of row)
+// mode: 0 = cursor to end, 1 = start to cursor, 2 = entire line
+// =============================================================================
+Function.Term_ClearLine {
+    Input: row: Integer
+    Input: mode: Integer
+    Body: {
+        cols = TermDim.COLS
+        col  = TermState.cursor_col
+
+        IfCondition EqualTo(mode, 0) ThenBlock: {
+            // Cursor to end of line
+            off = Add(Multiply(row, cols), col)
+            cnt = Subtract(cols, col)
+            Term_FillDword(Add(TermGrid.chars,  Multiply(off, 4)), 32, cnt)
+            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), TermSGR.default_fg, cnt)
+            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), TermSGR.default_bg, cnt)
+        }
+        IfCondition EqualTo(mode, 1) ThenBlock: {
+            // Start of line to cursor
+            off = Multiply(row, cols)
+            cnt = Add(col, 1)
+            Term_FillDword(Add(TermGrid.chars,  Multiply(off, 4)), 32, cnt)
+            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), TermSGR.default_fg, cnt)
+            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), TermSGR.default_bg, cnt)
+        }
+        IfCondition EqualTo(mode, 2) ThenBlock: {
+            // Entire line
+            off = Multiply(row, cols)
+            Term_FillDword(Add(TermGrid.chars,  Multiply(off, 4)), 32, cols)
+            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), TermSGR.default_fg, cols)
+            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), TermSGR.default_bg, cols)
+        }
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// PUT CHAR — write a printable char at cursor, advance, wrap + scroll
+// =============================================================================
+Function.Term_PutChar {
+    Input: ch: Integer
+    Body: {
+        row = TermState.cursor_row
+        col = TermState.cursor_col
+        fg  = TermSGR.fg
+        bg  = TermSGR.bg
+
+        // Handle reverse video
+        IfCondition EqualTo(TermSGR.reverse, 1) ThenBlock: {
+            tmp = fg
+            fg = bg
+            bg = tmp
+        }
+
+        Term_GridSetCell(row, col, ch, fg, bg)
+
+        // Advance cursor
+        col = Add(col, 1)
+        IfCondition GreaterEqual(col, TermDim.COLS) ThenBlock: {
+            col = 0
+            row = Add(row, 1)
+            IfCondition GreaterEqual(row, TermDim.ROWS) ThenBlock: {
+                Term_ScrollUp()
+                row = Subtract(TermDim.ROWS, 1)
+            }
+        }
+        TermState.cursor_row = row
+        TermState.cursor_col = col
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// LINE FEED — move cursor down, scroll if at bottom
+// =============================================================================
+Function.Term_LineFeed {
+    Body: {
+        row = TermState.cursor_row
+        bot = TermState.scroll_bot
+        // If at bottom of scroll region, scroll up within region
+        IfCondition EqualTo(row, bot) ThenBlock: {
+            Term_ScrollUp()
+        } ElseBlock: {
+            // If below scroll region or elsewhere, just move down clamped to screen
+            row = Add(row, 1)
+            IfCondition GreaterEqual(row, TermDim.ROWS) ThenBlock: {
+                row = Subtract(TermDim.ROWS, 1)
+            }
+            TermState.cursor_row = row
+        }
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// CSI PARAM PARSER — extract up to 8 numeric params from param_buf
+// Params are separated by ';'. Missing params default to 0.
+// Returns params in a pre-allocated array, sets count.
+// =============================================================================
+Function.Term_ParseCSIParams {
+    Input: out_arr: Address
+    Output: Integer
+    Body: {
+        pbuf = TermParser.param_buf
+        plen = TermParser.param_count
+        count = 0
+        val = 0
+        i = 0
+
+        WhileLoop LessThan(i, plen) {
+            b = GetByte(pbuf, i)
+            IfCondition EqualTo(b, 59) ThenBlock: {
+                // ';' separator
+                StoreValue(Add(out_arr, Multiply(count, 8)), val)
+                count = Add(count, 1)
+                val = 0
+            } ElseBlock: {
+                IfCondition And(GreaterEqual(b, 48), LessEqual(b, 57)) ThenBlock: {
+                    val = Add(Multiply(val, 10), Subtract(b, 48))
+                }
+            }
+            i = Add(i, 1)
+        }
+        // Final param
+        StoreValue(Add(out_arr, Multiply(count, 8)), val)
+        count = Add(count, 1)
+        ReturnValue(count)
+    }
+}
+
+// =============================================================================
+// CSI SGR — handle ESC[...m (Select Graphic Rendition)
+// =============================================================================
+Function.Term_CSI_SGR {
+    Input: params: Address
+    Input: count: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, count) {
+            p = Dereference(Add(params, Multiply(i, 8)))
+
+            // 0 = reset
+            IfCondition EqualTo(p, 0) ThenBlock: {
+                TermSGR.fg = TermSGR.default_fg
+                TermSGR.bg = TermSGR.default_bg
+                TermSGR.bold = 0
+                TermSGR.reverse = 0
+            }
+            // 1 = bold
+            IfCondition EqualTo(p, 1) ThenBlock: { TermSGR.bold = 1 }
+            // 7 = reverse
+            IfCondition EqualTo(p, 7) ThenBlock: { TermSGR.reverse = 1 }
+            // 22 = normal intensity (unbold)
+            IfCondition EqualTo(p, 22) ThenBlock: { TermSGR.bold = 0 }
+            // 27 = reverse off
+            IfCondition EqualTo(p, 27) ThenBlock: { TermSGR.reverse = 0 }
+
+            // 30-37 = set foreground (standard palette → BGRA)
+            IfCondition And(GreaterEqual(p, 30), LessEqual(p, 37)) ThenBlock: {
+                TermSGR.fg = Term_PaletteLookup(Subtract(p, 30))
+            }
+            // 38 = extended foreground (256-color or truecolor)
+            IfCondition EqualTo(p, 38) ThenBlock: {
+                i = Term_SGR_SetFgExt(params, i, count)
+            }
+            // 39 = default foreground
+            IfCondition EqualTo(p, 39) ThenBlock: { TermSGR.fg = TermSGR.default_fg }
+
+            // 40-47 = set background (standard palette → BGRA)
+            IfCondition And(GreaterEqual(p, 40), LessEqual(p, 47)) ThenBlock: {
+                TermSGR.bg = Term_PaletteLookup(Subtract(p, 40))
+            }
+            // 48 = extended background (256-color or truecolor)
+            IfCondition EqualTo(p, 48) ThenBlock: {
+                i = Term_SGR_SetBgExt(params, i, count)
+            }
+            // 49 = default background
+            IfCondition EqualTo(p, 49) ThenBlock: { TermSGR.bg = TermSGR.default_bg }
+
+            // 90-97 = bright foreground (palette → BGRA)
+            IfCondition And(GreaterEqual(p, 90), LessEqual(p, 97)) ThenBlock: {
+                TermSGR.fg = Term_PaletteLookup(Add(Subtract(p, 90), 8))
+            }
+
+            // 100-107 = bright background (palette → BGRA)
+            IfCondition And(GreaterEqual(p, 100), LessEqual(p, 107)) ThenBlock: {
+                TermSGR.bg = Term_PaletteLookup(Add(Subtract(p, 100), 8))
+            }
+
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// CLEAR DISPLAY — ESC[J
+// mode: 0 = cursor to end, 1 = start to cursor, 2 = entire screen
+// =============================================================================
+Function.Term_ClearDisplay {
+    Input: mode: Integer
+    Body: {
+        row = TermState.cursor_row
+        col = TermState.cursor_col
+        cols = TermDim.COLS
+        rows = TermDim.ROWS
+
+        IfCondition EqualTo(mode, 2) ThenBlock: {
+            // Clear all
+            Term_FillDword(TermGrid.chars,  32, TermDim.GRID_SIZE)
+            Term_FillDword(TermGrid.fg_arr, TermSGR.default_fg, TermDim.GRID_SIZE)
+            Term_FillDword(TermGrid.bg_arr, TermSGR.default_bg, TermDim.GRID_SIZE)
+        }
+        IfCondition EqualTo(mode, 0) ThenBlock: {
+            // Cursor to end: clear rest of current line + all lines below
+            Term_ClearLine(row, 0)
+            r = Add(row, 1)
+            WhileLoop LessThan(r, rows) {
+                Term_ClearLine(r, 2)
+                r = Add(r, 1)
+            }
+        }
+        IfCondition EqualTo(mode, 1) ThenBlock: {
+            // Start to cursor: clear lines above + start of current line
+            r = 0
+            WhileLoop LessThan(r, row) {
+                Term_ClearLine(r, 2)
+                r = Add(r, 1)
+            }
+            Term_ClearLine(row, 1)
+        }
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// DELETE CHARS — CSI P: delete N chars at cursor, shift rest of line left
+// =============================================================================
+Function.Term_DeleteChars {
+    Input: n: Integer
+    Body: {
+        row = TermState.cursor_row
+        col = TermState.cursor_col
+        cols = TermDim.COLS
+        remaining = Subtract(cols, Add(col, n))
+        IfCondition LessThan(remaining, 0) ThenBlock: { remaining = 0 }
+
+        base = Multiply(row, cols)
+        dst = Add(base, col)
+        src = Add(dst, n)
+
+        // Shift chars left (all arrays are 4 bytes per cell now)
+        IfCondition GreaterThan(remaining, 0) ThenBlock: {
+            MemoryCopy(Add(TermGrid.chars,  Multiply(dst, 4)), Add(TermGrid.chars,  Multiply(src, 4)), Multiply(remaining, 4))
+            MemoryCopy(Add(TermGrid.fg_arr, Multiply(dst, 4)), Add(TermGrid.fg_arr, Multiply(src, 4)), Multiply(remaining, 4))
+            MemoryCopy(Add(TermGrid.bg_arr, Multiply(dst, 4)), Add(TermGrid.bg_arr, Multiply(src, 4)), Multiply(remaining, 4))
+        }
+
+        // Clear vacated cells at end
+        clr_off = Add(dst, remaining)
+        clr_cnt = Subtract(cols, Add(col, remaining))
+        IfCondition GreaterThan(clr_cnt, 0) ThenBlock: {
+            Term_FillDword(Add(TermGrid.chars,  Multiply(clr_off, 4)), 32, clr_cnt)
+            Term_FillDword(Add(TermGrid.fg_arr, Multiply(clr_off, 4)), TermSGR.default_fg, clr_cnt)
+            Term_FillDword(Add(TermGrid.bg_arr, Multiply(clr_off, 4)), TermSGR.default_bg, clr_cnt)
+        }
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// INSERT CHARS — CSI @: insert N blank chars at cursor, shift rest right
+// =============================================================================
+Function.Term_InsertChars {
+    Input: n: Integer
+    Body: {
+        row = TermState.cursor_row
+        col = TermState.cursor_col
+        cols = TermDim.COLS
+        remaining = Subtract(cols, Add(col, n))
+        IfCondition LessThan(remaining, 0) ThenBlock: { remaining = 0 }
+
+        base = Multiply(row, cols)
+        src = Add(base, col)
+        dst = Add(src, n)
+
+        // Shift chars right (copy backwards to avoid overlap issues)
+        IfCondition GreaterThan(remaining, 0) ThenBlock: {
+            Term_ShiftRight(src, dst, remaining)
+        }
+
+        // Clear inserted cells at cursor
+        Term_FillDword(Add(TermGrid.chars,  Multiply(src, 4)), 32, n)
+        Term_FillDword(Add(TermGrid.fg_arr, Multiply(src, 4)), TermSGR.default_fg, n)
+        Term_FillDword(Add(TermGrid.bg_arr, Multiply(src, 4)), TermSGR.default_bg, n)
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// SHIFT RIGHT — copy N cells from src to dst (handles right-overlapping copy)
+// =============================================================================
+Function.Term_ShiftRight {
+    Input: src: Integer
+    Input: dst: Integer
+    Input: count: Integer
+    Body: {
+        // Copy cell by cell from end to start to handle overlap
+        // All arrays are 4 bytes per cell
+        i = Subtract(count, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            sb = Multiply(Add(src, i), 4)
+            db = Multiply(Add(dst, i), 4)
+            ch = Dereference(Add(TermGrid.chars, sb), "dword")
+            StoreValue(Add(TermGrid.chars, db), ch, "dword")
+            fg = Dereference(Add(TermGrid.fg_arr, sb), "dword")
+            StoreValue(Add(TermGrid.fg_arr, db), fg, "dword")
+            bg = Dereference(Add(TermGrid.bg_arr, sb), "dword")
+            StoreValue(Add(TermGrid.bg_arr, db), bg, "dword")
+            i = Subtract(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// ERASE CHARS — CSI X: erase N chars at cursor (replace with spaces, no shift)
+// =============================================================================
+Function.Term_EraseChars {
+    Input: n: Integer
+    Body: {
+        row = TermState.cursor_row
+        col = TermState.cursor_col
+        cols = TermDim.COLS
+        cnt = n
+        IfCondition GreaterThan(Add(col, cnt), cols) ThenBlock: {
+            cnt = Subtract(cols, col)
+        }
+
+        off = Add(Multiply(row, cols), col)
+        Term_FillDword(Add(TermGrid.chars,  Multiply(off, 4)), 32, cnt)
+        Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), TermSGR.default_fg, cnt)
+        Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), TermSGR.default_bg, cnt)
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// SCROLL REGION UP — scroll lines within scroll region up by 1
+// Only scrolls rows from scroll_top to scroll_bot
+// =============================================================================
+Function.Term_ScrollRegionUp {
+    Body: {
+        cols = TermDim.COLS
+        top = TermState.scroll_top
+        bot = TermState.scroll_bot
+
+        // Save top row of scroll region to scrollback (only if region starts at 0)
+        IfCondition EqualTo(top, 0) ThenBlock: {
+            IfCondition NotEqual(TermScroll.scroll_chars, 0) ThenBlock: {
+                Term_ScrollSaveLine()
+            }
+        }
+
+        // Copy rows top+1..bot to top..bot-1
+        copy_cells = Multiply(Subtract(bot, top), cols)
+        src_off = Multiply(Multiply(Add(top, 1), cols), 4)
+        dst_off = Multiply(Multiply(top, cols), 4)
+        copy_bytes = Multiply(copy_cells, 4)
+        MemoryCopy(Add(TermGrid.chars, dst_off), Add(TermGrid.chars, src_off), copy_bytes)
+        MemoryCopy(Add(TermGrid.fg_arr, dst_off), Add(TermGrid.fg_arr, src_off), copy_bytes)
+        MemoryCopy(Add(TermGrid.bg_arr, dst_off), Add(TermGrid.bg_arr, src_off), copy_bytes)
+
+        // Clear bottom row of scroll region
+        clr_off = Multiply(Multiply(bot, cols), 4)
+        Term_FillDword(Add(TermGrid.chars,  clr_off), 32, cols)
+        Term_FillDword(Add(TermGrid.fg_arr, clr_off), TermSGR.default_fg, cols)
+        Term_FillDword(Add(TermGrid.bg_arr, clr_off), TermSGR.default_bg, cols)
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// SCROLL REGION DOWN — scroll lines within scroll region down by 1
+// =============================================================================
+Function.Term_ScrollRegionDown {
+    Body: {
+        cols = TermDim.COLS
+        top = TermState.scroll_top
+        bot = TermState.scroll_bot
+        row_bytes = Multiply(cols, 4)
+
+        // Copy rows bottom-up to avoid forward-overlap corruption
+        r = bot
+        WhileLoop GreaterThan(r, top) {
+            dst_off = Multiply(Multiply(r, cols), 4)
+            src_off = Multiply(Multiply(Subtract(r, 1), cols), 4)
+            MemoryCopy(Add(TermGrid.chars,  dst_off), Add(TermGrid.chars,  src_off), row_bytes)
+            MemoryCopy(Add(TermGrid.fg_arr, dst_off), Add(TermGrid.fg_arr, src_off), row_bytes)
+            MemoryCopy(Add(TermGrid.bg_arr, dst_off), Add(TermGrid.bg_arr, src_off), row_bytes)
+            r = Subtract(r, 1)
+        }
+
+        // Clear top row of scroll region
+        top_off = Multiply(Multiply(top, cols), 4)
+        Term_FillDword(Add(TermGrid.chars,  top_off), 32, cols)
+        Term_FillDword(Add(TermGrid.fg_arr, top_off), TermSGR.default_fg, cols)
+        Term_FillDword(Add(TermGrid.bg_arr, top_off), TermSGR.default_bg, cols)
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// HANDLE CSI PRIVATE — parse ESC[?...h or ESC[?...l (DEC private modes)
+// Parses the mode number from param_buf (skipping '?'), dispatches h/l
+// =============================================================================
+Function.Term_HandleCSIPrivate {
+    Input: final_ch: Integer
+    Body: {
+        // Parse number from param_buf starting at index 1 (skip '?')
+        pbuf = TermParser.param_buf
+        plen = TermParser.param_count
+        val = 0
+        i = 1
+        WhileLoop LessThan(i, plen) {
+            b = GetByte(pbuf, i)
+            IfCondition And(GreaterEqual(b, 48), LessEqual(b, 57)) ThenBlock: {
+                val = Add(Multiply(val, 10), Subtract(b, 48))
+            }
+            i = Add(i, 1)
+        }
+
+        // h (104) = set mode, l (108) = reset mode
+        IfCondition EqualTo(final_ch, 104) ThenBlock: {
+            Term_HandlePrivateMode(val, 1)
+        }
+        IfCondition EqualTo(final_ch, 108) ThenBlock: {
+            Term_HandlePrivateMode(val, 0)
+        }
+    }
+}
+
+// =============================================================================
+// ENTER ALT SCREEN — save main grid, allocate fresh alt grid
+// =============================================================================
+Function.Term_EnterAltScreen {
+    Body: {
+        IfCondition EqualTo(AltScreen.active, 1) ThenBlock: { ReturnValue(0) }
+
+        gsz = TermDim.GRID_SIZE
+        gsz4 = Multiply(gsz, 4)
+        // Save main grid pointers and cursor
+        AltScreen.main_chars = TermGrid.chars
+        AltScreen.main_fg    = TermGrid.fg_arr
+        AltScreen.main_bg    = TermGrid.bg_arr
+        AltScreen.main_row   = TermState.cursor_row
+        AltScreen.main_col   = TermState.cursor_col
+        AltScreen.main_gsz   = gsz
+
+        // Allocate fresh alt grid (all 4 bytes/cell)
+        TermGrid.chars  = Allocate(gsz4)
+        TermGrid.fg_arr = Allocate(gsz4)
+        TermGrid.bg_arr = Allocate(gsz4)
+
+        // Clear alt grid
+        Term_FillDword(TermGrid.chars,  32, gsz)
+        Term_FillDword(TermGrid.fg_arr, TermSGR.default_fg, gsz)
+        Term_FillDword(TermGrid.bg_arr, TermSGR.default_bg, gsz)
+
+        TermState.cursor_row = 0
+        TermState.cursor_col = 0
+        AltScreen.active = 1
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// LEAVE ALT SCREEN — deallocate alt grid, restore main grid
+// =============================================================================
+Function.Term_LeaveAltScreen {
+    Body: {
+        IfCondition EqualTo(AltScreen.active, 0) ThenBlock: { ReturnValue(0) }
+
+        // Deallocate alt grid (all 4 bytes/cell)
+        gsz4 = Multiply(TermDim.GRID_SIZE, 4)
+        Deallocate(TermGrid.chars,  gsz4)
+        Deallocate(TermGrid.fg_arr, gsz4)
+        Deallocate(TermGrid.bg_arr, gsz4)
+
+        // Restore main grid
+        TermGrid.chars  = AltScreen.main_chars
+        TermGrid.fg_arr = AltScreen.main_fg
+        TermGrid.bg_arr = AltScreen.main_bg
+        TermState.cursor_row = AltScreen.main_row
+        TermState.cursor_col = AltScreen.main_col
+
+        AltScreen.main_chars = 0
+        AltScreen.main_fg    = 0
+        AltScreen.main_bg    = 0
+        AltScreen.active = 0
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// HANDLE DEC PRIVATE MODE — ESC[?Nh or ESC[?Nl
+// mode_num: the number after ?, set: 1=h(set), 0=l(reset)
+// =============================================================================
+Function.Term_HandlePrivateMode {
+    Input: mode_num: Integer
+    Input: set: Integer
+    Body: {
+        // ?1 — Application cursor keys (DECCKM)
+        IfCondition EqualTo(mode_num, 1) ThenBlock: {
+            TermState.app_cursor = set
+        }
+
+        // ?7 — Autowrap mode (DECAWM)
+        IfCondition EqualTo(mode_num, 7) ThenBlock: {
+            TermState.autowrap = set
+        }
+
+        // ?25 — Show/hide cursor (DECTCEM)
+        IfCondition EqualTo(mode_num, 25) ThenBlock: {
+            TermState.cursor_visible = set
+            TermState.dirty = 1
+        }
+
+        // ?1049 — Alternate screen buffer
+        IfCondition EqualTo(mode_num, 1049) ThenBlock: {
+            IfCondition EqualTo(set, 1) ThenBlock: {
+                Term_EnterAltScreen()
+            } ElseBlock: {
+                Term_LeaveAltScreen()
+            }
+        }
+
+        // ?2004 — Bracketed paste mode (just track, ignore)
+    }
+}
+
+// =============================================================================
+// HANDLE CSI SEQUENCE — dispatch on final character
+// =============================================================================
+Function.Term_HandleCSI {
+    Input: final_ch: Integer
+    Body: {
+        // Check for '?' private mode prefix
+        pc = TermParser.param_count
+        IfCondition GreaterThan(pc, 0) ThenBlock: {
+            first_byte = GetByte(TermParser.param_buf, 0)
+            IfCondition EqualTo(first_byte, 63) ThenBlock: {
+                // Private mode: parse number after '?', dispatch h/l
+                Term_HandleCSIPrivate(final_ch)
+                ReturnValue(0)
+            }
+        }
+
+        // Parse params from param_buf
+        params = Allocate(64)
+        count = Term_ParseCSIParams(params)
+
+        p0 = Dereference(params)
+        p1 = Dereference(Add(params, 8))
+
+        // Default p0 to 1 for cursor movement commands
+        dp0 = p0
+        IfCondition EqualTo(dp0, 0) ThenBlock: { dp0 = 1 }
+
+        // A — Cursor Up
+        IfCondition EqualTo(final_ch, 65) ThenBlock: {
+            nr = Subtract(TermState.cursor_row, dp0)
+            IfCondition LessThan(nr, 0) ThenBlock: { nr = 0 }
+            TermState.cursor_row = nr
+        }
+
+        // B — Cursor Down
+        IfCondition EqualTo(final_ch, 66) ThenBlock: {
+            nr = Add(TermState.cursor_row, dp0)
+            IfCondition GreaterEqual(nr, TermDim.ROWS) ThenBlock: { nr = Subtract(TermDim.ROWS, 1) }
+            TermState.cursor_row = nr
+        }
+
+        // C — Cursor Forward
+        IfCondition EqualTo(final_ch, 67) ThenBlock: {
+            nc = Add(TermState.cursor_col, dp0)
+            IfCondition GreaterEqual(nc, TermDim.COLS) ThenBlock: { nc = Subtract(TermDim.COLS, 1) }
+            TermState.cursor_col = nc
+        }
+
+        // D — Cursor Back
+        IfCondition EqualTo(final_ch, 68) ThenBlock: {
+            nc = Subtract(TermState.cursor_col, dp0)
+            IfCondition LessThan(nc, 0) ThenBlock: { nc = 0 }
+            TermState.cursor_col = nc
+        }
+
+        // H or f — Cursor Position (row;col, 1-based)
+        IfCondition Or(EqualTo(final_ch, 72), EqualTo(final_ch, 102)) ThenBlock: {
+            r = p0
+            c = p1
+            IfCondition EqualTo(r, 0) ThenBlock: { r = 1 }
+            IfCondition EqualTo(c, 0) ThenBlock: { c = 1 }
+            r = Subtract(r, 1)
+            c = Subtract(c, 1)
+            IfCondition GreaterEqual(r, TermDim.ROWS) ThenBlock: { r = Subtract(TermDim.ROWS, 1) }
+            IfCondition GreaterEqual(c, TermDim.COLS) ThenBlock: { c = Subtract(TermDim.COLS, 1) }
+            TermState.cursor_row = r
+            TermState.cursor_col = c
+        }
+
+        // J — Erase in Display
+        IfCondition EqualTo(final_ch, 74) ThenBlock: {
+            Term_ClearDisplay(p0)
+        }
+
+        // K — Erase in Line
+        IfCondition EqualTo(final_ch, 75) ThenBlock: {
+            Term_ClearLine(TermState.cursor_row, p0)
+        }
+
+        // m — SGR (Select Graphic Rendition)
+        IfCondition EqualTo(final_ch, 109) ThenBlock: {
+            // If no params, treat as reset (SGR 0)
+            IfCondition EqualTo(TermParser.param_count, 0) ThenBlock: {
+                StoreValue(params, 0)
+                count = 1
+            }
+            Term_CSI_SGR(params, count)
+        }
+
+        // s — Save cursor position
+        IfCondition EqualTo(final_ch, 115) ThenBlock: {
+            TermState.saved_row = TermState.cursor_row
+            TermState.saved_col = TermState.cursor_col
+        }
+
+        // u — Restore cursor position
+        IfCondition EqualTo(final_ch, 117) ThenBlock: {
+            TermState.cursor_row = TermState.saved_row
+            TermState.cursor_col = TermState.saved_col
+        }
+
+        // G — Cursor Horizontal Absolute (1-based column)
+        IfCondition EqualTo(final_ch, 71) ThenBlock: {
+            c = dp0
+            c = Subtract(c, 1)
+            IfCondition LessThan(c, 0) ThenBlock: { c = 0 }
+            IfCondition GreaterEqual(c, TermDim.COLS) ThenBlock: { c = Subtract(TermDim.COLS, 1) }
+            TermState.cursor_col = c
+        }
+
+        // d — Vertical Line Position Absolute (1-based row)
+        IfCondition EqualTo(final_ch, 100) ThenBlock: {
+            r = dp0
+            r = Subtract(r, 1)
+            IfCondition LessThan(r, 0) ThenBlock: { r = 0 }
+            IfCondition GreaterEqual(r, TermDim.ROWS) ThenBlock: { r = Subtract(TermDim.ROWS, 1) }
+            TermState.cursor_row = r
+        }
+
+        // L — Insert Lines
+        IfCondition EqualTo(final_ch, 76) ThenBlock: {
+            n = dp0
+            i = 0
+            WhileLoop LessThan(i, n) {
+                // Shift rows down from cursor, clear cursor row
+                Term_ScrollDown()
+                i = Add(i, 1)
+            }
+        }
+
+        // M — Delete Lines
+        IfCondition EqualTo(final_ch, 77) ThenBlock: {
+            n = dp0
+            i = 0
+            WhileLoop LessThan(i, n) {
+                Term_ScrollUp()
+                i = Add(i, 1)
+            }
+        }
+
+        // P — Delete Characters (shift rest of line left)
+        IfCondition EqualTo(final_ch, 80) ThenBlock: {
+            Term_DeleteChars(dp0)
+        }
+
+        // @ — Insert Characters (shift rest of line right)
+        IfCondition EqualTo(final_ch, 64) ThenBlock: {
+            Term_InsertChars(dp0)
+        }
+
+        // X — Erase Characters (replace with spaces, no shift)
+        IfCondition EqualTo(final_ch, 88) ThenBlock: {
+            Term_EraseChars(dp0)
+        }
+
+        // r — Set Scroll Region (top;bottom, 1-based)
+        IfCondition EqualTo(final_ch, 114) ThenBlock: {
+            st = p0
+            sb = p1
+            IfCondition EqualTo(st, 0) ThenBlock: { st = 1 }
+            IfCondition EqualTo(sb, 0) ThenBlock: { sb = TermDim.ROWS }
+            st = Subtract(st, 1)
+            sb = Subtract(sb, 1)
+            IfCondition GreaterEqual(sb, TermDim.ROWS) ThenBlock: { sb = Subtract(TermDim.ROWS, 1) }
+            IfCondition LessThan(st, sb) ThenBlock: {
+                TermState.scroll_top = st
+                TermState.scroll_bot = sb
+                // CSI r also moves cursor to home
+                TermState.cursor_row = 0
+                TermState.cursor_col = 0
+            }
+        }
+
+        // S — Scroll Up N lines
+        IfCondition EqualTo(final_ch, 83) ThenBlock: {
+            n = dp0
+            i = 0
+            WhileLoop LessThan(i, n) {
+                Term_ScrollUp()
+                i = Add(i, 1)
+            }
+        }
+
+        // T — Scroll Down N lines
+        IfCondition EqualTo(final_ch, 84) ThenBlock: {
+            n = dp0
+            i = 0
+            WhileLoop LessThan(i, n) {
+                Term_ScrollDown()
+                i = Add(i, 1)
+            }
+        }
+
+        TermState.dirty = 1
+        Deallocate(params, 64)
+    }
+}
+
+// =============================================================================
+// PROCESS BYTE — VT100 state machine
+// =============================================================================
+Function.Term_ProcessByte {
+    Input: ch: Integer
+    Body: {
+        st = TermParser.state
+
+        // ===== NORMAL state =====
+        IfCondition EqualTo(st, TPState.NORMAL) ThenBlock: {
+            // ESC (27) — enter escape state
+            IfCondition EqualTo(ch, 27) ThenBlock: {
+                TermParser.state = TPState.ESC
+                ReturnValue(0)
+            }
+            // LF (10) — line feed
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                Term_LineFeed()
+                ReturnValue(0)
+            }
+            // CR (13) — carriage return
+            IfCondition EqualTo(ch, 13) ThenBlock: {
+                TermState.cursor_col = 0
+                ReturnValue(0)
+            }
+            // BS (8) — backspace
+            IfCondition EqualTo(ch, 8) ThenBlock: {
+                IfCondition GreaterThan(TermState.cursor_col, 0) ThenBlock: {
+                    TermState.cursor_col = Subtract(TermState.cursor_col, 1)
+                }
+                ReturnValue(0)
+            }
+            // TAB (9) — tab to next 8-column stop
+            IfCondition EqualTo(ch, 9) ThenBlock: {
+                nc = BitwiseAnd(Add(TermState.cursor_col, 8), -8)
+                IfCondition GreaterEqual(nc, TermDim.COLS) ThenBlock: {
+                    nc = Subtract(TermDim.COLS, 1)
+                }
+                TermState.cursor_col = nc
+                ReturnValue(0)
+            }
+            // BEL (7) — bell, ignore
+            IfCondition EqualTo(ch, 7) ThenBlock: { ReturnValue(0) }
+            // SO (14), SI (15) — charset shift, ignore
+            IfCondition EqualTo(ch, 14) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(ch, 15) ThenBlock: { ReturnValue(0) }
+
+            // UTF-8 continuation byte (0x80-0xBF) — accumulate
+            IfCondition GreaterThan(TermParser.utf8_rem, 0) ThenBlock: {
+                IfCondition And(GreaterEqual(ch, 128), LessEqual(ch, 191)) ThenBlock: {
+                    acc = BitwiseOr(ShiftLeft(TermParser.utf8_acc, 6), BitwiseAnd(ch, 63))
+                    TermParser.utf8_acc = acc
+                    TermParser.utf8_rem = Subtract(TermParser.utf8_rem, 1)
+                    IfCondition EqualTo(TermParser.utf8_rem, 0) ThenBlock: {
+                        // Complete codepoint — emit it
+                        Term_PutChar(acc)
+                    }
+                } ElseBlock: {
+                    // Invalid continuation — reset and reprocess byte
+                    TermParser.utf8_rem = 0
+                    TermParser.utf8_acc = 0
+                    Term_ProcessByte(ch)
+                }
+                ReturnValue(0)
+            }
+
+            // UTF-8 lead bytes
+            IfCondition And(GreaterEqual(ch, 192), LessEqual(ch, 223)) ThenBlock: {
+                // 2-byte sequence (110xxxxx)
+                TermParser.utf8_acc = BitwiseAnd(ch, 31)
+                TermParser.utf8_rem = 1
+                ReturnValue(0)
+            }
+            IfCondition And(GreaterEqual(ch, 224), LessEqual(ch, 239)) ThenBlock: {
+                // 3-byte sequence (1110xxxx)
+                TermParser.utf8_acc = BitwiseAnd(ch, 15)
+                TermParser.utf8_rem = 2
+                ReturnValue(0)
+            }
+            IfCondition And(GreaterEqual(ch, 240), LessEqual(ch, 247)) ThenBlock: {
+                // 4-byte sequence (11110xxx)
+                TermParser.utf8_acc = BitwiseAnd(ch, 7)
+                TermParser.utf8_rem = 3
+                ReturnValue(0)
+            }
+
+            // Printable ASCII: 32-126
+            IfCondition And(GreaterEqual(ch, 32), LessEqual(ch, 126)) ThenBlock: {
+                Term_PutChar(ch)
+            }
+            ReturnValue(0)
+        }
+
+        // ===== ESC state =====
+        IfCondition EqualTo(st, TPState.ESC) ThenBlock: {
+            // '[' = CSI
+            IfCondition EqualTo(ch, 91) ThenBlock: {
+                TermParser.state = TPState.CSI
+                TermParser.param_count = 0
+                // Clear param_buf
+                MemorySet(TermParser.param_buf, 0, 32)
+                ReturnValue(0)
+            }
+            // ']' = OSC
+            IfCondition EqualTo(ch, 93) ThenBlock: {
+                TermParser.state = TPState.OSC
+                ReturnValue(0)
+            }
+            // 'c' = Full Reset (RIS)
+            IfCondition EqualTo(ch, 99) ThenBlock: {
+                Term_GridClear()
+                TermSGR.fg = TermSGR.default_fg
+                TermSGR.bg = TermSGR.default_bg
+                TermSGR.bold = 0
+                TermSGR.reverse = 0
+                TermParser.state = TPState.NORMAL
+                ReturnValue(0)
+            }
+            // 'D' = Line Feed
+            IfCondition EqualTo(ch, 68) ThenBlock: {
+                Term_LineFeed()
+                TermParser.state = TPState.NORMAL
+                ReturnValue(0)
+            }
+            // 'M' = Reverse Index (scroll down at top)
+            IfCondition EqualTo(ch, 77) ThenBlock: {
+                IfCondition EqualTo(TermState.cursor_row, 0) ThenBlock: {
+                    Term_ScrollDown()
+                } ElseBlock: {
+                    TermState.cursor_row = Subtract(TermState.cursor_row, 1)
+                }
+                TermParser.state = TPState.NORMAL
+                ReturnValue(0)
+            }
+            // '7' = Save cursor
+            IfCondition EqualTo(ch, 55) ThenBlock: {
+                TermState.saved_row = TermState.cursor_row
+                TermState.saved_col = TermState.cursor_col
+                TermParser.state = TPState.NORMAL
+                ReturnValue(0)
+            }
+            // '8' = Restore cursor
+            IfCondition EqualTo(ch, 56) ThenBlock: {
+                TermState.cursor_row = TermState.saved_row
+                TermState.cursor_col = TermState.saved_col
+                TermParser.state = TPState.NORMAL
+                ReturnValue(0)
+            }
+            // Anything else — discard and return to NORMAL
+            TermParser.state = TPState.NORMAL
+            ReturnValue(0)
+        }
+
+        // ===== CSI state =====
+        IfCondition EqualTo(st, TPState.CSI) ThenBlock: {
+            // Accumulate digits and ';' into param_buf
+            is_digit = And(GreaterEqual(ch, 48), LessEqual(ch, 57))
+            is_semi  = EqualTo(ch, 59)
+            // '?' is a private mode prefix (e.g. ESC[?25l) — accumulate it
+            is_qmark = EqualTo(ch, 63)
+
+            IfCondition Or(Or(is_digit, is_semi), is_qmark) ThenBlock: {
+                pc = TermParser.param_count
+                IfCondition LessThan(pc, 31) ThenBlock: {
+                    SetByte(TermParser.param_buf, pc, ch)
+                    TermParser.param_count = Add(pc, 1)
+                }
+                ReturnValue(0)
+            }
+
+            // Final character (letter or @, ~, etc.) — dispatch
+            IfCondition GreaterEqual(ch, 64) ThenBlock: {
+                Term_HandleCSI(ch)
+                TermParser.state = TPState.NORMAL
+                ReturnValue(0)
+            }
+
+            // Intermediate chars (space, !, ", etc.) — ignore but stay in CSI
+            ReturnValue(0)
+        }
+
+        // ===== OSC state =====
+        IfCondition EqualTo(st, TPState.OSC) ThenBlock: {
+            // Consume until BEL (7) or ST (ESC \)
+            IfCondition EqualTo(ch, 7) ThenBlock: {
+                TermParser.state = TPState.NORMAL
+            }
+            // ESC starts String Terminator (ESC \) — transition to ESC state
+            // which will handle '\' or any other follow-up byte correctly
+            IfCondition EqualTo(ch, 27) ThenBlock: {
+                TermParser.state = TPState.ESC
+            }
+            ReturnValue(0)
+        }
+    }
+}
+
+// =============================================================================
+// RENDER ROW FROM — render one row from arbitrary char/fg/bg pointers
+// screen_row: which screen row (0-based) to draw at (determines pixel Y)
+// src_chars/src_fg/src_bg: pointers to line data (COLS bytes each)
+// =============================================================================
+Function.Term_RenderRowFrom {
+    Input: screen_row: Integer
+    Input: src_chars: Address
+    Input: src_fg: Address
+    Input: src_bg: Address
+    Body: {
+        buf = ShmCanvasState.buf
+        stride = TermDim.CANVAS_W
+        py = Multiply(screen_row, TermFontConst.CHAR_H)
+
+        col = 0
+        WhileLoop LessThan(col, TermDim.COLS) {
+            boff = Multiply(col, 4)
+            ch = Dereference(Add(src_chars, boff), "dword")
+            fg_c = Dereference(Add(src_fg, boff), "dword")
+            bg_c = Dereference(Add(src_bg, boff), "dword")
+            TermFont_SetColors(fg_c, bg_c)
+
+            px = Multiply(col, TermFontConst.CHAR_W)
+            TermFont_DrawCharFgBg(buf, stride, px, py, ch)
+
+            col = Add(col, 1)
+        }
+    }
+}
+
+// =============================================================================
+// RENDER GRID ROW — render one row of the cell grid to the canvas
+// Split out from Term_RenderGrid to keep variable count manageable.
+// =============================================================================
+Function.Term_RenderRow {
+    Input: row: Integer
+    Body: {
+        base = Multiply(row, TermDim.COLS)
+        boff = Multiply(base, 4)
+        Term_RenderRowFrom(row, Add(TermGrid.chars, boff), Add(TermGrid.fg_arr, boff), Add(TermGrid.bg_arr, boff))
+    }
+}
+
+// =============================================================================
+// RENDER SCROLLBACK ROW — render one line from scrollback ring buffer
+// ring_idx: index into scrollback (0 = oldest stored line)
+// screen_row: which screen row to draw at
+// =============================================================================
+Function.Term_RenderScrollRow {
+    Input: ring_idx: Integer
+    Input: screen_row: Integer
+    Body: {
+        max = TermScroll.max_lines
+        lc  = TermScroll.line_count
+        wp  = TermScroll.write_pos
+        cols = TermScroll.buf_cols
+
+        // Map ring_idx to actual ring position
+        // oldest line = write_pos - line_count (mod max)
+        // ring_idx 0 = oldest, ring_idx (lc-1) = newest
+        oldest = Subtract(wp, lc)
+        IfCondition LessThan(oldest, 0) ThenBlock: {
+            oldest = Add(oldest, max)
+        }
+        actual = Add(oldest, ring_idx)
+        IfCondition GreaterEqual(actual, max) ThenBlock: {
+            actual = Subtract(actual, max)
+        }
+
+        boff = Multiply(Multiply(actual, cols), 4)
+        Term_RenderRowFrom(screen_row, Add(TermScroll.scroll_chars, boff), Add(TermScroll.scroll_fg, boff), Add(TermScroll.scroll_bg, boff))
+    }
+}
+
+// =============================================================================
+// RENDER VIEW — render either live grid or scrolled-back view
+//
+// When scroll_off == 0: render live grid (all ROWS from grid)
+// When scroll_off > 0:  viewport shows ROWS lines from combined history:
+//   history = scrollback[0..line_count-1] + grid[0..ROWS-1]
+//   total = line_count + ROWS
+//   view starts at total - ROWS - scroll_off
+//   For each visible line:
+//     if pos < line_count → render from scrollback ring
+//     else → render from grid row (pos - line_count)
+// =============================================================================
+Function.Term_RenderView {
+    Body: {
+        soff = TermScroll.scroll_off
+
+        IfCondition EqualTo(soff, 0) ThenBlock: {
+            // Live view — render all grid rows directly
+            row = 0
+            WhileLoop LessThan(row, TermDim.ROWS) {
+                Term_RenderRow(row)
+                row = Add(row, 1)
+            }
+            ReturnValue(0)
+        }
+
+        // Scrolled-back view
+        lc = TermScroll.line_count
+        rows = TermDim.ROWS
+        total = Add(lc, rows)
+
+        // First visible line in combined history
+        start = Subtract(Subtract(total, rows), soff)
+        IfCondition LessThan(start, 0) ThenBlock: { start = 0 }
+
+        sr = 0
+        WhileLoop LessThan(sr, rows) {
+            pos = Add(start, sr)
+            IfCondition LessThan(pos, lc) ThenBlock: {
+                // This row comes from scrollback
+                Term_RenderScrollRow(pos, sr)
+            } ElseBlock: {
+                // This row comes from live grid
+                grid_row = Subtract(pos, lc)
+                IfCondition LessThan(grid_row, rows) ThenBlock: {
+                    Term_RenderRow_At(grid_row, sr)
+                }
+            }
+            sr = Add(sr, 1)
+        }
+    }
+}
+
+// =============================================================================
+// RENDER ROW AT — render grid row at a different screen position
+// grid_row: which row in the grid to read from
+// screen_row: which screen row to draw at
+// =============================================================================
+Function.Term_RenderRow_At {
+    Input: grid_row: Integer
+    Input: screen_row: Integer
+    Body: {
+        base = Multiply(grid_row, TermDim.COLS)
+        boff = Multiply(base, 4)
+        Term_RenderRowFrom(screen_row, Add(TermGrid.chars, boff), Add(TermGrid.fg_arr, boff), Add(TermGrid.bg_arr, boff))
+    }
+}
+
+// =============================================================================
+// RENDER GRID — draw all rows to canvas (delegates to Term_RenderView)
+// =============================================================================
+Function.Term_RenderGrid {
+    Body: {
+        Term_RenderView()
+    }
+}
+
+// =============================================================================
+// DRAW CURSOR — invert the cell at cursor position
+// =============================================================================
+Function.Term_DrawCursor {
+    Body: {
+        row = TermState.cursor_row
+        col = TermState.cursor_col
+        buf = ShmCanvasState.buf
+        stride = TermDim.CANVAS_W
+
+        off = Multiply(Add(Multiply(row, TermDim.COLS), col), 4)
+        ch = Dereference(Add(TermGrid.chars, off), "dword")
+        fg_c = Dereference(Add(TermGrid.fg_arr, off), "dword")
+        bg_c = Dereference(Add(TermGrid.bg_arr, off), "dword")
+
+        // Invert: swap fg and bg for cursor block
+        TermFont_SetColors(bg_c, fg_c)
+
+        px = Multiply(col, TermFontConst.CHAR_W)
+        py = Multiply(row, TermFontConst.CHAR_H)
+        TermFont_DrawCharFgBg(buf, stride, px, py, ch)
+    }
+}
+
+// =============================================================================
+// OPEN PTY — open /dev/ptmx, unlock, get slave number
+// Returns master fd, stores slave path at slave_path_ptr
+// =============================================================================
+Function.Term_OpenPTY {
+    Input: slave_path_buf: Address
+    Output: Integer
+    Body: {
+        // open("/dev/ptmx", O_RDWR | O_NOCTTY)
+        flags = BitwiseOr(TFcntl.O_RDWR, TFcntl.O_NOCTTY)
+        master = SystemCall(TSys.SYS_OPEN, "/dev/ptmx", flags, 0)
+        IfCondition LessThan(master, 0) ThenBlock: {
+            PrintMessage("[Claude] open /dev/ptmx failed: ")
+            PrintNumber(master)
+            PrintMessage("\n")
+            ReturnValue(-1)
+        }
+
+        PrintMessage("[Claude] ptmx fd=")
+        PrintNumber(master)
+        PrintMessage("\n")
+
+        // ioctl(master, TIOCSPTLCK, &zero) — unlock slave
+        lock_val = Allocate(8)
+        StoreValue(lock_val, 0, "dword")
+        ur = SystemCall(TSys.SYS_IOCTL, master, TIoctl.TIOCSPTLCK, lock_val)
+        IfCondition LessThan(ur, 0) ThenBlock: {
+            PrintMessage("[Claude] TIOCSPTLCK failed: ")
+            PrintNumber(ur)
+            PrintMessage("\n")
+        }
+
+        // ioctl(master, TIOCGPTN, &ptn) — get slave number
+        ptn_buf = Allocate(8)
+        StoreValue(ptn_buf, 0, "dword")
+        gr = SystemCall(TSys.SYS_IOCTL, master, TIoctl.TIOCGPTN, ptn_buf)
+        IfCondition LessThan(gr, 0) ThenBlock: {
+            PrintMessage("[Claude] TIOCGPTN failed: ")
+            PrintNumber(gr)
+            PrintMessage("\n")
+            Deallocate(lock_val, 8)
+            Deallocate(ptn_buf, 8)
+            SystemCall(TSys.SYS_CLOSE, master)
+            ReturnValue(-1)
+        }
+
+        ptn = Dereference(ptn_buf, "dword")
+        Deallocate(lock_val, 8)
+        Deallocate(ptn_buf, 8)
+
+        // Build "/dev/pts/N" path
+        prefix = "/dev/pts/"
+        MemoryCopy(slave_path_buf, prefix, 9)
+        num_tmp = Allocate(12)
+        nlen = Term_NumToStr(ptn, num_tmp)
+        MemoryCopy(Add(slave_path_buf, 9), num_tmp, nlen)
+        SetByte(slave_path_buf, Add(9, nlen), 0)
+        Deallocate(num_tmp, 12)
+
+        PrintMessage("[Claude] slave: ")
+        PrintString(slave_path_buf)
+        PrintMessage("\n")
+
+        ReturnValue(master)
+    }
+}
+
+// =============================================================================
+// NUM TO STR — helper for integer to decimal string
+// =============================================================================
+Function.Term_NumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// FORK BASH — fork, child sets up slave PTY, exec /bin/bash
+// Returns bash pid (parent) or doesn't return (child)
+// =============================================================================
+Function.Term_ForkBash {
+    Input: master_fd: Integer
+    Input: slave_path: Address
+    Output: Integer
+    Body: {
+        pid = SystemCall(TSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[Claude] fork failed\n")
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // ===== CHILD PROCESS =====
+
+            // Close master fd — child uses slave
+            SystemCall(TSys.SYS_CLOSE, master_fd)
+
+            // Create new session (detach from parent's controlling terminal)
+            SystemCall(TSys.SYS_SETSID)
+
+            // Open slave — this becomes the controlling terminal
+            slave_fd = SystemCall(TSys.SYS_OPEN, slave_path, TFcntl.O_RDWR, 0)
+            IfCondition LessThan(slave_fd, 0) ThenBlock: {
+                PrintMessage("[Claude] child: open slave failed\n")
+                SystemCall(TSys.SYS_EXIT, 1)
+            }
+
+            // TIOCSCTTY — make this the controlling terminal
+            SystemCall(TSys.SYS_IOCTL, slave_fd, TIoctl.TIOCSCTTY, 0)
+
+            // Set window size: struct winsize { rows(u16), cols(u16), xpix(u16), ypix(u16) }
+            wsz = Allocate(8)
+            // rows = 24, cols = 80
+            StoreValue(wsz, 0, "dword")
+            SetByte(wsz, 0, 24)
+            SetByte(wsz, 2, 80)
+            SystemCall(TSys.SYS_IOCTL, slave_fd, TIoctl.TIOCSWINSZ, wsz)
+            Deallocate(wsz, 8)
+
+            // dup2 stdin/stdout/stderr to slave
+            SystemCall(TSys.SYS_DUP2, slave_fd, 0)
+            SystemCall(TSys.SYS_DUP2, slave_fd, 1)
+            SystemCall(TSys.SYS_DUP2, slave_fd, 2)
+
+            // Close original slave_fd if it's not 0, 1, or 2
+            IfCondition GreaterThan(slave_fd, 2) ThenBlock: {
+                SystemCall(TSys.SYS_CLOSE, slave_fd)
+            }
+
+            // Build argv: ["/home/bob/.npm-global/bin/claude", NULL]
+            argv = Allocate(16)
+            StoreValue(Add(argv, 0),  "/home/bob/.npm-global/bin/claude")
+            StoreValue(Add(argv, 8),  0)
+
+            // Build envp: TERM, HOME, PATH, LANG + update blockers
+            envp = Allocate(56)
+            StoreValue(Add(envp, 0),  "TERM=xterm-256color")
+            StoreValue(Add(envp, 8),  "HOME=/home/bob")
+            StoreValue(Add(envp, 16), "PATH=/home/bob/.npm-global/bin:/home/bob/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            StoreValue(Add(envp, 24), "LANG=en_US.UTF-8")
+            StoreValue(Add(envp, 32), "CLAUDE_CODE_SKIP_UPDATE=1")
+            StoreValue(Add(envp, 40), "CLAUDE_AUTO_UPDATE=0")
+            StoreValue(Add(envp, 48), 0)
+
+            // exec
+            SystemCall(TSys.SYS_EXECVE, "/home/bob/.npm-global/bin/claude", argv, envp)
+
+            // If execve returns, something went wrong
+            PrintMessage("[Claude] execve failed\n")
+            SystemCall(TSys.SYS_EXIT, 1)
+        }
+
+        // ===== PARENT PROCESS =====
+        PrintMessage("[Claude] bash pid=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// READ PTY — non-blocking read from master fd, feed bytes to parser
+// =============================================================================
+Function.Term_ReadPTY {
+    Body: {
+        mfd = TermState.master_fd
+        IfCondition LessThan(mfd, 0) ThenBlock: { ReturnValue(0) }
+
+        rbuf = Allocate(4096)
+        total = 0
+
+        // Read up to 3 chunks (12288 bytes max per tick) to keep responsive
+        // New output snaps scroll back to live view
+        rounds = 0
+        WhileLoop LessThan(rounds, 3) {
+            n = SystemCall(TSys.SYS_READ, mfd, rbuf, 4096)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                // EAGAIN or EOF
+                rounds = 3
+            } ElseBlock: {
+                // New output snaps scroll back to live view
+                TermScroll.scroll_off = 0
+                // Process each byte through VT100 parser
+                bi = 0
+                WhileLoop LessThan(bi, n) {
+                    b = GetByte(rbuf, bi)
+                    Term_ProcessByte(b)
+                    bi = Add(bi, 1)
+                }
+                total = Add(total, n)
+            }
+            rounds = Add(rounds, 1)
+        }
+
+        Deallocate(rbuf, 4096)
+        ReturnValue(total)
+    }
+}
+
+// =============================================================================
+// WRITE PTY — write bytes to master fd (sends to bash)
+// =============================================================================
+Function.Term_WritePTY {
+    Input: data: Address
+    Input: len: Integer
+    Body: {
+        mfd = TermState.master_fd
+        IfCondition LessThan(mfd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(TSys.SYS_WRITE, mfd, data, len, 0, 0)
+    }
+}
+
+// =============================================================================
+// WRITE PTY BYTE — write a single byte to master fd
+// =============================================================================
+Function.Term_WritePTYByte {
+    Input: byte_val: Integer
+    Body: {
+        tmp = Allocate(4)
+        SetByte(tmp, 0, byte_val)
+        Term_WritePTY(tmp, 1)
+        Deallocate(tmp, 4)
+    }
+}
+
+// =============================================================================
+// DRAW SCROLLBAR — visual scrollbar on right edge of canvas
+//
+// Track: full height on right edge
+// Thumb: proportional size + position based on scrollback history
+// Only drawn when there's scrollback content (line_count > 0)
+// =============================================================================
+Function.Term_DrawScrollbar {
+    Body: {
+        lc = TermScroll.line_count
+        // No scrollbar if no history
+        IfCondition EqualTo(lc, 0) ThenBlock: { ReturnValue(0) }
+
+        buf = ShmCanvasState.buf
+        cw  = TermDim.CANVAS_W
+        ch_px = TermDim.CANVAS_H
+        sbw = ScrollbarConst.WIDTH
+        track_x = Subtract(cw, sbw)
+
+        // Draw track background
+        Term_FillRect(track_x, 0, sbw, ch_px, ScrollbarConst.TRACK_COLOR)
+
+        // Calculate thumb size and position
+        rows = TermDim.ROWS
+        total = Add(lc, rows)
+
+        // Thumb height = (ROWS / total) * canvas_height, min MIN_THUMB
+        th = Divide(Multiply(rows, ch_px), total)
+        IfCondition LessThan(th, ScrollbarConst.MIN_THUMB) ThenBlock: {
+            th = ScrollbarConst.MIN_THUMB
+        }
+
+        // Thumb position: viewport is at (total - rows - scroll_off) from top
+        soff = TermScroll.scroll_off
+        view_top = Subtract(Subtract(total, rows), soff)
+        // Map view_top (0..total-rows) to pixel (0..canvas_h - thumb_h)
+        track_range = Subtract(ch_px, th)
+        max_scroll = Subtract(total, rows)
+        IfCondition LessThan(max_scroll, 1) ThenBlock: { max_scroll = 1 }
+        ty = Divide(Multiply(view_top, track_range), max_scroll)
+
+        // Clamp
+        IfCondition LessThan(ty, 0) ThenBlock: { ty = 0 }
+        IfCondition GreaterThan(ty, track_range) ThenBlock: { ty = track_range }
+
+        // Draw thumb
+        Term_FillRect(track_x, ty, sbw, th, ScrollbarConst.THUMB_COLOR)
+    }
+}
+
+// =============================================================================
+// FILL RECT — fill a rectangle on the canvas with a BGRA color
+// Used for scrollbar rendering
+// =============================================================================
+Function.Term_FillRect {
+    Input: rx: Integer
+    Input: ry: Integer
+    Input: rw: Integer
+    Input: rh: Integer
+    Input: color: Integer
+    Body: {
+        buf = ShmCanvasState.buf
+        stride = TermDim.CANVAS_W
+        canvas_h = TermDim.CANVAS_H
+
+        // Clamp to canvas bounds
+        IfCondition LessThan(rx, 0) ThenBlock: { rx = 0 }
+        IfCondition LessThan(ry, 0) ThenBlock: { ry = 0 }
+
+        y = ry
+        y_end = Add(ry, rh)
+        IfCondition GreaterThan(y_end, canvas_h) ThenBlock: { y_end = canvas_h }
+
+        x_end = Add(rx, rw)
+        IfCondition GreaterThan(x_end, stride) ThenBlock: { x_end = stride }
+
+        WhileLoop LessThan(y, y_end) {
+            x = rx
+            row_base = Multiply(y, stride)
+            WhileLoop LessThan(x, x_end) {
+                poff = Multiply(Add(row_base, x), 4)
+                StoreValue(Add(buf, poff), color, "dword")
+                x = Add(x, 1)
+            }
+            y = Add(y, 1)
+        }
+    }
+}
+
+// =============================================================================
+// SCROLL BACK — Shift+PageUp: scroll back by half a screen
+// =============================================================================
+Function.Term_ScrollBack {
+    Body: {
+        lc = TermScroll.line_count
+        IfCondition EqualTo(lc, 0) ThenBlock: { ReturnValue(0) }
+
+        // Scroll back by half a screen (ROWS/2)
+        step = Divide(TermDim.ROWS, 2)
+        IfCondition LessThan(step, 1) ThenBlock: { step = 1 }
+
+        soff = Add(TermScroll.scroll_off, step)
+        // Clamp to max scrollable (can't scroll past oldest line)
+        IfCondition GreaterThan(soff, lc) ThenBlock: { soff = lc }
+        TermScroll.scroll_off = soff
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// SCROLL FORWARD — Shift+PageDown: scroll forward by half a screen
+// =============================================================================
+Function.Term_ScrollForward {
+    Body: {
+        soff = TermScroll.scroll_off
+        IfCondition EqualTo(soff, 0) ThenBlock: { ReturnValue(0) }
+
+        step = Divide(TermDim.ROWS, 2)
+        IfCondition LessThan(step, 1) ThenBlock: { step = 1 }
+
+        soff = Subtract(soff, step)
+        IfCondition LessThan(soff, 0) ThenBlock: { soff = 0 }
+        TermScroll.scroll_off = soff
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// HANDLE KEY — translate IPC keycode to PTY input
+// =============================================================================
+Function.Term_HandleKey {
+    Input: keycode: Integer
+    Input: ch: Integer
+    Input: shift: Integer
+    Input: ctrl: Integer
+    Body: {
+        // Shift+PageUp (104) — scroll back
+        IfCondition And(EqualTo(keycode, 104), EqualTo(shift, 1)) ThenBlock: {
+            Term_ScrollBack()
+            ReturnValue(0)
+        }
+        // Shift+PageDown (109) — scroll forward
+        IfCondition And(EqualTo(keycode, 109), EqualTo(shift, 1)) ThenBlock: {
+            Term_ScrollForward()
+            ReturnValue(0)
+        }
+
+        // PageUp/PageDown without shift — send escape sequences
+        IfCondition EqualTo(keycode, 104) ThenBlock: {
+            Term_WritePTY("\x1b[5~", 4)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(keycode, 109) ThenBlock: {
+            Term_WritePTY("\x1b[6~", 4)
+            ReturnValue(0)
+        }
+
+        // Arrow keys: normal mode ESC[A/B/C/D, app cursor mode ESC OA/OB/OC/OD
+        // Up (103)
+        IfCondition EqualTo(keycode, 103) ThenBlock: {
+            IfCondition EqualTo(TermState.app_cursor, 1) ThenBlock: {
+                Term_WritePTY("\x1bOA", 3)
+            } ElseBlock: {
+                Term_WritePTY("\x1b[A", 3)
+            }
+            ReturnValue(0)
+        }
+        // Down (108)
+        IfCondition EqualTo(keycode, 108) ThenBlock: {
+            IfCondition EqualTo(TermState.app_cursor, 1) ThenBlock: {
+                Term_WritePTY("\x1bOB", 3)
+            } ElseBlock: {
+                Term_WritePTY("\x1b[B", 3)
+            }
+            ReturnValue(0)
+        }
+        // Right (106)
+        IfCondition EqualTo(keycode, 106) ThenBlock: {
+            IfCondition EqualTo(TermState.app_cursor, 1) ThenBlock: {
+                Term_WritePTY("\x1bOC", 3)
+            } ElseBlock: {
+                Term_WritePTY("\x1b[C", 3)
+            }
+            ReturnValue(0)
+        }
+        // Left (105)
+        IfCondition EqualTo(keycode, 105) ThenBlock: {
+            IfCondition EqualTo(TermState.app_cursor, 1) ThenBlock: {
+                Term_WritePTY("\x1bOD", 3)
+            } ElseBlock: {
+                Term_WritePTY("\x1b[D", 3)
+            }
+            ReturnValue(0)
+        }
+
+        // Home (102)
+        IfCondition EqualTo(keycode, 102) ThenBlock: {
+            Term_WritePTY("\x1b[H", 3)
+            ReturnValue(0)
+        }
+        // End (107)
+        IfCondition EqualTo(keycode, 107) ThenBlock: {
+            Term_WritePTY("\x1b[F", 3)
+            ReturnValue(0)
+        }
+
+        // Delete (111)
+        IfCondition EqualTo(keycode, 111) ThenBlock: {
+            Term_WritePTY("\x1b[3~", 4)
+            ReturnValue(0)
+        }
+
+        // Backspace (14) → DEL (0x7F)
+        IfCondition EqualTo(keycode, 14) ThenBlock: {
+            Term_WritePTYByte(127)
+            ReturnValue(0)
+        }
+
+        // Enter (28) → CR (0x0D)
+        IfCondition EqualTo(keycode, 28) ThenBlock: {
+            Term_WritePTYByte(13)
+            ReturnValue(0)
+        }
+
+        // Tab (15) → TAB (0x09)
+        IfCondition EqualTo(keycode, 15) ThenBlock: {
+            Term_WritePTYByte(9)
+            ReturnValue(0)
+        }
+
+        // Escape (1) → ESC (0x1B)
+        IfCondition EqualTo(keycode, 1) ThenBlock: {
+            Term_WritePTYByte(27)
+            ReturnValue(0)
+        }
+
+        // Ctrl held + printable → control character (ch & 0x1F)
+        IfCondition EqualTo(ctrl, 1) ThenBlock: {
+            IfCondition And(GreaterEqual(ch, 64), LessEqual(ch, 127)) ThenBlock: {
+                cc = BitwiseAnd(ch, 31)
+                Term_WritePTYByte(cc)
+                ReturnValue(0)
+            }
+            // Ctrl + lowercase
+            IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: {
+                cc = BitwiseAnd(ch, 31)
+                Term_WritePTYByte(cc)
+                ReturnValue(0)
+            }
+        }
+
+        // Regular printable character
+        IfCondition GreaterThan(ch, 0) ThenBlock: {
+            Term_WritePTYByte(ch)
+        }
+    }
+}
+
+// =============================================================================
+// POLL IPC MESSAGES — check for keyboard input, close, resize
+// =============================================================================
+Function.Term_PollMessages {
+    Input: sock: Integer
+    Body: {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: { ReturnValue(0) }
+
+        pmsg = ParseJSON(msg)
+        IfCondition NotEqual(pmsg, 0) ThenBlock: {
+            mobj = JSON.AsObject(pmsg)
+            method = JSON.GetString(mobj, "method")
+            IfCondition NotEqual(method, 0) ThenBlock: {
+
+                cmp = StringCompare(method, "window.closed")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    PrintMessage("[Claude] Window closed\n")
+                    TermState.running = 0
+                }
+
+                cmp = StringCompare(method, "input.key")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    kc = JSON.GetNumber(mobj, "keycode")
+                    kch = JSON.GetNumber(mobj, "char")
+                    ksh = JSON.GetNumber(mobj, "shift")
+                    kct = JSON.GetNumber(mobj, "ctrl")
+                    Term_HandleKey(kc, kch, ksh, kct)
+                }
+
+                cmp = StringCompare(method, "input.action")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    action = JSON.GetString(mobj, "action")
+                    IfCondition NotEqual(action, 0) ThenBlock: {
+                        PrintMessage("[Claude] Action: ")
+                        PrintString(action)
+                        PrintMessage("\n")
+                    }
+                }
+
+                cmp = StringCompare(method, "window.resized")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    rw = JSON.GetNumber(mobj, "width")
+                    rh = JSON.GetNumber(mobj, "height")
+                    Term_HandleResize(sock, rw, rh)
+                }
+            }
+            JSON.Free(pmsg)
+        }
+    }
+}
+
+// =============================================================================
+// HANDLE RESIZE — recalculate grid, recreate canvas, update PTY winsize
+// =============================================================================
+Function.Term_HandleResize {
+    Input: sock: Integer
+    Input: new_w: Integer
+    Input: new_h: Integer
+    Body: {
+        // Ignore zero or unchanged
+        IfCondition LessEqual(new_w, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(new_h, 0) ThenBlock: { ReturnValue(0) }
+
+        // Calculate new grid dimensions from pixel size
+        new_cols = Divide(new_w, TermFontConst.CHAR_W)
+        new_rows = Divide(new_h, TermFontConst.CHAR_H)
+
+        // Clamp minimums
+        IfCondition LessThan(new_cols, 10) ThenBlock: { new_cols = 10 }
+        IfCondition LessThan(new_rows, 4)  ThenBlock: { new_rows = 4 }
+
+        // Snap canvas to cell grid to prevent glyph writes past buffer edge
+        canvas_w = Multiply(new_cols, TermFontConst.CHAR_W)
+        canvas_h = Multiply(new_rows, TermFontConst.CHAR_H)
+
+        // Skip if both grid AND canvas unchanged
+        old_cols = TermDim.COLS
+        old_rows = TermDim.ROWS
+        IfCondition And(And(EqualTo(new_cols, old_cols), EqualTo(new_rows, old_rows)), And(EqualTo(canvas_w, TermDim.CANVAS_W), EqualTo(canvas_h, TermDim.CANVAS_H))) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        PrintMessage("[Claude] Resize: ")
+        PrintNumber(old_cols)
+        PrintMessage("x")
+        PrintNumber(old_rows)
+        PrintMessage(" -> ")
+        PrintNumber(new_cols)
+        PrintMessage("x")
+        PrintNumber(new_rows)
+        PrintMessage("\n")
+
+        // Allocate new grid buffers (all arrays: 4 bytes/cell)
+        new_gsz = Multiply(new_cols, new_rows)
+        new_gsz4 = Multiply(new_gsz, 4)
+        new_chars  = Allocate(new_gsz4)
+        new_fg_arr = Allocate(new_gsz4)
+        new_bg_arr = Allocate(new_gsz4)
+
+        // Clear new buffers
+        Term_FillDword(new_chars,  32, new_gsz)
+        Term_FillDword(new_fg_arr, TermSGR.default_fg, new_gsz)
+        Term_FillDword(new_bg_arr, TermSGR.default_bg, new_gsz)
+
+        // Copy old grid content into new (preserve what fits)
+        Term_CopyGrid(new_chars, new_fg_arr, new_bg_arr, new_cols, new_rows)
+
+        // Deallocate old grid (all arrays 4 bytes/cell)
+        old_gsz4 = Multiply(TermDim.GRID_SIZE, 4)
+        Deallocate(TermGrid.chars,  old_gsz4)
+        Deallocate(TermGrid.fg_arr, old_gsz4)
+        Deallocate(TermGrid.bg_arr, old_gsz4)
+
+        // Install new grid
+        TermGrid.chars  = new_chars
+        TermGrid.fg_arr = new_fg_arr
+        TermGrid.bg_arr = new_bg_arr
+
+        // Update dimensions
+        TermDim.COLS     = new_cols
+        TermDim.ROWS     = new_rows
+        TermDim.CANVAS_W = canvas_w
+        TermDim.CANVAS_H = canvas_h
+        TermDim.GRID_SIZE = new_gsz
+
+        // Reset scroll region to full screen
+        TermState.scroll_top = 0
+        TermState.scroll_bot = Subtract(new_rows, 1)
+
+        // Clamp cursor
+        IfCondition GreaterEqual(TermState.cursor_col, new_cols) ThenBlock: {
+            TermState.cursor_col = Subtract(new_cols, 1)
+        }
+        IfCondition GreaterEqual(TermState.cursor_row, new_rows) ThenBlock: {
+            TermState.cursor_row = Subtract(new_rows, 1)
+        }
+
+        // Destroy old canvas, create new one
+        wid = TermState.win_id
+        ShmCanvas_Destroy(wid)
+        buf = ShmCanvas_Create(wid, canvas_w, canvas_h)
+        IfCondition EqualTo(buf, 0) ThenBlock: {
+            PrintMessage("[Claude] ShmCanvas_Create failed after resize\n")
+            ReturnValue(0)
+        }
+        ShmCanvas_Attach(sock, wid, canvas_w, canvas_h)
+
+        // Clear canvas to black — ensures no gap artifacts at edges
+        ShmCanvas_Clear(4278190080)
+
+        // Send TIOCSWINSZ to PTY master so bash knows new dimensions
+        Term_SetWinSize(new_rows, new_cols)
+
+        // Reallocate scrollback at new column width (discard old history)
+        Term_ScrollFree()
+        Term_ScrollInit()
+
+        TermState.dirty = 1
+    }
+}
+
+// =============================================================================
+// COPY GRID — copy old grid content into new buffers (row by row)
+// =============================================================================
+Function.Term_CopyGrid {
+    Input: dst_chars:  Address
+    Input: dst_fg:     Address
+    Input: dst_bg:     Address
+    Input: new_cols:   Integer
+    Input: new_rows:   Integer
+    Body: {
+        old_cols = TermDim.COLS
+        old_rows = TermDim.ROWS
+
+        // Copy min(old_rows, new_rows) rows, min(old_cols, new_cols) cols per row
+        copy_rows = old_rows
+        IfCondition GreaterThan(copy_rows, new_rows) ThenBlock: { copy_rows = new_rows }
+        copy_cols = old_cols
+        IfCondition GreaterThan(copy_cols, new_cols) ThenBlock: { copy_cols = new_cols }
+
+        r = 0
+        WhileLoop LessThan(r, copy_rows) {
+            src_boff = Multiply(Multiply(r, old_cols), 4)
+            dst_boff = Multiply(Multiply(r, new_cols), 4)
+            copy_bytes = Multiply(copy_cols, 4)
+            MemoryCopy(Add(dst_chars, dst_boff), Add(TermGrid.chars, src_boff), copy_bytes)
+            MemoryCopy(Add(dst_fg, dst_boff), Add(TermGrid.fg_arr, src_boff), copy_bytes)
+            MemoryCopy(Add(dst_bg, dst_boff), Add(TermGrid.bg_arr, src_boff), copy_bytes)
+            r = Add(r, 1)
+        }
+    }
+}
+
+// =============================================================================
+// SET WINSIZE — ioctl TIOCSWINSZ on PTY master
+// =============================================================================
+Function.Term_SetWinSize {
+    Input: rows: Integer
+    Input: cols: Integer
+    Body: {
+        mfd = TermState.master_fd
+        IfCondition LessThan(mfd, 0) ThenBlock: { ReturnValue(0) }
+
+        // struct winsize { u16 ws_row, u16 ws_col, u16 ws_xpixel, u16 ws_ypixel }
+        wsz = Allocate(8)
+        MemorySet(wsz, 0, 8)
+        // rows in bytes 0-1 (LE u16)
+        SetByte(wsz, 0, BitwiseAnd(rows, 255))
+        SetByte(wsz, 1, BitwiseAnd(ShiftRight(rows, 8), 255))
+        // cols in bytes 2-3 (LE u16)
+        SetByte(wsz, 2, BitwiseAnd(cols, 255))
+        SetByte(wsz, 3, BitwiseAnd(ShiftRight(cols, 8), 255))
+
+        SystemCall(TSys.SYS_IOCTL, mfd, TIoctl.TIOCSWINSZ, wsz)
+        Deallocate(wsz, 8)
+
+        PrintMessage("[Claude] TIOCSWINSZ rows=")
+        PrintNumber(rows)
+        PrintMessage(" cols=")
+        PrintNumber(cols)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// CHECK CHILD — see if bash is still alive (waitpid WNOHANG)
+// =============================================================================
+Function.Term_CheckChild {
+    Output: Integer
+    Body: {
+        pid = TermState.bash_pid
+        IfCondition LessEqual(pid, 0) ThenBlock: { ReturnValue(0) }
+
+        status = Allocate(8)
+        wr = SystemCall(TSys.SYS_WAIT4, pid, status, TSig.WNOHANG, 0)
+        Deallocate(status, 8)
+
+        // If waitpid returned the pid, child exited
+        IfCondition EqualTo(wr, pid) ThenBlock: {
+            PrintMessage("[Claude] bash exited\n")
+            TermState.bash_pid = 0
+            TermState.running = 0
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Claude Code — PTY + VT100 + ShmCanvas\n")
+    PrintMessage("============================================\n\n")
+
+    // Init font
+    TermFont_Init()
+
+    // Allocate grid buffers (all arrays: 4 bytes/cell — codepoints + BGRA colors)
+    gsz = TermDim.GRID_SIZE
+    gsz4 = Multiply(gsz, 4)
+    TermGrid.chars  = Allocate(gsz4)
+    TermGrid.fg_arr = Allocate(gsz4)
+    TermGrid.bg_arr = Allocate(gsz4)
+
+    // Allocate parser param buffer
+    TermParser.param_buf = Allocate(32)
+
+    // Clear grid
+    Term_GridClear()
+
+    // Init scrollback ring buffer
+    Term_ScrollInit()
+
+    // Connect to display server
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[Claude] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, "/tmp/ailang_display.sock")
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[Claude] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[Claude] Connected to display server\n")
+    TermState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"claude\"}")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Claude Code\",\"w\":800,\"h\":600,\"html\":\"config/claude.html\"}")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[Claude] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        TermState.win_id = wid
+        PrintMessage("[Claude] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Create shared memory canvas (640x384 = 80*8 x 24*16)
+    cw = TermDim.CANVAS_W
+    ch = TermDim.CANVAS_H
+    wid = TermState.win_id
+    buf = ShmCanvas_Create(wid, cw, ch)
+    IfCondition EqualTo(buf, 0) ThenBlock: {
+        PrintMessage("[Claude] ShmCanvas_Create failed\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    ShmCanvas_Attach(sock, wid, cw, ch)
+    PrintMessage("[Claude] Canvas attached\n")
+
+    // Clear canvas to black
+    ShmCanvas_Clear(4278190080)
+    ShmCanvas_Present(sock, wid)
+
+    // Open PTY
+    slave_path = Allocate(32)
+    master = Term_OpenPTY(slave_path)
+    IfCondition LessThan(master, 0) ThenBlock: {
+        PrintMessage("[Claude] PTY open failed\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    TermState.master_fd = master
+
+    // Set master fd non-blocking
+    fl = SystemCall(TSys.SYS_FCNTL, master, TFcntl.F_GETFL, 0)
+    SystemCall(TSys.SYS_FCNTL, master, TFcntl.F_SETFL, BitwiseOr(fl, TFcntl.O_NONBLOCK))
+
+    // Fork bash
+    bpid = Term_ForkBash(master, slave_path)
+    IfCondition LessThan(bpid, 0) ThenBlock: {
+        PrintMessage("[Claude] Fork bash failed\n")
+        SystemCall(TSys.SYS_CLOSE, master)
+        Socket.Close(sock)
+        HaltProgram
+    }
+    TermState.bash_pid = bpid
+    Deallocate(slave_path, 32)
+
+    // Set socket non-blocking
+    Socket.SetNonBlock(sock)
+
+    // Tick timespecs
+    ts_tick = Allocate(16)
+    StoreValue(ts_tick, 0)
+    StoreValue(Add(ts_tick, 8), 5000000)
+
+    PrintMessage("[Claude] Entering main loop\n\n")
+
+    // ===== MAIN LOOP =====
+    WhileLoop EqualTo(TermState.running, 1) {
+
+        // 1. Read PTY output — non-blocking
+        Term_ReadPTY()
+
+        // 2. If dirty, render grid to canvas + present
+        IfCondition EqualTo(TermState.dirty, 1) ThenBlock: {
+            Term_RenderGrid()
+            // Only draw cursor in live view and when visible
+            IfCondition And(EqualTo(TermScroll.scroll_off, 0), EqualTo(TermState.cursor_visible, 1)) ThenBlock: {
+                Term_DrawCursor()
+            }
+            // Draw scrollbar overlay on right edge
+            Term_DrawScrollbar()
+            ShmCanvas_Present(sock, wid)
+            TermState.dirty = 0
+        }
+
+        // 3. Poll IPC messages (keyboard, close)
+        Term_PollMessages(sock)
+
+        // 4. Check if bash is still alive
+        Term_CheckChild()
+
+        // 5. Sleep 5ms tick
+        SystemCall(TSys.SYS_NANOSLEEP, ts_tick, 0)
+    }
+
+    // Cleanup
+    IfCondition GreaterThan(TermState.bash_pid, 0) ThenBlock: {
+        SystemCall(TSys.SYS_KILL, TermState.bash_pid, TSig.SIGTERM, 0, 0, 0)
+        status = Allocate(8)
+        SystemCall(TSys.SYS_WAIT4, TermState.bash_pid, status, 0, 0)
+        Deallocate(status, 8)
+    }
+
+    IfCondition GreaterEqual(TermState.master_fd, 0) ThenBlock: {
+        SystemCall(TSys.SYS_CLOSE, TermState.master_fd)
+    }
+
+    ShmCanvas_Destroy(wid)
+    Term_ScrollFree()
+
+    // If alt screen is active, free saved main grid too
+    IfCondition EqualTo(AltScreen.active, 1) ThenBlock: {
+        mgsz4 = Multiply(AltScreen.main_gsz, 4)
+        Deallocate(AltScreen.main_chars, mgsz4)
+        Deallocate(AltScreen.main_fg, mgsz4)
+        Deallocate(AltScreen.main_bg, mgsz4)
+    }
+
+    final_gsz4 = Multiply(TermDim.GRID_SIZE, 4)
+    Deallocate(TermGrid.chars,  final_gsz4)
+    Deallocate(TermGrid.fg_arr, final_gsz4)
+    Deallocate(TermGrid.bg_arr, final_gsz4)
+    Deallocate(TermParser.param_buf, 32)
+    Deallocate(ts_tick, 16)
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  Claude Code finished\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)
