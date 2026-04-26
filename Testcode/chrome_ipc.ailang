@@ -1,20 +1,23 @@
 // chrome_ipc.ailang
-// Sandboxed Chrome browser — runs Chrome inside Xvfb, captures via ffmpeg
-// x11grab, streams raw BGRA frames through ShmCanvas to the display server.
+// Sandboxed Chrome browser — runs Chrome inside Xvfb, reads framebuffer
+// directly via mmap of /tmp/Xvfb_screen0 (xwd format), streams BGRA pixels
+// through ShmCanvas to the display server. No ffmpeg needed.
 //
 // Architecture:
 //   Manages 3 child processes:
-//     1. Xvfb :99 -screen 0 WxHx24 -ac     (virtual X server)
-//     2. google-chrome --display=:99 ...      (browser, isolated from real FB)
-//     3. ffmpeg -f x11grab -i :99 pipe:1      (captures as raw BGRA frames)
+//     1. Xvfb :99 -screen 0 WxHx24 -ac -fbdir /tmp  (virtual X server)
+//     2. google-chrome --display=:99 ...               (browser, isolated)
+//     3. xdotool - (persistent pipe)                   (input forwarding)
 //
-//   Frame loop (same as videoplayer):
-//     - Read raw BGRA frames from ffmpeg stdout pipe
-//     - Frames land directly in shm canvas buffer
+//   Frame loop (direct mmap — no pipe, no encoding):
+//     - Xvfb writes pixels to /tmp/Xvfb_screen0 (mmap'd shared file)
+//     - Chrome app mmaps the same file read-only
+//     - Each tick: MemoryCopy from xvfb mmap (offset 3232) to shm canvas
 //     - ShmCanvas_Present() -> server blits
 //
-//   Input forwarding:
-//     - input.key -> fork/exec xdotool key/type on :99
+//   Input forwarding (persistent pipe — no fork/exec per event):
+//     - input.key -> write "key <keysym>\n" to xdotool stdin pipe
+//     - input.mouse -> write "mousemove/mousedown/mouseup\n" to pipe
 //     - input.action -> toolbar: back/fwd/reload/close
 //
 // Security model:
@@ -43,7 +46,11 @@ LibraryImport.ShmCanvas
 FixedPool.CSys {
     "SYS_READ":      Initialize=0
     "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
     "SYS_CLOSE":     Initialize=3
+    "SYS_FSTAT":     Initialize=5
+    "SYS_MMAP":      Initialize=9
+    "SYS_MUNMAP":    Initialize=11
     "SYS_PIPE":      Initialize=22
     "SYS_DUP2":      Initialize=33
     "SYS_FORK":      Initialize=57
@@ -53,7 +60,14 @@ FixedPool.CSys {
     "SYS_WAIT4":     Initialize=61
     "SYS_FCNTL":     Initialize=72
     "SYS_NANOSLEEP": Initialize=35
+    "SYS_UNLINK":    Initialize=87
     "SYS_SETSID":    Initialize=112
+}
+
+FixedPool.CMmap {
+    "O_RDONLY":    Initialize=0
+    "PROT_READ":   Initialize=1
+    "MAP_SHARED":  Initialize=1
 }
 
 FixedPool.CFcntl {
@@ -80,16 +94,24 @@ FixedPool.ChromeState {
     "canvas_h":     Initialize=700
     "xvfb_pid":     Initialize=0
     "chrome_pid":   Initialize=0
-    "ffmpeg_pid":   Initialize=0
-    "pipe_rd":      Initialize=-1
+    "xdotool_pid":  Initialize=0
+    "xdotool_wr":   Initialize=-1
     "frame_size":   Initialize=0
-    "frame_got":    Initialize=0
     "display_num":  Initialize=99
     "capturing":    Initialize=0
     "mouse_skip":   Initialize=0
     "pending_mx":   Initialize=0
     "pending_my":   Initialize=0
     "mouse_dirty":  Initialize=0
+    "cmd_buf":      Initialize=0
+    "xvfb_fb_ptr":  Initialize=0
+    "xvfb_fb_fd":   Initialize=-1
+    "xvfb_fb_size": Initialize=0
+}
+
+// XWD header: 160 byte header + 256 colors * 12 bytes = 3232 byte pixel offset
+FixedPool.XvfbConst {
+    "PIXEL_OFFSET": Initialize=3232
 }
 
 // =============================================================================
@@ -223,7 +245,72 @@ Function.Chrome_BuildDisplayStr {
 }
 
 // =============================================================================
-// LAUNCH XVFB — fork/exec Xvfb :99 -screen 0 WxHx24 -ac
+// SHELL HELPER — fork/exec /bin/sh -c "<cmd>". Waits for completion.
+// More reliable than pkill alone — shell handles globbing, multiple commands.
+// =============================================================================
+Function.Chrome_ShellExec {
+    Input: cmd: Address
+    Body: {
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            argv = Allocate(32)
+            StoreValue(Add(argv, 0), "/bin/sh")
+            StoreValue(Add(argv, 8), "-c")
+            StoreValue(Add(argv, 16), cmd)
+            StoreValue(Add(argv, 24), 0)
+            SystemCall(CSys.SYS_EXECVE, "/bin/sh", argv, 0)
+            SystemCall(CSys.SYS_EXIT, 0)
+        }
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            status = Allocate(8)
+            SystemCall(CSys.SYS_WAIT4, pid, status, 0, 0, 0, 0)
+            Deallocate(status, 8)
+        }
+    }
+}
+
+// =============================================================================
+// CLEANUP STALE — kill ALL orphaned Xvfb/chrome/xdotool + remove lock files
+// If chrome_ipc crashes, child processes stay running as orphans.
+// Chrome spawns ~13 subprocesses (renderer, gpu, utility, zygote, crashpad).
+// Strategy: kill twice with 200ms gap to catch reparented orphans.
+// =============================================================================
+Function.Chrome_CleanupStaleXvfb {
+    Body: {
+        PrintMessage("[Chrome] Killing orphaned processes...\n")
+
+        // First pass: kill orphaned Chrome + Xvfb + xdotool
+        // Use /opt/google/chrome/chrome to avoid matching chrome_ipc.x (ourselves!)
+        Chrome_ShellExec("pkill -9 -f /opt/google/chrome/chrome 2>/dev/null; pkill -9 -f chrome_crashpad 2>/dev/null; pkill -9 Xvfb 2>/dev/null; pkill -9 xdotool 2>/dev/null")
+
+        // Wait 200ms for processes to die + children to get reparented to init
+        ts = Allocate(16)
+        StoreValue(ts, 0)
+        StoreValue(Add(ts, 8), 200000000)
+        SystemCall(CSys.SYS_NANOSLEEP, ts, 0)
+
+        // Second pass: catch any survivors (orphaned children from first pass)
+        Chrome_ShellExec("pkill -9 -f /opt/google/chrome/chrome 2>/dev/null; pkill -9 Xvfb 2>/dev/null")
+
+        // Wait another 100ms
+        StoreValue(Add(ts, 8), 100000000)
+        SystemCall(CSys.SYS_NANOSLEEP, ts, 0)
+        Deallocate(ts, 16)
+
+        // Remove stale lock/socket/framebuffer files
+        SystemCall(CSys.SYS_UNLINK, "/tmp/.X99-lock", 0, 0, 0, 0)
+        SystemCall(CSys.SYS_UNLINK, "/tmp/.X11-unix/X99", 0, 0, 0, 0)
+        SystemCall(CSys.SYS_UNLINK, "/tmp/Xvfb_screen0", 0, 0, 0, 0)
+
+        // Remove Chrome profile locks from prior crash
+        Chrome_ShellExec("rm -f /tmp/chrome_ailang_profile/SingletonLock /tmp/chrome_ailang_profile/SingletonSocket /tmp/chrome_ailang_profile/SingletonCookie 2>/dev/null")
+
+        PrintMessage("[Chrome] Cleaned up stale processes and files\n")
+    }
+}
+
+// =============================================================================
+// LAUNCH XVFB — fork/exec Xvfb :99 -screen 0 WxHx24 -ac -fbdir /tmp
 // =============================================================================
 Function.Chrome_LaunchXvfb {
     Output: Integer
@@ -239,15 +326,17 @@ Function.Chrome_LaunchXvfb {
 
         IfCondition EqualTo(pid, 0) ThenBlock: {
             // ===== CHILD =====
-            // Xvfb :99 -screen 0 WxHx24 -ac
-            argv = Allocate(56)
+            // Xvfb :99 -screen 0 WxHx24 -ac -fbdir /tmp
+            argv = Allocate(72)
             StoreValue(Add(argv, 0),  "/usr/bin/Xvfb")
             StoreValue(Add(argv, 8),  disp_str)
             StoreValue(Add(argv, 16), "-screen")
             StoreValue(Add(argv, 24), "0")
             StoreValue(Add(argv, 32), size_str)
             StoreValue(Add(argv, 40), "-ac")
-            StoreValue(Add(argv, 48), 0)
+            StoreValue(Add(argv, 48), "-fbdir")
+            StoreValue(Add(argv, 56), "/tmp")
+            StoreValue(Add(argv, 64), 0)
 
             SystemCall(CSys.SYS_EXECVE, "/usr/bin/Xvfb", argv, 0)
             PrintMessage("[Chrome] Xvfb execve failed\n")
@@ -297,8 +386,8 @@ Function.Chrome_LaunchBrowser {
             // New session so Chrome's children don't inherit our terminal
             SystemCall(CSys.SYS_SETSID)
 
-            // 16 args + null = 17 * 8 = 136
-            argv = Allocate(136)
+            // 21 args + null = 22 * 8 = 176
+            argv = Allocate(176)
             StoreValue(Add(argv, 0),   "/usr/bin/google-chrome-stable")
             StoreValue(Add(argv, 8),   dd_arg)
             StoreValue(Add(argv, 16),  "--no-sandbox")
@@ -313,8 +402,13 @@ Function.Chrome_LaunchBrowser {
             StoreValue(Add(argv, 88),  "--mute-audio")
             StoreValue(Add(argv, 96),  "--disable-translate")
             StoreValue(Add(argv, 104), "--user-data-dir=/tmp/chrome_ailang_profile")
-            StoreValue(Add(argv, 112), "about:blank")
-            StoreValue(Add(argv, 120), 0)
+            StoreValue(Add(argv, 112), "--disable-dev-shm-usage")
+            StoreValue(Add(argv, 120), "--disable-features=MediaDrmPreprovisioning")
+            StoreValue(Add(argv, 128), "--autoplay-policy=no-user-gesture-required")
+            StoreValue(Add(argv, 136), "--crash-dumps-dir=/tmp")
+            StoreValue(Add(argv, 144), "--disable-breakpad")
+            StoreValue(Add(argv, 152), "about:blank")
+            StoreValue(Add(argv, 160), 0)
 
             // envp: DISPLAY=:99 HOME PATH
             envp = Allocate(40)
@@ -343,145 +437,66 @@ Function.Chrome_LaunchBrowser {
 }
 
 // =============================================================================
-// LAUNCH FFMPEG — fork/exec ffmpeg -f x11grab, pipe stdout to parent
+// MMAP XVFB FRAMEBUFFER — open /tmp/Xvfb_screen0 and mmap it read-only
+// Xvfb -fbdir /tmp writes the framebuffer in xwd format:
+//   3232 bytes header (160 header + 256 colors * 12 bytes) + pixel data
+// Pixel format: BGRX (32bpp, LSBFirst) — same as BGRA with alpha=0
+// Returns: 1 on success, -1 on failure
 // =============================================================================
-Function.Chrome_LaunchFFmpeg {
+Function.Chrome_MmapFB {
     Output: Integer
     Body: {
-        disp_str = Chrome_BuildDisplayStr()
-        size_str = Chrome_BuildSizeStr()
-
-        // Create pipe for video frames
-        pipefds = Allocate(8)
-        pr = SystemCall(CSys.SYS_PIPE, pipefds, 0, 0, 0, 0)
-        IfCondition LessThan(pr, 0) ThenBlock: {
-            PrintMessage("[Chrome] pipe() failed\n")
-            Deallocate(pipefds, 8)
-            ReturnValue(-1)
-        }
-        vid_read  = Dereference(pipefds, "dword")
-        vid_write = Dereference(Add(pipefds, 4), "dword")
-        Deallocate(pipefds, 8)
-
-        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
-        IfCondition LessThan(pid, 0) ThenBlock: {
-            PrintMessage("[Chrome] ffmpeg fork failed\n")
-            SystemCall(CSys.SYS_CLOSE, vid_read, 0, 0, 0, 0)
-            SystemCall(CSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
+        // Open the xvfb framebuffer file
+        fd = SystemCall(CSys.SYS_OPEN, "/tmp/Xvfb_screen0", CMmap.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[Chrome] Failed to open /tmp/Xvfb_screen0\n")
             ReturnValue(-1)
         }
 
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            // ===== CHILD =====
-            SystemCall(CSys.SYS_CLOSE, vid_read, 0, 0, 0, 0)
+        // Calculate total file size: header + pixels
+        fsize = ChromeState.frame_size
+        total = Add(XvfbConst.PIXEL_OFFSET, fsize)
 
-            // dup2(vid_write, 1) — stdout = frame pipe
-            SystemCall(CSys.SYS_DUP2, vid_write, 1, 0, 0, 0)
-            SystemCall(CSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
-
-            // ffmpeg -f x11grab -draw_mouse 1 -video_size WxH -framerate 30 -i :99
-            //        -vf format=bgra -f rawvideo -pix_fmt bgra pipe:1 -v quiet
-            // 22 args + null = 23 * 8 = 184
-            argv = Allocate(184)
-            StoreValue(Add(argv, 0),   "/usr/bin/ffmpeg")
-            StoreValue(Add(argv, 8),   "-f")
-            StoreValue(Add(argv, 16),  "x11grab")
-            StoreValue(Add(argv, 24),  "-draw_mouse")
-            StoreValue(Add(argv, 32),  "1")
-            StoreValue(Add(argv, 40),  "-video_size")
-            StoreValue(Add(argv, 48),  size_str)
-            StoreValue(Add(argv, 56),  "-framerate")
-            StoreValue(Add(argv, 64),  "30")
-            StoreValue(Add(argv, 72),  "-i")
-            StoreValue(Add(argv, 80),  disp_str)
-            StoreValue(Add(argv, 88),  "-vf")
-            StoreValue(Add(argv, 96),  "format=bgra")
-            StoreValue(Add(argv, 104), "-f")
-            StoreValue(Add(argv, 112), "rawvideo")
-            StoreValue(Add(argv, 120), "-pix_fmt")
-            StoreValue(Add(argv, 128), "bgra")
-            StoreValue(Add(argv, 136), "-v")
-            StoreValue(Add(argv, 144), "quiet")
-            StoreValue(Add(argv, 152), "pipe:1")
-            StoreValue(Add(argv, 160), 0)
-
-            // envp: need DISPLAY for x11grab
-            envp = Allocate(24)
-            denv = Allocate(24)
-            MemoryCopy(denv, "DISPLAY=", 8)
-            ddl = StringLength(disp_str)
-            MemoryCopy(Add(denv, 8), disp_str, Add(ddl, 1))
-            StoreValue(Add(envp, 0), denv)
-            StoreValue(Add(envp, 8), "HOME=/home/bob")
-            StoreValue(Add(envp, 16), 0)
-
-            SystemCall(CSys.SYS_EXECVE, "/usr/bin/ffmpeg", argv, envp)
-            PrintMessage("[Chrome] ffmpeg execve failed\n")
-            SystemCall(CSys.SYS_EXIT, 1)
+        // mmap(NULL, total, PROT_READ, MAP_SHARED, fd, 0)
+        ptr = SystemCall(CSys.SYS_MMAP, 0, total, CMmap.PROT_READ, CMmap.MAP_SHARED, fd, 0)
+        IfCondition LessThan(ptr, 0) ThenBlock: {
+            PrintMessage("[Chrome] mmap /tmp/Xvfb_screen0 failed\n")
+            SystemCall(CSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(-1)
         }
 
-        // ===== PARENT =====
-        SystemCall(CSys.SYS_CLOSE, vid_write, 0, 0, 0, 0)
+        ChromeState.xvfb_fb_ptr  = ptr
+        ChromeState.xvfb_fb_fd   = fd
+        ChromeState.xvfb_fb_size = total
+        ChromeState.capturing    = 1
 
-        // Make read end non-blocking
-        vflags = SystemCall(CSys.SYS_FCNTL, vid_read, CFcntl.F_GETFL, 0, 0, 0)
-        SystemCall(CSys.SYS_FCNTL, vid_read, CFcntl.F_SETFL, BitwiseOr(vflags, CFcntl.O_NONBLOCK), 0, 0)
-
-        ChromeState.pipe_rd    = vid_read
-        ChromeState.ffmpeg_pid = pid
-        ChromeState.frame_size = Multiply(Multiply(ChromeState.canvas_w, ChromeState.canvas_h), 4)
-        ChromeState.frame_got  = 0
-        ChromeState.capturing  = 1
-
-        PrintMessage("[Chrome] ffmpeg launched pid=")
-        PrintNumber(pid)
-        PrintMessage(" vid_fd=")
-        PrintNumber(vid_read)
-        PrintMessage(" frame_size=")
-        PrintNumber(ChromeState.frame_size)
+        PrintMessage("[Chrome] mmap'd Xvfb framebuffer: ptr=")
+        PrintNumber(ptr)
+        PrintMessage(" size=")
+        PrintNumber(total)
+        PrintMessage(" pixel_offset=")
+        PrintNumber(XvfbConst.PIXEL_OFFSET)
         PrintMessage("\n")
 
-        ReturnValue(pid)
+        ReturnValue(1)
     }
 }
 
 // =============================================================================
-// READ FRAME TICK — non-blocking partial frame accumulation (same as VP)
-// Returns:  1 = full frame ready
-//           0 = partial (more data needed)
-//          -1 = EOF / pipe closed
+// COPY FRAME — memcpy pixels from mmap'd Xvfb FB to shm canvas buffer
+// Always succeeds (no I/O, just memory copy). Returns 1.
 // =============================================================================
-Function.Chrome_ReadFrameTick {
+Function.Chrome_CopyFrame {
     Output: Integer
     Body: {
-        rd = ChromeState.pipe_rd
-        IfCondition LessThan(rd, 0) ThenBlock: { ReturnValue(-1) }
+        src = ChromeState.xvfb_fb_ptr
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(-1) }
 
-        buf = ShmCanvasState.buf
-        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(-1) }
+        dst = ShmCanvasState.buf
+        IfCondition EqualTo(dst, 0) ThenBlock: { ReturnValue(-1) }
 
         fsize = ChromeState.frame_size
-        got = ChromeState.frame_got
-
-        WhileLoop LessThan(got, fsize) {
-            remain = Subtract(fsize, got)
-            IfCondition GreaterThan(remain, 65536) ThenBlock: {
-                remain = 65536
-            }
-            n = SystemCall(CSys.SYS_READ, rd, Add(buf, got), remain)
-            IfCondition EqualTo(n, 0) ThenBlock: {
-                ChromeState.frame_got = 0
-                ReturnValue(-1)
-            }
-            IfCondition LessThan(n, 0) ThenBlock: {
-                ChromeState.frame_got = got
-                ReturnValue(0)
-            }
-            got = Add(got, n)
-        }
-
-        // Full frame ready
-        ChromeState.frame_got = 0
+        MemoryCopy(dst, Add(src, XvfbConst.PIXEL_OFFSET), fsize)
         ReturnValue(1)
     }
 }
@@ -502,17 +517,22 @@ Function.Chrome_KillChild {
 }
 
 // =============================================================================
-// STOP ALL — kill ffmpeg, chrome, xvfb in reverse order, close pipe
+// STOP ALL — kill xdotool, chrome, xvfb in reverse order, unmap framebuffer
 // =============================================================================
 Function.Chrome_StopAll {
     Body: {
-        // Kill in reverse order: ffmpeg first, then chrome, then xvfb
-        IfCondition GreaterThan(ChromeState.ffmpeg_pid, 0) ThenBlock: {
-            Chrome_KillChild(ChromeState.ffmpeg_pid)
-            PrintMessage("[Chrome] ffmpeg stopped pid=")
-            PrintNumber(ChromeState.ffmpeg_pid)
+        // Close xdotool write pipe first (causes clean EOF exit), then kill
+        xdt_wr = ChromeState.xdotool_wr
+        IfCondition GreaterEqual(xdt_wr, 0) ThenBlock: {
+            SystemCall(CSys.SYS_CLOSE, xdt_wr, 0, 0, 0, 0)
+            ChromeState.xdotool_wr = -1
+        }
+        IfCondition GreaterThan(ChromeState.xdotool_pid, 0) ThenBlock: {
+            Chrome_KillChild(ChromeState.xdotool_pid)
+            PrintMessage("[Chrome] xdotool stopped pid=")
+            PrintNumber(ChromeState.xdotool_pid)
             PrintMessage("\n")
-            ChromeState.ffmpeg_pid = 0
+            ChromeState.xdotool_pid = 0
         }
 
         IfCondition GreaterThan(ChromeState.chrome_pid, 0) ThenBlock: {
@@ -523,6 +543,16 @@ Function.Chrome_StopAll {
             ChromeState.chrome_pid = 0
         }
 
+        // Unmap Xvfb framebuffer before killing Xvfb
+        IfCondition GreaterThan(ChromeState.xvfb_fb_ptr, 0) ThenBlock: {
+            SystemCall(CSys.SYS_MUNMAP, ChromeState.xvfb_fb_ptr, ChromeState.xvfb_fb_size)
+            ChromeState.xvfb_fb_ptr = 0
+        }
+        IfCondition GreaterEqual(ChromeState.xvfb_fb_fd, 0) ThenBlock: {
+            SystemCall(CSys.SYS_CLOSE, ChromeState.xvfb_fb_fd, 0, 0, 0, 0)
+            ChromeState.xvfb_fb_fd = -1
+        }
+
         IfCondition GreaterThan(ChromeState.xvfb_pid, 0) ThenBlock: {
             Chrome_KillChild(ChromeState.xvfb_pid)
             PrintMessage("[Chrome] Xvfb stopped pid=")
@@ -531,35 +561,39 @@ Function.Chrome_StopAll {
             ChromeState.xvfb_pid = 0
         }
 
-        // Close pipe
-        rd = ChromeState.pipe_rd
-        IfCondition GreaterEqual(rd, 0) ThenBlock: {
-            SystemCall(CSys.SYS_CLOSE, rd, 0, 0, 0, 0)
-        }
+        // Sweep: pkill any Chrome subprocesses that survived SIGTERM
+        // Chrome spawns ~13 child processes that may outlive the parent
+        Chrome_ShellExec("pkill -9 -f /opt/google/chrome/chrome 2>/dev/null; pkill -9 -f chrome_crashpad 2>/dev/null")
 
-        ChromeState.pipe_rd   = -1
-        ChromeState.frame_got = 0
+        // Clean up Xvfb files so next launch starts clean
+        SystemCall(CSys.SYS_UNLINK, "/tmp/.X99-lock", 0, 0, 0, 0)
+        SystemCall(CSys.SYS_UNLINK, "/tmp/.X11-unix/X99", 0, 0, 0, 0)
+        SystemCall(CSys.SYS_UNLINK, "/tmp/Xvfb_screen0", 0, 0, 0, 0)
+
+        // Clean up Chrome profile locks (prevents "Chrome is already running" on restart)
+        Chrome_ShellExec("rm -f /tmp/chrome_ailang_profile/SingletonLock /tmp/chrome_ailang_profile/SingletonSocket /tmp/chrome_ailang_profile/SingletonCookie 2>/dev/null")
+
         ChromeState.capturing = 0
+        PrintMessage("[Chrome] All processes stopped, files cleaned\n")
     }
 }
 
 // =============================================================================
-// LAUNCH ALL — start Xvfb, wait, start Chrome, wait, start ffmpeg
+// LAUNCH ALL — start Xvfb, wait, start Chrome, wait, mmap framebuffer
 // =============================================================================
 Function.Chrome_LaunchAll {
     Body: {
         ts_wait = Allocate(16)
 
-        // 1. Launch Xvfb
+        // 1. Launch Xvfb (with -fbdir /tmp for direct framebuffer access)
         xr = Chrome_LaunchXvfb()
         IfCondition LessThan(xr, 0) ThenBlock: {
             PrintMessage("[Chrome] Failed to fork Xvfb — is Xvfb installed? (sudo apt install xvfb)\n")
             Deallocate(ts_wait, 16)
-            // NOT fatal — keep window alive with black canvas
             ReturnValue(0)
         }
 
-        // 2. Wait 500ms for Xvfb to initialize
+        // 2. Wait 500ms for Xvfb to initialize + write /tmp/Xvfb_screen0
         StoreValue(ts_wait, 0)
         StoreValue(Add(ts_wait, 8), 500000000)
         SystemCall(CSys.SYS_NANOSLEEP, ts_wait, 0)
@@ -601,195 +635,217 @@ Function.Chrome_LaunchAll {
             ReturnValue(0)
         }
 
-        // 5. Launch ffmpeg capture
-        fr = Chrome_LaunchFFmpeg()
-        IfCondition LessThan(fr, 0) ThenBlock: {
-            PrintMessage("[Chrome] Failed to fork ffmpeg\n")
+        // 5. Launch persistent xdotool pipe (for keyboard/mouse input)
+        xr2 = Chrome_LaunchXdotool()
+        IfCondition LessThan(xr2, 0) ThenBlock: {
+            PrintMessage("[Chrome] xdotool launch failed — input forwarding disabled\n")
+        }
+
+        // 6. Mmap Xvfb framebuffer (replaces ffmpeg — zero-copy pixel access)
+        ChromeState.frame_size = Multiply(Multiply(ChromeState.canvas_w, ChromeState.canvas_h), 4)
+        mr = Chrome_MmapFB()
+        IfCondition LessThan(mr, 0) ThenBlock: {
+            PrintMessage("[Chrome] Failed to mmap Xvfb framebuffer\n")
             Deallocate(ts_wait, 16)
             ReturnValue(0)
         }
 
         Deallocate(ts_wait, 16)
-        PrintMessage("[Chrome] All 3 processes running\n")
+        PrintMessage("[Chrome] All processes running + framebuffer mapped\n")
         ReturnValue(1)
     }
 }
 
 // =============================================================================
-// BUILD XDOTOOL ENVP — creates envp with DISPLAY=:NN for xdotool subcommands
-// xdotool key/type/mousemove/mousedown/mouseup do NOT accept --display flag,
-// they use DISPLAY env var via XOpenDisplay().
+// LAUNCH PERSISTENT XDOTOOL — fork/exec "xdotool -" with stdin pipe
+// Reads commands line-by-line from stdin, reuses one X11 connection.
+// Eliminates fork/exec overhead (~5-15ms → ~0.1ms per event).
 // =============================================================================
-Function.Chrome_BuildXdotoolEnvp {
+Function.Chrome_LaunchXdotool {
     Output: Integer
     Body: {
         disp_str = Chrome_BuildDisplayStr()
         dsl = StringLength(disp_str)
 
-        // Build "DISPLAY=:99"
-        denv = Allocate(24)
-        MemoryCopy(denv, "DISPLAY=", 8)
-        MemoryCopy(Add(denv, 8), disp_str, Add(dsl, 1))
+        // Create pipe: parent writes commands, child reads from stdin
+        pipefds = Allocate(8)
+        pr = SystemCall(CSys.SYS_PIPE, pipefds, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            PrintMessage("[Chrome] xdotool pipe() failed\n")
+            Deallocate(pipefds, 8)
+            ReturnValue(-1)
+        }
+        xdt_read  = Dereference(pipefds, "dword")
+        xdt_write = Dereference(Add(pipefds, 4), "dword")
+        Deallocate(pipefds, 8)
 
-        envp = Allocate(16)
-        StoreValue(Add(envp, 0), denv)
-        StoreValue(Add(envp, 8), 0)
-        ReturnValue(envp)
+        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[Chrome] xdotool fork failed\n")
+            SystemCall(CSys.SYS_CLOSE, xdt_read, 0, 0, 0, 0)
+            SystemCall(CSys.SYS_CLOSE, xdt_write, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // ===== CHILD =====
+            SystemCall(CSys.SYS_CLOSE, xdt_write, 0, 0, 0, 0)
+            // dup2(xdt_read, 0) — stdin = command pipe
+            SystemCall(CSys.SYS_DUP2, xdt_read, 0, 0, 0, 0)
+            SystemCall(CSys.SYS_CLOSE, xdt_read, 0, 0, 0, 0)
+
+            // argv: xdotool -
+            argv = Allocate(24)
+            StoreValue(Add(argv, 0), "/usr/bin/xdotool")
+            StoreValue(Add(argv, 8), "-")
+            StoreValue(Add(argv, 16), 0)
+
+            // envp: DISPLAY=:99
+            denv = Allocate(24)
+            MemoryCopy(denv, "DISPLAY=", 8)
+            MemoryCopy(Add(denv, 8), disp_str, Add(dsl, 1))
+            envp = Allocate(16)
+            StoreValue(Add(envp, 0), denv)
+            StoreValue(Add(envp, 8), 0)
+
+            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
+            SystemCall(CSys.SYS_EXIT, 1)
+        }
+
+        // ===== PARENT =====
+        SystemCall(CSys.SYS_CLOSE, xdt_read, 0, 0, 0, 0)
+        ChromeState.xdotool_pid = pid
+        ChromeState.xdotool_wr  = xdt_write
+
+        PrintMessage("[Chrome] xdotool pipe launched pid=")
+        PrintNumber(pid)
+        PrintMessage(" wr_fd=")
+        PrintNumber(xdt_write)
+        PrintMessage("\n")
+
+        ReturnValue(pid)
     }
 }
 
 // =============================================================================
-// FORWARD KEY VIA XDOTOOL — fork/exec xdotool key <keysym>
+// WRITE COMMAND TO XDOTOOL PIPE — single write() syscall, no fork/exec
+// cmd must be a complete command string like "key Return" (no newline).
+// This function appends the newline.
+// =============================================================================
+Function.Chrome_XdotoolWrite {
+    Input: cmd: Address
+    Body: {
+        wr = ChromeState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+
+        // Copy cmd + newline into cmd_buf
+        buf = ChromeState.cmd_buf
+        clen = StringLength(cmd)
+        MemoryCopy(buf, cmd, clen)
+        SetByte(buf, clen, 10)
+        SystemCall(CSys.SYS_WRITE, wr, buf, Add(clen, 1), 0, 0)
+    }
+}
+
+// =============================================================================
+// XDOTOOL KEY — write "key <keysym>\n" to pipe
 // =============================================================================
 Function.Chrome_XdotoolKey {
     Input: keysym: Address
     Body: {
-        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
-        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
-
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            argv = Allocate(32)
-            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
-            StoreValue(Add(argv, 8),  "key")
-            StoreValue(Add(argv, 16), keysym)
-            StoreValue(Add(argv, 24), 0)
-
-            envp = Chrome_BuildXdotoolEnvp()
-            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
-            SystemCall(CSys.SYS_EXIT, 1)
-        }
-
-        ReturnValue(pid)
+        buf = ChromeState.cmd_buf
+        MemoryCopy(buf, "key ", 4)
+        klen = StringLength(keysym)
+        MemoryCopy(Add(buf, 4), keysym, klen)
+        SetByte(buf, Add(4, klen), 10)
+        wr = ChromeState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(CSys.SYS_WRITE, wr, buf, Add(5, klen), 0, 0)
     }
 }
 
 // =============================================================================
-// FORWARD PRINTABLE CHAR VIA XDOTOOL TYPE
+// XDOTOOL TYPE — write "type <char>\n" to pipe
 // =============================================================================
 Function.Chrome_XdotoolType {
     Input: ch: Integer
     Body: {
-        // Build single-char string
-        cbuf = Allocate(4)
-        SetByte(cbuf, 0, ch)
-        SetByte(cbuf, 1, 0)
-
-        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
-        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
-
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            argv = Allocate(32)
-            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
-            StoreValue(Add(argv, 8),  "type")
-            StoreValue(Add(argv, 16), cbuf)
-            StoreValue(Add(argv, 24), 0)
-
-            envp = Chrome_BuildXdotoolEnvp()
-            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
-            SystemCall(CSys.SYS_EXIT, 1)
-        }
-
-        ReturnValue(pid)
+        buf = ChromeState.cmd_buf
+        MemoryCopy(buf, "type ", 5)
+        SetByte(buf, 5, ch)
+        SetByte(buf, 6, 10)
+        wr = ChromeState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(CSys.SYS_WRITE, wr, buf, 7, 0, 0)
     }
 }
 
 // =============================================================================
-// XDOTOOL MOUSEMOVE — fork/exec xdotool mousemove X Y
+// XDOTOOL MOUSEMOVE — write "mousemove X Y\n" to pipe
 // =============================================================================
 Function.Chrome_XdotoolMouseMove {
     Input: mx: Integer
     Input: my: Integer
     Body: {
-        // Build X and Y as strings
+        buf = ChromeState.cmd_buf
+        MemoryCopy(buf, "mousemove ", 10)
         xbuf = Allocate(12)
         ybuf = Allocate(12)
-        Chrome_NumToStr(mx, xbuf)
-        Chrome_NumToStr(my, ybuf)
-
-        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
-        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
-
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            argv = Allocate(40)
-            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
-            StoreValue(Add(argv, 8),  "mousemove")
-            StoreValue(Add(argv, 16), xbuf)
-            StoreValue(Add(argv, 24), ybuf)
-            StoreValue(Add(argv, 32), 0)
-
-            envp = Chrome_BuildXdotoolEnvp()
-            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
-            SystemCall(CSys.SYS_EXIT, 1)
-        }
-
-        ReturnValue(pid)
+        xlen = Chrome_NumToStr(mx, xbuf)
+        ylen = Chrome_NumToStr(my, ybuf)
+        off = 10
+        MemoryCopy(Add(buf, off), xbuf, xlen)
+        off = Add(off, xlen)
+        SetByte(buf, off, 32)
+        off = Add(off, 1)
+        MemoryCopy(Add(buf, off), ybuf, ylen)
+        off = Add(off, ylen)
+        SetByte(buf, off, 10)
+        off = Add(off, 1)
+        Deallocate(xbuf, 12)
+        Deallocate(ybuf, 12)
+        wr = ChromeState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(CSys.SYS_WRITE, wr, buf, off, 0, 0)
     }
 }
 
 // =============================================================================
-// XDOTOOL MOUSEDOWN — fork/exec xdotool mousedown BUTTON
+// XDOTOOL MOUSEDOWN — write "mousedown BUTTON\n" to pipe
 // Button mapping: IPC 0=left,1=right,2=mid → xdotool 1=left,2=mid,3=right
 // =============================================================================
 Function.Chrome_XdotoolMouseDown {
     Input: button: Integer
     Body: {
-        // Map button: 0→1(left), 1→3(right), 2→2(middle)
         xbtn = 1
         IfCondition EqualTo(button, 1) ThenBlock: { xbtn = 3 }
         IfCondition EqualTo(button, 2) ThenBlock: { xbtn = 2 }
-
-        bbuf = Allocate(4)
-        Chrome_NumToStr(xbtn, bbuf)
-
-        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
-        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
-
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            argv = Allocate(32)
-            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
-            StoreValue(Add(argv, 8),  "mousedown")
-            StoreValue(Add(argv, 16), bbuf)
-            StoreValue(Add(argv, 24), 0)
-
-            envp = Chrome_BuildXdotoolEnvp()
-            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
-            SystemCall(CSys.SYS_EXIT, 1)
-        }
-
-        ReturnValue(pid)
+        buf = ChromeState.cmd_buf
+        MemoryCopy(buf, "mousedown ", 10)
+        SetByte(buf, 10, Add(48, xbtn))
+        SetByte(buf, 11, 10)
+        wr = ChromeState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(CSys.SYS_WRITE, wr, buf, 12, 0, 0)
     }
 }
 
 // =============================================================================
-// XDOTOOL MOUSEUP — fork/exec xdotool mouseup BUTTON
+// XDOTOOL MOUSEUP — write "mouseup BUTTON\n" to pipe
 // =============================================================================
 Function.Chrome_XdotoolMouseUp {
     Input: button: Integer
     Body: {
-        // Map button: 0→1(left), 1→3(right), 2→2(middle)
         xbtn = 1
         IfCondition EqualTo(button, 1) ThenBlock: { xbtn = 3 }
         IfCondition EqualTo(button, 2) ThenBlock: { xbtn = 2 }
-
-        bbuf = Allocate(4)
-        Chrome_NumToStr(xbtn, bbuf)
-
-        pid = SystemCall(CSys.SYS_FORK, 0, 0, 0, 0, 0)
-        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(-1) }
-
-        IfCondition EqualTo(pid, 0) ThenBlock: {
-            argv = Allocate(32)
-            StoreValue(Add(argv, 0),  "/usr/bin/xdotool")
-            StoreValue(Add(argv, 8),  "mouseup")
-            StoreValue(Add(argv, 16), bbuf)
-            StoreValue(Add(argv, 24), 0)
-
-            envp = Chrome_BuildXdotoolEnvp()
-            SystemCall(CSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
-            SystemCall(CSys.SYS_EXIT, 1)
-        }
-
-        ReturnValue(pid)
+        buf = ChromeState.cmd_buf
+        MemoryCopy(buf, "mouseup ", 8)
+        SetByte(buf, 8, Add(48, xbtn))
+        SetByte(buf, 9, 10)
+        wr = ChromeState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(CSys.SYS_WRITE, wr, buf, 10, 0, 0)
     }
 }
 
@@ -1077,33 +1133,28 @@ Function.Chrome_HandleResize {
 // =============================================================================
 Function.Chrome_CheckChildren {
     Body: {
-        // Reap zombies from xdotool fire-and-forget forks + check critical processes
+        // Reap dead children — 3 processes: Xvfb, Chrome, xdotool
         status = Allocate(8)
 
-        // Loop reaping — there can be multiple dead children (xdotool fire-and-forget)
         reap_pass = 0
-        WhileLoop LessThan(reap_pass, 8) {
+        WhileLoop LessThan(reap_pass, 3) {
             wr = SystemCall(CSys.SYS_WAIT4, -1, status, CSig.WNOHANG, 0, 0, 0)
-            // No more children to reap
             IfCondition LessEqual(wr, 0) ThenBlock: {
-                reap_pass = 8
+                reap_pass = 3
             } ElseBlock: {
-                // Check if reaped child was one of our critical processes
                 IfCondition EqualTo(wr, ChromeState.xvfb_pid) ThenBlock: {
                     PrintMessage("[Chrome] Xvfb exited — display lost\n")
                     ChromeState.xvfb_pid = 0
                     ChromeState.capturing = 0
-                    // NOT fatal: keep window alive, user sees black canvas
                 }
                 IfCondition EqualTo(wr, ChromeState.chrome_pid) ThenBlock: {
                     PrintMessage("[Chrome] Chrome exited\n")
                     ChromeState.chrome_pid = 0
-                    // NOT fatal: keep window alive
                 }
-                IfCondition EqualTo(wr, ChromeState.ffmpeg_pid) ThenBlock: {
-                    PrintMessage("[Chrome] ffmpeg capture exited\n")
-                    ChromeState.ffmpeg_pid = 0
-                    ChromeState.capturing = 0
+                IfCondition EqualTo(wr, ChromeState.xdotool_pid) ThenBlock: {
+                    PrintMessage("[Chrome] xdotool exited — input disabled\n")
+                    ChromeState.xdotool_pid = 0
+                    ChromeState.xdotool_wr = -1
                 }
             }
             reap_pass = Add(reap_pass, 1)
@@ -1188,8 +1239,11 @@ SubRoutine.Main {
     Arena_Init()
 
     PrintMessage("============================================\n")
-    PrintMessage("  Chrome Browser — Xvfb + ffmpeg + ShmCanvas\n")
+    PrintMessage("  Chrome Browser — Xvfb + mmap + ShmCanvas\n")
     PrintMessage("============================================\n\n")
+
+    // Kill any orphaned processes from a prior crashed chrome_ipc instance
+    Chrome_CleanupStaleXvfb()
 
     // Connect to display server
     sock = Socket.Create(1, 1)
@@ -1255,7 +1309,10 @@ SubRoutine.Main {
     // Set socket non-blocking before launch (launch may take a while)
     Socket.SetNonBlock(sock)
 
-    // Launch Xvfb → Chrome → ffmpeg
+    // Allocate command buffer for xdotool pipe writes (reused, never freed)
+    ChromeState.cmd_buf = Allocate(128)
+
+    // Launch Xvfb → Chrome → xdotool → mmap framebuffer
     lr = Chrome_LaunchAll()
     IfCondition EqualTo(lr, 0) ThenBlock: {
         PrintMessage("[Chrome] Child processes failed — window stays open with black canvas\n")
@@ -1271,22 +1328,16 @@ SubRoutine.Main {
     StoreValue(ts_idle, 0)
     StoreValue(Add(ts_idle, 8), 50000000)
 
-    PrintMessage("[Chrome] Entering main loop (30fps capture)\n\n")
+    PrintMessage("[Chrome] Entering main loop (mmap framebuffer)\n\n")
 
     // ===== MAIN LOOP =====
     WhileLoop EqualTo(ChromeState.running, 1) {
 
         IfCondition EqualTo(ChromeState.capturing, 1) ThenBlock: {
-            // Read frame data from ffmpeg pipe
-            vr = Chrome_ReadFrameTick()
+            // Copy pixels from Xvfb mmap'd framebuffer to shm canvas
+            vr = Chrome_CopyFrame()
             IfCondition EqualTo(vr, 1) ThenBlock: {
-                // Full frame — present to display server
                 ShmCanvas_Present(sock, wid)
-            }
-            IfCondition EqualTo(vr, -1) ThenBlock: {
-                // EOF — ffmpeg died or was killed
-                PrintMessage("[Chrome] ffmpeg EOF\n")
-                ChromeState.capturing = 0
             }
 
             SystemCall(CSys.SYS_NANOSLEEP, ts_tick, 0)

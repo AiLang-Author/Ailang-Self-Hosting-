@@ -1,0 +1,442 @@
+// Library.AucklandEvent.ailang
+// Auckland Event Routing — hit testing, state machine, dirty redraw.
+// Make it work, then make it pretty, then optimize.
+// Copyright © 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Display.UI.Auckland
+LibraryImport.TextBuffer
+LibraryImport.Display.Input.DInputTypes
+
+// Mouse event types passed to AK_EventMouse
+FixedPool.AKMouseEv {
+    "MOVE":  Initialize=0
+    "DOWN":  Initialize=1
+    "UP":    Initialize=2
+}
+
+// =============================================================================
+// HIT TEST — find deepest visible+enabled node containing (x, y)
+// Reverse pre-order: walk tree collecting hits, last match = deepest drawn.
+// We do a forward pre-order walk and keep overwriting — last writer wins,
+// same as painter's algorithm. Simplest correct approach.
+// =============================================================================
+Function.AK_HitTest {
+    Input: ctx: LinkagePool.AKContext
+    Input: x: Integer
+    Input: y: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("ak.ht", 5)
+        root = ctx@tree_root
+        IfCondition LessThan(root, 0) ThenBlock: { ReturnValue(-1) }
+        hit = AK_HitWalk(ctx, root, x, y, -1)
+        ReturnValue(hit)
+    }
+}
+
+// Recursive pre-order walk. Returns deepest hit so far.
+Function.AK_HitWalk {
+    Input: ctx: LinkagePool.AKContext
+    Input: node: Integer
+    Input: x: Integer
+    Input: y: Integer
+    Input: best: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("ak.hw", 5)
+        IfCondition LessThan(node, 0) ThenBlock: { ReturnValue(best) }
+
+        vis = AK_Get(ctx, node, AKF.VISIBLE)
+        IfCondition EqualTo(vis, 0) ThenBlock: { ReturnValue(best) }
+
+        sx = AK_Get(ctx, node, AKF.SOLVED_X)
+        sy = AK_Get(ctx, node, AKF.SOLVED_Y)
+        sw = AK_Get(ctx, node, AKF.SOLVED_W)
+        sh = AK_Get(ctx, node, AKF.SOLVED_H)
+
+        // Point-in-rect test
+        inside = 0
+        IfCondition GreaterEqual(x, sx) ThenBlock: {
+            ex = Add(sx, sw)
+            IfCondition LessThan(x, ex) ThenBlock: {
+                IfCondition GreaterEqual(y, sy) ThenBlock: {
+                    ey = Add(sy, sh)
+                    IfCondition LessThan(y, ey) ThenBlock: {
+                        inside = 1
+                    }
+                }
+            }
+        }
+
+        // Only interactive tags are hittable
+        IfCondition EqualTo(inside, 1) ThenBlock: {
+            tag = AK_Get(ctx, node, AKF.TAG)
+            flags = AK_Get(ctx, node, AKF.FLAGS)
+            enabled = BitwiseAnd(flags, AKFlags.ENABLED)
+            hittable = 0
+            IfCondition EqualTo(tag, AKTag.BUTTON)   ThenBlock: { hittable = 1 }
+            IfCondition EqualTo(tag, AKTag.LABEL)     ThenBlock: { hittable = 1 }
+            IfCondition EqualTo(tag, AKTag.TEXT)       ThenBlock: { hittable = 1 }
+            IfCondition EqualTo(tag, AKTag.CHECKBOX)   ThenBlock: { hittable = 1 }
+            IfCondition EqualTo(tag, AKTag.RADIO)      ThenBlock: { hittable = 1 }
+            IfCondition EqualTo(tag, AKTag.SLIDER)     ThenBlock: { hittable = 1 }
+            IfCondition EqualTo(tag, AKTag.CANVAS)     ThenBlock: { hittable = 1 }
+            IfCondition EqualTo(tag, AKTag.DISPLAY)    ThenBlock: { hittable = 1 }
+            IfCondition And(EqualTo(hittable, 1), NotEqual(enabled, 0)) ThenBlock: {
+                best = node
+            }
+        }
+
+        // Walk children — pre-order, so deeper nodes overwrite
+        child = AK_Get(ctx, node, AKF.FIRST_CHILD)
+        WhileLoop NotEqual(child, -1) {
+            best = AK_HitWalk(ctx, child, x, y, best)
+            child = AK_Get(ctx, child, AKF.NEXT_SIBLING)
+        }
+
+        ReturnValue(best)
+    }
+}
+
+// =============================================================================
+// SET STATE — update node state, mark dirty, return old state
+// =============================================================================
+Function.AK_SetState {
+    Input: ctx: LinkagePool.AKContext
+    Input: node: Integer
+    Input: new_state: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("ak.sst", 6)
+        IfCondition LessThan(node, 0) ThenBlock: { ReturnValue(-1) }
+        old = AK_Get(ctx, node, AKF.STATE)
+        IfCondition NotEqual(old, new_state) ThenBlock: {
+            AK_Set(ctx, node, AKF.STATE, new_state)
+            AK_Set(ctx, node, AKF.DIRTY, 1)
+            dc = ctx@dirty_count
+            ctx@dirty_count = Add(dc, 1)
+        }
+        ReturnValue(old)
+    }
+}
+
+// =============================================================================
+// MOUSE EVENT DISPATCH — the state machine
+//
+// States per node: NORMAL -> HOVER -> PRESSED -> NORMAL (or action fire)
+//
+// MOVE: hit test. If target changed, old->NORMAL, new->HOVER.
+//       If pressed_node is set and mouse leaves it, it stays PRESSED
+//       (release outside = cancel, release inside = fire).
+//
+// DOWN: target -> PRESSED, record pressed_node.
+//
+// UP:   If over pressed_node -> fire action, -> HOVER.
+//       If not over pressed_node -> pressed_node -> NORMAL.
+//       Clear pressed_node.
+// =============================================================================
+Function.AK_EventMouse {
+    Input: ctx: LinkagePool.AKContext
+    Input: mx: Integer
+    Input: my: Integer
+    Input: ev: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("ak.evm", 6)
+        target = AK_HitTest(ctx, mx, my)
+
+        // =================================================================
+        // MOUSE MOVE
+        // =================================================================
+        IfCondition EqualTo(ev, AKMouseEv.MOVE) ThenBlock: {
+            DebugLog_Push("ak.evm.m", 8)
+            old_hover = ctx@hover_node
+            pressed = ctx@pressed_node
+
+            // If we're in a press-drag, don't change hover state
+            IfCondition GreaterEqual(pressed, 0) ThenBlock: {
+                // Still track hover_node for release detection
+                ctx@hover_node = target
+                ReturnValue(0)
+            }
+
+            // Hover changed?
+            IfCondition NotEqual(target, old_hover) ThenBlock: {
+                // Old node leaves hover
+                IfCondition GreaterEqual(old_hover, 0) ThenBlock: {
+                    AK_SetState(ctx, old_hover, AKState.NORMAL)
+                }
+                // New node enters hover
+                IfCondition GreaterEqual(target, 0) ThenBlock: {
+                    AK_SetState(ctx, target, AKState.HOVER)
+                }
+                ctx@hover_node = target
+            }
+            ReturnValue(0)
+        }
+
+        // =================================================================
+        // MOUSE DOWN
+        // =================================================================
+        IfCondition EqualTo(ev, AKMouseEv.DOWN) ThenBlock: {
+            DebugLog_Push("ak.evm.d", 8)
+            IfCondition GreaterEqual(target, 0) ThenBlock: {
+                AK_SetState(ctx, target, AKState.PRESSED)
+                ctx@pressed_node = target
+
+                // Focus tracking — clicked element gets focus
+                old_focus = ctx@focus_node
+                IfCondition NotEqual(old_focus, target) ThenBlock: {
+                    ctx@focus_node = target
+                }
+            }
+            // Clicked empty space — clear focus
+            IfCondition LessThan(target, 0) ThenBlock: {
+                ctx@focus_node = -1
+            }
+            ReturnValue(0)
+        }
+
+        // =================================================================
+        // MOUSE UP
+        // =================================================================
+        IfCondition EqualTo(ev, AKMouseEv.UP) ThenBlock: {
+            DebugLog_Push("ak.evm.u", 8)
+            pressed = ctx@pressed_node
+            IfCondition GreaterEqual(pressed, 0) ThenBlock: {
+                // Released over the same element we pressed?
+                IfCondition EqualTo(target, pressed) ThenBlock: {
+                    // CLICK — fire action, go to HOVER
+                    DebugLog_Push("ak.evm.f", 8)
+                    AK_FireAction(ctx, pressed)
+                    AK_SetState(ctx, pressed, AKState.HOVER)
+                } ElseBlock: {
+                    // Released outside — cancel, go to NORMAL
+                    AK_SetState(ctx, pressed, AKState.NORMAL)
+                }
+            }
+            ctx@pressed_node = -1
+
+            // Whatever we're over now gets HOVER (if not the thing we just set)
+            IfCondition GreaterEqual(target, 0) ThenBlock: {
+                cur_state = AK_Get(ctx, target, AKF.STATE)
+                IfCondition EqualTo(cur_state, AKState.NORMAL) ThenBlock: {
+                    AK_SetState(ctx, target, AKState.HOVER)
+                    ctx@hover_node = target
+                }
+            }
+            ReturnValue(0)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// FIRE ACTION — placeholder until Service Manager exists
+// Reads action string from extra, prints "[ACTION] service.method"
+// =============================================================================
+Function.AK_FireAction {
+    Input: ctx: LinkagePool.AKContext
+    Input: node: Integer
+    Body: {
+        DebugLog_Push("ak.fire", 7)
+        IfCondition LessThan(node, 0) ThenBlock: { ReturnValue(0) }
+
+        // Toggle checkbox VALUE on click
+        fire_tag = AK_Get(ctx, node, AKF.TAG)
+        IfCondition EqualTo(fire_tag, AKTag.CHECKBOX) ThenBlock: {
+            old_val = AK_ExtraGet(ctx, node, AKExtra.VALUE)
+            IfCondition EqualTo(old_val, 0) ThenBlock: {
+                AK_ExtraSet(ctx, node, AKExtra.VALUE, 1)
+            } ElseBlock: {
+                AK_ExtraSet(ctx, node, AKExtra.VALUE, 0)
+            }
+            AK_Set(ctx, node, AKF.DIRTY, 1)
+        }
+
+        ext = AK_Get(ctx, node, AKF.EXTRA)
+        IfCondition LessThan(ext, 0) ThenBlock: { ReturnValue(0) }
+
+        ap = AK_ExtraGet(ctx, node, AKExtra.ACTION_PTR)
+        al = AK_ExtraGet(ctx, node, AKExtra.ACTION_LEN)
+        IfCondition And(NotEqual(ap, 0), GreaterThan(al, 0)) ThenBlock: {
+            PrintMessage("[ACTION] ")
+            PrintString(ap)
+            PrintMessage("\n")
+
+            cb = ctx@action_cb
+            IfCondition NotEqual(cb, 0) ThenBlock: {
+                DebugLog_Push("ak.fir.c", 8)
+                CallIndirect(cb, ap, al)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// DRAW DIRTY — repaint only changed nodes
+// Walks full tree, redraws nodes with DIRTY=1, clears flag.
+// Returns 1 if anything was drawn, 0 if clean.
+// =============================================================================
+Function.AK_DrawDirty {
+    Input: ctx: LinkagePool.AKContext
+    Input: canvas: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("ak.ddr", 6)
+        root = ctx@tree_root
+        IfCondition LessThan(root, 0) ThenBlock: { ReturnValue(0) }
+
+        ctx@canvas = canvas
+        drew = AK_DrawDirtyWalk(ctx, root)
+        ctx@dirty_count = 0
+        ReturnValue(drew)
+    }
+}
+
+Function.AK_DrawDirtyWalk {
+    Input: ctx: LinkagePool.AKContext
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("ak.ddw", 6)
+        IfCondition LessThan(node, 0) ThenBlock: { ReturnValue(0) }
+        vis = AK_Get(ctx, node, AKF.VISIBLE)
+        IfCondition EqualTo(vis, 0) ThenBlock: { ReturnValue(0) }
+
+        drew = 0
+        dirty = AK_Get(ctx, node, AKF.DIRTY)
+        IfCondition EqualTo(dirty, 1) ThenBlock: {
+            // Redraw this node — call existing AK_DrawNode
+            AK_DrawNode(ctx, node)
+            AK_Set(ctx, node, AKF.DIRTY, 0)
+            drew = 1
+        }
+
+        // Walk children
+        child = AK_Get(ctx, node, AKF.FIRST_CHILD)
+        WhileLoop NotEqual(child, -1) {
+            cd = AK_DrawDirtyWalk(ctx, child)
+            IfCondition EqualTo(cd, 1) ThenBlock: { drew = 1 }
+            child = AK_Get(ctx, child, AKF.NEXT_SIBLING)
+        }
+
+        ReturnValue(drew)
+    }
+}
+
+// =============================================================================
+// KEYBOARD EVENT — route key to focused TEXTFIELD node
+// =============================================================================
+Function.AK_FindTextField {
+    Input: ctx: LinkagePool.AKContext
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(node, 0) ThenBlock: { ReturnValue(-1) }
+        tag = AK_Get(ctx, node, AKF.TAG)
+        IfCondition EqualTo(tag, AKTag.TEXTFIELD) ThenBlock: { ReturnValue(node) }
+        // Search children
+        child = AK_Get(ctx, node, AKF.FIRST_CHILD)
+        WhileLoop NotEqual(child, -1) {
+            found = AK_FindTextField(ctx, child)
+            IfCondition GreaterEqual(found, 0) ThenBlock: { ReturnValue(found) }
+            child = AK_Get(ctx, child, AKF.NEXT_SIBLING)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.AK_EventKey {
+    Input: ctx: LinkagePool.AKContext
+    Input: keycode: Integer
+    Input: ch: Integer
+    Input: shift: Integer
+    Body: {
+        DebugLog_Push("ak.evk", 6)
+
+        // Find the focused TEXTFIELD — prefer focus_node, else search tree
+        target = ctx@focus_node
+        IfCondition GreaterEqual(target, 0) ThenBlock: {
+            ttag = AK_Get(ctx, target, AKF.TAG)
+            IfCondition NotEqual(ttag, AKTag.TEXTFIELD) ThenBlock: {
+                target = -1
+            }
+        }
+        IfCondition LessThan(target, 0) ThenBlock: {
+            root = ctx@tree_root
+            target = AK_FindTextField(ctx, root)
+        }
+        IfCondition LessThan(target, 0) ThenBlock: { ReturnValue(0) }
+
+        // Get TextBuffer handle from this TEXTFIELD node
+        tbh = AK_ExtraGet(ctx, target, AKExtra.TEXTBUF_H)
+        IfCondition LessThan(tbh, 0) ThenBlock: { ReturnValue(0) }
+
+        // Dispatch by keycode
+        handled = 0
+
+        // Printable character
+        IfCondition GreaterThan(ch, 0) ThenBlock: {
+            TextBuf_InsertChar(tbh, ch)
+            handled = 1
+        }
+
+        // Backspace (scancode 14)
+        IfCondition EqualTo(keycode, Key.BACKSPACE) ThenBlock: {
+            TextBuf_Backspace(tbh)
+            handled = 1
+        }
+
+        // Delete (scancode 111)
+        IfCondition EqualTo(keycode, Key.DELETE) ThenBlock: {
+            TextBuf_Delete(tbh)
+            handled = 1
+        }
+
+        // Enter (scancode 28)
+        IfCondition EqualTo(keycode, Key.ENTER) ThenBlock: {
+            TextBuf_Enter(tbh)
+            handled = 1
+        }
+
+        // Arrow keys
+        IfCondition EqualTo(keycode, Key.LEFT) ThenBlock: {
+            TextBuf_MoveLeft(tbh)
+            handled = 1
+        }
+        IfCondition EqualTo(keycode, Key.RIGHT) ThenBlock: {
+            TextBuf_MoveRight(tbh)
+            handled = 1
+        }
+        IfCondition EqualTo(keycode, Key.UP) ThenBlock: {
+            TextBuf_MoveUp(tbh)
+            handled = 1
+        }
+        IfCondition EqualTo(keycode, Key.DOWN) ThenBlock: {
+            TextBuf_MoveDown(tbh)
+            handled = 1
+        }
+
+        // Home / End
+        IfCondition EqualTo(keycode, Key.HOME) ThenBlock: {
+            TextBuf_Home(tbh)
+            handled = 1
+        }
+        IfCondition EqualTo(keycode, Key.END) ThenBlock: {
+            TextBuf_End(tbh)
+            handled = 1
+        }
+
+        // Mark node dirty for redraw
+        IfCondition EqualTo(handled, 1) ThenBlock: {
+            AK_Set(ctx, target, AKF.DIRTY, 1)
+            dc = ctx@dirty_count
+            ctx@dirty_count = Add(dc, 1)
+        }
+
+        ReturnValue(handled)
+    }
+}

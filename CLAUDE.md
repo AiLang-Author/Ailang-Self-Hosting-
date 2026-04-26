@@ -8,8 +8,8 @@
 - Main loop: Evdev_Poll -> DrainInput -> Win_RenderDirty -> EventRouter_Drain -> IPCBroker_Poll -> Deskbar_Refresh -> DebugLog_Render -> Win_BlitAll -> sleep(16ms).
 - Deskbar has its own AKContext stored in `DeskbarState.ak_ctx`. No global swap needed.
 - Each window toolbar has its own AKContext stored via `WinMgr_SetToolbarCtx(idx, ctx)`.
-- **IPC Broker** (`Library.IPCBroker.ailang`): Embedded in display server. Unix socket at `/tmp/ailang_display.sock`. Non-blocking `poll(0)` once per frame. 8-client max. Protocol: 4-byte BE length prefix + JSON. Methods: `register`, `window.create`, `window.update` (app→server); `window.created`, `window.closed`, `input.action`, `input.key`, `input.mouse` (server→app).
-- **Start Menu** (`Library.StartMenu.ailang`): Windows XP/7-style popup panel above deskbar. Own AKContext, own surface, positioned overlay. "Home" button in deskbar (action `app.home`). Lists services from PostgreSQL cache + system items (About, Screenshot, Quit). Blitted in `Win_BlitAll` after deskbar, before dropdown menus.
+- **IPC Broker** (`Display/IPC/Library.IPCBroker.ailang`): Embedded in display server. Unix socket at `/tmp/ailang_display.sock`. Non-blocking `poll(0)` once per frame. 8-client max. Protocol: 4-byte BE length prefix + JSON. Methods: `register`, `window.create`, `window.update` (app→server); `window.created`, `window.closed`, `input.action`, `input.key`, `input.mouse` (server→app).
+- **Start Menu** (`Display/Menu/Library.StartMenu.ailang`): Windows XP/7-style popup panel above deskbar. Own AKContext, own surface, positioned overlay. "Home" button in deskbar (action `app.home`). Lists services from PostgreSQL cache + system items (About, Screenshot, Quit). Blitted in `Win_BlitAll` after deskbar, before dropdown menus.
 - **EventRouter action routing**: System actions (`win.`, `app.`, `menu:`, `sys.`, `fd.` prefixes) always handled locally by the display server. Non-system actions from IPC-owned windows forwarded to app process via `IPCBroker_RouteAction`. This ensures toolbar buttons (Close, About) work on IPC app windows while app-specific buttons (calculator digits, operators) route to the app.
 - **Init sequence**: `SysDisplay_Init → EventRouter_Init → Dialog_Init → Menu_Init → Deskbar_Init → IPCBroker_Init → StartMenu_Init → HTML_Init → PageSurface_Init → Doc_Init`
 
@@ -31,13 +31,13 @@
 
 ### HTML Toolbar System
 
-The `<window>` tag supports a `toolbar=` attribute parsed by `Library.AucklandBind.ailang`:
+The `<window>` tag supports a `toolbar=` attribute parsed by `Display/UI/Library.AucklandBind.ailang`:
 - `toolbar="none"` — no toolbar (TBMode.NONE=0)
 - `toolbar="about"` — [About] [spacer] [title] [X] (TBMode.ABOUT=1, default)
 - `toolbar="file"` — [File] [About] [spacer] [title] [X] (TBMode.FILE=2)
 - `toolbar="full"` — [File] [Edit] [View] [About] [spacer] [title] [X] (TBMode.FULL=3)
 
-`Win_BuildAppToolbar(ctx, mode, app_title)` in `Library.WinToolbar.ailang` builds the tree. `Win_CreateToolbarApp(idx, mode, app_title)` creates surface/context/stores refs. `AppHost_Open` reads `AK_GetToolbarMode(ak_ctx)` from parsed HTML.
+`Win_BuildAppToolbar(ctx, mode, app_title)` in `Display/Window/Library.WinToolbar.ailang` builds the tree. `Win_CreateToolbarApp(idx, mode, app_title)` creates surface/context/stores refs. `AppHost_Open` reads `AK_GetToolbarMode(ak_ctx)` from parsed HTML.
 
 ### Calculator Expression Buffer
 
@@ -101,27 +101,39 @@ Calculator maintains `expr_buf` (64 bytes) + `expr_len` in `CalcState`. Digits a
 | 04-26 | OSC ESC\\ terminator fix | ESC in OSC state transitions to ESC state so ST (ESC \\) terminates OSC correctly |
 | 04-26 | Terminal test expansion | 125-step headless test: 20 terminal steps + 31 Chrome steps (canvas, actions, keys, ctrl, resize, burst, mouse fwd, detach) |
 | 04-26 | Claude Code IPC app | Dedicated CLI wrapper — fork of terminal_ipc, execs claude 2.1.14, 800x600 window, xterm-256color, update blockers |
-| 04-26 | Chrome IPC app | Sandboxed browser: Xvfb :99 + google-chrome + ffmpeg x11grab → ShmCanvas, xdotool input forwarding, 15fps, 3-process management |
+| 04-26 | Chrome IPC app | Sandboxed browser: Xvfb :99 + google-chrome + mmap framebuffer → ShmCanvas, xdotool pipe input, 3-process management |
 | 04-26 | IPC mouse forwarding | `IPCBroker_SendMouse` — VM-style mouse capture for IPC canvas windows, cursor auto-hide, xdotool mousemove/mousedown/mouseup |
 | 04-26 | MOUSE_CAPTURE flag | Per-window flag in CanvasFields — only sandboxed apps (Chrome) capture mouse, not terminal/videoplayer. `ShmCanvas_AttachCapture()` sets `capture_mouse:1` in attach JSON |
 | 04-26 | Mouse move coalescing | Deferred mouse moves — stores pending position, `Chrome_FlushMouse()` sends one xdotool per tick instead of fork/exec per event |
 | 04-26 | Chrome session isolation | `--user-data-dir=/tmp/chrome_ailang_profile` — Chrome was joining existing session instead of starting in Xvfb, rendering nothing |
 | 04-26 | Chrome ffmpeg draw_mouse | Added `-draw_mouse 1` to ffmpeg x11grab args — Xvfb cursor now captured in frame output |
 | 04-26 | xdotool DISPLAY env fix | `--display` flag doesn't work for xdotool key/type/mousemove — must pass `DISPLAY=:99` in envp. Was passing empty envp + invalid `--display` arg, so all input went to null display |
+| 04-26 | Persistent xdotool pipe | Replaced fork/exec per keystroke with persistent `xdotool -` process reading from stdin pipe. All 5 xdotool functions rewritten to pipe writes (~0.1ms vs 5-15ms). `Chrome_LaunchXdotool` forks+execs xdotool with stdin pipe |
+| 04-26 | Canvas dirty flag | Added DIRTY field to CanvasState (offset 40, entry size 40→48). `canvas.present` and `canvas.attach` set dirty. Display server only reblits dirty canvases |
+| 04-26 | Mouse Y toolbar fix | `Win_ContentEvent` was sending Y relative to content top, but canvas sits below toolbar. Added `tb_h_cap = WinMgr_GetToolbarH(idx)` subtraction in MOUSE_CAPTURE branch |
+| 04-26 | Xvfb mmap (no ffmpeg) | Replaced ffmpeg x11grab with direct mmap of `/tmp/Xvfb_screen0`. Xvfb launched with `-fbdir /tmp`. Chrome app mmaps file read-only (PROT_READ, MAP_SHARED). Pixel data at offset 3232 (xwd header). MemoryCopy to shm canvas each tick. Eliminates entire ffmpeg process |
+| 04-26 | Library directory reorg | 58 display-server libs moved from `Librarys/` to `Librarys/Display/{System,Window,Input,UI,Menu,Render,Content,Theme,IPC}/`. All imports updated, 125 tests pass. Generic libs (Arena, Socket, JSON, ShmCanvas, KeyMap, etc.) stay in root |
+| 04-26 | DnD library reorg | 16 DnD-specific libs moved from `Librarys/` to `Librarys/DnD/{Engine,Character,Battle,Commerce,Save,Web}/`. All imports updated in dnd_game.ailang + all moved libs. Generic libs (TUI, Arena, StringUtils, JSON) stay in root |
+| 04-26 | Chrome orphan cleanup | `Chrome_CleanupStaleXvfb` double-pass pkill + lock file removal at launch/exit. `Chrome_ShellExec` helper for fork/exec `/bin/sh -c`. Fixes stranded Chrome/Xvfb after crash |
+| 04-26 | Chrome rasterizer fix | Removed `--disable-software-rasterizer` (Xvfb is software-only, flag killed all rendering). Removed `VizDisplayCompositor` from disable-features. Only `MediaDrmPreprovisioning` stays disabled |
 
 ## Chrome Browser (Sandboxed)
 
-Runs Chrome inside a virtual X display (Xvfb), never touches the real framebuffer. ffmpeg captures the virtual display as raw BGRA pixels — same pipeline as the video player. xdotool forwards keyboard input.
+Runs Chrome inside a virtual X display (Xvfb), never touches the real framebuffer. Direct mmap of Xvfb's framebuffer file (`/tmp/Xvfb_screen0`) — no ffmpeg needed. xdotool forwards input via persistent stdin pipe.
 
-**3-process stack:** Xvfb :99 (virtual X) → google-chrome --display=:99 (isolated browser) → ffmpeg -f x11grab (screen capture). Started in order, killed in reverse.
+**3-process stack:** Xvfb :99 -fbdir /tmp (virtual X, framebuffer file) → google-chrome --display=:99 (isolated browser) → xdotool - (persistent pipe for input). Started in order, killed in reverse.
 
-**Security:** Chrome runs in its own X session with `--user-data-dir=/tmp/chrome_ailang_profile` (forces independent instance, won't join existing Chrome sessions). No GPU (--disable-gpu), no extensions, no sync, no first-run wizard, muted audio. Software rendering only.
+**Frame capture:** Xvfb with `-fbdir /tmp` writes its framebuffer to `/tmp/Xvfb_screen0` in xwd format (memory-mapped file). Chrome app mmaps this file read-only. Each 5ms tick: `MemoryCopy(shm_canvas, xvfb_mmap + 3232, frame_size)` copies pixels directly. The 3232-byte offset is the xwd header (160 bytes) + colormap (256 colors × 12 bytes). Pixel format is BGRX (identical to BGRA with alpha=0). No encoding, no pipe I/O, no ffmpeg process.
 
-**Frame rate:** 30fps capture, 5ms main loop tick. `-draw_mouse 1` ensures Xvfb cursor appears in captured frames.
+**Security:** Chrome runs in its own X session with `--user-data-dir=/tmp/chrome_ailang_profile` (forces independent instance, won't join existing Chrome sessions). No GPU (--disable-gpu), no extensions, no sync, no first-run wizard, muted audio. Software rendering only. `--disable-dev-shm-usage` avoids /dev/shm contention. `--disable-features=MediaDrmPreprovisioning` prevents Widevine DRM crashes in sandboxed Xvfb. `--disable-breakpad` + `--crash-dumps-dir=/tmp` for cleaner crash handling. Do NOT use `--disable-software-rasterizer` — Xvfb has no GPU, software rasterizer is the only rendering path.
 
-**Keyboard:** xdotool fork/exec per keystroke (~2-5ms). Printable chars via `xdotool type`, special keys via `xdotool key`. Ctrl combos (Ctrl+L=URL bar, Ctrl+T=new tab, Ctrl+W=close tab, Ctrl+R=reload). Toolbar: Back (alt+Left), Forward (alt+Right), Reload (F5).
+**Cleanup:** `Chrome_CleanupStaleXvfb()` runs once at startup and `Chrome_StopAll()` runs at exit. Double-pass `pkill -9 -f /opt/google/chrome/chrome` with 200ms gap to catch reparented orphans. Uses full Chrome binary path to avoid matching `chrome_ipc.x` (self-kill bug). Also removes `/tmp/.X99-lock`, `/tmp/.X11-unix/X99`, `/tmp/Xvfb_screen0`, and Chrome profile lock files (`SingletonLock`/`SingletonSocket`/`SingletonCookie`). `Chrome_ShellExec(cmd)` helper forks `/bin/sh -c "cmd"` and waits.
 
-**Mouse:** VM-style capture via `MOUSE_CAPTURE` flag (set via `ShmCanvas_AttachCapture`). Only sandboxed apps request capture — regular canvas apps (terminal, videoplayer) don't. When mouse is over a captured canvas, all events forwarded to app, display server cursor auto-hidden. Mouse leaves → cursor reappears. Mouse moves coalesced: `Chrome_FlushMouse()` sends one `xdotool mousemove` per tick (not per event). Button mapping: IPC 0→X11 1 (left), IPC 1→X11 3 (right), IPC 2→X11 2 (middle).
+**Keyboard:** Persistent xdotool pipe (`xdotool -` reads commands from stdin). Printable chars via `type <ch>`, special keys via `key <keysym>`. Ctrl combos (Ctrl+L=URL bar, Ctrl+T=new tab, Ctrl+W=close tab, Ctrl+R=reload). Toolbar: Back (alt+Left), Forward (alt+Right), Reload (F5). ~0.1ms per command (vs 5-15ms with fork/exec).
+
+**Mouse:** VM-style capture via `MOUSE_CAPTURE` flag (set via `ShmCanvas_AttachCapture`). Only sandboxed apps request capture — regular canvas apps (terminal, videoplayer) don't. When mouse is over a captured canvas, all events forwarded to app, display server cursor auto-hidden. Mouse leaves → cursor reappears. Mouse moves coalesced: `Chrome_FlushMouse()` sends one `mousemove` per tick via xdotool pipe. Y coordinate adjusted by toolbar height for canvas-relative positioning. Button mapping: IPC 0→X11 1 (left), IPC 1→X11 3 (right), IPC 2→X11 2 (middle).
+
+**Canvas dirty flag:** Per-window `DIRTY` field in CanvasState (offset 40, 48-byte entries). `canvas.present` IPC handler sets it. `canvas.attach` also sets it. Display server only reblits canvas windows when dirty.
 
 **Resize:** Kills all 3 processes, destroys/recreates ShmCanvas at new size, relaunches all 3 at new resolution.
 
@@ -149,11 +161,11 @@ Zero-copy pixel streaming for IPC apps. Both processes mmap the same `/dev/shm/a
 
 **IPC messages:** `canvas.attach` (win_id, shm_path, w, h), `canvas.present` (win_id), `canvas.detach` (win_id)
 
-**Server side** (`Library.IPCBroker.ailang`): `canvas.attach` handler opens shm file, mmaps it, creates surface header pointing to shared memory. `Win_BlitAll` checks `Canvas_GetActive(i)` and substitutes the canvas surface.
+**Server side** (`Display/IPC/Library.IPCBroker.ailang`): `canvas.attach` handler opens shm file, mmaps it, creates surface header pointing to shared memory. `Win_BlitAll` checks `Canvas_GetActive(i)` and substitutes the canvas surface.
 
 **App side** (`Library.ShmCanvas.ailang`): `ShmCanvas_Create(win_id, w, h)` creates shm file, ftruncate, mmap. `ShmCanvas_Present(sock, win_id)` sends JSON. Pixel helpers: `ShmCanvas_SetPixel`, `ShmCanvas_Clear`, `ShmCanvas_FillRect`.
 
-**Canvas state** (`Library.WinManager.ailang`): Per-window `CanvasState` table (8 entries × 40 bytes): ACTIVE, SHM_PTR, SHM_SIZE, SURF, MOUSE_CAPTURE fields. MOUSE_CAPTURE distinguishes sandboxed apps (Chrome) from regular canvas apps (terminal, videoplayer).
+**Canvas state** (`Display/Window/Library.WinManager.ailang`): Per-window `CanvasState` table (8 entries × 48 bytes): ACTIVE, SHM_PTR, SHM_SIZE, SURF, MOUSE_CAPTURE, DIRTY fields. MOUSE_CAPTURE distinguishes sandboxed apps (Chrome) from regular canvas apps (terminal, videoplayer). DIRTY flag set by `canvas.present`/`canvas.attach`, cleared after blit.
 
 **Video player pattern:** fork/exec ffmpeg with `-f rawvideo -pix_fmt bgra -s 640x480 pipe:1`, capture stdout via pipe()+dup2(), read frames directly into shm buffer, present each frame. SIGSTOP/SIGCONT for pause/resume.
 
@@ -175,6 +187,49 @@ Standalone IPC app (`terminal_ipc.ailang`, ~191KB binary). Follows videoplayer a
 
 **Dynamic resize:** Handles `window.resized` IPC message. Recalculates COLS/ROWS from pixel dimensions (snapped to 8x16 cell grid). Allocates new grid buffers, copies old content row-by-row. Destroys+recreates ShmCanvas. Sends `TIOCSWINSZ` ioctl so bash/programs get `SIGWINCH`.
 
+## Library Directory Structure
+
+Display-server-specific libraries are organized under `Librarys/Display/`. DnD game libraries are organized under `Librarys/DnD/`. Generic reusable libraries stay in `Librarys/` root. Import paths use dots as separators: `LibraryImport.Display.Window.WinManager` resolves to `Librarys/Display/Window/Library.WinManager.ailang`. `LibraryImport.DnD.Engine.DND` resolves to `Librarys/DnD/Engine/Library.DND.ailang`.
+
+```
+Librarys/
+├── Library.Arena.ailang            # Generic — memory allocator
+├── Library.XArrays.ailang          # Generic — dynamic arrays
+├── Library.StringUtils.ailang      # Generic — string operations
+├── Library.JSON.ailang             # Generic — JSON parser/serializer
+├── Library.HashMap.ailang          # Generic — hash map
+├── Library.Socket.ailang           # Generic — Unix sockets
+├── Library.ShmCanvas.ailang        # Generic — app-side shared memory canvas
+├── Library.KeyMap.ailang           # Generic — scancode-to-char mapping
+├── Library.TextBuffer.ailang       # Generic — multi-line text editing
+├── Library.TermFont.ailang         # Generic — 8x16 bitmap font
+├── Library.TUI.ailang              # Generic — terminal user interface
+├── Library.Math.ailang             # Generic — math functions
+├── Compiler/                       # Compiler subsystem (already organized)
+├── AIMacro/                        # Macro subsystem (already organized)
+├── Display/                        # Display server subsystem
+│   ├── System/                     # SysDisplay, EventRouter, Screenshot
+│   ├── Window/                     # WinManager, WinToolbar, WinInput, WinStack, WinRender
+│   ├── Input/                      # DInputTypes, DInputEvdev, DInputDiscover, Cursor, CursorBitmap
+│   ├── UI/                         # Auckland, AucklandEvent, AucklandBind, TextRegion, PaneDecorator, Dialog, AboutDialog, FileDialog, NotepadApp
+│   ├── Menu/                       # Menu, StartMenu, CascadeMenu, Deskbar
+│   ├── Render/                     # Framebuffer, DRenderFB, DSurface*, DCompose*, DRing*, DZone*, Fonts, VIF, VIcon, AudioEngine, etc.
+│   ├── Content/                    # Document, PageSurface, HTMLParse, Editor
+│   ├── Theme/                      # UIConfig, UIScale, UITheme
+│   └── IPC/                        # IPCBroker, InputRouter
+└── DnD/                            # D&D RPG game subsystem
+    ├── Engine/                     # DND (core engine), GameConfig, World, Portal, Encounter, DICE
+    ├── Character/                  # Character, Item, EquipScreen
+    ├── Battle/                     # BattleScreen
+    ├── Commerce/                   # Shop, Inn
+    ├── Save/                       # Save, SaveScreen
+    └── Web/                        # HTMLBroadcast, DND_HTML_Output_engine
+```
+
+IPC apps (calc, grep, terminal, chrome, videoplayer) only import generic libs — they need NO Display/ imports.
+
+DnD game (`dnd_game.ailang`) imports from `DnD/` subdirectories plus generic libs (TUI, Arena). Build: `./ailang.x dnd_game.ailang dnd.x`.
+
 ## IPC Pipeline Architecture
 
 Full plan at: `.claude/plans/playful-cuddling-puffin.md`
@@ -183,9 +238,9 @@ Full plan at: `.claude/plans/playful-cuddling-puffin.md`
 
 | File | Purpose |
 |------|---------|
-| `Librarys/Library.IPCBroker.ailang` | Embedded IPC broker — socket, poll, client table, message dispatch |
-| `Librarys/Library.StartMenu.ailang` | Start Menu panel — Windows XP/7 style overlay |
-| `Librarys/Library.AboutDialog.ailang` | About dialog — system info, copyright, license |
+| `Librarys/Display/IPC/Library.IPCBroker.ailang` | Embedded IPC broker — socket, poll, client table, message dispatch |
+| `Librarys/Display/Menu/Library.StartMenu.ailang` | Start Menu panel — Windows XP/7 style overlay |
+| `Librarys/Display/UI/Library.AboutDialog.ailang` | About dialog — system info, copyright, license |
 | `Librarys/Library.Socket.ailang` | Added `Socket.SetNonBlock(fd)` |
 | `Testcode/calc_ipc.ailang` | Standalone IPC calculator client |
 | `config/calculator.html` | Calculator layout with `toolbar="about"` |
@@ -196,16 +251,10 @@ Full plan at: `.claude/plans/playful-cuddling-puffin.md`
 | `Testcode/grep_ipc.ailang` | Grep IPC client — pattern search with keyboard capture |
 | `Testcode/canvas_demo.ailang` | Animated gradient demo — proves shm canvas pipeline |
 | `Testcode/videoplayer.ailang` | Video player — fork/exec ffmpeg, pipe raw BGRA frames to shm canvas |
-| `config/grep.html` | Grep window layout — textfield, file buttons, checkboxes, results panel |
-| `config/canvas_demo.html` | Canvas demo window — black panel for pixel streaming |
-| `config/videoplayer.html` | Video player window — canvas + transport controls (play/pause/stop/open) |
 | `Librarys/Library.TermFont.ailang` | Embedded 8x16 VGA bitmap font for terminal rendering (95 glyphs, ASCII 32-126) |
 | `Testcode/terminal_ipc.ailang` | Terminal emulator — PTY + VT100 parser + ShmCanvas + dynamic resize |
-| `config/terminal.html` | Terminal window layout — black panel with file toolbar |
 | `Testcode/claude_ipc.ailang` | Claude Code app — fork of terminal, execs claude CLI via PTY, 800x600 100x37 grid |
-| `config/claude.html` | Claude Code window layout — dark panel with about toolbar |
-| `Testcode/chrome_ipc.ailang` | Chrome browser — Xvfb + google-chrome + ffmpeg x11grab, ShmCanvas, xdotool input |
-| `config/chrome.html` | Chrome window layout — nav buttons, URL bar, canvas panel |
+| `Testcode/chrome_ipc.ailang` | Chrome browser — Xvfb + google-chrome + mmap framebuffer, ShmCanvas, xdotool pipe input |
 
 ### PostgreSQL Services Table
 
@@ -258,7 +307,9 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 - 125-step headless stress test: resize + debug + start menu + IPC + calc + about + filedialog + notepad + keyboard + canvas + terminal + chrome + mouse
 - 0 analyzer errors, 10/10 calc tests, all headless tests pass
 - Claude Code IPC app: dedicated CLI wrapper, fork of terminal emulator, execs claude 2.1.14 via PTY, 800x600 100x37 grid, xterm-256color
-- Chrome browser: sandboxed via Xvfb + ffmpeg x11grab, 3-process management, xdotool keyboard+mouse forwarding, 30fps capture, toolbar nav, `--user-data-dir` session isolation, `-draw_mouse 1`, mouse move coalescing
+- Chrome browser: sandboxed via Xvfb + mmap framebuffer (no ffmpeg), 3-process management, persistent xdotool pipe input (~0.1ms vs 5-15ms fork/exec), canvas dirty flag, toolbar nav, `--user-data-dir` session isolation, mouse Y adjusted for toolbar height, mouse move coalescing
+- Library directory reorg: 58 display libs organized into `Librarys/Display/{System,Window,Input,UI,Menu,Render,Content,Theme,IPC}/`, generic libs stay in root
+- DnD library reorg: 16 game libs organized into `Librarys/DnD/{Engine,Character,Battle,Commerce,Save,Web}/`, generic libs (TUI, Arena, StringUtils) stay in root
 - SysDisplay.x binary: ~665KB, terminal_ipc.x: ~232KB, claude_ipc.x: ~232KB
 
 ### Build & Run
@@ -272,6 +323,7 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 ./ailang.x Testcode/terminal_ipc.ailang terminal_ipc.x # build terminal emulator
 ./ailang.x Testcode/claude_ipc.ailang claude_ipc.x     # build claude code app
 ./ailang.x Testcode/chrome_ipc.ailang chrome_ipc.x     # build chrome browser
+./ailang.x dnd_game.ailang dnd.x                        # build DnD game
 ./ailang.x Calc.ailang Calc.x                          # build calc standalone tests
 ./ailang.x TestCode/test_main.ailang test_main.x       # build headless tests
 ./SysDisplay.x                                          # run on TTY (Ctrl+Alt+F2)
@@ -288,7 +340,7 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 - `videoplayer.ailang` — ffmpeg video player via fork/exec + pipe + shm canvas
 - `terminal_ipc.ailang` — terminal emulator via PTY + VT100 parser + 8x16 bitmap font + ShmCanvas
 - `claude_ipc.ailang` — Claude Code CLI wrapper via PTY + VT100 + ShmCanvas (100x37 grid, xterm-256color)
-- `chrome_ipc.ailang` — Sandboxed Chrome browser via Xvfb + ffmpeg x11grab + ShmCanvas + xdotool input
+- `chrome_ipc.ailang` — Sandboxed Chrome browser via Xvfb mmap + ShmCanvas + xdotool pipe input
 - `Calc.ailang` — standalone calculator unit tests (10/10)
 - `test_offscreen_render.ailang` — 4 render tests (toolbar, menu, deskbar, file dialog)
 - `test_filedialog.ailang` — file dialog integration tests

@@ -1,0 +1,435 @@
+// Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.DInputDiscover.ailang
+// Discovers keyboard and mouse by reading /dev/input/by-id/ directory
+// Symlinks ending in "-event-kbd"   → keyboard
+// Symlinks ending in "-event-mouse" → mouse
+// Resolves symlink target (../eventN) to get the event number.
+//
+// Fallback: if by-id fails, scan /proc/bus/input/devices for last kbd/mouse.
+
+LibraryImport.Arena
+LibraryImport.Display.Render.DRingTypes
+LibraryImport.Display.Render.DRing
+LibraryImport.Display.Render.DRing1
+LibraryImport.Display.Input.DInputTypes
+LibraryImport.Display.Input.DInputEvdev
+
+FixedPool.DiscoverSys {
+    "SYS_OPEN":     Initialize=2
+    "SYS_READ":     Initialize=0
+    "SYS_CLOSE":    Initialize=3
+    "SYS_GETDENTS": Initialize=78    // getdents64
+    "O_RDONLY":     Initialize=0
+    "O_DIRECTORY":  Initialize=65536
+}
+
+FixedPool.DiscoverConst {
+    "BUF_SIZE":     Initialize=16384
+    "PATH_SIZE":    Initialize=64
+    "DENTS_SIZE":   Initialize=4096
+}
+
+FixedPool.DiscoverState {
+    "kbd_event":   Initialize=-1
+    "mouse_event": Initialize=-1
+}
+
+// linux_dirent64 layout (verified on Bob's Pop!_OS x86-64):
+//   d_ino:    8 bytes  (offset 0)
+//   d_off:    8 bytes  (offset 8)
+//   d_reclen: 2 bytes  (offset 16)
+//   d_name:   starts at offset 18  (no d_type byte on this build)
+FixedPool.Dirent {
+    "RECLEN": Initialize=16
+    "NAME":   Initialize=18
+}
+
+// =============================================================================
+// HELPERS
+// =============================================================================
+Function.Disc_MatchAt {
+    Input: buf:    Address
+    Input: off:    Integer
+    Input: needle: Address
+    Input: nlen:   Integer
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, nlen) {
+            IfCondition NotEqual(GetByte(buf, Add(off, i)), GetByte(needle, i)) ThenBlock: {
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Get null-terminated string length from buf at offset
+Function.Disc_StrLen {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        n = 0
+        WhileLoop NotEqual(GetByte(buf, Add(off, n)), 0) {
+            n = Add(n, 1)
+        }
+        ReturnValue(n)
+    }
+}
+
+// Check if string at buf[off] ends with suffix
+Function.Disc_EndsWith {
+    Input: buf:    Address
+    Input: off:    Integer
+    Input: suffix: Address
+    Input: slen:   Integer
+    Output: Integer
+    Body: {
+        slen2 = slen
+        namelen = Disc_StrLen(buf, off)
+        IfCondition LessThan(namelen, slen2) ThenBlock: {
+            ReturnValue(0)
+        }
+        start = Add(off, Subtract(namelen, slen2))
+        ReturnValue(Disc_MatchAt(buf, start, suffix, slen2))
+    }
+}
+
+// Parse eventN from symlink target "../eventN" — returns N or -1
+// target is a string like "../event2\0"
+Function.Disc_ParseEventTarget {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        // Find "event" in the string
+        len = Disc_StrLen(buf, off)
+        i = 0
+        WhileLoop LessThan(i, len) {
+            IfCondition EqualTo(Disc_MatchAt(buf, Add(off, i), "event", 5), 1) ThenBlock: {
+                // Parse number after "event"
+                num_pos = Add(Add(off, i), 5)
+                val = 0
+                WhileLoop LessThan(num_pos, Add(off, len)) {
+                    c = GetByte(buf, num_pos)
+                    IfCondition And(GreaterEqual(c, 48), LessEqual(c, 57)) ThenBlock: {
+                        val = Add(Multiply(val, 10), Subtract(c, 48))
+                        num_pos = Add(num_pos, 1)
+                    } ElseBlock: {
+                        num_pos = Add(off, len)
+                    }
+                }
+                ReturnValue(val)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// Read symlink target into out_buf, returns length or -1
+Function.Disc_ReadLink {
+    Input:  path:    Address
+    Input:  out_buf: Address
+    Input:  bufsz:   Integer
+    Output: Integer
+    Body: {
+        // SYS_READLINK = 89
+        n = SystemCall(89, path, out_buf, bufsz)
+        IfCondition LessThan(n, 0) ThenBlock: { ReturnValue(-1) }
+        // Null terminate
+        SetByte(out_buf, n, 0)
+        ReturnValue(n)
+    }
+}
+
+// Build "/dev/input/by-id/" + name into out_buf
+Function.Disc_BuildByIdPath {
+    Input:  name_buf: Address
+    Input:  name_off: Integer
+    Input:  out_buf:  Address
+    Output: Integer
+    Body: {
+        prefix = "/dev/input/by-id/"
+        plen = 17
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            SetByte(out_buf, i, GetByte(prefix, i))
+            i = Add(i, 1)
+        }
+        j = 0
+        WhileLoop NotEqual(GetByte(name_buf, Add(name_off, j)), 0) {
+            SetByte(out_buf, Add(i, j), GetByte(name_buf, Add(name_off, j)))
+            j = Add(j, 1)
+        }
+        SetByte(out_buf, Add(i, j), 0)
+        ReturnValue(Add(i, j))
+    }
+}
+
+// =============================================================================
+// SCAN /dev/input/by-id/ using getdents64
+// Find -event-kbd and -event-mouse symlinks, resolve to eventN
+// =============================================================================
+Function.Discover_FindDevices {
+    Output: Integer
+    Body: {
+        DiscoverState.kbd_event   = Add(-1, 65536)
+        DiscoverState.mouse_event = Add(-1, 65536)
+
+        // Open the by-id directory
+        dir_fd = SystemCall(DiscoverSys.SYS_OPEN, "/dev/input/by-id",
+                            DiscoverSys.O_RDONLY, 0)
+        IfCondition LessThan(dir_fd, 0) ThenBlock: {
+            PrintMessage("[Discover] by-id not available, trying fallback\n")
+            ReturnValue(Discover_FindDevicesFallback())
+        }
+
+        dents = Allocate(DiscoverConst.DENTS_SIZE)
+        link_buf = Allocate(DiscoverConst.PATH_SIZE)
+        path_buf = Allocate(DiscoverConst.PATH_SIZE)
+
+        done = Add(0, 65536)
+        WhileLoop EqualTo(done, Add(0, 65536)) {
+            nbytes = SystemCall(DiscoverSys.SYS_GETDENTS, dir_fd, dents,
+                                DiscoverConst.DENTS_SIZE)
+            IfCondition LessEqual(nbytes, 0) ThenBlock: {
+                done = Add(1, 65536)
+            } ElseBlock: {
+                pos = 0
+                WhileLoop LessThan(pos, nbytes) {
+                    reclen_lo = GetByte(dents, Add(pos, Dirent.RECLEN))
+                    reclen_hi = GetByte(dents, Add(pos, Add(Dirent.RECLEN, 1)))
+                    reclen    = Add(reclen_lo, Multiply(reclen_hi, 256))
+
+                    name_off = Add(pos, Dirent.NAME)
+
+                    // Check for "-event-kbd" suffix (10 chars)
+                    IfCondition EqualTo(Disc_EndsWith(dents, name_off, "-event-kbd", 10), 1) ThenBlock: {
+                        Disc_BuildByIdPath(dents, name_off, path_buf)
+                        n = Disc_ReadLink(path_buf, link_buf, DiscoverConst.PATH_SIZE)
+                        IfCondition GreaterThan(n, 0) ThenBlock: {
+                            evnum = Disc_ParseEventTarget(link_buf, 0)
+                            IfCondition GreaterEqual(evnum, 0) ThenBlock: {
+                                DiscoverState.kbd_event = Add(evnum, 65536)
+                                PrintMessage("[Discover] kbd via by-id: event")
+                                PrintNumber(evnum)
+                                PrintMessage("\n")
+                            }
+                        }
+                    }
+
+                    // Check for "-event-mouse" suffix (12 chars)
+                    IfCondition EqualTo(Disc_EndsWith(dents, name_off, "-event-mouse", 12), 1) ThenBlock: {
+                        Disc_BuildByIdPath(dents, name_off, path_buf)
+                        n = Disc_ReadLink(path_buf, link_buf, DiscoverConst.PATH_SIZE)
+                        IfCondition GreaterThan(n, 0) ThenBlock: {
+                            evnum = Disc_ParseEventTarget(link_buf, 0)
+                            IfCondition GreaterEqual(evnum, 0) ThenBlock: {
+                                DiscoverState.mouse_event = Add(evnum, 65536)
+                                PrintMessage("[Discover] mouse via by-id: event")
+                                PrintNumber(evnum)
+                                PrintMessage("\n")
+                            }
+                        }
+                    }
+
+                    pos = Add(pos, reclen)
+                    IfCondition EqualTo(reclen, 0) ThenBlock: {
+                        pos = nbytes
+                    }
+                }
+            }
+        }
+
+        Deallocate(dents,    DiscoverConst.DENTS_SIZE)
+        Deallocate(link_buf, DiscoverConst.PATH_SIZE)
+        Deallocate(path_buf, DiscoverConst.PATH_SIZE)
+        SystemCall(DiscoverSys.SYS_CLOSE, dir_fd, 0, 0)
+
+        // Report
+        IfCondition NotEqual(Subtract(DiscoverState.kbd_event, 65536), -1) ThenBlock: {
+            PrintMessage("[Discover] Keyboard: /dev/input/event")
+            PrintNumber(Subtract(DiscoverState.kbd_event, 65536))
+            PrintMessage("\n")
+        } ElseBlock: {
+            PrintMessage("[Discover] WARNING: no keyboard found\n")
+        }
+        IfCondition NotEqual(Subtract(DiscoverState.mouse_event, 65536), -1) ThenBlock: {
+            PrintMessage("[Discover] Mouse: /dev/input/event")
+            PrintNumber(Subtract(DiscoverState.mouse_event, 65536))
+            PrintMessage("\n")
+        } ElseBlock: {
+            PrintMessage("[Discover] WARNING: no mouse found\n")
+        }
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FALLBACK — last kbd/mouse in /proc/bus/input/devices
+// Used if by-id not available
+// =============================================================================
+Function.Discover_FindDevicesFallback {
+    Output: Integer
+    Body: {
+        fd = SystemCall(DiscoverSys.SYS_OPEN, "/proc/bus/input/devices",
+                        DiscoverSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        buf = Allocate(DiscoverConst.BUF_SIZE)
+        n   = SystemCall(DiscoverSys.SYS_READ, fd, buf, DiscoverConst.BUF_SIZE)
+        SystemCall(DiscoverSys.SYS_CLOSE, fd, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, DiscoverConst.BUF_SIZE)
+            ReturnValue(0)
+        }
+
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(Disc_MatchAt(buf, i, "H: Handlers=", 12), 1) ThenBlock: {
+                line_start = Add(i, 12)
+                line_end   = line_start
+                WhileLoop LessThan(line_end, n) {
+                    IfCondition Or(EqualTo(GetByte(buf, line_end), 10),
+                                   EqualTo(GetByte(buf, line_end), 0)) ThenBlock: {
+                        line_end = n
+                    } ElseBlock: {
+                        line_end = Add(line_end, 1)
+                    }
+                }
+
+                has_kbd   = Add(0,  65536)
+                has_mouse = Add(0,  65536)
+                event_num = Add(-1, 65536)
+
+                pos = line_start
+                WhileLoop LessThan(pos, line_end) {
+                    IfCondition EqualTo(Disc_MatchAt(buf, pos, "kbd", 3), 1) ThenBlock: {
+                        has_kbd = Add(1, 65536)
+                    }
+                    IfCondition EqualTo(Disc_MatchAt(buf, pos, "mouse", 5), 1) ThenBlock: {
+                        has_mouse = Add(1, 65536)
+                    }
+                    IfCondition EqualTo(Disc_MatchAt(buf, pos, "event", 5), 1) ThenBlock: {
+                        val = 0
+                        np  = Add(pos, 5)
+                        WhileLoop LessThan(np, line_end) {
+                            c = GetByte(buf, np)
+                            IfCondition And(GreaterEqual(c, 48), LessEqual(c, 57)) ThenBlock: {
+                                val = Add(Multiply(val, 10), Subtract(c, 48))
+                                np  = Add(np, 1)
+                            } ElseBlock: {
+                                np = line_end
+                            }
+                        }
+                        event_num = Add(val, 65536)
+                    }
+                    pos = Add(pos, 1)
+                }
+
+                k = Subtract(has_kbd,   65536)
+                m = Subtract(has_mouse, 65536)
+                e = Subtract(event_num, 65536)
+
+                IfCondition EqualTo(k, 1) ThenBlock: {
+                    IfCondition NotEqual(e, -1) ThenBlock: {
+                        DiscoverState.kbd_event = Add(e, 65536)
+                    }
+                }
+                IfCondition EqualTo(m, 1) ThenBlock: {
+                    IfCondition NotEqual(e, -1) ThenBlock: {
+                        DiscoverState.mouse_event = Add(e, 65536)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+
+        Deallocate(buf, DiscoverConst.BUF_SIZE)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// Disc_BuildPath — "/dev/input/eventN" into out_buf
+// =============================================================================
+Function.Disc_BuildPath {
+    Input:  event_num: Integer
+    Input:  out_buf:   Address
+    Output: Integer
+    Body: {
+        prefix = "/dev/input/event"
+        i = 0
+        WhileLoop LessThan(i, 16) {
+            c = GetByte(prefix, i)
+            IfCondition EqualTo(c, 0) ThenBlock: { i = 16 } ElseBlock: {
+                SetByte(out_buf, i, c)
+                i = Add(i, 1)
+            }
+        }
+        IfCondition EqualTo(event_num, 0) ThenBlock: {
+            SetByte(out_buf, i, 48)
+            i = Add(i, 1)
+        } ElseBlock: {
+            temp = event_num
+            ndig = 0
+            WhileLoop GreaterThan(temp, 0) {
+                ndig = Add(ndig, 1)
+                temp = Divide(temp, 10)
+            }
+            divisor = 1
+            d = 1
+            WhileLoop LessThan(d, ndig) {
+                divisor = Multiply(divisor, 10)
+                d = Add(d, 1)
+            }
+            rem = event_num
+            WhileLoop GreaterThan(divisor, 0) {
+                digit   = Divide(rem, divisor)
+                SetByte(out_buf, i, Add(48, digit))
+                rem     = Modulo(rem, divisor)
+                divisor = Divide(divisor, 10)
+                i = Add(i, 1)
+            }
+        }
+        SetByte(out_buf, i, 0)
+        ReturnValue(i)
+    }
+}
+
+// =============================================================================
+// Discover_OpenAll
+// =============================================================================
+Function.Discover_OpenAll {
+    Output: Integer
+    Body: {
+        ok = Discover_FindDevices()
+        IfCondition EqualTo(ok, 0) ThenBlock: { ReturnValue(0) }
+
+        path_buf = Allocate(DiscoverConst.PATH_SIZE)
+        opened   = 0
+
+        IfCondition NotEqual(Subtract(DiscoverState.kbd_event, 65536), -1) ThenBlock: {
+            knum = Subtract(DiscoverState.kbd_event, 65536)
+            Disc_BuildPath(knum, path_buf)
+            kfd = Evdev_OpenDevice(path_buf, InputDevType.KEYBOARD)
+            IfCondition GreaterEqual(kfd, 0) ThenBlock: { opened = Add(opened, 1) }
+        }
+
+        IfCondition NotEqual(Subtract(DiscoverState.mouse_event, 65536), -1) ThenBlock: {
+            mnum = Subtract(DiscoverState.mouse_event, 65536)
+            Disc_BuildPath(mnum, path_buf)
+            mfd = Evdev_OpenDevice(path_buf, InputDevType.MOUSE)
+            IfCondition GreaterEqual(mfd, 0) ThenBlock: { opened = Add(opened, 1) }
+        }
+
+        Deallocate(path_buf, DiscoverConst.PATH_SIZE)
+        ReturnValue(opened)
+    }
+}

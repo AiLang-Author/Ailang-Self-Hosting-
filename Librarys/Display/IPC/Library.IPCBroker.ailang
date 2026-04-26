@@ -1,0 +1,1128 @@
+// Library.IPCBroker.ailang
+// Embedded IPC broker — accepts app connections via Unix socket,
+// routes JSON messages between display server and app processes.
+//
+// The display server IS the broker. Apps connect to /tmp/ailang_display.sock,
+// register their service name, request window creation, and exchange
+// actions/updates via JSON messages with 4-byte BE length prefix.
+//
+// Non-blocking: poll(0) called once per frame in the main loop.
+// Zero blocking, zero frame impact.
+//
+// Protocol:
+//   App -> Server: register, window.create, window.update,
+//                  canvas.attach, canvas.present, canvas.detach
+//   Server -> App: window.created, window.closed, input.action, input.key
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.XArrays
+LibraryImport.HashMap
+LibraryImport.Display.Window.WinManager
+LibraryImport.AppHost
+LibraryImport.Display.UI.Auckland
+LibraryImport.Display.UI.AucklandEvent
+LibraryImport.Display.System.EventRouter
+LibraryImport.Display.System.SysDisplay
+LibraryImport.Display.Render.Fonts
+LibraryImport.Display.Theme.UIScale
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.IPCBrokerConst {
+    "MAX_CLIENTS":   Initialize=8
+    "ENTRY_SIZE":    Initialize=24
+}
+
+// Client table entry layout: [fd(8), service_id(8), win_idx(8)]
+FixedPool.IPCClientFields {
+    "FD":            Initialize=0
+    "SERVICE_ID":    Initialize=8
+    "WIN_IDX":       Initialize=16
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.IPCBrokerState {
+    "listen_fd":     Initialize=-1, CanChange=True
+    "client_table":  Initialize=0,  CanChange=True
+    "client_count":  Initialize=0,  CanChange=True
+    "pollfds":       Initialize=0,  CanChange=True
+    "initialized":   Initialize=0,  CanChange=True
+    "sock_path":     Initialize=0,  CanChange=True
+}
+
+// =============================================================================
+// INIT — create listen socket, bind, set non-blocking
+// =============================================================================
+Function.IPCBroker_Init {
+    Output: Integer
+    Body: {
+        DebugLog_Push("ipc.ini", 7)
+
+        // Allocate client table: 8 entries x 24 bytes
+        ct_sz = Multiply(IPCBrokerConst.MAX_CLIENTS, IPCBrokerConst.ENTRY_SIZE)
+        ct = Allocate(ct_sz)
+        IfCondition EqualTo(ct, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] client table alloc fail\n")
+            ReturnValue(0)
+        }
+        MemorySet(ct, 0, ct_sz)
+        IPCBrokerState.client_table = ct
+
+        // Allocate pollfds: (1 listen + 8 clients) x 8 bytes = 72 bytes
+        pf_sz = Multiply(Add(IPCBrokerConst.MAX_CLIENTS, 1), 8)
+        pf = Allocate(pf_sz)
+        IfCondition EqualTo(pf, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] pollfds alloc fail\n")
+            ReturnValue(0)
+        }
+        MemorySet(pf, 0, pf_sz)
+        IPCBrokerState.pollfds = pf
+
+        // Store socket path
+        IPCBrokerState.sock_path = "/tmp/ailang_display.sock"
+
+        // Create Unix domain socket
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] socket create fail\n")
+            ReturnValue(0)
+        }
+
+        // Bind
+        bres = Socket.BindUnix(fd, IPCBrokerState.sock_path)
+        IfCondition LessThan(bres, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] bind fail\n")
+            Socket.Close(fd)
+            ReturnValue(0)
+        }
+
+        // Listen
+        lres = Socket.Listen(fd, 8)
+        IfCondition LessThan(lres, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] listen fail\n")
+            Socket.Close(fd)
+            ReturnValue(0)
+        }
+
+        // Set non-blocking
+        Socket.SetNonBlock(fd)
+
+        IPCBrokerState.listen_fd = fd
+        IPCBrokerState.client_count = 0
+        IPCBrokerState.initialized = 1
+
+        PrintMessage("[IPCBroker] listening on ")
+        PrintMessage(IPCBrokerState.sock_path)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// CLIENT TABLE HELPERS
+// =============================================================================
+Function.IPCBroker_ClientPtr {
+    Input: ci: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(IPCBrokerState.client_table, Multiply(ci, IPCBrokerConst.ENTRY_SIZE)))
+    }
+}
+
+Function.IPCBroker_ClientGetFd {
+    Input: ci: Integer
+    Output: Integer
+    Body: {
+        base = IPCBroker_ClientPtr(ci)
+        ReturnValue(Dereference(Add(base, IPCClientFields.FD)))
+    }
+}
+
+Function.IPCBroker_ClientGetWinIdx {
+    Input: ci: Integer
+    Output: Integer
+    Body: {
+        base = IPCBroker_ClientPtr(ci)
+        ReturnValue(Dereference(Add(base, IPCClientFields.WIN_IDX)))
+    }
+}
+
+Function.IPCBroker_ClientSetWinIdx {
+    Input: ci: Integer
+    Input: win_idx: Integer
+    Body: {
+        base = IPCBroker_ClientPtr(ci)
+        StoreValue(Add(base, IPCClientFields.WIN_IDX), win_idx)
+    }
+}
+
+// =============================================================================
+// ACCEPT CLIENT — accept a pending connection, add to table
+// =============================================================================
+Function.IPCBroker_AcceptClient {
+    Output: Integer
+    Body: {
+        DebugLog_Push("ipc.acc", 7)
+        IfCondition GreaterEqual(IPCBrokerState.client_count, IPCBrokerConst.MAX_CLIENTS) ThenBlock: {
+            PrintMessage("[IPCBroker] client table full\n")
+            ReturnValue(-1)
+        }
+
+        new_fd = Socket.Accept(IPCBrokerState.listen_fd)
+        IfCondition LessThan(new_fd, 0) ThenBlock: {
+            // No pending connection (non-blocking)
+            ReturnValue(-1)
+        }
+
+        // Set new client non-blocking
+        Socket.SetNonBlock(new_fd)
+
+        ci = IPCBrokerState.client_count
+        base = IPCBroker_ClientPtr(ci)
+        StoreValue(Add(base, IPCClientFields.FD), new_fd)
+        StoreValue(Add(base, IPCClientFields.SERVICE_ID), 0)
+        StoreValue(Add(base, IPCClientFields.WIN_IDX), 0)
+        IPCBrokerState.client_count = Add(ci, 1)
+
+        PrintMessage("[IPCBroker] client connected ci=")
+        PrintNumber(ci)
+        PrintMessage(" fd=")
+        PrintNumber(new_fd)
+        PrintMessage("\n")
+        ReturnValue(ci)
+    }
+}
+
+// =============================================================================
+// REMOVE CLIENT — close fd, clean up window, compact table
+// =============================================================================
+Function.IPCBroker_RemoveClient {
+    Input: ci: Integer
+    Body: {
+        DebugLog_Push("ipc.rem", 7)
+        cc = IPCBrokerState.client_count
+        IfCondition GreaterEqual(ci, cc) ThenBlock: { ReturnValue(0) }
+
+        fd = IPCBroker_ClientGetFd(ci)
+        win_idx = IPCBroker_ClientGetWinIdx(ci)
+
+        // Close socket
+        IfCondition GreaterThan(fd, 0) ThenBlock: {
+            Socket.Close(fd)
+        }
+
+        // Close associated window if any
+        IfCondition GreaterThan(win_idx, 0) ThenBlock: {
+            // Clear JOB_PTR before closing so Win_Close doesn't try to notify
+            WinView_SetJobPtr(win_idx, 0)
+            AppHost_Close(win_idx)
+        }
+
+        PrintMessage("[IPCBroker] client removed ci=")
+        PrintNumber(ci)
+        PrintMessage("\n")
+
+        // Compact: move last entry into this slot
+        last = Subtract(cc, 1)
+        IfCondition NotEqual(ci, last) ThenBlock: {
+            src = IPCBroker_ClientPtr(last)
+            dst = IPCBroker_ClientPtr(ci)
+            MemoryCopy(dst, src, IPCBrokerConst.ENTRY_SIZE)
+
+            // Update WinView JOB_PTR for the moved client's window
+            moved_win = IPCBroker_ClientGetWinIdx(ci)
+            IfCondition GreaterThan(moved_win, 0) ThenBlock: {
+                // JOB_PTR stores ci+1 (so 0 means no IPC client)
+                WinView_SetJobPtr(moved_win, Add(ci, 1))
+            }
+        }
+
+        // Zero the vacated last slot
+        last_ptr = IPCBroker_ClientPtr(last)
+        MemorySet(last_ptr, 0, IPCBrokerConst.ENTRY_SIZE)
+        IPCBrokerState.client_count = last
+    }
+}
+
+// =============================================================================
+// SEND — send length-prefixed JSON to a client
+// =============================================================================
+Function.IPCBroker_Send {
+    Input: ci: Integer
+    Input: msg: Address
+    Body: {
+        DebugLog_Push("ipc.snd", 7)
+        fd = IPCBroker_ClientGetFd(ci)
+        IfCondition LessEqual(fd, 0) ThenBlock: { ReturnValue(0) }
+        Socket.SendMsg(fd, msg)
+    }
+}
+
+// =============================================================================
+// HANDLE MESSAGE — parse JSON, dispatch by method
+// =============================================================================
+Function.IPCBroker_HandleMsg {
+    Input: ci: Integer
+    Input: msg: Address
+    Body: {
+        DebugLog_Push("ipc.hm", 6)
+        parsed = ParseJSON(msg)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] JSON parse fail\n")
+            ReturnValue(0)
+        }
+
+        obj = JSON.AsObject(parsed)
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] no method field\n")
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+
+
+        // --- register ---
+        cmp_reg = StringCompare(method, "register")
+        IfCondition EqualTo(cmp_reg, 0) ThenBlock: {
+            svc_name = JSON.GetString(obj, "service")
+            PrintMessage("[IPCBroker] register: ")
+            IfCondition NotEqual(svc_name, 0) ThenBlock: {
+                PrintString(svc_name)
+            }
+            PrintMessage("\n")
+            // TODO: look up service_id from DeskbarState cache
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        // --- window.create ---
+        cmp_wc = StringCompare(method, "window.create")
+        IfCondition EqualTo(cmp_wc, 0) ThenBlock: {
+            IPCBroker_HandleWindowCreate(ci, obj)
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        // --- window.update ---
+        cmp_wu = StringCompare(method, "window.update")
+        IfCondition EqualTo(cmp_wu, 0) ThenBlock: {
+            IPCBroker_HandleWindowUpdate(ci, obj)
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        // --- window.addline ---
+        cmp_al = StringCompare(method, "window.addline")
+        IfCondition EqualTo(cmp_al, 0) ThenBlock: {
+            IPCBroker_HandleAddLine(ci, obj)
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        // --- window.clear ---
+        cmp_cl = StringCompare(method, "window.clear")
+        IfCondition EqualTo(cmp_cl, 0) ThenBlock: {
+            IPCBroker_HandleClearLines(ci, obj)
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        // --- window.setlabel ---
+        cmp_sl = StringCompare(method, "window.setlabel")
+        IfCondition EqualTo(cmp_sl, 0) ThenBlock: {
+            IPCBroker_HandleSetLabel(ci, obj)
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        // --- canvas.attach ---
+        cmp_ca = StringCompare(method, "canvas.attach")
+        IfCondition EqualTo(cmp_ca, 0) ThenBlock: {
+            IPCBroker_HandleCanvasAttach(ci, obj)
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        // --- canvas.present ---
+        cmp_cp = StringCompare(method, "canvas.present")
+        IfCondition EqualTo(cmp_cp, 0) ThenBlock: {
+            cp_wid = JSON.GetNumber(obj, "win_id")
+            Canvas_SetDirty(cp_wid, 1)
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        // --- canvas.detach ---
+        cmp_cd = StringCompare(method, "canvas.detach")
+        IfCondition EqualTo(cmp_cd, 0) ThenBlock: {
+            IPCBroker_HandleCanvasDetach(ci, obj)
+            JSON.Free(parsed)
+            ReturnValue(1)
+        }
+
+        PrintMessage("[IPCBroker] unknown method: ")
+        PrintString(method)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+}
+
+// =============================================================================
+// HANDLE WINDOW.CREATE
+// =============================================================================
+Function.IPCBroker_HandleWindowCreate {
+    Input: ci: Integer
+    Input: obj: Address
+    Body: {
+        DebugLog_Push("ipc.wc", 6)
+        html = JSON.GetString(obj, "html")
+        IfCondition EqualTo(html, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] window.create: no html field\n")
+            IPCBroker_Send(ci, "{\"method\":\"error\",\"msg\":\"no html\"}")
+            ReturnValue(0)
+        }
+
+        // Open window via AppHost with IPC action relay callback
+        win_idx = AppHost_Open(html, AddressOf(IPCBroker_ActionRelay))
+        IfCondition LessEqual(win_idx, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] window.create: AppHost_Open fail\n")
+            IPCBroker_Send(ci, "{\"method\":\"error\",\"msg\":\"open fail\"}")
+            ReturnValue(0)
+        }
+
+        // Store client index in WinView (ci+1 so 0 means no IPC)
+        WinView_SetJobPtr(win_idx, Add(ci, 1))
+
+        // Store window index in client table
+        IPCBroker_ClientSetWinIdx(ci, win_idx)
+
+        PrintMessage("[IPCBroker] window created win=")
+        PrintNumber(win_idx)
+        PrintMessage(" for client ci=")
+        PrintNumber(ci)
+        PrintMessage("\n")
+
+        // Send response: {"method":"window.created","win_id":N}
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "window.created")
+        JSON.SetNumber(resp, "win_id", win_idx)
+        resp_str = JSON.SerializeObject(resp)
+        IPCBroker_Send(ci, resp_str)
+        JSON.Free(resp)
+
+        SysDisplayState.dirty = 1
+    }
+}
+
+// =============================================================================
+// HANDLE WINDOW.UPDATE — update display in IPC-owned window
+//
+// For calculator: {"method":"window.update","win_id":N,"display":"42"}
+// Finds first LABEL node and updates its text.
+// =============================================================================
+Function.IPCBroker_HandleWindowUpdate {
+    Input: ci: Integer
+    Input: obj: Address
+    Body: {
+        DebugLog_Push("ipc.wu", 6)
+        win_id = JSON.GetNumber(obj, "win_id")
+        display = JSON.GetString(obj, "display")
+
+        IfCondition LessEqual(win_id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(display, 0) ThenBlock: { ReturnValue(0) }
+
+        ctx = WinView_GetContentCtx(win_id)
+        IfCondition EqualTo(ctx, 0) ThenBlock: { ReturnValue(0) }
+
+        // Find first LABEL node in tree
+        cnt = ctx@tree_count
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            tag = AK_Get(ctx, i, AKF.TAG)
+            IfCondition EqualTo(tag, AKTag.LABEL) ThenBlock: {
+                // Copy display string to a buffer the node can reference
+                dlen = StringLength(display)
+                IfCondition GreaterThan(dlen, 30) ThenBlock: { dlen = 30 }
+
+                // Free previous display buffer if any
+                old_ptr = AK_ExtraGet(ctx, i, AKExtra.STR_PTR)
+                IfCondition NotEqual(old_ptr, 0) ThenBlock: {
+                    Deallocate(old_ptr, 32)
+                }
+                // Allocate a small buffer for the text
+                buf = Allocate(32)
+                MemoryCopy(buf, display, dlen)
+                SetByte(buf, dlen, 0)
+
+                AK_ExtraSet(ctx, i, AKExtra.STR_PTR, buf)
+                AK_ExtraSet(ctx, i, AKExtra.STR_LEN, dlen)
+                AK_Set(ctx, i, AKF.DIRTY, 1)
+
+                // Re-render content
+                content = WinMgr_GetContent(win_id)
+                IfCondition NotEqual(content, 0) ThenBlock: {
+                    cw = Win_GetCanvasW(win_id)
+                    ch = Win_GetCanvasH(win_id)
+                    VFont_UseSize(UIScale.font_body)
+                    AK_Draw(ctx, content, cw, ch)
+                }
+                SysDisplayState.dirty = 1
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// FIND PANEL NODE — scan tree for first PANEL tag
+// =============================================================================
+Function.IPCBroker_FindPanel {
+    Input: ctx: LinkagePool.AKContext
+    Output: Integer
+    Body: {
+        cnt = ctx@tree_count
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            tag = AK_Get(ctx, i, AKF.TAG)
+            IfCondition EqualTo(tag, AKTag.PANEL) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// HANDLE WINDOW.ADDLINE — add a text LABEL child to first PANEL
+//
+// {"method":"window.addline","win_id":N,"text":"Hello","color":14737632}
+// color is optional (default 0xE0E0E0 = 14737632)
+// =============================================================================
+Function.IPCBroker_HandleAddLine {
+    Input: ci: Integer
+    Input: obj: Address
+    Body: {
+        DebugLog_Push("ipc.al", 6)
+        win_id = JSON.GetNumber(obj, "win_id")
+        text = JSON.GetString(obj, "text")
+
+        IfCondition LessEqual(win_id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(text, 0) ThenBlock: { ReturnValue(0) }
+
+        ctx = WinView_GetContentCtx(win_id)
+        IfCondition EqualTo(ctx, 0) ThenBlock: { ReturnValue(0) }
+
+        // Find first PANEL node
+        panel = IPCBroker_FindPanel(ctx)
+        IfCondition LessThan(panel, 0) ThenBlock: { ReturnValue(0) }
+
+        // Get text length and copy to owned buffer
+        tlen = StringLength(text)
+        IfCondition GreaterThan(tlen, 255) ThenBlock: { tlen = 255 }
+        buf = Allocate(Add(tlen, 1))
+        MemoryCopy(buf, text, tlen)
+        SetByte(buf, tlen, 0)
+
+        // Get optional color (default 0xE0E0E0)
+        color = JSON.GetNumber(obj, "color")
+        IfCondition EqualTo(color, 0) ThenBlock: { color = 14737632 }
+
+        // Create LABEL node and attach to panel
+        lbl = AK_CreateNode(ctx, AKTag.LABEL)
+        AK_Set(ctx, lbl, AKF.HEIGHT, 18)
+        AK_ExtraSet(ctx, lbl, AKExtra.STR_PTR, buf)
+        AK_ExtraSet(ctx, lbl, AKExtra.STR_LEN, tlen)
+        AK_ExtraSet(ctx, lbl, AKExtra.COLOR_FG, color)
+        AK_ExtraSet(ctx, lbl, AKExtra.TEXT_ALIGN, TRAlign.LEFT)
+        AK_AddChild(ctx, panel, lbl)
+
+        // Re-render
+        content = WinMgr_GetContent(win_id)
+        IfCondition NotEqual(content, 0) ThenBlock: {
+            cw = Win_GetCanvasW(win_id)
+            ch = Win_GetCanvasH(win_id)
+            VFont_UseSize(UIScale.font_body)
+            AK_Draw(ctx, content, cw, ch)
+        }
+        SysDisplayState.dirty = 1
+    }
+}
+
+// =============================================================================
+// HANDLE WINDOW.CLEAR — remove all children from first PANEL
+//
+// {"method":"window.clear","win_id":N}
+// =============================================================================
+Function.IPCBroker_HandleClearLines {
+    Input: ci: Integer
+    Input: obj: Address
+    Body: {
+        DebugLog_Push("ipc.cl", 6)
+        win_id = JSON.GetNumber(obj, "win_id")
+
+        IfCondition LessEqual(win_id, 0) ThenBlock: { ReturnValue(0) }
+
+        ctx = WinView_GetContentCtx(win_id)
+        IfCondition EqualTo(ctx, 0) ThenBlock: { ReturnValue(0) }
+
+        // Find first PANEL node
+        panel = IPCBroker_FindPanel(ctx)
+        IfCondition LessThan(panel, 0) ThenBlock: { ReturnValue(0) }
+
+        AK_ClearChildren(ctx, panel)
+
+        // Note: AK_Draw not called here — orphaned nodes still in tree array.
+        // Next window.addline will re-render, or caller can send addline after clear.
+        SysDisplayState.dirty = 1
+    }
+}
+
+// =============================================================================
+// HANDLE WINDOW.SETLABEL — update a specific label node by ID hash
+//
+// {"method":"window.setlabel","win_id":N,"id":"status","text":"Searching..."}
+// Uses DJB2 hash to find the node with matching id attribute.
+// =============================================================================
+Function.IPCBroker_HandleSetLabel {
+    Input: ci: Integer
+    Input: obj: Address
+    Body: {
+        DebugLog_Push("ipc.sl", 6)
+        win_id = JSON.GetNumber(obj, "win_id")
+        id_str = JSON.GetString(obj, "id")
+        text = JSON.GetString(obj, "text")
+
+        IfCondition LessEqual(win_id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(id_str, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(text, 0) ThenBlock: { ReturnValue(0) }
+
+        ctx = WinView_GetContentCtx(win_id)
+        IfCondition EqualTo(ctx, 0) ThenBlock: { ReturnValue(0) }
+
+        // Compute DJB2 hash of id string
+        id_hash = 5381
+        id_len = StringLength(id_str)
+        hi = 0
+        WhileLoop LessThan(hi, id_len) {
+            hc = GetByte(id_str, hi)
+            id_hash = Add(Multiply(id_hash, 33), hc)
+            hi = Add(hi, 1)
+        }
+
+        // Find node with matching ID_HASH
+        cnt = ctx@tree_count
+        ni = 0
+        WhileLoop LessThan(ni, cnt) {
+            nh = AK_Get(ctx, ni, AKF.ID_HASH)
+            IfCondition EqualTo(nh, id_hash) ThenBlock: {
+                // Update text
+                tlen = StringLength(text)
+                IfCondition GreaterThan(tlen, 255) ThenBlock: { tlen = 255 }
+
+                old_ptr = AK_ExtraGet(ctx, ni, AKExtra.STR_PTR)
+                IfCondition NotEqual(old_ptr, 0) ThenBlock: {
+                    Deallocate(old_ptr, 32)
+                }
+                buf = Allocate(Add(tlen, 1))
+                MemoryCopy(buf, text, tlen)
+                SetByte(buf, tlen, 0)
+
+                AK_ExtraSet(ctx, ni, AKExtra.STR_PTR, buf)
+                AK_ExtraSet(ctx, ni, AKExtra.STR_LEN, tlen)
+                AK_Set(ctx, ni, AKF.DIRTY, 1)
+
+                // Re-render
+                content = WinMgr_GetContent(win_id)
+                IfCondition NotEqual(content, 0) ThenBlock: {
+                    cw = Win_GetCanvasW(win_id)
+                    ch = Win_GetCanvasH(win_id)
+                    VFont_UseSize(UIScale.font_body)
+                    AK_Draw(ctx, content, cw, ch)
+                }
+                SysDisplayState.dirty = 1
+                ReturnValue(1)
+            }
+            ni = Add(ni, 1)
+        }
+    }
+}
+
+// =============================================================================
+// HANDLE CANVAS.ATTACH — map shared memory pixel buffer into compositor
+// =============================================================================
+Function.IPCBroker_HandleCanvasAttach {
+    Input: ci: Integer
+    Input: obj: Address
+    Body: {
+        DebugLog_Push("ipc.ca", 6)
+        win_id   = JSON.GetNumber(obj, "win_id")
+        shm_path = JSON.GetString(obj, "shm_path")
+        cw       = JSON.GetNumber(obj, "w")
+        ch       = JSON.GetNumber(obj, "h")
+
+        IfCondition LessEqual(win_id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(shm_path, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(cw, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(ch, 0) ThenBlock: { ReturnValue(0) }
+
+        // Validate ownership
+        job = WinView_GetJobPtr(win_id)
+        IfCondition NotEqual(job, Add(ci, 1)) ThenBlock: {
+            PrintMessage("[IPCBroker] canvas.attach: not owner\n")
+            ReturnValue(0)
+        }
+
+        // Clean up previous canvas if re-attaching (resize case)
+        IfCondition EqualTo(Canvas_GetActive(win_id), 1) ThenBlock: {
+            old_ptr  = Canvas_GetShmPtr(win_id)
+            old_size = Canvas_GetShmSize(win_id)
+            old_hdr  = Canvas_GetSurf(win_id)
+            IfCondition GreaterThan(old_ptr, 0) ThenBlock: {
+                SystemCall(11, old_ptr, old_size, 0, 0, 0, 0)
+            }
+            IfCondition NotEqual(old_hdr, 0) ThenBlock: {
+                Deallocate(old_hdr, 48)
+            }
+            Canvas_SetActive(win_id, 0)
+            PrintMessage("[IPCBroker] canvas.attach: cleaned up old mapping\n")
+        }
+
+        // Open shared memory file (syscall 2 = open, O_RDWR = 2)
+        fd = SystemCall(2, shm_path, 2, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] canvas.attach: open failed\n")
+            ReturnValue(0)
+        }
+
+        // mmap: syscall 9, MAP_SHARED=1, PROT_READ|PROT_WRITE=3
+        shm_size = Multiply(Multiply(cw, ch), 4)
+        ptr = SystemCall(9, 0, shm_size, 3, 1, fd, 0)
+        SystemCall(3, fd, 0, 0, 0, 0)
+
+        IfCondition LessThan(ptr, 0) ThenBlock: {
+            PrintMessage("[IPCBroker] canvas.attach: mmap failed\n")
+            ReturnValue(0)
+        }
+
+        // Create surface header pointing to shared memory
+        pitch = Multiply(cw, 4)
+        hdr = Allocate(48)
+        StoreValue(Add(hdr, SurfaceFields.FORMAT),    SurfaceFormat.PIXEL_32)
+        StoreValue(Add(hdr, SurfaceFields.WIDTH),     cw)
+        StoreValue(Add(hdr, SurfaceFields.HEIGHT),    ch)
+        StoreValue(Add(hdr, SurfaceFields.PITCH),     pitch)
+        StoreValue(Add(hdr, SurfaceFields.DATA),      ptr)
+        StoreValue(Add(hdr, SurfaceFields.DATA_SIZE), shm_size)
+
+        // Store in canvas state
+        Canvas_SetActive(win_id, 1)
+        Canvas_SetDirty(win_id, 1)
+        Canvas_SetShmPtr(win_id, ptr)
+        Canvas_SetShmSize(win_id, shm_size)
+        Canvas_SetSurf(win_id, hdr)
+
+        // Check if app requests mouse capture (sandboxed apps like Chrome)
+        mcap = JSON.GetNumber(obj, "capture_mouse")
+        Canvas_SetMouseCapture(win_id, mcap)
+
+        PrintMessage("[IPCBroker] canvas.attach: win=")
+        PrintNumber(win_id)
+        PrintMessage(" shm=")
+        PrintString(shm_path)
+        PrintMessage(" ")
+        PrintNumber(cw)
+        PrintMessage("x")
+        PrintNumber(ch)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// HANDLE CANVAS.DETACH — unmap shared memory, restore normal content
+// =============================================================================
+Function.IPCBroker_HandleCanvasDetach {
+    Input: ci: Integer
+    Input: obj: Address
+    Body: {
+        DebugLog_Push("ipc.cd", 6)
+        win_id = JSON.GetNumber(obj, "win_id")
+        IfCondition LessEqual(win_id, 0) ThenBlock: { ReturnValue(0) }
+
+        active = Canvas_GetActive(win_id)
+        IfCondition EqualTo(active, 0) ThenBlock: { ReturnValue(0) }
+
+        // munmap: syscall 11
+        shm_ptr  = Canvas_GetShmPtr(win_id)
+        shm_size = Canvas_GetShmSize(win_id)
+        IfCondition GreaterThan(shm_ptr, 0) ThenBlock: {
+            SystemCall(11, shm_ptr, shm_size, 0, 0, 0, 0)
+        }
+
+        // Free surface header (don't Deallocate DATA — it was mmap'd, not arena)
+        hdr = Canvas_GetSurf(win_id)
+        IfCondition NotEqual(hdr, 0) ThenBlock: {
+            Deallocate(hdr, 48)
+        }
+
+        // Clear state
+        Canvas_SetActive(win_id, 0)
+        Canvas_SetShmPtr(win_id, 0)
+        Canvas_SetShmSize(win_id, 0)
+        Canvas_SetSurf(win_id, 0)
+        Canvas_SetMouseCapture(win_id, 0)
+
+        PrintMessage("[IPCBroker] canvas.detach: win=")
+        PrintNumber(win_id)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// ACTION RELAY — callback for IPC-owned windows
+//
+// When a button is clicked in an IPC-owned window, this callback fires.
+// It serializes the action as JSON and sends it to the owning app.
+// =============================================================================
+Function.IPCBroker_ActionRelay {
+    Input: action_ptr: Address
+    Input: action_len: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("ipc.ar", 6)
+        win_idx = WinMgr.focused
+        IfCondition LessEqual(win_idx, 0) ThenBlock: { ReturnValue(0) }
+
+        // JOB_PTR stores ci+1 (0 means no IPC client)
+        job = WinView_GetJobPtr(win_idx)
+        IfCondition LessEqual(job, 0) ThenBlock: { ReturnValue(0) }
+        ci = Subtract(job, 1)
+
+        // Build JSON: {"method":"input.action","win_id":N,"action":"..."}
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "input.action")
+        JSON.SetNumber(req, "win_id", win_idx)
+
+        // Copy action string (it may not be null-terminated at action_len)
+        abuf = Allocate(Add(action_len, 1))
+        MemoryCopy(abuf, action_ptr, action_len)
+        SetByte(abuf, action_len, 0)
+        JSON.SetString(req, "action", abuf)
+        JSON.SetNumber(req, "action_len", action_len)
+
+        resp_str = JSON.SerializeObject(req)
+        IPCBroker_Send(ci, resp_str)
+        JSON.Free(req)
+        Deallocate(abuf, Add(action_len, 1))
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// ROUTE ACTION — called from EventRouter_Dispatch for IPC-owned windows
+// =============================================================================
+Function.IPCBroker_RouteAction {
+    Input: job: Integer
+    Input: action_ptr: Address
+    Input: action_len: Integer
+    Input: source_win: Integer
+    Body: {
+        DebugLog_Push("ipc.ra", 6)
+        ci = Subtract(job, 1)
+
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "input.action")
+        JSON.SetNumber(req, "win_id", source_win)
+
+        abuf = Allocate(Add(action_len, 1))
+        MemoryCopy(abuf, action_ptr, action_len)
+        SetByte(abuf, action_len, 0)
+        JSON.SetString(req, "action", abuf)
+        JSON.SetNumber(req, "action_len", action_len)
+
+        resp_str = JSON.SerializeObject(req)
+        IPCBroker_Send(ci, resp_str)
+        JSON.Free(req)
+        Deallocate(abuf, Add(action_len, 1))
+    }
+}
+
+// =============================================================================
+// KEY RELAY — forward hardware keyboard events to IPC apps
+//
+// Called from Win_KeyDown when the focused window is IPC-owned.
+// Sends scancode, translated ASCII char, shift state, and ctrl state.
+// =============================================================================
+Function.IPCBroker_SendKey {
+    Input: job:     Integer
+    Input: win_idx: Integer
+    Input: keycode: Integer
+    Input: ch:      Integer
+    Input: shift:   Integer
+    Input: ctrl:    Integer
+    Body: {
+        DebugLog_Push("ipc.sk", 6)
+        ci = Subtract(job, 1)
+
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "input.key")
+        JSON.SetNumber(req, "win_id", win_idx)
+        JSON.SetNumber(req, "keycode", keycode)
+        JSON.SetNumber(req, "char", ch)
+        JSON.SetNumber(req, "shift", shift)
+        JSON.SetNumber(req, "ctrl", ctrl)
+
+        resp_str = JSON.SerializeObject(req)
+        IPCBroker_Send(ci, resp_str)
+        JSON.Free(req)
+    }
+}
+
+// =============================================================================
+// MOUSE RELAY — forward mouse events to IPC apps (sandboxed canvas capture)
+//
+// Called from Win_ContentEvent when the target window is IPC-owned.
+// Sends local (content-relative) coordinates, event type, and button index.
+// Event types: 0=MOVE, 1=DOWN, 2=UP (matches AKMouseEv constants)
+// Button index: 0=left, 1=right, 2=middle (for DOWN/UP), 0 for MOVE
+// =============================================================================
+Function.IPCBroker_SendMouse {
+    Input: job:     Integer
+    Input: win_idx: Integer
+    Input: x:       Integer
+    Input: y:       Integer
+    Input: ev:      Integer
+    Input: button:  Integer
+    Body: {
+        DebugLog_Push("ipc.sm", 6)
+        ci = Subtract(job, 1)
+
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "input.mouse")
+        JSON.SetNumber(req, "win_id", win_idx)
+        JSON.SetNumber(req, "x", x)
+        JSON.SetNumber(req, "y", y)
+        JSON.SetNumber(req, "event", ev)
+        JSON.SetNumber(req, "button", button)
+
+        resp_str = JSON.SerializeObject(req)
+        IPCBroker_Send(ci, resp_str)
+        JSON.Free(req)
+    }
+}
+
+// =============================================================================
+// RECV CLIENT — read one message from client, dispatch it
+// Called only when poll() indicates data ready.
+// =============================================================================
+Function.IPCBroker_RecvClient {
+    Input: ci: Integer
+    Output: Integer
+    Body: {
+        DebugLog_Push("ipc.rc", 6)
+        fd = IPCBroker_ClientGetFd(ci)
+        IfCondition LessEqual(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        msg = Socket.RecvMsg(fd)
+        IfCondition EqualTo(msg, 0) ThenBlock: {
+            // Client disconnected
+            PrintMessage("[IPCBroker] client disconnected ci=")
+            PrintNumber(ci)
+            PrintMessage("\n")
+            IPCBroker_RemoveClient(ci)
+            ReturnValue(-1)
+        }
+
+        PrintMessage("[IPCBroker] recv ci=")
+        PrintNumber(ci)
+        PrintMessage(": ")
+        PrintMessage(msg)
+        PrintMessage("\n")
+
+        IPCBroker_HandleMsg(ci, msg)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// POLL — non-blocking poll of listen socket + all client sockets
+// Called once per frame in the main loop. Returns count of messages processed.
+// =============================================================================
+Function.IPCBroker_Poll {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(IPCBrokerState.initialized, 0) ThenBlock: { ReturnValue(0) }
+
+        pollfds = IPCBrokerState.pollfds
+        cc = IPCBrokerState.client_count
+        nfds = Add(cc, 1)
+
+        // Zero pollfds
+        pf_sz = Multiply(nfds, 8)
+        MemorySet(pollfds, 0, pf_sz)
+
+        // Entry 0: listen socket
+        listen_fd = IPCBrokerState.listen_fd
+        StoreValue(pollfds, listen_fd, "dword")
+        // events = POLLIN (1) at offset 4 (2 bytes)
+        SetByte(pollfds, 4, 1)
+
+        // Entries 1..cc: client sockets
+        ci = 0
+        WhileLoop LessThan(ci, cc) {
+            pfd_off = Multiply(Add(ci, 1), 8)
+            cfd = IPCBroker_ClientGetFd(ci)
+            StoreValue(Add(pollfds, pfd_off), cfd, "dword")
+            SetByte(Add(pollfds, pfd_off), 4, 1)
+            ci = Add(ci, 1)
+        }
+
+        // poll(pollfds, nfds, 0) — non-blocking
+        pr = SystemCall(7, pollfds, nfds, 0)
+        IfCondition LessEqual(pr, 0) ThenBlock: { ReturnValue(0) }
+
+        processed = 0
+
+        // Check listen socket for new connections (revents at offset 6)
+        rev_listen = GetByte(pollfds, 6)
+        IfCondition NotEqual(BitwiseAnd(rev_listen, 1), 0) ThenBlock: {
+            IPCBroker_AcceptClient()
+        }
+
+        // Check client sockets (only those that were polled — use cc, not live count)
+        ci = 0
+        WhileLoop LessThan(ci, cc) {
+            pfd_off = Multiply(Add(ci, 1), 8)
+            rev = GetByte(Add(pollfds, pfd_off), 6)
+
+            // POLLIN (1) — data ready
+            IfCondition NotEqual(BitwiseAnd(rev, 1), 0) ThenBlock: {
+                rr = IPCBroker_RecvClient(ci)
+                IfCondition EqualTo(rr, -1) ThenBlock: {
+                    // Client was removed, don't increment ci
+                    // (table was compacted, current ci now points to next client)
+                } ElseBlock: {
+                    processed = Add(processed, 1)
+                    ci = Add(ci, 1)
+                }
+            } ElseBlock: {
+                // POLLHUP (16) or POLLERR (8) — client gone
+                hup = BitwiseOr(BitwiseAnd(rev, 16), BitwiseAnd(rev, 8))
+                IfCondition NotEqual(hup, 0) ThenBlock: {
+                    PrintMessage("[IPCBroker] client hangup ci=")
+                    PrintNumber(ci)
+                    PrintMessage("\n")
+                    IPCBroker_RemoveClient(ci)
+                    // Don't increment — table compacted
+                } ElseBlock: {
+                    ci = Add(ci, 1)
+                }
+            }
+        }
+
+        ReturnValue(processed)
+    }
+}
+
+// =============================================================================
+// NOTIFY WINDOW CLOSED — called when a window with an IPC client is closed
+// Sends window.closed to the app so it knows to clean up.
+// =============================================================================
+Function.IPCBroker_NotifyWindowClosed {
+    Input: win_idx: Integer
+    Body: {
+        DebugLog_Push("ipc.nwc", 7)
+        job = WinView_GetJobPtr(win_idx)
+        IfCondition LessEqual(job, 0) ThenBlock: { ReturnValue(0) }
+        ci = Subtract(job, 1)
+
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "window.closed")
+        JSON.SetNumber(resp, "win_id", win_idx)
+        resp_str = JSON.SerializeObject(resp)
+        IPCBroker_Send(ci, resp_str)
+        JSON.Free(resp)
+
+        // Clear the window from client table
+        IPCBroker_ClientSetWinIdx(ci, 0)
+
+        PrintMessage("[IPCBroker] notified window.closed win=")
+        PrintNumber(win_idx)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// NOTIFY WINDOW RESIZED — tell IPC app its window got new dimensions
+// =============================================================================
+Function.IPCBroker_NotifyWindowResized {
+    Input: win_idx: Integer
+    Input: new_w:   Integer
+    Input: new_h:   Integer
+    Body: {
+        DebugLog_Push("ipc.nwr", 7)
+        job = WinView_GetJobPtr(win_idx)
+        IfCondition LessEqual(job, 0) ThenBlock: { ReturnValue(0) }
+        ci = Subtract(job, 1)
+
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "window.resized")
+        JSON.SetNumber(resp, "win_id", win_idx)
+        JSON.SetNumber(resp, "width", new_w)
+        JSON.SetNumber(resp, "height", new_h)
+        resp_str = JSON.SerializeObject(resp)
+        IPCBroker_Send(ci, resp_str)
+        JSON.Free(resp)
+
+        PrintMessage("[IPCBroker] notified window.resized win=")
+        PrintNumber(win_idx)
+        PrintMessage(" ")
+        PrintNumber(new_w)
+        PrintMessage("x")
+        PrintNumber(new_h)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// SHUTDOWN — close all connections, unlink socket
+// =============================================================================
+Function.IPCBroker_Shutdown {
+    Body: {
+        DebugLog_Push("ipc.shd", 7)
+        IfCondition EqualTo(IPCBrokerState.initialized, 0) ThenBlock: { ReturnValue(0) }
+
+        // Close all client connections
+        ci = 0
+        WhileLoop LessThan(ci, IPCBrokerState.client_count) {
+            fd = IPCBroker_ClientGetFd(ci)
+            IfCondition GreaterThan(fd, 0) ThenBlock: {
+                Socket.Close(fd)
+            }
+            ci = Add(ci, 1)
+        }
+        IPCBrokerState.client_count = 0
+
+        // Close listen socket
+        IfCondition GreaterThan(IPCBrokerState.listen_fd, 0) ThenBlock: {
+            Socket.Close(IPCBrokerState.listen_fd)
+            IPCBrokerState.listen_fd = -1
+        }
+
+        // Unlink socket file
+        SystemCall(87, IPCBrokerState.sock_path, 0, 0)
+
+        IPCBrokerState.initialized = 0
+        PrintMessage("[IPCBroker] shutdown\n")
+    }
+}
