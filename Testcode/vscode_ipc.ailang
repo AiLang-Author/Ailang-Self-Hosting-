@@ -1,0 +1,1200 @@
+// vscode_ipc.ailang
+// Sandboxed VS Code — runs VS Code inside Xvfb, reads framebuffer
+// directly via mmap of /tmp/Xvfb_screen0 (xwd format), streams BGRA pixels
+// through ShmCanvas to the display server. Same architecture as Chrome IPC.
+//
+// Architecture:
+//   Manages 3 child processes:
+//     1. Xvfb :98 -screen 0 WxHx24 -ac -fbdir /tmp  (virtual X server)
+//     2. code --display=:98 ...                        (VS Code, isolated)
+//     3. xdotool - (persistent pipe)                   (input forwarding)
+//
+//   Frame loop (direct mmap — no pipe, no encoding):
+//     - Xvfb writes pixels to /tmp/Xvfb_screen0 (mmap'd shared file)
+//     - This app mmaps the same file read-only
+//     - Each tick: MemoryCopy from xvfb mmap (offset 3232) to shm canvas
+//     - ShmCanvas_Present() -> server blits
+//
+//   Input forwarding (persistent pipe — no fork/exec per event):
+//     - input.key -> write "key <keysym>\n" to xdotool stdin pipe
+//     - input.mouse -> write "mousemove/mousedown/mouseup\n" to pipe
+//     - input.action -> toolbar close
+//
+// Prerequisites: sudo apt install xvfb xdotool code
+//
+// Build: ./ailang.x Testcode/vscode_ipc.ailang vscode_ipc.x
+// Run:   ./vscode_ipc.x  (after SysDisplay.x is running)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.HashMap
+LibraryImport.ShmCanvas
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.VSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_FSTAT":     Initialize=5
+    "SYS_MMAP":      Initialize=9
+    "SYS_MUNMAP":    Initialize=11
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_KILL":      Initialize=62
+    "SYS_WAIT4":     Initialize=61
+    "SYS_FCNTL":     Initialize=72
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_UNLINK":    Initialize=87
+    "SYS_SETSID":    Initialize=112
+}
+
+FixedPool.VMmap {
+    "O_RDONLY":    Initialize=0
+    "PROT_READ":   Initialize=1
+    "MAP_SHARED":  Initialize=1
+}
+
+FixedPool.VFcntl {
+    "F_GETFL":    Initialize=3
+    "F_SETFL":    Initialize=4
+    "O_NONBLOCK": Initialize=2048
+}
+
+FixedPool.VSig {
+    "SIGTERM":  Initialize=15
+    "SIGSTOP":  Initialize=19
+    "SIGCONT":  Initialize=18
+    "WNOHANG":  Initialize=1
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.VscState {
+    "running":      Initialize=1
+    "win_id":       Initialize=0
+    "sock":         Initialize=0
+    "canvas_w":     Initialize=1024
+    "canvas_h":     Initialize=700
+    "xvfb_pid":     Initialize=0
+    "vscode_pid":   Initialize=0
+    "xdotool_pid":  Initialize=0
+    "xdotool_wr":   Initialize=-1
+    "frame_size":   Initialize=0
+    "display_num":  Initialize=98
+    "capturing":    Initialize=0
+    "mouse_skip":   Initialize=0
+    "pending_mx":   Initialize=0
+    "pending_my":   Initialize=0
+    "mouse_dirty":  Initialize=0
+    "cmd_buf":      Initialize=0
+    "xvfb_fb_ptr":  Initialize=0
+    "xvfb_fb_fd":   Initialize=-1
+    "xvfb_fb_size": Initialize=0
+}
+
+// XWD header: 160 byte header + 256 colors * 12 bytes = 3232 byte pixel offset
+FixedPool.VXvfbConst {
+    "PIXEL_OFFSET": Initialize=3232
+    "SYS_MKDIR":    Initialize=83
+    "DIR_MODE":     Initialize=493
+}
+
+// =============================================================================
+// NUM TO STRING
+// =============================================================================
+Function.Vsc_NumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// BUILD XVFB SIZE — "WxHx24"
+// =============================================================================
+Function.Vsc_BuildXvfbSize {
+    Output: Integer
+    Body: {
+        buf = Allocate(32)
+        w_tmp = Allocate(12)
+        h_tmp = Allocate(12)
+        wlen = Vsc_NumToStr(VscState.canvas_w, w_tmp)
+        hlen = Vsc_NumToStr(VscState.canvas_h, h_tmp)
+        off = 0
+        MemoryCopy(buf, w_tmp, wlen)
+        off = wlen
+        SetByte(buf, off, 120)
+        off = Add(off, 1)
+        MemoryCopy(Add(buf, off), h_tmp, hlen)
+        off = Add(off, hlen)
+        SetByte(buf, off, 120)
+        SetByte(buf, Add(off, 1), 50)
+        SetByte(buf, Add(off, 2), 52)
+        off = Add(off, 3)
+        SetByte(buf, off, 0)
+        Deallocate(w_tmp, 12)
+        Deallocate(h_tmp, 12)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// BUILD DISPLAY STRING — ":98"
+// =============================================================================
+Function.Vsc_BuildDisplayStr {
+    Output: Integer
+    Body: {
+        buf = Allocate(8)
+        SetByte(buf, 0, 58)
+        nbuf = Allocate(8)
+        nlen = Vsc_NumToStr(VscState.display_num, nbuf)
+        MemoryCopy(Add(buf, 1), nbuf, nlen)
+        SetByte(buf, Add(1, nlen), 0)
+        Deallocate(nbuf, 8)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// SHELL HELPER — fork/exec /bin/sh -c "<cmd>". Waits for completion.
+// =============================================================================
+Function.Vsc_ShellExec {
+    Input: cmd: Address
+    Body: {
+        pid = SystemCall(VSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            argv = Allocate(32)
+            StoreValue(Add(argv, 0), "/bin/sh")
+            StoreValue(Add(argv, 8), "-c")
+            StoreValue(Add(argv, 16), cmd)
+            StoreValue(Add(argv, 24), 0)
+            SystemCall(VSys.SYS_EXECVE, "/bin/sh", argv, 0)
+            SystemCall(VSys.SYS_EXIT, 0)
+        }
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            status = Allocate(8)
+            SystemCall(VSys.SYS_WAIT4, pid, status, 0, 0, 0, 0)
+            Deallocate(status, 8)
+        }
+    }
+}
+
+// =============================================================================
+// CLEANUP STALE — kill orphaned Xvfb/code/xdotool from prior crash
+// Uses display :98 to avoid colliding with Chrome on :99
+// =============================================================================
+Function.Vsc_CleanupStale {
+    Body: {
+        PrintMessage("[VSCode] Killing orphaned processes...\n")
+
+        // Kill orphaned VS Code electron processes + Xvfb on :98 + xdotool
+        // Use --unity-launch to identify our VS Code instances
+        Vsc_ShellExec("pkill -9 -f 'code.*--display=:98' 2>/dev/null; pkill -9 -f 'Xvfb :98' 2>/dev/null; pkill -9 -f 'xdotool.*DISPLAY=:98' 2>/dev/null")
+
+        // Wait 200ms for processes to die
+        ts = Allocate(16)
+        StoreValue(ts, 0)
+        StoreValue(Add(ts, 8), 200000000)
+        SystemCall(VSys.SYS_NANOSLEEP, ts, 0)
+
+        // Second pass
+        Vsc_ShellExec("pkill -9 -f 'code.*--display=:98' 2>/dev/null; pkill -9 -f 'Xvfb :98' 2>/dev/null")
+
+        StoreValue(Add(ts, 8), 100000000)
+        SystemCall(VSys.SYS_NANOSLEEP, ts, 0)
+        Deallocate(ts, 16)
+
+        // Remove stale lock/socket/framebuffer files for display :98
+        SystemCall(VSys.SYS_UNLINK, "/tmp/.X98-lock", 0, 0, 0, 0)
+        SystemCall(VSys.SYS_UNLINK, "/tmp/.X11-unix/X98", 0, 0, 0, 0)
+        SystemCall(VSys.SYS_UNLINK, "/tmp/vscode_fb/Xvfb_screen0", 0, 0, 0, 0)
+
+        PrintMessage("[VSCode] Cleaned up stale processes and files\n")
+    }
+}
+
+// =============================================================================
+// LAUNCH XVFB — fork/exec Xvfb :98 -screen 0 WxHx24 -ac -fbdir /tmp
+// =============================================================================
+Function.Vsc_LaunchXvfb {
+    Output: Integer
+    Body: {
+        disp_str = Vsc_BuildDisplayStr()
+        size_str = Vsc_BuildXvfbSize()
+
+        pid = SystemCall(VSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[VSCode] Xvfb fork failed\n")
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Ensure /tmp/vscode_fb/ exists (separate from Chrome's /tmp/)
+            SystemCall(VXvfbConst.SYS_MKDIR, "/tmp/vscode_fb", VXvfbConst.DIR_MODE)
+
+            argv = Allocate(72)
+            StoreValue(Add(argv, 0),  "/usr/bin/Xvfb")
+            StoreValue(Add(argv, 8),  disp_str)
+            StoreValue(Add(argv, 16), "-screen")
+            StoreValue(Add(argv, 24), "0")
+            StoreValue(Add(argv, 32), size_str)
+            StoreValue(Add(argv, 40), "-ac")
+            StoreValue(Add(argv, 48), "-fbdir")
+            StoreValue(Add(argv, 56), "/tmp/vscode_fb")
+            StoreValue(Add(argv, 64), 0)
+
+            SystemCall(VSys.SYS_EXECVE, "/usr/bin/Xvfb", argv, 0)
+            PrintMessage("[VSCode] Xvfb execve failed\n")
+            SystemCall(VSys.SYS_EXIT, 1)
+        }
+
+        VscState.xvfb_pid = pid
+        PrintMessage("[VSCode] Xvfb launched pid=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// LAUNCH VS CODE — fork/exec code with Xvfb display
+// =============================================================================
+Function.Vsc_LaunchApp {
+    Output: Integer
+    Body: {
+        disp_str = Vsc_BuildDisplayStr()
+        dsl = StringLength(disp_str)
+
+        pid = SystemCall(VSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[VSCode] code fork failed\n")
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(VSys.SYS_SETSID)
+
+            // 10 args + null = 11 * 8 = 88
+            argv = Allocate(88)
+            StoreValue(Add(argv, 0),  "/usr/bin/code")
+            StoreValue(Add(argv, 8),  "--no-sandbox")
+            StoreValue(Add(argv, 16), "--disable-gpu")
+            StoreValue(Add(argv, 24), "--disable-workspace-trust")
+            StoreValue(Add(argv, 32), "--skip-release-notes")
+            StoreValue(Add(argv, 40), "--skip-welcome")
+            StoreValue(Add(argv, 48), "--disable-telemetry")
+            StoreValue(Add(argv, 56), "--disable-updates")
+            StoreValue(Add(argv, 64), "--unity-launch")
+            StoreValue(Add(argv, 72), "/home/bob/Ailang-Self-Hosting-")
+            StoreValue(Add(argv, 80), 0)
+
+            // envp: DISPLAY=:98 HOME PATH LANG
+            envp = Allocate(48)
+            denv = Allocate(24)
+            MemoryCopy(denv, "DISPLAY=", 8)
+            MemoryCopy(Add(denv, 8), disp_str, Add(dsl, 1))
+            StoreValue(Add(envp, 0),  denv)
+            StoreValue(Add(envp, 8),  "HOME=/home/bob")
+            StoreValue(Add(envp, 16), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            StoreValue(Add(envp, 24), "LANG=en_US.UTF-8")
+            StoreValue(Add(envp, 32), "ELECTRON_RUN_AS_NODE=")
+            StoreValue(Add(envp, 40), 0)
+
+            SystemCall(VSys.SYS_EXECVE, "/usr/bin/code", argv, envp)
+            PrintMessage("[VSCode] code execve failed\n")
+            SystemCall(VSys.SYS_EXIT, 1)
+        }
+
+        VscState.vscode_pid = pid
+        PrintMessage("[VSCode] VS Code launched pid=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// MMAP XVFB FRAMEBUFFER
+// =============================================================================
+Function.Vsc_MmapFB {
+    Output: Integer
+    Body: {
+        fd = SystemCall(VSys.SYS_OPEN, "/tmp/vscode_fb/Xvfb_screen0", VMmap.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[VSCode] Failed to open /tmp/Xvfb_screen0\n")
+            ReturnValue(-1)
+        }
+
+        fsize = VscState.frame_size
+        total = Add(VXvfbConst.PIXEL_OFFSET, fsize)
+
+        ptr = SystemCall(VSys.SYS_MMAP, 0, total, VMmap.PROT_READ, VMmap.MAP_SHARED, fd, 0)
+        IfCondition LessThan(ptr, 0) ThenBlock: {
+            PrintMessage("[VSCode] mmap failed\n")
+            SystemCall(VSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        VscState.xvfb_fb_ptr  = ptr
+        VscState.xvfb_fb_fd   = fd
+        VscState.xvfb_fb_size = total
+        VscState.capturing    = 1
+
+        PrintMessage("[VSCode] mmap'd Xvfb framebuffer: ptr=")
+        PrintNumber(ptr)
+        PrintMessage(" size=")
+        PrintNumber(total)
+        PrintMessage("\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// COPY FRAME — memcpy from mmap'd Xvfb FB to shm canvas
+// =============================================================================
+Function.Vsc_CopyFrame {
+    Output: Integer
+    Body: {
+        src = VscState.xvfb_fb_ptr
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(-1) }
+
+        dst = ShmCanvasState.buf
+        IfCondition EqualTo(dst, 0) ThenBlock: { ReturnValue(-1) }
+
+        fsize = VscState.frame_size
+        MemoryCopy(dst, Add(src, VXvfbConst.PIXEL_OFFSET), fsize)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// KILL PROCESS HELPER
+// =============================================================================
+Function.Vsc_KillChild {
+    Input: pid: Integer
+    Body: {
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            SystemCall(VSys.SYS_KILL, pid, VSig.SIGTERM, 0, 0, 0)
+            status = Allocate(8)
+            SystemCall(VSys.SYS_WAIT4, pid, status, VSig.WNOHANG, 0, 0, 0)
+            Deallocate(status, 8)
+        }
+    }
+}
+
+// =============================================================================
+// STOP ALL — kill xdotool, vscode, xvfb in reverse order
+// =============================================================================
+Function.Vsc_StopAll {
+    Body: {
+        xdt_wr = VscState.xdotool_wr
+        IfCondition GreaterEqual(xdt_wr, 0) ThenBlock: {
+            SystemCall(VSys.SYS_CLOSE, xdt_wr, 0, 0, 0, 0)
+            VscState.xdotool_wr = -1
+        }
+        IfCondition GreaterThan(VscState.xdotool_pid, 0) ThenBlock: {
+            Vsc_KillChild(VscState.xdotool_pid)
+            PrintMessage("[VSCode] xdotool stopped\n")
+            VscState.xdotool_pid = 0
+        }
+
+        IfCondition GreaterThan(VscState.vscode_pid, 0) ThenBlock: {
+            Vsc_KillChild(VscState.vscode_pid)
+            PrintMessage("[VSCode] VS Code stopped\n")
+            VscState.vscode_pid = 0
+        }
+
+        // Unmap Xvfb framebuffer before killing Xvfb
+        IfCondition GreaterThan(VscState.xvfb_fb_ptr, 0) ThenBlock: {
+            SystemCall(VSys.SYS_MUNMAP, VscState.xvfb_fb_ptr, VscState.xvfb_fb_size)
+            VscState.xvfb_fb_ptr = 0
+        }
+        IfCondition GreaterEqual(VscState.xvfb_fb_fd, 0) ThenBlock: {
+            SystemCall(VSys.SYS_CLOSE, VscState.xvfb_fb_fd, 0, 0, 0, 0)
+            VscState.xvfb_fb_fd = -1
+        }
+
+        IfCondition GreaterThan(VscState.xvfb_pid, 0) ThenBlock: {
+            Vsc_KillChild(VscState.xvfb_pid)
+            PrintMessage("[VSCode] Xvfb stopped\n")
+            VscState.xvfb_pid = 0
+        }
+
+        // Sweep orphaned electron/code processes
+        Vsc_ShellExec("pkill -9 -f 'code.*--display=:98' 2>/dev/null")
+
+        // Clean up files
+        SystemCall(VSys.SYS_UNLINK, "/tmp/.X98-lock", 0, 0, 0, 0)
+        SystemCall(VSys.SYS_UNLINK, "/tmp/.X11-unix/X98", 0, 0, 0, 0)
+        SystemCall(VSys.SYS_UNLINK, "/tmp/vscode_fb/Xvfb_screen0", 0, 0, 0, 0)
+
+        VscState.capturing = 0
+        PrintMessage("[VSCode] All processes stopped, files cleaned\n")
+    }
+}
+
+// =============================================================================
+// LAUNCH XDOTOOL — persistent pipe for input forwarding
+// =============================================================================
+Function.Vsc_LaunchXdotool {
+    Output: Integer
+    Body: {
+        disp_str = Vsc_BuildDisplayStr()
+        dsl = StringLength(disp_str)
+
+        pipefds = Allocate(8)
+        pr = SystemCall(VSys.SYS_PIPE, pipefds, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            PrintMessage("[VSCode] xdotool pipe() failed\n")
+            Deallocate(pipefds, 8)
+            ReturnValue(-1)
+        }
+        xdt_read  = Dereference(pipefds, "dword")
+        xdt_write = Dereference(Add(pipefds, 4), "dword")
+        Deallocate(pipefds, 8)
+
+        pid = SystemCall(VSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[VSCode] xdotool fork failed\n")
+            SystemCall(VSys.SYS_CLOSE, xdt_read, 0, 0, 0, 0)
+            SystemCall(VSys.SYS_CLOSE, xdt_write, 0, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(VSys.SYS_CLOSE, xdt_write, 0, 0, 0, 0)
+            SystemCall(VSys.SYS_DUP2, xdt_read, 0, 0, 0, 0)
+            SystemCall(VSys.SYS_CLOSE, xdt_read, 0, 0, 0, 0)
+
+            argv = Allocate(24)
+            StoreValue(Add(argv, 0), "/usr/bin/xdotool")
+            StoreValue(Add(argv, 8), "-")
+            StoreValue(Add(argv, 16), 0)
+
+            denv = Allocate(24)
+            MemoryCopy(denv, "DISPLAY=", 8)
+            MemoryCopy(Add(denv, 8), disp_str, Add(dsl, 1))
+            envp = Allocate(16)
+            StoreValue(Add(envp, 0), denv)
+            StoreValue(Add(envp, 8), 0)
+
+            SystemCall(VSys.SYS_EXECVE, "/usr/bin/xdotool", argv, envp)
+            SystemCall(VSys.SYS_EXIT, 1)
+        }
+
+        SystemCall(VSys.SYS_CLOSE, xdt_read, 0, 0, 0, 0)
+        VscState.xdotool_pid = pid
+        VscState.xdotool_wr  = xdt_write
+
+        PrintMessage("[VSCode] xdotool pipe launched pid=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// LAUNCH ALL — Xvfb → wait → VS Code → wait → xdotool → mmap
+// =============================================================================
+Function.Vsc_LaunchAll {
+    Body: {
+        ts_wait = Allocate(16)
+
+        // 1. Launch Xvfb
+        xr = Vsc_LaunchXvfb()
+        IfCondition LessThan(xr, 0) ThenBlock: {
+            PrintMessage("[VSCode] Xvfb fork failed\n")
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        // 2. Wait 500ms
+        StoreValue(ts_wait, 0)
+        StoreValue(Add(ts_wait, 8), 500000000)
+        SystemCall(VSys.SYS_NANOSLEEP, ts_wait, 0)
+
+        // Check Xvfb alive
+        xcheck = Allocate(8)
+        xw = SystemCall(VSys.SYS_WAIT4, VscState.xvfb_pid, xcheck, VSig.WNOHANG, 0, 0, 0)
+        Deallocate(xcheck, 8)
+        IfCondition EqualTo(xw, VscState.xvfb_pid) ThenBlock: {
+            PrintMessage("[VSCode] Xvfb exited immediately\n")
+            VscState.xvfb_pid = 0
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        // 3. Launch VS Code
+        cr = Vsc_LaunchApp()
+        IfCondition LessThan(cr, 0) ThenBlock: {
+            PrintMessage("[VSCode] code fork failed\n")
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        // 4. Wait 3s for VS Code to render (Electron apps take longer)
+        StoreValue(ts_wait, 3)
+        StoreValue(Add(ts_wait, 8), 0)
+        SystemCall(VSys.SYS_NANOSLEEP, ts_wait, 0)
+        PrintMessage("[VSCode] VS Code startup wait complete\n")
+
+        // Check if VS Code already died
+        ccheck = Allocate(8)
+        cw = SystemCall(VSys.SYS_WAIT4, VscState.vscode_pid, ccheck, VSig.WNOHANG, 0, 0, 0)
+        Deallocate(ccheck, 8)
+        IfCondition EqualTo(cw, VscState.vscode_pid) ThenBlock: {
+            PrintMessage("[VSCode] VS Code exited immediately — is code installed?\n")
+            VscState.vscode_pid = 0
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        // 5. Launch xdotool
+        xr2 = Vsc_LaunchXdotool()
+        IfCondition LessThan(xr2, 0) ThenBlock: {
+            PrintMessage("[VSCode] xdotool launch failed — input forwarding disabled\n")
+        }
+
+        // 6. Mmap Xvfb framebuffer
+        VscState.frame_size = Multiply(Multiply(VscState.canvas_w, VscState.canvas_h), 4)
+        mr = Vsc_MmapFB()
+        IfCondition LessThan(mr, 0) ThenBlock: {
+            PrintMessage("[VSCode] Failed to mmap Xvfb framebuffer\n")
+            Deallocate(ts_wait, 16)
+            ReturnValue(0)
+        }
+
+        Deallocate(ts_wait, 16)
+        PrintMessage("[VSCode] All processes running + framebuffer mapped\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// XDOTOOL WRITE HELPERS
+// =============================================================================
+Function.Vsc_XdotoolKey {
+    Input: keysym: Address
+    Body: {
+        buf = VscState.cmd_buf
+        MemoryCopy(buf, "key ", 4)
+        klen = StringLength(keysym)
+        MemoryCopy(Add(buf, 4), keysym, klen)
+        SetByte(buf, Add(4, klen), 10)
+        wr = VscState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(VSys.SYS_WRITE, wr, buf, Add(5, klen), 0, 0)
+    }
+}
+
+Function.Vsc_XdotoolType {
+    Input: ch: Integer
+    Body: {
+        buf = VscState.cmd_buf
+        MemoryCopy(buf, "type ", 5)
+        SetByte(buf, 5, ch)
+        SetByte(buf, 6, 10)
+        wr = VscState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(VSys.SYS_WRITE, wr, buf, 7, 0, 0)
+    }
+}
+
+Function.Vsc_XdotoolMouseMove {
+    Input: mx: Integer
+    Input: my: Integer
+    Body: {
+        buf = VscState.cmd_buf
+        MemoryCopy(buf, "mousemove ", 10)
+        xbuf = Allocate(12)
+        ybuf = Allocate(12)
+        xlen = Vsc_NumToStr(mx, xbuf)
+        ylen = Vsc_NumToStr(my, ybuf)
+        off = 10
+        MemoryCopy(Add(buf, off), xbuf, xlen)
+        off = Add(off, xlen)
+        SetByte(buf, off, 32)
+        off = Add(off, 1)
+        MemoryCopy(Add(buf, off), ybuf, ylen)
+        off = Add(off, ylen)
+        SetByte(buf, off, 10)
+        off = Add(off, 1)
+        Deallocate(xbuf, 12)
+        Deallocate(ybuf, 12)
+        wr = VscState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(VSys.SYS_WRITE, wr, buf, off, 0, 0)
+    }
+}
+
+Function.Vsc_XdotoolMouseDown {
+    Input: button: Integer
+    Body: {
+        xbtn = 1
+        IfCondition EqualTo(button, 1) ThenBlock: { xbtn = 3 }
+        IfCondition EqualTo(button, 2) ThenBlock: { xbtn = 2 }
+        buf = VscState.cmd_buf
+        MemoryCopy(buf, "mousedown ", 10)
+        SetByte(buf, 10, Add(48, xbtn))
+        SetByte(buf, 11, 10)
+        wr = VscState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(VSys.SYS_WRITE, wr, buf, 12, 0, 0)
+    }
+}
+
+Function.Vsc_XdotoolMouseUp {
+    Input: button: Integer
+    Body: {
+        xbtn = 1
+        IfCondition EqualTo(button, 1) ThenBlock: { xbtn = 3 }
+        IfCondition EqualTo(button, 2) ThenBlock: { xbtn = 2 }
+        buf = VscState.cmd_buf
+        MemoryCopy(buf, "mouseup ", 8)
+        SetByte(buf, 8, Add(48, xbtn))
+        SetByte(buf, 9, 10)
+        wr = VscState.xdotool_wr
+        IfCondition LessThan(wr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(VSys.SYS_WRITE, wr, buf, 10, 0, 0)
+    }
+}
+
+// =============================================================================
+// HANDLE MOUSE
+// =============================================================================
+Function.Vsc_HandleMouse {
+    Input: mx: Integer
+    Input: my: Integer
+    Input: ev: Integer
+    Input: button: Integer
+    Body: {
+        IfCondition EqualTo(VscState.vscode_pid, 0) ThenBlock: { ReturnValue(0) }
+
+        // MOVE — defer
+        IfCondition EqualTo(ev, 0) ThenBlock: {
+            VscState.pending_mx = mx
+            VscState.pending_my = my
+            VscState.mouse_dirty = 1
+            ReturnValue(0)
+        }
+
+        // DOWN
+        IfCondition EqualTo(ev, 1) ThenBlock: {
+            Vsc_XdotoolMouseMove(mx, my)
+            VscState.mouse_dirty = 0
+            Vsc_XdotoolMouseDown(button)
+            ReturnValue(0)
+        }
+
+        // UP
+        IfCondition EqualTo(ev, 2) ThenBlock: {
+            Vsc_XdotoolMouseUp(button)
+            ReturnValue(0)
+        }
+    }
+}
+
+// =============================================================================
+// FLUSH MOUSE — one coalesced mousemove per tick
+// =============================================================================
+Function.Vsc_FlushMouse {
+    Body: {
+        IfCondition EqualTo(VscState.mouse_dirty, 1) ThenBlock: {
+            Vsc_XdotoolMouseMove(VscState.pending_mx, VscState.pending_my)
+            VscState.mouse_dirty = 0
+        }
+    }
+}
+
+// =============================================================================
+// HANDLE KEY
+// =============================================================================
+Function.Vsc_HandleKey {
+    Input: keycode: Integer
+    Input: ch: Integer
+    Input: shift: Integer
+    Input: ctrl: Integer
+    Body: {
+        IfCondition EqualTo(VscState.vscode_pid, 0) ThenBlock: { ReturnValue(0) }
+
+        // Ctrl combos
+        IfCondition EqualTo(ctrl, 1) ThenBlock: {
+            // Ctrl+S (31) — save
+            IfCondition EqualTo(keycode, 31) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+s")
+                ReturnValue(0)
+            }
+            // Ctrl+P (25) — quick open
+            IfCondition EqualTo(keycode, 25) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+p")
+                ReturnValue(0)
+            }
+            // Ctrl+Shift+P — command palette
+            IfCondition And(EqualTo(keycode, 25), EqualTo(shift, 1)) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+shift+p")
+                ReturnValue(0)
+            }
+            // Ctrl+N (49) — new file
+            IfCondition EqualTo(keycode, 49) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+n")
+                ReturnValue(0)
+            }
+            // Ctrl+W (17) — close tab
+            IfCondition EqualTo(keycode, 17) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+w")
+                ReturnValue(0)
+            }
+            // Ctrl+Z (44) — undo
+            IfCondition EqualTo(keycode, 44) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+z")
+                ReturnValue(0)
+            }
+            // Ctrl+Y (21) — redo
+            IfCondition EqualTo(keycode, 21) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+y")
+                ReturnValue(0)
+            }
+            // Ctrl+C (46) — copy
+            IfCondition EqualTo(keycode, 46) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+c")
+                ReturnValue(0)
+            }
+            // Ctrl+V (47) — paste
+            IfCondition EqualTo(keycode, 47) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+v")
+                ReturnValue(0)
+            }
+            // Ctrl+X (45) — cut
+            IfCondition EqualTo(keycode, 45) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+x")
+                ReturnValue(0)
+            }
+            // Ctrl+F (33) — find
+            IfCondition EqualTo(keycode, 33) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+f")
+                ReturnValue(0)
+            }
+            // Ctrl+G (34) — go to line
+            IfCondition EqualTo(keycode, 34) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+g")
+                ReturnValue(0)
+            }
+            // Ctrl+B (48) — toggle sidebar
+            IfCondition EqualTo(keycode, 48) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+b")
+                ReturnValue(0)
+            }
+            // Ctrl+` (41) — toggle terminal
+            IfCondition EqualTo(keycode, 41) ThenBlock: {
+                Vsc_XdotoolKey("ctrl+grave")
+                ReturnValue(0)
+            }
+            ReturnValue(0)
+        }
+
+        // Arrow keys
+        IfCondition EqualTo(keycode, 103) ThenBlock: {
+            Vsc_XdotoolKey("Up")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(keycode, 108) ThenBlock: {
+            Vsc_XdotoolKey("Down")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(keycode, 105) ThenBlock: {
+            Vsc_XdotoolKey("Left")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(keycode, 106) ThenBlock: {
+            Vsc_XdotoolKey("Right")
+            ReturnValue(0)
+        }
+
+        // Enter
+        IfCondition EqualTo(keycode, 28) ThenBlock: {
+            Vsc_XdotoolKey("Return")
+            ReturnValue(0)
+        }
+
+        // Backspace
+        IfCondition EqualTo(keycode, 14) ThenBlock: {
+            Vsc_XdotoolKey("BackSpace")
+            ReturnValue(0)
+        }
+
+        // Tab
+        IfCondition EqualTo(keycode, 15) ThenBlock: {
+            Vsc_XdotoolKey("Tab")
+            ReturnValue(0)
+        }
+
+        // Escape
+        IfCondition EqualTo(keycode, 1) ThenBlock: {
+            Vsc_XdotoolKey("Escape")
+            ReturnValue(0)
+        }
+
+        // Space
+        IfCondition EqualTo(keycode, 57) ThenBlock: {
+            Vsc_XdotoolKey("space")
+            ReturnValue(0)
+        }
+
+        // Delete
+        IfCondition EqualTo(keycode, 111) ThenBlock: {
+            Vsc_XdotoolKey("Delete")
+            ReturnValue(0)
+        }
+
+        // Home
+        IfCondition EqualTo(keycode, 102) ThenBlock: {
+            Vsc_XdotoolKey("Home")
+            ReturnValue(0)
+        }
+
+        // End
+        IfCondition EqualTo(keycode, 107) ThenBlock: {
+            Vsc_XdotoolKey("End")
+            ReturnValue(0)
+        }
+
+        // PageUp
+        IfCondition EqualTo(keycode, 104) ThenBlock: {
+            Vsc_XdotoolKey("Page_Up")
+            ReturnValue(0)
+        }
+
+        // PageDown
+        IfCondition EqualTo(keycode, 109) ThenBlock: {
+            Vsc_XdotoolKey("Page_Down")
+            ReturnValue(0)
+        }
+
+        // F1 (59) — help
+        IfCondition EqualTo(keycode, 59) ThenBlock: {
+            Vsc_XdotoolKey("F1")
+            ReturnValue(0)
+        }
+
+        // Printable character
+        IfCondition And(GreaterEqual(ch, 32), LessEqual(ch, 126)) ThenBlock: {
+            Vsc_XdotoolType(ch)
+            ReturnValue(0)
+        }
+    }
+}
+
+// =============================================================================
+// HANDLE RESIZE
+// =============================================================================
+Function.Vsc_HandleResize {
+    Input: sock: Integer
+    Input: new_w: Integer
+    Input: new_h: Integer
+    Body: {
+        IfCondition LessEqual(new_w, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(new_h, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition And(EqualTo(new_w, VscState.canvas_w), EqualTo(new_h, VscState.canvas_h)) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        PrintMessage("[VSCode] Resize: ")
+        PrintNumber(VscState.canvas_w)
+        PrintMessage("x")
+        PrintNumber(VscState.canvas_h)
+        PrintMessage(" -> ")
+        PrintNumber(new_w)
+        PrintMessage("x")
+        PrintNumber(new_h)
+        PrintMessage("\n")
+
+        Vsc_StopAll()
+        ShmCanvas_Destroy(VscState.win_id)
+
+        VscState.canvas_w = new_w
+        VscState.canvas_h = new_h
+
+        wid = VscState.win_id
+        buf = ShmCanvas_Create(wid, new_w, new_h)
+        IfCondition EqualTo(buf, 0) ThenBlock: {
+            PrintMessage("[VSCode] ShmCanvas_Create failed after resize\n")
+            ReturnValue(0)
+        }
+
+        ShmCanvas_AttachCapture(sock, wid, new_w, new_h)
+        ShmCanvas_Clear(4280427042)
+        ShmCanvas_Present(sock, wid)
+
+        Vsc_LaunchAll()
+    }
+}
+
+// =============================================================================
+// CHECK CHILDREN
+// =============================================================================
+Function.Vsc_CheckChildren {
+    Body: {
+        status = Allocate(8)
+
+        reap_pass = 0
+        WhileLoop LessThan(reap_pass, 3) {
+            wr = SystemCall(VSys.SYS_WAIT4, -1, status, VSig.WNOHANG, 0, 0, 0)
+            IfCondition LessEqual(wr, 0) ThenBlock: {
+                reap_pass = 3
+            } ElseBlock: {
+                IfCondition EqualTo(wr, VscState.xvfb_pid) ThenBlock: {
+                    PrintMessage("[VSCode] Xvfb exited — display lost\n")
+                    VscState.xvfb_pid = 0
+                    VscState.capturing = 0
+                }
+                IfCondition EqualTo(wr, VscState.vscode_pid) ThenBlock: {
+                    PrintMessage("[VSCode] VS Code exited\n")
+                    VscState.vscode_pid = 0
+                }
+                IfCondition EqualTo(wr, VscState.xdotool_pid) ThenBlock: {
+                    PrintMessage("[VSCode] xdotool exited — input disabled\n")
+                    VscState.xdotool_pid = 0
+                    VscState.xdotool_wr = -1
+                }
+            }
+            reap_pass = Add(reap_pass, 1)
+        }
+
+        Deallocate(status, 8)
+    }
+}
+
+// =============================================================================
+// POLL IPC MESSAGES
+// =============================================================================
+Function.Vsc_PollMessages {
+    Input: sock: Integer
+    Body: {
+        poll_pass = 0
+        WhileLoop LessThan(poll_pass, 32) {
+            msg = Socket.RecvMsg(sock)
+            IfCondition EqualTo(msg, 0) ThenBlock: {
+                poll_pass = 32
+            } ElseBlock: {
+                pmsg = ParseJSON(msg)
+                IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                    mobj = JSON.AsObject(pmsg)
+                    method = JSON.GetString(mobj, "method")
+                    IfCondition NotEqual(method, 0) ThenBlock: {
+
+                        cmp = StringCompare(method, "window.closed")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            PrintMessage("[VSCode] Window closed\n")
+                            Vsc_StopAll()
+                            VscState.running = 0
+                            poll_pass = 32
+                        }
+
+                        cmp = StringCompare(method, "input.key")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            kc = JSON.GetNumber(mobj, "keycode")
+                            kch = JSON.GetNumber(mobj, "char")
+                            ksh = JSON.GetNumber(mobj, "shift")
+                            kct = JSON.GetNumber(mobj, "ctrl")
+                            Vsc_HandleKey(kc, kch, ksh, kct)
+                        }
+
+                        cmp = StringCompare(method, "input.mouse")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            mmx = JSON.GetNumber(mobj, "x")
+                            mmy = JSON.GetNumber(mobj, "y")
+                            mev = JSON.GetNumber(mobj, "event")
+                            mbtn = JSON.GetNumber(mobj, "button")
+                            Vsc_HandleMouse(mmx, mmy, mev, mbtn)
+                        }
+
+                        cmp = StringCompare(method, "input.action")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            // No custom actions — toolbar close handled by display server
+                        }
+
+                        cmp = StringCompare(method, "window.resized")
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            rw = JSON.GetNumber(mobj, "width")
+                            rh = JSON.GetNumber(mobj, "height")
+                            Vsc_HandleResize(sock, rw, rh)
+                        }
+                    }
+                    JSON.Free(pmsg)
+                }
+            }
+            poll_pass = Add(poll_pass, 1)
+        }
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  VS Code — Xvfb + mmap + ShmCanvas\n")
+    PrintMessage("============================================\n\n")
+
+    // Clean orphans from prior crash
+    Vsc_CleanupStale()
+
+    // Connect to display server
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[VSCode] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, "/tmp/ailang_display.sock")
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[VSCode] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[VSCode] Connected to display server\n")
+    VscState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"vscode\"}")
+    PrintMessage("[VSCode] Sent register\n")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"VS Code\",\"w\":1024,\"h\":700,\"html\":\"config/vscode.html\"}")
+    PrintMessage("[VSCode] Sent window.create\n")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[VSCode] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        VscState.win_id = wid
+        PrintMessage("[VSCode] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Create shared memory canvas
+    cw = VscState.canvas_w
+    ch = VscState.canvas_h
+    wid = VscState.win_id
+    buf = ShmCanvas_Create(wid, cw, ch)
+    IfCondition EqualTo(buf, 0) ThenBlock: {
+        PrintMessage("[VSCode] ShmCanvas_Create failed\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    ShmCanvas_AttachCapture(sock, wid, cw, ch)
+    PrintMessage("[VSCode] Canvas attached (mouse capture)\n")
+
+    // Clear to VS Code dark background
+    ShmCanvas_Clear(4280427042)
+    ShmCanvas_Present(sock, wid)
+
+    // Set socket non-blocking
+    Socket.SetNonBlock(sock)
+
+    // Allocate command buffer
+    VscState.cmd_buf = Allocate(128)
+
+    // Launch Xvfb → VS Code → xdotool → mmap
+    lr = Vsc_LaunchAll()
+    IfCondition EqualTo(lr, 0) ThenBlock: {
+        PrintMessage("[VSCode] Child processes failed — window stays open with dark canvas\n")
+        PrintMessage("[VSCode] Install prerequisites: sudo apt install xvfb xdotool code\n")
+    }
+
+    // Tick timespecs
+    ts_tick = Allocate(16)
+    StoreValue(ts_tick, 0)
+    StoreValue(Add(ts_tick, 8), 5000000)
+
+    ts_idle = Allocate(16)
+    StoreValue(ts_idle, 0)
+    StoreValue(Add(ts_idle, 8), 50000000)
+
+    PrintMessage("[VSCode] Entering main loop\n\n")
+
+    // ===== MAIN LOOP =====
+    WhileLoop EqualTo(VscState.running, 1) {
+
+        IfCondition EqualTo(VscState.capturing, 1) ThenBlock: {
+            vr = Vsc_CopyFrame()
+            IfCondition EqualTo(vr, 1) ThenBlock: {
+                ShmCanvas_Present(sock, wid)
+            }
+
+            SystemCall(VSys.SYS_NANOSLEEP, ts_tick, 0)
+        } ElseBlock: {
+            SystemCall(VSys.SYS_NANOSLEEP, ts_idle, 0)
+        }
+
+        // Poll IPC messages
+        Vsc_PollMessages(sock)
+
+        // Flush coalesced mouse move
+        Vsc_FlushMouse()
+
+        // Check/reap children
+        Vsc_CheckChildren()
+    }
+
+    // Cleanup
+    Vsc_StopAll()
+    ShmCanvas_Destroy(wid)
+    Deallocate(ts_tick, 16)
+    Deallocate(ts_idle, 16)
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  VS Code finished\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)

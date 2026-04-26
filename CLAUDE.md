@@ -116,6 +116,9 @@ Calculator maintains `expr_buf` (64 bytes) + `expr_len` in `CalcState`. Digits a
 | 04-26 | DnD library reorg | 16 DnD-specific libs moved from `Librarys/` to `Librarys/DnD/{Engine,Character,Battle,Commerce,Save,Web}/`. All imports updated in dnd_game.ailang + all moved libs. Generic libs (TUI, Arena, StringUtils, JSON) stay in root |
 | 04-26 | Chrome orphan cleanup | `Chrome_CleanupStaleXvfb` double-pass pkill + lock file removal at launch/exit. `Chrome_ShellExec` helper for fork/exec `/bin/sh -c`. Fixes stranded Chrome/Xvfb after crash |
 | 04-26 | Chrome rasterizer fix | Removed `--disable-software-rasterizer` (Xvfb is software-only, flag killed all rendering). Removed `VizDisplayCompositor` from disable-features. Only `MediaDrmPreprovisioning` stays disabled |
+| 04-26 | VS Code IPC app | Sandboxed VS Code via Xvfb :98 + mmap framebuffer + ShmCanvas, same architecture as Chrome. Separate fbdir `/tmp/vscode_fb/` avoids collision with Chrome's `/tmp/chrome_fb/` |
+| 04-26 | Per-app Xvfb fbdir | Chrome uses `/tmp/chrome_fb/`, VSCode uses `/tmp/vscode_fb/` — both can run simultaneously without framebuffer file collision |
+| 04-26 | X11 app porting guide | `X11_APP_PORTING.md` — step-by-step guide for porting any X11/Electron/GTK/Qt app. Display allocation, flags, recipes for common app types |
 
 ## Chrome Browser (Sandboxed)
 
@@ -255,6 +258,9 @@ Full plan at: `.claude/plans/playful-cuddling-puffin.md`
 | `Testcode/terminal_ipc.ailang` | Terminal emulator — PTY + VT100 parser + ShmCanvas + dynamic resize |
 | `Testcode/claude_ipc.ailang` | Claude Code app — fork of terminal, execs claude CLI via PTY, 800x600 100x37 grid |
 | `Testcode/chrome_ipc.ailang` | Chrome browser — Xvfb + google-chrome + mmap framebuffer, ShmCanvas, xdotool pipe input |
+| `Testcode/vscode_ipc.ailang` | VS Code — Xvfb + code + mmap framebuffer, ShmCanvas, xdotool pipe input |
+| `config/vscode.html` | VS Code window layout — dark panel with about toolbar |
+| `X11_APP_PORTING.md` | X11 app porting guide — step-by-step for any X11/Electron/GTK/Qt app |
 
 ### PostgreSQL Services Table
 
@@ -269,7 +275,7 @@ CREATE TABLE IF NOT EXISTS services (
 )
 ```
 
-Seeded services: notepad (`internal:win.new`), files (`internal:app.files`), calculator (`./calc_ipc.x`), grep (`./grep_ipc.x`), canvas_demo (`./canvas_demo.x`), videoplayer (`./videoplayer.x`), terminal (`./terminal_ipc.x`), claude (`./claude_ipc.x`), chrome (`./chrome_ipc.x`).
+Seeded services: notepad (`internal:win.new`), files (`internal:app.files`), calculator (`./calc_ipc.x`), grep (`./grep_ipc.x`), canvas_demo (`./canvas_demo.x`), videoplayer (`./videoplayer.x`), terminal (`./terminal_ipc.x`), claude (`./claude_ipc.x`), chrome (`./chrome_ipc.x`), vscode (`./vscode_ipc.x`).
 
 Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts), `windows` (state persistence), `encryption_keys` (per-service keys), `service_status` (runtime state — not yet populated).
 
@@ -308,9 +314,12 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 - 0 analyzer errors, 10/10 calc tests, all headless tests pass
 - Claude Code IPC app: dedicated CLI wrapper, fork of terminal emulator, execs claude 2.1.14 via PTY, 800x600 100x37 grid, xterm-256color
 - Chrome browser: sandboxed via Xvfb + mmap framebuffer (no ffmpeg), 3-process management, persistent xdotool pipe input (~0.1ms vs 5-15ms fork/exec), canvas dirty flag, toolbar nav, `--user-data-dir` session isolation, mouse Y adjusted for toolbar height, mouse move coalescing
+- VS Code: sandboxed via Xvfb :98 + mmap framebuffer + ShmCanvas, same architecture as Chrome, Ctrl+S/P/N/W/Z/F/G/B/` shortcuts, opens Ailang project dir by default
+- Per-app Xvfb fbdir: Chrome `/tmp/chrome_fb/`, VSCode `/tmp/vscode_fb/` — both can run simultaneously
 - Library directory reorg: 58 display libs organized into `Librarys/Display/{System,Window,Input,UI,Menu,Render,Content,Theme,IPC}/`, generic libs stay in root
 - DnD library reorg: 16 game libs organized into `Librarys/DnD/{Engine,Character,Battle,Commerce,Save,Web}/`, generic libs (TUI, Arena, StringUtils) stay in root
-- SysDisplay.x binary: ~665KB, terminal_ipc.x: ~232KB, claude_ipc.x: ~232KB
+- X11 app porting guide: step-by-step documentation for porting any X11/Electron/GTK/Qt app
+- SysDisplay.x binary: ~665KB, terminal_ipc.x: ~232KB, claude_ipc.x: ~232KB, vscode_ipc.x: ~131KB
 
 ### Build & Run
 
@@ -323,6 +332,7 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 ./ailang.x Testcode/terminal_ipc.ailang terminal_ipc.x # build terminal emulator
 ./ailang.x Testcode/claude_ipc.ailang claude_ipc.x     # build claude code app
 ./ailang.x Testcode/chrome_ipc.ailang chrome_ipc.x     # build chrome browser
+./ailang.x Testcode/vscode_ipc.ailang vscode_ipc.x   # build VS Code
 ./ailang.x dnd_game.ailang dnd.x                        # build DnD game
 ./ailang.x Calc.ailang Calc.x                          # build calc standalone tests
 ./ailang.x TestCode/test_main.ailang test_main.x       # build headless tests
@@ -341,6 +351,7 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 - `terminal_ipc.ailang` — terminal emulator via PTY + VT100 parser + 8x16 bitmap font + ShmCanvas
 - `claude_ipc.ailang` — Claude Code CLI wrapper via PTY + VT100 + ShmCanvas (100x37 grid, xterm-256color)
 - `chrome_ipc.ailang` — Sandboxed Chrome browser via Xvfb mmap + ShmCanvas + xdotool pipe input
+- `vscode_ipc.ailang` — Sandboxed VS Code via Xvfb mmap + ShmCanvas + xdotool pipe input
 - `Calc.ailang` — standalone calculator unit tests (10/10)
 - `test_offscreen_render.ailang` — 4 render tests (toolbar, menu, deskbar, file dialog)
 - `test_filedialog.ailang` — file dialog integration tests
