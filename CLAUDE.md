@@ -372,7 +372,36 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 - `test_offscreen_render.ailang` — 4 render tests (toolbar, menu, deskbar, file dialog)
 - `test_filedialog.ailang` — file dialog integration tests
 
-### Pending Work
+### Kernel Module Path (`-kmod`)
+
+The compiler can emit Linux kernel-module payload objects (ET_REL) that
+link against the C shim in `kernel_module/shim/` to produce loadable
+`.ko` files. See `kernel_module/PLAN.md` for the full architecture.
+
+```
+LibraryImport.KernelShim          // ail_printk, ail_kmalloc, etc.
+
+Function.ail_main {
+    Output: Integer
+    Body: {
+        ail_printk("hello from ailang")
+        ReturnValue(0)
+    }
+}
+Function.ail_exit {
+    Body: { ail_printk("goodbye") }
+}
+```
+
+`./ailang.x -kmod source.ailang ail_payload.o` produces an ET_REL with
+PLT32 relocs against extern calls and R_X86_64_64 relocs against `.data`
+for string literals. Drop into `kernel_module/shim/`, run `make`, then
+`sudo insmod ail_combined.ko` on a real Linux box (WSL can't insmod).
+
+Plan steps 1–5 + data-section relocs done. Step 6 (insmod load test)
+pending the dedicated Linux box.
+
+## Pending Work
 
 - **Terminal polish** — toolbar actions (File menu), cursor blink, mouse reporting (?1000h/?1006h for TUI apps)
 - **Window manager scroll** — scrollable content areas for canvas/terminal windows

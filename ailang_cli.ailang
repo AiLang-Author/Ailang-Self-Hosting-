@@ -53,6 +53,7 @@ LibraryImport.Compiler.CodeEmit.X86.CEmitX86Sys
 LibraryImport.Compiler.Output.CELFTypes
 LibraryImport.Compiler.Output.CELFBuilder
 LibraryImport.Compiler.Output.COutput
+LibraryImport.Compiler.Output.CELFKernelModule
 
 // =============================================================================
 // CLI STATE
@@ -64,6 +65,9 @@ FixedPool.Cli {
     "source_len": Initialize=0, CanChange=True
     "ast": Initialize=0, CanChange=True
     "dump_combined": Initialize=0, CanChange=True
+    // -kmod compiler mode: emit ET_REL Linux kernel module payload
+    // instead of ET_EXEC. See kernel_module/PLAN.md (Step 5).
+    "kmod_mode": Initialize=0, CanChange=True
 }
 
 // =============================================================================
@@ -311,7 +315,16 @@ Function.Cli_Compile {
         Emit_Init()
         EmitTag_Init()
         Compile_Init()
-        
+
+        // Tell the codegen we're in kernel-module mode (gates extern calls,
+        // see CompileFunc_UserCall). KMod_Init must also be called before
+        // codegen runs since extern call sites stage into the KMod pool.
+        Compile.kmod_mode = Cli.kmod_mode
+        IfCondition EqualTo(Cli.kmod_mode, 1) ThenBlock: {
+            ELF_Init()
+            KMod_Init()
+        }
+
         // Entry point
         start_label = Emit_CreateLabel()
         Emit_DefineLabel(start_label)
@@ -330,13 +343,26 @@ Function.Cli_Compile {
             ReturnValue(0)
         }
         
-        // Exit syscall
-        X86_MovRaxImm64(60)
-        X86_XorRdiRdi()
-        X86_SysInstr()
-        
+        // Exit syscall — ET_EXEC only. Kernel modules have no entry point;
+        // the C shim's module_init dispatches to ail_main directly via the
+        // GLOBAL FUNC symbol, so trailing exit bytes would be unreachable
+        // garbage that confuses disassembly and inflates .text.
+        IfCondition EqualTo(Cli.kmod_mode, 0) ThenBlock: {
+            X86_MovRaxImm64(60)
+            X86_XorRdiRdi()
+            X86_SysInstr()
+        }
+
         Emit_ResolveFixups()
-        Emit_ApplyDataRelocations()
+
+        // Data-pointer relocs: in ET_EXEC mode, patch with absolute baked-in
+        // addresses. In -kmod mode, stage as R_X86_64_64 records against the
+        // .data section symbol so insmod patches at module load.
+        IfCondition EqualTo(Cli.kmod_mode, 1) ThenBlock: {
+            KMod_BridgeDataRelocs()
+        } ElseBlock: {
+            Emit_ApplyDataRelocations()
+        }
 
         // Post-pass peephole optimization (see EMIT_TAG_DESIGN.md).
         // Runs after fixups so all jump offsets are baked in — NOPing
@@ -347,21 +373,60 @@ Function.Cli_Compile {
         PrintMessage("Writing to: ")
         PrintMessage(Cli.output_file)
         PrintMessage("\n")
-        
-        write_result = Output_BuildAndWrite(Cli.output_file)
-        
+
+        IfCondition EqualTo(Cli.kmod_mode, 1) ThenBlock: {
+            // ET_REL kernel module payload path.
+            // Required: source defines Function.ail_main {Output: Integer ...}
+            // Optional: source defines Function.ail_exit {Body: ...}
+            ail_main_label = Compile_FindFunction("ail_main")
+            IfCondition LessThan(ail_main_label, 0) ThenBlock: {
+                PrintMessage("Error: -kmod requires Function.ail_main to be defined\n")
+                Compile_Free()
+                EmitTag_Free()
+                Parse_Cleanup(1)
+                Lex_Free()
+                Sem_Free()
+                ReturnValue(0)
+            }
+            ail_main_off = Emit_GetLabelAddress(ail_main_label)
+
+            // ELF_Init / KMod_Init were called at the top of codegen so
+            // extern call sites could stage relocs during compilation.
+            // Here we just stage exports + invoke the builder.
+            KMod_StageExport("ail_main", ail_main_off)
+
+            ail_exit_label = Compile_FindFunction("ail_exit")
+            IfCondition GreaterEqual(ail_exit_label, 0) ThenBlock: {
+                ail_exit_off = Emit_GetLabelAddress(ail_exit_label)
+                KMod_StageExport("ail_exit", ail_exit_off)
+            } ElseBlock: {
+                PrintMessage("[KMOD] note: Function.ail_exit not defined (shim cleanup will be a no-op)\n")
+            }
+
+            // NOTE: extern + reloc staging is a no-op until plan Steps 3 + 4
+            // land (ExternalKernelFunction parser + codegen reloc emission).
+            // This first cut produces a self-contained payload — only useful
+            // if ail_main does pure computation. As soon as the source can
+            // call ail_printk etc., codegen will populate KMod_StageReloc.
+            write_result = Output_BuildKernelModule(Cli.output_file)
+            KMod_Free()
+            ELF_Free()
+        } ElseBlock: {
+            write_result = Output_BuildAndWrite(Cli.output_file)
+        }
+
         // Cleanup
         Compile_Free()
         EmitTag_Free()
         Parse_Cleanup(1)
         Lex_Free()
         Sem_Free()
-        
+
         IfCondition EqualTo(write_result, 0) ThenBlock: {
             PrintMessage("Error: Failed to write output file\n")
             ReturnValue(0)
         }
-        
+
         PrintMessage("Success.\n")
         ReturnValue(1)
     }
@@ -421,6 +486,15 @@ SubRoutine.Main {
             Cli.dump_combined = 1
         }
 
+        // -kmod: emit Linux kernel-module payload (ET_REL) instead of ET_EXEC.
+        //   Source must define Function.ail_main {Output: Integer ...}; may
+        //   also define Function.ail_exit. The C shim in kernel_module/shim/
+        //   provides module_init/module_exit; this object is linked against
+        //   it via `make` in that directory. See kernel_module/PLAN.md.
+        IfCondition EqualTo(StringEquals(arg, "-kmod"), 1) ThenBlock: {
+            Cli.kmod_mode = 1
+        }
+
         // First non-flag arg is the source file
         IfCondition EqualTo(Cli.filename, 0) ThenBlock: {
             first_char = StringCharAt(arg, 0)
@@ -442,12 +516,17 @@ SubRoutine.Main {
 
     IfCondition EqualTo(Cli.filename, 0) ThenBlock: {
         PrintMessage("AILang Compiler CLI\n")
-        PrintMessage("Usage: ./ailang.x [-P] [-D1-4] <source_file> [output_file]\n")
+        PrintMessage("Usage: ./ailang.x [-P] [-D1-4] [-d] [-kmod] <source_file> [output_file]\n")
+        PrintMessage("  -kmod   emit Linux kernel-module payload (ET_REL); requires Function.ail_main\n")
         ProcessExit(1)
     }
 
     IfCondition EqualTo(Cli.output_file, 0) ThenBlock: {
-        Cli.output_file = "a.out"
+        IfCondition EqualTo(Cli.kmod_mode, 1) ThenBlock: {
+            Cli.output_file = "ail_payload.o"
+        } ElseBlock: {
+            Cli.output_file = "a.out"
+        }
     }
 
     load_success = Cli_LoadFile(Cli.filename)

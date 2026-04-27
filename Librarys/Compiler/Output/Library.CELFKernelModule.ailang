@@ -53,6 +53,34 @@ FixedPool.KMod {
     "rela_buffer":    Initialize=0, CanChange=True
     "rela_cap":       Initialize=0, CanChange=True
     "first_global":   Initialize=0, CanChange=True
+
+    // Phase 2 staging — caller fills these via KMod_Stage* helpers
+    // BEFORE invoking ELF_BuildKernelModule. Emitter consumes them to
+    // populate the symtab + .rela.text section.
+    //
+    // Each slot is one qword:
+    //   in_externs[i]      = address of UND symbol name string
+    //   in_exports[i]      = address of GLOBAL DEFINED symbol name string
+    //   in_export_offs[i]  = byte offset within .text where that symbol lives
+    //   in_relocs records  = 4 qwords each: {text_offset, extern_idx, reloc_type, addend}
+    //                        (extern_idx is the 0-based index into in_externs[])
+    "in_externs":      Initialize=0, CanChange=True
+    "in_extern_count": Initialize=0, CanChange=True
+    "in_extern_cap":   Initialize=0, CanChange=True
+    "in_exports":      Initialize=0, CanChange=True
+    "in_export_offs":  Initialize=0, CanChange=True
+    "in_export_count": Initialize=0, CanChange=True
+    "in_export_cap":   Initialize=0, CanChange=True
+    "in_relocs":       Initialize=0, CanChange=True
+    "in_reloc_count":  Initialize=0, CanChange=True
+    "in_reloc_cap":    Initialize=0, CanChange=True
+
+    // Data-section relocs (R_X86_64_64): patch a 64-bit immediate in
+    // .text with the runtime address of (.data + data_offset). Each
+    // record is 2 qwords: {text_offset, data_offset}.
+    "in_drelocs":       Initialize=0, CanChange=True
+    "in_dreloc_count":  Initialize=0, CanChange=True
+    "in_dreloc_cap":    Initialize=0, CanChange=True
 }
 
 // =============================================================================
@@ -77,6 +105,25 @@ Function.KMod_Init {
         KMod.rela_count = 0
 
         KMod.first_global = 0
+
+        // Phase 2 staging buffers
+        // 32 externs, 32 exports, 256 reloc records (32B each) — generous defaults
+        KMod.in_extern_cap = 256
+        KMod.in_externs = Allocate(KMod.in_extern_cap)
+        KMod.in_extern_count = 0
+
+        KMod.in_export_cap = 256
+        KMod.in_exports = Allocate(KMod.in_export_cap)
+        KMod.in_export_offs = Allocate(KMod.in_export_cap)
+        KMod.in_export_count = 0
+
+        KMod.in_reloc_cap = 8192
+        KMod.in_relocs = Allocate(KMod.in_reloc_cap)
+        KMod.in_reloc_count = 0
+
+        KMod.in_dreloc_cap = 4096
+        KMod.in_drelocs = Allocate(KMod.in_dreloc_cap)
+        KMod.in_dreloc_count = 0
     }
 }
 
@@ -93,6 +140,140 @@ Function.KMod_Free {
         IfCondition NotEqual(KMod.rela_buffer, 0) ThenBlock: {
             Deallocate(KMod.rela_buffer, KMod.rela_cap)
             KMod.rela_buffer = 0
+        }
+        IfCondition NotEqual(KMod.in_externs, 0) ThenBlock: {
+            Deallocate(KMod.in_externs, KMod.in_extern_cap)
+            KMod.in_externs = 0
+        }
+        IfCondition NotEqual(KMod.in_exports, 0) ThenBlock: {
+            Deallocate(KMod.in_exports, KMod.in_export_cap)
+            Deallocate(KMod.in_export_offs, KMod.in_export_cap)
+            KMod.in_exports = 0
+            KMod.in_export_offs = 0
+        }
+        IfCondition NotEqual(KMod.in_relocs, 0) ThenBlock: {
+            Deallocate(KMod.in_relocs, KMod.in_reloc_cap)
+            KMod.in_relocs = 0
+        }
+        IfCondition NotEqual(KMod.in_drelocs, 0) ThenBlock: {
+            Deallocate(KMod.in_drelocs, KMod.in_dreloc_cap)
+            KMod.in_drelocs = 0
+        }
+        KMod.in_extern_count = 0
+        KMod.in_export_count = 0
+        KMod.in_reloc_count = 0
+        KMod.in_dreloc_count = 0
+    }
+}
+
+// =============================================================================
+// PHASE 2 STAGING HELPERS — caller invokes BEFORE ELF_BuildKernelModule
+// =============================================================================
+//
+// Lifecycle:
+//   ELF_Init()                              // existing
+//   KMod_Init()                             // existing — also zeroes staging
+//   KMod_StageExtern("ail_printk")          // → returns extern_idx (0-based)
+//   KMod_StageExport("ail_main", 0)         // .text-relative byte offset
+//   KMod_StageReloc(call_off+1, 0, 4, -4)   // R_X86_64_PLT32 = 4
+//   ELF_BuildKernelModule(code, code_size, data, data_size)
+//   ... write file ...
+//   KMod_Free()                             // (also auto-called inside builder)
+//   ELF_Free()
+//
+// Reloc records reference externs by their 0-based stage index (NOT the final
+// symtab index). The emitter resolves to the real symtab index when serializing
+// .rela.text, since all externs are appended to the symtab in stage order
+// after the exports.
+// =============================================================================
+
+Function.KMod_StageExtern {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        idx = KMod.in_extern_count
+        slot = Add(KMod.in_externs, Multiply(idx, 8))
+        StoreValue(slot, name)
+        KMod.in_extern_count = Add(idx, 1)
+        ReturnValue(idx)
+    }
+}
+
+// Dedup-aware variant for codegen: many call sites can reference the same
+// extern, but the symtab must contain exactly one UND entry per name.
+// Returns the existing index if found, otherwise stages and returns the
+// new index. Name comparison is by string content.
+Function.KMod_FindOrStageExtern {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, KMod.in_extern_count) {
+            existing = Dereference(Add(KMod.in_externs, Multiply(i, 8)))
+            IfCondition EqualTo(StringCompare(name, existing), 0) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(KMod_StageExtern(name))
+    }
+}
+
+Function.KMod_StageExport {
+    Input: name: Address
+    Input: text_offset: Integer
+    Output: Integer
+    Body: {
+        idx = KMod.in_export_count
+        StoreValue(Add(KMod.in_exports, Multiply(idx, 8)), name)
+        StoreValue(Add(KMod.in_export_offs, Multiply(idx, 8)), text_offset)
+        KMod.in_export_count = Add(idx, 1)
+        ReturnValue(idx)
+    }
+}
+
+Function.KMod_StageReloc {
+    Input: text_offset: Integer
+    Input: extern_idx: Integer
+    Input: reloc_type: Integer
+    Input: addend: Integer
+    Body: {
+        base = Add(KMod.in_relocs, Multiply(KMod.in_reloc_count, 32))
+        StoreValue(Add(base, 0),  text_offset)
+        StoreValue(Add(base, 8),  extern_idx)
+        StoreValue(Add(base, 16), reloc_type)
+        StoreValue(Add(base, 24), addend)
+        KMod.in_reloc_count = Add(KMod.in_reloc_count, 1)
+    }
+}
+
+// Stage a data-pointer reloc: patch the 8-byte immediate at `text_offset`
+// in .text with the runtime address of (.data + data_offset). Emitted as
+// R_X86_64_64 against the .data section symbol, addend = data_offset.
+Function.KMod_StageDataReloc {
+    Input: text_offset: Integer
+    Input: data_offset: Integer
+    Body: {
+        base = Add(KMod.in_drelocs, Multiply(KMod.in_dreloc_count, 16))
+        StoreValue(Add(base, 0), text_offset)
+        StoreValue(Add(base, 8), data_offset)
+        KMod.in_dreloc_count = Add(KMod.in_dreloc_count, 1)
+    }
+}
+
+// Bridge: drain Emit.data_relocs (codegen-side records) into KMod's
+// staging area. Called by ailang_cli in -kmod mode INSTEAD of
+// Emit_ApplyDataRelocations. Each Emit entry { POSITION, DATA_OFFSET }
+// becomes one KMod data-reloc record with the same fields.
+Function.KMod_BridgeDataRelocs {
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, Emit.data_reloc_count) {
+            entry = XArray.XGet(Emit.data_relocs, i)
+            cpos  = Dereference(Add(entry, CodeRelocField.CODE_POSITION))
+            doff  = Dereference(Add(entry, DataRelocField.DATA_OFFSET))
+            KMod_StageDataReloc(cpos, doff)
+            i = Add(i, 1)
         }
     }
 }
@@ -263,7 +444,8 @@ Function.ELF_BuildKernelModule {
     Body: {
         PrintMessage("[KO] Building kernel module...\n")
 
-        KMod_Init()
+        // NOTE: caller is responsible for KMod_Init() + staging (extern/export/
+        // reloc) before this call. KMod_Free() is invoked at the end here.
 
         // =====================================================================
         // Build .modinfo content: "license=GPL\0"
@@ -312,25 +494,82 @@ Function.ELF_BuildKernelModule {
 
         // =====================================================================
         // Build symbol table
+        //
+        // ELF requires: all STB_LOCAL symbols MUST come before any STB_GLOBAL
+        //   or STB_WEAK symbol. .symtab.sh_info must equal the index of the
+        //   first non-local. Order below: null, .text section, then exports
+        //   (GLOBAL DEFINED FUNC), then externs (GLOBAL UND FUNC).
         // =====================================================================
+
         // [0] null symbol — required
         KMod_AddSymbol(0, STBind.LOCAL, STType.NOTYPE, SHIndex.UNDEF, 0, 0)
 
-        // [1] .text section symbol
+        // [1] .text section symbol  (st_shndx = 1 = .text section)
         text_sec_name = KMod_AddString(".text")
         KMod_AddSymbol(text_sec_name, STBind.LOCAL, STType.SECTION, 1, 0, 0)
+
+        // [2] .data section symbol  (st_shndx = 2 = .data section).
+        // Required as the target of every R_X86_64_64 data-pointer reloc.
+        // Always emitted even when .data is empty so the symtab layout is
+        // stable (data_sec_sym = 2 is hard-coded below).
+        data_sec_name = KMod_AddString(".data")
+        KMod_AddSymbol(data_sec_name, STBind.LOCAL, STType.SECTION, 2, 0, 0)
+        data_sec_sym = 2
 
         // Mark first global (symbols after this are GLOBAL)
         KMod.first_global = KMod.sym_count
 
-        // [2] init_module — offset 0 in .text
-        init_name = KMod_AddString("init_module")
-        KMod_AddSymbol(init_name, STBind.GLOBAL, STType.FUNC, 1, 0, 0)
+        // GLOBAL DEFINED — exports staged by caller
+        i = 0
+        WhileLoop LessThan(i, KMod.in_export_count) {
+            ename = Dereference(Add(KMod.in_exports, Multiply(i, 8)))
+            eoff  = Dereference(Add(KMod.in_export_offs, Multiply(i, 8)))
+            ename_str = KMod_AddString(ename)
+            KMod_AddSymbol(ename_str, STBind.GLOBAL, STType.FUNC, 1, eoff, 0)
+            i = Add(i, 1)
+        }
 
-        // [3] cleanup_module — offset after init code
-        // init_module is: 31 C0 C3 = 3 bytes
-        cleanup_name = KMod_AddString("cleanup_module")
-        KMod_AddSymbol(cleanup_name, STBind.GLOBAL, STType.FUNC, 1, 3, 0)
+        // GLOBAL UND — externs staged by caller (st_shndx=0, st_value=0)
+        // The first extern's symtab index is (first_global + export_count);
+        // KMod_StageReloc's extern_idx is offset from that base.
+        i = 0
+        WhileLoop LessThan(i, KMod.in_extern_count) {
+            xname = Dereference(Add(KMod.in_externs, Multiply(i, 8)))
+            xname_str = KMod_AddString(xname)
+            KMod_AddSymbol(xname_str, STBind.GLOBAL, STType.FUNC, SHIndex.UNDEF, 0, 0)
+            i = Add(i, 1)
+        }
+
+        // =====================================================================
+        // Walk staged relocs → emit Elf64_Rela entries
+        // extern_idx is 0-based into in_externs[]; resolve to symtab index by
+        // adding the extern base (first_global + export_count).
+        // =====================================================================
+        extern_sym_base = Add(KMod.first_global, KMod.in_export_count)
+        i = 0
+        WhileLoop LessThan(i, KMod.in_reloc_count) {
+            rbase    = Add(KMod.in_relocs, Multiply(i, 32))
+            r_off    = Dereference(Add(rbase, 0))
+            r_xidx   = Dereference(Add(rbase, 8))
+            r_type   = Dereference(Add(rbase, 16))
+            r_addend = Dereference(Add(rbase, 24))
+            sym_idx  = Add(extern_sym_base, r_xidx)
+            KMod_AddRela(r_off, sym_idx, r_type, r_addend)
+            i = Add(i, 1)
+        }
+
+        // Data-pointer relocs (R_X86_64_64) targeting the .data section
+        // symbol. Addend = data_offset so the linker computes
+        // (.data_runtime_addr + data_offset) and writes that 64-bit value
+        // into the immediate slot at text_offset.
+        i = 0
+        WhileLoop LessThan(i, KMod.in_dreloc_count) {
+            dbase = Add(KMod.in_drelocs, Multiply(i, 16))
+            d_off = Dereference(Add(dbase, 0))
+            d_dat = Dereference(Add(dbase, 8))
+            KMod_AddRela(d_off, data_sec_sym, RelocType.R_X86_64_64, d_dat)
+            i = Add(i, 1)
+        }
 
         // =====================================================================
         // Calculate sizes
@@ -639,7 +878,18 @@ Function.KMod_WriteString {
 }
 
 // =============================================================================
-// OUTPUT: Build and write .ko from emit buffers
+// OUTPUT: Build and write .ko payload from emit buffers
+//
+// LIFECYCLE — caller is responsible for the surrounding setup:
+//   ELF_Init()
+//   KMod_Init()
+//   KMod_StageExport(...)        // ail_main, ail_exit, …
+//   KMod_StageExtern(...)        // ail_printk, … (Step 4 will populate)
+//   KMod_StageReloc(...)         // (Step 4 will populate from call sites)
+//   Output_BuildKernelModule(filename)
+//   ELF_Free()                   // KMod_Free is called inside the builder
+//
+// This is invoked by ailang_cli when -kmod is passed.
 // =============================================================================
 Function.Output_BuildKernelModule {
     Input: filename: Address
@@ -647,19 +897,14 @@ Function.Output_BuildKernelModule {
     Body: {
         PrintMessage("\n[OUTPUT] === Building Kernel Module ===\n")
 
-        ELF_Init()
-
         result = ELF_BuildKernelModule(Emit.code, Emit.code_size, Emit.data, Emit.data_size)
 
         IfCondition EqualTo(result, 0) ThenBlock: {
             PrintMessage("[OUTPUT] ERROR: KO build failed\n")
-            ELF_Free()
             ReturnValue(0)
         }
 
         result = Output_WriteExecutable(filename)
-
-        ELF_Free()
 
         IfCondition EqualTo(result, 1) ThenBlock: {
             PrintMessage("[OUTPUT] === Kernel Module Complete ===\n\n")

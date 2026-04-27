@@ -1,6 +1,20 @@
 # Kernel Module Emission — Full Plan
 
-**Status as of 2026-04-21:** Shim chunk done (`shim/ail_shim.{c,h}` + `shim/Makefile`). Remaining work is entirely on the AiLang side (emitter + codegen + CLI + test).
+**Status as of 2026-04-26:**
+- Step 1 (C shim): DONE 2026-04-21.
+- Step 2 (ELF emitter — staged inputs, .rela.text writer, symtab population): DONE.
+- Step 3 (`ExternalKernelFunction` lexer/parser/AST): DONE.
+- Step 4 (codegen reloc emission at extern call sites): DONE.
+- Step 5 (`-kmod` CLI flag): DONE.
+- Step 6 (end-to-end load test, Linux box): PENDING — bytes-clean, awaiting hardware.
+- Bonus (not originally in plan): R_X86_64_64 data-section relocs for string-literal pointers, plus `Library.KernelShim` mirroring `ail_shim.h`. DONE.
+
+End-to-end works in WSL today: `./ailang.x -kmod my.ailang ail_payload.o` produces an ET_REL with PLT32 relocs against the C shim's symbols and R_X86_64_64 relocs against `.data` for any string literals passed to externs. `ld -shared` against a stub resolves all calls and string pointers correctly. See `TestCode/Test.KModViaLibrary.ailang` for a representative source.
+
+Next AiLang-side polish (optional):
+- Function-skip JMP stubs around each function are still emitted in kmod mode (5 wasted bytes per function). Harmless; kernel doesn't execute that path.
+- Source code that needs FixedPools in a kmod payload would have to init them inside ail_main — the auto-emit prologue is suppressed.
+- Multi-payload kmod builds (one .ailang per .ko) untested.
 
 ---
 
@@ -37,14 +51,14 @@ This reduces AiLang's relocation-emission scope to exactly one reloc type (`R_X8
 
 ## WHAT — each step's concrete output
 
-### Step 1 — C shim (DONE 2026-04-21)
+### Step 1 — C shim   ✅ DONE 2026-04-21
 
 On disk now:
 - `kernel_module/shim/ail_shim.h` (39 lines) — stable ABI declarations.
 - `kernel_module/shim/ail_shim.c` (72 lines) — `module_init/exit` hooks calling `ail_main`/`ail_exit`; wrappers: `ail_printk`, `ail_kmalloc`, `ail_kfree`, `ail_strlen`.
 - `kernel_module/shim/Makefile` — `obj-m += ail_combined.o`, `ail_combined-objs := ail_shim.o ail_payload.o`. Guards on `ail_payload.o` existence.
 
-### Step 2 — Extend `ELF_BuildKernelModule` API
+### Step 2 — Extend `ELF_BuildKernelModule` API   ✅ DONE 2026-04-25
 
 Current: `ELF_BuildKernelModule(code, code_size, data, data_size)` — emits ET_REL with empty `.rela.text` and minimal `.symtab`.
 
@@ -73,7 +87,7 @@ Changes inside `Library.CELFKernelModule.ailang`:
 
 **Verifiable by:** hand-constructed call with one extern (`ail_printk`) and one reloc, then `readelf -r out.o` + `readelf -s out.o`.
 
-### Step 3 — Source-language marker for externs
+### Step 3 — Source-language marker for externs   ✅ DONE 2026-04-26
 
 New declaration form:
 ```
@@ -94,7 +108,7 @@ Parser work:
 3. AST: new node `AST.EXTERN_KFUNC` with `data1 = name`, children = parameters (no body child).
 4. Semantic pass: record into the extern-symbol table; fail if redeclared with mismatched signature; fail if a body appears.
 
-### Step 4 — Codegen reloc emission
+### Step 4 — Codegen reloc emission   ✅ DONE 2026-04-26
 
 At every `call` instruction currently emitted from `Library.CCompileFunc.ailang` (or wherever call codegen lives — confirm via `relmem callers` + grep during execution):
 
@@ -103,7 +117,7 @@ At every `call` instruction currently emitted from `Library.CCompileFunc.ailang`
 
 Reloc records accumulate in a new `RelocList` FixedPool at module scope. Flushed as the `relocs[]` parameter into `ELF_BuildKernelModule` at final emit time.
 
-### Step 5 — CLI flag `-kmod`
+### Step 5 — CLI flag `-kmod`   ✅ DONE 2026-04-25
 
 In `ailang_cli.ailang`:
 - Parse `-kmod` from argv.
