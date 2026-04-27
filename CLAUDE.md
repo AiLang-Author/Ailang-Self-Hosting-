@@ -261,20 +261,20 @@ Full plan at: `.claude/plans/playful-cuddling-puffin.md`
 | `Librarys/Display/Menu/Library.StartMenu.ailang` | Start Menu panel — Windows XP/7 style overlay |
 | `Librarys/Display/UI/Library.AboutDialog.ailang` | About dialog — system info, copyright, license |
 | `Librarys/Library.Socket.ailang` | Added `Socket.SetNonBlock(fd)` |
-| `Testcode/calc_ipc.ailang` | Standalone IPC calculator client |
+| `Applications/calc_ipc.ailang` | Standalone IPC calculator client |
 | `config/calculator.html` | Calculator layout with `toolbar="about"` |
 | `APP_DEVELOPMENT.md` | Application development guide |
 | `Librarys/Library.ShmCanvas.ailang` | App-side shared memory canvas — create/attach/present/destroy shm pixel buffers |
 | `Librarys/Library.KeyMap.ailang` | Keycode-to-character mapping for keyboard input |
 | `Librarys/Library.TextBuffer.ailang` | Multi-line text buffer with cursor, insert, delete, line split |
-| `Testcode/grep_ipc.ailang` | Grep IPC client — pattern search with keyboard capture |
+| `Applications/grep_ipc.ailang` | Grep IPC client — pattern search with keyboard capture |
 | `Testcode/canvas_demo.ailang` | Animated gradient demo — proves shm canvas pipeline |
-| `Testcode/videoplayer.ailang` | Video player — fork/exec ffmpeg, pipe raw BGRA frames to shm canvas |
+| `Applications/videoplayer.ailang` | Video player — fork/exec ffmpeg, pipe raw BGRA frames to shm canvas |
 | `Librarys/Library.TermFont.ailang` | Embedded 8x16 VGA bitmap font for terminal rendering (95 glyphs, ASCII 32-126) |
-| `Testcode/terminal_ipc.ailang` | Terminal emulator — PTY + VT100 parser + ShmCanvas + dynamic resize |
-| `Testcode/claude_ipc.ailang` | Claude Code app — fork of terminal, execs claude CLI via PTY, 800x600 100x37 grid |
-| `Testcode/chrome_ipc.ailang` | Chrome browser — Xvfb + google-chrome + mmap framebuffer, ShmCanvas, xdotool pipe input |
-| `Testcode/vscode_ipc.ailang` | VS Code — Xvfb + code + mmap framebuffer, ShmCanvas, xdotool pipe input |
+| `Applications/terminal_ipc.ailang` | Terminal emulator — PTY + VT100 parser + ShmCanvas + dynamic resize |
+| `Applications/claude_ipc.ailang` | Claude Code app — fork of terminal, execs claude CLI via PTY, 800x600 100x37 grid |
+| `Applications/chrome_ipc.ailang` | Chrome browser — Xvfb + google-chrome + mmap framebuffer, ShmCanvas, xdotool pipe input |
+| `Applications/vscode_ipc.ailang` | VS Code — Xvfb + code + mmap framebuffer, ShmCanvas, xdotool pipe input |
 | `config/vscode.html` | VS Code window layout — dark panel with about toolbar |
 | `X11_APP_PORTING.md` | X11 app porting guide — step-by-step for any X11/Electron/GTK/Qt app |
 
@@ -341,14 +341,14 @@ Related tables: `files` (VFS), `settings` (key-value per app), `users` (accounts
 
 ```
 ./ailang.x Main.ailang SysDisplay.x                    # build display server
-./ailang.x Testcode/calc_ipc.ailang calc_ipc.x         # build calculator
-./ailang.x Testcode/grep_ipc.ailang grep_ipc.x         # build grep
+./ailang.x Applications/calc_ipc.ailang calc_ipc.x         # build calculator
+./ailang.x Applications/grep_ipc.ailang grep_ipc.x         # build grep
 ./ailang.x Testcode/canvas_demo.ailang canvas_demo.x   # build canvas demo
-./ailang.x Testcode/videoplayer.ailang videoplayer.x   # build video player
-./ailang.x Testcode/terminal_ipc.ailang terminal_ipc.x # build terminal emulator
-./ailang.x Testcode/claude_ipc.ailang claude_ipc.x     # build claude code app
-./ailang.x Testcode/chrome_ipc.ailang chrome_ipc.x     # build chrome browser
-./ailang.x Testcode/vscode_ipc.ailang vscode_ipc.x   # build VS Code
+./ailang.x Applications/videoplayer.ailang videoplayer.x   # build video player
+./ailang.x Applications/terminal_ipc.ailang terminal_ipc.x # build terminal emulator
+./ailang.x Applications/claude_ipc.ailang claude_ipc.x     # build claude code app
+./ailang.x Applications/chrome_ipc.ailang chrome_ipc.x     # build chrome browser
+./ailang.x Applications/vscode_ipc.ailang vscode_ipc.x   # build VS Code
 ./ailang.x dnd_game.ailang dnd.x                        # build DnD game
 ./ailang.x Calc.ailang Calc.x                          # build calc standalone tests
 ./ailang.x TestCode/test_main.ailang test_main.x       # build headless tests

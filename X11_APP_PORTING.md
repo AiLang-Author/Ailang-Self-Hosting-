@@ -62,7 +62,7 @@ Pick an unused number (`:97`, `:96`, etc.).
 
 ### 3. Create the IPC App
 
-Copy `Testcode/vscode_ipc.ailang` (or `chrome_ipc.ailang`) and do find-and-replace:
+Copy `Applications/vscode_ipc.ailang` (or `chrome_ipc.ailang`) and do find-and-replace:
 
 | What to Change | Example (VS Code) |
 |---|---|
@@ -240,7 +240,7 @@ This makes the app appear in the Start Menu.
 
 ```bash
 # Build
-./ailang.x Testcode/myapp_ipc.ailang myapp_ipc.x
+./ailang.x Applications/myapp_ipc.ailang myapp_ipc.x
 
 # Test (display server must be running on TTY2)
 ./myapp_ipc.x
@@ -343,7 +343,7 @@ Startup wait: 500ms. No special flags needed.
 
 | File | Purpose |
 |------|---------|
-| `Testcode/<app>_ipc.ailang` | IPC app source |
+| `Applications/<app>_ipc.ailang` | IPC app source |
 | `config/<app>.html` | Window layout |
 | `/tmp/<app>_fb/Xvfb_screen0` | Xvfb framebuffer (runtime) |
 | `/tmp/.<display>-lock` | Xvfb lock file (runtime) |

@@ -283,7 +283,7 @@ ON CONFLICT (name) DO UPDATE SET binary_path = './myapp.x';
 
 ```bash
 # Build the app binary
-./ailang.x Testcode/myapp_ipc.ailang myapp.x
+./ailang.x Applications/myapp_ipc.ailang myapp.x
 
 # Build the display server (if service seed SQL changed)
 ./ailang.x Main.ailang SysDisplay.x
@@ -356,7 +356,7 @@ The calculator is the complete reference for the app development model:
 |-----------|------|---------|
 | Logic library | `Librarys/Library.Calculator.ailang` | Pure arithmetic engine with expression buffer. 10/10 standalone tests. |
 | HTML layout | `config/calculator.html` | 4x5 button grid + display label, `toolbar="about"` |
-| IPC service | `Testcode/calc_ipc.ailang` | Full IPC lifecycle. Connect, register, window, service loop. |
+| IPC service | `Applications/calc_ipc.ailang` | Full IPC lifecycle. Connect, register, window, service loop. |
 | Standalone tests | `Calc.ailang` | Tests logic library independently (no IPC, no display server). |
 | DB seed | `Library.SysDisplay.ailang` | `binary_path = './calc_ipc.x'` |
 | Headless tests | `TestCode/test_main.ailang` | IPC integration tests with `FB_InitHeadless` |
