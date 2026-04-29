@@ -1,0 +1,787 @@
+// Library.ANSI.ailang — modern terminal escape-sequence vocabulary.
+//
+// A generic, stateless library of ANSI / DEC / xterm escape-sequence
+// builders. Two-tier API: every primitive has a buffer-building variant
+// (append to buf, return new position) for assembling frames, plus a
+// direct-emit convenience wrapper that allocates, builds, syscall-writes,
+// and frees in one call.
+//
+// The library does not own state, does not initialize a terminal, does
+// not read from stdin. It is purely about producing the correct byte
+// sequences. Pair with Library.TUI (raw mode, ReadLine) when needed.
+//
+// Frame model (the "buffer thing"):
+//   buf, pos = ANSI.NewFrame()
+//   pos      = ANSI.Build_CursorTo(buf, pos, 1, 1)
+//   pos      = ANSI.Build_FgRGB(buf, pos, 204, 120, 92)         // Anthropic orange
+//   pos      = ANSI.Build_HyperlinkOpen(buf, pos, url, ulen)
+//   pos      = ANSI.Build_PutText(buf, pos, "click me", 8)
+//   pos      = ANSI.Build_HyperlinkClose(buf, pos)
+//   pos      = ANSI.Build_ResetSGR(buf, pos)
+//   ANSI.FlushFrame(buf, pos)         // wraps in synchronized output, writes once, frees
+//
+// Or in one-shot form:
+//   ANSI.HideCursor()
+//   ANSI.SetTitle("Claude Code — streaming reply", 30)
+//   ANSI.SetCursorShape(ANSICursor.STEADY_BEAM)
+//
+// Spec sources cited per function:
+//   xterm-ctlseqs   — https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
+//   DEC STD 070     — DECSCUSR cursor shape
+//   ECMA-48         — CSI / SGR canonical reference
+//   ITU-T T.416     — 24-bit color SGR extension
+//   xterm OSC 8     — Gnome / iTerm2 / kitty hyperlink spec
+//   sync output     — https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.StringUtils
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+FixedPool.ANSISys {
+    "SYS_WRITE":          Initialize=1
+    "STDOUT":             Initialize=1
+}
+
+// DECSCUSR cursor shape parameter values.
+// `CSI Ps SP q`  — Ps=0 resets to user default.
+FixedPool.ANSICursor {
+    "DEFAULT":            Initialize=0
+    "BLINK_BLOCK":        Initialize=1
+    "STEADY_BLOCK":       Initialize=2
+    "BLINK_UNDERLINE":    Initialize=3
+    "STEADY_UNDERLINE":   Initialize=4
+    "BLINK_BEAM":         Initialize=5    // xterm extension, universal modern
+    "STEADY_BEAM":        Initialize=6    // xterm extension, universal modern
+}
+
+// SGR attribute codes (ECMA-48). Use Build_SGRAttr for any not in the
+// dedicated builders.
+FixedPool.ANSISGR {
+    "RESET":              Initialize=0
+    "BOLD":               Initialize=1
+    "FAINT":              Initialize=2
+    "ITALIC":             Initialize=3
+    "UNDERLINE":          Initialize=4
+    "REVERSE":            Initialize=7
+    "STRIKETHROUGH":      Initialize=9
+    "DEFAULT_FG":         Initialize=39
+    "DEFAULT_BG":         Initialize=49
+}
+
+// Frame buffer growth — start small, grow on demand. Most frames fit in
+// a few KB; a full-screen redraw with truecolor SGR per cell is bounded
+// by terminal area × ~30 bytes/cell.
+FixedPool.ANSIFrame {
+    "INITIAL_CAP":        Initialize=4096
+    "GROW_FACTOR":        Initialize=2
+}
+
+// Frame state header — stored in the first 16 bytes of the frame buffer.
+// Layout: [0..7] capacity (qword), [8..15] reserved.
+// Caller-visible buf pointer is buf+16 ("data start"); pos values are
+// relative to data start.
+FixedPool.ANSIFrameOff {
+    "HEADER_SIZE":        Initialize=16
+    "CAP":                Initialize=0
+}
+
+// =============================================================================
+// LOW-LEVEL: byte/string append helpers
+// =============================================================================
+
+// Append a single byte to buf at pos. Returns pos+1.
+Function.ANSI_AppendByte {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: b:   Integer
+    Output: Integer
+    Body: {
+        SetByte(buf, pos, b)
+        ReturnValue(Add(pos, 1))
+    }
+}
+
+// Append `len` bytes from src into buf at pos. Returns new pos.
+Function.ANSI_AppendBytes {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: src: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, len) {
+            SetByte(buf, Add(pos, i), GetByte(src, i))
+            i = Add(i, 1)
+        }
+        ReturnValue(Add(pos, len))
+    }
+}
+
+// Append a null-terminated string. Returns new pos.
+Function.ANSI_AppendStr {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: s:   Address
+    Output: Integer
+    Body: {
+        ReturnValue(ANSI_AppendBytes(buf, pos, s, StringLength(s)))
+    }
+}
+
+// Append ESC (byte 27). Returns pos+1.
+// AILang string literals do not process \x1b — use this for the ESC byte.
+Function.ANSI_AppendESC {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: { ReturnValue(ANSI_AppendByte(buf, pos, 27)) }
+}
+
+// Append CSI introducer: ESC [ (bytes 27, 91). Returns pos+2.
+Function.ANSI_AppendCSI {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendByte(buf, pos, 27)
+        ReturnValue(ANSI_AppendByte(buf, pos, 91))
+    }
+}
+
+// Append OSC introducer: ESC ] (bytes 27, 93). Returns pos+2.
+Function.ANSI_AppendOSC {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendByte(buf, pos, 27)
+        ReturnValue(ANSI_AppendByte(buf, pos, 93))
+    }
+}
+
+// Append String Terminator: ESC \ (bytes 27, 92). Returns pos+2.
+Function.ANSI_AppendST {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendByte(buf, pos, 27)
+        ReturnValue(ANSI_AppendByte(buf, pos, 92))
+    }
+}
+
+// Append a non-negative decimal integer. Returns new pos.
+// Used to format Ps parameters in CSI sequences.
+Function.ANSI_AppendInt {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        // Special-case 0 so we always emit at least one digit.
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, pos, 48)
+            ReturnValue(Add(pos, 1))
+        }
+        // Emit digits LSB-first into a small scratch, then reverse-copy.
+        tmp = Allocate(20)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, Add(pos, i), GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        Deallocate(tmp, 20)
+        ReturnValue(Add(pos, n))
+    }
+}
+
+// =============================================================================
+// FRAME BUFFER LIFECYCLE
+// =============================================================================
+//
+// A "frame" is a heap buffer with a small header storing capacity, plus a
+// data area where escape sequences are appended. Caller treats the value
+// returned by NewFrame as the data pointer; pos is offset into data.
+
+// Allocate a new frame buffer. Returns the data pointer (buf in builder
+// API). Internally, header lives at buf-HEADER_SIZE; capacity is recorded.
+Function.ANSI.NewFrame {
+    Output: Address
+    Body: {
+        cap = ANSIFrame.INITIAL_CAP
+        raw = Allocate(Add(ANSIFrameOff.HEADER_SIZE, cap))
+        StoreValue(Add(raw, ANSIFrameOff.CAP), cap)
+        ReturnValue(Add(raw, ANSIFrameOff.HEADER_SIZE))
+    }
+}
+
+// Free a frame previously returned by NewFrame.
+Function.ANSI.FreeFrame {
+    Input: buf: Address
+    Body: {
+        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(0) }
+        raw = Subtract(buf, ANSIFrameOff.HEADER_SIZE)
+        cap = Dereference(Add(raw, ANSIFrameOff.CAP))
+        Deallocate(raw, Add(ANSIFrameOff.HEADER_SIZE, cap))
+    }
+}
+
+// Synchronously write the frame to stdout, wrapped in synchronized output
+// mode (DEC private mode 2026). Terminals that support 2026 will buffer
+// the entire payload internally and present it atomically — no tearing,
+// no flicker. Terminals that don't support 2026 silently ignore the
+// h/l brackets and render the inner sequences normally. Always free.
+//
+// xterm-ctlseqs DEC private mode 2026 (Synchronized Output):
+//   begin: CSI ? 2026 h
+//   end:   CSI ? 2026 l
+Function.ANSI.FlushFrame {
+    Input: buf: Address
+    Input: pos: Integer
+    Body: {
+        // Wrap-buffer for the begin/end brackets. Done outside `buf` so we
+        // can write the prologue + body + epilogue in a single fd write.
+        wrapped = Allocate(Add(pos, 24))
+        wpos = 0
+        wpos = ANSI_AppendCSI(wrapped, wpos)
+        wpos = ANSI_AppendStr(wrapped, wpos, "?2026h")
+        wpos = ANSI_AppendBytes(wrapped, wpos, buf, pos)
+        wpos = ANSI_AppendCSI(wrapped, wpos)
+        wpos = ANSI_AppendStr(wrapped, wpos, "?2026l")
+        SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, wrapped, wpos, 0, 0)
+        Deallocate(wrapped, Add(pos, 24))
+        ANSI.FreeFrame(buf)
+    }
+}
+
+// Same as FlushFrame but without the synchronized-output wrap. Useful when
+// the caller is already inside a sync block (nesting is undefined, so we
+// never auto-nest).
+Function.ANSI.FlushFrameRaw {
+    Input: buf: Address
+    Input: pos: Integer
+    Body: {
+        SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, buf, pos, 0, 0)
+        ANSI.FreeFrame(buf)
+    }
+}
+
+// =============================================================================
+// SYNCHRONIZED OUTPUT — the "buffer thing"
+// =============================================================================
+// Spec: https://gist.github.com/christianparpart/d8a62cc1ab659194337d73e399004036
+// Supported by: kitty, WezTerm, iTerm2, Ghostty, foot, contour, Alacritty (recent).
+// Unsupported terminals: silently ignore the h/l brackets.
+
+Function.ANSI.Build_SyncBegin {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?2026h"))
+    }
+}
+
+Function.ANSI.Build_SyncEnd {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?2026l"))
+    }
+}
+
+SubRoutine.ANSI.SyncBegin {
+    buf = Allocate(8)
+    pos = 0
+    pos = ANSI_AppendCSI(buf, pos)
+    pos = ANSI_AppendStr(buf, pos, "?2026h")
+    SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, buf, pos, 0, 0)
+    Deallocate(buf, 8)
+}
+SubRoutine.ANSI.SyncEnd {
+    buf = Allocate(8)
+    pos = 0
+    pos = ANSI_AppendCSI(buf, pos)
+    pos = ANSI_AppendStr(buf, pos, "?2026l")
+    SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, buf, pos, 0, 0)
+    Deallocate(buf, 8)
+}
+
+// =============================================================================
+// OSC 8 — HYPERLINKS
+// =============================================================================
+// Spec: https://gist.github.com/egmontkob/eb114294efbcd5adb1944c9f3cb5feda
+// Wire format:
+//   ESC ] 8 ; <params> ; <URL> ESC \         — open
+//   ESC ] 8 ; ;                ESC \         — close (empty URL)
+//   <params> is a key=value:key=value list, usually empty. We always emit empty.
+// Supported by: kitty, WezTerm, iTerm2, Ghostty, gnome-terminal (VTE), foot,
+//   alacritty (recent), mintty. Unsupported terminals show only the inner text.
+//
+// URL encoding: per spec the URL must not contain control bytes or the ST
+// terminator (ESC \). Caller is responsible for percent-encoding suspicious
+// bytes — for typical http(s):// and file:// URLs no encoding is needed.
+
+Function.ANSI.Build_HyperlinkOpen {
+    Input: buf:  Address
+    Input: pos:  Integer
+    Input: url:  Address
+    Input: ulen: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendOSC(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "8;;")
+        pos = ANSI_AppendBytes(buf, pos, url, ulen)
+        ReturnValue(ANSI_AppendST(buf, pos))
+    }
+}
+
+Function.ANSI.Build_HyperlinkClose {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendOSC(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "8;;")
+        ReturnValue(ANSI_AppendST(buf, pos))
+    }
+}
+
+// Emit open + text + close in one builder call — convenience for the
+// common case of "wrap this string in a link".
+Function.ANSI.Build_Hyperlink {
+    Input: buf:  Address
+    Input: pos:  Integer
+    Input: url:  Address
+    Input: ulen: Integer
+    Input: txt:  Address
+    Input: tlen: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI.Build_HyperlinkOpen(buf, pos, url, ulen)
+        pos = ANSI_AppendBytes(buf, pos, txt, tlen)
+        pos = ANSI.Build_HyperlinkClose(buf, pos)
+        ReturnValue(pos)
+    }
+}
+
+// =============================================================================
+// OSC 0 / 2 — WINDOW TITLE
+// =============================================================================
+// xterm-ctlseqs:  ESC ] 0 ; <text> ST     — set both icon name and window title
+//                 ESC ] 2 ; <text> ST     — set window title only
+// We use OSC 0 (set both) since it's the broadly-useful default. Always
+// terminate with ST (ESC \) per spec; BEL terminator works on most
+// terminals but is non-standard.
+
+Function.ANSI.Build_SetTitle {
+    Input: buf:  Address
+    Input: pos:  Integer
+    Input: text: Address
+    Input: len:  Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendOSC(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "0;")
+        pos = ANSI_AppendBytes(buf, pos, text, len)
+        ReturnValue(ANSI_AppendST(buf, pos))
+    }
+}
+
+Function.ANSI.SetTitle {
+    Input: text: Address
+    Input: len:  Integer
+    Body: {
+        buf = ANSI.NewFrame()
+        pos = ANSI.Build_SetTitle(buf, 0, text, len)
+        ANSI.FlushFrameRaw(buf, pos)
+    }
+}
+
+// =============================================================================
+// BRACKETED PASTE
+// =============================================================================
+// xterm-ctlseqs DEC private mode 2004:
+//   on:  CSI ? 2004 h
+//   off: CSI ? 2004 l
+// When enabled, pasted text is wrapped by the terminal in:
+//   ESC [ 200 ~ <pasted text> ESC [ 201 ~
+// so an application reading raw stdin can distinguish paste from typing.
+
+Function.ANSI.Build_BracketedPasteOn {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?2004h"))
+    }
+}
+
+Function.ANSI.Build_BracketedPasteOff {
+    Input: buf: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?2004l"))
+    }
+}
+
+SubRoutine.ANSI.BracketedPasteOn {
+    buf = Allocate(8)
+    pos = 0
+    pos = ANSI_AppendCSI(buf, pos)
+    pos = ANSI_AppendStr(buf, pos, "?2004h")
+    SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, buf, pos, 0, 0)
+    Deallocate(buf, 8)
+}
+SubRoutine.ANSI.BracketedPasteOff {
+    buf = Allocate(8)
+    pos = 0
+    pos = ANSI_AppendCSI(buf, pos)
+    pos = ANSI_AppendStr(buf, pos, "?2004l")
+    SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, buf, pos, 0, 0)
+    Deallocate(buf, 8)
+}
+
+// Bracketed-paste markers, exposed so an input parser can detect them.
+// Use these with byte-by-byte matching on stdin in raw mode.
+//   PASTE_START: ESC [ 200 ~   — 6 bytes
+//   PASTE_END:   ESC [ 201 ~   — 6 bytes
+
+// =============================================================================
+// CURSOR SHAPE — DECSCUSR
+// =============================================================================
+// DEC STD: CSI Ps SP q
+//   Ps=0  blinking block (default)
+//   Ps=1  blinking block
+//   Ps=2  steady block
+//   Ps=3  blinking underline
+//   Ps=4  steady underline
+//   Ps=5  blinking beam      (xterm extension, universal modern)
+//   Ps=6  steady beam        (xterm extension, universal modern)
+// Use the ANSICursor.* constants for clarity.
+
+Function.ANSI.Build_CursorShape {
+    Input: buf:   Address
+    Input: pos:   Integer
+    Input: shape: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendInt(buf, pos, shape)
+        pos = ANSI_AppendStr(buf, pos, " q")
+        ReturnValue(pos)
+    }
+}
+
+Function.ANSI.SetCursorShape {
+    Input: shape: Integer
+    Body: {
+        buf = ANSI.NewFrame()
+        pos = ANSI.Build_CursorShape(buf, 0, shape)
+        ANSI.FlushFrameRaw(buf, pos)
+    }
+}
+
+// =============================================================================
+// CURSOR — visibility, position, save/restore
+// =============================================================================
+// xterm-ctlseqs:
+//   show:    CSI ? 25 h
+//   hide:    CSI ? 25 l
+//   move:    CSI <row> ; <col> H        (1-based)
+//   save:    ESC 7
+//   restore: ESC 8
+
+Function.ANSI.Build_HideCursor {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?25l"))
+    }
+}
+Function.ANSI.Build_ShowCursor {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?25h"))
+    }
+}
+Function.ANSI.Build_CursorTo {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: row: Integer
+    Input: col: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendInt(buf, pos, row)
+        pos = ANSI_AppendByte(buf, pos, 59)         // ';'
+        pos = ANSI_AppendInt(buf, pos, col)
+        pos = ANSI_AppendByte(buf, pos, 72)         // 'H'
+        ReturnValue(pos)
+    }
+}
+Function.ANSI.Build_CursorSave {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendESC(buf, pos)
+        ReturnValue(ANSI_AppendByte(buf, pos, 55))  // '7'
+    }
+}
+Function.ANSI.Build_CursorRestore {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendESC(buf, pos)
+        ReturnValue(ANSI_AppendByte(buf, pos, 56))  // '8'
+    }
+}
+
+SubRoutine.ANSI.HideCursor {
+    buf = Allocate(6)
+    pos = 0
+    pos = ANSI_AppendCSI(buf, pos)
+    pos = ANSI_AppendStr(buf, pos, "?25l")
+    SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, buf, pos, 0, 0)
+    Deallocate(buf, 6)
+}
+SubRoutine.ANSI.ShowCursor {
+    buf = Allocate(6)
+    pos = 0
+    pos = ANSI_AppendCSI(buf, pos)
+    pos = ANSI_AppendStr(buf, pos, "?25h")
+    SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, buf, pos, 0, 0)
+    Deallocate(buf, 6)
+}
+
+// =============================================================================
+// SCREEN — alt buffer, clear
+// =============================================================================
+// xterm-ctlseqs:
+//   alt enter:  CSI ? 1049 h    — save cursor, switch to alt screen, clear
+//   alt leave:  CSI ? 1049 l    — switch back, restore cursor
+//   clear:      CSI 2 J + CSI H — clear and home
+//
+// ?1049 is preferred over the older ?47 / ?1047 — it bundles cursor save and
+// clear into one mode. Universal modern.
+
+Function.ANSI.Build_AltScreenEnter {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?1049h"))
+    }
+}
+Function.ANSI.Build_AltScreenLeave {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?1049l"))
+    }
+}
+Function.ANSI.Build_ClearScreen {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "2J")
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendByte(buf, pos, 72))  // 'H'
+    }
+}
+
+// =============================================================================
+// MOUSE SGR — extended mouse reporting (mode 1006)
+// =============================================================================
+// xterm-ctlseqs:
+//   ?1000  any-event mouse (button press/release only)
+//   ?1002  button-event mouse (also drag)
+//   ?1003  any-event mouse (also motion without buttons)
+//   ?1006  SGR extended encoding (decimal coords, no 223-byte limit)
+//
+// Standard combo for a modern mouse-driven app:
+//   on:  ?1000h ?1002h ?1006h
+//   off: ?1006l ?1002l ?1000l
+//
+// Decoding the events is the input layer's job — see DInputTTY in the
+// display-system spec for a reference SGR parser.
+
+Function.ANSI.Build_MouseSGROn {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "?1000h")
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "?1002h")
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?1006h"))
+    }
+}
+Function.ANSI.Build_MouseSGROff {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "?1006l")
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "?1002l")
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "?1000l"))
+    }
+}
+
+// =============================================================================
+// SGR — ATTRIBUTES AND COLOR
+// =============================================================================
+// ECMA-48 SGR base: CSI Ps m
+// ITU-T T.416 truecolor extension:  CSI 38 ; 2 ; r ; g ; b m  (fg)
+//                                   CSI 48 ; 2 ; r ; g ; b m  (bg)
+// xterm 256-color extension:        CSI 38 ; 5 ; idx m  (fg)
+//                                   CSI 48 ; 5 ; idx m  (bg)
+// All universal in modern terminals.
+
+Function.ANSI.Build_ResetSGR {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendStr(buf, pos, "0m"))
+    }
+}
+
+// Generic single-parameter SGR. Use ANSISGR.* constants for the common
+// attributes (BOLD, FAINT, ITALIC, UNDERLINE, REVERSE, STRIKETHROUGH).
+Function.ANSI.Build_SGRAttr {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: code: Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendInt(buf, pos, code)
+        ReturnValue(ANSI_AppendByte(buf, pos, 109))    // 'm'
+    }
+}
+
+// 24-bit truecolor foreground: CSI 38;2;r;g;b m
+Function.ANSI.Build_FgRGB {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: r:   Integer
+    Input: g:   Integer
+    Input: b:   Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "38;2;")
+        pos = ANSI_AppendInt(buf, pos, r)
+        pos = ANSI_AppendByte(buf, pos, 59)
+        pos = ANSI_AppendInt(buf, pos, g)
+        pos = ANSI_AppendByte(buf, pos, 59)
+        pos = ANSI_AppendInt(buf, pos, b)
+        ReturnValue(ANSI_AppendByte(buf, pos, 109))    // 'm'
+    }
+}
+
+// 24-bit truecolor background: CSI 48;2;r;g;b m
+Function.ANSI.Build_BgRGB {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: r:   Integer
+    Input: g:   Integer
+    Input: b:   Integer
+    Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "48;2;")
+        pos = ANSI_AppendInt(buf, pos, r)
+        pos = ANSI_AppendByte(buf, pos, 59)
+        pos = ANSI_AppendInt(buf, pos, g)
+        pos = ANSI_AppendByte(buf, pos, 59)
+        pos = ANSI_AppendInt(buf, pos, b)
+        ReturnValue(ANSI_AppendByte(buf, pos, 109))    // 'm'
+    }
+}
+
+// 256-color palette foreground: CSI 38;5;idx m
+Function.ANSI.Build_Fg256 {
+    Input: buf: Address  Input: pos: Integer  Input: idx: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "38;5;")
+        pos = ANSI_AppendInt(buf, pos, idx)
+        ReturnValue(ANSI_AppendByte(buf, pos, 109))    // 'm'
+    }
+}
+
+// 256-color palette background: CSI 48;5;idx m
+Function.ANSI.Build_Bg256 {
+    Input: buf: Address  Input: pos: Integer  Input: idx: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        pos = ANSI_AppendStr(buf, pos, "48;5;")
+        pos = ANSI_AppendInt(buf, pos, idx)
+        ReturnValue(ANSI_AppendByte(buf, pos, 109))    // 'm'
+    }
+}
+
+// =============================================================================
+// CAPABILITY QUERY — DA1 (Primary Device Attributes)
+// =============================================================================
+// xterm-ctlseqs: CSI c   — terminal replies with CSI ? <kind> ; <opts> c
+// Use to runtime-detect terminal class. Parsing is the input layer's job;
+// this lib only emits the request.
+
+Function.ANSI.Build_QueryDA1 {
+    Input: buf: Address  Input: pos: Integer  Output: Integer
+    Body: {
+        pos = ANSI_AppendCSI(buf, pos)
+        ReturnValue(ANSI_AppendByte(buf, pos, 99))     // 'c'
+    }
+}
+
+// =============================================================================
+// CONVENIENCE — direct text emit + raw text into a frame
+// =============================================================================
+// Plain text inside a frame: forwards to AppendBytes. Provided for symmetry
+// so an entire frame can be assembled with `pos = ANSI.Build_*(...)` calls
+// only — no mixing of helpers.
+
+Function.ANSI.Build_PutText {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: txt: Address
+    Input: len: Integer
+    Output: Integer
+    Body: { ReturnValue(ANSI_AppendBytes(buf, pos, txt, len)) }
+}
+
+Function.ANSI.Build_PutStr {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: s:   Address
+    Output: Integer
+    Body: { ReturnValue(ANSI_AppendStr(buf, pos, s)) }
+}
+
+// Raw write of a byte string to stdout — useful for quick prints when no
+// frame is needed (e.g. a single newline).
+Function.ANSI.WriteRaw {
+    Input: s:   Address
+    Input: len: Integer
+    Body: { SystemCall(ANSISys.SYS_WRITE, ANSISys.STDOUT, s, len, 0, 0) }
+}
