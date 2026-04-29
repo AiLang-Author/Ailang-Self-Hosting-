@@ -1,0 +1,1288 @@
+// Library.JSBridge.ailang — DOM bindings for JavaScript engine
+// Connects JSVM to the HTMLDom tree. Creates JS wrapper objects for DOM
+// elements (document, console, Math), registers native functions the VM
+// can call, dispatches native calls to the appropriate DOM/Runtime
+// functions, manages event listeners (addEventListener), and provides
+// timer integration (setTimeout/setInterval forwarding).
+//
+// CLOBBER SAFETY: Every function saves Input params to locals on the FIRST
+// line of Body. Complex expressions broken into steps. JSBridgeTmp fields
+// guarded with push/pop across recursive calls.
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.XArrays
+LibraryImport.StringUtils
+LibraryImport.HashMap
+LibraryImport.Browser.HTMLDom
+LibraryImport.Browser.JSRuntime
+
+// =============================================================================
+// BRIDGE CONSTANTS
+// =============================================================================
+FixedPool.JSBridgeConst {
+    "MAX_LISTENERS":  Initialize=256
+    "LISTENER_SIZE":  Initialize=24    // dom_node:8, event_name_ptr:8, callback_jsval:8
+    "MAX_DOM_WRAPS":  Initialize=512
+    "WRAP_SIZE":      Initialize=16    // dom_idx:8, js_obj:8
+}
+
+// =============================================================================
+// BRIDGE STATE — runtime pools and counters
+// =============================================================================
+FixedPool.JSBridgeState {
+    "listeners":      Initialize=0    // allocated pool for event listeners
+    "listener_count": Initialize=0
+    "dom_wraps":      Initialize=0    // allocated pool for DOM node -> JS object mapping
+    "wrap_count":     Initialize=0
+    "document_obj":   Initialize=0    // JS object for 'document'
+    "console_obj":    Initialize=0    // JS object for 'console'
+    "math_obj":       Initialize=0    // JS object for 'Math'
+    "dom_root":       Initialize=0    // DOM root node index
+    "initialized":    Initialize=0
+}
+
+// =============================================================================
+// CLOBBER-SAFE TEMPORARIES
+// =============================================================================
+FixedPool.JSBridgeTmp {
+    "idx":        Initialize=0
+    "ptr":        Initialize=0
+    "len":        Initialize=0
+    "type":       Initialize=0
+    "val":        Initialize=0
+    "val2":       Initialize=0
+    "addr":       Initialize=0
+    "dom_idx":    Initialize=0
+    "node":       Initialize=0
+    "found":      Initialize=0
+    "count":      Initialize=0
+    "result":     Initialize=0
+    "name_ptr":   Initialize=0
+    "cb_val":     Initialize=0
+    "obj":        Initialize=0
+}
+
+// =============================================================================
+// PUSH/POP STACK — clobber safety across function calls
+// =============================================================================
+FixedPool.JSBridgeStack {
+    "pool":       Initialize=0
+    "capacity":   Initialize=0
+    "sp":         Initialize=0
+}
+
+// =============================================================================
+// NATIVE FUNCTION IDS — constants for dispatch
+// JSRuntime built-ins use handlers 0-7. Bridge uses 8+.
+// Native functions are registered with bc_off = -(handler_id + 1).
+// =============================================================================
+FixedPool.JSNativeID {
+    "CONSOLE_LOG":         Initialize=8
+    "DOC_GET_BY_ID":       Initialize=9
+    "DOC_QUERY_SEL":       Initialize=10
+    "DOC_CREATE_ELEM":     Initialize=11
+    "ELEM_GET_ATTR":       Initialize=12
+    "ELEM_SET_ATTR":       Initialize=13
+    "ELEM_ADD_LISTENER":   Initialize=14
+    "ELEM_INNER_HTML_GET": Initialize=15
+    "ELEM_INNER_HTML_SET": Initialize=16
+    "ELEM_TEXT_CONTENT":   Initialize=17
+    "ELEM_APPEND_CHILD":   Initialize=18
+    "ELEM_REMOVE_CHILD":   Initialize=19
+    "ELEM_STYLE_SET":      Initialize=20
+    "SET_TIMEOUT":         Initialize=21
+    "SET_INTERVAL":        Initialize=22
+    "CLEAR_TIMEOUT":       Initialize=23
+    "PARSE_INT":           Initialize=24
+    "MATH_ABS":            Initialize=25
+    "MATH_MAX":            Initialize=26
+    "MATH_MIN":            Initialize=27
+    "MATH_FLOOR":          Initialize=28
+}
+
+// =============================================================================
+// STACK PUSH / POP — save/restore values across clobbering calls
+// =============================================================================
+Function.JSBridge__Push {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        save_val = val
+        addr = Add(JSBridgeStack.pool, Multiply(JSBridgeStack.sp, 8))
+        StoreValue(addr, save_val)
+        JSBridgeStack.sp = Add(JSBridgeStack.sp, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSBridge__Pop {
+    Output: Integer
+    Body: {
+        JSBridgeStack.sp = Subtract(JSBridgeStack.sp, 1)
+        addr = Add(JSBridgeStack.pool, Multiply(JSBridgeStack.sp, 8))
+        ReturnValue(Dereference(addr))
+    }
+}
+
+// =============================================================================
+// INIT — allocate pools, create global objects, register native functions
+// =============================================================================
+Function.JSBridge_Init {
+    Input: dom_root: Integer
+    Output: Integer
+    Body: {
+        save_root = dom_root
+
+        // Allocate listener pool: 256 * 24 = 6144 bytes
+        lsz = Multiply(JSBridgeConst.MAX_LISTENERS, JSBridgeConst.LISTENER_SIZE)
+        JSBridgeState.listeners = Allocate(lsz)
+        IfCondition EqualTo(JSBridgeState.listeners, 0) ThenBlock: {
+            PrintMessage("[JSBridge] listener alloc fail\n")
+            ReturnValue(0)
+        }
+        MemorySet(JSBridgeState.listeners, 0, lsz)
+        JSBridgeState.listener_count = 0
+
+        // Allocate DOM wrap pool: 512 * 16 = 8192 bytes
+        wsz = Multiply(JSBridgeConst.MAX_DOM_WRAPS, JSBridgeConst.WRAP_SIZE)
+        JSBridgeState.dom_wraps = Allocate(wsz)
+        IfCondition EqualTo(JSBridgeState.dom_wraps, 0) ThenBlock: {
+            PrintMessage("[JSBridge] wrap alloc fail\n")
+            ReturnValue(0)
+        }
+        MemorySet(JSBridgeState.dom_wraps, 0, wsz)
+        JSBridgeState.wrap_count = 0
+
+        // Allocate push/pop stack: 2048 * 8 = 16384 bytes
+        JSBridgeStack.pool = Allocate(16384)
+        IfCondition EqualTo(JSBridgeStack.pool, 0) ThenBlock: {
+            PrintMessage("[JSBridge] stack alloc fail\n")
+            ReturnValue(0)
+        }
+        JSBridgeStack.capacity = 2048
+        JSBridgeStack.sp = 0
+
+        // Save DOM root
+        JSBridgeState.dom_root = save_root
+
+        // Create the document object
+        JSBridgeState.document_obj = JSBridge__CreateDocObj()
+
+        // Create the console object (bridge version with actual I/O)
+        JSBridgeState.console_obj = JSBridge__CreateConsoleObj()
+
+        // Create the Math object (delegates to JSRT built-ins)
+        JSBridgeState.math_obj = JSBridge__CreateMathObj()
+
+        JSBridgeState.initialized = 1
+        PrintMessage("[JSBridge] initialized\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// RESET — clear all pools, reset state
+// =============================================================================
+Function.JSBridge_Reset {
+    Output: Integer
+    Body: {
+        lsz = Multiply(JSBridgeConst.MAX_LISTENERS, JSBridgeConst.LISTENER_SIZE)
+        IfCondition NotEqual(JSBridgeState.listeners, 0) ThenBlock: {
+            MemorySet(JSBridgeState.listeners, 0, lsz)
+        }
+        JSBridgeState.listener_count = 0
+
+        wsz = Multiply(JSBridgeConst.MAX_DOM_WRAPS, JSBridgeConst.WRAP_SIZE)
+        IfCondition NotEqual(JSBridgeState.dom_wraps, 0) ThenBlock: {
+            MemorySet(JSBridgeState.dom_wraps, 0, wsz)
+        }
+        JSBridgeState.wrap_count = 0
+
+        JSBridgeState.document_obj = 0
+        JSBridgeState.console_obj = 0
+        JSBridgeState.math_obj = 0
+        JSBridgeState.dom_root = 0
+        JSBridgeState.initialized = 0
+        JSBridgeStack.sp = 0
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// REGISTER GLOBALS — inject document, console, Math, setTimeout, etc.
+// into the VM's global hash. Called from JSEngine which passes JSVM_SetGlobal.
+// =============================================================================
+Function.JSBridge_RegisterGlobals {
+    Output: Integer
+    Body: {
+        // This function is now a stub — actual registration is done by
+        // JSEngine__RegisterBridgeGlobals which has access to both
+        // JSVM_SetGlobal and JSBridge state.
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// HELPER — create a native function JSValue for a given handler ID
+// bc_off = -(handler_id + 1), which JSVM decodes back to handler_id
+// =============================================================================
+Function.JSBridge__CreateNativeFunc {
+    Input: handler_id: Integer
+    Input: name: Address
+    Input: param_count: Integer
+    Output: Address
+    Body: {
+        save_id = handler_id
+        save_name = name
+        save_pc = param_count
+        // bytecode offset = -(handler_id + 1)
+        bc_off = Subtract(0, Add(save_id, 1))
+        ReturnValue(JSRT_CreateFunc(bc_off, save_pc, 0, save_name))
+    }
+}
+
+// =============================================================================
+// CREATE DOCUMENT OBJECT — JS object with getElementById, querySelector, etc.
+// =============================================================================
+Function.JSBridge__CreateDocObj {
+    Output: Address
+    Body: {
+        doc = JSRT_CreateObject()
+
+        // ─── document.getElementById ───
+        JSBridge__Push(doc)
+        gbi_func = JSBridge__CreateNativeFunc(JSNativeID.DOC_GET_BY_ID, "getElementById", 1)
+        doc = JSBridge__Pop()
+        JSRT_ObjSet(doc, "getElementById", gbi_func)
+
+        // ─── document.querySelector ───
+        JSBridge__Push(doc)
+        qs_func = JSBridge__CreateNativeFunc(JSNativeID.DOC_QUERY_SEL, "querySelector", 1)
+        doc = JSBridge__Pop()
+        JSRT_ObjSet(doc, "querySelector", qs_func)
+
+        // ─── document.createElement ───
+        JSBridge__Push(doc)
+        ce_func = JSBridge__CreateNativeFunc(JSNativeID.DOC_CREATE_ELEM, "createElement", 1)
+        doc = JSBridge__Pop()
+        JSRT_ObjSet(doc, "createElement", ce_func)
+
+        ReturnValue(doc)
+    }
+}
+
+// =============================================================================
+// CREATE CONSOLE OBJECT — bridge version with actual I/O via PrintMessage
+// =============================================================================
+Function.JSBridge__CreateConsoleObj {
+    Output: Address
+    Body: {
+        con = JSRT_CreateObject()
+
+        // ─── console.log ───
+        JSBridge__Push(con)
+        log_func = JSBridge__CreateNativeFunc(JSNativeID.CONSOLE_LOG, "console.log", 1)
+        con = JSBridge__Pop()
+        JSRT_ObjSet(con, "log", log_func)
+
+        ReturnValue(con)
+    }
+}
+
+// =============================================================================
+// CREATE MATH OBJECT — delegates to JSRuntime built-in Math handlers
+// Bridge registers its own handler IDs so it can intercept if needed.
+// =============================================================================
+Function.JSBridge__CreateMathObj {
+    Output: Address
+    Body: {
+        mo = JSRT_CreateObject()
+
+        // ─── Math.abs ───
+        JSBridge__Push(mo)
+        abs_func = JSBridge__CreateNativeFunc(JSNativeID.MATH_ABS, "Math.abs", 1)
+        mo = JSBridge__Pop()
+        JSRT_ObjSet(mo, "abs", abs_func)
+
+        // ─── Math.max ───
+        JSBridge__Push(mo)
+        max_func = JSBridge__CreateNativeFunc(JSNativeID.MATH_MAX, "Math.max", 2)
+        mo = JSBridge__Pop()
+        JSRT_ObjSet(mo, "max", max_func)
+
+        // ─── Math.min ───
+        JSBridge__Push(mo)
+        min_func = JSBridge__CreateNativeFunc(JSNativeID.MATH_MIN, "Math.min", 2)
+        mo = JSBridge__Pop()
+        JSRT_ObjSet(mo, "min", min_func)
+
+        // ─── Math.floor ───
+        JSBridge__Push(mo)
+        flr_func = JSBridge__CreateNativeFunc(JSNativeID.MATH_FLOOR, "Math.floor", 1)
+        mo = JSBridge__Pop()
+        JSRT_ObjSet(mo, "floor", flr_func)
+
+        ReturnValue(mo)
+    }
+}
+
+// =============================================================================
+// DOM NODE WRAPPING — create or find cached JS object for a DOM node
+// Each wrapped node is a JS OBJECT with:
+//   __dom_idx  : NUMBER (the DOM node index)
+//   tagName    : STRING
+//   id         : STRING (if present)
+//   innerHTML  : STRING (text of first text child)
+//   getAttribute    : FUNCTION (native)
+//   setAttribute    : FUNCTION (native)
+//   addEventListener: FUNCTION (native)
+//   textContent     : STRING (alias of innerHTML for v1)
+// =============================================================================
+
+// Look up existing wrapper by DOM index. Returns JS object or 0.
+Function.JSBridge__FindWrap {
+    Input: dom_idx: Integer
+    Output: Address
+    Body: {
+        save_idx = dom_idx
+        wi = 0
+        WhileLoop LessThan(wi, JSBridgeState.wrap_count) {
+            base = Add(JSBridgeState.dom_wraps, Multiply(wi, JSBridgeConst.WRAP_SIZE))
+            entry_idx = Dereference(base)
+            IfCondition EqualTo(entry_idx, save_idx) ThenBlock: {
+                ReturnValue(Dereference(Add(base, 8)))
+            }
+            wi = Add(wi, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Store a new DOM-index -> JS-object mapping.
+Function.JSBridge__StoreWrap {
+    Input: dom_idx: Integer
+    Input: js_obj: Address
+    Output: Integer
+    Body: {
+        save_idx = dom_idx
+        save_obj = js_obj
+        IfCondition GreaterEqual(JSBridgeState.wrap_count, JSBridgeConst.MAX_DOM_WRAPS) ThenBlock: {
+            PrintMessage("[JSBridge] wrap pool full\n")
+            ReturnValue(0)
+        }
+        base = Add(JSBridgeState.dom_wraps, Multiply(JSBridgeState.wrap_count, JSBridgeConst.WRAP_SIZE))
+        StoreValue(base, save_idx)
+        StoreValue(Add(base, 8), save_obj)
+        JSBridgeState.wrap_count = Add(JSBridgeState.wrap_count, 1)
+        ReturnValue(1)
+    }
+}
+
+// Public API: wrap a DOM node as a JS object (or return cached wrapper).
+Function.JSBridge_WrapNode {
+    Input: dom_idx: Integer
+    Output: Address
+    Body: {
+        save_idx = dom_idx
+
+        // Negative index means "not found" in DOM
+        IfCondition LessThan(save_idx, 0) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        // Check cache first
+        cached = JSBridge__FindWrap(save_idx)
+        IfCondition NotEqual(cached, 0) ThenBlock: {
+            ReturnValue(cached)
+        }
+
+        // Create new JS object
+        obj = JSRT_CreateObject()
+
+        // Set __dom_idx property
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        idx_val = JSRT_CreateNumber(save_idx)
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        JSRT_ObjSet(obj, "__dom_idx", idx_val)
+
+        // Set tagName
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        tag_ptr = DOM_GetTag(save_idx)
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        IfCondition NotEqual(tag_ptr, 0) ThenBlock: {
+            JSBridge__Push(save_idx)
+            JSBridge__Push(obj)
+            tag_val = JSRT_CreateString(tag_ptr)
+            obj = JSBridge__Pop()
+            save_idx = JSBridge__Pop()
+            JSRT_ObjSet(obj, "tagName", tag_val)
+        }
+
+        // Set id (from DOM attribute)
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        id_ptr = DOM_GetAttr(save_idx, "id")
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        IfCondition NotEqual(id_ptr, 0) ThenBlock: {
+            JSBridge__Push(save_idx)
+            JSBridge__Push(obj)
+            id_val = JSRT_CreateString(id_ptr)
+            obj = JSBridge__Pop()
+            save_idx = JSBridge__Pop()
+            JSRT_ObjSet(obj, "id", id_val)
+        }
+
+        // Set innerHTML / textContent from first TEXT child
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        text_str = JSBridge__GetNodeText(save_idx)
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        IfCondition NotEqual(text_str, 0) ThenBlock: {
+            JSBridge__Push(save_idx)
+            JSBridge__Push(obj)
+            text_val = JSRT_CreateString(text_str)
+            obj = JSBridge__Pop()
+            save_idx = JSBridge__Pop()
+            JSRT_ObjSet(obj, "innerHTML", text_val)
+            // textContent aliases innerHTML for v1
+            JSRT_ObjSet(obj, "textContent", text_val)
+        }
+
+        // ─── method: getAttribute ───
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        ga_func = JSBridge__CreateNativeFunc(JSNativeID.ELEM_GET_ATTR, "getAttribute", 1)
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        JSRT_ObjSet(obj, "getAttribute", ga_func)
+
+        // ─── method: setAttribute ───
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        sa_func = JSBridge__CreateNativeFunc(JSNativeID.ELEM_SET_ATTR, "setAttribute", 2)
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        JSRT_ObjSet(obj, "setAttribute", sa_func)
+
+        // ─── method: addEventListener ───
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        ael_func = JSBridge__CreateNativeFunc(JSNativeID.ELEM_ADD_LISTENER, "addEventListener", 2)
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        JSRT_ObjSet(obj, "addEventListener", ael_func)
+
+        // ─── method: appendChild ───
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        ac_func = JSBridge__CreateNativeFunc(JSNativeID.ELEM_APPEND_CHILD, "appendChild", 1)
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        JSRT_ObjSet(obj, "appendChild", ac_func)
+
+        // ─── method: removeChild ───
+        JSBridge__Push(save_idx)
+        JSBridge__Push(obj)
+        rc_func = JSBridge__CreateNativeFunc(JSNativeID.ELEM_REMOVE_CHILD, "removeChild", 1)
+        obj = JSBridge__Pop()
+        save_idx = JSBridge__Pop()
+        JSRT_ObjSet(obj, "removeChild", rc_func)
+
+        // Store in wrap cache
+        JSBridge__StoreWrap(save_idx, obj)
+
+        ReturnValue(obj)
+    }
+}
+
+// =============================================================================
+// HELPER — get the text content of a DOM node's first TEXT child
+// Returns pointer to string, or 0 if no text child
+// =============================================================================
+Function.JSBridge__GetNodeText {
+    Input: dom_idx: Integer
+    Output: Address
+    Body: {
+        save_idx = dom_idx
+        IfCondition LessThan(save_idx, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Check if this node itself is a text node
+        ntype = DOM_GetType(save_idx)
+        IfCondition EqualTo(ntype, DOMType.TEXT) ThenBlock: {
+            ReturnValue(DOM_GetText(save_idx))
+        }
+
+        // Walk children to find first TEXT node
+        ch = DOM_GetFirstChild(save_idx)
+        WhileLoop NotEqual(ch, -1) {
+            ch_type = DOM_GetType(ch)
+            IfCondition EqualTo(ch_type, DOMType.TEXT) ThenBlock: {
+                ReturnValue(DOM_GetText(ch))
+            }
+            ch = DOM_GetNextSib(ch)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// HELPER — extract __dom_idx integer from a JS wrapper object
+// Returns the DOM node index, or -1 if not a wrapper
+// =============================================================================
+Function.JSBridge__GetDomIdx {
+    Input: js_obj: Address
+    Output: Integer
+    Body: {
+        save_obj = js_obj
+        IfCondition EqualTo(save_obj, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        otype = JSRT_GetType(save_obj)
+        IfCondition NotEqual(otype, JSType.OBJECT) ThenBlock: {
+            ReturnValue(-1)
+        }
+        idx_val = JSRT_ObjGet(save_obj, "__dom_idx")
+        IfCondition EqualTo(idx_val, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        vtype = JSRT_GetType(idx_val)
+        IfCondition NotEqual(vtype, JSType.NUMBER) ThenBlock: {
+            ReturnValue(-1)
+        }
+        ReturnValue(JSRT_GetPayload(idx_val))
+    }
+}
+
+// =============================================================================
+// NATIVE DISPATCH — route handler ID to the appropriate native impl
+// Called by JSVM when handler_id >= 8.
+// args = pointer to array of JSValue pointers (8 bytes each)
+// argc = number of arguments
+// Returns a JSValue pointer (result).
+// =============================================================================
+Function.JSBridge_Dispatch {
+    Input: native_id: Integer
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_id = native_id
+        save_args = args
+        save_argc = argc
+
+        // ─── CONSOLE_LOG (8) ───
+        IfCondition EqualTo(save_id, JSNativeID.CONSOLE_LOG) ThenBlock: {
+            ReturnValue(JSBridge__NConsoleLog(save_args, save_argc))
+        }
+
+        // ─── DOC_GET_BY_ID (9) ───
+        IfCondition EqualTo(save_id, JSNativeID.DOC_GET_BY_ID) ThenBlock: {
+            ReturnValue(JSBridge__NGetById(save_args, save_argc))
+        }
+
+        // ─── DOC_QUERY_SEL (10) ───
+        IfCondition EqualTo(save_id, JSNativeID.DOC_QUERY_SEL) ThenBlock: {
+            ReturnValue(JSBridge__NQuerySel(save_args, save_argc))
+        }
+
+        // ─── DOC_CREATE_ELEM (11) ───
+        IfCondition EqualTo(save_id, JSNativeID.DOC_CREATE_ELEM) ThenBlock: {
+            // Stub for v1 — return undefined
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // ─── ELEM_GET_ATTR (12) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_GET_ATTR) ThenBlock: {
+            ReturnValue(JSBridge__NGetAttr(save_args, save_argc))
+        }
+
+        // ─── ELEM_SET_ATTR (13) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_SET_ATTR) ThenBlock: {
+            // Stub for v1 — return undefined
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // ─── ELEM_ADD_LISTENER (14) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_ADD_LISTENER) ThenBlock: {
+            ReturnValue(JSBridge__NAddListener(save_args, save_argc))
+        }
+
+        // ─── ELEM_INNER_HTML_GET (15) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_INNER_HTML_GET) ThenBlock: {
+            ReturnValue(JSBridge__NInnerHTMLGet(save_args, save_argc))
+        }
+
+        // ─── ELEM_INNER_HTML_SET (16) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_INNER_HTML_SET) ThenBlock: {
+            // Stub for v1 — return undefined
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // ─── ELEM_TEXT_CONTENT (17) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_TEXT_CONTENT) ThenBlock: {
+            // Same as innerHTML get for v1
+            ReturnValue(JSBridge__NInnerHTMLGet(save_args, save_argc))
+        }
+
+        // ─── ELEM_APPEND_CHILD (18) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_APPEND_CHILD) ThenBlock: {
+            // Stub for v1 — return undefined
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // ─── ELEM_REMOVE_CHILD (19) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_REMOVE_CHILD) ThenBlock: {
+            // Stub for v1 — return undefined
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // ─── ELEM_STYLE_SET (20) ───
+        IfCondition EqualTo(save_id, JSNativeID.ELEM_STYLE_SET) ThenBlock: {
+            // Stub for v1 — return undefined
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // ─── SET_TIMEOUT (21) ───
+        IfCondition EqualTo(save_id, JSNativeID.SET_TIMEOUT) ThenBlock: {
+            ReturnValue(JSBridge__NSetTimeout(save_args, save_argc))
+        }
+
+        // ─── SET_INTERVAL (22) ───
+        IfCondition EqualTo(save_id, JSNativeID.SET_INTERVAL) ThenBlock: {
+            ReturnValue(JSBridge__NSetInterval(save_args, save_argc))
+        }
+
+        // ─── CLEAR_TIMEOUT (23) ───
+        IfCondition EqualTo(save_id, JSNativeID.CLEAR_TIMEOUT) ThenBlock: {
+            ReturnValue(JSBridge__NClearTimeout(save_args, save_argc))
+        }
+
+        // ─── PARSE_INT (24) ───
+        IfCondition EqualTo(save_id, JSNativeID.PARSE_INT) ThenBlock: {
+            ReturnValue(JSBridge__NParseInt(save_args, save_argc))
+        }
+
+        // ─── MATH_ABS (25) ───
+        IfCondition EqualTo(save_id, JSNativeID.MATH_ABS) ThenBlock: {
+            // Delegate to JSRT built-in handler 1
+            ReturnValue(JSRT_CallNative(1, save_args, save_argc))
+        }
+
+        // ─── MATH_MAX (26) ───
+        IfCondition EqualTo(save_id, JSNativeID.MATH_MAX) ThenBlock: {
+            // Delegate to JSRT built-in handler 2
+            ReturnValue(JSRT_CallNative(2, save_args, save_argc))
+        }
+
+        // ─── MATH_MIN (27) ───
+        IfCondition EqualTo(save_id, JSNativeID.MATH_MIN) ThenBlock: {
+            // Delegate to JSRT built-in handler 3
+            ReturnValue(JSRT_CallNative(3, save_args, save_argc))
+        }
+
+        // ─── MATH_FLOOR (28) ───
+        IfCondition EqualTo(save_id, JSNativeID.MATH_FLOOR) ThenBlock: {
+            // Delegate to JSRT built-in handler 4
+            ReturnValue(JSRT_CallNative(4, save_args, save_argc))
+        }
+
+        // Unknown handler — return undefined
+        PrintMessage("[JSBridge] unknown native id: ")
+        PrintNumber(save_id)
+        PrintMessage("\n")
+        ReturnValue(JSRT_Undefined())
+    }
+}
+
+// =============================================================================
+// NATIVE: console.log — coerce all args to string, print each
+// =============================================================================
+Function.JSBridge__NConsoleLog {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        ai = 0
+        WhileLoop LessThan(ai, save_argc) {
+            arg_addr = Add(save_args, Multiply(ai, 8))
+            arg_val = Dereference(arg_addr)
+
+            // Convert to string for printing
+            JSBridge__Push(save_args)
+            JSBridge__Push(save_argc)
+            JSBridge__Push(ai)
+            str_val = JSRT_ToString(arg_val)
+            ai = JSBridge__Pop()
+            save_argc = JSBridge__Pop()
+            save_args = JSBridge__Pop()
+
+            // Get the string payload and print it
+            str_ptr = JSRT_GetPayload(str_val)
+            IfCondition NotEqual(str_ptr, 0) ThenBlock: {
+                IfCondition GreaterThan(ai, 0) ThenBlock: {
+                    PrintMessage(" ")
+                }
+                PrintMessage(str_ptr)
+            }
+            ai = Add(ai, 1)
+        }
+        PrintMessage("\n")
+        ReturnValue(JSRT_Undefined())
+    }
+}
+
+// =============================================================================
+// NATIVE: document.getElementById — find DOM node by id, return wrapped
+// =============================================================================
+Function.JSBridge__NGetById {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 1) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        // Get first arg (should be string)
+        arg0 = Dereference(save_args)
+        arg0_type = JSRT_GetType(arg0)
+        IfCondition NotEqual(arg0_type, JSType.STRING) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        // Extract string pointer
+        id_str = JSRT_GetPayload(arg0)
+        IfCondition EqualTo(id_str, 0) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        // Search DOM tree
+        found = DOM_FindById(JSBridgeState.dom_root, id_str)
+        IfCondition LessThan(found, 0) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        // Wrap the DOM node as a JS object
+        ReturnValue(JSBridge_WrapNode(found))
+    }
+}
+
+// =============================================================================
+// NATIVE: document.querySelector — simplified v1 (tag name only)
+// =============================================================================
+Function.JSBridge__NQuerySel {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 1) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        arg0 = Dereference(save_args)
+        arg0_type = JSRT_GetType(arg0)
+        IfCondition NotEqual(arg0_type, JSType.STRING) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        sel_str = JSRT_GetPayload(arg0)
+        IfCondition EqualTo(sel_str, 0) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        // v1: treat selector as tag name
+        found = DOM_FindByTag(JSBridgeState.dom_root, sel_str)
+        IfCondition LessThan(found, 0) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        ReturnValue(JSBridge_WrapNode(found))
+    }
+}
+
+// =============================================================================
+// NATIVE: element.getAttribute — get DOM attribute value as JS string
+// args[0] = element wrapper object, args[1] = attribute name string
+// Note: in practice, the element is the `this` object. For v1, we accept
+// args[0] as the attribute name and determine element from the wrapper
+// that was used to look up this function. Since JSVM does not pass `this`,
+// we use a fallback: if args[0] is a string, treat it as attr name and
+// try to find the element from the wrapper cache by scanning for the last
+// accessed wrapper. This is a v1 simplification.
+// =============================================================================
+Function.JSBridge__NGetAttr {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 2) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // args[0] = element wrapper, args[1] = attr name
+        elem_val = Dereference(save_args)
+        JSBridge__Push(save_args)
+        JSBridge__Push(save_argc)
+        dom_idx = JSBridge__GetDomIdx(elem_val)
+        save_argc = JSBridge__Pop()
+        save_args = JSBridge__Pop()
+
+        IfCondition LessThan(dom_idx, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Get attribute name string
+        name_addr = Add(save_args, 8)
+        name_val = Dereference(name_addr)
+        name_type = JSRT_GetType(name_val)
+        IfCondition NotEqual(name_type, JSType.STRING) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+        name_str = JSRT_GetPayload(name_val)
+        IfCondition EqualTo(name_str, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Look up attribute in DOM
+        JSBridge__Push(dom_idx)
+        attr_val = DOM_GetAttr(dom_idx, name_str)
+        dom_idx = JSBridge__Pop()
+        IfCondition EqualTo(attr_val, 0) ThenBlock: {
+            ReturnValue(JSRT_Null())
+        }
+
+        ReturnValue(JSRT_CreateString(attr_val))
+    }
+}
+
+// =============================================================================
+// NATIVE: element.addEventListener — register event listener
+// args[0] = element wrapper, args[1] = event name, args[2] = callback
+// =============================================================================
+Function.JSBridge__NAddListener {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 3) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // args[0] = element wrapper
+        elem_val = Dereference(save_args)
+        JSBridge__Push(save_args)
+        JSBridge__Push(save_argc)
+        dom_idx = JSBridge__GetDomIdx(elem_val)
+        save_argc = JSBridge__Pop()
+        save_args = JSBridge__Pop()
+
+        IfCondition LessThan(dom_idx, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // args[1] = event name string
+        name_addr = Add(save_args, 8)
+        name_val = Dereference(name_addr)
+        name_str = JSRT_GetPayload(name_val)
+
+        // args[2] = callback function
+        cb_addr = Add(save_args, 16)
+        cb_val = Dereference(cb_addr)
+
+        // Register the listener
+        JSBridge_AddListener(dom_idx, name_str, cb_val)
+
+        ReturnValue(JSRT_Undefined())
+    }
+}
+
+// =============================================================================
+// NATIVE: element.innerHTML get — return inner text as JS string
+// args[0] = element wrapper object
+// =============================================================================
+Function.JSBridge__NInnerHTMLGet {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 1) ThenBlock: {
+            ReturnValue(JSRT_CreateString(""))
+        }
+
+        elem_val = Dereference(save_args)
+        JSBridge__Push(save_args)
+        dom_idx = JSBridge__GetDomIdx(elem_val)
+        save_args = JSBridge__Pop()
+
+        IfCondition LessThan(dom_idx, 0) ThenBlock: {
+            ReturnValue(JSRT_CreateString(""))
+        }
+
+        text_ptr = JSBridge__GetNodeText(dom_idx)
+        IfCondition EqualTo(text_ptr, 0) ThenBlock: {
+            ReturnValue(JSRT_CreateString(""))
+        }
+
+        ReturnValue(JSRT_CreateString(text_ptr))
+    }
+}
+
+// =============================================================================
+// NATIVE: setTimeout — register one-shot timer
+// args[0] = callback function, args[1] = delay in ms
+// Returns timer ID as number
+// =============================================================================
+Function.JSBridge__NSetTimeout {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 2) ThenBlock: {
+            ReturnValue(JSRT_CreateNumber(0))
+        }
+
+        // args[0] = callback
+        cb_val = Dereference(save_args)
+
+        // args[1] = delay
+        delay_addr = Add(save_args, 8)
+        delay_val = Dereference(delay_addr)
+        JSBridge__Push(cb_val)
+        delay_ms = JSRT_ToNumber(delay_val)
+        cb_val = JSBridge__Pop()
+
+        // Register one-shot timer (is_interval=0)
+        timer_id = JSRT_TimerAdd(cb_val, delay_ms, 0)
+        ReturnValue(JSRT_CreateNumber(timer_id))
+    }
+}
+
+// =============================================================================
+// NATIVE: setInterval — register repeating timer
+// args[0] = callback function, args[1] = interval in ms
+// Returns timer ID as number
+// =============================================================================
+Function.JSBridge__NSetInterval {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 2) ThenBlock: {
+            ReturnValue(JSRT_CreateNumber(0))
+        }
+
+        cb_val = Dereference(save_args)
+        delay_addr = Add(save_args, 8)
+        delay_val = Dereference(delay_addr)
+        JSBridge__Push(cb_val)
+        delay_ms = JSRT_ToNumber(delay_val)
+        cb_val = JSBridge__Pop()
+
+        // Register interval timer (is_interval=1)
+        timer_id = JSRT_TimerAdd(cb_val, delay_ms, 1)
+        ReturnValue(JSRT_CreateNumber(timer_id))
+    }
+}
+
+// =============================================================================
+// NATIVE: clearTimeout / clearInterval — remove timer by ID
+// args[0] = timer ID number
+// =============================================================================
+Function.JSBridge__NClearTimeout {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 1) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        id_val = Dereference(save_args)
+        timer_id = JSRT_ToNumber(id_val)
+        JSRT_TimerRemove(timer_id)
+        ReturnValue(JSRT_Undefined())
+    }
+}
+
+// =============================================================================
+// NATIVE: parseInt — string to integer
+// args[0] = string value
+// =============================================================================
+Function.JSBridge__NParseInt {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        IfCondition LessThan(save_argc, 1) ThenBlock: {
+            ReturnValue(JSRT_CreateNumber(0))
+        }
+
+        arg0 = Dereference(save_args)
+        arg0_type = JSRT_GetType(arg0)
+        IfCondition EqualTo(arg0_type, JSType.NUMBER) ThenBlock: {
+            // Already a number — return identity
+            ReturnValue(arg0)
+        }
+        IfCondition NotEqual(arg0_type, JSType.STRING) ThenBlock: {
+            ReturnValue(JSRT_CreateNumber(0))
+        }
+
+        str_ptr = JSRT_GetPayload(arg0)
+        IfCondition EqualTo(str_ptr, 0) ThenBlock: {
+            ReturnValue(JSRT_CreateNumber(0))
+        }
+
+        result = StringToInt(str_ptr)
+        ReturnValue(JSRT_CreateNumber(result))
+    }
+}
+
+// =============================================================================
+// EVENT LISTENER MANAGEMENT
+// Listener pool entries (24 bytes each):
+//   Offset 0:  dom_node (8) — DOM node index
+//   Offset 8:  event_name_ptr (8) — pointer to event name string
+//   Offset 16: callback_jsval (8) — JSValue pointer to callback function
+// =============================================================================
+
+// Add an event listener. Returns 1 on success, 0 on pool full.
+Function.JSBridge_AddListener {
+    Input: dom_node: Integer
+    Input: event_name: Address
+    Input: callback: Address
+    Output: Integer
+    Body: {
+        save_node = dom_node
+        save_name = event_name
+        save_cb = callback
+        IfCondition GreaterEqual(JSBridgeState.listener_count, JSBridgeConst.MAX_LISTENERS) ThenBlock: {
+            PrintMessage("[JSBridge] listener pool full\n")
+            ReturnValue(0)
+        }
+
+        idx = JSBridgeState.listener_count
+        JSBridgeState.listener_count = Add(idx, 1)
+        base = Add(JSBridgeState.listeners, Multiply(idx, JSBridgeConst.LISTENER_SIZE))
+        StoreValue(base, save_node)
+        StoreValue(Add(base, 8), save_name)
+        StoreValue(Add(base, 16), save_cb)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FIRE EVENT — invoke all listeners matching dom_node + event_name
+// Returns number of callbacks invoked.
+// NOTE: Actually invoking callbacks requires running them through JSVM.
+// For v1, this function finds matching listeners and returns the count.
+// A future version will call JSVM to execute each callback.
+// =============================================================================
+Function.JSBridge_FireEvent {
+    Input: dom_node: Integer
+    Input: event_name: Address
+    Output: Integer
+    Body: {
+        save_node = dom_node
+        save_name = event_name
+        fired = 0
+        li = 0
+
+        WhileLoop LessThan(li, JSBridgeState.listener_count) {
+            base = Add(JSBridgeState.listeners, Multiply(li, JSBridgeConst.LISTENER_SIZE))
+            entry_node = Dereference(base)
+            IfCondition EqualTo(entry_node, save_node) ThenBlock: {
+                entry_name = Dereference(Add(base, 8))
+                IfCondition NotEqual(entry_name, 0) ThenBlock: {
+                    JSBridge__Push(save_node)
+                    JSBridge__Push(save_name)
+                    JSBridge__Push(li)
+                    JSBridge__Push(fired)
+                    JSBridge__Push(base)
+                    cmp = StringCompare(entry_name, save_name)
+                    base = JSBridge__Pop()
+                    fired = JSBridge__Pop()
+                    li = JSBridge__Pop()
+                    save_name = JSBridge__Pop()
+                    save_node = JSBridge__Pop()
+
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        // Match found — get callback
+                        cb = Dereference(Add(base, 16))
+                        IfCondition NotEqual(cb, 0) ThenBlock: {
+                            // For v1: count the match. Full impl would call JSVM.
+                            fired = Add(fired, 1)
+                        }
+                    }
+                }
+            }
+            li = Add(li, 1)
+        }
+        ReturnValue(fired)
+    }
+}
+
+// =============================================================================
+// TIMER TICK — forward to JSRT_TimerTick
+// Returns count of expired timers.
+// =============================================================================
+Function.JSBridge_TickTimers {
+    Input: current_ms: Integer
+    Output: Integer
+    Body: {
+        save_ms = current_ms
+        ReturnValue(JSRT_TimerTick(save_ms))
+    }
+}
+
+// =============================================================================
+// STATE QUERY — public accessors
+// =============================================================================
+Function.JSBridge_GetListenerCount {
+    Output: Integer
+    Body: {
+        ReturnValue(JSBridgeState.listener_count)
+    }
+}
+
+Function.JSBridge_GetWrapCount {
+    Output: Integer
+    Body: {
+        ReturnValue(JSBridgeState.wrap_count)
+    }
+}
+
+Function.JSBridge_GetDocObj {
+    Output: Address
+    Body: {
+        ReturnValue(JSBridgeState.document_obj)
+    }
+}
+
+Function.JSBridge_GetConsoleObj {
+    Output: Address
+    Body: {
+        ReturnValue(JSBridgeState.console_obj)
+    }
+}
+
+Function.JSBridge_GetMathObj {
+    Output: Address
+    Body: {
+        ReturnValue(JSBridgeState.math_obj)
+    }
+}
+
+Function.JSBridge_IsInitialized {
+    Output: Integer
+    Body: {
+        ReturnValue(JSBridgeState.initialized)
+    }
+}
+
+// =============================================================================
+// GET LISTENER CALLBACK — retrieve callback JSValue for a listener by index
+// Used by the engine to invoke callbacks via JSVM.
+// =============================================================================
+Function.JSBridge_GetListenerCB {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        save_idx = idx
+        IfCondition LessThan(save_idx, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition GreaterEqual(save_idx, JSBridgeState.listener_count) ThenBlock: {
+            ReturnValue(0)
+        }
+        base = Add(JSBridgeState.listeners, Multiply(save_idx, JSBridgeConst.LISTENER_SIZE))
+        ReturnValue(Dereference(Add(base, 16)))
+    }
+}
+
+// =============================================================================
+// GET LISTENER NODE — retrieve the DOM node index for a listener by index
+// =============================================================================
+Function.JSBridge_GetListenerNode {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        save_idx = idx
+        IfCondition LessThan(save_idx, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        IfCondition GreaterEqual(save_idx, JSBridgeState.listener_count) ThenBlock: {
+            ReturnValue(-1)
+        }
+        base = Add(JSBridgeState.listeners, Multiply(save_idx, JSBridgeConst.LISTENER_SIZE))
+        ReturnValue(Dereference(base))
+    }
+}
+
+// =============================================================================
+// GET LISTENER EVENT NAME — retrieve event name ptr for a listener by index
+// =============================================================================
+Function.JSBridge_GetListenerName {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        save_idx = idx
+        IfCondition LessThan(save_idx, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition GreaterEqual(save_idx, JSBridgeState.listener_count) ThenBlock: {
+            ReturnValue(0)
+        }
+        base = Add(JSBridgeState.listeners, Multiply(save_idx, JSBridgeConst.LISTENER_SIZE))
+        ReturnValue(Dereference(Add(base, 8)))
+    }
+}
+
+// =============================================================================
+// DEBUG — dump bridge state
+// =============================================================================
+Function.JSBridge_Dump {
+    Body: {
+        PrintMessage("\n--- JSBridge State ---\n")
+        PrintMessage("  initialized: ")
+        PrintNumber(JSBridgeState.initialized)
+        PrintMessage("\n  dom_root: ")
+        PrintNumber(JSBridgeState.dom_root)
+        PrintMessage("\n  wrap_count: ")
+        PrintNumber(JSBridgeState.wrap_count)
+        PrintMessage("\n  listener_count: ")
+        PrintNumber(JSBridgeState.listener_count)
+        PrintMessage("\n  stack sp: ")
+        PrintNumber(JSBridgeStack.sp)
+        PrintMessage("\n--- End JSBridge ---\n\n")
+    }
+}

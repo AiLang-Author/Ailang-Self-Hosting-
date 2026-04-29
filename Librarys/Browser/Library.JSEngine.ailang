@@ -1,0 +1,881 @@
+// Library.JSEngine.ailang — JavaScript engine orchestrator
+// Top-level controller that wires together JSLexer, JSParser, JSCompiler,
+// JSRuntime, JSVM, and JSBridge. Extracts <script> tags from the DOM tree,
+// feeds each through the lex->parse->compile->run pipeline, and provides
+// a per-frame tick for timer/event dispatch.
+//
+// CLOBBER SAFETY: Every function saves Input params to locals on the FIRST
+// line of Body. Complex expressions broken into steps. JSEngTmp fields
+// guarded with push/pop across recursive calls.
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+LibraryImport.Browser.HTMLDom
+LibraryImport.Browser.JSLexer
+LibraryImport.Browser.JSParser
+LibraryImport.Browser.JSCompiler
+LibraryImport.Browser.JSRuntime
+LibraryImport.Browser.JSVM
+LibraryImport.Browser.JSBridge
+
+// =============================================================================
+// ENGINE CONSTANTS
+// =============================================================================
+FixedPool.JSEngConst {
+    "MAX_SCRIPTS":   Initialize=32
+    "SCRIPT_SIZE":   Initialize=16     // src_ptr:8, src_len:8
+    "STR_BUF_CAP":   Initialize=65536
+    "DFS_STACK_CAP":  Initialize=512   // max nodes on DFS stack
+}
+
+// =============================================================================
+// ENGINE STATE
+// =============================================================================
+FixedPool.JSEngState {
+    "dom_root":      Initialize=0      // DOM root node index
+    "initialized":   Initialize=0
+    "bridge_ready":  Initialize=0      // 1 after JSBridge_Init called
+    "script_pool":   Initialize=0      // allocated pool of script entries
+    "script_count":  Initialize=0
+    "str_buf":       Initialize=0      // buffer for extracted script text
+    "str_pos":       Initialize=0
+    "dfs_stack":     Initialize=0      // iterative DFS stack (node indices)
+    "error":         Initialize=0
+    "err_msg":       Initialize=0
+}
+
+// =============================================================================
+// CLOBBER-SAFE TEMPORARIES
+// =============================================================================
+FixedPool.JSEngTmp {
+    "idx":      Initialize=0
+    "node":     Initialize=0
+    "child":    Initialize=0
+    "type":     Initialize=0
+    "tag":      Initialize=0
+    "tag_len":  Initialize=0
+    "ptr":      Initialize=0
+    "len":      Initialize=0
+    "done":     Initialize=0
+    "count":    Initialize=0
+    "result":   Initialize=0
+    "top":      Initialize=0
+}
+
+// =============================================================================
+// PUSH / POP — save temporaries across calls
+// Uses a flat 8-byte-per-entry stack inside dfs_stack (reused when DFS
+// is not running). Separate from JSVM stack.
+// =============================================================================
+FixedPool.JSEngStack {
+    "pool":      Initialize=0
+    "sp":        Initialize=0
+    "capacity":  Initialize=0
+    "tmp_val":   Initialize=0
+    "tmp_addr":  Initialize=0
+}
+
+Function.JSEng__Push {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        JSEngStack.tmp_val = val
+        JSEngStack.tmp_addr = Add(JSEngStack.pool, Multiply(JSEngStack.sp, 8))
+        StoreValue(JSEngStack.tmp_addr, JSEngStack.tmp_val)
+        JSEngStack.sp = Add(JSEngStack.sp, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSEng__Pop {
+    Output: Integer
+    Body: {
+        JSEngStack.sp = Subtract(JSEngStack.sp, 1)
+        ReturnValue(Dereference(Add(JSEngStack.pool, Multiply(JSEngStack.sp, 8))))
+    }
+}
+
+// =============================================================================
+// INIT — allocate buffers and initialize all JS subsystems
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.JSEngine_Init {
+    Output: Integer
+    Body: {
+        // Already initialized guard
+        IfCondition EqualTo(JSEngState.initialized, 1) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // --- Allocate script pool (32 entries x 16 bytes = 512 bytes) ---
+        pool_sz = Multiply(JSEngConst.MAX_SCRIPTS, JSEngConst.SCRIPT_SIZE)
+        JSEngState.script_pool = Allocate(pool_sz)
+        IfCondition EqualTo(JSEngState.script_pool, 0) ThenBlock: {
+            PrintMessage("[JSEngine] script_pool alloc fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+        MemorySet(JSEngState.script_pool, 0, pool_sz)
+        JSEngState.script_count = 0
+
+        // --- Allocate string buffer (64KB for extracted script text) ---
+        JSEngState.str_buf = Allocate(JSEngConst.STR_BUF_CAP)
+        IfCondition EqualTo(JSEngState.str_buf, 0) ThenBlock: {
+            PrintMessage("[JSEngine] str_buf alloc fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+        MemorySet(JSEngState.str_buf, 0, JSEngConst.STR_BUF_CAP)
+        JSEngState.str_pos = 0
+
+        // --- Allocate DFS stack (512 entries x 8 bytes = 4096 bytes) ---
+        dfs_sz = Multiply(JSEngConst.DFS_STACK_CAP, 8)
+        JSEngState.dfs_stack = Allocate(dfs_sz)
+        IfCondition EqualTo(JSEngState.dfs_stack, 0) ThenBlock: {
+            PrintMessage("[JSEngine] dfs_stack alloc fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+        MemorySet(JSEngState.dfs_stack, 0, dfs_sz)
+
+        // --- Allocate push/pop stack (1024 entries x 8 bytes = 8192) ---
+        JSEngStack.pool = Allocate(8192)
+        IfCondition EqualTo(JSEngStack.pool, 0) ThenBlock: {
+            PrintMessage("[JSEngine] eng_stack alloc fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+        JSEngStack.capacity = 1024
+        JSEngStack.sp = 0
+
+        // --- Initialize JS subsystems in dependency order ---
+        // 1. Lexer
+        lex_ok = JSLex_Init()
+        IfCondition EqualTo(lex_ok, 0) ThenBlock: {
+            PrintMessage("[JSEngine] JSLex_Init fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+
+        // 2. Parser
+        parse_ok = JSParse_Init()
+        IfCondition EqualTo(parse_ok, 0) ThenBlock: {
+            PrintMessage("[JSEngine] JSParse_Init fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+
+        // 3. Compiler
+        comp_ok = JSComp_Init()
+        IfCondition EqualTo(comp_ok, 0) ThenBlock: {
+            PrintMessage("[JSEngine] JSComp_Init fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+
+        // 4. Runtime (value pool, type system)
+        rt_ok = JSRT_Init()
+        IfCondition EqualTo(rt_ok, 0) ThenBlock: {
+            PrintMessage("[JSEngine] JSRT_Init fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+
+        // 5. Virtual machine (stacks, globals hash)
+        vm_ok = JSVM_Init()
+        IfCondition EqualTo(vm_ok, 0) ThenBlock: {
+            PrintMessage("[JSEngine] JSVM_Init fail\n")
+            JSEngState.error = 1
+            ReturnValue(0)
+        }
+
+        // Note: JSBridge_Init is NOT called here — it needs a DOM root,
+        // which isn't known until JSEngine_LoadPage.
+        JSEngState.bridge_ready = 0
+
+        JSEngState.dom_root = 0
+        JSEngState.error = 0
+        JSEngState.initialized = 1
+        PrintMessage("[JSEngine] Init OK\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// RESET — clear runtime state for a new page load
+// Resets all subsystems and clears local script buffers.
+// =============================================================================
+Function.JSEngine_Reset {
+    Output: Integer
+    Body: {
+        // Reset JS subsystems
+        JSLex_Reset()
+        JSComp_Reset()
+        JSVM_Reset()
+        JSRT_Reset()
+
+        // Reset engine state
+        JSEngState.script_count = 0
+        JSEngState.str_pos = 0
+        JSEngState.error = 0
+        JSEngState.err_msg = 0
+        JSEngState.bridge_ready = 0
+
+        // Clear script pool
+        pool_sz = Multiply(JSEngConst.MAX_SCRIPTS, JSEngConst.SCRIPT_SIZE)
+        MemorySet(JSEngState.script_pool, 0, pool_sz)
+
+        // Clear string buffer
+        MemorySet(JSEngState.str_buf, 0, JSEngConst.STR_BUF_CAP)
+
+        // Clear push/pop stack
+        JSEngStack.sp = 0
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCRIPT POOL HELPERS
+// Each entry is 16 bytes: [src_ptr:8][src_len:8]
+// =============================================================================
+
+// Store a discovered script source into the script pool.
+// ptr = pointer to the script text in str_buf, len = byte length
+// Returns index of stored entry, or -1 on overflow.
+Function.JSEngine__StoreScript {
+    Input: ptr: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        save_ptr = ptr
+        save_len = len
+        idx = JSEngState.script_count
+        IfCondition GreaterEqual(idx, JSEngConst.MAX_SCRIPTS) ThenBlock: {
+            PrintMessage("[JSEngine] script pool full\n")
+            ReturnValue(-1)
+        }
+        base = Add(JSEngState.script_pool, Multiply(idx, JSEngConst.SCRIPT_SIZE))
+        StoreValue(base, save_ptr)
+        StoreValue(Add(base, 8), save_len)
+        JSEngState.script_count = Add(idx, 1)
+        ReturnValue(idx)
+    }
+}
+
+// Get a script entry's source pointer by index.
+Function.JSEngine__GetScriptPtr {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        save_idx = idx
+        base = Add(JSEngState.script_pool, Multiply(save_idx, JSEngConst.SCRIPT_SIZE))
+        ReturnValue(Dereference(base))
+    }
+}
+
+// Get a script entry's source length by index.
+Function.JSEngine__GetScriptLen {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        save_idx = idx
+        base = Add(JSEngState.script_pool, Multiply(save_idx, JSEngConst.SCRIPT_SIZE))
+        ReturnValue(Dereference(Add(base, 8)))
+    }
+}
+
+// =============================================================================
+// DFS STACK HELPERS — used by JSEngine__FindScripts for iterative tree walk
+// =============================================================================
+
+Function.JSEngine__DFSPush {
+    Input: node_idx: Integer
+    Output: Integer
+    Body: {
+        save_node = node_idx
+        JSEngTmp.top = Dereference(Add(JSEngState.dfs_stack, 0))
+        // top is stored at dfs_stack[0..7] as a counter
+        // Actually, let's use a separate variable approach:
+        // We keep 'dfs_top' in JSEngTmp.top during the DFS loop.
+        // This function is called from a controlled context.
+        // Use the stack area starting at offset 8 (slot 0 = reserved for top counter)
+        // Simpler: just store directly using the top value passed via JSEngTmp.top
+        addr = Add(JSEngState.dfs_stack, Multiply(JSEngTmp.top, 8))
+        StoreValue(addr, save_node)
+        JSEngTmp.top = Add(JSEngTmp.top, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSEngine__DFSPop {
+    Output: Integer
+    Body: {
+        JSEngTmp.top = Subtract(JSEngTmp.top, 1)
+        addr = Add(JSEngState.dfs_stack, Multiply(JSEngTmp.top, 8))
+        ReturnValue(Dereference(addr))
+    }
+}
+
+// =============================================================================
+// TAG MATCHING — check if a DOM node's tag is "script" (6 bytes)
+// Returns 1 if tag matches "script", 0 otherwise.
+// Uses byte-by-byte comparison to avoid clobber from StringCompare.
+// "script" = 115 99 114 105 112 116
+// =============================================================================
+Function.JSEngine__IsScriptTag {
+    Input: tag_ptr: Address
+    Input: tag_len: Integer
+    Output: Integer
+    Body: {
+        // Length check first (inline, no clobber)
+        IfCondition NotEqual(tag_len, 6) ThenBlock: {
+            ReturnValue(0)
+        }
+        // Byte-by-byte: s=115 c=99 r=114 i=105 p=112 t=116
+        IfCondition NotEqual(GetByte(tag_ptr, 0), 115) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(tag_ptr, 1), 99) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(tag_ptr, 2), 114) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(tag_ptr, 3), 105) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(tag_ptr, 4), 112) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(tag_ptr, 5), 116) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// EXTRACT SCRIPT — given a <script> element node, find its text child,
+// copy the text content into str_buf, record in script_pool.
+// Returns 1 on success, 0 on failure (no text child, buffer full, etc.)
+// =============================================================================
+Function.JSEngine__ExtractScript {
+    Input: script_node: Integer
+    Output: Integer
+    Body: {
+        save_node = script_node
+
+        // Walk children to find the first TEXT node
+        JSEngTmp.child = DOM_GetFirstChild(save_node)
+
+        JSEngTmp.done = 0
+        WhileLoop And(GreaterEqual(JSEngTmp.child, 0), EqualTo(JSEngTmp.done, 0)) {
+            JSEngTmp.type = DOM_GetType(JSEngTmp.child)
+            IfCondition EqualTo(JSEngTmp.type, DOMType.TEXT) ThenBlock: {
+                JSEngTmp.done = 1
+            }
+            IfCondition EqualTo(JSEngTmp.done, 0) ThenBlock: {
+                JSEngTmp.child = DOM_GetNextSib(JSEngTmp.child)
+            }
+        }
+
+        // No text child found
+        IfCondition LessThan(JSEngTmp.child, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Get text pointer and length
+        JSEngTmp.ptr = DOM_GetText(JSEngTmp.child)
+        JSEngTmp.len = DOM_GetTextLen(JSEngTmp.child)
+
+        // Validate
+        IfCondition EqualTo(JSEngTmp.ptr, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(JSEngTmp.len, 0) ThenBlock: { ReturnValue(0) }
+
+        // Check buffer capacity
+        len_plus1 = Add(JSEngTmp.len, 1)
+        needed = Add(JSEngState.str_pos, len_plus1)
+        IfCondition GreaterEqual(needed, JSEngConst.STR_BUF_CAP) ThenBlock: {
+            PrintMessage("[JSEngine] str_buf overflow\n")
+            ReturnValue(0)
+        }
+
+        // Copy script text into str_buf at current position
+        dest = Add(JSEngState.str_buf, JSEngState.str_pos)
+        MemoryCopy(dest, JSEngTmp.ptr, JSEngTmp.len)
+        // Null-terminate
+        SetByte(dest, JSEngTmp.len, 0)
+
+        // Record in script pool
+        store_ok = JSEngine__StoreScript(dest, JSEngTmp.len)
+
+        // Advance str_pos past the text + null terminator
+        advance = Add(JSEngTmp.len, 1)
+        JSEngState.str_pos = Add(JSEngState.str_pos, advance)
+
+        IfCondition LessThan(store_ok, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FIND SCRIPTS — iterative DFS walk of the DOM tree
+// For each ELEMENT node with tag "script", extract its text content.
+// Uses an explicit stack (dfs_stack) to avoid deep recursion.
+// Returns number of scripts found.
+// =============================================================================
+Function.JSEngine__FindScripts {
+    Input: root_node: Integer
+    Output: Integer
+    Body: {
+        save_root = root_node
+
+        // Guard: invalid root
+        IfCondition LessThan(save_root, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Initialize DFS stack
+        JSEngTmp.top = 0
+        JSEngTmp.count = 0
+
+        // Push root onto DFS stack
+        addr = Add(JSEngState.dfs_stack, Multiply(JSEngTmp.top, 8))
+        StoreValue(addr, save_root)
+        JSEngTmp.top = Add(JSEngTmp.top, 1)
+
+        // DFS loop
+        WhileLoop GreaterThan(JSEngTmp.top, 0) {
+            // Pop node
+            JSEngTmp.top = Subtract(JSEngTmp.top, 1)
+            pop_addr = Add(JSEngState.dfs_stack, Multiply(JSEngTmp.top, 8))
+            JSEngTmp.node = Dereference(pop_addr)
+
+            // Check if this is an ELEMENT node
+            JSEngTmp.type = DOM_GetType(JSEngTmp.node)
+            IfCondition EqualTo(JSEngTmp.type, DOMType.ELEMENT) ThenBlock: {
+                // Get tag name
+                JSEngTmp.tag = DOM_GetTag(JSEngTmp.node)
+                JSEngTmp.tag_len = DOM_GetTagLen(JSEngTmp.node)
+
+                // Check if tag is "script"
+                is_script = JSEngine__IsScriptTag(JSEngTmp.tag, JSEngTmp.tag_len)
+                IfCondition EqualTo(is_script, 1) ThenBlock: {
+                    // Extract and store the script content
+                    JSEng__Push(JSEngTmp.node)
+                    JSEng__Push(JSEngTmp.top)
+                    JSEng__Push(JSEngTmp.count)
+                    ext_ok = JSEngine__ExtractScript(JSEngTmp.node)
+                    JSEngTmp.count = JSEng__Pop()
+                    JSEngTmp.top = JSEng__Pop()
+                    JSEngTmp.node = JSEng__Pop()
+                    IfCondition EqualTo(ext_ok, 1) ThenBlock: {
+                        JSEngTmp.count = Add(JSEngTmp.count, 1)
+                    }
+                    // Don't recurse into <script> children — already extracted text
+                }
+            }
+
+            // Push children onto DFS stack (only for non-script ELEMENT and ROOT nodes)
+            // We push children in reverse order so first child is processed first
+            should_push = 0
+            IfCondition EqualTo(JSEngTmp.type, DOMType.ROOT) ThenBlock: {
+                should_push = 1
+            }
+            IfCondition EqualTo(JSEngTmp.type, DOMType.ELEMENT) ThenBlock: {
+                // Only push children if NOT a script tag
+                JSEngTmp.tag = DOM_GetTag(JSEngTmp.node)
+                JSEngTmp.tag_len = DOM_GetTagLen(JSEngTmp.node)
+                not_script = JSEngine__IsScriptTag(JSEngTmp.tag, JSEngTmp.tag_len)
+                IfCondition EqualTo(not_script, 0) ThenBlock: {
+                    should_push = 1
+                }
+            }
+
+            IfCondition EqualTo(should_push, 1) ThenBlock: {
+                // Collect children into a temporary reverse buffer
+                // so DFS processes them in DOM order (first child first)
+                // We push all children, then they get popped in reverse = correct DFS order
+                // Actually for DFS, pushing children left-to-right means last child
+                // is popped first. To get document-order DFS we push right-to-left.
+                // But for script extraction, order matters for execution order.
+                //
+                // Strategy: collect children into temp array, then push in reverse.
+                child_buf_sz = Multiply(JSEngConst.DFS_STACK_CAP, 8)
+                child_buf = Allocate(child_buf_sz)
+                child_count = 0
+                JSEngTmp.child = DOM_GetFirstChild(JSEngTmp.node)
+
+                WhileLoop GreaterEqual(JSEngTmp.child, 0) {
+                    c_addr = Add(child_buf, Multiply(child_count, 8))
+                    StoreValue(c_addr, JSEngTmp.child)
+                    child_count = Add(child_count, 1)
+                    JSEngTmp.child = DOM_GetNextSib(JSEngTmp.child)
+                }
+
+                // Push children in reverse order onto DFS stack
+                ri = Subtract(child_count, 1)
+                WhileLoop GreaterEqual(ri, 0) {
+                    c_addr = Add(child_buf, Multiply(ri, 8))
+                    c_val = Dereference(c_addr)
+                    // Bounds check on DFS stack
+                    IfCondition LessThan(JSEngTmp.top, JSEngConst.DFS_STACK_CAP) ThenBlock: {
+                        s_addr = Add(JSEngState.dfs_stack, Multiply(JSEngTmp.top, 8))
+                        StoreValue(s_addr, c_val)
+                        JSEngTmp.top = Add(JSEngTmp.top, 1)
+                    }
+                    ri = Subtract(ri, 1)
+                }
+            }
+        }
+
+        ReturnValue(JSEngTmp.count)
+    }
+}
+
+// =============================================================================
+// REGISTER BRIDGE GLOBALS — install JSBridge objects into JSVM globals
+// Must be called after JSBridge_Init and JSVM_InstallBuiltins.
+// Overrides JSRT's console/Math with JSBridge's DOM-aware versions.
+// =============================================================================
+Function.JSEngine__RegisterBridgeGlobals {
+    Output: Integer
+    Body: {
+        // document, console, Math from JSBridge
+        doc_obj = JSBridge_GetDocObj()
+        JSVM_SetGlobal("document", doc_obj)
+
+        con_obj = JSBridge_GetConsoleObj()
+        JSVM_SetGlobal("console", con_obj)
+
+        math_obj = JSBridge_GetMathObj()
+        JSVM_SetGlobal("Math", math_obj)
+
+        // setTimeout
+        st_func = JSBridge__CreateNativeFunc(JSNativeID.SET_TIMEOUT, "setTimeout", 2)
+        JSVM_SetGlobal("setTimeout", st_func)
+
+        // setInterval
+        si_func = JSBridge__CreateNativeFunc(JSNativeID.SET_INTERVAL, "setInterval", 2)
+        JSVM_SetGlobal("setInterval", si_func)
+
+        // clearTimeout
+        ct_func = JSBridge__CreateNativeFunc(JSNativeID.CLEAR_TIMEOUT, "clearTimeout", 1)
+        JSVM_SetGlobal("clearTimeout", ct_func)
+
+        // parseInt
+        pi_func = JSBridge__CreateNativeFunc(JSNativeID.PARSE_INT, "parseInt", 1)
+        JSVM_SetGlobal("parseInt", pi_func)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// RUN — execute a single JavaScript source string through the full pipeline
+// Resets lexer/compiler/VM, reinstalls builtins and bridge globals,
+// then evaluates via JSVM_Eval.
+// Returns result JSValue pointer (or JSRT_Undefined on error).
+// =============================================================================
+Function.JSEngine_Run {
+    Input: source: Address
+    Input: src_len: Integer
+    Output: Address
+    Body: {
+        save_src = source
+        save_len = src_len
+
+        // Guard
+        IfCondition EqualTo(save_src, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+        IfCondition LessEqual(save_len, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Reset subsystems for this execution unit
+        JSLex_Reset()
+        JSComp_Reset()
+        JSVM_Reset()
+
+        // Re-install built-in globals (console, Math, etc.)
+        JSVM_InstallBuiltins()
+
+        // Re-register DOM bridge globals if bridge is ready
+        IfCondition EqualTo(JSEngState.bridge_ready, 1) ThenBlock: {
+            JSEngine__RegisterBridgeGlobals()
+        }
+
+        // Tokenize
+        tok_count = JSLex_Tokenize(save_src, save_len)
+        IfCondition LessEqual(tok_count, 0) ThenBlock: {
+            PrintMessage("[JSEngine] Lex failed\n")
+            JSEngState.error = 1
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Parse
+        ast_root = JSParse_Parse()
+        IfCondition LessThan(ast_root, 0) ThenBlock: {
+            PrintMessage("[JSEngine] Parse failed\n")
+            JSEngState.error = 1
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Compile
+        comp_ok = JSComp_Compile(ast_root)
+        IfCondition EqualTo(comp_ok, 0) ThenBlock: {
+            PrintMessage("[JSEngine] Compile failed\n")
+            JSEngState.error = 1
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Load bytecode into VM
+        bc = JSComp_GetCode()
+        bc_len = JSComp_GetCodeLen()
+        cp = JSComp_GetConst(0)
+        cc = JSComp_GetConstCount()
+        JSVM_Load(bc, bc_len, cp, cc)
+
+        // Execute
+        result = JSVM_Run()
+
+        // Check for VM errors
+        vm_err = JSVM_GetError()
+        IfCondition EqualTo(vm_err, 1) ThenBlock: {
+            vm_steps = JSVM_GetSteps()
+            PrintMessage("[JSEngine] VM error after ")
+            PrintNumber(vm_steps)
+            PrintMessage(" steps\n")
+            JSEngState.error = 1
+        }
+
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// LOAD PAGE — main entry point for running JS on a loaded page
+// 1. Store dom_root
+// 2. Initialize JSBridge with DOM bindings
+// 3. Install built-in globals
+// 4. Walk DOM to find all <script> elements
+// 5. Execute each script in document order
+// Returns number of scripts executed, or -1 on error.
+// =============================================================================
+Function.JSEngine_LoadPage {
+    Input: dom_root: Integer
+    Output: Integer
+    Body: {
+        save_root = dom_root
+
+        // Guard: engine must be initialized
+        IfCondition EqualTo(JSEngState.initialized, 0) ThenBlock: {
+            PrintMessage("[JSEngine] Not initialized\n")
+            ReturnValue(-1)
+        }
+
+        // Store DOM root
+        JSEngState.dom_root = save_root
+
+        // Reset script collection state
+        JSEngState.script_count = 0
+        JSEngState.str_pos = 0
+        JSEngState.error = 0
+
+        // --- Initialize JSBridge with DOM root ---
+        bridge_ok = JSBridge_Init(save_root)
+        IfCondition EqualTo(bridge_ok, 0) ThenBlock: {
+            PrintMessage("[JSEngine] JSBridge_Init fail\n")
+            ReturnValue(-1)
+        }
+        JSEngState.bridge_ready = 1
+
+        // --- Install VM built-ins (console, Math, etc.) ---
+        JSVM_InstallBuiltins()
+
+        // --- Register DOM bridge globals (document, window, etc.) ---
+        JSEngine__RegisterBridgeGlobals()
+
+        // --- Walk DOM tree to find all <script> elements ---
+        script_count = JSEngine__FindScripts(save_root)
+        PrintMessage("[JSEngine] Found ")
+        PrintNumber(script_count)
+        PrintMessage(" script(s)\n")
+
+        // --- Execute each script in document order ---
+        exec_count = 0
+        si = 0
+        WhileLoop LessThan(si, JSEngState.script_count) {
+            s_ptr = JSEngine__GetScriptPtr(si)
+            s_len = JSEngine__GetScriptLen(si)
+
+            IfCondition And(NotEqual(s_ptr, 0), GreaterThan(s_len, 0)) ThenBlock: {
+                PrintMessage("[JSEngine] Exec script #")
+                PrintNumber(si)
+                PrintMessage(" (")
+                PrintNumber(s_len)
+                PrintMessage(" bytes)\n")
+
+                // Save loop index across JSEngine_Run call
+                JSEng__Push(si)
+                JSEng__Push(exec_count)
+                JSEngine_Run(s_ptr, s_len)
+                exec_count = JSEng__Pop()
+                si = JSEng__Pop()
+
+                exec_count = Add(exec_count, 1)
+            }
+
+            si = Add(si, 1)
+        }
+
+        PrintMessage("[JSEngine] Executed ")
+        PrintNumber(exec_count)
+        PrintMessage(" script(s)\n")
+        ReturnValue(exec_count)
+    }
+}
+
+// =============================================================================
+// TICK — called from the browser main loop each frame
+// Dispatches timer callbacks (setTimeout, setInterval) that have expired.
+// current_ms = monotonic milliseconds from the browser clock.
+// Returns number of timers fired.
+// =============================================================================
+Function.JSEngine_Tick {
+    Input: current_ms: Integer
+    Output: Integer
+    Body: {
+        save_ms = current_ms
+
+        // Guard: bridge must be ready
+        IfCondition EqualTo(JSEngState.bridge_ready, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Dispatch expired timers via the bridge
+        fired = JSBridge_TickTimers(save_ms)
+        ReturnValue(fired)
+    }
+}
+
+// =============================================================================
+// FIRE DOM EVENT — called when a user interaction or DOM event occurs
+// Looks up registered event handlers and invokes them.
+// dom_node = DOM node index that was interacted with
+// event_name = null-terminated string e.g. "click", "input", "change"
+// Returns 1 if a handler was invoked, 0 if no handler found.
+// =============================================================================
+Function.JSEngine_FireDOMEvent {
+    Input: dom_node: Integer
+    Input: event_name: Address
+    Output: Integer
+    Body: {
+        save_node = dom_node
+        save_name = event_name
+
+        // Guard: bridge must be ready
+        IfCondition EqualTo(JSEngState.bridge_ready, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        result = JSBridge_FireEvent(save_node, save_name)
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// EVAL STRING — convenience function to evaluate an arbitrary JS string
+// Can be called at any time after JSEngine_Init (bridge optional).
+// Useful for console input, bookmarklets, etc.
+// Returns result JSValue pointer.
+// =============================================================================
+Function.JSEngine_EvalString {
+    Input: js_str: Address
+    Input: js_len: Integer
+    Output: Address
+    Body: {
+        save_str = js_str
+        save_len = js_len
+
+        IfCondition EqualTo(JSEngState.initialized, 0) ThenBlock: {
+            PrintMessage("[JSEngine] Not initialized\n")
+            ReturnValue(JSRT_Undefined())
+        }
+
+        result = JSEngine_Run(save_str, save_len)
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// STATE QUERY — expose engine state for debug/diagnostics
+// =============================================================================
+
+Function.JSEngine_GetError {
+    Output: Integer
+    Body: {
+        ReturnValue(JSEngState.error)
+    }
+}
+
+Function.JSEngine_GetScriptCount {
+    Output: Integer
+    Body: {
+        ReturnValue(JSEngState.script_count)
+    }
+}
+
+Function.JSEngine_IsInitialized {
+    Output: Integer
+    Body: {
+        ReturnValue(JSEngState.initialized)
+    }
+}
+
+Function.JSEngine_IsBridgeReady {
+    Output: Integer
+    Body: {
+        ReturnValue(JSEngState.bridge_ready)
+    }
+}
+
+Function.JSEngine_GetDomRoot {
+    Output: Integer
+    Body: {
+        ReturnValue(JSEngState.dom_root)
+    }
+}
+
+// =============================================================================
+// SET DOM ROOT — update the DOM root without full re-init
+// Used when the DOM tree is rebuilt (e.g., innerHTML assignment).
+// =============================================================================
+Function.JSEngine_SetDomRoot {
+    Input: new_root: Integer
+    Output: Integer
+    Body: {
+        save_root = new_root
+        JSEngState.dom_root = save_root
+
+        // Re-initialize bridge with new root
+        IfCondition EqualTo(JSEngState.bridge_ready, 1) ThenBlock: {
+            JSBridge_Init(save_root)
+        }
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SHUTDOWN — release resources (called on browser exit, optional)
+// Sets initialized flag to 0. Does not free memory (Arena handles that).
+// =============================================================================
+Function.JSEngine_Shutdown {
+    Output: Integer
+    Body: {
+        JSEngState.initialized = 0
+        JSEngState.bridge_ready = 0
+        JSEngState.dom_root = 0
+        JSEngState.script_count = 0
+        JSEngState.str_pos = 0
+        JSEngState.error = 0
+        JSEngStack.sp = 0
+        PrintMessage("[JSEngine] Shutdown\n")
+        ReturnValue(0)
+    }
+}
