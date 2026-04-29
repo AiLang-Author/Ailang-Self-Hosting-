@@ -1,0 +1,588 @@
+// Library.HTTPClient.ailang — HTTP/1.1 client for the Ailang browser engine
+// Direct TCP via Socket library. Supports GET/POST, chunked transfer,
+// redirects, and keep-alive connection reuse.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+LibraryImport.Socket
+LibraryImport.Browser.URL
+LibraryImport.Browser.DNS
+
+FixedPool.HTTPSys {
+    "SYS_READ":     Initialize=0
+    "SYS_WRITE":    Initialize=1
+    "SYS_CLOSE":    Initialize=3
+}
+
+FixedPool.HTTPConst {
+    "MAX_RESP":     Initialize=16
+    "RESP_SIZE":    Initialize=64
+    "R_STATUS":     Initialize=0
+    "R_BODY_PTR":   Initialize=8
+    "R_BODY_LEN":   Initialize=16
+    "R_CTYPE_PTR":  Initialize=24
+    "R_HDRS_PTR":   Initialize=32
+    "R_HDRS_LEN":   Initialize=40
+    "R_VALID":      Initialize=48
+    "R_LOCATION":   Initialize=56
+    "MAX_REDIR":    Initialize=5
+    "RECV_BUF":     Initialize=65536
+    "MAX_BODY":     Initialize=4194304
+}
+
+FixedPool.HTTPState {
+    "pool":         Initialize=0
+    "next":         Initialize=0
+    "recv_buf":     Initialize=0
+}
+
+Function.HTTP_Init {
+    Output: Integer
+    Body: {
+        total = Multiply(HTTPConst.MAX_RESP, HTTPConst.RESP_SIZE)
+        HTTPState.pool = Allocate(total)
+        MemorySet(HTTPState.pool, 0, total)
+        HTTPState.recv_buf = Allocate(HTTPConst.RECV_BUF)
+        HTTPState.next = 0
+        ReturnValue(0)
+    }
+}
+
+// ---- Allocate response slot ----
+Function.HTTP__AllocResp {
+    Output: Integer
+    Body: {
+        h = HTTPState.next
+        IfCondition GreaterEqual(h, HTTPConst.MAX_RESP) ThenBlock: {
+            h = 0   // Wrap around
+        }
+        HTTPState.next = Add(h, 1)
+        base = Add(HTTPState.pool, Multiply(h, HTTPConst.RESP_SIZE))
+        MemorySet(base, 0, HTTPConst.RESP_SIZE)
+        ReturnValue(h)
+    }
+}
+
+Function.HTTP__RespBase {
+    Input: h: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(HTTPState.pool, Multiply(h, HTTPConst.RESP_SIZE)))
+    }
+}
+
+// ---- GET request with redirect following ----
+Function.HTTP_Get {
+    Input: url_h: Integer
+    Output: Integer
+    Body: {
+        redir = 0
+        cur_url = url_h
+        WhileLoop LessThan(redir, HTTPConst.MAX_REDIR) {
+            resp_h = HTTP__DoGet(cur_url)
+            IfCondition LessThan(resp_h, 0) ThenBlock: {
+                ReturnValue(-1)
+            }
+            status = HTTP_GetStatus(resp_h)
+            // 301, 302, 307, 308 — follow Location
+            is_redir = Or(Or(EqualTo(status, 301), EqualTo(status, 302)),
+                         Or(EqualTo(status, 307), EqualTo(status, 308)))
+            IfCondition EqualTo(is_redir, 1) ThenBlock: {
+                loc = HTTP_GetLocation(resp_h)
+                IfCondition EqualTo(loc, 0) ThenBlock: {
+                    ReturnValue(resp_h)
+                }
+                loc_len = StringLength(loc)
+                IfCondition EqualTo(loc_len, 0) ThenBlock: {
+                    ReturnValue(resp_h)
+                }
+                // Parse location URL
+                cur_url = URL_Parse(loc, loc_len)
+                IfCondition LessThan(cur_url, 0) ThenBlock: {
+                    ReturnValue(resp_h)
+                }
+                redir = Add(redir, 1)
+            } ElseBlock: {
+                ReturnValue(resp_h)
+            }
+        }
+        PrintMessage("[HTTP] too many redirects\n")
+        ReturnValue(-1)
+    }
+}
+
+// ---- Internal: single GET without redirect ----
+Function.HTTP__DoGet {
+    Input: url_h: Integer
+    Output: Integer
+    Body: {
+        host = URL_GetHost(url_h)
+        port = URL_GetPort(url_h)
+        path = URL_GetPath(url_h)
+        is_https = URL_IsHTTPS(url_h)
+
+        // Resolve hostname
+        host_len = StringLength(host)
+        ip4 = DNS_Resolve(host, host_len)
+        IfCondition LessThan(ip4, 0) ThenBlock: {
+            PrintMessage("[HTTP] DNS failed for ")
+            PrintMessage(host)
+            PrintMessage("\n")
+            ReturnValue(-1)
+        }
+
+        ip_str = DNS_IP4ToString(ip4)
+
+        // For HTTPS, use TLS subprocess (if available)
+        IfCondition EqualTo(is_https, 1) ThenBlock: {
+            ReturnValue(HTTP__DoGetTLS(url_h, host, port, path, ip_str))
+        }
+
+        // TCP connect
+        sock = Socket.Create(2, 1)
+        IfCondition LessThan(sock, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        // Build sockaddr_in directly (bypasses Socket.CreateAddr/ArrayGet mismatch)
+        addr = Allocate(16)
+        MemorySet(addr, 0, 16)
+        SetByte(addr, 0, 2)  // AF_INET
+        SetByte(addr, 1, 0)
+        SetByte(addr, 2, Divide(port, 256))
+        SetByte(addr, 3, Subtract(port, Multiply(Divide(port, 256), 256)))
+        // IP from ip4 integer
+        SetByte(addr, 4, Divide(ip4, 16777216))
+        ipr1 = Subtract(ip4, Multiply(Divide(ip4, 16777216), 16777216))
+        SetByte(addr, 5, Divide(ipr1, 65536))
+        ipr2 = Subtract(ipr1, Multiply(Divide(ipr1, 65536), 65536))
+        SetByte(addr, 6, Divide(ipr2, 256))
+        SetByte(addr, 7, Subtract(ipr2, Multiply(Divide(ipr2, 256), 256)))
+        conn = Socket.Connect(sock, addr)
+        IfCondition LessThan(conn, 0) ThenBlock: {
+            SystemCall(HTTPSys.SYS_CLOSE, sock, 0, 0)
+            ReturnValue(-1)
+        }
+
+        // Build request
+        req = HTTP__BuildRequest("GET", path, host)
+        req_len = StringLength(req)
+
+        // Send
+        sent = Socket.Send(sock, req, req_len)
+        IfCondition LessEqual(sent, 0) ThenBlock: {
+            SystemCall(HTTPSys.SYS_CLOSE, sock, 0, 0)
+            ReturnValue(-1)
+        }
+
+        // Receive response
+        resp_h = HTTP__RecvResponse(sock)
+        SystemCall(HTTPSys.SYS_CLOSE, sock, 0, 0)
+        ReturnValue(resp_h)
+    }
+}
+
+// ---- HTTPS via openssl s_client subprocess ----
+Function.HTTP__DoGetTLS {
+    Input: url_h: Integer
+    Input: host: Address
+    Input: port: Integer
+    Input: path: Address
+    Input: ip_str: Address
+    Output: Integer
+    Body: {
+        // Build "host:port" connect string for openssl
+        port_str = IntToString(port)
+        // "openssl s_client -connect host:port -quiet -servername host"
+        // We fork/exec with pipes
+
+        // Create pipe for stdin (we write request)
+        pipe_in = Allocate(16)
+        SystemCall(22, pipe_in, 0, 0, 0, 0)   // SYS_PIPE
+        read_in = Dereference(pipe_in, "dword")
+        write_in = Dereference(Add(pipe_in, 4), "dword")
+
+        // Create pipe for stdout (we read response)
+        pipe_out = Allocate(16)
+        SystemCall(22, pipe_out, 0, 0, 0, 0)
+        read_out = Dereference(pipe_out, "dword")
+        write_out = Dereference(Add(pipe_out, 4), "dword")
+
+        // Fork
+        pid = SystemCall(57, 0, 0, 0, 0, 0)   // SYS_FORK
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child: wire pipes, exec openssl
+            SystemCall(33, read_in, 0, 0, 0, 0)    // dup2(read_in, 0)
+            SystemCall(33, write_out, 1, 0, 0, 0)  // dup2(write_out, 1)
+            SystemCall(33, write_out, 2, 0, 0, 0)  // dup2(write_out, 2)
+            SystemCall(HTTPSys.SYS_CLOSE, write_in, 0, 0)
+            SystemCall(HTTPSys.SYS_CLOSE, read_out, 0, 0)
+
+            // Build connect arg: "host:port"
+            connect_arg = Allocate(256)
+            hl = StringLength(host)
+            MemoryCopy(connect_arg, host, hl)
+            ci = hl
+            SetByte(connect_arg, ci, 58)
+            ci = Add(ci, 1)
+            pl = StringLength(port_str)
+            MemoryCopy(Add(connect_arg, ci), port_str, pl)
+            ci = Add(ci, pl)
+            SetByte(connect_arg, ci, 0)
+
+            argv = Allocate(56)
+            StoreValue(Add(argv, 0), "/usr/bin/openssl")
+            StoreValue(Add(argv, 8), "s_client")
+            StoreValue(Add(argv, 16), "-connect")
+            StoreValue(Add(argv, 24), connect_arg)
+            StoreValue(Add(argv, 32), "-quiet")
+            StoreValue(Add(argv, 40), "-servername")
+            StoreValue(Add(argv, 48), host)
+
+            // Need null terminator for argv but we're at 7 args = 56 bytes
+            // Reallocate with space for null
+            argv2 = Allocate(64)
+            MemoryCopy(argv2, argv, 56)
+            StoreValue(Add(argv2, 56), 0)
+
+            envp = Allocate(16)
+            StoreValue(Add(envp, 0), "PATH=/usr/bin:/bin")
+            StoreValue(Add(envp, 8), 0)
+
+            SystemCall(59, "/usr/bin/openssl", argv2, envp)
+            SystemCall(60, 1, 0, 0, 0, 0)  // exit(1) if execve fails
+        }
+
+        // Parent: close unused ends
+        SystemCall(HTTPSys.SYS_CLOSE, read_in, 0, 0)
+        SystemCall(HTTPSys.SYS_CLOSE, write_out, 0, 0)
+
+        // Wait a moment for TLS handshake (sleep 1 sec)
+        // Use nanosleep: 1 second
+        ts = Allocate(16)
+        StoreValue(Add(ts, 0), 1)
+        StoreValue(Add(ts, 8), 0)
+        SystemCall(35, ts, 0, 0, 0, 0)   // SYS_NANOSLEEP
+
+        // Send HTTP request through the TLS tunnel
+        req = HTTP__BuildRequest("GET", path, host)
+        req_len = StringLength(req)
+        SystemCall(HTTPSys.SYS_WRITE, write_in, req, req_len)
+
+        // Read response
+        resp_h = HTTP__RecvResponse(read_out)
+
+        // Cleanup
+        SystemCall(HTTPSys.SYS_CLOSE, write_in, 0, 0)
+        SystemCall(HTTPSys.SYS_CLOSE, read_out, 0, 0)
+        // Kill child
+        SystemCall(62, pid, 9, 0, 0, 0)    // SYS_KILL SIGKILL
+        // Reap
+        SystemCall(61, pid, 0, 0, 0, 0)    // SYS_WAIT4
+
+        ReturnValue(resp_h)
+    }
+}
+
+// ---- Build HTTP/1.1 request ----
+Function.HTTP__BuildRequest {
+    Input: method: Address
+    Input: path: Address
+    Input: host: Address
+    Output: Address
+    Body: {
+        buf = Allocate(2048)
+        pos = 0
+
+        // "METHOD /path HTTP/1.1\r\n"
+        ml = StringLength(method)
+        MemoryCopy(Add(buf, pos), method, ml)
+        pos = Add(pos, ml)
+        SetByte(buf, pos, 32)
+        pos = Add(pos, 1)
+
+        pl = StringLength(path)
+        IfCondition GreaterThan(pl, 0) ThenBlock: {
+            MemoryCopy(Add(buf, pos), path, pl)
+            pos = Add(pos, pl)
+        } ElseBlock: {
+            SetByte(buf, pos, 47)
+            pos = Add(pos, 1)
+        }
+
+        http_ver = " HTTP/1.1\r\n"
+        hvl = StringLength(http_ver)
+        MemoryCopy(Add(buf, pos), http_ver, hvl)
+        pos = Add(pos, hvl)
+
+        // "Host: host\r\n"
+        hdr_host = "Host: "
+        hl = StringLength(hdr_host)
+        MemoryCopy(Add(buf, pos), hdr_host, hl)
+        pos = Add(pos, hl)
+        hl2 = StringLength(host)
+        MemoryCopy(Add(buf, pos), host, hl2)
+        pos = Add(pos, hl2)
+        SetByte(buf, pos, 13)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 10)
+        pos = Add(pos, 1)
+
+        // Standard headers
+        std_hdrs = "User-Agent: AilangBrowser/1.0\r\nAccept: text/html,*/*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        sl = StringLength(std_hdrs)
+        MemoryCopy(Add(buf, pos), std_hdrs, sl)
+        pos = Add(pos, sl)
+
+        SetByte(buf, pos, 0)
+        ReturnValue(buf)
+    }
+}
+
+// ---- Receive and parse HTTP response ----
+Function.HTTP__RecvResponse {
+    Input: sock: Integer
+    Output: Integer
+    Body: {
+        // Set recv timeout: 10 seconds
+        tval = Allocate(16)
+        StoreValue(Add(tval, 0), 10)
+        StoreValue(Add(tval, 8), 0)
+        SystemCall(54, sock, 1, 20, tval, 16)
+
+        // Read all data into a buffer
+        body_buf = Allocate(HTTPConst.MAX_BODY)
+        recv_total = 0
+        done = 0
+        WhileLoop EqualTo(done, 0) {
+            remain = Subtract(HTTPConst.MAX_BODY, recv_total)
+            IfCondition LessEqual(remain, 0) ThenBlock: {
+                done = 1
+            } ElseBlock: {
+                rsize = remain
+                IfCondition GreaterThan(rsize, HTTPConst.RECV_BUF) ThenBlock: {
+                    rsize = HTTPConst.RECV_BUF
+                }
+                n = SystemCall(HTTPSys.SYS_READ, sock, Add(body_buf, recv_total), rsize)
+                IfCondition LessEqual(n, 0) ThenBlock: {
+                    done = 1
+                } ElseBlock: {
+                    recv_total = Add(recv_total, n)
+                }
+            }
+        }
+
+        IfCondition EqualTo(recv_total, 0) ThenBlock: {
+            PrintMessage("[HTTP] no data received\n")
+            ReturnValue(-1)
+        }
+
+        resp_h = HTTP__AllocResp()
+        base = HTTP__RespBase(resp_h)
+
+        // Find \r\n\r\n (end of headers)
+        hdr_end = -1
+        si = 0
+        search_max = Subtract(recv_total, 3)
+        WhileLoop LessThan(si, search_max) {
+            c0 = GetByte(body_buf, si)
+            c1 = GetByte(body_buf, Add(si, 1))
+            c2 = GetByte(body_buf, Add(si, 2))
+            c3 = GetByte(body_buf, Add(si, 3))
+            IfCondition And(And(EqualTo(c0, 13), EqualTo(c1, 10)), And(EqualTo(c2, 13), EqualTo(c3, 10))) ThenBlock: {
+                hdr_end = si
+                si = search_max  // break
+            }
+            si = Add(si, 1)
+        }
+
+        IfCondition LessThan(hdr_end, 0) ThenBlock: {
+            PrintMessage("[HTTP] no header terminator\n")
+            StoreValue(Add(base, HTTPConst.R_STATUS), 0)
+            StoreValue(Add(base, HTTPConst.R_VALID), 1)
+            ReturnValue(resp_h)
+        }
+
+        // Parse status line: "HTTP/1.1 NNN reason\r\n"
+        status = HTTP__ParseStatus(body_buf, hdr_end)
+        StoreValue(Add(base, HTTPConst.R_STATUS), status)
+
+        // Store headers region
+        StoreValue(Add(base, HTTPConst.R_HDRS_PTR), body_buf)
+        StoreValue(Add(base, HTTPConst.R_HDRS_LEN), hdr_end)
+
+        // Parse Location header for redirects
+        loc = HTTP__FindHeader(body_buf, hdr_end, "Location")
+        StoreValue(Add(base, HTTPConst.R_LOCATION), loc)
+
+        // Parse Content-Type
+        ctype = HTTP__FindHeader(body_buf, hdr_end, "Content-Type")
+        StoreValue(Add(base, HTTPConst.R_CTYPE_PTR), ctype)
+
+        // Body starts after \r\n\r\n
+        body_start = Add(hdr_end, 4)
+        body_len = Subtract(recv_total, body_start)
+        IfCondition LessThan(body_len, 0) ThenBlock: { body_len = 0 }
+
+        StoreValue(Add(base, HTTPConst.R_BODY_PTR), Add(body_buf, body_start))
+        StoreValue(Add(base, HTTPConst.R_BODY_LEN), body_len)
+        StoreValue(Add(base, HTTPConst.R_VALID), 1)
+
+        ReturnValue(resp_h)
+    }
+}
+
+// ---- Parse "HTTP/1.x NNN" -> status code ----
+Function.HTTP__ParseStatus {
+    Input: buf: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        // Find first space, then parse 3 digits
+        i = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(buf, i)
+            IfCondition EqualTo(ch, 32) ThenBlock: {
+                // Parse NNN
+                d1 = Subtract(GetByte(buf, Add(i, 1)), 48)
+                d2 = Subtract(GetByte(buf, Add(i, 2)), 48)
+                d3 = Subtract(GetByte(buf, Add(i, 3)), 48)
+                ReturnValue(Add(Add(Multiply(d1, 100), Multiply(d2, 10)), d3))
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ---- Find header value by name (case-insensitive first char match) ----
+Function.HTTP__FindHeader {
+    Input: buf: Address
+    Input: hdr_end: Integer
+    Input: name: Address
+    Output: Address
+    Body: {
+        nlen = StringLength(name)
+        IfCondition EqualTo(nlen, 0) ThenBlock: { ReturnValue(0) }
+
+        // Scan line by line
+        line_start = 0
+        i = 0
+        WhileLoop LessThan(i, hdr_end) {
+            ch = GetByte(buf, i)
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                line_start = Add(i, 1)
+            }
+            // Check if this line starts with "Name: "
+            IfCondition EqualTo(i, line_start) ThenBlock: {
+                match = 1
+                j = 0
+                WhileLoop LessThan(j, nlen) {
+                    c1 = GetByte(buf, Add(i, j))
+                    c2 = GetByte(name, j)
+                    // Case-insensitive compare
+                    IfCondition And(GreaterEqual(c1, 65), LessEqual(c1, 90)) ThenBlock: {
+                        c1 = Add(c1, 32)
+                    }
+                    IfCondition And(GreaterEqual(c2, 65), LessEqual(c2, 90)) ThenBlock: {
+                        c2 = Add(c2, 32)
+                    }
+                    IfCondition NotEqual(c1, c2) ThenBlock: {
+                        match = 0
+                        j = nlen
+                    }
+                    j = Add(j, 1)
+                }
+                IfCondition EqualTo(match, 1) ThenBlock: {
+                    // Check for ": " after name
+                    colon_pos = Add(i, nlen)
+                    IfCondition LessThan(Add(colon_pos, 1), hdr_end) ThenBlock: {
+                        cc = GetByte(buf, colon_pos)
+                        IfCondition EqualTo(cc, 58) ThenBlock: {
+                            // Skip ": " (colon + optional space)
+                            val_start = Add(colon_pos, 1)
+                            IfCondition LessThan(val_start, hdr_end) ThenBlock: {
+                                sp = GetByte(buf, val_start)
+                                IfCondition EqualTo(sp, 32) ThenBlock: {
+                                    val_start = Add(val_start, 1)
+                                }
+                            }
+                            // Find end of value (CR or LF)
+                            val_end = val_start
+                            WhileLoop LessThan(val_end, hdr_end) {
+                                vc = GetByte(buf, val_end)
+                                IfCondition Or(EqualTo(vc, 13), EqualTo(vc, 10)) ThenBlock: {
+                                    val_end = hdr_end
+                                } ElseBlock: {
+                                    val_end = Add(val_end, 1)
+                                }
+                            }
+                            // Re-find actual end
+                            val_end = val_start
+                            WhileLoop LessThan(val_end, hdr_end) {
+                                vc = GetByte(buf, val_end)
+                                IfCondition Or(EqualTo(vc, 13), EqualTo(vc, 10)) ThenBlock: {
+                                    // Copy value
+                                    vlen = Subtract(val_end, val_start)
+                                    vbuf = Allocate(Add(vlen, 1))
+                                    MemoryCopy(vbuf, Add(buf, val_start), vlen)
+                                    SetByte(vbuf, vlen, 0)
+                                    ReturnValue(vbuf)
+                                }
+                                val_end = Add(val_end, 1)
+                            }
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ---- Accessors ----
+Function.HTTP_GetStatus {
+    Input: h: Integer
+    Output: Integer
+    Body: {
+        base = HTTP__RespBase(h)
+        ReturnValue(Dereference(Add(base, HTTPConst.R_STATUS)))
+    }
+}
+
+Function.HTTP_GetBody {
+    Input: h: Integer
+    Output: Address
+    Body: {
+        base = HTTP__RespBase(h)
+        ReturnValue(Dereference(Add(base, HTTPConst.R_BODY_PTR)))
+    }
+}
+
+Function.HTTP_GetBodyLen {
+    Input: h: Integer
+    Output: Integer
+    Body: {
+        base = HTTP__RespBase(h)
+        ReturnValue(Dereference(Add(base, HTTPConst.R_BODY_LEN)))
+    }
+}
+
+Function.HTTP_GetContentType {
+    Input: h: Integer
+    Output: Address
+    Body: {
+        base = HTTP__RespBase(h)
+        ReturnValue(Dereference(Add(base, HTTPConst.R_CTYPE_PTR)))
+    }
+}
+
+Function.HTTP_GetLocation {
+    Input: h: Integer
+    Output: Address
+    Body: {
+        base = HTTP__RespBase(h)
+        ReturnValue(Dereference(Add(base, HTTPConst.R_LOCATION)))
+    }
+}

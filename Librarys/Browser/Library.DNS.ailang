@@ -1,0 +1,572 @@
+// Library.DNS.ailang — DNS resolver for the Ailang browser engine
+// Sends A-record queries via UDP to the system resolver (from /etc/resolv.conf).
+// 64-entry cache with TTL expiry.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// Syscall numbers
+FixedPool.DNSSys {
+    "SYS_READ":     Initialize=0
+    "SYS_WRITE":    Initialize=1
+    "SYS_OPEN":     Initialize=2
+    "SYS_CLOSE":    Initialize=3
+    "SYS_SOCKET":   Initialize=41
+    "SYS_SENDTO":   Initialize=44
+    "SYS_RECVFROM": Initialize=45
+    "SYS_TIME":     Initialize=201
+    "AF_INET":      Initialize=2
+    "SOCK_DGRAM":   Initialize=2
+}
+
+// Cache: 64 entries x 32 bytes = 2048 bytes
+// Per entry: hostname_ptr(8) + ip4(8) + expire_time(8) + valid(8)
+FixedPool.DNSConst {
+    "CACHE_MAX":    Initialize=64
+    "ENTRY_SIZE":   Initialize=32
+    "E_HOST":       Initialize=0
+    "E_IP4":        Initialize=8
+    "E_EXPIRE":     Initialize=16
+    "E_VALID":      Initialize=24
+    "CACHE_TTL":    Initialize=300
+    "DNS_PORT":     Initialize=53
+}
+
+FixedPool.DNSState {
+    "cache":        Initialize=0
+    "ns_ip":        Initialize=0
+    "ns_ready":     Initialize=0
+    "query_id":     Initialize=1
+}
+
+Function.DNS_Init {
+    Output: Integer
+    Body: {
+        total = Multiply(DNSConst.CACHE_MAX, DNSConst.ENTRY_SIZE)
+        DNSState.cache = Allocate(total)
+        MemorySet(DNSState.cache, 0, total)
+        DNS__ReadResolv()
+        ReturnValue(0)
+    }
+}
+
+// ---- Read /etc/resolv.conf for first nameserver IP ----
+Function.DNS__ReadResolv {
+    Output: Integer
+    Body: {
+        fd = SystemCall(DNSSys.SYS_OPEN, "/etc/resolv.conf", 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            // Fallback: 8.8.8.8
+            DNSState.ns_ip = Add(Add(Multiply(8, 16777216), Multiply(8, 65536)), Add(Multiply(8, 256), 8))
+            DNSState.ns_ready = 1
+            ReturnValue(0)
+        }
+
+        buf = Allocate(1024)
+        n = SystemCall(DNSSys.SYS_READ, fd, buf, 1023)
+        SystemCall(DNSSys.SYS_CLOSE, fd, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            DNSState.ns_ip = Add(Add(Multiply(8, 16777216), Multiply(8, 65536)), Add(Multiply(8, 256), 8))
+            DNSState.ns_ready = 1
+            ReturnValue(0)
+        }
+        SetByte(buf, n, 0)
+
+        // Scan through buffer byte-by-byte to find "nameserver " at start of a line
+        // Track whether we're at column 0 (start of line)
+        at_col0 = 1
+        i = 0
+        WhileLoop LessThan(i, n) {
+            ch = GetByte(buf, i)
+            IfCondition And(EqualTo(at_col0, 1), EqualTo(ch, 110)) ThenBlock: {
+                // Might be "nameserver " — check full prefix
+                match = 1
+                ns_str = "nameserver "
+                j = 0
+                WhileLoop LessThan(j, 11) {
+                    pos = Add(i, j)
+                    IfCondition GreaterEqual(pos, n) ThenBlock: {
+                        match = 0
+                        j = 11
+                    } ElseBlock: {
+                        c1 = GetByte(buf, pos)
+                        c2 = GetByte(ns_str, j)
+                        IfCondition NotEqual(c1, c2) ThenBlock: {
+                            match = 0
+                            j = 11
+                        }
+                    }
+                    j = Add(j, 1)
+                }
+                IfCondition EqualTo(match, 1) ThenBlock: {
+                    // Found! Extract IP digits+dots starting at i+11
+                    ip_start = Add(i, 11)
+                    ip_end = ip_start
+                    ip_real_end = ip_start
+                    WhileLoop LessThan(ip_end, n) {
+                        c = GetByte(buf, ip_end)
+                        is_ip = Or(And(GreaterEqual(c, 48), LessEqual(c, 57)), EqualTo(c, 46))
+                        IfCondition EqualTo(is_ip, 1) ThenBlock: {
+                            ip_end = Add(ip_end, 1)
+                            ip_real_end = ip_end
+                        } ElseBlock: {
+                            ip_end = n  // break loop
+                        }
+                    }
+                    ip_str = URL__CopyRange(buf, ip_start, ip_real_end)
+                    DNSState.ns_ip = DNS__ParseIP4(ip_str)
+                    DNSState.ns_ready = 1
+                    ReturnValue(0)
+                }
+            }
+            // Track line boundaries
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                at_col0 = 1
+            } ElseBlock: {
+                at_col0 = 0
+            }
+            i = Add(i, 1)
+        }
+
+        // No nameserver found — fallback 8.8.8.8
+        DNSState.ns_ip = Add(Add(Multiply(8, 16777216), Multiply(8, 65536)), Add(Multiply(8, 256), 8))
+        DNSState.ns_ready = 1
+        ReturnValue(0)
+    }
+}
+
+// ---- Parse "a.b.c.d" string into 32-bit IP (network byte order as 4 bytes) ----
+Function.DNS__ParseIP4 {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        len = StringLength(str)
+        parts = Allocate(32)
+        MemorySet(parts, 0, 32)
+        part_idx = 0
+        val = 0
+        i = 0
+        WhileLoop LessEqual(i, len) {
+            ch = 0
+            IfCondition LessThan(i, len) ThenBlock: { ch = GetByte(str, i) }
+            IfCondition Or(EqualTo(ch, 46), EqualTo(i, len)) ThenBlock: {
+                StoreValue(Add(parts, Multiply(part_idx, 8)), val)
+                part_idx = Add(part_idx, 1)
+                val = 0
+            } ElseBlock: {
+                IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: {
+                    val = Add(Multiply(val, 10), Subtract(ch, 48))
+                }
+            }
+            i = Add(i, 1)
+        }
+        a = Dereference(Add(parts, 0))
+        b = Dereference(Add(parts, 8))
+        c = Dereference(Add(parts, 16))
+        d = Dereference(Add(parts, 24))
+        ReturnValue(Add(Add(Multiply(a, 16777216), Multiply(b, 65536)), Add(Multiply(c, 256), d)))
+    }
+}
+
+// ---- Check cache for hostname, return IP or -1 ----
+Function.DNS__CacheLookup {
+    Input: hostname: Address
+    Output: Integer
+    Body: {
+        now = SystemCall(DNSSys.SYS_TIME, 0, 0, 0)
+        i = 0
+        WhileLoop LessThan(i, DNSConst.CACHE_MAX) {
+            ebase = Add(DNSState.cache, Multiply(i, DNSConst.ENTRY_SIZE))
+            valid = Dereference(Add(ebase, DNSConst.E_VALID))
+            IfCondition EqualTo(valid, 1) ThenBlock: {
+                ehost = Dereference(Add(ebase, DNSConst.E_HOST))
+                expire = Dereference(Add(ebase, DNSConst.E_EXPIRE))
+                IfCondition GreaterThan(expire, now) ThenBlock: {
+                    cmp = StringCompare(hostname, ehost)
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        ReturnValue(Dereference(Add(ebase, DNSConst.E_IP4)))
+                    }
+                } ElseBlock: {
+                    // Expired — invalidate
+                    StoreValue(Add(ebase, DNSConst.E_VALID), 0)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// ---- Store in cache ----
+Function.DNS__CacheStore {
+    Input: hostname: Address
+    Input: ip4: Integer
+    Input: ttl: Integer
+    Output: Integer
+    Body: {
+        now = SystemCall(DNSSys.SYS_TIME, 0, 0, 0)
+        // Find free or expired slot
+        i = 0
+        WhileLoop LessThan(i, DNSConst.CACHE_MAX) {
+            ebase = Add(DNSState.cache, Multiply(i, DNSConst.ENTRY_SIZE))
+            valid = Dereference(Add(ebase, DNSConst.E_VALID))
+            IfCondition EqualTo(valid, 0) ThenBlock: {
+                // Copy hostname
+                hlen = StringLength(hostname)
+                hcopy = Allocate(Add(hlen, 1))
+                MemoryCopy(hcopy, hostname, Add(hlen, 1))
+                StoreValue(Add(ebase, DNSConst.E_HOST), hcopy)
+                StoreValue(Add(ebase, DNSConst.E_IP4), ip4)
+                StoreValue(Add(ebase, DNSConst.E_EXPIRE), Add(now, ttl))
+                StoreValue(Add(ebase, DNSConst.E_VALID), 1)
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        // Cache full — overwrite slot 0
+        ebase = DNSState.cache
+        hlen = StringLength(hostname)
+        hcopy = Allocate(Add(hlen, 1))
+        MemoryCopy(hcopy, hostname, Add(hlen, 1))
+        StoreValue(Add(ebase, DNSConst.E_HOST), hcopy)
+        StoreValue(Add(ebase, DNSConst.E_IP4), ip4)
+        StoreValue(Add(ebase, DNSConst.E_EXPIRE), Add(now, ttl))
+        StoreValue(Add(ebase, DNSConst.E_VALID), 1)
+        ReturnValue(0)
+    }
+}
+
+// ---- Build DNS query packet for A record ----
+Function.DNS__BuildQuery {
+    Input: hostname: Address
+    Input: query_id: Integer
+    Output: Address
+    Body: {
+        hlen = StringLength(hostname)
+        // Max packet: 12 header + hlen + 2 (labels overhead) + 4 (qtype+qclass) + 1 null
+        pkt = Allocate(Add(hlen, 20))
+
+        // Header: ID(2) + flags(2) + qdcount(2) + ancount(2) + nscount(2) + arcount(2)
+        SetByte(pkt, 0, Divide(query_id, 256))
+        SetByte(pkt, 1, Subtract(query_id, Multiply(Divide(query_id, 256), 256)))
+        SetByte(pkt, 2, 1)    // RD=1 (recursion desired)
+        SetByte(pkt, 3, 0)
+        SetByte(pkt, 4, 0)    // QDCOUNT = 1
+        SetByte(pkt, 5, 1)
+        SetByte(pkt, 6, 0)    // ANCOUNT = 0
+        SetByte(pkt, 7, 0)
+        SetByte(pkt, 8, 0)    // NSCOUNT = 0
+        SetByte(pkt, 9, 0)
+        SetByte(pkt, 10, 0)   // ARCOUNT = 0
+        SetByte(pkt, 11, 0)
+
+        // QNAME: encode hostname as DNS labels
+        pos = 12
+        label_start = 0
+        i = 0
+        WhileLoop LessEqual(i, hlen) {
+            ch = 0
+            IfCondition LessThan(i, hlen) ThenBlock: { ch = GetByte(hostname, i) }
+            IfCondition Or(EqualTo(ch, 46), EqualTo(i, hlen)) ThenBlock: {
+                label_len = Subtract(i, label_start)
+                SetByte(pkt, pos, label_len)
+                pos = Add(pos, 1)
+                j = label_start
+                WhileLoop LessThan(j, i) {
+                    SetByte(pkt, pos, GetByte(hostname, j))
+                    pos = Add(pos, 1)
+                    j = Add(j, 1)
+                }
+                label_start = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        SetByte(pkt, pos, 0)  // Root label
+        pos = Add(pos, 1)
+
+        // QTYPE = A (1)
+        SetByte(pkt, pos, 0)
+        SetByte(pkt, Add(pos, 1), 1)
+        pos = Add(pos, 2)
+
+        // QCLASS = IN (1)
+        SetByte(pkt, pos, 0)
+        SetByte(pkt, Add(pos, 1), 1)
+        pos = Add(pos, 2)
+
+        // Store length in first byte of a length-prefixed wrapper
+        // Actually, we return raw packet — caller needs length
+        // Store length at pkt[-8] offset... or just return both.
+        // Convention: store length in DNSState temp
+        DNSState.query_id = pos   // Reuse as packet length temp
+        ReturnValue(pkt)
+    }
+}
+
+// ---- Main resolve: hostname -> 32-bit IP or -1 ----
+Function.DNS_Resolve {
+    Input: hostname: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        // Check if it's already an IP address (starts with digit)
+        c0 = GetByte(hostname, 0)
+        IfCondition And(GreaterEqual(c0, 48), LessEqual(c0, 57)) ThenBlock: {
+            ReturnValue(DNS__ParseIP4(hostname))
+        }
+
+        // Check cache
+        cached = DNS__CacheLookup(hostname)
+        IfCondition GreaterEqual(cached, 0) ThenBlock: {
+            ReturnValue(cached)
+        }
+
+        // Build and send query
+        qid = DNSState.query_id
+        DNSState.query_id = Add(qid, 1)
+        pkt = DNS__BuildQuery(hostname, qid)
+        pkt_len = DNSState.query_id  // Length stored here by BuildQuery
+        DNSState.query_id = Add(qid, 1)  // Restore proper query_id
+
+        // Create UDP socket
+        sock = SystemCall(DNSSys.SYS_SOCKET, DNSSys.AF_INET, DNSSys.SOCK_DGRAM, 0)
+        IfCondition LessThan(sock, 0) ThenBlock: {
+            PrintMessage("[DNS] socket failed\n")
+            ReturnValue(-1)
+        }
+
+        // Build server sockaddr_in
+        ns_addr = Allocate(16)
+        MemorySet(ns_addr, 0, 16)
+        SetByte(ns_addr, 0, 2)  // AF_INET
+        SetByte(ns_addr, 1, 0)
+        SetByte(ns_addr, 2, 0)  // Port 53 big-endian
+        SetByte(ns_addr, 3, 53)
+        // IP from DNSState.ns_ip
+        ip = DNSState.ns_ip
+        SetByte(ns_addr, 4, Divide(ip, 16777216))
+        ip_r1 = Subtract(ip, Multiply(Divide(ip, 16777216), 16777216))
+        SetByte(ns_addr, 5, Divide(ip_r1, 65536))
+        ip_r2 = Subtract(ip_r1, Multiply(Divide(ip_r1, 65536), 65536))
+        SetByte(ns_addr, 6, Divide(ip_r2, 256))
+        SetByte(ns_addr, 7, Subtract(ip_r2, Multiply(Divide(ip_r2, 256), 256)))
+
+        // connect UDP socket to nameserver (allows plain read/write)
+        cres = SystemCall(42, sock, ns_addr, 16)
+        IfCondition LessThan(cres, 0) ThenBlock: {
+            SystemCall(DNSSys.SYS_CLOSE, sock, 0, 0)
+            PrintMessage("[DNS] connect failed\n")
+            ReturnValue(-1)
+        }
+
+        // write query
+        sent = SystemCall(DNSSys.SYS_WRITE, sock, pkt, pkt_len)
+        IfCondition LessEqual(sent, 0) ThenBlock: {
+            SystemCall(DNSSys.SYS_CLOSE, sock, 0, 0)
+            PrintMessage("[DNS] write failed\n")
+            ReturnValue(-1)
+        }
+
+        // Set recv timeout: 3 seconds
+        tval = Allocate(16)
+        StoreValue(Add(tval, 0), 3)   // tv_sec
+        StoreValue(Add(tval, 8), 0)   // tv_usec
+        SystemCall(54, sock, 1, 20, tval, 16)  // setsockopt SO_RCVTIMEO
+
+        // read response
+        resp = Allocate(512)
+        rlen = SystemCall(DNSSys.SYS_READ, sock, resp, 512)
+        SystemCall(DNSSys.SYS_CLOSE, sock, 0, 0)
+
+        IfCondition LessEqual(rlen, 12) ThenBlock: {
+            PrintMessage("[DNS] no response\n")
+            ReturnValue(-1)
+        }
+
+        // Parse response: skip header (12 bytes), skip question, read first answer
+        ancount = Add(Multiply(GetByte(resp, 6), 256), GetByte(resp, 7))
+        IfCondition EqualTo(ancount, 0) ThenBlock: {
+            PrintMessage("[DNS] no answers\n")
+            ReturnValue(-1)
+        }
+
+        // Skip question section: scan past QNAME + 4 bytes
+        rpos = 12
+        WhileLoop LessThan(rpos, rlen) {
+            lbl = GetByte(resp, rpos)
+            IfCondition EqualTo(lbl, 0) ThenBlock: {
+                rpos = Add(rpos, 1)
+                rpos = rlen  // break
+            } ElseBlock: {
+                IfCondition GreaterEqual(lbl, 192) ThenBlock: {
+                    // Pointer — 2 bytes
+                    rpos = Add(rpos, 2)
+                    rpos = rlen  // break
+                } ElseBlock: {
+                    rpos = Add(rpos, Add(lbl, 1))
+                }
+            }
+        }
+        // Re-find actual position (the break logic above is approximate)
+        rpos = 12
+        WhileLoop 1 {
+            lbl = GetByte(resp, rpos)
+            IfCondition EqualTo(lbl, 0) ThenBlock: {
+                rpos = Add(rpos, 5)   // null + QTYPE(2) + QCLASS(2)
+                ReturnValue(DNS__ParseAnswer(resp, rpos, rlen, hostname))
+            }
+            IfCondition GreaterEqual(lbl, 192) ThenBlock: {
+                rpos = Add(rpos, 6)   // ptr(2) + QTYPE(2) + QCLASS(2)
+                ReturnValue(DNS__ParseAnswer(resp, rpos, rlen, hostname))
+            }
+            rpos = Add(rpos, Add(lbl, 1))
+            IfCondition GreaterEqual(rpos, rlen) ThenBlock: {
+                ReturnValue(-1)
+            }
+        }
+        ReturnValue(-1)
+    }
+}
+
+// ---- Parse answer section, extract first A record IP ----
+Function.DNS__ParseAnswer {
+    Input: resp: Address
+    Input: offset: Integer
+    Input: rlen: Integer
+    Input: hostname: Address
+    Output: Integer
+    Body: {
+        pos = offset
+        // Each answer: NAME(var) + TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) + RDATA(var)
+        IfCondition GreaterEqual(Add(pos, 12), rlen) ThenBlock: {
+            ReturnValue(-1)
+        }
+
+        // Skip NAME (could be pointer or labels)
+        lbl = GetByte(resp, pos)
+        IfCondition GreaterEqual(lbl, 192) ThenBlock: {
+            pos = Add(pos, 2)
+        } ElseBlock: {
+            WhileLoop 1 {
+                l2 = GetByte(resp, pos)
+                IfCondition EqualTo(l2, 0) ThenBlock: {
+                    pos = Add(pos, 1)
+                    l2 = 999  // break
+                }
+                IfCondition GreaterEqual(l2, 192) ThenBlock: {
+                    pos = Add(pos, 2)
+                    l2 = 999
+                }
+                IfCondition LessThan(l2, 192) ThenBlock: {
+                    pos = Add(pos, Add(l2, 1))
+                }
+                IfCondition EqualTo(l2, 999) ThenBlock: {
+                    ReturnValue(DNS__ParseAnswerData(resp, pos, rlen, hostname))
+                }
+            }
+        }
+        ReturnValue(DNS__ParseAnswerData(resp, pos, rlen, hostname))
+    }
+}
+
+Function.DNS__ParseAnswerData {
+    Input: resp: Address
+    Input: pos: Integer
+    Input: rlen: Integer
+    Input: hostname: Address
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(Add(pos, 10), rlen) ThenBlock: {
+            ReturnValue(-1)
+        }
+        rtype = Add(Multiply(GetByte(resp, pos), 256), GetByte(resp, Add(pos, 1)))
+        // rclass = bytes 2-3
+        ttl = Add(Add(Multiply(GetByte(resp, Add(pos, 4)), 16777216),
+                      Multiply(GetByte(resp, Add(pos, 5)), 65536)),
+                 Add(Multiply(GetByte(resp, Add(pos, 6)), 256),
+                     GetByte(resp, Add(pos, 7))))
+        rdlen = Add(Multiply(GetByte(resp, Add(pos, 8)), 256), GetByte(resp, Add(pos, 9)))
+        dpos = Add(pos, 10)
+
+        // TYPE A = 1, RDLENGTH = 4
+        IfCondition And(EqualTo(rtype, 1), EqualTo(rdlen, 4)) ThenBlock: {
+            a = GetByte(resp, dpos)
+            b = GetByte(resp, Add(dpos, 1))
+            c = GetByte(resp, Add(dpos, 2))
+            d = GetByte(resp, Add(dpos, 3))
+            ip4 = Add(Add(Multiply(a, 16777216), Multiply(b, 65536)), Add(Multiply(c, 256), d))
+
+            // Cache it
+            cache_ttl = ttl
+            IfCondition LessThan(cache_ttl, 60) ThenBlock: { cache_ttl = 60 }
+            IfCondition GreaterThan(cache_ttl, 3600) ThenBlock: { cache_ttl = 3600 }
+            DNS__CacheStore(hostname, ip4, cache_ttl)
+
+            ReturnValue(ip4)
+        }
+
+        // Not an A record — skip RDATA and try next answer (not implemented, return -1)
+        ReturnValue(-1)
+    }
+}
+
+// ---- Convert 32-bit IP to "a.b.c.d" string ----
+Function.DNS_IP4ToString {
+    Input: ip4: Integer
+    Output: Address
+    Body: {
+        a = Divide(ip4, 16777216)
+        r1 = Subtract(ip4, Multiply(a, 16777216))
+        b = Divide(r1, 65536)
+        r2 = Subtract(r1, Multiply(b, 65536))
+        c = Divide(r2, 256)
+        d = Subtract(r2, Multiply(c, 256))
+
+        buf = Allocate(16)
+        pos = 0
+
+        // Write each octet
+        pos = DNS__WriteDecimal(buf, pos, a)
+        SetByte(buf, pos, 46)
+        pos = Add(pos, 1)
+        pos = DNS__WriteDecimal(buf, pos, b)
+        SetByte(buf, pos, 46)
+        pos = Add(pos, 1)
+        pos = DNS__WriteDecimal(buf, pos, c)
+        SetByte(buf, pos, 46)
+        pos = Add(pos, 1)
+        pos = DNS__WriteDecimal(buf, pos, d)
+        SetByte(buf, pos, 0)
+        ReturnValue(buf)
+    }
+}
+
+Function.DNS__WriteDecimal {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(val, 100) ThenBlock: {
+            SetByte(buf, pos, Add(48, Divide(val, 100)))
+            pos = Add(pos, 1)
+            rem = Subtract(val, Multiply(Divide(val, 100), 100))
+            SetByte(buf, pos, Add(48, Divide(rem, 10)))
+            pos = Add(pos, 1)
+            SetByte(buf, pos, Add(48, Subtract(rem, Multiply(Divide(rem, 10), 10))))
+            pos = Add(pos, 1)
+        } ElseBlock: {
+            IfCondition GreaterEqual(val, 10) ThenBlock: {
+                SetByte(buf, pos, Add(48, Divide(val, 10)))
+                pos = Add(pos, 1)
+                SetByte(buf, pos, Add(48, Subtract(val, Multiply(Divide(val, 10), 10))))
+                pos = Add(pos, 1)
+            } ElseBlock: {
+                SetByte(buf, pos, Add(48, val))
+                pos = Add(pos, 1)
+            }
+        }
+        ReturnValue(pos)
+    }
+}

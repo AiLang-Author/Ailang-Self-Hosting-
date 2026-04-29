@@ -1,0 +1,938 @@
+// Library.ImageDecode.ailang — PNG decoder for the Ailang browser engine
+// Parses PNG chunks (IHDR, IDAT, IEND), inflates DEFLATE data (RFC 1951),
+// defilters scanlines, outputs BGRA pixel buffer.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// ---- Constants ----
+FixedPool.IMGConst {
+    "MAX_IMG":     Initialize=16
+    "SLOT_SIZE":   Initialize=48
+    "S_WIDTH":     Initialize=0
+    "S_HEIGHT":    Initialize=8
+    "S_PIXELS":    Initialize=16
+    "S_BPP":       Initialize=24
+    "S_STRIDE":    Initialize=32
+    "S_VALID":     Initialize=40
+}
+
+FixedPool.IMGState {
+    "pool":        Initialize=0
+    "next":        Initialize=0
+}
+
+// ---- PNG signature: 137 80 78 71 13 10 26 10 ----
+FixedPool.PNGSig {
+    "B0": Initialize=137
+    "B1": Initialize=80
+    "B2": Initialize=78
+    "B3": Initialize=71
+    "B4": Initialize=13
+    "B5": Initialize=10
+    "B6": Initialize=26
+    "B7": Initialize=10
+}
+
+// ---- DEFLATE constants ----
+FixedPool.DEFConst {
+    "MAX_BITS":    Initialize=15
+    "MAX_LIT":     Initialize=286
+    "MAX_DIST":    Initialize=30
+    "MAX_CODES":   Initialize=19
+    "WINDOW_SIZE": Initialize=32768
+}
+
+Function.IMG_Init {
+    Output: Integer
+    Body: {
+        total = Multiply(IMGConst.MAX_IMG, IMGConst.SLOT_SIZE)
+        IMGState.pool = Allocate(total)
+        MemorySet(IMGState.pool, 0, total)
+        IMGState.next = 0
+        ReturnValue(0)
+    }
+}
+
+Function.IMG__AllocSlot {
+    Output: Integer
+    Body: {
+        h = IMGState.next
+        IfCondition GreaterEqual(h, IMGConst.MAX_IMG) ThenBlock: { h = 0 }
+        IMGState.next = Add(h, 1)
+        base = Add(IMGState.pool, Multiply(h, IMGConst.SLOT_SIZE))
+        MemorySet(base, 0, IMGConst.SLOT_SIZE)
+        ReturnValue(h)
+    }
+}
+
+Function.IMG__SlotBase {
+    Input: h: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(IMGState.pool, Multiply(h, IMGConst.SLOT_SIZE)))
+    }
+}
+
+// ---- Accessors ----
+Function.IMG_GetWidth {
+    Input: h: Integer
+    Output: Integer
+    Body: { ReturnValue(Dereference(Add(IMG__SlotBase(h), IMGConst.S_WIDTH))) }
+}
+
+Function.IMG_GetHeight {
+    Input: h: Integer
+    Output: Integer
+    Body: { ReturnValue(Dereference(Add(IMG__SlotBase(h), IMGConst.S_HEIGHT))) }
+}
+
+Function.IMG_GetPixels {
+    Input: h: Integer
+    Output: Address
+    Body: { ReturnValue(Dereference(Add(IMG__SlotBase(h), IMGConst.S_PIXELS))) }
+}
+
+// ---- Read big-endian u32 from data ----
+Function.PNG__ReadU32 {
+    Input: data: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(Add(Multiply(GetByte(data, off), 16777216),
+                            Multiply(GetByte(data, Add(off, 1)), 65536)),
+                     Add(Multiply(GetByte(data, Add(off, 2)), 256),
+                         GetByte(data, Add(off, 3)))))
+    }
+}
+
+// ---- Check PNG signature ----
+Function.PNG__CheckSig {
+    Input: data: Address
+    Output: Integer
+    Body: {
+        IfCondition And(And(EqualTo(GetByte(data, 0), PNGSig.B0), EqualTo(GetByte(data, 1), PNGSig.B1)),
+                       And(EqualTo(GetByte(data, 2), PNGSig.B2), EqualTo(GetByte(data, 3), PNGSig.B3))) ThenBlock: {
+            IfCondition And(And(EqualTo(GetByte(data, 4), PNGSig.B4), EqualTo(GetByte(data, 5), PNGSig.B5)),
+                           And(EqualTo(GetByte(data, 6), PNGSig.B6), EqualTo(GetByte(data, 7), PNGSig.B7))) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// ===========================================================================
+// DEFLATE Inflate — RFC 1951
+// ===========================================================================
+
+// Bit reader state: stored in a small struct
+// [0] = data ptr, [8] = data_len, [16] = byte_pos, [24] = bit_pos, [32] = bit_buf
+FixedPool.BRConst {
+    "DATA":    Initialize=0
+    "LEN":     Initialize=8
+    "BPOS":    Initialize=16
+    "BBIT":    Initialize=24
+    "BBUF":    Initialize=32
+}
+
+Function.BR_Init {
+    Input: data: Address
+    Input: len: Integer
+    Output: Address
+    Body: {
+        br = Allocate(40)
+        StoreValue(Add(br, BRConst.DATA), data)
+        StoreValue(Add(br, BRConst.LEN), len)
+        StoreValue(Add(br, BRConst.BPOS), 0)
+        StoreValue(Add(br, BRConst.BBIT), 0)
+        StoreValue(Add(br, BRConst.BBUF), 0)
+        ReturnValue(br)
+    }
+}
+
+// Read n bits from the stream (LSB first, as per DEFLATE)
+Function.BR_ReadBits {
+    Input: br: Address
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        result = 0
+        shift = 0
+        remain = n
+        WhileLoop GreaterThan(remain, 0) {
+            bbit = Dereference(Add(br, BRConst.BBIT))
+            IfCondition EqualTo(bbit, 0) ThenBlock: {
+                // Load next byte
+                bpos = Dereference(Add(br, BRConst.BPOS))
+                data = Dereference(Add(br, BRConst.DATA))
+                byte_val = GetByte(data, bpos)
+                StoreValue(Add(br, BRConst.BBUF), byte_val)
+                StoreValue(Add(br, BRConst.BPOS), Add(bpos, 1))
+                StoreValue(Add(br, BRConst.BBIT), 8)
+                bbit = 8
+            }
+            bbuf = Dereference(Add(br, BRConst.BBUF))
+            bit = BitwiseAnd(bbuf, 1)
+            result = Add(result, Multiply(bit, IMG__Pow2(shift)))
+            StoreValue(Add(br, BRConst.BBUF), Divide(bbuf, 2))
+            StoreValue(Add(br, BRConst.BBIT), Subtract(bbit, 1))
+            shift = Add(shift, 1)
+            remain = Subtract(remain, 1)
+        }
+        ReturnValue(result)
+    }
+}
+
+// Power of 2
+Function.IMG__Pow2 {
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        result = 1
+        i = 0
+        WhileLoop LessThan(i, n) {
+            result = Multiply(result, 2)
+            i = Add(i, 1)
+        }
+        ReturnValue(result)
+    }
+}
+
+// ---- Build Huffman decode table from code lengths ----
+// Table: for each code, store (code_bits, code_len, symbol)
+// We use a simple approach: array of max_codes entries
+// sorted by (len, code), decode by sequential search.
+// This is O(n) per symbol but correct and simple.
+
+// Returns: table address. Format: [num_entries(8)] + entries * 24 bytes each
+//   entry: [bit_pattern(8), bit_length(8), symbol(8)]
+Function.HUFF_Build {
+    Input: lengths: Address
+    Input: num_symbols: Integer
+    Output: Address
+    Body: {
+        // Count codes per length
+        bl_count = Allocate(128)  // 16 * 8 bytes
+        MemorySet(bl_count, 0, 128)
+        i = 0
+        WhileLoop LessThan(i, num_symbols) {
+            cl = GetByte(lengths, i)
+            IfCondition GreaterThan(cl, 0) ThenBlock: {
+                old = Dereference(Add(bl_count, Multiply(cl, 8)))
+                StoreValue(Add(bl_count, Multiply(cl, 8)), Add(old, 1))
+            }
+            i = Add(i, 1)
+        }
+
+        // Compute next_code for each length
+        next_code = Allocate(128)
+        MemorySet(next_code, 0, 128)
+        code = 0
+        bits = 1
+        WhileLoop LessEqual(bits, DEFConst.MAX_BITS) {
+            code = Multiply(Add(code, Dereference(Add(bl_count, Multiply(Subtract(bits, 1), 8)))), 2)
+            StoreValue(Add(next_code, Multiply(bits, 8)), code)
+            bits = Add(bits, 1)
+        }
+
+        // Assign codes to symbols
+        // Table: array of entries [reversed_bits(8), length(8), symbol(8)]
+        table = Allocate(Add(8, Multiply(num_symbols, 24)))
+        num_entries = 0
+        tbase = Add(table, 8)
+        i = 0
+        WhileLoop LessThan(i, num_symbols) {
+            cl = GetByte(lengths, i)
+            IfCondition GreaterThan(cl, 0) ThenBlock: {
+                c = Dereference(Add(next_code, Multiply(cl, 8)))
+                StoreValue(Add(next_code, Multiply(cl, 8)), Add(c, 1))
+
+                // Reverse the bits (DEFLATE uses reversed bit order)
+                rev = IMG__ReverseBits(c, cl)
+
+                eaddr = Add(tbase, Multiply(num_entries, 24))
+                StoreValue(eaddr, rev)
+                StoreValue(Add(eaddr, 8), cl)
+                StoreValue(Add(eaddr, 16), i)
+                num_entries = Add(num_entries, 1)
+            }
+            i = Add(i, 1)
+        }
+        StoreValue(table, num_entries)
+        ReturnValue(table)
+    }
+}
+
+// Reverse 'nbits' bits of val
+Function.IMG__ReverseBits {
+    Input: val: Integer
+    Input: nbits: Integer
+    Output: Integer
+    Body: {
+        result = 0
+        v = val
+        i = 0
+        WhileLoop LessThan(i, nbits) {
+            result = Add(Multiply(result, 2), BitwiseAnd(v, 1))
+            v = Divide(v, 2)
+            i = Add(i, 1)
+        }
+        ReturnValue(result)
+    }
+}
+
+// Decode one symbol using Huffman table
+Function.HUFF_Decode {
+    Input: br: Address
+    Input: table: Address
+    Output: Integer
+    Body: {
+        num_entries = Dereference(table)
+        tbase = Add(table, 8)
+
+        // Read bits one at a time, check against table entries
+        code = 0
+        bits_read = 0
+        WhileLoop LessEqual(bits_read, DEFConst.MAX_BITS) {
+            bit = BR_ReadBits(br, 1)
+            code = Add(code, Multiply(bit, IMG__Pow2(bits_read)))
+            bits_read = Add(bits_read, 1)
+
+            // Search table for match
+            ei = 0
+            WhileLoop LessThan(ei, num_entries) {
+                eaddr = Add(tbase, Multiply(ei, 24))
+                entry_bits = Dereference(eaddr)
+                entry_len = Dereference(Add(eaddr, 8))
+                IfCondition And(EqualTo(entry_len, bits_read), EqualTo(entry_bits, code)) ThenBlock: {
+                    ReturnValue(Dereference(Add(eaddr, 16)))
+                }
+                ei = Add(ei, 1)
+            }
+        }
+        // Error: no match
+        ReturnValue(-1)
+    }
+}
+
+// ---- Fixed Huffman tables (BTYPE=1) ----
+Function.HUFF_FixedLitLen {
+    Output: Address
+    Body: {
+        lengths = Allocate(288)
+        // 0-143: 8 bits, 144-255: 9 bits, 256-279: 7 bits, 280-287: 8 bits
+        i = 0
+        WhileLoop LessThan(i, 144) { SetByte(lengths, i, 8) i = Add(i, 1) }
+        WhileLoop LessThan(i, 256) { SetByte(lengths, i, 9) i = Add(i, 1) }
+        WhileLoop LessThan(i, 280) { SetByte(lengths, i, 7) i = Add(i, 1) }
+        WhileLoop LessThan(i, 288) { SetByte(lengths, i, 8) i = Add(i, 1) }
+        ReturnValue(HUFF_Build(lengths, 288))
+    }
+}
+
+Function.HUFF_FixedDist {
+    Output: Address
+    Body: {
+        lengths = Allocate(32)
+        i = 0
+        WhileLoop LessThan(i, 32) { SetByte(lengths, i, 5) i = Add(i, 1) }
+        ReturnValue(HUFF_Build(lengths, 32))
+    }
+}
+
+// ---- Length/distance extra bits tables ----
+// Length codes 257-285 -> base length + extra bits
+// Stored as: base_len[29], extra_bits[29]
+Function.DEF__GetLenBase {
+    Input: code: Integer
+    Output: Integer
+    Body: {
+        // Length base values for codes 257..285
+        c = Subtract(code, 257)
+        // 0-7: 3-10, then pairs double extra bits
+        IfCondition LessThan(c, 8) ThenBlock: { ReturnValue(Add(c, 3)) }
+        IfCondition EqualTo(c, 8)  ThenBlock: { ReturnValue(11) }
+        IfCondition EqualTo(c, 9)  ThenBlock: { ReturnValue(13) }
+        IfCondition EqualTo(c, 10) ThenBlock: { ReturnValue(15) }
+        IfCondition EqualTo(c, 11) ThenBlock: { ReturnValue(17) }
+        IfCondition EqualTo(c, 12) ThenBlock: { ReturnValue(19) }
+        IfCondition EqualTo(c, 13) ThenBlock: { ReturnValue(23) }
+        IfCondition EqualTo(c, 14) ThenBlock: { ReturnValue(27) }
+        IfCondition EqualTo(c, 15) ThenBlock: { ReturnValue(31) }
+        IfCondition EqualTo(c, 16) ThenBlock: { ReturnValue(35) }
+        IfCondition EqualTo(c, 17) ThenBlock: { ReturnValue(43) }
+        IfCondition EqualTo(c, 18) ThenBlock: { ReturnValue(51) }
+        IfCondition EqualTo(c, 19) ThenBlock: { ReturnValue(59) }
+        IfCondition EqualTo(c, 20) ThenBlock: { ReturnValue(67) }
+        IfCondition EqualTo(c, 21) ThenBlock: { ReturnValue(83) }
+        IfCondition EqualTo(c, 22) ThenBlock: { ReturnValue(99) }
+        IfCondition EqualTo(c, 23) ThenBlock: { ReturnValue(115) }
+        IfCondition EqualTo(c, 24) ThenBlock: { ReturnValue(131) }
+        IfCondition EqualTo(c, 25) ThenBlock: { ReturnValue(163) }
+        IfCondition EqualTo(c, 26) ThenBlock: { ReturnValue(195) }
+        IfCondition EqualTo(c, 27) ThenBlock: { ReturnValue(227) }
+        IfCondition EqualTo(c, 28) ThenBlock: { ReturnValue(258) }
+        ReturnValue(3)
+    }
+}
+
+Function.DEF__GetLenExtra {
+    Input: code: Integer
+    Output: Integer
+    Body: {
+        c = Subtract(code, 257)
+        IfCondition LessThan(c, 8)  ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(c, 12) ThenBlock: { ReturnValue(1) }
+        IfCondition LessThan(c, 16) ThenBlock: { ReturnValue(2) }
+        IfCondition LessThan(c, 20) ThenBlock: { ReturnValue(3) }
+        IfCondition LessThan(c, 24) ThenBlock: { ReturnValue(4) }
+        IfCondition LessThan(c, 28) ThenBlock: { ReturnValue(5) }
+        ReturnValue(0)
+    }
+}
+
+Function.DEF__GetDistBase {
+    Input: code: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(code, 0)  ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(code, 1)  ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(code, 2)  ThenBlock: { ReturnValue(3) }
+        IfCondition EqualTo(code, 3)  ThenBlock: { ReturnValue(4) }
+        IfCondition EqualTo(code, 4)  ThenBlock: { ReturnValue(5) }
+        IfCondition EqualTo(code, 5)  ThenBlock: { ReturnValue(7) }
+        IfCondition EqualTo(code, 6)  ThenBlock: { ReturnValue(9) }
+        IfCondition EqualTo(code, 7)  ThenBlock: { ReturnValue(13) }
+        IfCondition EqualTo(code, 8)  ThenBlock: { ReturnValue(17) }
+        IfCondition EqualTo(code, 9)  ThenBlock: { ReturnValue(25) }
+        IfCondition EqualTo(code, 10) ThenBlock: { ReturnValue(33) }
+        IfCondition EqualTo(code, 11) ThenBlock: { ReturnValue(49) }
+        IfCondition EqualTo(code, 12) ThenBlock: { ReturnValue(65) }
+        IfCondition EqualTo(code, 13) ThenBlock: { ReturnValue(97) }
+        IfCondition EqualTo(code, 14) ThenBlock: { ReturnValue(129) }
+        IfCondition EqualTo(code, 15) ThenBlock: { ReturnValue(193) }
+        IfCondition EqualTo(code, 16) ThenBlock: { ReturnValue(257) }
+        IfCondition EqualTo(code, 17) ThenBlock: { ReturnValue(385) }
+        IfCondition EqualTo(code, 18) ThenBlock: { ReturnValue(513) }
+        IfCondition EqualTo(code, 19) ThenBlock: { ReturnValue(769) }
+        IfCondition EqualTo(code, 20) ThenBlock: { ReturnValue(1025) }
+        IfCondition EqualTo(code, 21) ThenBlock: { ReturnValue(1537) }
+        IfCondition EqualTo(code, 22) ThenBlock: { ReturnValue(2049) }
+        IfCondition EqualTo(code, 23) ThenBlock: { ReturnValue(3073) }
+        IfCondition EqualTo(code, 24) ThenBlock: { ReturnValue(4097) }
+        IfCondition EqualTo(code, 25) ThenBlock: { ReturnValue(6145) }
+        IfCondition EqualTo(code, 26) ThenBlock: { ReturnValue(8193) }
+        IfCondition EqualTo(code, 27) ThenBlock: { ReturnValue(12289) }
+        IfCondition EqualTo(code, 28) ThenBlock: { ReturnValue(16385) }
+        IfCondition EqualTo(code, 29) ThenBlock: { ReturnValue(24577) }
+        ReturnValue(1)
+    }
+}
+
+Function.DEF__GetDistExtra {
+    Input: code: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(code, 4)  ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(code, 6)  ThenBlock: { ReturnValue(1) }
+        IfCondition LessThan(code, 8)  ThenBlock: { ReturnValue(2) }
+        IfCondition LessThan(code, 10) ThenBlock: { ReturnValue(3) }
+        IfCondition LessThan(code, 12) ThenBlock: { ReturnValue(4) }
+        IfCondition LessThan(code, 14) ThenBlock: { ReturnValue(5) }
+        IfCondition LessThan(code, 16) ThenBlock: { ReturnValue(6) }
+        IfCondition LessThan(code, 18) ThenBlock: { ReturnValue(7) }
+        IfCondition LessThan(code, 20) ThenBlock: { ReturnValue(8) }
+        IfCondition LessThan(code, 22) ThenBlock: { ReturnValue(9) }
+        IfCondition LessThan(code, 24) ThenBlock: { ReturnValue(10) }
+        IfCondition LessThan(code, 26) ThenBlock: { ReturnValue(11) }
+        IfCondition LessThan(code, 28) ThenBlock: { ReturnValue(12) }
+        IfCondition LessThan(code, 30) ThenBlock: { ReturnValue(13) }
+        ReturnValue(0)
+    }
+}
+
+// ===========================================================================
+// DEFLATE inflate (supports BTYPE 0, 1, 2)
+// ===========================================================================
+Function.DEF_Inflate {
+    Input: comp_data: Address
+    Input: comp_len: Integer
+    Input: out_buf: Address
+    Input: out_max: Integer
+    Output: Integer
+    Body: {
+        br = BR_Init(comp_data, comp_len)
+        out_pos = 0
+        done = 0
+
+        WhileLoop EqualTo(done, 0) {
+            bfinal = BR_ReadBits(br, 1)
+            btype = BR_ReadBits(br, 2)
+
+            IfCondition EqualTo(btype, 0) ThenBlock: {
+                // Stored block (uncompressed)
+                // Align to byte boundary
+                StoreValue(Add(br, BRConst.BBIT), 0)
+                // Read LEN and NLEN
+                bpos = Dereference(Add(br, BRConst.BPOS))
+                data = Dereference(Add(br, BRConst.DATA))
+                slen = Add(GetByte(data, bpos), Multiply(GetByte(data, Add(bpos, 1)), 256))
+                StoreValue(Add(br, BRConst.BPOS), Add(bpos, 4))
+                bpos = Add(bpos, 4)
+                // Copy LEN bytes
+                IfCondition GreaterThan(slen, 0) ThenBlock: {
+                    MemoryCopy(Add(out_buf, out_pos), Add(data, bpos), slen)
+                    out_pos = Add(out_pos, slen)
+                    StoreValue(Add(br, BRConst.BPOS), Add(bpos, slen))
+                }
+            }
+
+            IfCondition EqualTo(btype, 1) ThenBlock: {
+                // Fixed Huffman codes
+                lit_table = HUFF_FixedLitLen()
+                dist_table = HUFF_FixedDist()
+                out_pos = DEF__InflateBlock(br, lit_table, dist_table, out_buf, out_pos, out_max)
+            }
+
+            IfCondition EqualTo(btype, 2) ThenBlock: {
+                // Dynamic Huffman codes
+                hlit = Add(BR_ReadBits(br, 5), 257)
+                hdist = Add(BR_ReadBits(br, 5), 1)
+                hclen = Add(BR_ReadBits(br, 4), 4)
+
+                // Read code length code lengths (meta-Huffman)
+                cl_order = Allocate(19)
+                MemorySet(cl_order, 0, 19)
+                // The permutation order for code length codes
+                SetByte(cl_order, 0, 16) SetByte(cl_order, 1, 17) SetByte(cl_order, 2, 18)
+                SetByte(cl_order, 3, 0)  SetByte(cl_order, 4, 8)  SetByte(cl_order, 5, 7)
+                SetByte(cl_order, 6, 9)  SetByte(cl_order, 7, 6)  SetByte(cl_order, 8, 10)
+                SetByte(cl_order, 9, 5)  SetByte(cl_order, 10, 11) SetByte(cl_order, 11, 4)
+                SetByte(cl_order, 12, 12) SetByte(cl_order, 13, 3)  SetByte(cl_order, 14, 13)
+                SetByte(cl_order, 15, 2) SetByte(cl_order, 16, 14) SetByte(cl_order, 17, 1)
+                SetByte(cl_order, 18, 15)
+
+                cl_lengths = Allocate(19)
+                MemorySet(cl_lengths, 0, 19)
+                ci = 0
+                WhileLoop LessThan(ci, hclen) {
+                    idx = GetByte(cl_order, ci)
+                    SetByte(cl_lengths, idx, BR_ReadBits(br, 3))
+                    ci = Add(ci, 1)
+                }
+
+                cl_table = HUFF_Build(cl_lengths, 19)
+
+                // Decode literal/length + distance code lengths
+                total_codes = Add(hlit, hdist)
+                all_lengths = Allocate(Add(total_codes, 1))
+                MemorySet(all_lengths, 0, Add(total_codes, 1))
+                ali = 0
+                WhileLoop LessThan(ali, total_codes) {
+                    sym = HUFF_Decode(br, cl_table)
+                    IfCondition LessThan(sym, 16) ThenBlock: {
+                        SetByte(all_lengths, ali, sym)
+                        ali = Add(ali, 1)
+                    }
+                    IfCondition EqualTo(sym, 16) ThenBlock: {
+                        // Repeat previous 3-6 times
+                        rep = Add(BR_ReadBits(br, 2), 3)
+                        prev = GetByte(all_lengths, Subtract(ali, 1))
+                        ri = 0
+                        WhileLoop LessThan(ri, rep) {
+                            SetByte(all_lengths, ali, prev)
+                            ali = Add(ali, 1)
+                            ri = Add(ri, 1)
+                        }
+                    }
+                    IfCondition EqualTo(sym, 17) ThenBlock: {
+                        // Repeat 0 for 3-10 times
+                        rep = Add(BR_ReadBits(br, 3), 3)
+                        ri = 0
+                        WhileLoop LessThan(ri, rep) {
+                            SetByte(all_lengths, ali, 0)
+                            ali = Add(ali, 1)
+                            ri = Add(ri, 1)
+                        }
+                    }
+                    IfCondition EqualTo(sym, 18) ThenBlock: {
+                        // Repeat 0 for 11-138 times
+                        rep = Add(BR_ReadBits(br, 7), 11)
+                        ri = 0
+                        WhileLoop LessThan(ri, rep) {
+                            SetByte(all_lengths, ali, 0)
+                            ali = Add(ali, 1)
+                            ri = Add(ri, 1)
+                        }
+                    }
+                }
+
+                // Split into lit/len and dist tables
+                lit_lengths = all_lengths
+                dist_lengths = Add(all_lengths, hlit)
+                lit_table = HUFF_Build(lit_lengths, hlit)
+                dist_table = HUFF_Build(dist_lengths, hdist)
+                out_pos = DEF__InflateBlock(br, lit_table, dist_table, out_buf, out_pos, out_max)
+            }
+
+            IfCondition EqualTo(bfinal, 1) ThenBlock: { done = 1 }
+        }
+
+        ReturnValue(out_pos)
+    }
+}
+
+// Inflate one Huffman-coded block
+Function.DEF__InflateBlock {
+    Input: br: Address
+    Input: lit_table: Address
+    Input: dist_table: Address
+    Input: out_buf: Address
+    Input: out_pos: Integer
+    Input: out_max: Integer
+    Output: Integer
+    Body: {
+        done = 0
+        WhileLoop EqualTo(done, 0) {
+            sym = HUFF_Decode(br, lit_table)
+            IfCondition LessThan(sym, 256) ThenBlock: {
+                // Literal byte
+                IfCondition LessThan(out_pos, out_max) ThenBlock: {
+                    SetByte(out_buf, out_pos, sym)
+                    out_pos = Add(out_pos, 1)
+                }
+            }
+            IfCondition EqualTo(sym, 256) ThenBlock: {
+                // End of block
+                done = 1
+            }
+            IfCondition GreaterThan(sym, 256) ThenBlock: {
+                // Length + distance
+                len_base = DEF__GetLenBase(sym)
+                len_extra = DEF__GetLenExtra(sym)
+                length = len_base
+                IfCondition GreaterThan(len_extra, 0) ThenBlock: {
+                    length = Add(len_base, BR_ReadBits(br, len_extra))
+                }
+
+                dist_sym = HUFF_Decode(br, dist_table)
+                dist_base = DEF__GetDistBase(dist_sym)
+                dist_extra = DEF__GetDistExtra(dist_sym)
+                distance = dist_base
+                IfCondition GreaterThan(dist_extra, 0) ThenBlock: {
+                    distance = Add(dist_base, BR_ReadBits(br, dist_extra))
+                }
+
+                // Copy 'length' bytes from output at (out_pos - distance)
+                src_pos = Subtract(out_pos, distance)
+                ci = 0
+                WhileLoop LessThan(ci, length) {
+                    IfCondition LessThan(out_pos, out_max) ThenBlock: {
+                        SetByte(out_buf, out_pos, GetByte(out_buf, Add(src_pos, ci)))
+                        out_pos = Add(out_pos, 1)
+                    }
+                    ci = Add(ci, 1)
+                }
+            }
+        }
+        ReturnValue(out_pos)
+    }
+}
+
+// ===========================================================================
+// PNG scanline defiltering
+// ===========================================================================
+
+// Paeth predictor
+Function.PNG__Paeth {
+    Input: a: Integer
+    Input: b: Integer
+    Input: c: Integer
+    Output: Integer
+    Body: {
+        p = Subtract(Add(a, b), c)
+        // abs(p - a)
+        pa = Subtract(p, a)
+        IfCondition LessThan(pa, 0) ThenBlock: { pa = Subtract(0, pa) }
+        pb = Subtract(p, b)
+        IfCondition LessThan(pb, 0) ThenBlock: { pb = Subtract(0, pb) }
+        pc = Subtract(p, c)
+        IfCondition LessThan(pc, 0) ThenBlock: { pc = Subtract(0, pc) }
+        IfCondition And(LessEqual(pa, pb), LessEqual(pa, pc)) ThenBlock: { ReturnValue(a) }
+        IfCondition LessEqual(pb, pc) ThenBlock: { ReturnValue(b) }
+        ReturnValue(c)
+    }
+}
+
+// Defilter all scanlines in place
+// raw: filter_byte + pixel_bytes per row
+// bpp = bytes per pixel (e.g., 3 for RGB, 4 for RGBA)
+Function.PNG__Defilter {
+    Input: raw: Address
+    Input: width: Integer
+    Input: height: Integer
+    Input: bpp: Integer
+    Output: Integer
+    Body: {
+        stride = Multiply(width, bpp)
+        raw_stride = Add(stride, 1)  // +1 for filter byte
+
+        y = 0
+        WhileLoop LessThan(y, height) {
+            row_start = Multiply(y, raw_stride)
+            filter = GetByte(raw, row_start)
+            pixel_start = Add(row_start, 1)
+
+            IfCondition EqualTo(filter, 0) ThenBlock: {
+                // None — no filtering
+            }
+
+            IfCondition EqualTo(filter, 1) ThenBlock: {
+                // Sub: each byte += byte at (x - bpp)
+                x = bpp
+                WhileLoop LessThan(x, stride) {
+                    cur = GetByte(raw, Add(pixel_start, x))
+                    left = GetByte(raw, Add(pixel_start, Subtract(x, bpp)))
+                    SetByte(raw, Add(pixel_start, x), BitwiseAnd(Add(cur, left), 255))
+                    x = Add(x, 1)
+                }
+            }
+
+            IfCondition EqualTo(filter, 2) ThenBlock: {
+                // Up: each byte += byte in previous row
+                IfCondition GreaterThan(y, 0) ThenBlock: {
+                    prev_start = Add(Multiply(Subtract(y, 1), raw_stride), 1)
+                    x = 0
+                    WhileLoop LessThan(x, stride) {
+                        cur = GetByte(raw, Add(pixel_start, x))
+                        up = GetByte(raw, Add(prev_start, x))
+                        SetByte(raw, Add(pixel_start, x), BitwiseAnd(Add(cur, up), 255))
+                        x = Add(x, 1)
+                    }
+                }
+            }
+
+            IfCondition EqualTo(filter, 3) ThenBlock: {
+                // Average: byte += floor((left + up) / 2)
+                prev_start = 0
+                has_prev = 0
+                IfCondition GreaterThan(y, 0) ThenBlock: {
+                    prev_start = Add(Multiply(Subtract(y, 1), raw_stride), 1)
+                    has_prev = 1
+                }
+                x = 0
+                WhileLoop LessThan(x, stride) {
+                    cur = GetByte(raw, Add(pixel_start, x))
+                    left = 0
+                    IfCondition GreaterEqual(x, bpp) ThenBlock: {
+                        left = GetByte(raw, Add(pixel_start, Subtract(x, bpp)))
+                    }
+                    up = 0
+                    IfCondition EqualTo(has_prev, 1) ThenBlock: {
+                        up = GetByte(raw, Add(prev_start, x))
+                    }
+                    SetByte(raw, Add(pixel_start, x), BitwiseAnd(Add(cur, Divide(Add(left, up), 2)), 255))
+                    x = Add(x, 1)
+                }
+            }
+
+            IfCondition EqualTo(filter, 4) ThenBlock: {
+                // Paeth
+                prev_start = 0
+                has_prev = 0
+                IfCondition GreaterThan(y, 0) ThenBlock: {
+                    prev_start = Add(Multiply(Subtract(y, 1), raw_stride), 1)
+                    has_prev = 1
+                }
+                x = 0
+                WhileLoop LessThan(x, stride) {
+                    cur = GetByte(raw, Add(pixel_start, x))
+                    left = 0
+                    IfCondition GreaterEqual(x, bpp) ThenBlock: {
+                        left = GetByte(raw, Add(pixel_start, Subtract(x, bpp)))
+                    }
+                    up = 0
+                    up_left = 0
+                    IfCondition EqualTo(has_prev, 1) ThenBlock: {
+                        up = GetByte(raw, Add(prev_start, x))
+                        IfCondition GreaterEqual(x, bpp) ThenBlock: {
+                            up_left = GetByte(raw, Add(prev_start, Subtract(x, bpp)))
+                        }
+                    }
+                    paeth = PNG__Paeth(left, up, up_left)
+                    SetByte(raw, Add(pixel_start, x), BitwiseAnd(Add(cur, paeth), 255))
+                    x = Add(x, 1)
+                }
+            }
+
+            y = Add(y, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ===========================================================================
+// Main PNG decoder entry point
+// ===========================================================================
+Function.IMG_DecodePNG {
+    Input: data: Address
+    Input: data_len: Integer
+    Output: Integer
+    Body: {
+        // Check signature
+        IfCondition LessThan(data_len, 8) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(PNG__CheckSig(data), 0) ThenBlock: {
+            PrintMessage("[PNG] bad signature\n")
+            ReturnValue(-1)
+        }
+
+        // Parse chunks
+        pos = 8
+        width = 0
+        height = 0
+        bit_depth = 0
+        color_type = 0
+        bpp = 0
+
+        // Collect IDAT data
+        idat_buf = Allocate(Multiply(4, 1048576))  // 4 MB max compressed
+        idat_len = 0
+
+        done = 0
+        WhileLoop EqualTo(done, 0) {
+            IfCondition GreaterEqual(Add(pos, 8), data_len) ThenBlock: {
+                done = 1
+            } ElseBlock: {
+                chunk_len = PNG__ReadU32(data, pos)
+                // Chunk type: 4 bytes at pos+4
+                ct0 = GetByte(data, Add(pos, 4))
+                ct1 = GetByte(data, Add(pos, 5))
+                ct2 = GetByte(data, Add(pos, 6))
+                ct3 = GetByte(data, Add(pos, 7))
+
+                chunk_data = Add(pos, 8)
+
+                // IHDR: 73 72 68 82
+                IfCondition And(And(EqualTo(ct0, 73), EqualTo(ct1, 72)), And(EqualTo(ct2, 68), EqualTo(ct3, 82))) ThenBlock: {
+                    width = PNG__ReadU32(data, chunk_data)
+                    height = PNG__ReadU32(data, Add(chunk_data, 4))
+                    bit_depth = GetByte(data, Add(chunk_data, 8))
+                    color_type = GetByte(data, Add(chunk_data, 9))
+                    // Compute bytes per pixel
+                    IfCondition EqualTo(color_type, 2) ThenBlock: { bpp = 3 }  // RGB
+                    IfCondition EqualTo(color_type, 6) ThenBlock: { bpp = 4 }  // RGBA
+                    IfCondition EqualTo(color_type, 0) ThenBlock: { bpp = 1 }  // Grayscale
+                    IfCondition EqualTo(color_type, 4) ThenBlock: { bpp = 2 }  // Gray+Alpha
+                }
+
+                // IDAT: 73 68 65 84
+                IfCondition And(And(EqualTo(ct0, 73), EqualTo(ct1, 68)), And(EqualTo(ct2, 65), EqualTo(ct3, 84))) ThenBlock: {
+                    MemoryCopy(Add(idat_buf, idat_len), Add(data, chunk_data), chunk_len)
+                    idat_len = Add(idat_len, chunk_len)
+                }
+
+                // IEND: 73 69 78 68
+                IfCondition And(And(EqualTo(ct0, 73), EqualTo(ct1, 69)), And(EqualTo(ct2, 78), EqualTo(ct3, 68))) ThenBlock: {
+                    done = 1
+                }
+
+                // Advance: length(4) + type(4) + data(chunk_len) + crc(4)
+                pos = Add(pos, Add(12, chunk_len))
+            }
+        }
+
+        IfCondition Or(EqualTo(width, 0), EqualTo(height, 0)) ThenBlock: {
+            PrintMessage("[PNG] no IHDR\n")
+            ReturnValue(-1)
+        }
+        IfCondition EqualTo(bpp, 0) ThenBlock: {
+            PrintMessage("[PNG] unsupported color type\n")
+            ReturnValue(-1)
+        }
+
+        // Inflate IDAT (skip 2-byte zlib header)
+        raw_size = Multiply(height, Add(Multiply(width, bpp), 1))
+        raw_buf = Allocate(raw_size)
+        MemorySet(raw_buf, 0, raw_size)
+
+        inflated = DEF_Inflate(Add(idat_buf, 2), Subtract(idat_len, 2), raw_buf, raw_size)
+
+        // Defilter scanlines
+        PNG__Defilter(raw_buf, width, height, bpp)
+
+        // Convert to BGRA pixel buffer
+        pixels = Allocate(Multiply(Multiply(width, height), 4))
+        stride = Multiply(width, bpp)
+        raw_stride = Add(stride, 1)
+
+        y = 0
+        WhileLoop LessThan(y, height) {
+            row_start = Add(Multiply(y, raw_stride), 1)  // +1 skip filter byte
+            dst_row = Multiply(y, Multiply(width, 4))
+            x = 0
+            WhileLoop LessThan(x, width) {
+                src = Add(row_start, Multiply(x, bpp))
+
+                IfCondition EqualTo(color_type, 2) ThenBlock: {
+                    // RGB -> BGRA
+                    r = GetByte(raw_buf, src)
+                    g = GetByte(raw_buf, Add(src, 1))
+                    b = GetByte(raw_buf, Add(src, 2))
+                    dp = Add(dst_row, Multiply(x, 4))
+                    SetByte(pixels, dp, b)
+                    SetByte(pixels, Add(dp, 1), g)
+                    SetByte(pixels, Add(dp, 2), r)
+                    SetByte(pixels, Add(dp, 3), 255)
+                }
+                IfCondition EqualTo(color_type, 6) ThenBlock: {
+                    // RGBA -> BGRA
+                    r = GetByte(raw_buf, src)
+                    g = GetByte(raw_buf, Add(src, 1))
+                    b = GetByte(raw_buf, Add(src, 2))
+                    a = GetByte(raw_buf, Add(src, 3))
+                    dp = Add(dst_row, Multiply(x, 4))
+                    SetByte(pixels, dp, b)
+                    SetByte(pixels, Add(dp, 1), g)
+                    SetByte(pixels, Add(dp, 2), r)
+                    SetByte(pixels, Add(dp, 3), a)
+                }
+                IfCondition EqualTo(color_type, 0) ThenBlock: {
+                    // Grayscale -> BGRA
+                    v = GetByte(raw_buf, src)
+                    dp = Add(dst_row, Multiply(x, 4))
+                    SetByte(pixels, dp, v)
+                    SetByte(pixels, Add(dp, 1), v)
+                    SetByte(pixels, Add(dp, 2), v)
+                    SetByte(pixels, Add(dp, 3), 255)
+                }
+                IfCondition EqualTo(color_type, 4) ThenBlock: {
+                    // Gray+Alpha -> BGRA
+                    v = GetByte(raw_buf, src)
+                    a = GetByte(raw_buf, Add(src, 1))
+                    dp = Add(dst_row, Multiply(x, 4))
+                    SetByte(pixels, dp, v)
+                    SetByte(pixels, Add(dp, 1), v)
+                    SetByte(pixels, Add(dp, 2), v)
+                    SetByte(pixels, Add(dp, 3), a)
+                }
+
+                x = Add(x, 1)
+            }
+            y = Add(y, 1)
+        }
+
+        // Store in slot
+        h = IMG__AllocSlot()
+        base = IMG__SlotBase(h)
+        StoreValue(Add(base, IMGConst.S_WIDTH), width)
+        StoreValue(Add(base, IMGConst.S_HEIGHT), height)
+        StoreValue(Add(base, IMGConst.S_PIXELS), pixels)
+        StoreValue(Add(base, IMGConst.S_BPP), 4)
+        StoreValue(Add(base, IMGConst.S_STRIDE), Multiply(width, 4))
+        StoreValue(Add(base, IMGConst.S_VALID), 1)
+
+        ReturnValue(h)
+    }
+}

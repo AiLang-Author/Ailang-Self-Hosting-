@@ -1,0 +1,1059 @@
+// Library.HTMLTokenizer.ailang — Browser-grade HTML tokenizer
+// Tokenizes raw HTML into a flat token stream. Handles real-world web HTML:
+// entity decoding, void elements, raw text (script/style), single/unquoted attrs,
+// case-insensitive tags, DOCTYPE, comments.
+// Based on Display/Content/Library.HTMLParse.ailang lexer, adapted for browser use.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// =============================================================================
+// TOKEN TYPES
+// =============================================================================
+FixedPool.HTKType {
+    "TAG_OPEN":       Initialize=1    // <tagname
+    "TAG_CLOSE":      Initialize=2    // </tagname>
+    "TAG_SELF_CLOSE": Initialize=3    // />
+    "TAG_END":        Initialize=4    // > (end of opening tag)
+    "ATTR_NAME":      Initialize=5    // attribute name
+    "ATTR_VALUE":     Initialize=6    // attribute value (entity-decoded)
+    "ATTR_BARE":      Initialize=7    // bare attribute (no value, e.g. disabled)
+    "TEXT":           Initialize=8    // text content between tags
+    "COMMENT":        Initialize=9    // <!-- ... --> content
+    "DOCTYPE":        Initialize=10   // <!DOCTYPE ...>
+    "EOF":            Initialize=11
+}
+
+// =============================================================================
+// TOKEN STRUCTURE — 40 bytes per token
+// =============================================================================
+FixedPool.HTKConst {
+    "MAX_TOKENS":   Initialize=8192
+    "TOKEN_SIZE":   Initialize=40
+    "T_TYPE":       Initialize=0
+    "T_PTR":        Initialize=8     // interned string pointer
+    "T_LEN":        Initialize=16    // string length
+    "T_LINE":       Initialize=24    // source line number
+    "T_COL":        Initialize=32    // source column number
+    "STR_CAP":      Initialize=131072  // 128 KB string intern table
+}
+
+// =============================================================================
+// LEXER STATE
+// =============================================================================
+FixedPool.HTKState {
+    "tok_pool":   Initialize=0
+    "tok_count":  Initialize=0
+    "str_buf":    Initialize=0
+    "str_pos":    Initialize=0
+    "source":     Initialize=0
+    "src_len":    Initialize=0
+    "pos":        Initialize=0
+    "line":       Initialize=1
+    "col":        Initialize=1
+    "error":      Initialize=0
+    "err_msg":    Initialize=0
+}
+
+// Clobber-safe temporaries for scan loops
+FixedPool.HTKTmp {
+    "ch":         Initialize=0
+    "ch2":        Initialize=0
+    "ch3":        Initialize=0
+    "start":      Initialize=0
+    "len":        Initialize=0
+    "ptr":        Initialize=0
+    "interned":   Initialize=0
+    "tag_name":   Initialize=0    // for raw text detection
+    "tag_len":    Initialize=0
+    "quote":      Initialize=0    // quote char (34 or 39)
+    "done":       Initialize=0
+    "ent_val":    Initialize=0    // entity decoded value
+}
+
+// =============================================================================
+// INIT / RESET
+// =============================================================================
+Function.HTK_Init {
+    Output: Integer
+    Body: {
+        tsz = Multiply(HTKConst.MAX_TOKENS, HTKConst.TOKEN_SIZE)
+        HTKState.tok_pool = Allocate(tsz)
+        MemorySet(HTKState.tok_pool, 0, tsz)
+        HTKState.tok_count = 0
+
+        HTKState.str_buf = Allocate(HTKConst.STR_CAP)
+        MemorySet(HTKState.str_buf, 0, HTKConst.STR_CAP)
+        HTKState.str_pos = 0
+
+        HTKState.error = 0
+        ReturnValue(1)
+    }
+}
+
+Function.HTK_Reset {
+    Output: Integer
+    Body: {
+        HTKState.tok_count = 0
+        HTKState.str_pos = 0
+        HTKState.pos = 0
+        HTKState.line = 1
+        HTKState.col = 1
+        HTKState.error = 0
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// STRING INTERNING
+// =============================================================================
+Function.HTK__Intern {
+    Input: src: Address
+    Input: len: Integer
+    Output: Address
+    Body: {
+        needed = Add(HTKState.str_pos, Add(len, 1))
+        IfCondition GreaterEqual(needed, HTKConst.STR_CAP) ThenBlock: {
+            ReturnValue(0)
+        }
+        dest = Add(HTKState.str_buf, HTKState.str_pos)
+        MemoryCopy(dest, src, len)
+        SetByte(dest, len, 0)
+        HTKState.str_pos = Add(HTKState.str_pos, Add(len, 1))
+        ReturnValue(dest)
+    }
+}
+
+// Intern with lowercase conversion (for tag/attr names)
+Function.HTK__InternLower {
+    Input: src: Address
+    Input: len: Integer
+    Output: Address
+    Body: {
+        needed = Add(HTKState.str_pos, Add(len, 1))
+        IfCondition GreaterEqual(needed, HTKConst.STR_CAP) ThenBlock: {
+            ReturnValue(0)
+        }
+        dest = Add(HTKState.str_buf, HTKState.str_pos)
+        ci = 0
+        WhileLoop LessThan(ci, len) {
+            ch = GetByte(src, ci)
+            // A-Z (65-90) -> a-z (97-122)
+            IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+                ch = Add(ch, 32)
+            }
+            SetByte(dest, ci, ch)
+            ci = Add(ci, 1)
+        }
+        SetByte(dest, len, 0)
+        HTKState.str_pos = Add(HTKState.str_pos, Add(len, 1))
+        ReturnValue(dest)
+    }
+}
+
+// =============================================================================
+// TOKEN EMISSION
+// =============================================================================
+Function.HTK__TokBase {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(HTKState.tok_pool, Multiply(idx, HTKConst.TOKEN_SIZE)))
+    }
+}
+
+Function.HTK__AddToken {
+    Input: ttype: Integer
+    Input: ptr: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        idx = HTKState.tok_count
+        IfCondition GreaterEqual(idx, HTKConst.MAX_TOKENS) ThenBlock: {
+            ReturnValue(-1)
+        }
+        // Save params to locals before any compound expressions
+        save_type = ttype
+        save_ptr = ptr
+        save_len = len
+        HTKState.tok_count = Add(idx, 1)
+        base = Add(HTKState.tok_pool, Multiply(idx, HTKConst.TOKEN_SIZE))
+        StoreValue(Add(base, HTKConst.T_TYPE), save_type)
+        StoreValue(Add(base, HTKConst.T_PTR), save_ptr)
+        StoreValue(Add(base, HTKConst.T_LEN), save_len)
+        StoreValue(Add(base, HTKConst.T_LINE), HTKState.line)
+        StoreValue(Add(base, HTKConst.T_COL), HTKState.col)
+        ReturnValue(idx)
+    }
+}
+
+// =============================================================================
+// CHARACTER NAVIGATION
+// =============================================================================
+Function.HTK__Peek {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(HTKState.pos, HTKState.src_len) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(GetByte(HTKState.source, HTKState.pos))
+    }
+}
+
+Function.HTK__PeekAt {
+    Input: offset: Integer
+    Output: Integer
+    Body: {
+        p = Add(HTKState.pos, offset)
+        IfCondition GreaterEqual(p, HTKState.src_len) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(GetByte(HTKState.source, p))
+    }
+}
+
+Function.HTK__Advance {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(HTKState.pos, HTKState.src_len) ThenBlock: {
+            ReturnValue(0)
+        }
+        ch = GetByte(HTKState.source, HTKState.pos)
+        HTKState.pos = Add(HTKState.pos, 1)
+        IfCondition EqualTo(ch, 10) ThenBlock: {
+            HTKState.line = Add(HTKState.line, 1)
+            HTKState.col = 1
+        }
+        IfCondition NotEqual(ch, 10) ThenBlock: {
+            HTKState.col = Add(HTKState.col, 1)
+        }
+        ReturnValue(ch)
+    }
+}
+
+Function.HTK__SkipWS {
+    Output: Integer
+    Body: {
+        HTKTmp.ch = HTK__Peek()
+        WhileLoop Or(Or(EqualTo(HTKTmp.ch, 32), EqualTo(HTKTmp.ch, 9)),
+                     Or(EqualTo(HTKTmp.ch, 10), EqualTo(HTKTmp.ch, 13))) {
+            HTK__Advance()
+            HTKTmp.ch = HTK__Peek()
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CHARACTER CLASSIFICATION
+// =============================================================================
+Function.HTK__IsWS {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ch, 32) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 9) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 10) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 13) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.HTK__IsNameChar {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 45) ThenBlock: { ReturnValue(1) }  // hyphen
+        IfCondition EqualTo(ch, 95) ThenBlock: { ReturnValue(1) }  // underscore
+        IfCondition EqualTo(ch, 58) ThenBlock: { ReturnValue(1) }  // colon (for xml:lang etc)
+        ReturnValue(0)
+    }
+}
+
+Function.HTK__IsNameStart {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// ENTITY DECODING — &amp; &lt; &gt; &quot; &apos; &nbsp; &#NNN; &#xHHH;
+// Returns decoded byte value or -1 on failure.
+// Advances HTKState.pos past the entity (including trailing ;).
+// =============================================================================
+Function.HTK__HexVal {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: {
+            ReturnValue(Subtract(ch, 48))
+        }
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 102)) ThenBlock: {
+            ReturnValue(Add(Subtract(ch, 97), 10))
+        }
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 70)) ThenBlock: {
+            ReturnValue(Add(Subtract(ch, 65), 10))
+        }
+        ReturnValue(-1)
+    }
+}
+
+// Decode entity starting AFTER the '&'. Advances pos past ';'.
+// Returns decoded byte value, or -1 if not recognized.
+Function.HTK__DecodeEntity {
+    Output: Integer
+    Body: {
+        HTKTmp.ch = HTK__Peek()
+
+        // Numeric: &#NNN; or &#xHHH;
+        IfCondition EqualTo(HTKTmp.ch, 35) ThenBlock: {
+            HTK__Advance()
+            HTKTmp.ch = HTK__Peek()
+            // Hex: &#x
+            IfCondition Or(EqualTo(HTKTmp.ch, 120), EqualTo(HTKTmp.ch, 88)) ThenBlock: {
+                HTK__Advance()
+                HTKTmp.ent_val = 0
+                HTKTmp.ch = HTK__Peek()
+                HTKTmp.ch2 = HTK__HexVal(HTKTmp.ch)
+                WhileLoop NotEqual(HTKTmp.ch2, -1) {
+                    HTKTmp.ent_val = Add(Multiply(HTKTmp.ent_val, 16), HTKTmp.ch2)
+                    HTK__Advance()
+                    HTKTmp.ch = HTK__Peek()
+                    HTKTmp.ch2 = HTK__HexVal(HTKTmp.ch)
+                }
+                IfCondition EqualTo(HTKTmp.ch, 59) ThenBlock: { HTK__Advance() }
+                ReturnValue(HTKTmp.ent_val)
+            }
+            // Decimal: &#NNN
+            HTKTmp.ent_val = 0
+            WhileLoop And(GreaterEqual(HTKTmp.ch, 48), LessEqual(HTKTmp.ch, 57)) {
+                HTKTmp.ent_val = Add(Multiply(HTKTmp.ent_val, 10), Subtract(HTKTmp.ch, 48))
+                HTK__Advance()
+                HTKTmp.ch = HTK__Peek()
+            }
+            IfCondition EqualTo(HTKTmp.ch, 59) ThenBlock: { HTK__Advance() }
+            ReturnValue(HTKTmp.ent_val)
+        }
+
+        // Named entities — check first char to dispatch
+        HTKTmp.start = HTKState.pos
+        // Scan entity name (letters only, up to 10 chars)
+        HTKTmp.len = 0
+        WhileLoop And(And(GreaterEqual(HTKTmp.ch, 97), LessEqual(HTKTmp.ch, 122)),
+                      LessThan(HTKTmp.len, 10)) {
+            // also accept A-Z
+            HTK__Advance()
+            HTKTmp.len = Add(HTKTmp.len, 1)
+            HTKTmp.ch = HTK__Peek()
+        }
+        // Also accept uppercase in entity names
+        WhileLoop And(And(GreaterEqual(HTKTmp.ch, 65), LessEqual(HTKTmp.ch, 90)),
+                      LessThan(HTKTmp.len, 10)) {
+            HTK__Advance()
+            HTKTmp.len = Add(HTKTmp.len, 1)
+            HTKTmp.ch = HTK__Peek()
+        }
+        IfCondition EqualTo(HTKTmp.ch, 59) ThenBlock: { HTK__Advance() }
+
+        // Match known entities by comparing bytes from source
+        HTKTmp.ptr = Add(HTKState.source, HTKTmp.start)
+
+        // &amp; (3 chars)
+        IfCondition EqualTo(HTKTmp.len, 3) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(HTKTmp.ptr, 0), 97),
+                           And(EqualTo(GetByte(HTKTmp.ptr, 1), 109),
+                               EqualTo(GetByte(HTKTmp.ptr, 2), 112))) ThenBlock: {
+                ReturnValue(38)
+            }
+        }
+        // &lt; (2 chars)
+        IfCondition EqualTo(HTKTmp.len, 2) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(HTKTmp.ptr, 0), 108),
+                           EqualTo(GetByte(HTKTmp.ptr, 1), 116)) ThenBlock: {
+                ReturnValue(60)
+            }
+            // &gt;
+            IfCondition And(EqualTo(GetByte(HTKTmp.ptr, 0), 103),
+                           EqualTo(GetByte(HTKTmp.ptr, 1), 116)) ThenBlock: {
+                ReturnValue(62)
+            }
+        }
+        // &quot; (4 chars)
+        IfCondition EqualTo(HTKTmp.len, 4) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(HTKTmp.ptr, 0), 113),
+                           EqualTo(GetByte(HTKTmp.ptr, 1), 117)) ThenBlock: {
+                ReturnValue(34)
+            }
+            // &apos;
+            IfCondition And(EqualTo(GetByte(HTKTmp.ptr, 0), 97),
+                           EqualTo(GetByte(HTKTmp.ptr, 1), 112)) ThenBlock: {
+                ReturnValue(39)
+            }
+            // &nbsp;
+            IfCondition And(EqualTo(GetByte(HTKTmp.ptr, 0), 110),
+                           EqualTo(GetByte(HTKTmp.ptr, 1), 98)) ThenBlock: {
+                ReturnValue(32)
+            }
+        }
+
+        // Unknown entity — return '&' literally
+        ReturnValue(38)
+    }
+}
+
+// =============================================================================
+// VOID ELEMENT DETECTION — tags that must not have a close tag
+// =============================================================================
+Function.HTK__IsVoid {
+    Input: name: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        // Quick reject by length
+        IfCondition LessThan(len, 2) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(len, 8) ThenBlock: { ReturnValue(0) }
+
+        c0 = GetByte(name, 0)
+        // br (2)
+        IfCondition And(EqualTo(c0, 98), EqualTo(len, 2)) ThenBlock: {
+            IfCondition EqualTo(GetByte(name, 1), 114) ThenBlock: { ReturnValue(1) }
+        }
+        // hr (2)
+        IfCondition And(EqualTo(c0, 104), EqualTo(len, 2)) ThenBlock: {
+            IfCondition EqualTo(GetByte(name, 1), 114) ThenBlock: { ReturnValue(1) }
+        }
+        // img (3)
+        IfCondition And(EqualTo(c0, 105), EqualTo(len, 3)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 109), EqualTo(GetByte(name, 2), 103)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // input (5)
+        IfCondition And(EqualTo(c0, 105), EqualTo(len, 5)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 110), EqualTo(GetByte(name, 2), 112)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // meta (4)
+        IfCondition And(EqualTo(c0, 109), EqualTo(len, 4)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 101), EqualTo(GetByte(name, 2), 116)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // link (4)
+        IfCondition And(EqualTo(c0, 108), EqualTo(len, 4)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 105), EqualTo(GetByte(name, 2), 110)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // base (4)
+        IfCondition And(EqualTo(c0, 98), EqualTo(len, 4)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 97), EqualTo(GetByte(name, 2), 115)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // col (3)
+        IfCondition And(EqualTo(c0, 99), EqualTo(len, 3)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 111), EqualTo(GetByte(name, 2), 108)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // embed (5)
+        IfCondition And(EqualTo(c0, 101), EqualTo(len, 5)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 109), EqualTo(GetByte(name, 2), 98)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // source (6)
+        IfCondition And(EqualTo(c0, 115), EqualTo(len, 6)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 111), EqualTo(GetByte(name, 2), 117)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // track (5)
+        IfCondition And(EqualTo(c0, 116), EqualTo(len, 5)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 114), EqualTo(GetByte(name, 2), 97)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // wbr (3)
+        IfCondition And(EqualTo(c0, 119), EqualTo(len, 3)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 98), EqualTo(GetByte(name, 2), 114)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // area (4)
+        IfCondition And(EqualTo(c0, 97), EqualTo(len, 4)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 114), EqualTo(GetByte(name, 2), 101)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        // param (5)
+        IfCondition And(EqualTo(c0, 112), EqualTo(len, 5)) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 1), 97), EqualTo(GetByte(name, 2), 114)) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// RAW TEXT ELEMENT DETECTION — script, style
+// =============================================================================
+Function.HTK__IsRawText {
+    Input: name: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        // script (6)
+        IfCondition EqualTo(len, 6) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 0), 115), EqualTo(GetByte(name, 1), 99)) ThenBlock: {
+                IfCondition And(EqualTo(GetByte(name, 2), 114), EqualTo(GetByte(name, 3), 105)) ThenBlock: {
+                    ReturnValue(1)
+                }
+            }
+        }
+        // style (5)
+        IfCondition EqualTo(len, 5) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(name, 0), 115), EqualTo(GetByte(name, 1), 116)) ThenBlock: {
+                IfCondition And(EqualTo(GetByte(name, 2), 121), EqualTo(GetByte(name, 3), 108)) ThenBlock: {
+                    ReturnValue(1)
+                }
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCAN TAG NAME — scan name chars, intern as lowercase
+// Stores result in HTKTmp.ptr and HTKTmp.len
+// =============================================================================
+Function.HTK__ScanName {
+    Output: Integer
+    Body: {
+        HTKTmp.start = HTKState.pos
+        HTKTmp.ch = HTK__Peek()
+        HTKTmp.done = HTK__IsNameChar(HTKTmp.ch)
+        WhileLoop EqualTo(HTKTmp.done, 1) {
+            HTK__Advance()
+            HTKTmp.ch = HTK__Peek()
+            HTKTmp.done = HTK__IsNameChar(HTKTmp.ch)
+        }
+        HTKTmp.len = Subtract(HTKState.pos, HTKTmp.start)
+        IfCondition EqualTo(HTKTmp.len, 0) ThenBlock: {
+            HTKTmp.ptr = 0
+            ReturnValue(0)
+        }
+        HTKTmp.ptr = HTK__InternLower(Add(HTKState.source, HTKTmp.start), HTKTmp.len)
+        ReturnValue(HTKTmp.len)
+    }
+}
+
+// =============================================================================
+// SCAN QUOTED ATTRIBUTE VALUE — handles both " and ' quotes, with entity decoding
+// Quote char must be in HTKTmp.quote. Stores result in HTKTmp.ptr/HTKTmp.len.
+// =============================================================================
+Function.HTK__ScanQuoted {
+    Output: Integer
+    Body: {
+        // Allocate a temp buffer for entity-decoded output
+        buf = Allocate(4096)
+        di = 0
+        HTKTmp.ch = HTK__Peek()
+        WhileLoop And(NotEqual(HTKTmp.ch, HTKTmp.quote), NotEqual(HTKTmp.ch, 0)) {
+            IfCondition EqualTo(HTKTmp.ch, 38) ThenBlock: {
+                // '&' — entity decode
+                HTK__Advance()
+                HTKTmp.ent_val = HTK__DecodeEntity()
+                IfCondition And(GreaterThan(HTKTmp.ent_val, 0), LessThan(HTKTmp.ent_val, 256)) ThenBlock: {
+                    SetByte(buf, di, HTKTmp.ent_val)
+                    di = Add(di, 1)
+                }
+            } ElseBlock: {
+                SetByte(buf, di, HTKTmp.ch)
+                di = Add(di, 1)
+                HTK__Advance()
+            }
+            HTKTmp.ch = HTK__Peek()
+        }
+        // Consume closing quote
+        IfCondition EqualTo(HTKTmp.ch, HTKTmp.quote) ThenBlock: {
+            HTK__Advance()
+        }
+        HTKTmp.ptr = HTK__Intern(buf, di)
+        HTKTmp.len = di
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCAN UNQUOTED ATTRIBUTE VALUE — stops at whitespace, >, /
+// =============================================================================
+Function.HTK__ScanUnquoted {
+    Output: Integer
+    Body: {
+        HTKTmp.start = HTKState.pos
+        HTKTmp.ch = HTK__Peek()
+        WhileLoop And(And(NotEqual(HTKTmp.ch, 32), NotEqual(HTKTmp.ch, 9)),
+                     And(And(NotEqual(HTKTmp.ch, 10), NotEqual(HTKTmp.ch, 13)),
+                         And(NotEqual(HTKTmp.ch, 62), And(NotEqual(HTKTmp.ch, 47),
+                             NotEqual(HTKTmp.ch, 0))))) {
+            HTK__Advance()
+            HTKTmp.ch = HTK__Peek()
+        }
+        HTKTmp.len = Subtract(HTKState.pos, HTKTmp.start)
+        IfCondition EqualTo(HTKTmp.len, 0) ThenBlock: {
+            HTKTmp.ptr = 0
+            ReturnValue(0)
+        }
+        HTKTmp.ptr = HTK__Intern(Add(HTKState.source, HTKTmp.start), HTKTmp.len)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCAN COMMENT — after <!-- detected. Scans to -->
+// =============================================================================
+Function.HTK__ScanComment {
+    Output: Integer
+    Body: {
+        HTKTmp.start = HTKState.pos
+        HTKTmp.done = 0
+        WhileLoop EqualTo(HTKTmp.done, 0) {
+            HTKTmp.ch = HTK__Peek()
+            IfCondition EqualTo(HTKTmp.ch, 0) ThenBlock: {
+                HTKTmp.done = 1
+            }
+            IfCondition EqualTo(HTKTmp.ch, 45) ThenBlock: {
+                HTKTmp.ch2 = HTK__PeekAt(1)
+                IfCondition EqualTo(HTKTmp.ch2, 45) ThenBlock: {
+                    HTKTmp.ch3 = HTK__PeekAt(2)
+                    IfCondition EqualTo(HTKTmp.ch3, 62) ThenBlock: {
+                        // Found --> : emit comment content, consume -->
+                        HTKTmp.len = Subtract(HTKState.pos, HTKTmp.start)
+                        IfCondition GreaterThan(HTKTmp.len, 0) ThenBlock: {
+                            HTKTmp.interned = HTK__Intern(Add(HTKState.source, HTKTmp.start), HTKTmp.len)
+                            HTK__AddToken(HTKType.COMMENT, HTKTmp.interned, HTKTmp.len)
+                        }
+                        HTK__Advance()
+                        HTK__Advance()
+                        HTK__Advance()
+                        HTKTmp.done = 1
+                    }
+                }
+            }
+            IfCondition EqualTo(HTKTmp.done, 0) ThenBlock: {
+                HTK__Advance()
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCAN DOCTYPE — after <! detected (non-comment). Scans to >
+// =============================================================================
+Function.HTK__ScanDoctype {
+    Output: Integer
+    Body: {
+        // Just skip everything until '>'
+        HTKTmp.ch = HTK__Peek()
+        WhileLoop And(NotEqual(HTKTmp.ch, 62), NotEqual(HTKTmp.ch, 0)) {
+            HTK__Advance()
+            HTKTmp.ch = HTK__Peek()
+        }
+        IfCondition EqualTo(HTKTmp.ch, 62) ThenBlock: {
+            HTK__Advance()
+        }
+        HTK__AddToken(HTKType.DOCTYPE, 0, 0)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCAN RAW TEXT — content of <script> or <style> until matching </tag>
+// Tag name must be in HTKTmp.tag_name/HTKTmp.tag_len
+// =============================================================================
+Function.HTK__ScanRawText {
+    Output: Integer
+    Body: {
+        HTKTmp.start = HTKState.pos
+        HTKTmp.done = 0
+
+        WhileLoop EqualTo(HTKTmp.done, 0) {
+            HTKTmp.ch = HTK__Peek()
+            IfCondition EqualTo(HTKTmp.ch, 0) ThenBlock: {
+                HTKTmp.done = 1
+            }
+            // Look for </
+            IfCondition EqualTo(HTKTmp.ch, 60) ThenBlock: {
+                HTKTmp.ch2 = HTK__PeekAt(1)
+                IfCondition EqualTo(HTKTmp.ch2, 47) ThenBlock: {
+                    // Check if following name matches tag_name (case-insensitive)
+                    mi = 0
+                    match = 1
+                    WhileLoop LessThan(mi, HTKTmp.tag_len) {
+                        mc = HTK__PeekAt(Add(2, mi))
+                        // lowercase
+                        IfCondition And(GreaterEqual(mc, 65), LessEqual(mc, 90)) ThenBlock: {
+                            mc = Add(mc, 32)
+                        }
+                        tc = GetByte(HTKTmp.tag_name, mi)
+                        IfCondition NotEqual(mc, tc) ThenBlock: {
+                            match = 0
+                        }
+                        mi = Add(mi, 1)
+                    }
+                    // Check char after name is > or whitespace
+                    IfCondition EqualTo(match, 1) ThenBlock: {
+                        ec = HTK__PeekAt(Add(2, HTKTmp.tag_len))
+                        IfCondition Or(EqualTo(ec, 62), Or(EqualTo(ec, 32), EqualTo(ec, 9))) ThenBlock: {
+                            // Emit raw text content
+                            HTKTmp.len = Subtract(HTKState.pos, HTKTmp.start)
+                            IfCondition GreaterThan(HTKTmp.len, 0) ThenBlock: {
+                                HTKTmp.interned = HTK__Intern(Add(HTKState.source, HTKTmp.start), HTKTmp.len)
+                                HTK__AddToken(HTKType.TEXT, HTKTmp.interned, HTKTmp.len)
+                            }
+                            // Consume </ + tag name
+                            HTK__Advance()
+                            HTK__Advance()
+                            ci = 0
+                            WhileLoop LessThan(ci, HTKTmp.tag_len) {
+                                HTK__Advance()
+                                ci = Add(ci, 1)
+                            }
+                            // Skip whitespace and consume >
+                            HTK__SkipWS()
+                            HTKTmp.ch3 = HTK__Peek()
+                            IfCondition EqualTo(HTKTmp.ch3, 62) ThenBlock: {
+                                HTK__Advance()
+                            }
+                            // Emit TAG_CLOSE
+                            HTK__AddToken(HTKType.TAG_CLOSE, HTKTmp.tag_name, HTKTmp.tag_len)
+                            HTKTmp.done = 1
+                        }
+                    }
+                }
+            }
+            IfCondition EqualTo(HTKTmp.done, 0) ThenBlock: {
+                HTK__Advance()
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCAN TEXT CONTENT — between tags, with entity decoding
+// =============================================================================
+Function.HTK__ScanText {
+    Output: Integer
+    Body: {
+        buf = Allocate(8192)
+        di = 0
+        HTKTmp.ch = HTK__Peek()
+
+        WhileLoop And(NotEqual(HTKTmp.ch, 60), NotEqual(HTKTmp.ch, 0)) {
+            IfCondition EqualTo(HTKTmp.ch, 38) ThenBlock: {
+                // Entity
+                HTK__Advance()
+                HTKTmp.ent_val = HTK__DecodeEntity()
+                IfCondition And(GreaterThan(HTKTmp.ent_val, 0), LessThan(HTKTmp.ent_val, 256)) ThenBlock: {
+                    SetByte(buf, di, HTKTmp.ent_val)
+                    di = Add(di, 1)
+                }
+            } ElseBlock: {
+                // Whitespace normalization: collapse runs to single space
+                HTKTmp.done = HTK__IsWS(HTKTmp.ch)
+                IfCondition EqualTo(HTKTmp.done, 1) ThenBlock: {
+                    SetByte(buf, di, 32)
+                    di = Add(di, 1)
+                    HTK__Advance()
+                    HTKTmp.ch = HTK__Peek()
+                    HTKTmp.done = HTK__IsWS(HTKTmp.ch)
+                    WhileLoop EqualTo(HTKTmp.done, 1) {
+                        HTK__Advance()
+                        HTKTmp.ch = HTK__Peek()
+                        HTKTmp.done = HTK__IsWS(HTKTmp.ch)
+                    }
+                } ElseBlock: {
+                    SetByte(buf, di, HTKTmp.ch)
+                    di = Add(di, 1)
+                    HTK__Advance()
+                }
+            }
+            HTKTmp.ch = HTK__Peek()
+        }
+
+        // Skip whitespace-only text
+        IfCondition GreaterThan(di, 0) ThenBlock: {
+            all_ws = 1
+            wi = 0
+            WhileLoop LessThan(wi, di) {
+                wc = GetByte(buf, wi)
+                IfCondition NotEqual(wc, 32) ThenBlock: { all_ws = 0 }
+                wi = Add(wi, 1)
+            }
+            IfCondition EqualTo(all_ws, 0) ThenBlock: {
+                HTKTmp.interned = HTK__Intern(buf, di)
+                HTK__AddToken(HTKType.TEXT, HTKTmp.interned, di)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SCAN ATTRIBUTES on current open tag
+// =============================================================================
+Function.HTK__ScanAttrs {
+    Output: Integer
+    Body: {
+        HTK__SkipWS()
+        HTKTmp.ch = HTK__Peek()
+        HTKTmp.done = 0
+
+        WhileLoop EqualTo(HTKTmp.done, 0) {
+            // End of tag?
+            IfCondition Or(EqualTo(HTKTmp.ch, 62), Or(EqualTo(HTKTmp.ch, 47), EqualTo(HTKTmp.ch, 0))) ThenBlock: {
+                HTKTmp.done = 1
+            }
+
+            IfCondition EqualTo(HTKTmp.done, 0) ThenBlock: {
+                // Scan attribute name
+                HTK__ScanName()
+                IfCondition EqualTo(HTKTmp.len, 0) ThenBlock: {
+                    // Bad char — skip it
+                    HTK__Advance()
+                } ElseBlock: {
+                    // Save attr name before it gets clobbered
+                    attr_name_ptr = HTKTmp.ptr
+                    attr_name_len = HTKTmp.len
+
+                    HTK__SkipWS()
+                    HTKTmp.ch = HTK__Peek()
+
+                    // Check for = (attribute has value)
+                    IfCondition EqualTo(HTKTmp.ch, 61) ThenBlock: {
+                        HTK__AddToken(HTKType.ATTR_NAME, attr_name_ptr, attr_name_len)
+                        HTK__Advance()
+                        HTK__SkipWS()
+                        HTKTmp.ch = HTK__Peek()
+
+                        // Double quote
+                        IfCondition EqualTo(HTKTmp.ch, 34) ThenBlock: {
+                            HTK__Advance()
+                            HTKTmp.quote = 34
+                            HTK__ScanQuoted()
+                            HTK__AddToken(HTKType.ATTR_VALUE, HTKTmp.ptr, HTKTmp.len)
+                        }
+                        // Single quote
+                        IfCondition EqualTo(HTKTmp.ch, 39) ThenBlock: {
+                            HTK__Advance()
+                            HTKTmp.quote = 39
+                            HTK__ScanQuoted()
+                            HTK__AddToken(HTKType.ATTR_VALUE, HTKTmp.ptr, HTKTmp.len)
+                        }
+                        // Unquoted value
+                        IfCondition And(NotEqual(HTKTmp.ch, 34), NotEqual(HTKTmp.ch, 39)) ThenBlock: {
+                            IfCondition And(NotEqual(HTKTmp.ch, 62), NotEqual(HTKTmp.ch, 0)) ThenBlock: {
+                                HTK__ScanUnquoted()
+                                HTK__AddToken(HTKType.ATTR_VALUE, HTKTmp.ptr, HTKTmp.len)
+                            }
+                        }
+                    } ElseBlock: {
+                        // No = sign: bare attribute (disabled, checked, etc.)
+                        HTK__AddToken(HTKType.ATTR_BARE, attr_name_ptr, attr_name_len)
+                    }
+                }
+
+                HTK__SkipWS()
+                HTKTmp.ch = HTK__Peek()
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MAIN TOKENIZE ENTRY POINT
+// =============================================================================
+Function.HTK_Tokenize {
+    Input: source: Address
+    Input: src_len: Integer
+    Output: Integer
+    Body: {
+        HTKState.source = source
+        HTKState.src_len = src_len
+        HTKState.pos = 0
+        HTKState.line = 1
+        HTKState.col = 1
+        HTKState.error = 0
+        HTKState.tok_count = 0
+
+        HTKTmp.ch = HTK__Peek()
+
+        WhileLoop And(NotEqual(HTKTmp.ch, 0), EqualTo(HTKState.error, 0)) {
+
+            // ─── TAG START: < ───
+            IfCondition EqualTo(HTKTmp.ch, 60) ThenBlock: {
+                HTK__Advance()
+                HTKTmp.ch2 = HTK__Peek()
+
+                // ─── CLOSE TAG: </ ───
+                IfCondition EqualTo(HTKTmp.ch2, 47) ThenBlock: {
+                    HTK__Advance()
+                    HTK__ScanName()
+                    IfCondition GreaterThan(HTKTmp.len, 0) ThenBlock: {
+                        HTK__AddToken(HTKType.TAG_CLOSE, HTKTmp.ptr, HTKTmp.len)
+                        HTK__SkipWS()
+                        HTKTmp.ch3 = HTK__Peek()
+                        IfCondition EqualTo(HTKTmp.ch3, 62) ThenBlock: {
+                            HTK__Advance()
+                        }
+                    }
+                }
+
+                // ─── COMMENT or DOCTYPE: <! ───
+                IfCondition EqualTo(HTKTmp.ch2, 33) ThenBlock: {
+                    HTKTmp.ch3 = HTK__PeekAt(1)
+                    IfCondition EqualTo(HTKTmp.ch3, 45) ThenBlock: {
+                        // <!-- comment
+                        HTK__Advance()
+                        HTK__Advance()
+                        HTK__Advance()
+                        HTK__ScanComment()
+                    } ElseBlock: {
+                        // <!DOCTYPE or other
+                        HTK__ScanDoctype()
+                    }
+                }
+
+                // ─── OPEN TAG: <tagname ───
+                IfCondition And(NotEqual(HTKTmp.ch2, 47), NotEqual(HTKTmp.ch2, 33)) ThenBlock: {
+                    // Must be a name-start character
+                    HTKTmp.done = HTK__IsNameStart(HTKTmp.ch2)
+                    IfCondition EqualTo(HTKTmp.done, 1) ThenBlock: {
+                        HTK__ScanName()
+                        IfCondition GreaterThan(HTKTmp.len, 0) ThenBlock: {
+                            HTK__AddToken(HTKType.TAG_OPEN, HTKTmp.ptr, HTKTmp.len)
+                            // Save tag name for potential raw text detection
+                            HTKTmp.tag_name = HTKTmp.ptr
+                            HTKTmp.tag_len = HTKTmp.len
+
+                            // Scan attributes
+                            HTK__ScanAttrs()
+
+                            // End of tag: > or />
+                            HTKTmp.ch3 = HTK__Peek()
+                            is_self_close = 0
+                            IfCondition EqualTo(HTKTmp.ch3, 47) ThenBlock: {
+                                HTK__Advance()
+                                HTKTmp.ch3 = HTK__Peek()
+                                IfCondition EqualTo(HTKTmp.ch3, 62) ThenBlock: {
+                                    HTK__Advance()
+                                    HTK__AddToken(HTKType.TAG_SELF_CLOSE, 0, 0)
+                                    is_self_close = 1
+                                }
+                            }
+                            IfCondition EqualTo(is_self_close, 0) ThenBlock: {
+                                HTKTmp.ch3 = HTK__Peek()
+                                IfCondition EqualTo(HTKTmp.ch3, 62) ThenBlock: {
+                                    HTK__Advance()
+                                    HTK__AddToken(HTKType.TAG_END, 0, 0)
+
+                                    // Check for raw text element (script/style)
+                                    HTKTmp.done = HTK__IsRawText(HTKTmp.tag_name, HTKTmp.tag_len)
+                                    IfCondition EqualTo(HTKTmp.done, 1) ThenBlock: {
+                                        HTK__ScanRawText()
+                                    }
+                                }
+                            }
+                        }
+                    } ElseBlock: {
+                        // Not a valid tag start — treat < as text
+                        // Back up: we already consumed '<', just emit it as part of text scan
+                    }
+                }
+            }
+
+            // ─── TEXT CONTENT ───
+            IfCondition NotEqual(HTKTmp.ch, 60) ThenBlock: {
+                HTK__ScanText()
+            }
+
+            HTKTmp.ch = HTK__Peek()
+        }
+
+        // EOF token
+        HTK__AddToken(HTKType.EOF, 0, 0)
+
+        IfCondition EqualTo(HTKState.error, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PUBLIC ACCESSORS
+// =============================================================================
+Function.HTK_Count {
+    Output: Integer
+    Body: { ReturnValue(HTKState.tok_count) }
+}
+
+Function.HTK_GetType {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = Add(HTKState.tok_pool, Multiply(idx, HTKConst.TOKEN_SIZE))
+        ReturnValue(Dereference(Add(base, HTKConst.T_TYPE)))
+    }
+}
+
+Function.HTK_GetPtr {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        base = Add(HTKState.tok_pool, Multiply(idx, HTKConst.TOKEN_SIZE))
+        ReturnValue(Dereference(Add(base, HTKConst.T_PTR)))
+    }
+}
+
+Function.HTK_GetLen {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = Add(HTKState.tok_pool, Multiply(idx, HTKConst.TOKEN_SIZE))
+        ReturnValue(Dereference(Add(base, HTKConst.T_LEN)))
+    }
+}
+
+Function.HTK_GetLine {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = Add(HTKState.tok_pool, Multiply(idx, HTKConst.TOKEN_SIZE))
+        ReturnValue(Dereference(Add(base, HTKConst.T_LINE)))
+    }
+}
+
+Function.HTK_GetCol {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = Add(HTKState.tok_pool, Multiply(idx, HTKConst.TOKEN_SIZE))
+        ReturnValue(Dereference(Add(base, HTKConst.T_COL)))
+    }
+}
