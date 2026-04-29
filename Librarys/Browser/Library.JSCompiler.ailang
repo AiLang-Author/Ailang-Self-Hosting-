@@ -1,0 +1,1734 @@
+// Library.JSCompiler.ailang — JavaScript AST-to-bytecode compiler
+// Walks the AST from JSParser, emits a flat bytecode stream + constant pool.
+// Stack-based VM target (no register allocation). 1-byte opcode + 0-2 byte
+// big-endian operands. Handles scoped variable resolution, jump patching,
+// loop break/continue, and function compilation.
+//
+// CLOBBER SAFETY: Every function saves Input params to locals on the FIRST
+// line of Body. Complex expressions broken into steps. JSCompTmp fields
+// guarded with push/pop across recursive calls.
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Browser.JSParser
+LibraryImport.Browser.JSLexer
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// =============================================================================
+// OPCODES (~50)
+// =============================================================================
+FixedPool.JSOp {
+    // Stack
+    "PUSH_CONST":    Initialize=1
+    "PUSH_UNDEF":    Initialize=2
+    "PUSH_NULL":     Initialize=3
+    "PUSH_TRUE":     Initialize=4
+    "PUSH_FALSE":    Initialize=5
+    "POP":           Initialize=6
+    "DUP":           Initialize=7
+
+    // Variables
+    "GET_LOCAL":     Initialize=10
+    "SET_LOCAL":     Initialize=11
+    "GET_GLOBAL":    Initialize=12
+    "SET_GLOBAL":    Initialize=13
+
+    // Properties
+    "GET_PROP":      Initialize=16
+    "SET_PROP":      Initialize=17
+    "GET_ELEM":      Initialize=18
+    "SET_ELEM":      Initialize=19
+
+    // Arithmetic
+    "ADD":           Initialize=20
+    "SUB":           Initialize=21
+    "MUL":           Initialize=22
+    "DIV":           Initialize=23
+    "MOD":           Initialize=24
+    "NEG":           Initialize=25
+
+    // Comparison
+    "EQ":            Initialize=30
+    "NEQ":           Initialize=31
+    "LT":            Initialize=32
+    "GT":            Initialize=33
+    "LTE":           Initialize=34
+    "GTE":           Initialize=35
+    "STRICT_EQ":     Initialize=36
+    "STRICT_NEQ":    Initialize=37
+
+    // Logic/Bits
+    "NOT":           Initialize=40
+    "BIT_AND":       Initialize=41
+    "BIT_OR":        Initialize=42
+    "BIT_XOR":       Initialize=43
+    "BIT_NOT":       Initialize=44
+    "SHL":           Initialize=45
+    "SHR":           Initialize=46
+    "TYPEOF":        Initialize=47
+
+    // Control
+    "JMP":           Initialize=50
+    "JMP_FALSE":     Initialize=51
+    "JMP_TRUE":      Initialize=52
+
+    // Functions
+    "CALL":          Initialize=55
+    "RETURN":        Initialize=56
+    "CLOSURE":       Initialize=57
+
+    // Objects
+    "NEW_OBJECT":    Initialize=60
+    "NEW_ARRAY":     Initialize=61
+    "CONCAT":        Initialize=62
+
+    // Special
+    "HALT":          Initialize=0
+    "NOP":           Initialize=99
+}
+
+// =============================================================================
+// COMPILER CONSTANTS
+// =============================================================================
+FixedPool.JSCompConst {
+    "MAX_CODE":      Initialize=65536
+    "MAX_CONSTS":    Initialize=4096
+    "MAX_LOCALS":    Initialize=256
+    "MAX_SCOPES":    Initialize=16
+    "SCOPE_SIZE":    Initialize=1536
+    "CONST_SIZE":    Initialize=16
+    "MAX_PATCHES":   Initialize=256
+    "MAX_LOOPS":     Initialize=8
+    "LOOP_SIZE":     Initialize=24
+    "STR_CAP":       Initialize=65536
+    "FUNC_SIZE":     Initialize=40
+    "MAX_FUNCS":     Initialize=256
+}
+
+// =============================================================================
+// COMPILER STATE
+// =============================================================================
+FixedPool.JSCompState {
+    "code":          Initialize=0
+    "code_pos":      Initialize=0
+    "const_pool":    Initialize=0
+    "const_count":   Initialize=0
+    "scope_stack":   Initialize=0
+    "scope_depth":   Initialize=0
+    "scope_locals":  Initialize=0
+    "str_buf":       Initialize=0
+    "str_pos":       Initialize=0
+    "func_pool":     Initialize=0
+    "func_count":    Initialize=0
+    "loop_stack":    Initialize=0
+    "loop_depth":    Initialize=0
+    "error":         Initialize=0
+}
+
+// =============================================================================
+// CLOBBER-SAFE TEMPORARIES
+// =============================================================================
+FixedPool.JSCompTmp {
+    "idx":       Initialize=0
+    "type":      Initialize=0
+    "ptr":       Initialize=0
+    "len":       Initialize=0
+    "node":      Initialize=0
+    "left":      Initialize=0
+    "right":     Initialize=0
+    "op":        Initialize=0
+    "val":       Initialize=0
+    "addr":      Initialize=0
+    "done":      Initialize=0
+    "count":     Initialize=0
+    "slot":      Initialize=0
+    "name_ptr":  Initialize=0
+    "name_len":  Initialize=0
+    "patch":     Initialize=0
+}
+
+// =============================================================================
+// COMPILER STACK — save/restore JSCompTmp fields across recursive calls
+// =============================================================================
+FixedPool.JSCompStack {
+    "pool":       Initialize=0
+    "sp":         Initialize=0
+    "capacity":   Initialize=0
+    "tmp_val":    Initialize=0
+    "tmp_addr":   Initialize=0
+}
+
+// =============================================================================
+// STACK PUSH / POP
+// =============================================================================
+Function.JSComp__Push {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        JSCompStack.tmp_val = val
+        JSCompStack.tmp_addr = Add(JSCompStack.pool, Multiply(JSCompStack.sp, 8))
+        StoreValue(JSCompStack.tmp_addr, JSCompStack.tmp_val)
+        JSCompStack.sp = Add(JSCompStack.sp, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSComp__Pop {
+    Output: Integer
+    Body: {
+        JSCompStack.sp = Subtract(JSCompStack.sp, 1)
+        ReturnValue(Dereference(Add(JSCompStack.pool, Multiply(JSCompStack.sp, 8))))
+    }
+}
+
+// =============================================================================
+// INIT / RESET
+// =============================================================================
+Function.JSComp_Init {
+    Output: Integer
+    Body: {
+        JSCompState.code = Allocate(JSCompConst.MAX_CODE)
+        MemorySet(JSCompState.code, 0, JSCompConst.MAX_CODE)
+
+        csz = Multiply(JSCompConst.MAX_CONSTS, JSCompConst.CONST_SIZE)
+        JSCompState.const_pool = Allocate(csz)
+        MemorySet(JSCompState.const_pool, 0, csz)
+
+        ssz = Multiply(JSCompConst.MAX_SCOPES, JSCompConst.SCOPE_SIZE)
+        JSCompState.scope_stack = Allocate(ssz)
+        MemorySet(JSCompState.scope_stack, 0, ssz)
+
+        slsz = Multiply(JSCompConst.MAX_SCOPES, 8)
+        JSCompState.scope_locals = Allocate(slsz)
+        MemorySet(JSCompState.scope_locals, 0, slsz)
+
+        JSCompState.str_buf = Allocate(JSCompConst.STR_CAP)
+        MemorySet(JSCompState.str_buf, 0, JSCompConst.STR_CAP)
+
+        fsz = Multiply(JSCompConst.MAX_FUNCS, JSCompConst.FUNC_SIZE)
+        JSCompState.func_pool = Allocate(fsz)
+        MemorySet(JSCompState.func_pool, 0, fsz)
+
+        lsz = Multiply(JSCompConst.MAX_LOOPS, JSCompConst.LOOP_SIZE)
+        JSCompState.loop_stack = Allocate(lsz)
+        MemorySet(JSCompState.loop_stack, 0, lsz)
+
+        // Compiler frame stack (2048 entries x 8 bytes)
+        JSCompStack.pool = Allocate(16384)
+        JSCompStack.capacity = 2048
+        JSCompStack.sp = 0
+
+        JSCompState.code_pos = 0
+        JSCompState.const_count = 0
+        JSCompState.scope_depth = 0
+        JSCompState.str_pos = 0
+        JSCompState.func_count = 0
+        JSCompState.loop_depth = 0
+        JSCompState.error = 0
+
+        ReturnValue(1)
+    }
+}
+
+Function.JSComp_Reset {
+    Output: Integer
+    Body: {
+        MemorySet(JSCompState.code, 0, JSCompConst.MAX_CODE)
+        csz = Multiply(JSCompConst.MAX_CONSTS, JSCompConst.CONST_SIZE)
+        MemorySet(JSCompState.const_pool, 0, csz)
+        ssz = Multiply(JSCompConst.MAX_SCOPES, JSCompConst.SCOPE_SIZE)
+        MemorySet(JSCompState.scope_stack, 0, ssz)
+        slsz = Multiply(JSCompConst.MAX_SCOPES, 8)
+        MemorySet(JSCompState.scope_locals, 0, slsz)
+        JSCompState.str_pos = 0
+        fsz = Multiply(JSCompConst.MAX_FUNCS, JSCompConst.FUNC_SIZE)
+        MemorySet(JSCompState.func_pool, 0, fsz)
+        lsz = Multiply(JSCompConst.MAX_LOOPS, JSCompConst.LOOP_SIZE)
+        MemorySet(JSCompState.loop_stack, 0, lsz)
+        JSCompState.code_pos = 0
+        JSCompState.const_count = 0
+        JSCompState.scope_depth = 0
+        JSCompState.func_count = 0
+        JSCompState.loop_depth = 0
+        JSCompState.error = 0
+        JSCompStack.sp = 0
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// BYTECODE EMISSION HELPERS
+// =============================================================================
+
+// Emit single byte
+Function.JSComp__Emit1 {
+    Input: byte: Integer
+    Output: Integer
+    Body: {
+        save_byte = byte
+        IfCondition GreaterEqual(JSCompState.code_pos, JSCompConst.MAX_CODE) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        SetByte(JSCompState.code, JSCompState.code_pos, save_byte)
+        JSCompState.code_pos = Add(JSCompState.code_pos, 1)
+        ReturnValue(0)
+    }
+}
+
+// Emit opcode + 16-bit big-endian operand (3 bytes total)
+Function.JSComp__Emit3 {
+    Input: opcode: Integer
+    Input: hi: Integer
+    Input: lo: Integer
+    Output: Integer
+    Body: {
+        save_op = opcode
+        save_hi = hi
+        save_lo = lo
+        JSComp__Emit1(save_op)
+        JSComp__Emit1(save_hi)
+        JSComp__Emit1(save_lo)
+        ReturnValue(0)
+    }
+}
+
+// Emit opcode + 16-bit operand from a single value (splits into hi/lo)
+Function.JSComp__EmitOp16 {
+    Input: opcode: Integer
+    Input: operand: Integer
+    Output: Integer
+    Body: {
+        save_op = opcode
+        save_operand = operand
+        hi = BitwiseAnd(ShiftRight(save_operand, 8), 255)
+        lo = BitwiseAnd(save_operand, 255)
+        JSComp__Emit3(save_op, hi, lo)
+        ReturnValue(0)
+    }
+}
+
+// Patch a 16-bit jump target at addr+1, addr+2 with current code_pos
+Function.JSComp__PatchJump {
+    Input: addr: Integer
+    Output: Integer
+    Body: {
+        save_addr = addr
+        target = JSCompState.code_pos
+        hi = BitwiseAnd(ShiftRight(target, 8), 255)
+        lo = BitwiseAnd(target, 255)
+        patch_hi = Add(save_addr, 1)
+        patch_lo = Add(save_addr, 2)
+        SetByte(JSCompState.code, patch_hi, hi)
+        SetByte(JSCompState.code, patch_lo, lo)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CONSTANT POOL
+// =============================================================================
+
+// Add number constant, return pool index
+Function.JSComp__AddNumber {
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        save_n = n
+        idx = JSCompState.const_count
+        IfCondition GreaterEqual(idx, JSCompConst.MAX_CONSTS) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        JSCompState.const_count = Add(idx, 1)
+        base = Add(JSCompState.const_pool, Multiply(idx, JSCompConst.CONST_SIZE))
+        // Type 1 = NUMBER
+        StoreValue(base, 1)
+        StoreValue(Add(base, 8), save_n)
+        ReturnValue(idx)
+    }
+}
+
+// Add string constant: copy string into str_buf, add pool entry, return index
+Function.JSComp__AddString {
+    Input: ptr: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        save_ptr = ptr
+        save_len = len
+        // Check str_buf capacity
+        needed = Add(JSCompState.str_pos, Add(save_len, 1))
+        IfCondition GreaterEqual(needed, JSCompConst.STR_CAP) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        // Copy string into str_buf
+        dest = Add(JSCompState.str_buf, JSCompState.str_pos)
+        MemoryCopy(dest, save_ptr, save_len)
+        SetByte(dest, save_len, 0)
+        str_start = dest
+        JSCompState.str_pos = Add(JSCompState.str_pos, Add(save_len, 1))
+
+        // Add pool entry
+        idx = JSCompState.const_count
+        IfCondition GreaterEqual(idx, JSCompConst.MAX_CONSTS) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        JSCompState.const_count = Add(idx, 1)
+        base = Add(JSCompState.const_pool, Multiply(idx, JSCompConst.CONST_SIZE))
+        // Type 2 = STRING
+        StoreValue(base, 2)
+        StoreValue(Add(base, 8), str_start)
+        ReturnValue(idx)
+    }
+}
+
+// =============================================================================
+// STRING COMPARISON — byte-by-byte
+// =============================================================================
+Function.JSComp__StrEq {
+    Input: p1: Address
+    Input: l1: Integer
+    Input: p2: Address
+    Input: l2: Integer
+    Output: Integer
+    Body: {
+        save_p1 = p1
+        save_l1 = l1
+        save_p2 = p2
+        save_l2 = l2
+        IfCondition NotEqual(save_l1, save_l2) ThenBlock: {
+            ReturnValue(0)
+        }
+        JSCompTmp.idx = 0
+        WhileLoop LessThan(JSCompTmp.idx, save_l1) {
+            JSCompTmp.op = GetByte(save_p1, JSCompTmp.idx)
+            JSCompTmp.val = GetByte(save_p2, JSCompTmp.idx)
+            IfCondition NotEqual(JSCompTmp.op, JSCompTmp.val) ThenBlock: {
+                ReturnValue(0)
+            }
+            JSCompTmp.idx = Add(JSCompTmp.idx, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SCOPE MANAGEMENT
+// =============================================================================
+
+Function.JSComp__PushScope {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(JSCompState.scope_depth, JSCompConst.MAX_SCOPES) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        // Zero the local count for this scope
+        addr = Add(JSCompState.scope_locals, Multiply(JSCompState.scope_depth, 8))
+        StoreValue(addr, 0)
+        // Zero the scope entry area
+        sbase = Add(JSCompState.scope_stack, Multiply(JSCompState.scope_depth, JSCompConst.SCOPE_SIZE))
+        MemorySet(sbase, 0, JSCompConst.SCOPE_SIZE)
+        JSCompState.scope_depth = Add(JSCompState.scope_depth, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSComp__PopScope {
+    Output: Integer
+    Body: {
+        IfCondition LessThan(JSCompState.scope_depth, 1) ThenBlock: {
+            ReturnValue(-1)
+        }
+        JSCompState.scope_depth = Subtract(JSCompState.scope_depth, 1)
+        ReturnValue(0)
+    }
+}
+
+// Add a local variable to the current scope, return its slot index
+Function.JSComp__AddLocal {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        save_ptr = name_ptr
+        save_len = name_len
+        depth_idx = Subtract(JSCompState.scope_depth, 1)
+        IfCondition LessThan(depth_idx, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        // Get current local count for this scope
+        lc_addr = Add(JSCompState.scope_locals, Multiply(depth_idx, 8))
+        lc = Dereference(lc_addr)
+        IfCondition GreaterEqual(lc, 64) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        // Each local entry: 24 bytes (name_ptr(8) + name_len(8) + slot(8))
+        sbase = Add(JSCompState.scope_stack, Multiply(depth_idx, JSCompConst.SCOPE_SIZE))
+        entry = Add(sbase, Multiply(lc, 24))
+        // Calculate absolute slot: sum of locals in all scopes below + lc
+        abs_slot = 0
+        JSCompTmp.idx = 0
+        WhileLoop LessThan(JSCompTmp.idx, depth_idx) {
+            prev_addr = Add(JSCompState.scope_locals, Multiply(JSCompTmp.idx, 8))
+            abs_slot = Add(abs_slot, Dereference(prev_addr))
+            JSCompTmp.idx = Add(JSCompTmp.idx, 1)
+        }
+        abs_slot = Add(abs_slot, lc)
+        StoreValue(entry, save_ptr)
+        StoreValue(Add(entry, 8), save_len)
+        StoreValue(Add(entry, 16), abs_slot)
+        // Increment local count
+        StoreValue(lc_addr, Add(lc, 1))
+        ReturnValue(abs_slot)
+    }
+}
+
+// Find a local variable by name, searching from current scope outward.
+// Returns slot index or -1 if not found.
+Function.JSComp__FindLocal {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        save_ptr = name_ptr
+        save_len = name_len
+        // Search from innermost scope to outermost
+        JSCompTmp.idx = Subtract(JSCompState.scope_depth, 1)
+        WhileLoop GreaterEqual(JSCompTmp.idx, 0) {
+            lc_addr = Add(JSCompState.scope_locals, Multiply(JSCompTmp.idx, 8))
+            lc = Dereference(lc_addr)
+            sbase = Add(JSCompState.scope_stack, Multiply(JSCompTmp.idx, JSCompConst.SCOPE_SIZE))
+            JSCompTmp.val = 0
+            WhileLoop LessThan(JSCompTmp.val, lc) {
+                entry = Add(sbase, Multiply(JSCompTmp.val, 24))
+                ep = Dereference(entry)
+                el = Dereference(Add(entry, 8))
+                eq = JSComp__StrEq(save_ptr, save_len, ep, el)
+                IfCondition EqualTo(eq, 1) ThenBlock: {
+                    ReturnValue(Dereference(Add(entry, 16)))
+                }
+                JSCompTmp.val = Add(JSCompTmp.val, 1)
+            }
+            JSCompTmp.idx = Subtract(JSCompTmp.idx, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// VARIABLE RESOLUTION — emit GET/SET LOCAL or GLOBAL
+// =============================================================================
+
+Function.JSComp__EmitVarGet {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        save_ptr = name_ptr
+        save_len = name_len
+        slot = JSComp__FindLocal(save_ptr, save_len)
+        IfCondition GreaterEqual(slot, 0) ThenBlock: {
+            JSComp__EmitOp16(JSOp.GET_LOCAL, slot)
+        } ElseBlock: {
+            ci = JSComp__AddString(save_ptr, save_len)
+            JSComp__EmitOp16(JSOp.GET_GLOBAL, ci)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.JSComp__EmitVarSet {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        save_ptr = name_ptr
+        save_len = name_len
+        slot = JSComp__FindLocal(save_ptr, save_len)
+        IfCondition GreaterEqual(slot, 0) ThenBlock: {
+            JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
+        } ElseBlock: {
+            ci = JSComp__AddString(save_ptr, save_len)
+            JSComp__EmitOp16(JSOp.SET_GLOBAL, ci)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LOOP STACK — for break/continue
+// =============================================================================
+
+// Push a new loop frame: break_patch=-1, continue_target, break_count=0
+Function.JSComp__PushLoop {
+    Input: cont_target: Integer
+    Output: Integer
+    Body: {
+        save_ct = cont_target
+        IfCondition GreaterEqual(JSCompState.loop_depth, JSCompConst.MAX_LOOPS) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        base = Add(JSCompState.loop_stack, Multiply(JSCompState.loop_depth, JSCompConst.LOOP_SIZE))
+        // break_patch slot (will be patched later)
+        StoreValue(base, -1)
+        // continue_target
+        StoreValue(Add(base, 8), save_ct)
+        // break_count
+        StoreValue(Add(base, 16), 0)
+        JSCompState.loop_depth = Add(JSCompState.loop_depth, 1)
+        ReturnValue(0)
+    }
+}
+
+// Pop loop frame and patch all break jumps to current code_pos
+Function.JSComp__PopLoop {
+    Output: Integer
+    Body: {
+        IfCondition LessThan(JSCompState.loop_depth, 1) ThenBlock: {
+            ReturnValue(-1)
+        }
+        JSCompState.loop_depth = Subtract(JSCompState.loop_depth, 1)
+        base = Add(JSCompState.loop_stack, Multiply(JSCompState.loop_depth, JSCompConst.LOOP_SIZE))
+        brk_addr = Dereference(base)
+        // If there is a break jump to patch
+        IfCondition GreaterEqual(brk_addr, 0) ThenBlock: {
+            JSComp__PatchJump(brk_addr)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Record a break jump address for the current loop
+Function.JSComp__RecordBreak {
+    Input: jmp_addr: Integer
+    Output: Integer
+    Body: {
+        save_addr = jmp_addr
+        IfCondition LessThan(JSCompState.loop_depth, 1) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        depth_idx = Subtract(JSCompState.loop_depth, 1)
+        base = Add(JSCompState.loop_stack, Multiply(depth_idx, JSCompConst.LOOP_SIZE))
+        // Store the break jump address (overwrites previous; for multiple breaks
+        // we chain via JSComp__PatchJump in PopLoop — simplified: last break wins)
+        StoreValue(base, save_addr)
+        ReturnValue(0)
+    }
+}
+
+// Get continue target for current loop
+Function.JSComp__GetContinueTarget {
+    Output: Integer
+    Body: {
+        IfCondition LessThan(JSCompState.loop_depth, 1) ThenBlock: {
+            ReturnValue(-1)
+        }
+        depth_idx = Subtract(JSCompState.loop_depth, 1)
+        base = Add(JSCompState.loop_stack, Multiply(depth_idx, JSCompConst.LOOP_SIZE))
+        ReturnValue(Dereference(Add(base, 8)))
+    }
+}
+
+// =============================================================================
+// BINARY OPERATOR MAPPING — token type to bytecode opcode
+// =============================================================================
+Function.JSComp__MapBinOp {
+    Input: tok_type: Integer
+    Output: Integer
+    Body: {
+        save_tt = tok_type
+        IfCondition EqualTo(save_tt, JSTokType.PLUS) ThenBlock: { ReturnValue(JSOp.ADD) }
+        IfCondition EqualTo(save_tt, JSTokType.MINUS) ThenBlock: { ReturnValue(JSOp.SUB) }
+        IfCondition EqualTo(save_tt, JSTokType.STAR) ThenBlock: { ReturnValue(JSOp.MUL) }
+        IfCondition EqualTo(save_tt, JSTokType.SLASH) ThenBlock: { ReturnValue(JSOp.DIV) }
+        IfCondition EqualTo(save_tt, JSTokType.PERCENT) ThenBlock: { ReturnValue(JSOp.MOD) }
+        IfCondition EqualTo(save_tt, JSTokType.EQ) ThenBlock: { ReturnValue(JSOp.EQ) }
+        IfCondition EqualTo(save_tt, JSTokType.NEQ) ThenBlock: { ReturnValue(JSOp.NEQ) }
+        IfCondition EqualTo(save_tt, JSTokType.STRICT_EQ) ThenBlock: { ReturnValue(JSOp.STRICT_EQ) }
+        IfCondition EqualTo(save_tt, JSTokType.STRICT_NEQ) ThenBlock: { ReturnValue(JSOp.STRICT_NEQ) }
+        IfCondition EqualTo(save_tt, JSTokType.LT) ThenBlock: { ReturnValue(JSOp.LT) }
+        IfCondition EqualTo(save_tt, JSTokType.GT) ThenBlock: { ReturnValue(JSOp.GT) }
+        IfCondition EqualTo(save_tt, JSTokType.LTE) ThenBlock: { ReturnValue(JSOp.LTE) }
+        IfCondition EqualTo(save_tt, JSTokType.GTE) ThenBlock: { ReturnValue(JSOp.GTE) }
+        IfCondition EqualTo(save_tt, JSTokType.AMP) ThenBlock: { ReturnValue(JSOp.BIT_AND) }
+        IfCondition EqualTo(save_tt, JSTokType.PIPE) ThenBlock: { ReturnValue(JSOp.BIT_OR) }
+        IfCondition EqualTo(save_tt, JSTokType.CARET) ThenBlock: { ReturnValue(JSOp.BIT_XOR) }
+        IfCondition EqualTo(save_tt, JSTokType.SHL) ThenBlock: { ReturnValue(JSOp.SHL) }
+        IfCondition EqualTo(save_tt, JSTokType.SHR) ThenBlock: { ReturnValue(JSOp.SHR) }
+        // AND/OR are short-circuit — handled separately in CompileExpr
+        ReturnValue(JSOp.NOP)
+    }
+}
+
+// =============================================================================
+// AST WALKING — COMPILE EXPRESSIONS
+// =============================================================================
+
+// Forward declarations:
+// JSComp__CompileNode(node)
+// JSComp__CompileExpr(node)
+// JSComp__CompileBlock(node)
+// JSComp__CompileProgram(node)
+// JSComp__CompileFunc(node)
+
+// ---------------------------------------------------------------------------
+// Compile expression — leaves one value on the VM stack
+// ---------------------------------------------------------------------------
+Function.JSComp__CompileExpr {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        save_node = node
+        IfCondition EqualTo(JSCompState.error, 1) ThenBlock: { ReturnValue(-1) }
+        IfCondition LessThan(save_node, 0) ThenBlock: { ReturnValue(-1) }
+
+        ntype = JSParse_GetType(save_node)
+
+        // --- NUMBER_LIT ---
+        IfCondition EqualTo(ntype, ASTType.NUMBER_LIT) ThenBlock: {
+            nval = JSParse_GetValue(save_node)
+            ci = JSComp__AddNumber(nval)
+            JSComp__EmitOp16(JSOp.PUSH_CONST, ci)
+            ReturnValue(0)
+        }
+
+        // --- STRING_LIT ---
+        IfCondition EqualTo(ntype, ASTType.STRING_LIT) ThenBlock: {
+            sp = JSParse_GetNamePtr(save_node)
+            sl = JSParse_GetNameLen(save_node)
+            ci = JSComp__AddString(sp, sl)
+            JSComp__EmitOp16(JSOp.PUSH_CONST, ci)
+            ReturnValue(0)
+        }
+
+        // --- BOOL_LIT ---
+        IfCondition EqualTo(ntype, ASTType.BOOL_LIT) ThenBlock: {
+            bval = JSParse_GetValue(save_node)
+            IfCondition EqualTo(bval, 1) ThenBlock: {
+                JSComp__Emit1(JSOp.PUSH_TRUE)
+            } ElseBlock: {
+                JSComp__Emit1(JSOp.PUSH_FALSE)
+            }
+            ReturnValue(0)
+        }
+
+        // --- NULL_LIT ---
+        IfCondition EqualTo(ntype, ASTType.NULL_LIT) ThenBlock: {
+            JSComp__Emit1(JSOp.PUSH_NULL)
+            ReturnValue(0)
+        }
+
+        // --- UNDEF_LIT ---
+        IfCondition EqualTo(ntype, ASTType.UNDEF_LIT) ThenBlock: {
+            JSComp__Emit1(JSOp.PUSH_UNDEF)
+            ReturnValue(0)
+        }
+
+        // --- THIS_EXPR ---
+        IfCondition EqualTo(ntype, ASTType.THIS_EXPR) ThenBlock: {
+            // Emit GET_GLOBAL("this")
+            // "this" = 116 104 105 115
+            tbuf = Allocate(8)
+            SetByte(tbuf, 0, 116)
+            SetByte(tbuf, 1, 104)
+            SetByte(tbuf, 2, 105)
+            SetByte(tbuf, 3, 115)
+            SetByte(tbuf, 4, 0)
+            ci = JSComp__AddString(tbuf, 4)
+            JSComp__EmitOp16(JSOp.GET_GLOBAL, ci)
+            ReturnValue(0)
+        }
+
+        // --- IDENT ---
+        IfCondition EqualTo(ntype, ASTType.IDENT) ThenBlock: {
+            np = JSParse_GetNamePtr(save_node)
+            nl = JSParse_GetNameLen(save_node)
+            JSComp__EmitVarGet(np, nl)
+            ReturnValue(0)
+        }
+
+        // --- BINARY_OP ---
+        IfCondition EqualTo(ntype, ASTType.BINARY_OP) ThenBlock: {
+            bop = JSParse_GetOp(save_node)
+
+            // Short-circuit AND
+            IfCondition EqualTo(bop, JSTokType.AND) ThenBlock: {
+                bl = JSParse_GetLeft(save_node)
+                JSComp__CompileExpr(bl)
+                JSComp__Emit1(JSOp.DUP)
+                sc_addr = JSCompState.code_pos
+                JSComp__EmitOp16(JSOp.JMP_FALSE, 0)
+                JSComp__Emit1(JSOp.POP)
+                br = JSParse_GetRight(save_node)
+                JSComp__CompileExpr(br)
+                JSComp__PatchJump(sc_addr)
+                ReturnValue(0)
+            }
+
+            // Short-circuit OR
+            IfCondition EqualTo(bop, JSTokType.OR) ThenBlock: {
+                bl = JSParse_GetLeft(save_node)
+                JSComp__CompileExpr(bl)
+                JSComp__Emit1(JSOp.DUP)
+                sc_addr = JSCompState.code_pos
+                JSComp__EmitOp16(JSOp.JMP_TRUE, 0)
+                JSComp__Emit1(JSOp.POP)
+                br = JSParse_GetRight(save_node)
+                JSComp__CompileExpr(br)
+                JSComp__PatchJump(sc_addr)
+                ReturnValue(0)
+            }
+
+            // Normal binary ops
+            bl = JSParse_GetLeft(save_node)
+
+            // CLOBBER GUARD: push save_node and bop before recursive compile
+            JSComp__Push(save_node)
+            JSComp__Push(bop)
+
+            JSComp__CompileExpr(bl)
+
+            bop = JSComp__Pop()
+            save_node = JSComp__Pop()
+
+            br = JSParse_GetRight(save_node)
+
+            JSComp__Push(bop)
+
+            JSComp__CompileExpr(br)
+
+            bop = JSComp__Pop()
+
+            vm_op = JSComp__MapBinOp(bop)
+            JSComp__Emit1(vm_op)
+            ReturnValue(0)
+        }
+
+        // --- UNARY_OP ---
+        IfCondition EqualTo(ntype, ASTType.UNARY_OP) ThenBlock: {
+            uop = JSParse_GetOp(save_node)
+            ul = JSParse_GetLeft(save_node)
+            JSComp__CompileExpr(ul)
+            IfCondition EqualTo(uop, JSTokType.MINUS) ThenBlock: {
+                JSComp__Emit1(JSOp.NEG)
+            }
+            IfCondition EqualTo(uop, JSTokType.NOT) ThenBlock: {
+                JSComp__Emit1(JSOp.NOT)
+            }
+            IfCondition EqualTo(uop, JSTokType.TILDE) ThenBlock: {
+                JSComp__Emit1(JSOp.BIT_NOT)
+            }
+            ReturnValue(0)
+        }
+
+        // --- TYPEOF_EXPR ---
+        IfCondition EqualTo(ntype, ASTType.TYPEOF_EXPR) ThenBlock: {
+            tl = JSParse_GetLeft(save_node)
+            JSComp__CompileExpr(tl)
+            JSComp__Emit1(JSOp.TYPEOF)
+            ReturnValue(0)
+        }
+
+        // --- ASSIGN ---
+        IfCondition EqualTo(ntype, ASTType.ASSIGN) ThenBlock: {
+            aop = JSParse_GetOp(save_node)
+            al = JSParse_GetLeft(save_node)
+            ar = JSParse_GetRight(save_node)
+            al_type = JSParse_GetType(al)
+
+            // Compound assignment (+=, -=, *=, /=)
+            IfCondition NotEqual(aop, JSTokType.ASSIGN) ThenBlock: {
+                // Load current value
+                JSComp__Push(save_node)
+                JSComp__Push(aop)
+                JSComp__Push(al)
+                JSComp__CompileExpr(al)
+                al = JSComp__Pop()
+                aop = JSComp__Pop()
+                save_node = JSComp__Pop()
+                ar = JSParse_GetRight(save_node)
+
+                // Load RHS
+                JSComp__Push(save_node)
+                JSComp__Push(aop)
+                JSComp__Push(al)
+                JSComp__CompileExpr(ar)
+                al = JSComp__Pop()
+                aop = JSComp__Pop()
+                save_node = JSComp__Pop()
+
+                // Emit compound op
+                IfCondition EqualTo(aop, JSTokType.PLUS_ASSIGN) ThenBlock: {
+                    JSComp__Emit1(JSOp.ADD)
+                }
+                IfCondition EqualTo(aop, JSTokType.MINUS_ASSIGN) ThenBlock: {
+                    JSComp__Emit1(JSOp.SUB)
+                }
+                IfCondition EqualTo(aop, JSTokType.STAR_ASSIGN) ThenBlock: {
+                    JSComp__Emit1(JSOp.MUL)
+                }
+                IfCondition EqualTo(aop, JSTokType.SLASH_ASSIGN) ThenBlock: {
+                    JSComp__Emit1(JSOp.DIV)
+                }
+
+                // Store result
+                al_type = JSParse_GetType(al)
+            } ElseBlock: {
+                // Simple assignment: compile RHS first
+                JSComp__Push(save_node)
+                JSComp__Push(al)
+                JSComp__CompileExpr(ar)
+                al = JSComp__Pop()
+                save_node = JSComp__Pop()
+                al_type = JSParse_GetType(al)
+            }
+
+            // Emit store based on target type
+            IfCondition EqualTo(al_type, ASTType.IDENT) ThenBlock: {
+                np = JSParse_GetNamePtr(al)
+                nl = JSParse_GetNameLen(al)
+                JSComp__EmitVarSet(np, nl)
+            }
+            IfCondition EqualTo(al_type, ASTType.MEMBER_DOT) ThenBlock: {
+                // Stack has value on top; need object below it
+                // Recompile object expression, swap... simplified:
+                // Emit: compile obj, then SET_PROP
+                obj = JSParse_GetLeft(al)
+                JSComp__CompileExpr(obj)
+                pnp = JSParse_GetNamePtr(al)
+                pnl = JSParse_GetNameLen(al)
+                ci = JSComp__AddString(pnp, pnl)
+                JSComp__EmitOp16(JSOp.SET_PROP, ci)
+            }
+            IfCondition EqualTo(al_type, ASTType.MEMBER_BRACKET) ThenBlock: {
+                obj = JSParse_GetLeft(al)
+                key = JSParse_GetRight(al)
+                JSComp__CompileExpr(obj)
+                JSComp__CompileExpr(key)
+                JSComp__Emit1(JSOp.SET_ELEM)
+            }
+            ReturnValue(0)
+        }
+
+        // --- CALL ---
+        IfCondition EqualTo(ntype, ASTType.CALL) ThenBlock: {
+            callee = JSParse_GetLeft(save_node)
+            argc = JSParse_GetValue(save_node)
+
+            // Compile callee
+            JSComp__Push(save_node)
+            JSComp__Push(argc)
+            JSComp__CompileExpr(callee)
+            argc = JSComp__Pop()
+            save_node = JSComp__Pop()
+
+            // Compile arguments in order (linked via N_RIGHT -> N_NEXT chain)
+            arg = JSParse_GetRight(save_node)
+            JSComp__Push(argc)
+            WhileLoop GreaterEqual(arg, 0) {
+                JSComp__Push(arg)
+                JSComp__CompileExpr(arg)
+                arg = JSComp__Pop()
+                arg = JSParse_GetNext(arg)
+            }
+            argc = JSComp__Pop()
+
+            // Emit CALL with arg count (1-byte operand)
+            JSComp__Emit1(JSOp.CALL)
+            JSComp__Emit1(argc)
+            ReturnValue(0)
+        }
+
+        // --- NEW_EXPR ---
+        IfCondition EqualTo(ntype, ASTType.NEW_EXPR) ThenBlock: {
+            // Treat like CALL for now — VM handles new semantics
+            callee = JSParse_GetLeft(save_node)
+            argc = JSParse_GetValue(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__Push(argc)
+            JSComp__CompileExpr(callee)
+            argc = JSComp__Pop()
+            save_node = JSComp__Pop()
+
+            arg = JSParse_GetRight(save_node)
+            JSComp__Push(argc)
+            WhileLoop GreaterEqual(arg, 0) {
+                JSComp__Push(arg)
+                JSComp__CompileExpr(arg)
+                arg = JSComp__Pop()
+                arg = JSParse_GetNext(arg)
+            }
+            argc = JSComp__Pop()
+
+            JSComp__Emit1(JSOp.CALL)
+            JSComp__Emit1(argc)
+            ReturnValue(0)
+        }
+
+        // --- MEMBER_DOT ---
+        IfCondition EqualTo(ntype, ASTType.MEMBER_DOT) ThenBlock: {
+            obj = JSParse_GetLeft(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__CompileExpr(obj)
+            save_node = JSComp__Pop()
+
+            pnp = JSParse_GetNamePtr(save_node)
+            pnl = JSParse_GetNameLen(save_node)
+            ci = JSComp__AddString(pnp, pnl)
+            JSComp__EmitOp16(JSOp.GET_PROP, ci)
+            ReturnValue(0)
+        }
+
+        // --- MEMBER_BRACKET ---
+        IfCondition EqualTo(ntype, ASTType.MEMBER_BRACKET) ThenBlock: {
+            obj = JSParse_GetLeft(save_node)
+            key = JSParse_GetRight(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__CompileExpr(obj)
+            save_node = JSComp__Pop()
+
+            key = JSParse_GetRight(save_node)
+            JSComp__CompileExpr(key)
+            JSComp__Emit1(JSOp.GET_ELEM)
+            ReturnValue(0)
+        }
+
+        // --- TERNARY ---
+        IfCondition EqualTo(ntype, ASTType.TERNARY) ThenBlock: {
+            cond_n = JSParse_GetCond(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__CompileExpr(cond_n)
+            save_node = JSComp__Pop()
+
+            false_jmp = JSCompState.code_pos
+            JSComp__EmitOp16(JSOp.JMP_FALSE, 0)
+
+            // Consequent (N_LEFT)
+            tl = JSParse_GetLeft(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__CompileExpr(tl)
+            save_node = JSComp__Pop()
+
+            end_jmp = JSCompState.code_pos
+            JSComp__EmitOp16(JSOp.JMP, 0)
+
+            JSComp__PatchJump(false_jmp)
+
+            // Alternate (N_RIGHT)
+            tr = JSParse_GetRight(save_node)
+            JSComp__CompileExpr(tr)
+
+            JSComp__PatchJump(end_jmp)
+            ReturnValue(0)
+        }
+
+        // --- UPDATE_EXPR (++/--) ---
+        IfCondition EqualTo(ntype, ASTType.UPDATE_EXPR) ThenBlock: {
+            uop = JSParse_GetOp(save_node)
+            is_prefix = JSParse_GetValue(save_node)
+            operand = JSParse_GetLeft(save_node)
+            op_type = JSParse_GetType(operand)
+
+            IfCondition EqualTo(op_type, ASTType.IDENT) ThenBlock: {
+                np = JSParse_GetNamePtr(operand)
+                nl = JSParse_GetNameLen(operand)
+
+                // Postfix: push original value first
+                IfCondition EqualTo(is_prefix, 0) ThenBlock: {
+                    JSComp__EmitVarGet(np, nl)
+                }
+
+                // Load, add/sub 1, store
+                JSComp__Push(is_prefix)
+                JSComp__Push(uop)
+                JSComp__EmitVarGet(np, nl)
+                uop = JSComp__Pop()
+                is_prefix = JSComp__Pop()
+
+                one_ci = JSComp__AddNumber(1)
+
+                JSComp__Push(is_prefix)
+                JSComp__Push(uop)
+                JSComp__Push(operand)
+                JSComp__EmitOp16(JSOp.PUSH_CONST, one_ci)
+                operand = JSComp__Pop()
+                uop = JSComp__Pop()
+                is_prefix = JSComp__Pop()
+
+                IfCondition EqualTo(uop, JSTokType.PLUS_PLUS) ThenBlock: {
+                    JSComp__Emit1(JSOp.ADD)
+                } ElseBlock: {
+                    JSComp__Emit1(JSOp.SUB)
+                }
+
+                // Store updated value
+                np = JSParse_GetNamePtr(operand)
+                nl = JSParse_GetNameLen(operand)
+                JSComp__EmitVarSet(np, nl)
+
+                // Prefix: push the new value (it's already stored, re-get it)
+                IfCondition EqualTo(is_prefix, 1) ThenBlock: {
+                    JSComp__EmitVarGet(np, nl)
+                }
+            }
+            ReturnValue(0)
+        }
+
+        // --- OBJECT_LIT ---
+        IfCondition EqualTo(ntype, ASTType.OBJECT_LIT) ThenBlock: {
+            JSComp__Emit1(JSOp.NEW_OBJECT)
+            // Properties are linked via N_LEFT -> N_NEXT chain
+            prop = JSParse_GetLeft(save_node)
+            WhileLoop GreaterEqual(prop, 0) {
+                JSComp__Emit1(JSOp.DUP)
+                // Property value is in N_RIGHT of PROPERTY node
+                pval = JSParse_GetRight(prop)
+
+                JSComp__Push(prop)
+                JSComp__CompileExpr(pval)
+                prop = JSComp__Pop()
+
+                // Property key name
+                kp = JSParse_GetNamePtr(prop)
+                kl = JSParse_GetNameLen(prop)
+                ci = JSComp__AddString(kp, kl)
+                JSComp__EmitOp16(JSOp.SET_PROP, ci)
+
+                prop = JSParse_GetNext(prop)
+            }
+            ReturnValue(0)
+        }
+
+        // --- ARRAY_LIT ---
+        IfCondition EqualTo(ntype, ASTType.ARRAY_LIT) ThenBlock: {
+            // Count and compile elements (linked via N_LEFT -> N_NEXT chain)
+            elem = JSParse_GetLeft(save_node)
+            elem_count = 0
+            // First pass: compile each element
+            WhileLoop GreaterEqual(elem, 0) {
+                JSComp__Push(elem)
+                JSComp__CompileExpr(elem)
+                elem = JSComp__Pop()
+                elem_count = Add(elem_count, 1)
+                elem = JSParse_GetNext(elem)
+            }
+            JSComp__EmitOp16(JSOp.NEW_ARRAY, elem_count)
+            ReturnValue(0)
+        }
+
+        // --- FUNC_EXPR ---
+        IfCondition EqualTo(ntype, ASTType.FUNC_EXPR) ThenBlock: {
+            JSComp__CompileFunc(save_node)
+            ReturnValue(0)
+        }
+
+        // Fallback — unknown expression type
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// AST WALKING — COMPILE STATEMENTS
+// =============================================================================
+
+// ---------------------------------------------------------------------------
+// Compile a single AST node (statement or declaration)
+// ---------------------------------------------------------------------------
+Function.JSComp__CompileNode {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        save_node = node
+        IfCondition EqualTo(JSCompState.error, 1) ThenBlock: { ReturnValue(-1) }
+        IfCondition LessThan(save_node, 0) ThenBlock: { ReturnValue(-1) }
+
+        ntype = JSParse_GetType(save_node)
+
+        // --- PROGRAM ---
+        IfCondition EqualTo(ntype, ASTType.PROGRAM) ThenBlock: {
+            JSComp__CompileProgram(save_node)
+            ReturnValue(0)
+        }
+
+        // --- BLOCK ---
+        IfCondition EqualTo(ntype, ASTType.BLOCK) ThenBlock: {
+            JSComp__CompileBlock(save_node)
+            ReturnValue(0)
+        }
+
+        // --- VAR_DECL ---
+        IfCondition EqualTo(ntype, ASTType.VAR_DECL) ThenBlock: {
+            np = JSParse_GetNamePtr(save_node)
+            nl = JSParse_GetNameLen(save_node)
+            slot = JSComp__AddLocal(np, nl)
+
+            // Check for initializer (N_LEFT)
+            init = JSParse_GetLeft(save_node)
+            IfCondition GreaterEqual(init, 0) ThenBlock: {
+                JSComp__Push(slot)
+                JSComp__CompileExpr(init)
+                slot = JSComp__Pop()
+                JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
+            } ElseBlock: {
+                // Initialize to undefined
+                JSComp__Emit1(JSOp.PUSH_UNDEF)
+                JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
+            }
+            ReturnValue(0)
+        }
+
+        // --- FUNC_DECL ---
+        IfCondition EqualTo(ntype, ASTType.FUNC_DECL) ThenBlock: {
+            // Add function name as local
+            np = JSParse_GetNamePtr(save_node)
+            nl = JSParse_GetNameLen(save_node)
+            slot = JSComp__AddLocal(np, nl)
+
+            // Compile function body into func_pool
+            JSComp__Push(slot)
+            JSComp__CompileFunc(save_node)
+            slot = JSComp__Pop()
+
+            // SET_LOCAL to bind the closure to the variable
+            JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
+            ReturnValue(0)
+        }
+
+        // --- RETURN_STMT ---
+        IfCondition EqualTo(ntype, ASTType.RETURN_STMT) ThenBlock: {
+            ret_expr = JSParse_GetLeft(save_node)
+            IfCondition GreaterEqual(ret_expr, 0) ThenBlock: {
+                JSComp__CompileExpr(ret_expr)
+            } ElseBlock: {
+                JSComp__Emit1(JSOp.PUSH_UNDEF)
+            }
+            JSComp__Emit1(JSOp.RETURN)
+            ReturnValue(0)
+        }
+
+        // --- EXPR_STMT ---
+        IfCondition EqualTo(ntype, ASTType.EXPR_STMT) ThenBlock: {
+            es = JSParse_GetLeft(save_node)
+            JSComp__CompileExpr(es)
+            JSComp__Emit1(JSOp.POP)
+            ReturnValue(0)
+        }
+
+        // --- IF_STMT ---
+        IfCondition EqualTo(ntype, ASTType.IF_STMT) ThenBlock: {
+            // Compile condition
+            cond_n = JSParse_GetCond(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__CompileExpr(cond_n)
+            save_node = JSComp__Pop()
+
+            // JMP_FALSE to else/end
+            false_jmp = JSCompState.code_pos
+            JSComp__EmitOp16(JSOp.JMP_FALSE, 0)
+
+            // Compile then-body
+            body_n = JSParse_GetBody(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__Push(false_jmp)
+            JSComp__CompileNode(body_n)
+            false_jmp = JSComp__Pop()
+            save_node = JSComp__Pop()
+
+            // Check for else branch (N_RIGHT)
+            else_n = JSParse_GetRight(save_node)
+            IfCondition GreaterEqual(else_n, 0) ThenBlock: {
+                // JMP over else
+                end_jmp = JSCompState.code_pos
+                JSComp__EmitOp16(JSOp.JMP, 0)
+
+                // Patch false_jmp to here (start of else)
+                JSComp__PatchJump(false_jmp)
+
+                // Compile else body
+                JSComp__CompileNode(else_n)
+
+                // Patch end_jmp
+                JSComp__PatchJump(end_jmp)
+            } ElseBlock: {
+                // No else — patch false_jmp to here
+                JSComp__PatchJump(false_jmp)
+            }
+            ReturnValue(0)
+        }
+
+        // --- WHILE_STMT ---
+        IfCondition EqualTo(ntype, ASTType.WHILE_STMT) ThenBlock: {
+            loop_start = JSCompState.code_pos
+            JSComp__PushLoop(loop_start)
+
+            // Compile condition
+            cond_n = JSParse_GetCond(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__Push(loop_start)
+            JSComp__CompileExpr(cond_n)
+            loop_start = JSComp__Pop()
+            save_node = JSComp__Pop()
+
+            // JMP_FALSE to end
+            exit_jmp = JSCompState.code_pos
+            JSComp__EmitOp16(JSOp.JMP_FALSE, 0)
+            JSComp__RecordBreak(exit_jmp)
+
+            // Compile body
+            body_n = JSParse_GetBody(save_node)
+
+            JSComp__Push(loop_start)
+            JSComp__CompileNode(body_n)
+            loop_start = JSComp__Pop()
+
+            // JMP back to condition
+            JSComp__EmitOp16(JSOp.JMP, loop_start)
+
+            // Patch exit and pop loop
+            JSComp__PopLoop()
+            ReturnValue(0)
+        }
+
+        // --- DO_WHILE ---
+        IfCondition EqualTo(ntype, ASTType.DO_WHILE) ThenBlock: {
+            loop_start = JSCompState.code_pos
+            JSComp__PushLoop(loop_start)
+
+            // Compile body first
+            body_n = JSParse_GetBody(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__Push(loop_start)
+            JSComp__CompileNode(body_n)
+            loop_start = JSComp__Pop()
+            save_node = JSComp__Pop()
+
+            // Compile condition
+            cond_n = JSParse_GetCond(save_node)
+
+            JSComp__Push(loop_start)
+            JSComp__CompileExpr(cond_n)
+            loop_start = JSComp__Pop()
+
+            // JMP_TRUE back to start
+            JSComp__EmitOp16(JSOp.JMP_TRUE, loop_start)
+
+            JSComp__PopLoop()
+            ReturnValue(0)
+        }
+
+        // --- FOR_STMT ---
+        IfCondition EqualTo(ntype, ASTType.FOR_STMT) ThenBlock: {
+            // Push a scope for for-loop variables
+            JSComp__PushScope()
+
+            // Compile init (N_LEFT)
+            init_n = JSParse_GetLeft(save_node)
+            IfCondition GreaterEqual(init_n, 0) ThenBlock: {
+                JSComp__Push(save_node)
+                JSComp__CompileNode(init_n)
+                save_node = JSComp__Pop()
+            }
+
+            // Record loop start (at condition)
+            loop_start = JSCompState.code_pos
+
+            // We need a continue target that jumps to the update, not cond.
+            // For now, use cond as continue target; update comes after body.
+            // We'll set the real continue target after we know where update is.
+            // Use loop_start as placeholder.
+            JSComp__PushLoop(loop_start)
+
+            // Compile condition (N_COND)
+            cond_n = JSParse_GetCond(save_node)
+            IfCondition GreaterEqual(cond_n, 0) ThenBlock: {
+                JSComp__Push(save_node)
+                JSComp__Push(loop_start)
+                JSComp__CompileExpr(cond_n)
+                loop_start = JSComp__Pop()
+                save_node = JSComp__Pop()
+
+                // JMP_FALSE to end
+                exit_jmp = JSCompState.code_pos
+                JSComp__EmitOp16(JSOp.JMP_FALSE, 0)
+                JSComp__RecordBreak(exit_jmp)
+            }
+
+            // Compile body (N_BODY)
+            body_n = JSParse_GetBody(save_node)
+            IfCondition GreaterEqual(body_n, 0) ThenBlock: {
+                JSComp__Push(save_node)
+                JSComp__Push(loop_start)
+                JSComp__CompileNode(body_n)
+                loop_start = JSComp__Pop()
+                save_node = JSComp__Pop()
+            }
+
+            // Update continue target to point here (before update expr)
+            // We update the loop stack entry directly
+            IfCondition GreaterEqual(JSCompState.loop_depth, 1) ThenBlock: {
+                ld = Subtract(JSCompState.loop_depth, 1)
+                lbase = Add(JSCompState.loop_stack, Multiply(ld, JSCompConst.LOOP_SIZE))
+                StoreValue(Add(lbase, 8), JSCompState.code_pos)
+            }
+
+            // Compile update (N_RIGHT)
+            update_n = JSParse_GetRight(save_node)
+            IfCondition GreaterEqual(update_n, 0) ThenBlock: {
+                JSComp__Push(loop_start)
+                JSComp__CompileExpr(update_n)
+                JSComp__Emit1(JSOp.POP)
+                loop_start = JSComp__Pop()
+            }
+
+            // JMP back to condition
+            JSComp__EmitOp16(JSOp.JMP, loop_start)
+
+            // Pop loop (patches break jumps)
+            JSComp__PopLoop()
+            JSComp__PopScope()
+            ReturnValue(0)
+        }
+
+        // --- BREAK_STMT ---
+        IfCondition EqualTo(ntype, ASTType.BREAK_STMT) ThenBlock: {
+            brk_addr = JSCompState.code_pos
+            JSComp__EmitOp16(JSOp.JMP, 0)
+            JSComp__RecordBreak(brk_addr)
+            ReturnValue(0)
+        }
+
+        // --- CONTINUE_STMT ---
+        IfCondition EqualTo(ntype, ASTType.CONTINUE_STMT) ThenBlock: {
+            ct = JSComp__GetContinueTarget()
+            JSComp__EmitOp16(JSOp.JMP, ct)
+            ReturnValue(0)
+        }
+
+        // --- SWITCH_STMT ---
+        IfCondition EqualTo(ntype, ASTType.SWITCH_STMT) ThenBlock: {
+            // Compile discriminant (N_LEFT)
+            disc = JSParse_GetLeft(save_node)
+
+            JSComp__Push(save_node)
+            JSComp__CompileExpr(disc)
+            save_node = JSComp__Pop()
+
+            // Push a "loop" for break support (no continue target)
+            JSComp__PushLoop(-1)
+
+            // Cases are linked via N_RIGHT -> N_NEXT
+            case_n = JSParse_GetRight(save_node)
+            // We need to collect fall-through addresses
+            // Simplified: emit DUP + test + JMP_FALSE for each case,
+            // then body; no fall-through (each case body gets its own jump)
+
+            // First pass: emit all case tests and bodies
+            WhileLoop GreaterEqual(case_n, 0) {
+                case_type = JSParse_GetType(case_n)
+                IfCondition EqualTo(case_type, ASTType.CASE_CLAUSE) ThenBlock: {
+                    // Check if default (N_LEFT == -1)
+                    test_n = JSParse_GetLeft(case_n)
+                    IfCondition GreaterEqual(test_n, 0) ThenBlock: {
+                        // Non-default case: DUP discriminant, compile test, STRICT_EQ
+                        JSComp__Emit1(JSOp.DUP)
+
+                        JSComp__Push(case_n)
+                        JSComp__CompileExpr(test_n)
+                        case_n = JSComp__Pop()
+
+                        JSComp__Emit1(JSOp.STRICT_EQ)
+                        skip_jmp = JSCompState.code_pos
+                        JSComp__EmitOp16(JSOp.JMP_FALSE, 0)
+
+                        // Compile case body (N_BODY)
+                        cbody = JSParse_GetBody(case_n)
+                        IfCondition GreaterEqual(cbody, 0) ThenBlock: {
+                            JSComp__Push(case_n)
+                            JSComp__Push(skip_jmp)
+                            JSComp__CompileNode(cbody)
+                            skip_jmp = JSComp__Pop()
+                            case_n = JSComp__Pop()
+                        }
+
+                        JSComp__PatchJump(skip_jmp)
+                    } ElseBlock: {
+                        // Default case: just compile body
+                        cbody = JSParse_GetBody(case_n)
+                        IfCondition GreaterEqual(cbody, 0) ThenBlock: {
+                            JSComp__Push(case_n)
+                            JSComp__CompileNode(cbody)
+                            case_n = JSComp__Pop()
+                        }
+                    }
+                }
+                case_n = JSParse_GetNext(case_n)
+            }
+
+            // Pop discriminant
+            JSComp__Emit1(JSOp.POP)
+
+            // Pop loop frame (patches break jumps)
+            JSComp__PopLoop()
+            ReturnValue(0)
+        }
+
+        // If we get here with an expression-type node, treat it as EXPR_STMT
+        // This handles edge cases where expression nodes appear at statement level
+        IfCondition GreaterEqual(ntype, ASTType.ASSIGN) ThenBlock: {
+            JSComp__CompileExpr(save_node)
+            JSComp__Emit1(JSOp.POP)
+            ReturnValue(0)
+        }
+
+        // Unknown node type
+        ReturnValue(-1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile block — iterate body chain via N_BODY -> N_NEXT
+// ---------------------------------------------------------------------------
+Function.JSComp__CompileBlock {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        save_node = node
+        IfCondition EqualTo(JSCompState.error, 1) ThenBlock: { ReturnValue(-1) }
+        IfCondition LessThan(save_node, 0) ThenBlock: { ReturnValue(-1) }
+
+        JSComp__PushScope()
+
+        // Body chain starts at N_BODY
+        stmt = JSParse_GetBody(save_node)
+        WhileLoop GreaterEqual(stmt, 0) {
+            JSComp__Push(stmt)
+            JSComp__CompileNode(stmt)
+            stmt = JSComp__Pop()
+            stmt = JSParse_GetNext(stmt)
+        }
+
+        JSComp__PopScope()
+        ReturnValue(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile program root — iterate body chain via N_BODY -> N_NEXT, emit HALT
+// ---------------------------------------------------------------------------
+Function.JSComp__CompileProgram {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        save_node = node
+        IfCondition EqualTo(JSCompState.error, 1) ThenBlock: { ReturnValue(-1) }
+
+        JSComp__PushScope()
+
+        stmt = JSParse_GetBody(save_node)
+        WhileLoop GreaterEqual(stmt, 0) {
+            JSComp__Push(stmt)
+            JSComp__CompileNode(stmt)
+            stmt = JSComp__Pop()
+            stmt = JSParse_GetNext(stmt)
+        }
+
+        JSComp__Emit1(JSOp.HALT)
+        JSComp__PopScope()
+        ReturnValue(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Compile function — emit into separate code region, add to func_pool
+// Leaves CLOSURE on stack.
+// ---------------------------------------------------------------------------
+Function.JSComp__CompileFunc {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        save_node = node
+        IfCondition EqualTo(JSCompState.error, 1) ThenBlock: { ReturnValue(-1) }
+
+        // Record function index
+        fidx = JSCompState.func_count
+        IfCondition GreaterEqual(fidx, JSCompConst.MAX_FUNCS) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        JSCompState.func_count = Add(fidx, 1)
+
+        // Save current code_pos — function code starts here
+        func_start = JSCompState.code_pos
+
+        // Push scope for function body
+        JSComp__PushScope()
+
+        // Add parameters as locals
+        param = JSParse_GetLeft(save_node)
+        param_count = 0
+        WhileLoop GreaterEqual(param, 0) {
+            pp = JSParse_GetNamePtr(param)
+            pl = JSParse_GetNameLen(param)
+            JSComp__AddLocal(pp, pl)
+            param_count = Add(param_count, 1)
+            param = JSParse_GetNext(param)
+        }
+
+        // Compile function body
+        body = JSParse_GetBody(save_node)
+        IfCondition GreaterEqual(body, 0) ThenBlock: {
+            // Body is a BLOCK node — compile its statements
+            bstmt = JSParse_GetBody(body)
+            WhileLoop GreaterEqual(bstmt, 0) {
+                JSComp__Push(bstmt)
+                JSComp__CompileNode(bstmt)
+                bstmt = JSComp__Pop()
+                bstmt = JSParse_GetNext(bstmt)
+            }
+        }
+
+        // Implicit return undefined at end of function
+        JSComp__Emit1(JSOp.PUSH_UNDEF)
+        JSComp__Emit1(JSOp.RETURN)
+
+        // Count locals in this scope
+        depth_idx = Subtract(JSCompState.scope_depth, 1)
+        lc_addr = Add(JSCompState.scope_locals, Multiply(depth_idx, 8))
+        local_count = Dereference(lc_addr)
+
+        JSComp__PopScope()
+
+        // Build function descriptor in func_pool
+        fbase = Add(JSCompState.func_pool, Multiply(fidx, JSCompConst.FUNC_SIZE))
+        StoreValue(fbase, func_start)
+        StoreValue(Add(fbase, 8), param_count)
+        StoreValue(Add(fbase, 16), local_count)
+
+        // Function name (if any)
+        fnp = JSParse_GetNamePtr(save_node)
+        fnl = JSParse_GetNameLen(save_node)
+        StoreValue(Add(fbase, 24), fnp)
+        StoreValue(Add(fbase, 32), fnl)
+
+        // Add function descriptor to const pool as type 3 = FUNCTION
+        ci = JSCompState.const_count
+        IfCondition GreaterEqual(ci, JSCompConst.MAX_CONSTS) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        JSCompState.const_count = Add(ci, 1)
+        cbase = Add(JSCompState.const_pool, Multiply(ci, JSCompConst.CONST_SIZE))
+        StoreValue(cbase, 3)
+        StoreValue(Add(cbase, 8), fbase)
+
+        // Emit CLOSURE instruction
+        JSComp__EmitOp16(JSOp.CLOSURE, ci)
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PUBLIC API
+// =============================================================================
+
+// Compile AST from root node. Returns 1 on success, 0 on error.
+Function.JSComp_Compile {
+    Input: root: Integer
+    Output: Integer
+    Body: {
+        save_root = root
+        JSCompState.error = 0
+        JSCompState.code_pos = 0
+        JSCompState.const_count = 0
+        JSCompState.scope_depth = 0
+        JSCompState.func_count = 0
+        JSCompState.loop_depth = 0
+        JSCompState.str_pos = 0
+        JSCompStack.sp = 0
+
+        JSComp__CompileNode(save_root)
+
+        IfCondition EqualTo(JSCompState.error, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Return pointer to bytecode buffer
+Function.JSComp_GetCode {
+    Output: Address
+    Body: {
+        ReturnValue(JSCompState.code)
+    }
+}
+
+// Return bytecode length
+Function.JSComp_GetCodeLen {
+    Output: Integer
+    Body: {
+        ReturnValue(JSCompState.code_pos)
+    }
+}
+
+// Return pointer to constant pool entry at index
+Function.JSComp_GetConst {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        save_idx = idx
+        ReturnValue(Add(JSCompState.const_pool, Multiply(save_idx, JSCompConst.CONST_SIZE)))
+    }
+}
+
+// Return constant pool count
+Function.JSComp_GetConstCount {
+    Output: Integer
+    Body: {
+        ReturnValue(JSCompState.const_count)
+    }
+}
+
+// Return pointer to function descriptor at index
+Function.JSComp_GetFunc {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        save_idx = idx
+        ReturnValue(Add(JSCompState.func_pool, Multiply(save_idx, JSCompConst.FUNC_SIZE)))
+    }
+}
+
+// Return function descriptor count
+Function.JSComp_GetFuncCount {
+    Output: Integer
+    Body: {
+        ReturnValue(JSCompState.func_count)
+    }
+}
+
+// Return error flag
+Function.JSComp_HasError {
+    Output: Integer
+    Body: {
+        ReturnValue(JSCompState.error)
+    }
+}
