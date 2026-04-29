@@ -1,0 +1,1412 @@
+// Library.JSVM.ailang — JavaScript bytecode interpreter (virtual machine)
+// Giant dispatch loop over ~50 opcodes. Maintains a value stack, call frame
+// stack, global variable table (XSHash), and executes compiled bytecode from
+// JSCompiler. Pattern modeled after CPU6502 (dispatch loop, register state,
+// step/run).
+//
+// Uses JSRuntime for value creation, arithmetic, comparison, type coercion,
+// and object/array manipulation. The JSVM only manages execution state:
+// program counter, value stack, call frames, globals hash.
+//
+// CLOBBER SAFETY: Every function saves Input params to locals on the FIRST
+// line of Body. Complex expressions broken into steps. JSVMTmp fields
+// guarded with push/pop across recursive calls.
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Browser.JSRuntime
+LibraryImport.Browser.JSCompiler
+LibraryImport.Arena
+LibraryImport.XArrays
+LibraryImport.StringUtils
+LibraryImport.HashMap
+
+// =============================================================================
+// VM CONSTANTS
+// =============================================================================
+FixedPool.JSVMConst {
+    "MAX_STACK":     Initialize=4096
+    "MAX_FRAMES":    Initialize=256
+    "FRAME_SIZE":    Initialize=40
+}
+
+// =============================================================================
+// VM STATE
+// =============================================================================
+FixedPool.JSVMState {
+    "stack":         Initialize=0
+    "sp":            Initialize=0
+    "frames":        Initialize=0
+    "fp":            Initialize=0
+    "code":          Initialize=0
+    "code_len":      Initialize=0
+    "pc":            Initialize=0
+    "const_pool":    Initialize=0
+    "const_count":   Initialize=0
+    "globals":       Initialize=0
+    "halted":        Initialize=0
+    "error":         Initialize=0
+    "steps":         Initialize=0
+    "max_steps":     Initialize=1000000
+}
+
+// =============================================================================
+// CLOBBER-SAFE TEMPORARIES
+// =============================================================================
+FixedPool.JSVMTmp {
+    "idx":       Initialize=0
+    "type":      Initialize=0
+    "ptr":       Initialize=0
+    "len":       Initialize=0
+    "val":       Initialize=0
+    "val2":      Initialize=0
+    "addr":      Initialize=0
+    "op":        Initialize=0
+    "done":      Initialize=0
+    "count":     Initialize=0
+    "result":    Initialize=0
+}
+
+// =============================================================================
+// VM STACK — save/restore values across calls
+// =============================================================================
+FixedPool.JSVMStack {
+    "pool":      Initialize=0
+    "sp":        Initialize=0
+    "capacity":  Initialize=0
+    "tmp_val":   Initialize=0
+    "tmp_addr":  Initialize=0
+}
+
+// =============================================================================
+// STACK PUSH / POP (for saving temporaries across calls)
+// =============================================================================
+Function.JSVM__Push {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        JSVMStack.tmp_val = val
+        JSVMStack.tmp_addr = Add(JSVMStack.pool, Multiply(JSVMStack.sp, 8))
+        StoreValue(JSVMStack.tmp_addr, JSVMStack.tmp_val)
+        JSVMStack.sp = Add(JSVMStack.sp, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSVM__Pop {
+    Output: Integer
+    Body: {
+        JSVMStack.sp = Subtract(JSVMStack.sp, 1)
+        ReturnValue(Dereference(Add(JSVMStack.pool, Multiply(JSVMStack.sp, 8))))
+    }
+}
+
+// =============================================================================
+// VALUE STACK OPERATIONS — push/pop JSValue pointers
+// =============================================================================
+
+Function.JSVM__StackPush {
+    Input: val: Address
+    Output: Integer
+    Body: {
+        save_val = val
+        IfCondition GreaterEqual(JSVMState.sp, JSVMConst.MAX_STACK) ThenBlock: {
+            JSVMState.error = 1
+            ReturnValue(-1)
+        }
+        saddr = Add(JSVMState.stack, Multiply(JSVMState.sp, 8))
+        StoreValue(saddr, save_val)
+        JSVMState.sp = Add(JSVMState.sp, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSVM__StackPop {
+    Output: Address
+    Body: {
+        IfCondition LessEqual(JSVMState.sp, 0) ThenBlock: {
+            JSVMState.error = 1
+            ReturnValue(JSRT_Undefined())
+        }
+        JSVMState.sp = Subtract(JSVMState.sp, 1)
+        saddr = Add(JSVMState.stack, Multiply(JSVMState.sp, 8))
+        ReturnValue(Dereference(saddr))
+    }
+}
+
+Function.JSVM__StackPeek {
+    Output: Address
+    Body: {
+        IfCondition LessEqual(JSVMState.sp, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+        idx = Subtract(JSVMState.sp, 1)
+        saddr = Add(JSVMState.stack, Multiply(idx, 8))
+        ReturnValue(Dereference(saddr))
+    }
+}
+
+// =============================================================================
+// BYTECODE READING HELPERS
+// =============================================================================
+
+// Read one byte at PC, advance PC
+Function.JSVM__ReadByte {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(JSVMState.pc, JSVMState.code_len) ThenBlock: {
+            JSVMState.error = 1
+            ReturnValue(0)
+        }
+        b = GetByte(JSVMState.code, JSVMState.pc)
+        JSVMState.pc = Add(JSVMState.pc, 1)
+        ReturnValue(b)
+    }
+}
+
+// Read 16-bit big-endian operand (2 bytes), advance PC by 2
+Function.JSVM__Read16 {
+    Output: Integer
+    Body: {
+        hi = JSVM__ReadByte()
+        lo = JSVM__ReadByte()
+        ReturnValue(Add(Multiply(hi, 256), lo))
+    }
+}
+
+// =============================================================================
+// CALL FRAME HELPERS
+// Frame layout (40 bytes):
+//   Offset 0:  return_pc (8)
+//   Offset 8:  return_sp (8)
+//   Offset 16: locals_base (8)
+//   Offset 24: param_count (8)
+//   Offset 32: local_count (8)
+// =============================================================================
+
+// Get pointer to current frame
+Function.JSVM__CurFrame {
+    Output: Address
+    Body: {
+        IfCondition LessEqual(JSVMState.fp, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        fidx = Subtract(JSVMState.fp, 1)
+        ReturnValue(Add(JSVMState.frames, Multiply(fidx, JSVMConst.FRAME_SIZE)))
+    }
+}
+
+// Push a new call frame
+Function.JSVM__PushFrame {
+    Input: ret_pc: Integer
+    Input: ret_sp: Integer
+    Input: locals_base: Integer
+    Input: param_count: Integer
+    Input: local_count: Integer
+    Output: Integer
+    Body: {
+        save_rpc = ret_pc
+        save_rsp = ret_sp
+        save_lb = locals_base
+        save_pc = param_count
+        save_lc = local_count
+        IfCondition GreaterEqual(JSVMState.fp, JSVMConst.MAX_FRAMES) ThenBlock: {
+            JSVMState.error = 1
+            ReturnValue(-1)
+        }
+        faddr = Add(JSVMState.frames, Multiply(JSVMState.fp, JSVMConst.FRAME_SIZE))
+        StoreValue(faddr, save_rpc)
+        StoreValue(Add(faddr, 8), save_rsp)
+        StoreValue(Add(faddr, 16), save_lb)
+        StoreValue(Add(faddr, 24), save_pc)
+        StoreValue(Add(faddr, 32), save_lc)
+        JSVMState.fp = Add(JSVMState.fp, 1)
+        ReturnValue(0)
+    }
+}
+
+// Pop call frame, return pointer to it for reading saved values
+Function.JSVM__PopFrame {
+    Output: Address
+    Body: {
+        IfCondition LessEqual(JSVMState.fp, 0) ThenBlock: {
+            JSVMState.error = 1
+            ReturnValue(0)
+        }
+        JSVMState.fp = Subtract(JSVMState.fp, 1)
+        ReturnValue(Add(JSVMState.frames, Multiply(JSVMState.fp, JSVMConst.FRAME_SIZE)))
+    }
+}
+
+// =============================================================================
+// CONSTANT POOL ACCESS
+// Constant pool entries are 16 bytes: [type:8][payload:8]
+// type: 1=NUMBER, 2=STRING, 3=FUNCTION
+// =============================================================================
+
+Function.JSVM__GetConstType {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        save_idx = idx
+        base = Add(JSVMState.const_pool, Multiply(save_idx, 16))
+        ReturnValue(Dereference(base))
+    }
+}
+
+Function.JSVM__GetConstPayload {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        save_idx = idx
+        base = Add(JSVMState.const_pool, Multiply(save_idx, 16))
+        ReturnValue(Dereference(Add(base, 8)))
+    }
+}
+
+// Create a JSValue from a constant pool entry
+Function.JSVM__LoadConst {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        save_idx = idx
+        IfCondition Or(LessThan(save_idx, 0), GreaterEqual(save_idx, JSVMState.const_count)) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+        ctype = JSVM__GetConstType(save_idx)
+        cpay = JSVM__GetConstPayload(save_idx)
+
+        // NUMBER (type=1)
+        IfCondition EqualTo(ctype, 1) ThenBlock: {
+            ReturnValue(JSRT_CreateNumber(cpay))
+        }
+
+        // STRING (type=2) — payload is pointer to null-terminated string
+        IfCondition EqualTo(ctype, 2) ThenBlock: {
+            ReturnValue(JSRT_CreateString(cpay))
+        }
+
+        // FUNCTION (type=3) — payload is pointer to function descriptor
+        // The descriptor layout from JSCompiler is:
+        //   Offset 0:  bytecode_offset (8)
+        //   Offset 8:  param_count (8)
+        //   Offset 16: local_count (8)
+        //   Offset 24: name_ptr (8)
+        //   Offset 32: name_len (8)
+        // JSRuntime's JSRT_CreateFunc expects (bc_off, params, locals, name)
+        IfCondition EqualTo(ctype, 3) ThenBlock: {
+            f_bc = Dereference(cpay)
+            f_params = Dereference(Add(cpay, 8))
+            f_locals = Dereference(Add(cpay, 16))
+            f_name = Dereference(Add(cpay, 24))
+            ReturnValue(JSRT_CreateFunc(f_bc, f_params, f_locals, f_name))
+        }
+
+        ReturnValue(JSRT_Undefined())
+    }
+}
+
+// =============================================================================
+// LOCAL VARIABLE ACCESS (relative to current frame's locals_base)
+// =============================================================================
+
+Function.JSVM__GetLocal {
+    Input: slot: Integer
+    Output: Address
+    Body: {
+        save_slot = slot
+        frame = JSVM__CurFrame()
+        IfCondition EqualTo(frame, 0) ThenBlock: {
+            // No frame — use absolute slot (top-level code)
+            saddr = Add(JSVMState.stack, Multiply(save_slot, 8))
+            ReturnValue(Dereference(saddr))
+        }
+        lb = Dereference(Add(frame, 16))
+        abs_idx = Add(lb, save_slot)
+        saddr = Add(JSVMState.stack, Multiply(abs_idx, 8))
+        ReturnValue(Dereference(saddr))
+    }
+}
+
+Function.JSVM__SetLocal {
+    Input: slot: Integer
+    Input: val: Address
+    Output: Integer
+    Body: {
+        save_slot = slot
+        save_val = val
+        frame = JSVM__CurFrame()
+        IfCondition EqualTo(frame, 0) ThenBlock: {
+            saddr = Add(JSVMState.stack, Multiply(save_slot, 8))
+            StoreValue(saddr, save_val)
+            ReturnValue(0)
+        }
+        lb = Dereference(Add(frame, 16))
+        abs_idx = Add(lb, save_slot)
+        saddr = Add(JSVMState.stack, Multiply(abs_idx, 8))
+        StoreValue(saddr, save_val)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// GLOBAL VARIABLE ACCESS (via XSHash)
+// name must be a null-terminated string pointer
+// =============================================================================
+
+Function.JSVM__GetGlobal {
+    Input: name: Address
+    Output: Address
+    Body: {
+        save_name = name
+        IfCondition EqualTo(JSVMState.globals, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+        result = XSHash.XLookup(JSVMState.globals, save_name)
+        IfCondition EqualTo(result, XArrays.XNULL) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+        ReturnValue(result)
+    }
+}
+
+Function.JSVM__SetGlobal {
+    Input: name: Address
+    Input: val: Address
+    Output: Integer
+    Body: {
+        save_name = name
+        save_val = val
+        IfCondition EqualTo(JSVMState.globals, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        XSHash.XInsert(JSVMState.globals, save_name, save_val)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// INIT — allocate all VM memory structures
+// =============================================================================
+Function.JSVM_Init {
+    Output: Integer
+    Body: {
+        // Value stack (4096 x 8 bytes = 32768)
+        ssz = Multiply(JSVMConst.MAX_STACK, 8)
+        JSVMState.stack = Allocate(ssz)
+        MemorySet(JSVMState.stack, 0, ssz)
+
+        // Call frame stack (256 x 40 bytes = 10240)
+        fsz = Multiply(JSVMConst.MAX_FRAMES, JSVMConst.FRAME_SIZE)
+        JSVMState.frames = Allocate(fsz)
+        MemorySet(JSVMState.frames, 0, fsz)
+
+        // Global variable hash
+        JSVMState.globals = XSHash.XCreate(256)
+
+        // VM temp stack (2048 entries x 8 bytes)
+        JSVMStack.pool = Allocate(16384)
+        JSVMStack.capacity = 2048
+        JSVMStack.sp = 0
+
+        // Reset runtime state
+        JSVMState.sp = 0
+        JSVMState.fp = 0
+        JSVMState.pc = 0
+        JSVMState.halted = 0
+        JSVMState.error = 0
+        JSVMState.steps = 0
+        JSVMState.code = 0
+        JSVMState.code_len = 0
+        JSVMState.const_pool = 0
+        JSVMState.const_count = 0
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// RESET — clear runtime state for re-execution
+// =============================================================================
+Function.JSVM_Reset {
+    Output: Integer
+    Body: {
+        ssz = Multiply(JSVMConst.MAX_STACK, 8)
+        MemorySet(JSVMState.stack, 0, ssz)
+        fsz = Multiply(JSVMConst.MAX_FRAMES, JSVMConst.FRAME_SIZE)
+        MemorySet(JSVMState.frames, 0, fsz)
+        JSVMState.sp = 0
+        JSVMState.fp = 0
+        JSVMState.pc = 0
+        JSVMState.halted = 0
+        JSVMState.error = 0
+        JSVMState.steps = 0
+        JSVMStack.sp = 0
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LOAD — load compiled bytecode and constant pool into VM
+// =============================================================================
+Function.JSVM_Load {
+    Input: code: Address
+    Input: code_len: Integer
+    Input: const_pool: Address
+    Input: const_count: Integer
+    Output: Integer
+    Body: {
+        save_code = code
+        save_len = code_len
+        save_cp = const_pool
+        save_cc = const_count
+        JSVMState.code = save_code
+        JSVMState.code_len = save_len
+        JSVMState.const_pool = save_cp
+        JSVMState.const_count = save_cc
+        JSVMState.pc = 0
+        JSVMState.sp = 0
+        JSVMState.fp = 0
+        JSVMState.halted = 0
+        JSVMState.error = 0
+        JSVMState.steps = 0
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// STEP — execute a single bytecode instruction
+// Returns: 1 = still running, 0 = halted, -1 = error
+// =============================================================================
+Function.JSVM_Step {
+    Output: Integer
+    Body: {
+        // Check halted/error flags
+        IfCondition EqualTo(JSVMState.halted, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(JSVMState.error, 1) ThenBlock: { ReturnValue(-1) }
+
+        // Check PC bounds
+        IfCondition GreaterEqual(JSVMState.pc, JSVMState.code_len) ThenBlock: {
+            JSVMState.halted = 1
+            ReturnValue(0)
+        }
+
+        // Fetch opcode
+        op = JSVM__ReadByte()
+        JSVMState.steps = Add(JSVMState.steps, 1)
+
+        // Check step limit
+        IfCondition GreaterEqual(JSVMState.steps, JSVMState.max_steps) ThenBlock: {
+            JSVMState.error = 1
+            ReturnValue(-1)
+        }
+
+        // =====================================================================
+        // HALT (0)
+        // =====================================================================
+        IfCondition EqualTo(op, 0) ThenBlock: {
+            JSVMState.halted = 1
+            ReturnValue(0)
+        }
+
+        // =====================================================================
+        // PUSH_CONST (1) — 16-bit operand: constant pool index
+        // =====================================================================
+        IfCondition EqualTo(op, 1) ThenBlock: {
+            cidx = JSVM__Read16()
+            cval = JSVM__LoadConst(cidx)
+            JSVM__StackPush(cval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // PUSH_UNDEF (2)
+        // =====================================================================
+        IfCondition EqualTo(op, 2) ThenBlock: {
+            JSVM__StackPush(JSRT_Undefined())
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // PUSH_NULL (3)
+        // =====================================================================
+        IfCondition EqualTo(op, 3) ThenBlock: {
+            JSVM__StackPush(JSRT_Null())
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // PUSH_TRUE (4)
+        // =====================================================================
+        IfCondition EqualTo(op, 4) ThenBlock: {
+            JSVM__StackPush(JSRT_True())
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // PUSH_FALSE (5)
+        // =====================================================================
+        IfCondition EqualTo(op, 5) ThenBlock: {
+            JSVM__StackPush(JSRT_False())
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // POP (6)
+        // =====================================================================
+        IfCondition EqualTo(op, 6) ThenBlock: {
+            JSVM__StackPop()
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // DUP (7) — duplicate top of stack
+        // =====================================================================
+        IfCondition EqualTo(op, 7) ThenBlock: {
+            top = JSVM__StackPeek()
+            JSVM__StackPush(top)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // GET_LOCAL (10) — 16-bit operand: local slot index
+        // =====================================================================
+        IfCondition EqualTo(op, 10) ThenBlock: {
+            slot = JSVM__Read16()
+            lval = JSVM__GetLocal(slot)
+            JSVM__StackPush(lval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // SET_LOCAL (11) — 16-bit operand: local slot index
+        // =====================================================================
+        IfCondition EqualTo(op, 11) ThenBlock: {
+            slot = JSVM__Read16()
+            sval = JSVM__StackPop()
+            JSVM__SetLocal(slot, sval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // GET_GLOBAL (12) — 16-bit operand: constant pool index (string name)
+        // =====================================================================
+        IfCondition EqualTo(op, 12) ThenBlock: {
+            cidx = JSVM__Read16()
+            cpay = JSVM__GetConstPayload(cidx)
+            gval = JSVM__GetGlobal(cpay)
+            JSVM__StackPush(gval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // SET_GLOBAL (13) — 16-bit operand: constant pool index (string name)
+        // =====================================================================
+        IfCondition EqualTo(op, 13) ThenBlock: {
+            cidx = JSVM__Read16()
+            cpay = JSVM__GetConstPayload(cidx)
+            sval = JSVM__StackPop()
+            JSVM__SetGlobal(cpay, sval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // GET_PROP (16) — 16-bit operand: constant pool index (property name)
+        // Pop object, push object.prop
+        // =====================================================================
+        IfCondition EqualTo(op, 16) ThenBlock: {
+            cidx = JSVM__Read16()
+            cpay = JSVM__GetConstPayload(cidx)
+            obj = JSVM__StackPop()
+
+            // Handle array.length
+            obj_type = JSRT_GetType(obj)
+            IfCondition EqualTo(obj_type, JSType.ARRAY) ThenBlock: {
+                // Check if property is "length"
+                // "length" = 108 101 110 103 116 104
+                is_len = 0
+                c0 = GetByte(cpay, 0)
+                IfCondition EqualTo(c0, 108) ThenBlock: {
+                    c1 = GetByte(cpay, 1)
+                    IfCondition EqualTo(c1, 101) ThenBlock: {
+                        c2 = GetByte(cpay, 2)
+                        IfCondition EqualTo(c2, 110) ThenBlock: {
+                            c3 = GetByte(cpay, 3)
+                            IfCondition EqualTo(c3, 103) ThenBlock: {
+                                c4 = GetByte(cpay, 4)
+                                IfCondition EqualTo(c4, 116) ThenBlock: {
+                                    c5 = GetByte(cpay, 5)
+                                    IfCondition EqualTo(c5, 104) ThenBlock: {
+                                        c6 = GetByte(cpay, 6)
+                                        IfCondition EqualTo(c6, 0) ThenBlock: {
+                                            is_len = 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                IfCondition EqualTo(is_len, 1) ThenBlock: {
+                    alen = JSRT_ArrLen(obj)
+                    JSVM__StackPush(JSRT_CreateNumber(alen))
+                    ReturnValue(1)
+                }
+            }
+
+            pval = JSRT_ObjGet(obj, cpay)
+            JSVM__StackPush(pval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // SET_PROP (17) — 16-bit operand: constant pool index (property name)
+        // Stack: [..., object, value]. Pop value, pop object, set prop.
+        // =====================================================================
+        IfCondition EqualTo(op, 17) ThenBlock: {
+            cidx = JSVM__Read16()
+            cpay = JSVM__GetConstPayload(cidx)
+            sval = JSVM__StackPop()
+            obj = JSVM__StackPop()
+            JSRT_ObjSet(obj, cpay, sval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // GET_ELEM (18) — pop index, pop array, push array[index]
+        // =====================================================================
+        IfCondition EqualTo(op, 18) ThenBlock: {
+            idx_val = JSVM__StackPop()
+            arr_val = JSVM__StackPop()
+            idx_num = JSRT_ToNumber(idx_val)
+            elem = JSRT_ArrGet(arr_val, idx_num)
+            JSVM__StackPush(elem)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // SET_ELEM (19) — pop index, pop array, pop value
+        // Stack: [..., value, array, index]
+        // =====================================================================
+        IfCondition EqualTo(op, 19) ThenBlock: {
+            idx_val = JSVM__StackPop()
+            arr_val = JSVM__StackPop()
+            sval = JSVM__StackPop()
+            idx_num = JSRT_ToNumber(idx_val)
+            JSRT_ArrSet(arr_val, idx_num, sval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // ADD (20) — pop b, pop a, push JSRT_Add(a, b)
+        // =====================================================================
+        IfCondition EqualTo(op, 20) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_Add(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // SUB (21)
+        // =====================================================================
+        IfCondition EqualTo(op, 21) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_Sub(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // MUL (22)
+        // =====================================================================
+        IfCondition EqualTo(op, 22) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_Mul(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // DIV (23)
+        // =====================================================================
+        IfCondition EqualTo(op, 23) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_Div(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // MOD (24)
+        // =====================================================================
+        IfCondition EqualTo(op, 24) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_Mod(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // NEG (25) — negate top of stack
+        // =====================================================================
+        IfCondition EqualTo(op, 25) ThenBlock: {
+            av = JSVM__StackPop()
+            result = JSRT_Neg(av)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // EQ (30) — abstract equality (returns int 0/1, wrap to JSValue bool)
+        // =====================================================================
+        IfCondition EqualTo(op, 30) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            cmp_int = JSRT_AbstractEqual(av, bv)
+            result = JSRT_CreateBool(cmp_int)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // NEQ (31) — abstract inequality
+        // =====================================================================
+        IfCondition EqualTo(op, 31) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            cmp_int = JSRT_AbstractEqual(av, bv)
+            IfCondition EqualTo(cmp_int, 0) ThenBlock: {
+                JSVM__StackPush(JSRT_True())
+            } ElseBlock: {
+                JSVM__StackPush(JSRT_False())
+            }
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // LT (32) — returns int 0/1, wrap to JSValue bool
+        // =====================================================================
+        IfCondition EqualTo(op, 32) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            cmp_int = JSRT_LessThan(av, bv)
+            result = JSRT_CreateBool(cmp_int)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // GT (33)
+        // =====================================================================
+        IfCondition EqualTo(op, 33) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            cmp_int = JSRT_GreaterThan(av, bv)
+            result = JSRT_CreateBool(cmp_int)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // LTE (34)
+        // =====================================================================
+        IfCondition EqualTo(op, 34) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            cmp_int = JSRT_LessEqual(av, bv)
+            result = JSRT_CreateBool(cmp_int)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // GTE (35)
+        // =====================================================================
+        IfCondition EqualTo(op, 35) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            cmp_int = JSRT_GreaterEqual(av, bv)
+            result = JSRT_CreateBool(cmp_int)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // STRICT_EQ (36)
+        // =====================================================================
+        IfCondition EqualTo(op, 36) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            cmp_int = JSRT_StrictEqual(av, bv)
+            result = JSRT_CreateBool(cmp_int)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // STRICT_NEQ (37)
+        // =====================================================================
+        IfCondition EqualTo(op, 37) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            cmp_int = JSRT_StrictEqual(av, bv)
+            IfCondition EqualTo(cmp_int, 0) ThenBlock: {
+                JSVM__StackPush(JSRT_True())
+            } ElseBlock: {
+                JSVM__StackPush(JSRT_False())
+            }
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // NOT (40) — logical not
+        // =====================================================================
+        IfCondition EqualTo(op, 40) ThenBlock: {
+            av = JSVM__StackPop()
+            result = JSRT_Not(av)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // BIT_AND (41)
+        // =====================================================================
+        IfCondition EqualTo(op, 41) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_BitAnd(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // BIT_OR (42)
+        // =====================================================================
+        IfCondition EqualTo(op, 42) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_BitOr(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // BIT_XOR (43)
+        // =====================================================================
+        IfCondition EqualTo(op, 43) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_BitXor(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // BIT_NOT (44)
+        // =====================================================================
+        IfCondition EqualTo(op, 44) ThenBlock: {
+            av = JSVM__StackPop()
+            result = JSRT_BitNot(av)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // SHL (45)
+        // =====================================================================
+        IfCondition EqualTo(op, 45) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_Shl(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // SHR (46)
+        // =====================================================================
+        IfCondition EqualTo(op, 46) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            result = JSRT_Shr(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // TYPEOF (47)
+        // =====================================================================
+        IfCondition EqualTo(op, 47) ThenBlock: {
+            av = JSVM__StackPop()
+            result = JSRT_TypeOf(av)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // JMP (50) — unconditional jump, 16-bit target address
+        // =====================================================================
+        IfCondition EqualTo(op, 50) ThenBlock: {
+            target = JSVM__Read16()
+            JSVMState.pc = target
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // JMP_FALSE (51) — pop value, jump if falsy
+        // =====================================================================
+        IfCondition EqualTo(op, 51) ThenBlock: {
+            target = JSVM__Read16()
+            av = JSVM__StackPop()
+            truth = JSRT_IsTruthy(av)
+            IfCondition EqualTo(truth, 0) ThenBlock: {
+                JSVMState.pc = target
+            }
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // JMP_TRUE (52) — pop value, jump if truthy
+        // =====================================================================
+        IfCondition EqualTo(op, 52) ThenBlock: {
+            target = JSVM__Read16()
+            av = JSVM__StackPop()
+            truth = JSRT_IsTruthy(av)
+            IfCondition EqualTo(truth, 1) ThenBlock: {
+                JSVMState.pc = target
+            }
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // CALL (55) — 1-byte operand: argc
+        // Stack: [..., func, arg0, arg1, ..., argN-1]
+        // =====================================================================
+        IfCondition EqualTo(op, 55) ThenBlock: {
+            argc = JSVM__ReadByte()
+
+            // Pop arguments into temp buffer (top of stack = last arg)
+            arg_buf = Allocate(Multiply(Add(argc, 1), 8))
+            MemorySet(arg_buf, 0, Multiply(Add(argc, 1), 8))
+
+            ai = Subtract(argc, 1)
+            WhileLoop GreaterEqual(ai, 0) {
+                arg_v = JSVM__StackPop()
+                StoreValue(Add(arg_buf, Multiply(ai, 8)), arg_v)
+                ai = Subtract(ai, 1)
+            }
+
+            // Pop function value
+            func_val = JSVM__StackPop()
+            ft = JSRT_GetType(func_val)
+            IfCondition NotEqual(ft, JSType.FUNCTION) ThenBlock: {
+                // Not a function — push undefined as result
+                JSVM__StackPush(JSRT_Undefined())
+                ReturnValue(1)
+            }
+
+            // Check if this is a native function
+            // Native functions have bytecode offset = -1 (or check via handler)
+            func_bc = JSRT_FuncGetBC(func_val)
+            IfCondition LessThan(func_bc, 0) ThenBlock: {
+                // Native function call — dispatch through JSRuntime
+                // The handler ID is stored as the bytecode offset (negated-1)
+                handler_id = Subtract(-1, func_bc)
+                native_result = JSRT_CallNative(handler_id, arg_buf, argc)
+                JSVM__StackPush(native_result)
+                ReturnValue(1)
+            }
+
+            // Get function descriptor fields
+            func_params = JSRT_FuncGetParams(func_val)
+            func_locals = JSRT_FuncGetLocals(func_val)
+
+            // Save current state in a call frame
+            save_pc = JSVMState.pc
+            save_sp = JSVMState.sp
+            locals_base = JSVMState.sp
+
+            JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+
+            // Push locals onto stack (initialize args, rest to undefined)
+            pi = 0
+            WhileLoop LessThan(pi, func_locals) {
+                IfCondition LessThan(pi, argc) ThenBlock: {
+                    pval = Dereference(Add(arg_buf, Multiply(pi, 8)))
+                    JSVM__StackPush(pval)
+                } ElseBlock: {
+                    JSVM__StackPush(JSRT_Undefined())
+                }
+                pi = Add(pi, 1)
+            }
+
+            // Jump to function code
+            JSVMState.pc = func_bc
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // RETURN (56)
+        // =====================================================================
+        IfCondition EqualTo(op, 56) ThenBlock: {
+            // Pop return value
+            ret_val = JSVM__StackPop()
+
+            // Pop frame
+            frame = JSVM__PopFrame()
+            IfCondition EqualTo(frame, 0) ThenBlock: {
+                // No frame to pop — halt
+                JSVM__StackPush(ret_val)
+                JSVMState.halted = 1
+                ReturnValue(0)
+            }
+
+            // Restore state
+            JSVMState.pc = Dereference(frame)
+            ret_sp = Dereference(Add(frame, 8))
+            JSVMState.sp = ret_sp
+
+            // Push return value
+            JSVM__StackPush(ret_val)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // CLOSURE (57) — 16-bit constant index pointing to function descriptor
+        // Creates a function value and pushes it
+        // =====================================================================
+        IfCondition EqualTo(op, 57) ThenBlock: {
+            cidx = JSVM__Read16()
+            cval = JSVM__LoadConst(cidx)
+            JSVM__StackPush(cval)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // NEW_OBJECT (60)
+        // =====================================================================
+        IfCondition EqualTo(op, 60) ThenBlock: {
+            obj = JSRT_CreateObject()
+            JSVM__StackPush(obj)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // NEW_ARRAY (61) — 16-bit operand: element count
+        // Elements are on stack (first element pushed first = deepest)
+        // =====================================================================
+        IfCondition EqualTo(op, 61) ThenBlock: {
+            elem_count = JSVM__Read16()
+            arr = JSRT_CreateArray()
+
+            // Pop elements in reverse (top = last element)
+            // Store into a temp buffer first, then push in order
+            IfCondition GreaterThan(elem_count, 0) ThenBlock: {
+                tbuf = Allocate(Multiply(elem_count, 8))
+                ei = Subtract(elem_count, 1)
+                WhileLoop GreaterEqual(ei, 0) {
+                    ev = JSVM__StackPop()
+                    StoreValue(Add(tbuf, Multiply(ei, 8)), ev)
+                    ei = Subtract(ei, 1)
+                }
+                // Push them into array in order
+                ei = 0
+                WhileLoop LessThan(ei, elem_count) {
+                    ev = Dereference(Add(tbuf, Multiply(ei, 8)))
+                    JSRT_ArrPush(arr, ev)
+                    ei = Add(ei, 1)
+                }
+            }
+
+            JSVM__StackPush(arr)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // CONCAT (62) — string concatenation (pop 2, push result)
+        // =====================================================================
+        IfCondition EqualTo(op, 62) ThenBlock: {
+            bv = JSVM__StackPop()
+            av = JSVM__StackPop()
+            // Use JSRT_Add which handles string concatenation
+            result = JSRT_Add(av, bv)
+            JSVM__StackPush(result)
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // NOP (99)
+        // =====================================================================
+        IfCondition EqualTo(op, 99) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // =====================================================================
+        // UNKNOWN OPCODE — error
+        // =====================================================================
+        PrintMessage("[JSVM] Unknown opcode: ")
+        PrintNumber(op)
+        PrintMessage(" at pc=")
+        PrintNumber(Subtract(JSVMState.pc, 1))
+        PrintMessage("\n")
+        JSVMState.error = 1
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// RUN — execute until HALT or error
+// Returns top-of-stack value (address to JSValue), or undefined
+// =============================================================================
+Function.JSVM_Run {
+    Output: Address
+    Body: {
+        JSVMTmp.done = 0
+        WhileLoop EqualTo(JSVMTmp.done, 0) {
+            rc = JSVM_Step()
+            IfCondition Or(EqualTo(JSVMState.halted, 1), EqualTo(JSVMState.error, 1)) ThenBlock: {
+                JSVMTmp.done = 1
+            }
+        }
+        // Return top of stack if any
+        IfCondition GreaterThan(JSVMState.sp, 0) ThenBlock: {
+            ReturnValue(JSVM__StackPop())
+        }
+        ReturnValue(JSRT_Undefined())
+    }
+}
+
+// =============================================================================
+// PUBLIC API — Set/Get Global variables
+// =============================================================================
+
+Function.JSVM_SetGlobal {
+    Input: name: Address
+    Input: jsval: Address
+    Output: Integer
+    Body: {
+        save_name = name
+        save_val = jsval
+        ReturnValue(JSVM__SetGlobal(save_name, save_val))
+    }
+}
+
+Function.JSVM_GetGlobal {
+    Input: name: Address
+    Output: Address
+    Body: {
+        save_name = name
+        ReturnValue(JSVM__GetGlobal(save_name))
+    }
+}
+
+// =============================================================================
+// STATE QUERY
+// =============================================================================
+
+Function.JSVM_GetError {
+    Output: Integer
+    Body: {
+        ReturnValue(JSVMState.error)
+    }
+}
+
+Function.JSVM_IsHalted {
+    Output: Integer
+    Body: {
+        ReturnValue(JSVMState.halted)
+    }
+}
+
+Function.JSVM_GetSteps {
+    Output: Integer
+    Body: {
+        ReturnValue(JSVMState.steps)
+    }
+}
+
+Function.JSVM_GetPC {
+    Output: Integer
+    Body: {
+        ReturnValue(JSVMState.pc)
+    }
+}
+
+Function.JSVM_GetSP {
+    Output: Integer
+    Body: {
+        ReturnValue(JSVMState.sp)
+    }
+}
+
+// =============================================================================
+// DUMP STACK — debug aid, prints top N stack entries
+// Returns number of entries printed
+// =============================================================================
+Function.JSVM_DumpStack {
+    Output: Integer
+    Body: {
+        count = JSVMState.sp
+        IfCondition GreaterThan(count, 16) ThenBlock: {
+            count = 16
+        }
+        idx = 0
+        WhileLoop LessThan(idx, count) {
+            si = Subtract(Subtract(JSVMState.sp, 1), idx)
+            saddr = Add(JSVMState.stack, Multiply(si, 8))
+            val = Dereference(saddr)
+            IfCondition NotEqual(val, 0) ThenBlock: {
+                vt = JSRT_GetType(val)
+                // NUMBER: print value
+                IfCondition EqualTo(vt, JSType.NUMBER) ThenBlock: {
+                    nv = JSRT_GetPayload(val)
+                    PrintNumber(nv)
+                }
+                // STRING: print string
+                IfCondition EqualTo(vt, JSType.STRING) ThenBlock: {
+                    sv = JSRT_GetPayload(val)
+                    IfCondition NotEqual(sv, 0) ThenBlock: {
+                        PrintString(sv)
+                    }
+                }
+                // BOOLEAN: print true/false
+                IfCondition EqualTo(vt, JSType.BOOLEAN) ThenBlock: {
+                    bv = JSRT_GetPayload(val)
+                    IfCondition NotEqual(bv, 0) ThenBlock: {
+                        PrintString("true")
+                    } ElseBlock: {
+                        PrintString("false")
+                    }
+                }
+                // UNDEFINED
+                IfCondition EqualTo(vt, JSType.UNDEFINED) ThenBlock: {
+                    PrintString("undefined")
+                }
+                // NULL
+                IfCondition EqualTo(vt, JSType.NULL) ThenBlock: {
+                    PrintString("null")
+                }
+                // OBJECT
+                IfCondition EqualTo(vt, JSType.OBJECT) ThenBlock: {
+                    PrintString("[object]")
+                }
+                // ARRAY
+                IfCondition EqualTo(vt, JSType.ARRAY) ThenBlock: {
+                    PrintString("[array]")
+                }
+                // FUNCTION
+                IfCondition EqualTo(vt, JSType.FUNCTION) ThenBlock: {
+                    PrintString("[function]")
+                }
+                PrintString(" ")
+            }
+            idx = Add(idx, 1)
+        }
+        ReturnValue(count)
+    }
+}
+
+// =============================================================================
+// MAX STEPS CONFIGURATION
+// =============================================================================
+
+Function.JSVM_SetMaxSteps {
+    Input: max: Integer
+    Output: Integer
+    Body: {
+        JSVMState.max_steps = max
+        ReturnValue(0)
+    }
+}
+
+Function.JSVM_GetMaxSteps {
+    Output: Integer
+    Body: {
+        ReturnValue(JSVMState.max_steps)
+    }
+}
+
+// =============================================================================
+// CONVENIENCE: Install built-in globals (console, Math, etc.)
+// Delegates to JSRuntime's built-in registration.
+// =============================================================================
+Function.JSVM_InstallBuiltins {
+    Output: Integer
+    Body: {
+        // Register JSRuntime built-in native functions
+        JSRT_RegisterBuiltins()
+
+        // Create console object and install as global
+        console_obj = JSRT_CreateConsole()
+        JSVM__SetGlobal("console", console_obj)
+
+        // Create Math object and install as global
+        math_obj = JSRT_CreateMath()
+        JSVM__SetGlobal("Math", math_obj)
+
+        // Install undefined, null, NaN, Infinity as globals
+        JSVM__SetGlobal("undefined", JSRT_Undefined())
+        JSVM__SetGlobal("null", JSRT_Null())
+        JSVM__SetGlobal("NaN", JSRT_CreateNumber(0))
+        JSVM__SetGlobal("Infinity", JSRT_CreateNumber(999999999))
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FULL PIPELINE: Lex + Parse + Compile + Run
+// Takes JS source string and length, returns result JSValue.
+// Requires JSLex_Init, JSParse_Init, JSComp_Init, JSVM_Init already called.
+// =============================================================================
+Function.JSVM_Eval {
+    Input: source: Address
+    Input: src_len: Integer
+    Output: Address
+    Body: {
+        save_src = source
+        save_len = src_len
+
+        // Reset subsystems
+        JSLex_Reset()
+        JSComp_Reset()
+        JSVM_Reset()
+
+        // Tokenize
+        tok_count = JSLex_Tokenize(save_src, save_len)
+        IfCondition LessEqual(tok_count, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Parse
+        root = JSParse_Parse()
+        IfCondition LessThan(root, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Compile
+        JSVM__Push(root)
+        comp_ok = JSComp_Compile(root)
+        root = JSVM__Pop()
+        IfCondition EqualTo(comp_ok, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // Load bytecode
+        bc = JSComp_GetCode()
+        bc_len = JSComp_GetCodeLen()
+        cp = JSComp_GetConst(0)
+        cc = JSComp_GetConstCount()
+        JSVM_Load(bc, bc_len, cp, cc)
+
+        // Run
+        result = JSVM_Run()
+        ReturnValue(result)
+    }
+}
