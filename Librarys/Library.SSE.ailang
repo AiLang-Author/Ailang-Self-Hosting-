@@ -1,0 +1,294 @@
+// Library.SSE.ailang — Server-Sent Events parser, line-driven.
+//
+// SSE wire format (RFC: https://html.spec.whatwg.org/multipage/server-sent-events.html):
+//   event: <type>\n
+//   data: <payload-line-1>\n
+//   data: <payload-line-2>\n
+//   \n                          <-- blank line dispatches the event
+//
+// Caller drives this lib by feeding ONE physical line at a time (already
+// stripped of \n by HTTP.ReadLine). When FeedLine returns 1, an event is
+// ready: pull its type and data with GetEventType / GetEventData, then
+// call Reset before feeding the next event's lines.
+//
+// Why line-driven and not chunk-driven: SSE events span multiple TCP reads
+// and chunks can arrive split across event boundaries. A chunk-based parser
+// will desync. Letting the caller (HTTP.ReadLine) handle the byte-stream-to-
+// line conversion isolates the protocol logic from network framing entirely.
+//
+// State buffer layout (caller-allocated, pass to SSE_Init):
+//   Recommended size: ~16KB. Anthropic's data: lines fit easily; the SSE
+//   spec allows arbitrary data length, so use a generous buffer for safety.
+//
+// Public API:
+//   SSE.Init(state_buf, total_size)
+//   SSE.FeedLine(state, line, line_len)   -> 1 if event ready, else 0
+//   SSE.GetEventType(state)               -> Address (null-terminated)
+//   SSE.GetEventData(state)               -> Address (null-terminated, joined with \n)
+//   SSE.Reset(state)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// =============================================================================
+// STATE LAYOUT (in caller-supplied buffer)
+//   [0..63]    event type buffer (64 bytes, null-terminated)
+//   [64..71]   data buffer pointer (Address, qword)
+//   [72..75]   data buffer capacity (dword)
+//   [76..79]   data buffer used (dword)        — bytes of valid data
+//   [80..83]   total buffer size from caller   — for our reference
+//   [84..87]   reserved
+// =============================================================================
+FixedPool.SSEOff {
+    "TYPE_BUF":      Initialize=0
+    "DATA_PTR":      Initialize=64
+    "DATA_CAP":      Initialize=72
+    "DATA_USED":     Initialize=76
+    "TOTAL_SIZE":    Initialize=80
+    "HEADER_SIZE":   Initialize=88
+}
+
+FixedPool.SSEConst {
+    "TYPE_MAX":      Initialize=63    // 64 bytes minus null terminator
+    "DATA_INIT":     Initialize=4096  // initial data buffer allocation
+}
+
+// =============================================================================
+// INIT — caller passes a buffer; we use the first 88 bytes for header,
+// allocate a separate growable data buffer.
+// =============================================================================
+Function.SSE.Init {
+    Input: state: Address
+    Input: total_size: Integer
+    Body: {
+        MemorySet(state, 0, SSEOff.HEADER_SIZE)
+        StoreValue(Add(state, SSEOff.TOTAL_SIZE), total_size, "dword")
+        data = Allocate(SSEConst.DATA_INIT)
+        SetByte(data, 0, 0)
+        StoreValue(Add(state, SSEOff.DATA_PTR), data)
+        StoreValue(Add(state, SSEOff.DATA_CAP), SSEConst.DATA_INIT, "dword")
+        StoreValue(Add(state, SSEOff.DATA_USED), 0, "dword")
+    }
+}
+
+// =============================================================================
+// RESET — clear after consuming an event, ready for next event's lines.
+// Keeps the data buffer allocated for reuse.
+// =============================================================================
+Function.SSE.Reset {
+    Input: state: Address
+    Body: {
+        // Clear type
+        SetByte(Add(state, SSEOff.TYPE_BUF), 0, 0)
+        // Reset data length (keep capacity)
+        StoreValue(Add(state, SSEOff.DATA_USED), 0, "dword")
+        data = Dereference(Add(state, SSEOff.DATA_PTR))
+        IfCondition NotEqual(data, 0) ThenBlock: { SetByte(data, 0, 0) }
+    }
+}
+
+// =============================================================================
+// INTERNAL: ensure data buffer has room for `extra` more bytes + null.
+// Doubles capacity until it fits.
+// =============================================================================
+Function.SSE_EnsureCap {
+    Input: state: Address
+    Input: extra: Integer
+    Body: {
+        used = Dereference(Add(state, SSEOff.DATA_USED), "dword")
+        cap = Dereference(Add(state, SSEOff.DATA_CAP), "dword")
+        need = Add(Add(used, extra), 1)
+        IfCondition LessEqual(need, cap) ThenBlock: { ReturnValue(0) }
+
+        new_cap = cap
+        WhileLoop LessThan(new_cap, need) {
+            new_cap = Multiply(new_cap, 2)
+        }
+        old_data = Dereference(Add(state, SSEOff.DATA_PTR))
+        new_data = Allocate(new_cap)
+        IfCondition GreaterThan(used, 0) ThenBlock: {
+            i = 0
+            WhileLoop LessThan(i, used) {
+                SetByte(new_data, i, GetByte(old_data, i))
+                i = Add(i, 1)
+            }
+        }
+        SetByte(new_data, used, 0)
+        IfCondition NotEqual(old_data, 0) ThenBlock: {
+            Deallocate(old_data, cap)
+        }
+        StoreValue(Add(state, SSEOff.DATA_PTR), new_data)
+        StoreValue(Add(state, SSEOff.DATA_CAP), new_cap, "dword")
+    }
+}
+
+// Append `n` bytes from `src` to data buffer; null-terminates.
+Function.SSE_AppendData {
+    Input: state: Address
+    Input: src: Address
+    Input: n: Integer
+    Body: {
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        SSE_EnsureCap(state, n)
+        used = Dereference(Add(state, SSEOff.DATA_USED), "dword")
+        data = Dereference(Add(state, SSEOff.DATA_PTR))
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(data, Add(used, i), GetByte(src, i))
+            i = Add(i, 1)
+        }
+        new_used = Add(used, n)
+        SetByte(data, new_used, 0)
+        StoreValue(Add(state, SSEOff.DATA_USED), new_used, "dword")
+    }
+}
+
+// Append a single byte to data buffer.
+Function.SSE_AppendByte {
+    Input: state: Address
+    Input: b: Integer
+    Body: {
+        SSE_EnsureCap(state, 1)
+        used = Dereference(Add(state, SSEOff.DATA_USED), "dword")
+        data = Dereference(Add(state, SSEOff.DATA_PTR))
+        SetByte(data, used, b)
+        new_used = Add(used, 1)
+        SetByte(data, new_used, 0)
+        StoreValue(Add(state, SSEOff.DATA_USED), new_used, "dword")
+    }
+}
+
+// =============================================================================
+// FEED LINE — process one physical SSE line (no trailing \n).
+// Returns 1 when a complete event has been collected, else 0.
+//
+// Recognized line forms:
+//   ""                          -> dispatch (event ready) if data present
+//   ":..."                      -> comment, ignored
+//   "event: <type>"             -> set event type (SSE field, optional space)
+//   "data: <payload>"           -> append payload + \n separator
+//   "data:<payload>"            -> same (space after colon is optional per spec)
+//   "event:<type>"              -> same
+//   "id: <id>" / "retry: <ms>"  -> currently ignored; can be added later
+// =============================================================================
+Function.SSE.FeedLine {
+    Input: state: Address
+    Input: line: Address
+    Input: line_len: Integer
+    Output: Integer
+    Body: {
+        // Blank line — dispatch
+        IfCondition EqualTo(line_len, 0) ThenBlock: {
+            used = Dereference(Add(state, SSEOff.DATA_USED), "dword")
+            type_buf = Add(state, SSEOff.TYPE_BUF)
+            type_first = GetByte(type_buf, 0)
+            // Dispatch only if we collected ANY content (type or data)
+            IfCondition Or(GreaterThan(used, 0), NotEqual(type_first, 0)) ThenBlock: {
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+
+        first = GetByte(line, 0)
+        // Comment
+        IfCondition EqualTo(first, 58) ThenBlock: { ReturnValue(0) }
+
+        // Detect "event:" or "data:" prefix
+        is_event = SSE_StartsWith(line, line_len, "event:")
+        IfCondition EqualTo(is_event, 1) ThenBlock: {
+            val_off = SSE_ValueStart(line, line_len, 6)
+            val_len = Subtract(line_len, val_off)
+            type_buf = Add(state, SSEOff.TYPE_BUF)
+            copy_n = val_len
+            IfCondition GreaterThan(copy_n, SSEConst.TYPE_MAX) ThenBlock: {
+                copy_n = SSEConst.TYPE_MAX
+            }
+            j = 0
+            WhileLoop LessThan(j, copy_n) {
+                SetByte(type_buf, j, GetByte(line, Add(val_off, j)))
+                j = Add(j, 1)
+            }
+            SetByte(type_buf, copy_n, 0)
+            ReturnValue(0)
+        }
+
+        is_data = SSE_StartsWith(line, line_len, "data:")
+        IfCondition EqualTo(is_data, 1) ThenBlock: {
+            val_off = SSE_ValueStart(line, line_len, 5)
+            val_len = Subtract(line_len, val_off)
+            // If we already have data, separate previous chunk with \n per spec
+            used = Dereference(Add(state, SSEOff.DATA_USED), "dword")
+            IfCondition GreaterThan(used, 0) ThenBlock: {
+                SSE_AppendByte(state, 10)
+            }
+            IfCondition GreaterThan(val_len, 0) ThenBlock: {
+                SSE_AppendData(state, Add(line, val_off), val_len)
+            }
+            ReturnValue(0)
+        }
+
+        // Unknown field — ignore silently
+        ReturnValue(0)
+    }
+}
+
+// Internal: 1 if line[0..prefix_len) == prefix.
+Function.SSE_StartsWith {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: prefix: Address
+    Output: Integer
+    Body: {
+        plen = StringLength(prefix)
+        IfCondition LessThan(line_len, plen) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            IfCondition NotEqual(GetByte(line, i), GetByte(prefix, i)) ThenBlock: {
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Internal: given a line that begins with "<field>:", return the offset
+// where the value text begins. Skips the colon and at most one space.
+Function.SSE_ValueStart {
+    Input: line: Address
+    Input: line_len: Integer
+    Input: after_colon: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(after_colon, line_len) ThenBlock: {
+            ReturnValue(after_colon)
+        }
+        IfCondition EqualTo(GetByte(line, after_colon), 32) ThenBlock: {
+            ReturnValue(Add(after_colon, 1))
+        }
+        ReturnValue(after_colon)
+    }
+}
+
+// =============================================================================
+// ACCESSORS
+// =============================================================================
+Function.SSE.GetEventType {
+    Input: state: Address
+    Output: Address
+    Body: { ReturnValue(Add(state, SSEOff.TYPE_BUF)) }
+}
+
+Function.SSE.GetEventData {
+    Input: state: Address
+    Output: Address
+    Body: { ReturnValue(Dereference(Add(state, SSEOff.DATA_PTR))) }
+}
+
+Function.SSE.GetEventDataLen {
+    Input: state: Address
+    Output: Integer
+    Body: { ReturnValue(Dereference(Add(state, SSEOff.DATA_USED), "dword")) }
+}

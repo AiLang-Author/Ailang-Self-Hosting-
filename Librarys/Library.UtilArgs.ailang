@@ -1,0 +1,637 @@
+// Library.UtilArgs.ailang — unified argument format for AiLang sysutils.
+//
+// One schema definition per util produces FOUR surfaces:
+//   1. CLI flag parser    (`mytool --path /foo --verbose`)
+//   2. IPC JSON parser    (`{"method":"...", "args":{"path":"/foo"}}`)
+//   3. Anthropic tool schema (JSON Schema embeddable in tools[] array)
+//   4. --help text        (uniform format across every util)
+//
+// Why: every existing AiLang coreutil (cat/ls/grep/etc.) reimplements
+// per-flag byte-comparison parsing (~300 LoC apiece). This kills that
+// pattern at the OS level. Backporting any util onto this lib replaces
+// hundreds of lines with a single schema declaration.
+//
+// Schema is a JSON object so it can be serialized/exported trivially.
+// Args object is also JSON, so JSON.GetString/Number/Bool work directly.
+//
+// Convention:
+//   * Field types: "string", "int", "bool", "path" (path = string + tool-hint)
+//   * cli_long is required, cli_short is optional
+//   * boolean flags have no value (`--verbose`, not `--verbose true`)
+//   * required:true + missing -> ParseCLI/ParseIPC return 0
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.JSON
+LibraryImport.StringUtils
+
+// =============================================================================
+// SYSCALL HELPERS — read /proc/self/cmdline (no argv in AiLang main)
+// =============================================================================
+Function.UA_SysOpen {
+    Input: path: Address
+    Output: Integer
+    Body: { ReturnValue(SystemCall(2, path, 0, 0)) }
+}
+
+Function.UA_SysRead {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: n: Integer
+    Output: Integer
+    Body: { ReturnValue(SystemCall(0, fd, buf, n)) }
+}
+
+Function.UA_SysClose {
+    Input: fd: Integer
+    Body: { SystemCall(3, fd) }
+}
+
+Function.UA_WriteStdout {
+    Input: s: Address
+    Body: {
+        len = StringLength(s)
+        IfCondition GreaterThan(len, 0) ThenBlock: {
+            SystemCall(1, 1, s, len)
+        }
+    }
+}
+
+// =============================================================================
+// SCHEMA CONSTRUCTION
+// =============================================================================
+
+// Create a new schema for a util. Returns a JSON tagged object.
+//   name = util identifier ("Read", "Bash", etc.)
+//   desc = one-line description (used in tool schema and --help)
+Function.UtilArgs_NewSchema {
+    Input: util_name: Address
+    Input: util_desc: Address
+    Output: Address
+    Body: {
+        s = JSON.NewObject()
+        JSON.SetString(s, "name", util_name)
+        JSON.SetString(s, "description", util_desc)
+        flds = JSON.NewArray()
+        JSON.SetArray(s, "fields", flds)
+        ReturnValue(s)
+    }
+}
+
+// Add a field to the schema. cli_long must be unique across fields.
+// type_str: "string" | "int" | "bool" | "path"
+Function.UtilArgs_AddField {
+    Input: schema: Address
+    Input: name: Address
+    Input: type_str: Address
+    Input: required: Integer
+    Input: desc: Address
+    Input: cli_long: Address
+    Body: {
+        f = JSON.NewObject()
+        JSON.SetString(f, "name", name)
+        JSON.SetString(f, "type", type_str)
+        JSON.SetBool(f, "required", required)
+        JSON.SetString(f, "desc", desc)
+        JSON.SetString(f, "cli_long", cli_long)
+        // cli_short and default are optional — set via separate functions
+        flds = JSON.GetArray(schema, "fields")
+        JSON.PushObject(flds, f)
+    }
+}
+
+// Optional: set a single-char short flag (e.g. "p" for -p).
+Function.UtilArgs_SetShort {
+    Input: schema: Address
+    Input: field_name: Address
+    Input: short_char: Address
+    Body: {
+        f = UA_FindField(schema, field_name)
+        IfCondition NotEqual(f, 0) ThenBlock: {
+            JSON.SetString(f, "cli_short", short_char)
+        }
+    }
+}
+
+// Optional: set a default value (string form — converted at parse time).
+Function.UtilArgs_SetDefault {
+    Input: schema: Address
+    Input: field_name: Address
+    Input: default_str: Address
+    Body: {
+        f = UA_FindField(schema, field_name)
+        IfCondition NotEqual(f, 0) ThenBlock: {
+            JSON.SetString(f, "default", default_str)
+        }
+    }
+}
+
+// Internal: locate a field object by name. Returns 0 if missing.
+Function.UA_FindField {
+    Input: schema: Address
+    Input: field_name: Address
+    Output: Address
+    Body: {
+        flds = JSON.GetArray(schema, "fields")
+        IfCondition EqualTo(flds, 0) ThenBlock: { ReturnValue(0) }
+        n = JSON.ArrayLength(flds)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            f_tag = JSON.ArrayGet(flds, i)
+            f = JSON.AsObject(f_tag)
+            IfCondition NotEqual(f, 0) ThenBlock: {
+                fn = JSON.GetString(f, "name")
+                IfCondition NotEqual(fn, 0) ThenBlock: {
+                    IfCondition EqualTo(StringCompare(fn, field_name), 0) ThenBlock: {
+                        ReturnValue(f)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CLI PARSING — reads /proc/self/cmdline, returns args JSON object
+// =============================================================================
+
+// Read the whole cmdline into a freshly allocated buffer.
+// Returns (buf, len) via output addr; caller frees buf.
+// Returns 0 buf on failure.
+Function.UA_ReadCmdline {
+    Input: out_len_ptr: Address
+    Output: Address
+    Body: {
+        path = "/proc/self/cmdline"
+        fd = UA_SysOpen(path)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            StoreValue(out_len_ptr, 0)
+            ReturnValue(0)
+        }
+        buf = Allocate(8192)
+        n = UA_SysRead(fd, buf, 8192)
+        UA_SysClose(fd)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 8192)
+            StoreValue(out_len_ptr, 0)
+            ReturnValue(0)
+        }
+        StoreValue(out_len_ptr, n)
+        ReturnValue(buf)
+    }
+}
+
+// Extract the next null-terminated arg starting at offset `start`.
+// Writes new arg to a fresh allocation; returns its address.
+// Updates *next_offset to point past the trailing null.
+// Returns 0 if at end of buffer.
+Function.UA_NextArg {
+    Input: buf: Address
+    Input: total_len: Integer
+    Input: start: Integer
+    Input: next_offset_ptr: Address
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(start, total_len) ThenBlock: {
+            StoreValue(next_offset_ptr, start)
+            ReturnValue(0)
+        }
+        // Find length until null
+        i = start
+        WhileLoop LessThan(i, total_len) {
+            ch = GetByte(buf, i)
+            IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            i = Add(i, 1)
+        }
+        arg_len = Subtract(i, start)
+        IfCondition EqualTo(arg_len, 0) ThenBlock: {
+            // Empty arg — skip the null and recurse-equivalent
+            StoreValue(next_offset_ptr, Add(i, 1))
+            ReturnValue(0)
+        }
+        // Allocate and copy
+        out = Allocate(Add(arg_len, 1))
+        j = 0
+        WhileLoop LessThan(j, arg_len) {
+            SetByte(out, j, GetByte(buf, Add(start, j)))
+            j = Add(j, 1)
+        }
+        SetByte(out, arg_len, 0)
+        StoreValue(next_offset_ptr, Add(i, 1))
+        ReturnValue(out)
+    }
+}
+
+// Locate a field by --long flag (without leading dashes) or by -short char.
+// match_kind: 0 = long, 1 = short
+Function.UA_FindFieldByFlag {
+    Input: schema: Address
+    Input: flag_str: Address
+    Input: match_kind: Integer
+    Output: Address
+    Body: {
+        flds = JSON.GetArray(schema, "fields")
+        IfCondition EqualTo(flds, 0) ThenBlock: { ReturnValue(0) }
+        n = JSON.ArrayLength(flds)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            f_tag = JSON.ArrayGet(flds, i)
+            f = JSON.AsObject(f_tag)
+            IfCondition NotEqual(f, 0) ThenBlock: {
+                key_name = "cli_long"
+                IfCondition EqualTo(match_kind, 1) ThenBlock: {
+                    key_name = "cli_short"
+                }
+                v = JSON.GetString(f, key_name)
+                IfCondition NotEqual(v, 0) ThenBlock: {
+                    IfCondition EqualTo(StringCompare(v, flag_str), 0) ThenBlock: {
+                        ReturnValue(f)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Stuff value into args obj using field type. Frees value where appropriate.
+Function.UA_SetArgValue {
+    Input: args_obj: Address
+    Input: field: Address
+    Input: value_str: Address
+    Body: {
+        name = JSON.GetString(field, "name")
+        type_str = JSON.GetString(field, "type")
+        // bool: presence-only, value ignored
+        IfCondition EqualTo(StringCompare(type_str, "bool"), 0) ThenBlock: {
+            JSON.SetBool(args_obj, name, 1)
+            ReturnValue(0)
+        }
+        // int: parse decimal
+        IfCondition EqualTo(StringCompare(type_str, "int"), 0) ThenBlock: {
+            n = StringToInt(value_str)
+            JSON.SetNumber(args_obj, name, n)
+            ReturnValue(0)
+        }
+        // string / path: store as-is
+        JSON.SetString(args_obj, name, value_str)
+    }
+}
+
+// Apply schema defaults to any unset fields in args_obj.
+// Use JSON.GetType to detect presence regardless of field type
+// (the previous GetString-based check broke int/bool fields).
+Function.UA_ApplyDefaults {
+    Input: schema: Address
+    Input: args_obj: Address
+    Body: {
+        flds = JSON.GetArray(schema, "fields")
+        IfCondition EqualTo(flds, 0) ThenBlock: { ReturnValue(0) }
+        n = JSON.ArrayLength(flds)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            f_tag = JSON.ArrayGet(flds, i)
+            f = JSON.AsObject(f_tag)
+            IfCondition NotEqual(f, 0) ThenBlock: {
+                name = JSON.GetString(f, "name")
+                existing_type = JSON.GetType(args_obj, name)
+                IfCondition EqualTo(existing_type, JType.NULL) ThenBlock: {
+                    def = JSON.GetString(f, "default")
+                    IfCondition NotEqual(def, 0) ThenBlock: {
+                        UA_SetArgValue(args_obj, f, def)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// Validate that all required fields are present. Returns 1 ok, 0 missing.
+// Writes name of first missing field to stderr if any.
+Function.UA_ValidateRequired {
+    Input: schema: Address
+    Input: args_obj: Address
+    Output: Integer
+    Body: {
+        flds = JSON.GetArray(schema, "fields")
+        IfCondition EqualTo(flds, 0) ThenBlock: { ReturnValue(1) }
+        n = JSON.ArrayLength(flds)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            f_tag = JSON.ArrayGet(flds, i)
+            f = JSON.AsObject(f_tag)
+            IfCondition NotEqual(f, 0) ThenBlock: {
+                req = JSON.GetBool(f, "required")
+                IfCondition EqualTo(req, 1) ThenBlock: {
+                    name = JSON.GetString(f, "name")
+                    type_str = JSON.GetString(f, "type")
+                    have = 0
+                    IfCondition EqualTo(StringCompare(type_str, "bool"), 0) ThenBlock: {
+                        have = JSON.GetBool(args_obj, name)
+                    } ElseBlock: {
+                        IfCondition EqualTo(StringCompare(type_str, "int"), 0) ThenBlock: {
+                            // GetNumber returns 0 for both missing and zero;
+                            // GetType returns JType.NULL (0) only when missing.
+                            t = JSON.GetType(args_obj, name)
+                            IfCondition NotEqual(t, JType.NULL) ThenBlock: { have = 1 }
+                        } ElseBlock: {
+                            v = JSON.GetString(args_obj, name)
+                            IfCondition NotEqual(v, 0) ThenBlock: { have = 1 }
+                        }
+                    }
+                    IfCondition EqualTo(have, 0) ThenBlock: {
+                        ReturnValue(0)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Main CLI parser. Returns a JSON args object on success, 0 on validation
+// failure (missing required, unknown flag, etc.). Caller is responsible
+// for printing usage on failure.
+Function.UtilArgs_ParseCLI {
+    Input: schema: Address
+    Output: Address
+    Body: {
+        len_holder = Allocate(8)
+        StoreValue(len_holder, 0)
+        buf = UA_ReadCmdline(len_holder)
+        total = Dereference(len_holder)
+        Deallocate(len_holder, 8)
+        IfCondition EqualTo(buf, 0) ThenBlock: {
+            // No cmdline — return empty args, defaults will populate
+            args = JSON.NewObject()
+            UA_ApplyDefaults(schema, args)
+            ReturnValue(args)
+        }
+
+        args = JSON.NewObject()
+        offset_holder = Allocate(8)
+        StoreValue(offset_holder, 0)
+
+        // Skip program name
+        prog = UA_NextArg(buf, total, 0, offset_holder)
+        IfCondition NotEqual(prog, 0) ThenBlock: { Deallocate(prog, 0) }
+
+        WhileLoop 1 {
+            cur = Dereference(offset_holder)
+            IfCondition GreaterEqual(cur, total) ThenBlock: { BreakLoop }
+            arg = UA_NextArg(buf, total, cur, offset_holder)
+            IfCondition EqualTo(arg, 0) ThenBlock: { BreakLoop }
+
+            // Check for --help / --version short-circuit
+            IfCondition EqualTo(StringCompare(arg, "--help"), 0) ThenBlock: {
+                UtilArgs_PrintHelp(schema)
+                Deallocate(arg, 0)
+                Deallocate(buf, 8192)
+                Deallocate(offset_holder, 8)
+                SystemCall(60, 0)
+            }
+
+            first = GetByte(arg, 0)
+            second = GetByte(arg, 1)
+            field = 0
+            is_long = 0
+
+            IfCondition EqualTo(first, 45) ThenBlock: {
+                IfCondition EqualTo(second, 45) ThenBlock: {
+                    // Long flag: skip "--"
+                    flag_name = Add(arg, 2)
+                    field = UA_FindFieldByFlag(schema, flag_name, 0)
+                    is_long = 1
+                } ElseBlock: {
+                    // Short flag: char at index 1, must be lone single char
+                    third = GetByte(arg, 2)
+                    IfCondition EqualTo(third, 0) ThenBlock: {
+                        // Build single-char string
+                        sc = Allocate(2)
+                        SetByte(sc, 0, second)
+                        SetByte(sc, 1, 0)
+                        field = UA_FindFieldByFlag(schema, sc, 1)
+                        Deallocate(sc, 2)
+                    }
+                }
+            }
+
+            IfCondition EqualTo(field, 0) ThenBlock: {
+                // Unknown flag — quietly skip (lenient mode)
+                Deallocate(arg, 0)
+            } ElseBlock: {
+                ftype = JSON.GetString(field, "type")
+                IfCondition EqualTo(StringCompare(ftype, "bool"), 0) ThenBlock: {
+                    UA_SetArgValue(args, field, 0)
+                    Deallocate(arg, 0)
+                } ElseBlock: {
+                    // Need next arg as value
+                    cur2 = Dereference(offset_holder)
+                    IfCondition GreaterEqual(cur2, total) ThenBlock: {
+                        // Missing value
+                        Deallocate(arg, 0)
+                        BreakLoop
+                    }
+                    val = UA_NextArg(buf, total, cur2, offset_holder)
+                    IfCondition NotEqual(val, 0) ThenBlock: {
+                        UA_SetArgValue(args, field, val)
+                        Deallocate(val, 0)
+                    }
+                    Deallocate(arg, 0)
+                }
+            }
+        }
+
+        Deallocate(buf, 8192)
+        Deallocate(offset_holder, 8)
+
+        UA_ApplyDefaults(schema, args)
+
+        IfCondition EqualTo(UA_ValidateRequired(schema, args), 0) ThenBlock: {
+            UA_WriteStdout("error: missing required argument\n")
+            UtilArgs_PrintHelp(schema)
+            JSON.FreeObject(args)
+            ReturnValue(0)
+        }
+
+        ReturnValue(args)
+    }
+}
+
+// =============================================================================
+// IPC PARSING — accept a JSON args object, validate against schema
+// =============================================================================
+
+// Take a JSON object representing the "args" field of an IPC message
+// and validate it. Applies defaults. Returns the validated object on
+// success, 0 on validation failure.
+//
+// The caller owns the input object; on failure the input is NOT freed.
+Function.UtilArgs_ParseIPC {
+    Input: schema: Address
+    Input: args_obj: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(args_obj, 0) ThenBlock: {
+            args_obj = JSON.NewObject()
+        }
+        UA_ApplyDefaults(schema, args_obj)
+        IfCondition EqualTo(UA_ValidateRequired(schema, args_obj), 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(args_obj)
+    }
+}
+
+// =============================================================================
+// VALUE GETTERS — convenience wrappers over JSON.GetX
+// =============================================================================
+Function.UtilArgs_GetString {
+    Input: args: Address
+    Input: name: Address
+    Output: Address
+    Body: { ReturnValue(JSON.GetString(args, name)) }
+}
+
+Function.UtilArgs_GetInt {
+    Input: args: Address
+    Input: name: Address
+    Output: Integer
+    Body: { ReturnValue(JSON.GetNumber(args, name)) }
+}
+
+Function.UtilArgs_GetBool {
+    Input: args: Address
+    Input: name: Address
+    Output: Integer
+    Body: { ReturnValue(JSON.GetBool(args, name)) }
+}
+
+// =============================================================================
+// HELP TEXT — uniform format across every util
+// =============================================================================
+Function.UtilArgs_PrintHelp {
+    Input: schema: Address
+    Body: {
+        name = JSON.GetString(schema, "name")
+        desc = JSON.GetString(schema, "description")
+        UA_WriteStdout("Usage: ")
+        UA_WriteStdout(name)
+        UA_WriteStdout(" [options]\n\n")
+        IfCondition NotEqual(desc, 0) ThenBlock: {
+            UA_WriteStdout(desc)
+            UA_WriteStdout("\n\n")
+        }
+        UA_WriteStdout("Options:\n")
+        flds = JSON.GetArray(schema, "fields")
+        IfCondition EqualTo(flds, 0) ThenBlock: { ReturnValue(0) }
+        n = JSON.ArrayLength(flds)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            f_tag = JSON.ArrayGet(flds, i)
+            f = JSON.AsObject(f_tag)
+            IfCondition NotEqual(f, 0) ThenBlock: {
+                UA_WriteStdout("  --")
+                cl = JSON.GetString(f, "cli_long")
+                IfCondition NotEqual(cl, 0) ThenBlock: { UA_WriteStdout(cl) }
+                cs = JSON.GetString(f, "cli_short")
+                IfCondition NotEqual(cs, 0) ThenBlock: {
+                    UA_WriteStdout(", -")
+                    UA_WriteStdout(cs)
+                }
+                t = JSON.GetString(f, "type")
+                IfCondition NotEqual(t, 0) ThenBlock: {
+                    IfCondition NotEqual(StringCompare(t, "bool"), 0) ThenBlock: {
+                        UA_WriteStdout(" <")
+                        UA_WriteStdout(t)
+                        UA_WriteStdout(">")
+                    }
+                }
+                req = JSON.GetBool(f, "required")
+                IfCondition EqualTo(req, 1) ThenBlock: {
+                    UA_WriteStdout("  (required)")
+                }
+                fdesc = JSON.GetString(f, "desc")
+                IfCondition NotEqual(fdesc, 0) ThenBlock: {
+                    UA_WriteStdout("\n      ")
+                    UA_WriteStdout(fdesc)
+                }
+                UA_WriteStdout("\n")
+            }
+            i = Add(i, 1)
+        }
+        UA_WriteStdout("  --help\n      Show this message.\n")
+    }
+}
+
+// =============================================================================
+// ANTHROPIC TOOL SCHEMA EXPORT
+// Generates a JSON object suitable for the tools[] array in a Messages
+// API request:
+//   { "name": "...", "description": "...", "input_schema": {...} }
+// Returns serialized JSON string (caller owns).
+// =============================================================================
+Function.UtilArgs_ExportToolSchema {
+    Input: schema: Address
+    Output: Address
+    Body: {
+        out = JSON.NewObject()
+        name = JSON.GetString(schema, "name")
+        desc = JSON.GetString(schema, "description")
+        IfCondition NotEqual(name, 0) ThenBlock: { JSON.SetString(out, "name", name) }
+        IfCondition NotEqual(desc, 0) ThenBlock: { JSON.SetString(out, "description", desc) }
+
+        input_schema = JSON.NewObject()
+        JSON.SetString(input_schema, "type", "object")
+
+        properties = JSON.NewObject()
+        required_arr = JSON.NewArray()
+
+        flds = JSON.GetArray(schema, "fields")
+        IfCondition NotEqual(flds, 0) ThenBlock: {
+            n = JSON.ArrayLength(flds)
+            i = 0
+            WhileLoop LessThan(i, n) {
+                f_tag = JSON.ArrayGet(flds, i)
+                f = JSON.AsObject(f_tag)
+                IfCondition NotEqual(f, 0) ThenBlock: {
+                    fname = JSON.GetString(f, "name")
+                    ftype = JSON.GetString(f, "type")
+                    fdesc = JSON.GetString(f, "desc")
+
+                    prop = JSON.NewObject()
+                    // Map our type names to JSON Schema types
+                    schema_type = "string"
+                    IfCondition EqualTo(StringCompare(ftype, "int"), 0) ThenBlock: {
+                        schema_type = "integer"
+                    }
+                    IfCondition EqualTo(StringCompare(ftype, "bool"), 0) ThenBlock: {
+                        schema_type = "boolean"
+                    }
+                    JSON.SetString(prop, "type", schema_type)
+                    IfCondition NotEqual(fdesc, 0) ThenBlock: {
+                        JSON.SetString(prop, "description", fdesc)
+                    }
+                    JSON.SetObject(properties, fname, prop)
+
+                    req = JSON.GetBool(f, "required")
+                    IfCondition EqualTo(req, 1) ThenBlock: {
+                        JSON.PushString(required_arr, fname)
+                    }
+                }
+                i = Add(i, 1)
+            }
+        }
+        JSON.SetObject(input_schema, "properties", properties)
+        JSON.SetArray(input_schema, "required", required_arr)
+        JSON.SetObject(out, "input_schema", input_schema)
+
+        ReturnValue(JSON.SerializeObject(out))
+    }
+}

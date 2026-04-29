@@ -1,0 +1,808 @@
+// =============================================================================
+// PARKED — superseded by Applications/ClaudeCode/cc_tools/cc_relmem_ipc.ailang
+//
+// This file was a first draft of relmem-in-AiLang as a standalone CLI binary.
+// During bring-up the user pointed at the cc_tools IPC pattern + UtilArgs as
+// the right shape; the working tool now lives at the cc_relmem_ipc path above.
+// The body below is preserved (as comments) for design reference only — do
+// NOT pass this file to ./ailang.x.
+// =============================================================================
+
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// relmem.ailang — symbolic memory tool for Claude Code sessions, AILang edition.
+//
+// Successor to tools/relmem.py. Same on-disk format
+// (~/.claude/relmem/index.json), same CLI surface, broader parser set.
+//
+// Design notes:
+//   * Pluggable parser table keyed by file extension. Adding a new
+//     language is an entry in Parse_Dispatch and a Parse_<Lang>(content,
+//     path) function returning a JSON object of {nid -> node}.
+//   * "Node" shape: { tok, cat, kind, line, edges } — edges is an array
+//     of [target_nid, edge_kind] pairs. Same as relmem.py so an index
+//     produced here is interchangeable with one produced there.
+//   * Index is JSON-native end to end: load -> ParseJSON -> mutate
+//     -> JSON.SerializeObject -> atomic write. No intermediate
+//     in-memory structs to keep in sync with the on-disk shape.
+//   * Languages on day one: AILang, Python (heuristic, no AST),
+//     C, Zig, Shell, HTML, JSON, Markdown, plain-text fallback.
+//     The fallback covers natural-language files (English, Spanish,
+//     etc.) by extracting capitalized tokens.
+//   * Parser version (pv) bumped to 3 since the parser surface is
+//     broader. Files with cached pv != 3 get re-parsed on next index.
+
+// LibraryImport.JSON
+// LibraryImport.Regex_Thompson
+// LibraryImport.StringUtils
+// LibraryImport.XArrays
+
+
+// // =============================================================================
+// // SYSCALL CONSTANTS  (linux x86-64)
+// // =============================================================================
+// FixedPool.RelSys {
+//     "READ":      Initialize=0
+//     "WRITE":     Initialize=1
+//     "OPEN":      Initialize=2
+//     "CLOSE":     Initialize=3
+//     "STAT":      Initialize=4
+//     "FSTAT":     Initialize=5
+//     "LSTAT":     Initialize=6
+//     "GETDENTS":  Initialize=78
+//     "RENAME":    Initialize=82
+//     "MKDIR":     Initialize=83
+//     "EXIT":      Initialize=60
+
+//     "O_RDONLY":  Initialize=0
+//     "O_WRONLY":  Initialize=1
+//     "O_CREAT":   Initialize=64
+//     "O_TRUNC":   Initialize=512
+//     "O_DIR":     Initialize=65536
+
+//     // S_IFMT mask for stat.st_mode
+//     "S_IFMT":    Initialize=61440        // 0o170000
+//     "S_IFDIR":   Initialize=16384        // 0o040000
+//     "S_IFREG":   Initialize=32768        // 0o100000
+
+//     "MODE_DIR":  Initialize=493          // 0o755
+//     "MODE_FILE": Initialize=420          // 0o644
+// }
+
+
+// // =============================================================================
+// // CONSTANTS
+// // =============================================================================
+// FixedPool.RelConst {
+//     "PARSER_VERSION": Initialize=3
+
+//     "PATH_MAX":       Initialize=4096
+//     "DENTS_BUF":      Initialize=8192
+//     "READ_CHUNK":     Initialize=65536
+//     "ENV_BUF":        Initialize=16384
+
+//     // stat(2) struct field offsets we care about
+//     "ST_MODE_OFF":    Initialize=24
+//     "ST_SIZE_OFF":    Initialize=48
+//     "ST_MTIME_OFF":   Initialize=88
+
+//     // linux_dirent64 layout: ino(8) + off(8) + reclen(2) + type(1) + name
+//     "DENT_RECLEN":    Initialize=16
+//     "DENT_TYPE":      Initialize=18
+//     "DENT_NAME":      Initialize=19
+
+//     // d_type values we care about
+//     "DT_DIR":         Initialize=4
+//     "DT_REG":         Initialize=8
+//     "DT_UNKNOWN":     Initialize=0
+
+//     "MAX_NODE_TOK":   Initialize=128
+//     "MAX_LINE":       Initialize=4096
+// }
+
+
+// // =============================================================================
+// // MUTABLE STATE  (argv, cached paths)
+// // =============================================================================
+// FixedPool.RelState {
+//     "argv":        Initialize=0      // XArray of arg strings
+//     "argc":        Initialize=0
+//     "home":        Initialize=0      // cached $HOME (Address)
+//     "store_dir":   Initialize=0      // ~/.claude/relmem
+//     "index_path":  Initialize=0      // ~/.claude/relmem/index.json
+//     "exit_code":   Initialize=0
+// }
+
+
+// // =============================================================================
+// // OUTPUT HELPERS
+// // =============================================================================
+// Function.Out_Raw {
+//     Input: buf: Address
+//     Input: len: Integer
+//     Body: {
+//         IfCondition GreaterThan(len, 0) ThenBlock: {
+//             SystemCall(RelSys.WRITE, 1, buf, len)
+//         }
+//     }
+// }
+
+// Function.Err_Raw {
+//     Input: buf: Address
+//     Input: len: Integer
+//     Body: {
+//         IfCondition GreaterThan(len, 0) ThenBlock: {
+//             SystemCall(RelSys.WRITE, 2, buf, len)
+//         }
+//     }
+// }
+
+// Function.Out_Str {
+//     Input: s: Address
+//     Body: {
+//         IfCondition NotEqual(s, 0) ThenBlock: {
+//             Out_Raw(s, StringLength(s))
+//         }
+//     }
+// }
+
+// Function.Err_Str {
+//     Input: s: Address
+//     Body: {
+//         IfCondition NotEqual(s, 0) ThenBlock: {
+//             Err_Raw(s, StringLength(s))
+//         }
+//     }
+// }
+
+// Function.Out_Char {
+//     Input: ch: Integer
+//     Body: {
+//         tmp = Allocate(2)
+//         SetByte(tmp, 0, ch)
+//         SetByte(tmp, 1, 0)
+//         Out_Raw(tmp, 1)
+//         Deallocate(tmp, 2)
+//     }
+// }
+
+// Function.Out_Newline {
+//     Body: { Out_Char(10) }
+// }
+
+// Function.Out_Int {
+//     Input: n: Integer
+//     Body: {
+//         s = NumberToString(n)
+//         Out_Str(s)
+//         Deallocate(s, 0)
+//     }
+// }
+
+
+// // =============================================================================
+// // ENVIRONMENT — read /proc/self/environ to recover $HOME
+// // =============================================================================
+// Function.Env_LoadHome {
+//     Output: Address
+//     Body: {
+//         IfCondition NotEqual(RelState.home, 0) ThenBlock: {
+//             ReturnValue(RelState.home)
+//         }
+
+//         fd = SystemCall(RelSys.OPEN, "/proc/self/environ", RelSys.O_RDONLY, 0)
+//         IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+//         buf = Allocate(RelConst.ENV_BUF)
+//         n = SystemCall(RelSys.READ, fd, buf, Subtract(RelConst.ENV_BUF, 1))
+//         SystemCall(RelSys.CLOSE, fd)
+
+//         IfCondition LessEqual(n, 0) ThenBlock: {
+//             Deallocate(buf, RelConst.ENV_BUF)
+//             ReturnValue(0)
+//         }
+//         SetByte(buf, n, 0)
+
+//         // Scan for "HOME=" at the start of any null-separated entry.
+//         i = 0
+//         WhileLoop LessThan(i, n) {
+//             // Match HOME=
+//             IfCondition And(LessThan(Add(i, 5), n),
+//                             And(EqualTo(GetByte(buf, i), 72),
+//                                 And(EqualTo(GetByte(buf, Add(i, 1)), 79),
+//                                     And(EqualTo(GetByte(buf, Add(i, 2)), 77),
+//                                         And(EqualTo(GetByte(buf, Add(i, 3)), 69),
+//                                             EqualTo(GetByte(buf, Add(i, 4)), 61)))))) ThenBlock: {
+//                 start = Add(i, 5)
+//                 end = start
+//                 WhileLoop And(LessThan(end, n), NotEqual(GetByte(buf, end), 0)) {
+//                     end = Add(end, 1)
+//                 }
+//                 hlen = Subtract(end, start)
+//                 home = Allocate(Add(hlen, 1))
+//                 MemoryCopy(home, Add(buf, start), hlen)
+//                 SetByte(home, hlen, 0)
+//                 Deallocate(buf, RelConst.ENV_BUF)
+//                 RelState.home = home
+//                 ReturnValue(home)
+//             }
+
+//             // Skip to next null-terminated entry
+//             WhileLoop And(LessThan(i, n), NotEqual(GetByte(buf, i), 0)) {
+//                 i = Add(i, 1)
+//             }
+//             i = Add(i, 1)
+//         }
+
+//         Deallocate(buf, RelConst.ENV_BUF)
+//         ReturnValue(0)
+//     }
+// }
+
+
+// // =============================================================================
+// // PATH HELPERS
+// // =============================================================================
+// Function.Path_Join {
+//     Input: a: Address
+//     Input: b: Address
+//     Output: Address
+//     Body: {
+//         alen = StringLength(a)
+//         blen = StringLength(b)
+
+//         // If a ends with /, don't double up
+//         needs_sep = 1
+//         IfCondition GreaterThan(alen, 0) ThenBlock: {
+//             IfCondition EqualTo(GetByte(a, Subtract(alen, 1)), 47) ThenBlock: {
+//                 needs_sep = 0
+//             }
+//         }
+//         IfCondition EqualTo(alen, 0) ThenBlock: { needs_sep = 0 }
+
+//         total = Add(Add(alen, blen), Add(needs_sep, 1))
+//         out = Allocate(total)
+//         MemoryCopy(out, a, alen)
+//         IfCondition EqualTo(needs_sep, 1) ThenBlock: {
+//             SetByte(out, alen, 47)
+//             MemoryCopy(Add(out, Add(alen, 1)), b, blen)
+//             SetByte(out, Add(alen, Add(blen, 1)), 0)
+//         } ElseBlock: {
+//             MemoryCopy(Add(out, alen), b, blen)
+//             SetByte(out, Add(alen, blen), 0)
+//         }
+//         ReturnValue(out)
+//     }
+// }
+
+// Function.Path_Basename {
+//     Input: p: Address
+//     Output: Address
+//     Body: {
+//         plen = StringLength(p)
+//         // Walk back from the end to find the last '/'
+//         i = Subtract(plen, 1)
+//         last_slash = -1
+//         WhileLoop GreaterEqual(i, 0) {
+//             IfCondition EqualTo(GetByte(p, i), 47) ThenBlock: {
+//                 last_slash = i
+//                 i = -1
+//             } ElseBlock: {
+//                 i = Subtract(i, 1)
+//             }
+//         }
+//         start = Add(last_slash, 1)
+//         blen = Subtract(plen, start)
+//         out = Allocate(Add(blen, 1))
+//         MemoryCopy(out, Add(p, start), blen)
+//         SetByte(out, blen, 0)
+//         ReturnValue(out)
+//     }
+// }
+
+// Function.Path_Ext {
+//     Input: p: Address
+//     Output: Address
+//     Body: {
+//         plen = StringLength(p)
+//         // Walk back to find last '.', stopping if we hit a '/' first
+//         i = Subtract(plen, 1)
+//         dot = -1
+//         WhileLoop GreaterEqual(i, 0) {
+//             ch = GetByte(p, i)
+//             IfCondition EqualTo(ch, 47) ThenBlock: { i = -1 }
+//             IfCondition EqualTo(ch, 46) ThenBlock: {
+//                 dot = i
+//                 i = -1
+//             }
+//             IfCondition GreaterEqual(i, 0) ThenBlock: {
+//                 i = Subtract(i, 1)
+//             }
+//         }
+//         IfCondition LessThan(dot, 0) ThenBlock: {
+//             out = Allocate(1)
+//             SetByte(out, 0, 0)
+//             ReturnValue(out)
+//         }
+//         elen = Subtract(plen, dot)
+//         out = Allocate(Add(elen, 1))
+//         MemoryCopy(out, Add(p, dot), elen)
+//         SetByte(out, elen, 0)
+//         ReturnValue(out)
+//     }
+// }
+
+
+// // =============================================================================
+// // FILE I/O — thin syscall wrappers
+// // =============================================================================
+// Function.FS_Open {
+//     Input: path: Address
+//     Input: flags: Integer
+//     Input: mode: Integer
+//     Output: Integer
+//     Body: {
+//         fd = SystemCall(RelSys.OPEN, path, flags, mode)
+//         ReturnValue(fd)
+//     }
+// }
+
+// Function.FS_Read {
+//     Input: fd: Integer
+//     Input: buf: Address
+//     Input: n: Integer
+//     Output: Integer
+//     Body: {
+//         r = SystemCall(RelSys.READ, fd, buf, n)
+//         ReturnValue(r)
+//     }
+// }
+
+// Function.FS_Write {
+//     Input: fd: Integer
+//     Input: buf: Address
+//     Input: n: Integer
+//     Output: Integer
+//     Body: {
+//         w = SystemCall(RelSys.WRITE, fd, buf, n)
+//         ReturnValue(w)
+//     }
+// }
+
+// Function.FS_Close {
+//     Input: fd: Integer
+//     Body: {
+//         SystemCall(RelSys.CLOSE, fd)
+//     }
+// }
+
+// // stat(path) -> mtime (seconds), or -1 if path missing.
+// // Mode is reported via the side-effect FixedPool RelState.last_mode so callers
+// // that need both don't have to stat twice.
+// Function.FS_Stat {
+//     Input: path: Address
+//     Output: Integer
+//     Body: {
+//         statbuf = Allocate(144)
+//         rc = SystemCall(RelSys.STAT, path, statbuf, 0)
+//         IfCondition LessThan(rc, 0) ThenBlock: {
+//             Deallocate(statbuf, 144)
+//             ReturnValue(-1)
+//         }
+//         mtime = Dereference(Add(statbuf, RelConst.ST_MTIME_OFF))
+//         mode = Dereference(Add(statbuf, RelConst.ST_MODE_OFF))
+//         Deallocate(statbuf, 144)
+//         RelState.last_mode = mode
+//         ReturnValue(mtime)
+//     }
+// }
+
+// Function.FS_IsDir {
+//     Input: path: Address
+//     Output: Integer
+//     Body: {
+//         statbuf = Allocate(144)
+//         rc = SystemCall(RelSys.STAT, path, statbuf, 0)
+//         IfCondition LessThan(rc, 0) ThenBlock: {
+//             Deallocate(statbuf, 144)
+//             ReturnValue(0)
+//         }
+//         mode = Dereference(Add(statbuf, RelConst.ST_MODE_OFF))
+//         Deallocate(statbuf, 144)
+//         masked = And(mode, RelSys.S_IFMT)
+//         IfCondition EqualTo(masked, RelSys.S_IFDIR) ThenBlock: { ReturnValue(1) }
+//         ReturnValue(0)
+//     }
+// }
+
+// Function.FS_Exists {
+//     Input: path: Address
+//     Output: Integer
+//     Body: {
+//         statbuf = Allocate(144)
+//         rc = SystemCall(RelSys.STAT, path, statbuf, 0)
+//         Deallocate(statbuf, 144)
+//         IfCondition LessThan(rc, 0) ThenBlock: { ReturnValue(0) }
+//         ReturnValue(1)
+//     }
+// }
+
+// Function.FS_Mkdir {
+//     Input: path: Address
+//     Output: Integer
+//     Body: {
+//         rc = SystemCall(RelSys.MKDIR, path, RelSys.MODE_DIR, 0)
+//         ReturnValue(rc)
+//     }
+// }
+
+// // Create directory, including any missing parents. Idempotent — returns 0
+// // when the leaf already exists.
+// Function.FS_MkdirP {
+//     Input: path: Address
+//     Output: Integer
+//     Body: {
+//         plen = StringLength(path)
+//         IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(0) }
+
+//         buf = Allocate(Add(plen, 1))
+//         MemoryCopy(buf, path, plen)
+//         SetByte(buf, plen, 0)
+
+//         i = 1
+//         WhileLoop LessThan(i, plen) {
+//             IfCondition EqualTo(GetByte(buf, i), 47) ThenBlock: {
+//                 SetByte(buf, i, 0)
+//                 IfCondition EqualTo(FS_Exists(buf), 0) ThenBlock: {
+//                     FS_Mkdir(buf)
+//                 }
+//                 SetByte(buf, i, 47)
+//             }
+//             i = Add(i, 1)
+//         }
+//         IfCondition EqualTo(FS_Exists(buf), 0) ThenBlock: {
+//             FS_Mkdir(buf)
+//         }
+//         Deallocate(buf, Add(plen, 1))
+//         ReturnValue(0)
+//     }
+// }
+
+// // Read entire file into a freshly-allocated NUL-terminated string.
+// // Returns 0 on missing/empty.
+// Function.FS_ReadAll {
+//     Input: path: Address
+//     Output: Address
+//     Body: {
+//         fd = FS_Open(path, RelSys.O_RDONLY, 0)
+//         IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+//         // Use fstat to get size (cheaper than seek+tell, and works on regular files).
+//         statbuf = Allocate(144)
+//         rc = SystemCall(RelSys.FSTAT, fd, statbuf, 0)
+//         IfCondition LessThan(rc, 0) ThenBlock: {
+//             Deallocate(statbuf, 144)
+//             FS_Close(fd)
+//             ReturnValue(0)
+//         }
+//         size = Dereference(Add(statbuf, RelConst.ST_SIZE_OFF))
+//         Deallocate(statbuf, 144)
+
+//         IfCondition LessEqual(size, 0) ThenBlock: {
+//             FS_Close(fd)
+//             empty = Allocate(1)
+//             SetByte(empty, 0, 0)
+//             ReturnValue(empty)
+//         }
+
+//         out = Allocate(Add(size, 1))
+//         total = 0
+//         WhileLoop LessThan(total, size) {
+//             r = FS_Read(fd, Add(out, total), Subtract(size, total))
+//             IfCondition LessEqual(r, 0) ThenBlock: { total = size }
+//             IfCondition GreaterThan(r, 0) ThenBlock: { total = Add(total, r) }
+//         }
+//         SetByte(out, total, 0)
+//         FS_Close(fd)
+//         ReturnValue(out)
+//     }
+// }
+
+// // Atomic write: write to <path>.tmp then rename.
+// Function.FS_WriteAtomic {
+//     Input: path: Address
+//     Input: content: Address
+//     Output: Integer
+//     Body: {
+//         clen = StringLength(content)
+//         plen = StringLength(path)
+//         tmp = Allocate(Add(plen, 5))
+//         MemoryCopy(tmp, path, plen)
+//         SetByte(tmp, plen, 46)        // .
+//         SetByte(tmp, Add(plen, 1), 116) // t
+//         SetByte(tmp, Add(plen, 2), 109) // m
+//         SetByte(tmp, Add(plen, 3), 112) // p
+//         SetByte(tmp, Add(plen, 4), 0)
+
+//         flags = Add(Add(RelSys.O_WRONLY, RelSys.O_CREAT), RelSys.O_TRUNC)
+//         fd = FS_Open(tmp, flags, RelSys.MODE_FILE)
+//         IfCondition LessThan(fd, 0) ThenBlock: {
+//             Deallocate(tmp, Add(plen, 5))
+//             ReturnValue(-1)
+//         }
+
+//         written = 0
+//         WhileLoop LessThan(written, clen) {
+//             w = FS_Write(fd, Add(content, written), Subtract(clen, written))
+//             IfCondition LessEqual(w, 0) ThenBlock: { written = clen }
+//             IfCondition GreaterThan(w, 0) ThenBlock: { written = Add(written, w) }
+//         }
+//         FS_Close(fd)
+
+//         rc = SystemCall(RelSys.RENAME, tmp, path, 0)
+//         Deallocate(tmp, Add(plen, 5))
+//         ReturnValue(rc)
+//     }
+// }
+
+
+// // =============================================================================
+// // ARGV — parse /proc/self/cmdline into RelState.argv (XArray of strings)
+// // =============================================================================
+// Function.Argv_Init {
+//     Body: {
+//         fd = FS_Open("/proc/self/cmdline", RelSys.O_RDONLY, 0)
+//         IfCondition LessThan(fd, 0) ThenBlock: {
+//             RelState.argv = XArray.XCreate(1)
+//             RelState.argc = 0
+//             ReturnValue(0)
+//         }
+
+//         buf = Allocate(RelConst.ENV_BUF)
+//         n = FS_Read(fd, buf, Subtract(RelConst.ENV_BUF, 1))
+//         FS_Close(fd)
+//         IfCondition LessThan(n, 0) ThenBlock: { n = 0 }
+//         SetByte(buf, n, 0)
+
+//         args = XArray.XCreate(8)
+//         start = 0
+//         i = 0
+//         WhileLoop LessThan(i, n) {
+//             IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: {
+//                 slen = Subtract(i, start)
+//                 arg = Allocate(Add(slen, 1))
+//                 MemoryCopy(arg, Add(buf, start), slen)
+//                 SetByte(arg, slen, 0)
+//                 XArray.XPush(args, arg)
+//                 start = Add(i, 1)
+//             }
+//             i = Add(i, 1)
+//         }
+//         Deallocate(buf, RelConst.ENV_BUF)
+
+//         RelState.argv = args
+//         RelState.argc = XArray.XSize(args)
+//     }
+// }
+
+// Function.Argv_Get {
+//     Input: idx: Integer
+//     Output: Address
+//     Body: {
+//         IfCondition Or(LessThan(idx, 0), GreaterEqual(idx, RelState.argc)) ThenBlock: {
+//             ReturnValue(0)
+//         }
+//         ReturnValue(XArray.XGet(RelState.argv, idx))
+//     }
+// }
+
+
+// // =============================================================================
+// // INDEX I/O
+// // =============================================================================
+// Function.Index_PathInit {
+//     Body: {
+//         IfCondition NotEqual(RelState.index_path, 0) ThenBlock: { ReturnValue(0) }
+//         home = Env_LoadHome()
+//         IfCondition EqualTo(home, 0) ThenBlock: { home = StringConcat("/tmp", "") }
+
+//         claude_dir = Path_Join(home, ".claude")
+//         store = Path_Join(claude_dir, "relmem")
+//         Deallocate(claude_dir, 0)
+//         idx = Path_Join(store, "index.json")
+
+//         RelState.store_dir = store
+//         RelState.index_path = idx
+//     }
+// }
+
+// // Load the index. On any error, returns an empty {projects: {}}.
+// Function.Index_Load {
+//     Output: Address
+//     Body: {
+//         Index_PathInit()
+//         content = FS_ReadAll(RelState.index_path)
+//         IfCondition EqualTo(content, 0) ThenBlock: {
+//             ReturnValue(Index_Empty())
+//         }
+//         IfCondition EqualTo(StringLength(content), 0) ThenBlock: {
+//             Deallocate(content, 0)
+//             ReturnValue(Index_Empty())
+//         }
+//         tagged = ParseJSON(content)
+//         Deallocate(content, 0)
+//         IfCondition EqualTo(tagged, 0) ThenBlock: {
+//             Err_Str("warning: index corrupt, starting fresh\n")
+//             ReturnValue(Index_Empty())
+//         }
+//         ReturnValue(tagged)
+//     }
+// }
+
+// Function.Index_Empty {
+//     Output: Address
+//     Body: {
+//         root = JSON.NewObject()
+//         projects = JSON.NewObject()
+//         JSON.SetObject(root, "projects", projects)
+//         ReturnValue(JSON.Tag(JType.OBJECT, root))
+//     }
+// }
+
+// Function.Index_Save {
+//     Input: tagged: Address
+//     Output: Integer
+//     Body: {
+//         Index_PathInit()
+//         FS_MkdirP(RelState.store_dir)
+
+//         obj = JSON.AsObject(tagged)
+//         text = JSON.SerializeObject(obj)
+//         rc = FS_WriteAtomic(RelState.index_path, text)
+//         Deallocate(text, 0)
+//         ReturnValue(rc)
+//     }
+// }
+
+// Function.Index_Projects {
+//     Input: tagged: Address
+//     Output: Address
+//     Body: {
+//         root = JSON.AsObject(tagged)
+//         projects_tag = JSON.GetObject(root, "projects")
+//         IfCondition EqualTo(projects_tag, 0) ThenBlock: { ReturnValue(0) }
+//         ReturnValue(projects_tag)
+//     }
+// }
+
+
+// // =============================================================================
+// // COMMAND: status
+// // =============================================================================
+// Function.Cmd_Status {
+//     Output: Integer
+//     Body: {
+//         Index_PathInit()
+//         Out_Str("store: ")
+//         Out_Str(RelState.index_path)
+//         Out_Newline()
+
+//         idx = Index_Load()
+//         projects = Index_Projects(idx)
+//         IfCondition EqualTo(projects, 0) ThenBlock: {
+//             Out_Str("  (empty)")
+//             Out_Newline()
+//             ReturnValue(0)
+//         }
+//         keys = XSHash.XKeys(projects)
+//         n = XArray.XSize(keys)
+//         IfCondition EqualTo(n, 0) ThenBlock: {
+//             Out_Str("  (empty)")
+//             Out_Newline()
+//             ReturnValue(0)
+//         }
+
+//         Out_Str("projects: ")
+//         Out_Int(n)
+//         Out_Newline()
+
+//         i = 0
+//         WhileLoop LessThan(i, n) {
+//             proot = XArray.XGet(keys, i)
+//             base = Path_Basename(proot)
+//             proj_tag = XSHash.XLookup(projects, proot)
+
+//             Out_Str("  ")
+//             Out_Str(base)
+//             Out_Str("  ")
+
+//             // Count files + symbols
+//             nfiles = 0
+//             nsyms = 0
+//             IfCondition NotEqual(proj_tag, 0) ThenBlock: {
+//                 proj = JSON.AsObject(proj_tag)
+//                 files_tag = JSON.GetObject(proj, "files")
+//                 IfCondition NotEqual(files_tag, 0) ThenBlock: {
+//                     fkeys = XSHash.XKeys(files_tag)
+//                     nfiles = XArray.XSize(fkeys)
+//                     j = 0
+//                     WhileLoop LessThan(j, nfiles) {
+//                         fname = XArray.XGet(fkeys, j)
+//                         f_tag = XSHash.XLookup(files_tag, fname)
+//                         IfCondition NotEqual(f_tag, 0) ThenBlock: {
+//                             f_obj = JSON.AsObject(f_tag)
+//                             nodes_tag = JSON.GetObject(f_obj, "nodes")
+//                             IfCondition NotEqual(nodes_tag, 0) ThenBlock: {
+//                                 nkeys = XSHash.XKeys(nodes_tag)
+//                                 nsyms = Add(nsyms, XArray.XSize(nkeys))
+//                                 XArray.XDestroy(nkeys)
+//                             }
+//                         }
+//                         j = Add(j, 1)
+//                     }
+//                     XArray.XDestroy(fkeys)
+//                 }
+//             }
+
+//             Out_Int(nfiles)
+//             Out_Str(" files  ")
+//             Out_Int(nsyms)
+//             Out_Str(" symbols")
+//             Out_Newline()
+
+//             Deallocate(base, 0)
+//             i = Add(i, 1)
+//         }
+//         XArray.XDestroy(keys)
+//         ReturnValue(0)
+//     }
+// }
+
+
+// // =============================================================================
+// // USAGE / HELP
+// // =============================================================================
+// Function.Show_Usage {
+//     Body: {
+//         Err_Str("usage: relmem.x <command> [args...]\n\n")
+//         Err_Str("commands:\n")
+//         Err_Str("  index <dir> [--ext py,ailang,sh,md,c,zig,html,json]\n")
+//         Err_Str("  summary [--project <path>]\n")
+//         Err_Str("  query <kw>... [--limit N]\n")
+//         Err_Str("  focus <file> <symbol>\n")
+//         Err_Str("  symbols <file>\n")
+//         Err_Str("  where <symbol>\n")
+//         Err_Str("  callers <symbol> [--limit N]\n")
+//         Err_Str("  calls <symbol>\n")
+//         Err_Str("  forget <file>\n")
+//         Err_Str("  drop [--project <path>]\n")
+//         Err_Str("  status\n")
+//     }
+// }
+
+
+// // =============================================================================
+// // MAIN
+// // =============================================================================
+// SubRoutine.Main {
+//     Argv_Init()
+
+//     cmd = Argv_Get(1)
+//     IfCondition EqualTo(cmd, 0) ThenBlock: {
+//         Show_Usage()
+//         RelState.exit_code = 2
+//         SystemCall(RelSys.EXIT, RelState.exit_code)
+//     }
+
+//     IfCondition StringEquals(cmd, "status") ThenBlock: {
+//         Cmd_Status()
+//         SystemCall(RelSys.EXIT, RelState.exit_code)
+//     }
+
+//     Err_Str("relmem: unknown command: ")
+//     Err_Str(cmd)
+//     Err_Str("\n")
+//     Show_Usage()
+//     SystemCall(RelSys.EXIT, 2)
+// }

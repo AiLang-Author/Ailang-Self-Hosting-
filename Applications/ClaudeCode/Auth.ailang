@@ -1,0 +1,310 @@
+// Auth.ailang — ClaudeCode auth dispatcher.
+//
+// Decides between subscription OAuth (claude.ai manual-paste flow) and
+// console API key. Designed so the caller (ClaudeCode.ailang) can detect
+// "needs setup" and run a bootstrap flow rather than just erroring out.
+//
+// Return shape from Auth.RunOAuthFlow / Auth.RunAPIKeyFlow:
+//   {
+//     "status":     "ok" | "needs_setup_oauth" | "needs_setup_apikey" | "error",
+//     "mode":       "oauth" | "apikey"           (only when status=="ok")
+//     "credential": "<bearer-or-key>"            (only when status=="ok")
+//     "message":    "<human-readable detail>"    (always present)
+//   }
+//
+// OAuth flow (manual paste, matches official `claude` CLI behavior):
+//   1. Open browser to claude.ai/oauth/authorize?... with code=true and a
+//      redirect_uri pointing to a server-rendered "copy this code" page.
+//   2. User authorizes, browser shows a one-time code.
+//   3. User pastes the code back into the terminal.
+//   4. Exchange code (with PKCE verifier) for access+refresh tokens.
+//   5. Cache tokens at ~/.claudecode/oauth_tokens.json (mode 0600).
+//
+// Why not localhost callback: Anthropic's subscription OAuth (claude.ai) is
+// configured for a fixed remote redirect_uri. They do strict redirect_uri
+// matching, and the registered URI is hosted on platform.claude.com — not
+// localhost. The manual-paste pattern is the only one that works with their
+// current OAuth config.
+//
+// PR note: this client uses the same client_id as the official Claude Code
+// CLI because Anthropic doesn't expose a third-party-registration path for
+// subscription scopes. The PR proposes adding such a path. See
+// ClaudeCode.md "OAuth & client_id reuse" for the full transparency note.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.HTTP
+LibraryImport.OAuth
+
+FixedPool.AuthSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_MKDIR":     Initialize=83
+}
+
+FixedPool.AuthConst {
+    "TOKEN_LEEWAY":  Initialize=60      // refresh if within 60s of expiry
+    "PASTE_BUF":     Initialize=4096    // max length for pasted code
+}
+
+// =============================================================================
+// RESULT HELPER
+// =============================================================================
+Function.Auth_Result {
+    Input: status: Address
+    Input: mode: Address
+    Input: credential: Address
+    Input: message: Address
+    Output: Address
+    Body: {
+        out = JSON.NewObject()
+        JSON.SetString(out, "status", status)
+        IfCondition NotEqual(mode, 0) ThenBlock: { JSON.SetString(out, "mode", mode) }
+        IfCondition NotEqual(credential, 0) ThenBlock: { JSON.SetString(out, "credential", credential) }
+        IfCondition NotEqual(message, 0) ThenBlock: { JSON.SetString(out, "message", message) }
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// CONFIG LOAD/WRITE
+// =============================================================================
+Function.Auth.LoadConfig {
+    Input: path: Address
+    Output: Address
+    Body: { ReturnValue(OAuth.LoadTokens(path)) }
+}
+
+// Write the default OAuth config. All values here come from observation of
+// the official `claude` CLI's OAuth handshake. They are checked into the
+// default config (NOT hardcoded into source) so users can edit them without
+// recompiling — and so the same binary can be retargeted at a different
+// OAuth provider by editing one file.
+Function.Auth.WriteDefaultOAuthConfig {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        cfg = JSON.NewObject()
+        // Endpoints — discovered from the official Claude CLI binary
+        // (strings extraction + observation of /login flow). Sourced from
+        // /tmp/oauth_urls.txt, captured 2026-04-28.
+        JSON.SetString(cfg, "authorize_endpoint", "https://claude.ai/oauth/authorize")
+        JSON.SetString(cfg, "token_endpoint",     "https://platform.claude.com/v1/oauth/token")
+        // The static client_id used by the official Claude Code CLI for
+        // subscription auth. See ClaudeCode.md OAuth section for the
+        // attribution + transparency note.
+        JSON.SetString(cfg, "client_id", "9d1c250a-e61b-44d9-88ed-5944d1962f5e")
+        // Server-hosted manual-paste redirect.
+        JSON.SetString(cfg, "redirect_uri", "https://platform.claude.com/oauth/code/callback")
+        // Scopes — full set the official CLI requests (subscription billing requires user:inference)
+        scopes = JSON.NewArray()
+        JSON.PushString(scopes, "org:create_api_key")
+        JSON.PushString(scopes, "user:profile")
+        JSON.PushString(scopes, "user:inference")
+        JSON.PushString(scopes, "user:sessions:claude_code")
+        JSON.PushString(scopes, "user:mcp_servers")
+        JSON.PushString(scopes, "user:file_upload")
+        JSON.SetArray(cfg, "scopes", scopes)
+        // Browser launcher
+        JSON.SetString(cfg, "browser_command", "wslview")
+        // Manual paste flow — append "code=true" to the authorize URL so
+        // claude.ai renders the "copy code" page rather than auto-redirecting.
+        JSON.SetBool(cfg, "manual_paste_flow", 1)
+        ReturnValue(OAuth.SaveTokens(path, cfg))
+    }
+}
+
+// =============================================================================
+// READ ONE LINE FROM STDIN — for the user's pasted code
+// =============================================================================
+Function.Auth_ReadLine {
+    Input: buf: Address
+    Input: maxlen: Integer
+    Output: Integer
+    Body: {
+        used = 0
+        WhileLoop LessThan(used, Subtract(maxlen, 1)) {
+            n = SystemCall(AuthSys.SYS_READ, 0, Add(buf, used), 1, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            ch = GetByte(buf, used)
+            IfCondition EqualTo(ch, 10) ThenBlock: { BreakLoop }
+            used = Add(used, 1)
+        }
+        // Strip trailing CR if present
+        IfCondition GreaterThan(used, 0) ThenBlock: {
+            last = GetByte(buf, Subtract(used, 1))
+            IfCondition EqualTo(last, 13) ThenBlock: { used = Subtract(used, 1) }
+        }
+        SetByte(buf, used, 0)
+        ReturnValue(used)
+    }
+}
+
+// =============================================================================
+// MANUAL-PASTE BROWSER FLOW
+// Match the official Claude CLI's UX:
+//   1. Print "opening browser..." with the URL fallback
+//   2. User approves at claude.ai, copies the displayed code
+//   3. Terminal prompts "paste code: ", reads pasted line
+//   4. Exchange code+verifier+redirect_uri for tokens
+// =============================================================================
+Function.Auth_RunPasteFlow {
+    Input: config: Address
+    Output: Address
+    Body: {
+        authorize_endpoint = JSON.GetString(config, "authorize_endpoint")
+        token_endpoint     = JSON.GetString(config, "token_endpoint")
+        client_id          = JSON.GetString(config, "client_id")
+        redirect_uri       = JSON.GetString(config, "redirect_uri")
+        scopes             = JSON.GetArray(config, "scopes")
+
+        IfCondition Or(EqualTo(authorize_endpoint, 0), EqualTo(token_endpoint, 0)) ThenBlock: {
+            PrintMessage("[auth] config missing authorize_endpoint or token_endpoint\n")
+            ReturnValue(0)
+        }
+        IfCondition Or(EqualTo(client_id, 0), EqualTo(redirect_uri, 0)) ThenBlock: {
+            PrintMessage("[auth] config missing client_id or redirect_uri\n")
+            ReturnValue(0)
+        }
+
+        // PKCE
+        pkce = OAuth.GeneratePKCE()
+        IfCondition EqualTo(pkce, 0) ThenBlock: {
+            PrintMessage("[auth] PKCE generation failed (sha256sum/xxd missing?)\n")
+            ReturnValue(0)
+        }
+        verifier = JSON.GetString(pkce, "verifier")
+        challenge = JSON.GetString(pkce, "challenge")
+
+        // State (random, anti-CSRF)
+        state_pkce = OAuth.GeneratePKCE()
+        state = "x"
+        IfCondition NotEqual(state_pkce, 0) ThenBlock: {
+            sv = JSON.GetString(state_pkce, "verifier")
+            IfCondition NotEqual(sv, 0) ThenBlock: { state = sv }
+        }
+
+        // Build authorize URL with the trailing &code=true if requested
+        url = OAuth.BuildAuthorizeURL(authorize_endpoint, client_id, redirect_uri, scopes, state, challenge)
+        IfCondition EqualTo(JSON.GetBool(config, "manual_paste_flow"), 1) ThenBlock: {
+            url = StringConcat(url, "&code=true")
+        }
+
+        PrintMessage("\n[auth] Opening browser to:\n  ")
+        PrintMessage(url)
+        PrintMessage("\n[auth] If the browser doesn't open, paste that URL into one manually.\n\n")
+
+        browser_cmd = JSON.GetString(config, "browser_command")
+        OAuth.LaunchBrowser(url, browser_cmd)
+
+        PrintMessage("After authorizing, claude.ai will display a one-time code.\n")
+        PrintMessage("Paste that code here and press Enter.\n")
+        PrintMessage("> ")
+
+        buf = Allocate(AuthConst.PASTE_BUF)
+        n = Auth_ReadLine(buf, AuthConst.PASTE_BUF)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, AuthConst.PASTE_BUF)
+            PrintMessage("[auth] no code entered\n")
+            ReturnValue(0)
+        }
+
+        // The displayed code may be of the form "<code>#<state>". Split if present.
+        code_only = buf
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(GetByte(buf, i), 35) ThenBlock: {   // '#' = 35
+                SetByte(buf, i, 0)
+                BreakLoop
+            }
+            i = Add(i, 1)
+        }
+
+        // Exchange
+        tokens = OAuth.ExchangeCode(token_endpoint, client_id, code_only, redirect_uri, verifier)
+        Deallocate(buf, AuthConst.PASTE_BUF)
+        IfCondition EqualTo(tokens, 0) ThenBlock: {
+            PrintMessage("[auth] token exchange failed (invalid or expired code?)\n")
+            ReturnValue(0)
+        }
+        PrintMessage("[auth] authenticated successfully\n")
+        ReturnValue(tokens)
+    }
+}
+
+// =============================================================================
+// PUBLIC: RUN FLOW for option 1 (OAuth subscription)
+// Order:
+//   1. Load config — if missing, return needs_setup_oauth
+//   2. Try cached tokens (fresh) — return ok if valid
+//   3. Try refresh — return ok if refresh worked
+//   4. Run interactive paste flow
+// =============================================================================
+Function.Auth.RunOAuthFlow {
+    Input: config_path: Address
+    Input: tokens_path: Address
+    Output: Address
+    Body: {
+        config = Auth.LoadConfig(config_path)
+        IfCondition EqualTo(config, 0) ThenBlock: {
+            ReturnValue(Auth_Result("needs_setup_oauth", 0, 0, "no config file at the given path"))
+        }
+        client_id = JSON.GetString(config, "client_id")
+        token_endpoint = JSON.GetString(config, "token_endpoint")
+        IfCondition Or(EqualTo(client_id, 0), EqualTo(token_endpoint, 0)) ThenBlock: {
+            ReturnValue(Auth_Result("needs_setup_oauth", 0, 0, "config missing required fields (client_id, token_endpoint)"))
+        }
+
+        // Try existing tokens
+        tokens = OAuth.LoadTokens(tokens_path)
+        IfCondition NotEqual(tokens, 0) ThenBlock: {
+            IfCondition EqualTo(OAuth.IsExpired(tokens, AuthConst.TOKEN_LEEWAY), 0) ThenBlock: {
+                access = OAuth.GetAccessToken(tokens)
+                IfCondition NotEqual(access, 0) ThenBlock: {
+                    ReturnValue(Auth_Result("ok", "oauth", access, "using cached subscription token"))
+                }
+            }
+            // Expired — refresh
+            refresh_tok = OAuth.GetRefreshToken(tokens)
+            IfCondition NotEqual(refresh_tok, 0) ThenBlock: {
+                new_tokens = OAuth.RefreshTokens(token_endpoint, client_id, refresh_tok)
+                IfCondition NotEqual(new_tokens, 0) ThenBlock: {
+                    OAuth.SaveTokens(tokens_path, new_tokens)
+                    access = OAuth.GetAccessToken(new_tokens)
+                    ReturnValue(Auth_Result("ok", "oauth", access, "refreshed subscription token"))
+                }
+            }
+            // Refresh failed; fall through to interactive
+        }
+
+        // Interactive paste flow
+        new_tokens = Auth_RunPasteFlow(config)
+        IfCondition EqualTo(new_tokens, 0) ThenBlock: {
+            ReturnValue(Auth_Result("error", 0, 0, "OAuth paste flow failed; see messages above"))
+        }
+        OAuth.SaveTokens(tokens_path, new_tokens)
+        access = OAuth.GetAccessToken(new_tokens)
+        ReturnValue(Auth_Result("ok", "oauth", access, "authenticated via browser + paste"))
+    }
+}
+
+// =============================================================================
+// PUBLIC: RUN FLOW for option 2 (API key from env)
+// =============================================================================
+Function.Auth.RunAPIKeyFlow {
+    Input: api_key: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(api_key, 0) ThenBlock: {
+            ReturnValue(Auth_Result("needs_setup_apikey", 0, 0, "ANTHROPIC_API_KEY not set"))
+        }
+        IfCondition LessEqual(StringLength(api_key), 0) ThenBlock: {
+            ReturnValue(Auth_Result("needs_setup_apikey", 0, 0, "ANTHROPIC_API_KEY is empty"))
+        }
+        ReturnValue(Auth_Result("ok", "apikey", api_key, "using ANTHROPIC_API_KEY"))
+    }
+}

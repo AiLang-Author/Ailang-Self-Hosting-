@@ -1,0 +1,509 @@
+// Library.HTTP.ailang — generic HTTP/1.1 client (curl-backed).
+//
+// Companion to Library.HTTPServer.ailang (which keeps server-side code).
+// This file owns the *client* side — outbound requests, including streaming
+// POST for SSE / chunked responses (used by Claude Code's Anthropic loop,
+// any future REST consumer, Olympus push, etc.).
+//
+// Implementation is a thin wrapper over `curl` invoked via fork+exec with
+// stdin/stdout pipes. Curl handles the hard parts (TLS 1.3, IPv6, redirects,
+// chunked encoding, keepalive) so we don't have to. A future native TLS
+// rewrite is a drop-in replacement; the public API never mentions curl.
+//
+// Public API:
+//   HTTP.Get(url, headers_str)               -> body_str (one-shot)
+//   HTTP.Post(url, headers_str, body_str)    -> body_str (one-shot)
+//   HTTP.PostStream(url, headers_str, body)  -> stream_handle
+//   HTTP.ReadLine(handle, buf, maxlen)       -> line_len (0 = empty line, -1 = EOF)
+//   HTTP.CloseStream(handle)
+//
+// headers_str format: newline-separated header lines, one per line.
+//   "Authorization: Bearer sk-...\nContent-Type: application/json"
+// Each line becomes a `-H "<line>"` argument to curl. Lines may not
+// contain newlines themselves (obviously). Empty headers_str is fine.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.HSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_CLOSE":     Initialize=3
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_WAIT4":     Initialize=61
+    "SYS_FCNTL":     Initialize=72
+}
+
+FixedPool.HFcntl {
+    "F_GETFL":       Initialize=3
+    "F_SETFL":       Initialize=4
+    "O_NONBLOCK":    Initialize=2048
+}
+
+FixedPool.HConst {
+    "MAX_HEADERS":   Initialize=32
+    "READ_BUF_SZ":   Initialize=8192
+    "CURL_PATH":     Initialize=0, CanChange=True
+}
+
+// Stream handle layout (40 bytes):
+//   [0]   stdin_fd  (dword)
+//   [4]   stdout_fd (dword)
+//   [8]   pid       (qword)
+//   [16]  line_buf  (Address)
+//   [24]  buf_pos   (dword) — read cursor in line_buf
+//   [28]  buf_end   (dword) — end of valid data in line_buf
+//   [32]  eof_flag  (dword) — 1 once read returned 0/err
+//   [36]  reserved  (dword)
+FixedPool.HHandleOff {
+    "STDIN_FD":      Initialize=0
+    "STDOUT_FD":     Initialize=4
+    "PID":           Initialize=8
+    "LINE_BUF":      Initialize=16
+    "BUF_POS":       Initialize=24
+    "BUF_END":       Initialize=28
+    "EOF":           Initialize=32
+}
+
+// =============================================================================
+// HEADER COUNTING / SCANNING
+// =============================================================================
+
+// Count non-empty header lines in headers_str. headers_str may be 0/null.
+Function.HTTP_CountHeaders {
+    Input: hdr: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(hdr, 0) ThenBlock: { ReturnValue(0) }
+        n = 0
+        i = 0
+        line_has_text = 0
+        WhileLoop 1 {
+            ch = GetByte(hdr, i)
+            IfCondition EqualTo(ch, 0) ThenBlock: {
+                IfCondition EqualTo(line_has_text, 1) ThenBlock: { n = Add(n, 1) }
+                ReturnValue(n)
+            }
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                IfCondition EqualTo(line_has_text, 1) ThenBlock: { n = Add(n, 1) }
+                line_has_text = 0
+            } ElseBlock: {
+                line_has_text = 1
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(n)
+    }
+}
+
+// Allocate a fresh null-terminated copy of headers_str[start..end].
+Function.HTTP_DupSlice {
+    Input: src: Address
+    Input: start: Integer
+    Input: len: Integer
+    Output: Address
+    Body: {
+        out = Allocate(Add(len, 1))
+        i = 0
+        WhileLoop LessThan(i, len) {
+            SetByte(out, i, GetByte(src, Add(start, i)))
+            i = Add(i, 1)
+        }
+        SetByte(out, len, 0)
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// ARGV BUILDER — assembles the curl command line
+// =============================================================================
+// Layout:
+//   ["/usr/bin/curl", "-sS", "-N",
+//    [POST: "-X", "POST", "--data-binary", "@-"],
+//    [for each header: "-H", "<header>"],
+//    "<url>", 0]
+//
+// Returns argv pointer (caller frees argv but NOT the duped header strings,
+// which must outlive the child exec — they're freed by HTTP_FreeArgvAfterFork).
+Function.HTTP_BuildArgv {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: with_post: Integer
+    Output: Address
+    Body: {
+        n_hdr = HTTP_CountHeaders(headers_str)
+
+        // Slot count: curl, -sS, -N, [optional 4 POST args], 2*n_hdr (-H VAL), url, NULL
+        post_slots = 0
+        IfCondition EqualTo(with_post, 1) ThenBlock: { post_slots = 4 }
+        slots = Add(Add(Add(3, post_slots), Multiply(n_hdr, 2)), 2)
+        bytes = Multiply(slots, 8)
+
+        argv = Allocate(bytes)
+        // Default to no curl path override
+        IfCondition EqualTo(HConst.CURL_PATH, 0) ThenBlock: {
+            HConst.CURL_PATH = "/usr/bin/curl"
+        }
+        idx = 0
+        StoreValue(Add(argv, Multiply(idx, 8)), HConst.CURL_PATH)
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "-sS")
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "-N")
+        idx = Add(idx, 1)
+        IfCondition EqualTo(with_post, 1) ThenBlock: {
+            StoreValue(Add(argv, Multiply(idx, 8)), "-X")
+            idx = Add(idx, 1)
+            StoreValue(Add(argv, Multiply(idx, 8)), "POST")
+            idx = Add(idx, 1)
+            StoreValue(Add(argv, Multiply(idx, 8)), "--data-binary")
+            idx = Add(idx, 1)
+            StoreValue(Add(argv, Multiply(idx, 8)), "@-")
+            idx = Add(idx, 1)
+        }
+
+        // Walk headers_str line-by-line, allocating a duplicate per line
+        IfCondition NotEqual(headers_str, 0) ThenBlock: {
+            i = 0
+            line_start = 0
+            WhileLoop 1 {
+                ch = GetByte(headers_str, i)
+                at_end = 0
+                IfCondition EqualTo(ch, 0) ThenBlock: { at_end = 1 }
+                IfCondition Or(EqualTo(ch, 10), EqualTo(at_end, 1)) ThenBlock: {
+                    line_len = Subtract(i, line_start)
+                    IfCondition GreaterThan(line_len, 0) ThenBlock: {
+                        line = HTTP_DupSlice(headers_str, line_start, line_len)
+                        StoreValue(Add(argv, Multiply(idx, 8)), "-H")
+                        idx = Add(idx, 1)
+                        StoreValue(Add(argv, Multiply(idx, 8)), line)
+                        idx = Add(idx, 1)
+                    }
+                    line_start = Add(i, 1)
+                }
+                IfCondition EqualTo(at_end, 1) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+        }
+
+        StoreValue(Add(argv, Multiply(idx, 8)), url)
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), 0)
+
+        ReturnValue(argv)
+    }
+}
+
+// =============================================================================
+// FORK+EXEC CURL — returns stream handle, or 0 on failure.
+// If body_str non-zero, body is written to curl's stdin and stdin closed.
+// =============================================================================
+Function.HTTP_SpawnCurl {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: body_str: Address
+    Input: with_post: Integer
+    Output: Address
+    Body: {
+        // stdin pipe (parent writes, child reads)
+        in_pf = Allocate(8)
+        ipr = SystemCall(HSys.SYS_PIPE, in_pf, 0, 0, 0, 0)
+        IfCondition LessThan(ipr, 0) ThenBlock: {
+            Deallocate(in_pf, 8)
+            ReturnValue(0)
+        }
+        in_read  = Dereference(in_pf, "dword")
+        in_write = Dereference(Add(in_pf, 4), "dword")
+        Deallocate(in_pf, 8)
+
+        // stdout pipe (child writes, parent reads)
+        out_pf = Allocate(8)
+        opr = SystemCall(HSys.SYS_PIPE, out_pf, 0, 0, 0, 0)
+        IfCondition LessThan(opr, 0) ThenBlock: {
+            SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
+            Deallocate(out_pf, 8)
+            ReturnValue(0)
+        }
+        out_read  = Dereference(out_pf, "dword")
+        out_write = Dereference(Add(out_pf, 4), "dword")
+        Deallocate(out_pf, 8)
+
+        argv = HTTP_BuildArgv(url, headers_str, with_post)
+
+        pid = SystemCall(HSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, out_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, out_write, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child
+            SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, out_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_DUP2, in_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_DUP2, out_write, 1, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, out_write, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_EXECVE, HConst.CURL_PATH, argv, 0)
+            SystemCall(HSys.SYS_EXIT, 1, 0, 0, 0, 0)
+        }
+
+        // Parent
+        SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
+        SystemCall(HSys.SYS_CLOSE, out_write, 0, 0, 0, 0)
+
+        // Write body if any, then close stdin so curl sends and waits for response
+        IfCondition NotEqual(body_str, 0) ThenBlock: {
+            blen = StringLength(body_str)
+            IfCondition GreaterThan(blen, 0) ThenBlock: {
+                SystemCall(HSys.SYS_WRITE, in_write, body_str, blen, 0, 0)
+            }
+        }
+        SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
+
+        // Allocate handle
+        h = Allocate(40)
+        MemorySet(h, 0, 40)
+        StoreValue(Add(h, HHandleOff.STDIN_FD), -1, "dword")
+        StoreValue(Add(h, HHandleOff.STDOUT_FD), out_read, "dword")
+        StoreValue(Add(h, HHandleOff.PID), pid)
+        line_buf = Allocate(HConst.READ_BUF_SZ)
+        StoreValue(Add(h, HHandleOff.LINE_BUF), line_buf)
+        StoreValue(Add(h, HHandleOff.BUF_POS), 0, "dword")
+        StoreValue(Add(h, HHandleOff.BUF_END), 0, "dword")
+        StoreValue(Add(h, HHandleOff.EOF), 0, "dword")
+
+        ReturnValue(h)
+    }
+}
+
+// =============================================================================
+// PUBLIC: STREAMING POST
+// =============================================================================
+Function.HTTP.PostStream {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: body_str: Address
+    Output: Address
+    Body: {
+        ReturnValue(HTTP_SpawnCurl(url, headers_str, body_str, 1))
+    }
+}
+
+// =============================================================================
+// PUBLIC: READ ONE LINE FROM STREAM
+// Returns:
+//    >0 = number of bytes copied into caller's buf (newline stripped)
+//     0 = blank line (consumed \n only)
+//    -1 = EOF, no more data
+//
+// CR (\r) is stripped from the end if present (handles \r\n endings).
+// Lines longer than maxlen are truncated; the rest of the line is dropped.
+// =============================================================================
+Function.HTTP.ReadLine {
+    Input: handle: Address
+    Input: out_buf: Address
+    Input: maxlen: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(-1) }
+        line_buf = Dereference(Add(handle, HHandleOff.LINE_BUF))
+        fd = Dereference(Add(handle, HHandleOff.STDOUT_FD), "dword")
+
+        WhileLoop 1 {
+            pos = Dereference(Add(handle, HHandleOff.BUF_POS), "dword")
+            end = Dereference(Add(handle, HHandleOff.BUF_END), "dword")
+
+            // Search for newline in [pos, end)
+            scan = pos
+            found = -1
+            WhileLoop LessThan(scan, end) {
+                IfCondition EqualTo(GetByte(line_buf, scan), 10) ThenBlock: {
+                    found = scan
+                    BreakLoop
+                }
+                scan = Add(scan, 1)
+            }
+
+            IfCondition GreaterEqual(found, 0) ThenBlock: {
+                line_len = Subtract(found, pos)
+                // Strip trailing \r
+                IfCondition GreaterThan(line_len, 0) ThenBlock: {
+                    last = GetByte(line_buf, Subtract(found, 1))
+                    IfCondition EqualTo(last, 13) ThenBlock: {
+                        line_len = Subtract(line_len, 1)
+                    }
+                }
+                copy_n = line_len
+                IfCondition GreaterThan(copy_n, maxlen) ThenBlock: { copy_n = maxlen }
+                j = 0
+                WhileLoop LessThan(j, copy_n) {
+                    SetByte(out_buf, j, GetByte(line_buf, Add(pos, j)))
+                    j = Add(j, 1)
+                }
+                StoreValue(Add(handle, HHandleOff.BUF_POS), Add(found, 1), "dword")
+                ReturnValue(copy_n)
+            }
+
+            // No newline yet — refill the buffer
+            eof_flag = Dereference(Add(handle, HHandleOff.EOF), "dword")
+            IfCondition EqualTo(eof_flag, 1) ThenBlock: {
+                // Final partial line if any
+                tail_len = Subtract(end, pos)
+                IfCondition GreaterThan(tail_len, 0) ThenBlock: {
+                    copy_n = tail_len
+                    IfCondition GreaterThan(copy_n, maxlen) ThenBlock: { copy_n = maxlen }
+                    j = 0
+                    WhileLoop LessThan(j, copy_n) {
+                        SetByte(out_buf, j, GetByte(line_buf, Add(pos, j)))
+                        j = Add(j, 1)
+                    }
+                    StoreValue(Add(handle, HHandleOff.BUF_POS), end, "dword")
+                    ReturnValue(copy_n)
+                }
+                ReturnValue(-1)
+            }
+
+            // Compact buffer: move [pos,end) to [0, end-pos)
+            tail_len = Subtract(end, pos)
+            IfCondition GreaterThan(tail_len, 0) ThenBlock: {
+                k = 0
+                WhileLoop LessThan(k, tail_len) {
+                    SetByte(line_buf, k, GetByte(line_buf, Add(pos, k)))
+                    k = Add(k, 1)
+                }
+            }
+            StoreValue(Add(handle, HHandleOff.BUF_POS), 0, "dword")
+            StoreValue(Add(handle, HHandleOff.BUF_END), tail_len, "dword")
+
+            // Read more
+            free_space = Subtract(HConst.READ_BUF_SZ, tail_len)
+            IfCondition LessEqual(free_space, 0) ThenBlock: {
+                // Buffer full and no newline — return what we have, drop the rest
+                copy_n = HConst.READ_BUF_SZ
+                IfCondition GreaterThan(copy_n, maxlen) ThenBlock: { copy_n = maxlen }
+                j = 0
+                WhileLoop LessThan(j, copy_n) {
+                    SetByte(out_buf, j, GetByte(line_buf, j))
+                    j = Add(j, 1)
+                }
+                StoreValue(Add(handle, HHandleOff.BUF_POS), HConst.READ_BUF_SZ, "dword")
+                ReturnValue(copy_n)
+            }
+            n = SystemCall(HSys.SYS_READ, fd, Add(line_buf, tail_len), free_space, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                StoreValue(Add(handle, HHandleOff.EOF), 1, "dword")
+                // Loop around — next iteration handles tail or returns -1
+            } ElseBlock: {
+                StoreValue(Add(handle, HHandleOff.BUF_END), Add(tail_len, n), "dword")
+            }
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// PUBLIC: CLOSE STREAM
+// Closes fds, reaps the curl child, frees the handle.
+// =============================================================================
+Function.HTTP.CloseStream {
+    Input: handle: Address
+    Body: {
+        IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(0) }
+        fd = Dereference(Add(handle, HHandleOff.STDOUT_FD), "dword")
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            SystemCall(HSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        }
+        line_buf = Dereference(Add(handle, HHandleOff.LINE_BUF))
+        IfCondition NotEqual(line_buf, 0) ThenBlock: {
+            Deallocate(line_buf, HConst.READ_BUF_SZ)
+        }
+        // Reap child (non-blocking) — best effort
+        pid = Dereference(Add(handle, HHandleOff.PID))
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            status = Allocate(8)
+            SystemCall(HSys.SYS_WAIT4, pid, status, 0, 0, 0, 0)
+            Deallocate(status, 8)
+        }
+        Deallocate(handle, 40)
+    }
+}
+
+// =============================================================================
+// PUBLIC: ONE-SHOT GET — drains the response body into a single string.
+// Returns 0 on failure.
+// =============================================================================
+Function.HTTP.Get {
+    Input: url: Address
+    Input: headers_str: Address
+    Output: Address
+    Body: {
+        h = HTTP_SpawnCurl(url, headers_str, 0, 0)
+        IfCondition EqualTo(h, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(HTTP_DrainAll(h))
+    }
+}
+
+// =============================================================================
+// PUBLIC: ONE-SHOT POST — drains the response body into a single string.
+// =============================================================================
+Function.HTTP.Post {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: body_str: Address
+    Output: Address
+    Body: {
+        h = HTTP_SpawnCurl(url, headers_str, body_str, 1)
+        IfCondition EqualTo(h, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(HTTP_DrainAll(h))
+    }
+}
+
+// =============================================================================
+// INTERNAL: drain a stream handle into a single allocated string.
+// =============================================================================
+Function.HTTP_DrainAll {
+    Input: handle: Address
+    Output: Address
+    Body: {
+        cap = 8192
+        out = Allocate(cap)
+        used = 0
+        fd = Dereference(Add(handle, HHandleOff.STDOUT_FD), "dword")
+        WhileLoop 1 {
+            free_space = Subtract(cap, Add(used, 1))
+            IfCondition LessEqual(free_space, 0) ThenBlock: {
+                new_cap = Multiply(cap, 2)
+                bigger = Allocate(new_cap)
+                k = 0
+                WhileLoop LessThan(k, used) {
+                    SetByte(bigger, k, GetByte(out, k))
+                    k = Add(k, 1)
+                }
+                Deallocate(out, cap)
+                out = bigger
+                cap = new_cap
+                free_space = Subtract(cap, Add(used, 1))
+            }
+            n = SystemCall(HSys.SYS_READ, fd, Add(out, used), free_space, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SetByte(out, used, 0)
+        HTTP.CloseStream(handle)
+        ReturnValue(out)
+    }
+}

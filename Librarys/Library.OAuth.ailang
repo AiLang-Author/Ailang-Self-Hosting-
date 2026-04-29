@@ -1,0 +1,925 @@
+// Library.OAuth.ailang — generic OAuth 2.0 + PKCE client.
+//
+// Knows nothing about Anthropic. Any AILang app needing OAuth 2.0
+// authorization-code-with-PKCE against a public client (no secret) can
+// use this — RSS reader, OlympusRepo client, future LLM clients, etc.
+//
+// Public API:
+//   OAuth.GeneratePKCE()                          -> JSON {verifier, challenge}
+//   OAuth.FetchAuthServerMetadata(metadata_url)   -> JSON of RFC 8414 metadata
+//   OAuth.BuildAuthorizeURL(authorize_endpoint, client_id, redirect_uri,
+//                           scopes_arr, state, code_challenge) -> URL string
+//   OAuth.LaunchBrowser(url, browser_cmd)         -> 0/1
+//   OAuth.RunCallbackServer(port, expected_state, timeout_secs) -> JSON {code} or 0
+//   OAuth.ExchangeCode(token_endpoint, client_id, code, redirect_uri,
+//                      code_verifier)             -> tokens JSON or 0
+//   OAuth.RefreshTokens(token_endpoint, client_id, refresh_token) -> tokens JSON or 0
+//   OAuth.SaveTokens(path, tokens_json)           -> 0/1
+//   OAuth.LoadTokens(path)                        -> tokens JSON or 0
+//   OAuth.IsExpired(tokens_json, leeway_secs)     -> 0/1
+//   OAuth.GetAccessToken(tokens_json)             -> string or 0
+//   OAuth.PickRandomPort()                        -> int (binds + getsockname)
+//
+// Assumptions:
+//   - Public client (token_endpoint_auth_method = "none"); no client_secret.
+//   - PKCE/S256 mandatory (most modern OAuth servers require it).
+//   - Authorization Code flow with refresh tokens.
+//   - Tokens stored as JSON at a caller-specified absolute path.
+//
+// Crypto: SHA256 via shell-out to sha256sum. Random bytes via /dev/urandom.
+// Native AILang SHA256 deferred — single hash per OAuth handshake, not
+// in any hot path.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.HTTP
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.OASys {
+    "SYS_READ":          Initialize=0
+    "SYS_WRITE":         Initialize=1
+    "SYS_OPEN":          Initialize=2
+    "SYS_CLOSE":         Initialize=3
+    "SYS_PIPE":          Initialize=22
+    "SYS_DUP2":          Initialize=33
+    "SYS_FORK":          Initialize=57
+    "SYS_EXECVE":        Initialize=59
+    "SYS_EXIT":          Initialize=60
+    "SYS_WAIT4":         Initialize=61
+    "SYS_FCHMOD":        Initialize=91
+    "SYS_TIME":          Initialize=201
+    "SYS_GETSOCKNAME":   Initialize=51
+}
+
+FixedPool.OAFlags {
+    "O_RDONLY":          Initialize=0
+    "O_WRONLY":          Initialize=1
+    "O_CREAT":           Initialize=64
+    "O_TRUNC":           Initialize=512
+}
+
+FixedPool.OAConst {
+    "RAND_BYTES":        Initialize=32        // verifier length pre-base64
+    "READ_BUF":          Initialize=4096
+    "MAX_CB_REQ":        Initialize=8192      // max bytes to read from callback client
+}
+
+// =============================================================================
+// /dev/urandom
+// =============================================================================
+Function.OAuth_Random {
+    Input: n: Integer
+    Output: Address
+    Body: {
+        fd = SystemCall(OASys.SYS_OPEN, "/dev/urandom", OAFlags.O_RDONLY, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(n)
+        total = 0
+        WhileLoop LessThan(total, n) {
+            r = SystemCall(OASys.SYS_READ, fd, Add(buf, total), Subtract(n, total), 0, 0)
+            IfCondition LessEqual(r, 0) ThenBlock: { BreakLoop }
+            total = Add(total, r)
+        }
+        SystemCall(OASys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessThan(total, n) ThenBlock: {
+            Deallocate(buf, n)
+            ReturnValue(0)
+        }
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// BASE64URL ENCODE — RFC 4648 §5, no padding, +/ → -_
+// =============================================================================
+Function.OAuth_B64UrlByte {
+    Input: v: Integer
+    Output: Integer
+    Body: {
+        // 0..25 -> 'A'..'Z'  (65..)
+        IfCondition LessThan(v, 26) ThenBlock: { ReturnValue(Add(65, v)) }
+        // 26..51 -> 'a'..'z'  (97..)
+        IfCondition LessThan(v, 52) ThenBlock: { ReturnValue(Add(97, Subtract(v, 26))) }
+        // 52..61 -> '0'..'9'  (48..)
+        IfCondition LessThan(v, 62) ThenBlock: { ReturnValue(Add(48, Subtract(v, 52))) }
+        // 62 -> '-'
+        IfCondition EqualTo(v, 62) ThenBlock: { ReturnValue(45) }
+        // 63 -> '_'
+        ReturnValue(95)
+    }
+}
+
+Function.OAuth_Base64Url {
+    Input: data: Address
+    Input: data_len: Integer
+    Output: Address
+    Body: {
+        // Output: 4 chars per 3 bytes, no padding.
+        full = Divide(data_len, 3)
+        rem = Subtract(data_len, Multiply(full, 3))
+        out_len = Multiply(full, 4)
+        IfCondition EqualTo(rem, 1) ThenBlock: { out_len = Add(out_len, 2) }
+        IfCondition EqualTo(rem, 2) ThenBlock: { out_len = Add(out_len, 3) }
+
+        out = Allocate(Add(out_len, 1))
+        oi = 0
+        i = 0
+        WhileLoop LessThan(i, full) {
+            base = Multiply(i, 3)
+            b0 = GetByte(data, base)
+            b1 = GetByte(data, Add(base, 1))
+            b2 = GetByte(data, Add(base, 2))
+            v0 = BitwiseAnd(RightShift(b0, 2), 63)
+            v1 = BitwiseAnd(BitwiseOr(LeftShift(b0, 4), RightShift(b1, 4)), 63)
+            v2 = BitwiseAnd(BitwiseOr(LeftShift(b1, 2), RightShift(b2, 6)), 63)
+            v3 = BitwiseAnd(b2, 63)
+            SetByte(out, oi, OAuth_B64UrlByte(v0))
+            SetByte(out, Add(oi, 1), OAuth_B64UrlByte(v1))
+            SetByte(out, Add(oi, 2), OAuth_B64UrlByte(v2))
+            SetByte(out, Add(oi, 3), OAuth_B64UrlByte(v3))
+            oi = Add(oi, 4)
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(rem, 1) ThenBlock: {
+            base = Multiply(full, 3)
+            b0 = GetByte(data, base)
+            v0 = BitwiseAnd(RightShift(b0, 2), 63)
+            v1 = BitwiseAnd(LeftShift(b0, 4), 63)
+            SetByte(out, oi, OAuth_B64UrlByte(v0))
+            SetByte(out, Add(oi, 1), OAuth_B64UrlByte(v1))
+            oi = Add(oi, 2)
+        }
+        IfCondition EqualTo(rem, 2) ThenBlock: {
+            base = Multiply(full, 3)
+            b0 = GetByte(data, base)
+            b1 = GetByte(data, Add(base, 1))
+            v0 = BitwiseAnd(RightShift(b0, 2), 63)
+            v1 = BitwiseAnd(BitwiseOr(LeftShift(b0, 4), RightShift(b1, 4)), 63)
+            v2 = BitwiseAnd(LeftShift(b1, 2), 63)
+            SetByte(out, oi, OAuth_B64UrlByte(v0))
+            SetByte(out, Add(oi, 1), OAuth_B64UrlByte(v1))
+            SetByte(out, Add(oi, 2), OAuth_B64UrlByte(v2))
+            oi = Add(oi, 3)
+        }
+        SetByte(out, oi, 0)
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// SHA256 + Base64URL via shell pipeline
+// =============================================================================
+// Runs: printf '%s' "$verifier" | sha256sum | cut -d' ' -f1 | xxd -r -p | base64 | tr -d '=' | tr '/+' '_-'
+// Returns the base64url(sha256(verifier)) string.
+Function.OAuth_SHA256B64Url {
+    Input: input_str: Address
+    Output: Address
+    Body: {
+        // Build the shell command with the verifier interpolated safely.
+        // verifier is a base64url string [A-Za-z0-9_-]+ — shell-safe; no quoting needed.
+        cmd_prefix = "printf '%s' "
+        cmd_suffix = " | sha256sum | cut -d' ' -f1 | xxd -r -p | base64 | tr -d '=' | tr '/+' '_-'"
+        a = StringConcat(cmd_prefix, input_str)
+        full_cmd = StringConcat(a, cmd_suffix)
+
+        // Pipe stdout
+        pf = Allocate(8)
+        pr = SystemCall(OASys.SYS_PIPE, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: { Deallocate(pf, 8)  ReturnValue(0) }
+        rfd = Dereference(pf, "dword")
+        wfd = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+
+        // argv: ["/bin/sh", "-c", full_cmd, NULL]
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0),  "/bin/sh")
+        StoreValue(Add(argv, 8),  "-c")
+        StoreValue(Add(argv, 16), full_cmd)
+        StoreValue(Add(argv, 24), 0)
+
+        pid = SystemCall(OASys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            SystemCall(OASys.SYS_CLOSE, rfd, 0, 0, 0, 0)
+            SystemCall(OASys.SYS_CLOSE, wfd, 0, 0, 0, 0)
+            Deallocate(argv, 32)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            SystemCall(OASys.SYS_CLOSE, rfd, 0, 0, 0, 0)
+            SystemCall(OASys.SYS_DUP2, wfd, 1, 0, 0, 0)
+            SystemCall(OASys.SYS_CLOSE, wfd, 0, 0, 0, 0)
+            SystemCall(OASys.SYS_EXECVE, "/bin/sh", argv, 0)
+            SystemCall(OASys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+        SystemCall(OASys.SYS_CLOSE, wfd, 0, 0, 0, 0)
+
+        // Drain stdout — should be ~43 chars + newline
+        out = Allocate(256)
+        used = 0
+        WhileLoop LessThan(used, 255) {
+            n = SystemCall(OASys.SYS_READ, rfd, Add(out, used), Subtract(255, used), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SystemCall(OASys.SYS_CLOSE, rfd, 0, 0, 0, 0)
+        // Strip trailing newline
+        WhileLoop GreaterThan(used, 0) {
+            last = GetByte(out, Subtract(used, 1))
+            IfCondition Or(EqualTo(last, 10), EqualTo(last, 13)) ThenBlock: {
+                used = Subtract(used, 1)
+            } ElseBlock: { BreakLoop }
+        }
+        SetByte(out, used, 0)
+
+        // Reap
+        status = Allocate(8)
+        SystemCall(OASys.SYS_WAIT4, pid, status, 0, 0, 0)
+        Deallocate(status, 8)
+        Deallocate(argv, 32)
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// PKCE: verifier (43 chars b64url of 32 random bytes), challenge (b64url(sha256(verifier)))
+// =============================================================================
+Function.OAuth.GeneratePKCE {
+    Output: Address
+    Body: {
+        rand = OAuth_Random(OAConst.RAND_BYTES)
+        IfCondition EqualTo(rand, 0) ThenBlock: { ReturnValue(0) }
+        verifier = OAuth_Base64Url(rand, OAConst.RAND_BYTES)
+        Deallocate(rand, OAConst.RAND_BYTES)
+        IfCondition EqualTo(verifier, 0) ThenBlock: { ReturnValue(0) }
+
+        challenge = OAuth_SHA256B64Url(verifier)
+        IfCondition EqualTo(challenge, 0) ThenBlock: { ReturnValue(0) }
+
+        out = JSON.NewObject()
+        JSON.SetString(out, "verifier", verifier)
+        JSON.SetString(out, "challenge", challenge)
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// URL ENCODE — percent-encode anything outside [A-Za-z0-9-._~]
+// =============================================================================
+Function.OAuth_HexDigit {
+    Input: v: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(v, 10) ThenBlock: { ReturnValue(Add(48, v)) }
+        ReturnValue(Add(55, v))   // 'A' = 65 = 55+10
+    }
+}
+
+Function.OAuth_UrlEncode {
+    Input: s: Address
+    Output: Address
+    Body: {
+        slen = StringLength(s)
+        // Worst case 3x growth
+        out = Allocate(Add(Multiply(slen, 3), 1))
+        oi = 0
+        i = 0
+        WhileLoop LessThan(i, slen) {
+            c = GetByte(s, i)
+            keep = 0
+            IfCondition And(GreaterEqual(c, 65), LessEqual(c, 90)) ThenBlock: { keep = 1 }
+            IfCondition And(GreaterEqual(c, 97), LessEqual(c, 122)) ThenBlock: { keep = 1 }
+            IfCondition And(GreaterEqual(c, 48), LessEqual(c, 57)) ThenBlock: { keep = 1 }
+            IfCondition Or(EqualTo(c, 45), EqualTo(c, 95)) ThenBlock: { keep = 1 }   // - _
+            IfCondition Or(EqualTo(c, 46), EqualTo(c, 126)) ThenBlock: { keep = 1 }  // . ~
+
+            IfCondition EqualTo(keep, 1) ThenBlock: {
+                SetByte(out, oi, c)
+                oi = Add(oi, 1)
+            } ElseBlock: {
+                SetByte(out, oi, 37)   // %
+                SetByte(out, Add(oi, 1), OAuth_HexDigit(BitwiseAnd(RightShift(c, 4), 15)))
+                SetByte(out, Add(oi, 2), OAuth_HexDigit(BitwiseAnd(c, 15)))
+                oi = Add(oi, 3)
+            }
+            i = Add(i, 1)
+        }
+        SetByte(out, oi, 0)
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// Build authorize URL.
+//   <authorize>?response_type=code&client_id=<id>&redirect_uri=<uri>
+//             &scope=<space-joined>&state=<state>&code_challenge=<chall>
+//             &code_challenge_method=S256
+// scopes_arr is a JSON array of strings.
+// =============================================================================
+Function.OAuth_AppendParam {
+    Input: buf: Address
+    Input: key: Address
+    Input: value_encoded: Address
+    Input: is_first: Integer
+    Output: Address
+    Body: {
+        sep = "&"
+        IfCondition EqualTo(is_first, 1) ThenBlock: { sep = "?" }
+        a = StringConcat(buf, sep)
+        b = StringConcat(a, key)
+        c = StringConcat(b, "=")
+        d = StringConcat(c, value_encoded)
+        ReturnValue(d)
+    }
+}
+
+Function.OAuth.BuildAuthorizeURL {
+    Input: authorize_endpoint: Address
+    Input: client_id: Address
+    Input: redirect_uri: Address
+    Input: scopes_arr: Address
+    Input: state: Address
+    Input: code_challenge: Address
+    Output: Address
+    Body: {
+        // Join scopes with single space; URL-encode the joined string.
+        scope_str = ""
+        IfCondition NotEqual(scopes_arr, 0) ThenBlock: {
+            n = JSON.ArrayLength(scopes_arr)
+            i = 0
+            WhileLoop LessThan(i, n) {
+                s_tag = JSON.ArrayGet(scopes_arr, i)
+                s = JSON.AsString(s_tag)
+                IfCondition NotEqual(s, 0) ThenBlock: {
+                    IfCondition GreaterThan(StringLength(scope_str), 0) ThenBlock: {
+                        scope_str = StringConcat(scope_str, " ")
+                    }
+                    scope_str = StringConcat(scope_str, s)
+                }
+                i = Add(i, 1)
+            }
+        }
+
+        url = StringConcat(authorize_endpoint, "")
+        url = OAuth_AppendParam(url, "response_type", "code", 1)
+        url = OAuth_AppendParam(url, "client_id", OAuth_UrlEncode(client_id), 0)
+        url = OAuth_AppendParam(url, "redirect_uri", OAuth_UrlEncode(redirect_uri), 0)
+        url = OAuth_AppendParam(url, "scope", OAuth_UrlEncode(scope_str), 0)
+        url = OAuth_AppendParam(url, "state", OAuth_UrlEncode(state), 0)
+        url = OAuth_AppendParam(url, "code_challenge", OAuth_UrlEncode(code_challenge), 0)
+        url = OAuth_AppendParam(url, "code_challenge_method", "S256", 0)
+        ReturnValue(url)
+    }
+}
+
+// =============================================================================
+// Browser launch — fork+exec the configured browser command with the URL.
+// browser_cmd is something like "wslview", "xdg-open", or a full path.
+// Returns 1 on success (fork worked), 0 on failure.
+// Detached: parent doesn't wait, child runs independently.
+// =============================================================================
+Function.OAuth.LaunchBrowser {
+    Input: url: Address
+    Input: browser_cmd: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(browser_cmd, 0) ThenBlock: { browser_cmd = "wslview" }
+        pid = SystemCall(OASys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child — silence output so it doesn't pollute the chat
+            devnull = SystemCall(OASys.SYS_OPEN, "/dev/null", OAFlags.O_WRONLY, 0, 0, 0)
+            IfCondition GreaterEqual(devnull, 0) ThenBlock: {
+                SystemCall(OASys.SYS_DUP2, devnull, 1, 0, 0, 0)
+                SystemCall(OASys.SYS_DUP2, devnull, 2, 0, 0, 0)
+                SystemCall(OASys.SYS_CLOSE, devnull, 0, 0, 0, 0)
+            }
+            argv = Allocate(24)
+            StoreValue(Add(argv, 0), browser_cmd)
+            StoreValue(Add(argv, 8), url)
+            StoreValue(Add(argv, 16), 0)
+            // exec — searches PATH if browser_cmd has no slash
+            SystemCall(OASys.SYS_EXECVE, browser_cmd, argv, 0)
+            // If exec failed (cmd not in PATH), bash-style fallback: try via /usr/bin/env
+            argv2 = Allocate(32)
+            StoreValue(Add(argv2, 0), "/usr/bin/env")
+            StoreValue(Add(argv2, 8), browser_cmd)
+            StoreValue(Add(argv2, 16), url)
+            StoreValue(Add(argv2, 24), 0)
+            SystemCall(OASys.SYS_EXECVE, "/usr/bin/env", argv2, 0)
+            SystemCall(OASys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+        // Parent — don't wait; browser runs async
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PICK A RANDOM PORT — bind localhost:0, getsockname returns OS-assigned port.
+// Caller closes returned fd and re-binds when ready, OR calls
+// OAuth_BindLocalhostAny() which returns both fd and port.
+// =============================================================================
+// Bind localhost on a specific port (or 0 for OS-assigned).
+// Returns (fd, actual_port_via_out_ptr) or -1 on failure.
+Function.OAuth_BindLocalhostPort {
+    Input: port: Integer
+    Input: out_port_ptr: Address
+    Output: Integer
+    Body: {
+        StoreValue(out_port_ptr, 0, "dword")
+        fd = Socket.Create(2, 1)   // AF_INET=2, SOCK_STREAM=1
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(-1) }
+
+        addr = Allocate(16)
+        MemorySet(addr, 0, 16)
+        SetByte(addr, 0, 2)    // AF_INET little-endian short
+        SetByte(addr, 1, 0)
+        SetByte(addr, 2, BitwiseAnd(RightShift(port, 8), 255))   // port high byte (network order)
+        SetByte(addr, 3, BitwiseAnd(port, 255))                  // port low byte
+        SetByte(addr, 4, 127)
+        SetByte(addr, 5, 0)
+        SetByte(addr, 6, 0)
+        SetByte(addr, 7, 1)
+
+        br = SystemCall(49, fd, addr, 16, 0, 0)   // bind
+        IfCondition LessThan(br, 0) ThenBlock: {
+            Deallocate(addr, 16)
+            Socket.Close(fd)
+            ReturnValue(-1)
+        }
+        // Read back assigned port
+        len_holder = Allocate(8)
+        StoreValue(len_holder, 16, "dword")
+        gr = SystemCall(OASys.SYS_GETSOCKNAME, fd, addr, len_holder, 0, 0)
+        Deallocate(len_holder, 8)
+        IfCondition LessThan(gr, 0) ThenBlock: {
+            Deallocate(addr, 16)
+            Socket.Close(fd)
+            ReturnValue(-1)
+        }
+        hi = GetByte(addr, 2)
+        lo = GetByte(addr, 3)
+        actual_port = BitwiseOr(LeftShift(hi, 8), lo)
+        Deallocate(addr, 16)
+        StoreValue(out_port_ptr, actual_port, "dword")
+
+        lr = Socket.Listen(fd, 1)
+        IfCondition LessThan(lr, 0) ThenBlock: {
+            Socket.Close(fd)
+            ReturnValue(-1)
+        }
+        ReturnValue(fd)
+    }
+}
+
+// Backward-compat: bind any port.
+Function.OAuth_BindLocalhostAny {
+    Input: out_port_ptr: Address
+    Output: Integer
+    Body: { ReturnValue(OAuth_BindLocalhostPort(0, out_port_ptr)) }
+}
+
+// =============================================================================
+// Parse the GET line of an HTTP request to extract the `code` query parameter.
+// Returns allocated string (caller frees) or 0 if not found.
+// req_buf may contain headers after the request line.
+// Looks for: "GET /callback?code=<value>&..." (or in any order).
+// =============================================================================
+Function.OAuth_ExtractQueryParam {
+    Input: req_buf: Address
+    Input: req_len: Integer
+    Input: param_name: Address
+    Output: Address
+    Body: {
+        // Find first \r\n or \n — that's the end of the request line
+        line_end = req_len
+        i = 0
+        WhileLoop LessThan(i, req_len) {
+            ch = GetByte(req_buf, i)
+            IfCondition EqualTo(ch, 13) ThenBlock: { line_end = i  BreakLoop }
+            IfCondition EqualTo(ch, 10) ThenBlock: { line_end = i  BreakLoop }
+            i = Add(i, 1)
+        }
+        // Find ?
+        q = -1
+        i = 0
+        WhileLoop LessThan(i, line_end) {
+            IfCondition EqualTo(GetByte(req_buf, i), 63) ThenBlock: { q = i  BreakLoop }
+            i = Add(i, 1)
+        }
+        IfCondition LessThan(q, 0) ThenBlock: { ReturnValue(0) }
+        // Find end of query string (space before HTTP/...)
+        qs_end = line_end
+        i = q
+        WhileLoop LessThan(i, line_end) {
+            IfCondition EqualTo(GetByte(req_buf, i), 32) ThenBlock: { qs_end = i  BreakLoop }
+            i = Add(i, 1)
+        }
+        // Walk pairs separated by &
+        plen = StringLength(param_name)
+        cur = Add(q, 1)
+        WhileLoop LessThan(cur, qs_end) {
+            // Find = and & boundaries within this pair
+            eq = -1
+            amp = qs_end
+            j = cur
+            WhileLoop LessThan(j, qs_end) {
+                ch = GetByte(req_buf, j)
+                IfCondition And(EqualTo(ch, 61), EqualTo(eq, -1)) ThenBlock: { eq = j }
+                IfCondition EqualTo(ch, 38) ThenBlock: { amp = j  BreakLoop }
+                j = Add(j, 1)
+            }
+            IfCondition GreaterEqual(eq, 0) ThenBlock: {
+                key_len = Subtract(eq, cur)
+                IfCondition EqualTo(key_len, plen) ThenBlock: {
+                    match = 1
+                    k = 0
+                    WhileLoop LessThan(k, plen) {
+                        IfCondition NotEqual(GetByte(req_buf, Add(cur, k)), GetByte(param_name, k)) ThenBlock: { match = 0  BreakLoop }
+                        k = Add(k, 1)
+                    }
+                    IfCondition EqualTo(match, 1) ThenBlock: {
+                        val_start = Add(eq, 1)
+                        val_len = Subtract(amp, val_start)
+                        out = Allocate(Add(val_len, 1))
+                        m = 0
+                        WhileLoop LessThan(m, val_len) {
+                            SetByte(out, m, GetByte(req_buf, Add(val_start, m)))
+                            m = Add(m, 1)
+                        }
+                        SetByte(out, val_len, 0)
+                        ReturnValue(out)
+                    }
+                }
+            }
+            cur = Add(amp, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// One-shot callback server.
+//
+// port: 0 means "pick any open port" (caller should have called
+//       OAuth_BindLocalhostAny first to discover and pre-bind).
+// In the simple form here, we accept "port = listen_fd" via a sentinel:
+// pass listen_fd as port (we identify it by being > 1024 and pre-bound).
+// Cleaner: caller passes the already-bound listen_fd directly. We'll use that.
+//
+// Returns JSON {"code": "..."} on success, 0 on failure/timeout.
+// =============================================================================
+Function.OAuth.RunCallbackServer {
+    Input: listen_fd: Integer
+    Input: expected_state: Address
+    Input: timeout_secs: Integer
+    Output: Address
+    Body: {
+        // Block on accept (no timeout in this v1; caller controls overall flow).
+        client_fd = Socket.Accept(listen_fd)
+        IfCondition LessThan(client_fd, 0) ThenBlock: { ReturnValue(0) }
+
+        // Read request into buffer
+        buf = Allocate(OAConst.MAX_CB_REQ)
+        used = 0
+        // Read until we have a full request line + headers (blank line),
+        // or the buffer fills, or read returns 0/<0.
+        WhileLoop LessThan(used, OAConst.MAX_CB_REQ) {
+            n = SystemCall(OASys.SYS_READ, client_fd, Add(buf, used), Subtract(OAConst.MAX_CB_REQ, used), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+            // Look for end-of-headers \r\n\r\n
+            done = 0
+            IfCondition GreaterEqual(used, 4) ThenBlock: {
+                k = 0
+                WhileLoop LessThan(k, Subtract(used, 3)) {
+                    IfCondition EqualTo(GetByte(buf, k), 13) ThenBlock: {
+                        IfCondition EqualTo(GetByte(buf, Add(k, 1)), 10) ThenBlock: {
+                            IfCondition EqualTo(GetByte(buf, Add(k, 2)), 13) ThenBlock: {
+                                IfCondition EqualTo(GetByte(buf, Add(k, 3)), 10) ThenBlock: {
+                                    done = 1
+                                    BreakLoop
+                                }
+                            }
+                        }
+                    }
+                    k = Add(k, 1)
+                }
+            }
+            IfCondition EqualTo(done, 1) ThenBlock: { BreakLoop }
+        }
+
+        code = OAuth_ExtractQueryParam(buf, used, "code")
+        state = OAuth_ExtractQueryParam(buf, used, "state")
+
+        // Validate state matches if expected
+        state_ok = 1
+        IfCondition NotEqual(expected_state, 0) ThenBlock: {
+            IfCondition EqualTo(state, 0) ThenBlock: {
+                state_ok = 0
+            } ElseBlock: {
+                IfCondition NotEqual(StringCompare(state, expected_state), 0) ThenBlock: {
+                    state_ok = 0
+                }
+            }
+        }
+
+        // Send response
+        body_ok = "<!doctype html><html><body style='font-family:sans-serif;padding:2em'><h2>Authorization complete</h2><p>You may close this tab and return to the terminal.</p></body></html>"
+        body_err = "<!doctype html><html><body style='font-family:sans-serif;padding:2em'><h2>Authorization failed</h2><p>State mismatch or missing code. Please retry.</p></body></html>"
+        body = body_ok
+        IfCondition Or(EqualTo(code, 0), EqualTo(state_ok, 0)) ThenBlock: { body = body_err }
+
+        body_len = StringLength(body)
+        hdr = StringConcat("HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: ", NumberToString(body_len))
+        hdr = StringConcat(hdr, "\r\nConnection: close\r\n\r\n")
+        SystemCall(OASys.SYS_WRITE, client_fd, hdr, StringLength(hdr), 0, 0)
+        SystemCall(OASys.SYS_WRITE, client_fd, body, body_len, 0, 0)
+        Socket.Close(client_fd)
+        Deallocate(buf, OAConst.MAX_CB_REQ)
+
+        IfCondition Or(EqualTo(code, 0), EqualTo(state_ok, 0)) ThenBlock: { ReturnValue(0) }
+        out = JSON.NewObject()
+        JSON.SetString(out, "code", code)
+        IfCondition NotEqual(state, 0) ThenBlock: { JSON.SetString(out, "state", state) }
+        ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// FETCH AUTHORIZATION SERVER METADATA (RFC 8414)
+// Returns the parsed JSON object (raw XSHash, ready for JSON.GetString).
+// =============================================================================
+Function.OAuth.FetchAuthServerMetadata {
+    Input: metadata_url: Address
+    Output: Address
+    Body: {
+        body = HTTP.Get(metadata_url, "")
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(0) }
+        parsed = ParseJSON(body)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(JSON.AsObject(parsed))
+    }
+}
+
+// =============================================================================
+// DYNAMIC CLIENT REGISTRATION (RFC 7591)
+// POSTs the metadata JSON object to the registration endpoint.
+// Returns parsed registration response (contains client_id, client_id_issued_at,
+// optionally client_secret/registration_access_token/registration_client_uri).
+// Returns 0 on failure.
+// =============================================================================
+Function.OAuth.RegisterClient {
+    Input: registration_endpoint: Address
+    Input: metadata_obj: Address
+    Output: Address
+    Body: {
+        body = JSON.SerializeObject(metadata_obj)
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(0) }
+        headers = "content-type: application/json"
+        resp = HTTP.Post(registration_endpoint, headers, body)
+        IfCondition EqualTo(resp, 0) ThenBlock: { ReturnValue(0) }
+        parsed = ParseJSON(resp)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: { ReturnValue(0) }
+        cid = JSON.GetString(obj, "client_id")
+        IfCondition EqualTo(cid, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(obj)
+    }
+}
+
+// =============================================================================
+// Build a form-encoded body for token requests
+// =============================================================================
+Function.OAuth_FormEncode {
+    Input: pairs: Address    // JSON object {key: value, key: value, ...}
+    Output: Address
+    Body: {
+        out = ""
+        // Iterate over JSON object keys — JSON lib doesn't expose key iteration
+        // directly, so we walk the underlying XSHash via a known set of fields.
+        // For the calls we make below we know the key set up front.
+        ReturnValue(out)
+    }
+}
+
+// Build token-exchange or refresh form body explicitly (avoids needing
+// generic key iteration over a JSON object).
+Function.OAuth_BuildExchangeBody {
+    Input: client_id: Address
+    Input: code: Address
+    Input: redirect_uri: Address
+    Input: code_verifier: Address
+    Output: Address
+    Body: {
+        b = "grant_type=authorization_code"
+        b = StringConcat(b, "&client_id=")
+        b = StringConcat(b, OAuth_UrlEncode(client_id))
+        b = StringConcat(b, "&code=")
+        b = StringConcat(b, OAuth_UrlEncode(code))
+        b = StringConcat(b, "&redirect_uri=")
+        b = StringConcat(b, OAuth_UrlEncode(redirect_uri))
+        b = StringConcat(b, "&code_verifier=")
+        b = StringConcat(b, OAuth_UrlEncode(code_verifier))
+        ReturnValue(b)
+    }
+}
+
+Function.OAuth_BuildRefreshBody {
+    Input: client_id: Address
+    Input: refresh_token: Address
+    Output: Address
+    Body: {
+        b = "grant_type=refresh_token"
+        b = StringConcat(b, "&client_id=")
+        b = StringConcat(b, OAuth_UrlEncode(client_id))
+        b = StringConcat(b, "&refresh_token=")
+        b = StringConcat(b, OAuth_UrlEncode(refresh_token))
+        ReturnValue(b)
+    }
+}
+
+// Decorate parsed token JSON with `expires_at` (Unix seconds).
+Function.OAuth_DecorateExpiresAt {
+    Input: tokens: Address
+    Body: {
+        expires_in = JSON.GetNumber(tokens, "expires_in")
+        IfCondition LessEqual(expires_in, 0) ThenBlock: { expires_in = 3600 }
+        now = SystemCall(OASys.SYS_TIME, 0, 0, 0, 0, 0)
+        JSON.SetNumber(tokens, "expires_at", Add(now, expires_in))
+    }
+}
+
+// =============================================================================
+// EXCHANGE authorization code for tokens
+// =============================================================================
+Function.OAuth.ExchangeCode {
+    Input: token_endpoint: Address
+    Input: client_id: Address
+    Input: code: Address
+    Input: redirect_uri: Address
+    Input: code_verifier: Address
+    Output: Address
+    Body: {
+        body = OAuth_BuildExchangeBody(client_id, code, redirect_uri, code_verifier)
+        headers = "content-type: application/x-www-form-urlencoded"
+        PrintMessage("[OAuth.ExchangeCode] POST ")
+        PrintMessage(token_endpoint)
+        PrintMessage("\n[OAuth.ExchangeCode] body: ")
+        PrintMessage(body)
+        PrintMessage("\n")
+        resp = HTTP.Post(token_endpoint, headers, body)
+        IfCondition EqualTo(resp, 0) ThenBlock: {
+            PrintMessage("[OAuth.ExchangeCode] HTTP.Post returned 0 (curl spawn or empty body)\n")
+            ReturnValue(0)
+        }
+        PrintMessage("[OAuth.ExchangeCode] response body:\n")
+        PrintMessage(resp)
+        PrintMessage("\n")
+        parsed = ParseJSON(resp)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            PrintMessage("[OAuth.ExchangeCode] response was not valid JSON\n")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            PrintMessage("[OAuth.ExchangeCode] parsed JSON was not an object\n")
+            ReturnValue(0)
+        }
+        // Verify there's an access_token (otherwise it's an error response)
+        access = JSON.GetString(obj, "access_token")
+        IfCondition EqualTo(access, 0) ThenBlock: {
+            err = JSON.GetString(obj, "error")
+            err_desc = JSON.GetString(obj, "error_description")
+            PrintMessage("[OAuth.ExchangeCode] no access_token in response.\n")
+            IfCondition NotEqual(err, 0) ThenBlock: {
+                PrintMessage("  error: ")  PrintMessage(err)  PrintMessage("\n")
+            }
+            IfCondition NotEqual(err_desc, 0) ThenBlock: {
+                PrintMessage("  error_description: ")  PrintMessage(err_desc)  PrintMessage("\n")
+            }
+            ReturnValue(0)
+        }
+        OAuth_DecorateExpiresAt(obj)
+        ReturnValue(obj)
+    }
+}
+
+// =============================================================================
+// REFRESH tokens
+// =============================================================================
+Function.OAuth.RefreshTokens {
+    Input: token_endpoint: Address
+    Input: client_id: Address
+    Input: refresh_token: Address
+    Output: Address
+    Body: {
+        body = OAuth_BuildRefreshBody(client_id, refresh_token)
+        headers = "content-type: application/x-www-form-urlencoded"
+        resp = HTTP.Post(token_endpoint, headers, body)
+        IfCondition EqualTo(resp, 0) ThenBlock: { ReturnValue(0) }
+        parsed = ParseJSON(resp)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: { ReturnValue(0) }
+        access = JSON.GetString(obj, "access_token")
+        IfCondition EqualTo(access, 0) ThenBlock: { ReturnValue(0) }
+        // Some servers omit refresh_token from refresh responses; preserve original
+        new_refresh = JSON.GetString(obj, "refresh_token")
+        IfCondition EqualTo(new_refresh, 0) ThenBlock: {
+            JSON.SetString(obj, "refresh_token", refresh_token)
+        }
+        OAuth_DecorateExpiresAt(obj)
+        ReturnValue(obj)
+    }
+}
+
+// =============================================================================
+// TOKEN STORAGE
+// =============================================================================
+Function.OAuth.SaveTokens {
+    Input: path: Address
+    Input: tokens_obj: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(tokens_obj, 0) ThenBlock: { ReturnValue(0) }
+        s = JSON.SerializeObject(tokens_obj)
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
+        flags = BitwiseOr(BitwiseOr(OAFlags.O_WRONLY, OAFlags.O_CREAT), OAFlags.O_TRUNC)
+        fd = SystemCall(OASys.SYS_OPEN, path, flags, 384, 0, 0)   // 0600 = 384
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        slen = StringLength(s)
+        total = 0
+        WhileLoop LessThan(total, slen) {
+            n = SystemCall(OASys.SYS_WRITE, fd, Add(s, total), Subtract(slen, total), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            total = Add(total, n)
+        }
+        // Tighten mode in case umask softened it
+        SystemCall(OASys.SYS_FCHMOD, fd, 384, 0, 0, 0)
+        SystemCall(OASys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition EqualTo(total, slen) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.OAuth.LoadTokens {
+    Input: path: Address
+    Output: Address
+    Body: {
+        fd = SystemCall(OASys.SYS_OPEN, path, OAFlags.O_RDONLY, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        cap = 16384
+        buf = Allocate(Add(cap, 1))
+        used = 0
+        WhileLoop LessThan(used, cap) {
+            n = SystemCall(OASys.SYS_READ, fd, Add(buf, used), Subtract(cap, used), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SystemCall(OASys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        SetByte(buf, used, 0)
+        parsed = ParseJSON(buf)
+        Deallocate(buf, Add(cap, 1))
+        IfCondition EqualTo(parsed, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(JSON.AsObject(parsed))
+    }
+}
+
+Function.OAuth.IsExpired {
+    Input: tokens_obj: Address
+    Input: leeway_secs: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(tokens_obj, 0) ThenBlock: { ReturnValue(1) }
+        expires_at = JSON.GetNumber(tokens_obj, "expires_at")
+        IfCondition LessEqual(expires_at, 0) ThenBlock: { ReturnValue(1) }
+        now = SystemCall(OASys.SYS_TIME, 0, 0, 0, 0, 0)
+        IfCondition GreaterEqual(Add(now, leeway_secs), expires_at) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.OAuth.GetAccessToken {
+    Input: tokens_obj: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(tokens_obj, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(JSON.GetString(tokens_obj, "access_token"))
+    }
+}
+
+Function.OAuth.GetRefreshToken {
+    Input: tokens_obj: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(tokens_obj, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(JSON.GetString(tokens_obj, "refresh_token"))
+    }
+}

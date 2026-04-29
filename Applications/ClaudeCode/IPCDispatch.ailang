@@ -1,0 +1,327 @@
+// ClaudeCode.IPCDispatch.ailang — generic tool dispatcher.
+//
+// Speaks the cc_tools envelope to any number of tool services. Owns
+// nothing tool-specific — adding a new tool is a single RegisterTool()
+// call at startup, and a new cc_*_ipc.ailang on disk. The ClaudeCode
+// binary itself never needs to know what Read/Bash/Grep do.
+//
+// Lifecycle:
+//   IPCDispatch.Init()                       — alloc tool table
+//   IPCDispatch.RegisterTool(name, sock)     — connect + fetch schema
+//   IPCDispatch.GetToolSchemasArray()        — JSON array for tools[] in API request
+//   IPCDispatch.Dispatch(name, input, id)    — fire one tool call, return content string
+//   IPCDispatch.Shutdown()                   — close all sockets
+//
+// Each tool has a persistent connection — reused for the whole session
+// rather than reconnecting per call.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+
+FixedPool.IPCDConst {
+    "MAX_TOOLS":     Initialize=16
+    "ENTRY_SIZE":    Initialize=24    // 8 name + 8 fd + 8 schema
+}
+
+FixedPool.IPCDOff {
+    "NAME":          Initialize=0
+    "FD":            Initialize=8
+    "SCHEMA":        Initialize=16
+}
+
+FixedPool.IPCDState {
+    "table":         Initialize=0, CanChange=True
+    "count":         Initialize=0, CanChange=True
+    "schemas_arr":   Initialize=0, CanChange=True   // cached JSON array of schemas
+}
+
+// =============================================================================
+// INIT / SHUTDOWN
+// =============================================================================
+Function.IPCDispatch.Init {
+    Body: {
+        sz = Multiply(IPCDConst.MAX_TOOLS, IPCDConst.ENTRY_SIZE)
+        IPCDState.table = Allocate(sz)
+        MemorySet(IPCDState.table, 0, sz)
+        IPCDState.count = 0
+        IPCDState.schemas_arr = JSON.NewArray()
+    }
+}
+
+Function.IPCDispatch.Shutdown {
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, IPCDState.count) {
+            base = Add(IPCDState.table, Multiply(i, IPCDConst.ENTRY_SIZE))
+            fd = Dereference(Add(base, IPCDOff.FD))
+            IfCondition GreaterEqual(fd, 0) ThenBlock: { Socket.Close(fd) }
+            i = Add(i, 1)
+        }
+        IPCDState.count = 0
+    }
+}
+
+// =============================================================================
+// File logger — writes to /tmp/cc-ipcd.log so the TUI doesn't eat the output.
+// O_WRONLY|O_CREAT|O_APPEND = 1|64|1024 = 1089, mode 0644 = 420.
+// =============================================================================
+Function.IPCD_Log {
+    Input: msg: Address
+    Body: {
+        fd = SystemCall(2, "/tmp/cc-ipcd.log", 1089, 420, 0, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            SystemCall(1, fd, msg, StringLength(msg), 0, 0)
+            SystemCall(3, fd, 0, 0, 0, 0)
+        }
+    }
+}
+
+// =============================================================================
+// REGISTER A TOOL — connect to its socket, fetch its schema, cache.
+// Returns 1 on success, 0 on failure (tool service not running).
+// =============================================================================
+Function.IPCDispatch.RegisterTool {
+    Input: name: Address
+    Input: sock_path: Address
+    Output: Integer
+    Body: {
+        IPCD_Log("[ipcd] BEGIN ")
+        IPCD_Log(name)
+        IPCD_Log("\n")
+
+        IfCondition GreaterEqual(IPCDState.count, IPCDConst.MAX_TOOLS) ThenBlock: {
+            IPCD_Log("[ipcd] FAIL table_full\n")
+            ReturnValue(0)
+        }
+
+        fd = Socket.Create(1, 1)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            IPCD_Log("[ipcd] FAIL socket_create ")
+            IPCD_Log(name)
+            IPCD_Log("\n")
+            ReturnValue(0)
+        }
+
+        // Retry connect — there's a race between fork/exec of cc_*_ipc and
+        // its bind+listen. The 2s global sleep covers most cases but not
+        // ALL 7 services on slower hosts. Up to 20 tries × 100ms = 2s extra.
+        attempts = 0
+        cr = -1
+        WhileLoop LessThan(attempts, 20) {
+            cr = Socket.ConnectUnix(fd, sock_path)
+            IfCondition GreaterEqual(cr, 0) ThenBlock: {
+                attempts = 20
+            } ElseBlock: {
+                // Need a fresh socket for each retry attempt — a failed
+                // connect can leave the fd in an unusable state.
+                Socket.Close(fd)
+                fd = Socket.Create(1, 1)
+                ts = Allocate(16)
+                StoreValue(Add(ts, 0), 0)
+                StoreValue(Add(ts, 8), 100000000)   // 100ms
+                SystemCall(35, ts, 0, 0, 0, 0)
+                Deallocate(ts, 16)
+                attempts = Add(attempts, 1)
+            }
+        }
+        IfCondition LessThan(cr, 0) ThenBlock: {
+            IPCD_Log("[ipcd] FAIL connect ")
+            IPCD_Log(name)
+            IPCD_Log(" at ")
+            IPCD_Log(sock_path)
+            IPCD_Log(" (after retries)\n")
+            Socket.Close(fd)
+            ReturnValue(0)
+        }
+
+        // Request schema
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "schema")
+        req_str = JSON.SerializeObject(req)
+        Socket.SendMsg(fd, req_str)
+
+        resp_str = Socket.RecvMsg(fd)
+        IfCondition EqualTo(resp_str, 0) ThenBlock: {
+            IPCD_Log("[ipcd] FAIL no_response ")
+            IPCD_Log(name)
+            IPCD_Log("\n")
+            Socket.Close(fd)
+            ReturnValue(0)
+        }
+
+        parsed = ParseJSON(resp_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            IPCD_Log("[ipcd] FAIL parse ")
+            IPCD_Log(name)
+            IPCD_Log("\n")
+            Socket.Close(fd)
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            IPCD_Log("[ipcd] FAIL as_object ")
+            IPCD_Log(name)
+            IPCD_Log("\n")
+            Socket.Close(fd)
+            ReturnValue(0)
+        }
+        schema_obj = JSON.GetObject(obj, "schema")
+        IfCondition EqualTo(schema_obj, 0) ThenBlock: {
+            IPCD_Log("[ipcd] FAIL get_schema ")
+            IPCD_Log(name)
+            IPCD_Log("\n")
+            Socket.Close(fd)
+            ReturnValue(0)
+        }
+
+        // Store entry
+        idx = IPCDState.count
+        base = Add(IPCDState.table, Multiply(idx, IPCDConst.ENTRY_SIZE))
+        StoreValue(Add(base, IPCDOff.NAME), name)
+        StoreValue(Add(base, IPCDOff.FD), fd)
+        StoreValue(Add(base, IPCDOff.SCHEMA), schema_obj)
+        IPCDState.count = Add(idx, 1)
+
+        // Append schema to cached schemas array
+        JSON.PushObject(IPCDState.schemas_arr, schema_obj)
+
+        IPCD_Log("[ipcd] OK ")
+        IPCD_Log(name)
+        IPCD_Log("\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SCHEMA ARRAY — feed straight into Anthropic.BuildRequest tools_arr arg
+// =============================================================================
+Function.IPCDispatch.GetToolSchemasArray {
+    Output: Address
+    Body: { ReturnValue(IPCDState.schemas_arr) }
+}
+
+// =============================================================================
+// LOOKUP — find a tool's fd by name, return -1 if missing
+// =============================================================================
+Function.IPCDispatch_FindFd {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, IPCDState.count) {
+            base = Add(IPCDState.table, Multiply(i, IPCDConst.ENTRY_SIZE))
+            stored = Dereference(Add(base, IPCDOff.NAME))
+            IfCondition NotEqual(stored, 0) ThenBlock: {
+                IfCondition EqualTo(StringCompare(stored, name), 0) ThenBlock: {
+                    ReturnValue(Dereference(Add(base, IPCDOff.FD)))
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// DISPATCH — send a tool call, await response, return content/error string.
+// Always returns a non-null string suitable for embedding in a tool_result.
+// On error, the string is the error message and out_is_error_ptr is set to 1.
+// =============================================================================
+Function.IPCDispatch.Dispatch {
+    Input: name: Address
+    Input: input_obj: Address
+    Input: tool_use_id: Address
+    Input: out_is_error_ptr: Address
+    Output: Address
+    Body: {
+        StoreValue(out_is_error_ptr, 0, "dword")
+
+        fd = IPCDispatch_FindFd(name)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            StoreValue(out_is_error_ptr, 1, "dword")
+            ReturnValue(StringConcat("tool not registered: ", name))
+        }
+
+        // Build request
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "call")
+        IfCondition NotEqual(tool_use_id, 0) ThenBlock: {
+            JSON.SetString(req, "id", tool_use_id)
+        }
+        IfCondition NotEqual(input_obj, 0) ThenBlock: {
+            JSON.SetObject(req, "args", input_obj)
+        }
+        req_str = JSON.SerializeObject(req)
+
+        sr = Socket.SendMsg(fd, req_str)
+        IfCondition LessThan(sr, 0) ThenBlock: {
+            StoreValue(out_is_error_ptr, 1, "dword")
+            ReturnValue(StringConcat("send failed to: ", name))
+        }
+
+        // 60-second timeout. Tools doing real work (relmem indexing a
+        // big project, web fetches) get plenty of time. Hangs unblock.
+        Socket.SetRecvTimeout(fd, 60000)
+        // Track wall time so we can flag slow tools (>5s) for visibility
+        // without spamming chat for fast ones.
+        t_start = SystemCall(201, 0, 0, 0, 0, 0)   // SYS_TIME — Unix epoch seconds
+        resp_str = Socket.RecvMsg(fd)
+        t_end = SystemCall(201, 0, 0, 0, 0, 0)
+        elapsed = Subtract(t_end, t_start)
+
+        IfCondition EqualTo(resp_str, 0) ThenBlock: {
+            StoreValue(out_is_error_ptr, 1, "dword")
+            // Distinguish timeout from normal close based on elapsed time
+            IfCondition GreaterEqual(elapsed, 60) ThenBlock: {
+                ReturnValue(StringConcat("tool TIMED OUT (60s): ", name))
+            }
+            ReturnValue(StringConcat("no response from: ", name))
+        }
+        // -1 = bad length prefix (e.g. tool returned a payload bigger than
+        // the 64KB IPC envelope sanity check). Socket.RecvMsg already
+        // drained the buffer to resync. Treat as a tool-level error so
+        // the model sees something useful instead of us hanging.
+        IfCondition EqualTo(resp_str, -1) ThenBlock: {
+            StoreValue(out_is_error_ptr, 1, "dword")
+            ReturnValue(StringConcat("tool response too large (>64KB): ", name))
+        }
+        // Slow-tool flag: only emit if we crossed 5s, so fast tools stay quiet.
+        IfCondition GreaterEqual(elapsed, 5) ThenBlock: {
+            slow_msg = StringConcat("[slow tool: ", name)
+            slow_msg = StringConcat(slow_msg, " took ")
+            slow_msg = StringConcat(slow_msg, NumberToString(elapsed))
+            slow_msg = StringConcat(slow_msg, "s]")
+            UI.ChatPrintln(slow_msg)
+        }
+
+        parsed = ParseJSON(resp_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            StoreValue(out_is_error_ptr, 1, "dword")
+            ReturnValue("invalid JSON response from tool")
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            StoreValue(out_is_error_ptr, 1, "dword")
+            ReturnValue("tool response was not an object")
+        }
+
+        ok = JSON.GetBool(obj, "ok")
+        IfCondition EqualTo(ok, 1) ThenBlock: {
+            content = JSON.GetString(obj, "content")
+            IfCondition EqualTo(content, 0) ThenBlock: {
+                ReturnValue("")
+            }
+            ReturnValue(content)
+        }
+
+        // ok = false  -> error path
+        StoreValue(out_is_error_ptr, 1, "dword")
+        err = JSON.GetString(obj, "error")
+        IfCondition EqualTo(err, 0) ThenBlock: { ReturnValue("tool returned error (no detail)") }
+        ReturnValue(err)
+    }
+}
