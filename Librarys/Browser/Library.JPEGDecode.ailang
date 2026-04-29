@@ -1,0 +1,1172 @@
+// Library.JPEGDecode.ailang — Baseline JPEG decoder (JFIF/EXIF, SOF0)
+// Decodes baseline DCT JPEG: Huffman entropy, dequantization, IDCT,
+// YCbCr->BGRA conversion. Supports 4:4:4, 4:2:2, 4:2:0 chroma subsampling.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// ---- JPEG marker bytes (second byte after 0xFF) ----
+FixedPool.JPGMarker {
+    "SOI":   Initialize=216
+    "EOI":   Initialize=217
+    "SOF0":  Initialize=192
+    "DHT":   Initialize=196
+    "DQT":   Initialize=219
+    "DRI":   Initialize=221
+    "SOS":   Initialize=218
+    "APP0":  Initialize=224
+    "APP1":  Initialize=225
+    "COM":   Initialize=254
+}
+
+// ---- JPEG decode state (single-image working state) ----
+// We store everything needed for one decode pass in a flat struct.
+FixedPool.JPGConst {
+    "MAX_QT":      Initialize=4
+    "MAX_HT":      Initialize=8
+    "QT_SIZE":     Initialize=64
+    "BLOCK_SIZE":  Initialize=64
+    "MCU_MAX_BLK": Initialize=6
+}
+
+// Quantization table storage: 4 tables x 64 entries x 8 bytes = 2048 bytes
+// Huffman table storage: DC0, DC1, AC0, AC1 — each has counts[16] + values[256]
+// Component info: up to 4 components x 5 fields (id, qt_sel, dc_sel, ac_sel, h_samp, v_samp)
+
+FixedPool.JPGState {
+    "qt_base":     Initialize=0
+    "ht_dc_base":  Initialize=0
+    "ht_ac_base":  Initialize=0
+    "width":       Initialize=0
+    "height":      Initialize=0
+    "num_comp":    Initialize=0
+    "comp_base":   Initialize=0
+    "restart_int": Initialize=0
+    "data":        Initialize=0
+    "data_len":    Initialize=0
+    "bit_buf":     Initialize=0
+    "bit_cnt":     Initialize=0
+    "byte_pos":    Initialize=0
+    "dc_pred0":    Initialize=0
+    "dc_pred1":    Initialize=0
+    "dc_pred2":    Initialize=0
+    "zigzag":      Initialize=0
+    "blocks":      Initialize=0
+    "pixels":      Initialize=0
+    "out_w":       Initialize=0
+    "out_h":       Initialize=0
+    "max_h":       Initialize=0
+    "max_v":       Initialize=0
+    "c0_hs":       Initialize=0
+    "c0_vs":       Initialize=0
+    "c0_ctx":      Initialize=0
+    "c1_ctx":      Initialize=0
+    "c2_ctx":      Initialize=0
+}
+
+// Component info layout per component (48 bytes each):
+// [0] = component_id, [8] = h_samp, [16] = v_samp, [24] = qt_sel, [32] = dc_sel, [40] = ac_sel
+FixedPool.COMPOff {
+    "ID":     Initialize=0
+    "HSAMP":  Initialize=8
+    "VSAMP":  Initialize=16
+    "QTSEL":  Initialize=24
+    "DCSEL":  Initialize=32
+    "ACSEL":  Initialize=40
+    "SIZE":   Initialize=48
+}
+
+// ===========================================================================
+// JPEG Bit Reader (MSB-first, opposite of DEFLATE!)
+// Handles 0xFF00 byte stuffing
+// ===========================================================================
+
+// Caller must set JPGState.data, JPGState.data_len, JPGState.byte_pos before calling
+Function.JPG__InitBitReader {
+    Output: Integer
+    Body: {
+        JPGState.bit_buf = 0
+        JPGState.bit_cnt = 0
+        ReturnValue(0)
+    }
+}
+
+// Read next byte from stream, handling FF00 stuffing
+Function.JPG__NextByte {
+    Output: Integer
+    Body: {
+        pos = JPGState.byte_pos
+        data = JPGState.data
+        b = GetByte(data, pos)
+        pos = Add(pos, 1)
+        // If we hit 0xFF, the next byte should be 0x00 (stuffed) — skip it
+        IfCondition EqualTo(b, 255) ThenBlock: {
+            next = GetByte(data, pos)
+            IfCondition EqualTo(next, 0) ThenBlock: {
+                pos = Add(pos, 1)
+            }
+            // If next != 0, it's a marker — we shouldn't be here in normal decode
+        }
+        JPGState.byte_pos = pos
+        ReturnValue(b)
+    }
+}
+
+// Read n bits from the JPEG bitstream (MSB first)
+// Caller must set RBState.n before calling
+FixedPool.RBState {
+    "n": Initialize=0
+}
+FixedPool.RBTmp {
+    "byte": Initialize=0
+}
+Function.JPG__ReadBits {
+    Output: Integer
+    Body: {
+        // Fill buffer until we have enough bits
+        WhileLoop LessThan(JPGState.bit_cnt, RBState.n) {
+            // FLATTEN: call NextByte first, store result, THEN combine
+            RBTmp.byte = JPG__NextByte()
+            JPGState.bit_buf = BitwiseOr(ShiftLeft(JPGState.bit_buf, 8), RBTmp.byte)
+            JPGState.bit_cnt = Add(JPGState.bit_cnt, 8)
+        }
+        // Extract top n bits (no function calls here, safe as one expression)
+        JPGState.bit_cnt = Subtract(JPGState.bit_cnt, RBState.n)
+        ReturnValue(BitwiseAnd(ShiftRight(JPGState.bit_buf, JPGState.bit_cnt),
+                               Subtract(ShiftLeft(1, RBState.n), 1)))
+    }
+}
+
+// Receive: read n bits, then convert from JPEG sign-magnitude to integer
+// In JPEG, if the MSB is 0, the value is negative (subtract 2^n - 1)
+// Uses JPGState globals for nbits/raw to avoid clobber
+FixedPool.RCVState {
+    "nbits": Initialize=0
+    "raw":   Initialize=0
+}
+// Caller must set RCVState.nbits before calling
+Function.JPG__Receive {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(RCVState.nbits, 0) ThenBlock: { ReturnValue(0) }
+        RBState.n = RCVState.nbits
+        RCVState.raw = JPG__ReadBits()
+        // If MSB is 0, value is negative
+        IfCondition LessThan(RCVState.raw, ShiftLeft(1, Subtract(RCVState.nbits, 1))) ThenBlock: {
+            ReturnValue(Add(Subtract(RCVState.raw, ShiftLeft(1, RCVState.nbits)), 1))
+        }
+        ReturnValue(RCVState.raw)
+    }
+}
+
+// ===========================================================================
+// Read big-endian u16 from data
+// ===========================================================================
+Function.JPG__ReadU16 {
+    Input: data: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(Multiply(GetByte(data, off), 256), GetByte(data, Add(off, 1))))
+    }
+}
+
+// ===========================================================================
+// JPEG Huffman table decode
+// ===========================================================================
+// Each Huffman table is stored as:
+//   [0..15]   = counts per code length (16 bytes)
+//   [16..271] = symbol values (256 bytes)
+// Total: 272 bytes per table
+
+// Huffman decoder state — globals to survive register clobber across JPG__ReadBits calls
+FixedPool.HDState {
+    "table":  Initialize=0
+    "code":   Initialize=0
+    "idx":    Initialize=0
+    "len":    Initialize=0
+    "count":  Initialize=0
+}
+
+// Decode one Huffman symbol from the bitstream
+// Caller must set HDState.table before calling
+FixedPool.HDTmp {
+    "bit": Initialize=0
+}
+Function.JPG__HuffDecode {
+    Output: Integer
+    Body: {
+        HDState.code = 0
+        HDState.idx = 0
+        HDState.len = 1
+        WhileLoop LessEqual(HDState.len, 16) {
+            // FLATTEN: call ReadBits first, store result, THEN combine
+            RBState.n = 1
+            HDTmp.bit = JPG__ReadBits()
+            HDState.code = BitwiseOr(ShiftLeft(HDState.code, 1), HDTmp.bit)
+            HDState.count = GetByte(HDState.table, Subtract(HDState.len, 1))
+            // Check if code falls in this length's range
+            IfCondition LessThan(HDState.code, HDState.count) ThenBlock: {
+                // Symbol is at table[16 + idx + code]
+                ReturnValue(GetByte(HDState.table, Add(16, Add(HDState.idx, HDState.code))))
+            }
+            HDState.idx = Add(HDState.idx, HDState.count)
+            HDState.code = Subtract(HDState.code, HDState.count)
+            HDState.len = Add(HDState.len, 1)
+        }
+        // Error — no valid code found
+        ReturnValue(-1)
+    }
+}
+
+// ===========================================================================
+// Parse DHT (Define Huffman Table) marker
+// ===========================================================================
+Function.JPG__ParseDHT {
+    Input: data: Address
+    Input: seg_len: Integer
+    Output: Integer
+    Body: {
+        pos = 0
+        WhileLoop LessThan(pos, seg_len) {
+            info = GetByte(data, pos)
+            pos = Add(pos, 1)
+            tc = ShiftRight(info, 4)    // table class: 0=DC, 1=AC
+            th = BitwiseAnd(info, 15)   // table index: 0-3
+
+            // Determine target table
+            target = 0
+            IfCondition EqualTo(tc, 0) ThenBlock: {
+                // DC table
+                target = Add(JPGState.ht_dc_base, Multiply(th, 272))
+            }
+            IfCondition EqualTo(tc, 1) ThenBlock: {
+                // AC table
+                target = Add(JPGState.ht_ac_base, Multiply(th, 272))
+            }
+
+            // Read 16 counts
+            total = 0
+            ci = 0
+            WhileLoop LessThan(ci, 16) {
+                c = GetByte(data, Add(pos, ci))
+                SetByte(target, ci, c)
+                total = Add(total, c)
+                ci = Add(ci, 1)
+            }
+            pos = Add(pos, 16)
+
+            // Read symbol values
+            si = 0
+            WhileLoop LessThan(si, total) {
+                SetByte(target, Add(16, si), GetByte(data, Add(pos, si)))
+                si = Add(si, 1)
+            }
+            pos = Add(pos, total)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ===========================================================================
+// Parse DQT (Define Quantization Table) marker
+// ===========================================================================
+Function.JPG__ParseDQT {
+    Input: data: Address
+    Input: seg_len: Integer
+    Output: Integer
+    Body: {
+        pos = 0
+        WhileLoop LessThan(pos, seg_len) {
+            info = GetByte(data, pos)
+            pos = Add(pos, 1)
+            prec = ShiftRight(info, 4)     // 0 = 8-bit, 1 = 16-bit
+            tq = BitwiseAnd(info, 15)      // table index
+
+            target = Add(JPGState.qt_base, Multiply(tq, 512))  // 64 entries x 8 bytes
+
+            qi = 0
+            WhileLoop LessThan(qi, 64) {
+                IfCondition EqualTo(prec, 0) ThenBlock: {
+                    StoreValue(Add(target, Multiply(qi, 8)), GetByte(data, pos))
+                    pos = Add(pos, 1)
+                }
+                IfCondition EqualTo(prec, 1) ThenBlock: {
+                    StoreValue(Add(target, Multiply(qi, 8)), JPG__ReadU16(data, pos))
+                    pos = Add(pos, 2)
+                }
+                qi = Add(qi, 1)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// ===========================================================================
+// Parse SOF0 (Start of Frame — baseline DCT)
+// ===========================================================================
+Function.JPG__ParseSOF0 {
+    Input: data: Address
+    Output: Integer
+    Body: {
+        // data[0] = precision (should be 8)
+        JPGState.height = JPG__ReadU16(data, 1)
+        JPGState.width = JPG__ReadU16(data, 3)
+        JPGState.num_comp = GetByte(data, 5)
+
+        pos = 6
+        ci = 0
+        WhileLoop LessThan(ci, JPGState.num_comp) {
+            cbase = Add(JPGState.comp_base, Multiply(ci, COMPOff.SIZE))
+            comp_id = GetByte(data, pos)
+            samp = GetByte(data, Add(pos, 1))
+            qt_sel = GetByte(data, Add(pos, 2))
+
+            StoreValue(Add(cbase, COMPOff.ID), comp_id)
+            StoreValue(Add(cbase, COMPOff.HSAMP), ShiftRight(samp, 4))
+            StoreValue(Add(cbase, COMPOff.VSAMP), BitwiseAnd(samp, 15))
+            StoreValue(Add(cbase, COMPOff.QTSEL), qt_sel)
+
+            pos = Add(pos, 3)
+            ci = Add(ci, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ===========================================================================
+// Parse SOS (Start of Scan) — read component selectors
+// ===========================================================================
+Function.JPG__ParseSOS {
+    Input: data: Address
+    Output: Integer
+    Body: {
+        ns = GetByte(data, 0)
+        pos = 1
+        ci = 0
+        WhileLoop LessThan(ci, ns) {
+            cs = GetByte(data, pos)       // component selector
+            tdta = GetByte(data, Add(pos, 1))
+            td = ShiftRight(tdta, 4)      // DC table selector
+            ta = BitwiseAnd(tdta, 15)     // AC table selector
+
+            // Find the matching component and set its table selectors
+            ki = 0
+            WhileLoop LessThan(ki, JPGState.num_comp) {
+                cbase = Add(JPGState.comp_base, Multiply(ki, COMPOff.SIZE))
+                IfCondition EqualTo(Dereference(Add(cbase, COMPOff.ID)), cs) ThenBlock: {
+                    StoreValue(Add(cbase, COMPOff.DCSEL), td)
+                    StoreValue(Add(cbase, COMPOff.ACSEL), ta)
+                }
+                ki = Add(ki, 1)
+            }
+            pos = Add(pos, 2)
+            ci = Add(ci, 1)
+        }
+        // Skip 3 bytes (Ss, Se, Ah/Al) — baseline ignores these
+        ReturnValue(Add(pos, 3))
+    }
+}
+
+// ===========================================================================
+// JPEG Zigzag order table (stored as bytes in an Allocate'd buffer)
+// ===========================================================================
+Function.JPG__MakeZigzag {
+    Output: Address
+    Body: {
+        z = Allocate(64)
+        SetByte(z, 0,  0) SetByte(z, 1,  1) SetByte(z, 2,  8) SetByte(z, 3, 16)
+        SetByte(z, 4,  9) SetByte(z, 5,  2) SetByte(z, 6,  3) SetByte(z, 7, 10)
+        SetByte(z, 8, 17) SetByte(z, 9, 24) SetByte(z, 10,32) SetByte(z, 11,25)
+        SetByte(z, 12,18) SetByte(z, 13,11) SetByte(z, 14, 4) SetByte(z, 15, 5)
+        SetByte(z, 16,12) SetByte(z, 17,19) SetByte(z, 18,26) SetByte(z, 19,33)
+        SetByte(z, 20,40) SetByte(z, 21,48) SetByte(z, 22,41) SetByte(z, 23,34)
+        SetByte(z, 24,27) SetByte(z, 25,20) SetByte(z, 26,13) SetByte(z, 27, 6)
+        SetByte(z, 28, 7) SetByte(z, 29,14) SetByte(z, 30,21) SetByte(z, 31,28)
+        SetByte(z, 32,35) SetByte(z, 33,42) SetByte(z, 34,49) SetByte(z, 35,56)
+        SetByte(z, 36,57) SetByte(z, 37,50) SetByte(z, 38,43) SetByte(z, 39,36)
+        SetByte(z, 40,29) SetByte(z, 41,22) SetByte(z, 42,15) SetByte(z, 43,23)
+        SetByte(z, 44,30) SetByte(z, 45,37) SetByte(z, 46,44) SetByte(z, 47,51)
+        SetByte(z, 48,58) SetByte(z, 49,59) SetByte(z, 50,52) SetByte(z, 51,45)
+        SetByte(z, 52,38) SetByte(z, 53,31) SetByte(z, 54,39) SetByte(z, 55,46)
+        SetByte(z, 56,53) SetByte(z, 57,60) SetByte(z, 58,61) SetByte(z, 59,54)
+        SetByte(z, 60,47) SetByte(z, 61,55) SetByte(z, 62,62) SetByte(z, 63,63)
+        ReturnValue(z)
+    }
+}
+
+// ===========================================================================
+// Block decode context — packs 4 pointers into a struct to stay under 6-arg limit
+// [0]=dc_table, [8]=ac_table, [16]=qt, [24]=zigzag
+// ===========================================================================
+FixedPool.BDCtxOff {
+    "DC_TBL":  Initialize=0
+    "AC_TBL":  Initialize=8
+    "QT":      Initialize=16
+    "ZIGZAG":  Initialize=24
+    "SIZE":    Initialize=32
+}
+
+Function.JPG__MakeBlockCtx {
+    Input: dc_tbl: Address
+    Input: ac_tbl: Address
+    Input: qt: Address
+    Input: zigzag: Address
+    Output: Address
+    Body: {
+        ctx = Allocate(BDCtxOff.SIZE)
+        StoreValue(Add(ctx, BDCtxOff.DC_TBL), dc_tbl)
+        StoreValue(Add(ctx, BDCtxOff.AC_TBL), ac_tbl)
+        StoreValue(Add(ctx, BDCtxOff.QT), qt)
+        StoreValue(Add(ctx, BDCtxOff.ZIGZAG), zigzag)
+        ReturnValue(ctx)
+    }
+}
+
+// Decode one 8x8 block of DCT coefficients
+// ctx = block decode context (dc_table, ac_table, qt, zigzag)
+// DecodeBlock stores its own state in globals to avoid register clobber
+FixedPool.DBState {
+    "block":   Initialize=0
+    "ctx":     Initialize=0
+    "dc_pred": Initialize=0
+    "dc_val":  Initialize=0
+    "k":       Initialize=0
+    "dc_cat":  Initialize=0
+    "dc_diff": Initialize=0
+    "rs":      Initialize=0
+    "rrrr":    Initialize=0
+    "ssss":    Initialize=0
+    "val":     Initialize=0
+    "zpos":    Initialize=0
+    "qval":    Initialize=0
+}
+
+// DecodeBlock takes NO args — all state passed through DBState globals
+// Caller must set DBState.block, DBState.ctx, DBState.dc_pred before calling
+Function.JPG__DecodeBlock {
+    Output: Integer
+    Body: {
+        // Clear block (64 qwords = 512 bytes)
+        MemorySet(DBState.block, 0, 512)
+
+        // DC coefficient — all intermediates go through DBState, flattened
+        HDState.table = Dereference(Add(DBState.ctx, BDCtxOff.DC_TBL))
+        DBState.dc_cat = JPG__HuffDecode()
+        RCVState.nbits = DBState.dc_cat
+        DBState.dc_diff = JPG__Receive()
+        DBState.dc_val = Add(DBState.dc_pred, DBState.dc_diff)
+
+        // Dequantize DC and store at zigzag[0] position
+        DBState.val = Dereference(Add(DBState.ctx, BDCtxOff.ZIGZAG))
+        DBState.zpos = GetByte(DBState.val, 0)
+        DBState.val = Dereference(Add(DBState.ctx, BDCtxOff.QT))
+        DBState.qval = Dereference(DBState.val)
+        StoreValue(Add(DBState.block, Multiply(DBState.zpos, 8)), Multiply(DBState.dc_val, DBState.qval))
+
+        // AC coefficients
+        DBState.k = 1
+        WhileLoop LessThan(DBState.k, 64) {
+            HDState.table = Dereference(Add(DBState.ctx, BDCtxOff.AC_TBL))
+            DBState.rs = JPG__HuffDecode()
+            IfCondition EqualTo(DBState.rs, 0) ThenBlock: {
+                // EOB — rest are zeros
+                DBState.k = 64
+            } ElseBlock: {
+                DBState.rrrr = ShiftRight(DBState.rs, 4)
+                DBState.ssss = BitwiseAnd(DBState.rs, 15)
+                DBState.k = Add(DBState.k, DBState.rrrr)
+                IfCondition LessThan(DBState.k, 64) ThenBlock: {
+                    RCVState.nbits = DBState.ssss
+                    DBState.val = JPG__Receive()
+                    DBState.zpos = Dereference(Add(DBState.ctx, BDCtxOff.ZIGZAG))
+                    DBState.zpos = GetByte(DBState.zpos, DBState.k)
+                    DBState.qval = Dereference(Add(DBState.ctx, BDCtxOff.QT))
+                    DBState.qval = Dereference(Add(DBState.qval, Multiply(DBState.zpos, 8)))
+                    StoreValue(Add(DBState.block, Multiply(DBState.zpos, 8)), Multiply(DBState.val, DBState.qval))
+                    DBState.k = Add(DBState.k, 1)
+                }
+            }
+        }
+
+        // Return new DC predictor
+        ReturnValue(DBState.dc_val)
+    }
+}
+
+// ===========================================================================
+// Integer IDCT — based on the Loeffler/Ligtenberg/Moschytz algorithm
+// Uses fixed-point arithmetic (12-bit fractional precision)
+// This avoids all floating-point operations.
+//
+// Constants (scaled by 4096):
+//   cos(pi/16)*sqrt(2) * 4096 = 5681    (C1)
+//   sin(pi/16)*sqrt(2) * 4096 = 1609    (S1)  -- not used directly
+//   cos(3pi/16)*sqrt(2) * 4096 = 4816   (C3)
+//   sin(3pi/16)*sqrt(2) * 4096 = 3218   (S3)  -- not used directly
+//   cos(pi/8)*sqrt(2) * 4096 = 5352     (C2)  -- not used directly
+//   sin(pi/8)*sqrt(2) * 4096 = 2217     (S2)  -- not used directly
+//
+// We use a simpler approach: the classic 1-D IDCT from the IJG reference
+// implementation, scaled by 8 with descale at each stage.
+// ===========================================================================
+
+// Clamp value to 0..255
+Function.JPG__Clamp {
+    Input: v: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(v, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(v, 255) ThenBlock: { ReturnValue(255) }
+        ReturnValue(v)
+    }
+}
+
+// Integer IDCT using the IJG-style integer method
+// Fixed-point constants (13-bit precision, multiply by 8192):
+//   FIX_0_298631336 = 2446
+//   FIX_0_390180644 = 3196
+//   FIX_0_541196100 = 4433
+//   FIX_0_765366865 = 6270
+//   FIX_0_899976223 = 7373
+//   FIX_1_175875602 = 9633
+//   FIX_1_501321110 = 12299
+//   FIX_1_847759065 = 15137
+//   FIX_1_961570560 = 16069
+//   FIX_2_053119869 = 16819
+//   FIX_2_562915447 = 20995
+//   FIX_3_072711026 = 25172
+
+FixedPool.IDCT {
+    "F0298": Initialize=2446
+    "F0390": Initialize=3196
+    "F0541": Initialize=4433
+    "F0765": Initialize=6270
+    "F0899": Initialize=7373
+    "F1175": Initialize=9633
+    "F1501": Initialize=12299
+    "F1847": Initialize=15137
+    "F1961": Initialize=16069
+    "F2053": Initialize=16819
+    "F2562": Initialize=20995
+    "F3072": Initialize=25172
+    "PASS1_BITS": Initialize=2
+    "CONST_BITS": Initialize=13
+}
+
+// Descale: (val + (1 << (shift-1))) >> shift
+Function.JPG__Descale {
+    Input: val: Integer
+    Input: shift: Integer
+    Output: Integer
+    Body: {
+        round = ShiftLeft(1, Subtract(shift, 1))
+        ReturnValue(ShiftRight(Add(val, round), shift))
+    }
+}
+
+// Apply IDCT to an 8x8 block (in-place, qword array)
+// Input block has dequantized coefficients, output is pixel values 0-255
+Function.JPG__IDCT {
+    Input: block: Address
+    Output: Integer
+    Body: {
+        // Workspace for intermediate results (8x8 qwords)
+        ws = Allocate(512)
+
+        // Pass 1: process columns from block into ws
+        col = 0
+        WhileLoop LessThan(col, 8) {
+            // Load column values: block[row*8 + col]
+            d0 = Dereference(Add(block, Multiply(Add(Multiply(0, 8), col), 8)))
+            d1 = Dereference(Add(block, Multiply(Add(Multiply(1, 8), col), 8)))
+            d2 = Dereference(Add(block, Multiply(Add(Multiply(2, 8), col), 8)))
+            d3 = Dereference(Add(block, Multiply(Add(Multiply(3, 8), col), 8)))
+            d4 = Dereference(Add(block, Multiply(Add(Multiply(4, 8), col), 8)))
+            d5 = Dereference(Add(block, Multiply(Add(Multiply(5, 8), col), 8)))
+            d6 = Dereference(Add(block, Multiply(Add(Multiply(6, 8), col), 8)))
+            d7 = Dereference(Add(block, Multiply(Add(Multiply(7, 8), col), 8)))
+
+            // Check for all-zero AC — shortcut
+            IfCondition And(And(EqualTo(d1, 0), EqualTo(d2, 0)),
+                           And(EqualTo(d3, 0), And(EqualTo(d4, 0),
+                           And(EqualTo(d5, 0), And(EqualTo(d6, 0), EqualTo(d7, 0)))))) ThenBlock: {
+                dcval = ShiftLeft(d0, IDCT.PASS1_BITS)
+                ri = 0
+                WhileLoop LessThan(ri, 8) {
+                    StoreValue(Add(ws, Multiply(Add(Multiply(ri, 8), col), 8)), dcval)
+                    ri = Add(ri, 1)
+                }
+            } ElseBlock: {
+                // Even part
+                tmp0 = ShiftLeft(Add(d0, d4), IDCT.CONST_BITS)
+                tmp1 = ShiftLeft(Subtract(d0, d4), IDCT.CONST_BITS)
+                tmp2 = Add(Multiply(d2, IDCT.F0541), Multiply(d6, Subtract(IDCT.F0541, IDCT.F1847)))
+                tmp3 = Add(Multiply(d2, Add(IDCT.F0541, IDCT.F0765)), Multiply(d6, IDCT.F0541))
+
+                tmp10 = Add(tmp0, tmp3)
+                tmp13 = Subtract(tmp0, tmp3)
+                tmp11 = Add(tmp1, tmp2)
+                tmp12 = Subtract(tmp1, tmp2)
+
+                // Odd part
+                tmp0 = d7
+                tmp1 = d5
+                tmp2 = d3
+                tmp3 = d1
+
+                z1 = Add(tmp0, tmp3)
+                z2 = Add(tmp1, tmp2)
+                z3 = Add(tmp0, tmp2)
+                z4 = Add(tmp1, tmp3)
+                z5 = Multiply(Add(z3, z4), IDCT.F1175)
+
+                tmp0 = Multiply(tmp0, IDCT.F0298)
+                tmp1 = Multiply(tmp1, IDCT.F2053)
+                tmp2 = Multiply(tmp2, IDCT.F3072)
+                tmp3 = Multiply(tmp3, IDCT.F1501)
+                z1 = Multiply(z1, Subtract(0, IDCT.F0899))
+                z2 = Multiply(z2, Subtract(0, IDCT.F2562))
+                z3 = Multiply(z3, Subtract(0, IDCT.F1961))
+                z4 = Multiply(z4, Subtract(0, IDCT.F0390))
+
+                z3 = Add(z3, z5)
+                z4 = Add(z4, z5)
+
+                tmp0 = Add(Add(tmp0, z1), z3)
+                tmp1 = Add(Add(tmp1, z2), z4)
+                tmp2 = Add(Add(tmp2, z2), z3)
+                tmp3 = Add(Add(tmp3, z1), z4)
+
+                // Store to workspace — FLATTEN: compute Descale first, then store
+                dshift = Subtract(IDCT.CONST_BITS, IDCT.PASS1_BITS)
+                idct_tmp = JPG__Descale(Add(tmp10, tmp3), dshift)
+                StoreValue(Add(ws, Multiply(Add(Multiply(0, 8), col), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Subtract(tmp10, tmp3), dshift)
+                StoreValue(Add(ws, Multiply(Add(Multiply(7, 8), col), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Add(tmp11, tmp2), dshift)
+                StoreValue(Add(ws, Multiply(Add(Multiply(1, 8), col), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Subtract(tmp11, tmp2), dshift)
+                StoreValue(Add(ws, Multiply(Add(Multiply(6, 8), col), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Add(tmp12, tmp1), dshift)
+                StoreValue(Add(ws, Multiply(Add(Multiply(2, 8), col), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Subtract(tmp12, tmp1), dshift)
+                StoreValue(Add(ws, Multiply(Add(Multiply(5, 8), col), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Add(tmp13, tmp0), dshift)
+                StoreValue(Add(ws, Multiply(Add(Multiply(3, 8), col), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Subtract(tmp13, tmp0), dshift)
+                StoreValue(Add(ws, Multiply(Add(Multiply(4, 8), col), 8)), idct_tmp)
+            }
+            col = Add(col, 1)
+        }
+
+        // Pass 2: process rows from ws, store final pixel values back to block
+        row = 0
+        WhileLoop LessThan(row, 8) {
+            rbase = Multiply(row, 8)
+            d0 = Dereference(Add(ws, Multiply(Add(rbase, 0), 8)))
+            d1 = Dereference(Add(ws, Multiply(Add(rbase, 1), 8)))
+            d2 = Dereference(Add(ws, Multiply(Add(rbase, 2), 8)))
+            d3 = Dereference(Add(ws, Multiply(Add(rbase, 3), 8)))
+            d4 = Dereference(Add(ws, Multiply(Add(rbase, 4), 8)))
+            d5 = Dereference(Add(ws, Multiply(Add(rbase, 5), 8)))
+            d6 = Dereference(Add(ws, Multiply(Add(rbase, 6), 8)))
+            d7 = Dereference(Add(ws, Multiply(Add(rbase, 7), 8)))
+
+            // Check AC shortcut
+            IfCondition And(And(EqualTo(d1, 0), EqualTo(d2, 0)),
+                           And(EqualTo(d3, 0), And(EqualTo(d4, 0),
+                           And(EqualTo(d5, 0), And(EqualTo(d6, 0), EqualTo(d7, 0)))))) ThenBlock: {
+                // Pass 1 shortcut only applied PASS1_BITS of scaling (not CONST_BITS)
+                // so descale by PASS1_BITS + 3, not CONST_BITS + PASS1_BITS + 3
+                idct_tmp = JPG__Descale(d0, Add(IDCT.PASS1_BITS, 3))
+                dcval = JPG__Clamp(Add(idct_tmp, 128))
+                ri = 0
+                WhileLoop LessThan(ri, 8) {
+                    StoreValue(Add(block, Multiply(Add(rbase, ri), 8)), dcval)
+                    ri = Add(ri, 1)
+                }
+            } ElseBlock: {
+                // Even part
+                tmp0 = ShiftLeft(Add(d0, d4), IDCT.CONST_BITS)
+                tmp1 = ShiftLeft(Subtract(d0, d4), IDCT.CONST_BITS)
+                tmp2 = Add(Multiply(d2, IDCT.F0541), Multiply(d6, Subtract(IDCT.F0541, IDCT.F1847)))
+                tmp3 = Add(Multiply(d2, Add(IDCT.F0541, IDCT.F0765)), Multiply(d6, IDCT.F0541))
+
+                tmp10 = Add(tmp0, tmp3)
+                tmp13 = Subtract(tmp0, tmp3)
+                tmp11 = Add(tmp1, tmp2)
+                tmp12 = Subtract(tmp1, tmp2)
+
+                // Odd part
+                tmp0 = d7
+                tmp1 = d5
+                tmp2 = d3
+                tmp3 = d1
+
+                z1 = Add(tmp0, tmp3)
+                z2 = Add(tmp1, tmp2)
+                z3 = Add(tmp0, tmp2)
+                z4 = Add(tmp1, tmp3)
+                z5 = Multiply(Add(z3, z4), IDCT.F1175)
+
+                tmp0 = Multiply(tmp0, IDCT.F0298)
+                tmp1 = Multiply(tmp1, IDCT.F2053)
+                tmp2 = Multiply(tmp2, IDCT.F3072)
+                tmp3 = Multiply(tmp3, IDCT.F1501)
+                z1 = Multiply(z1, Subtract(0, IDCT.F0899))
+                z2 = Multiply(z2, Subtract(0, IDCT.F2562))
+                z3 = Multiply(z3, Subtract(0, IDCT.F1961))
+                z4 = Multiply(z4, Subtract(0, IDCT.F0390))
+
+                z3 = Add(z3, z5)
+                z4 = Add(z4, z5)
+
+                tmp0 = Add(Add(tmp0, z1), z3)
+                tmp1 = Add(Add(tmp1, z2), z4)
+                tmp2 = Add(Add(tmp2, z2), z3)
+                tmp3 = Add(Add(tmp3, z1), z4)
+
+                // Final descale + level shift (+128) + clamp
+                // FLATTEN: compute Descale+Clamp first, then store
+                fshift = Add(Add(IDCT.CONST_BITS, IDCT.PASS1_BITS), 3)
+                idct_tmp = JPG__Descale(Add(tmp10, tmp3), fshift)
+                idct_tmp = JPG__Clamp(Add(idct_tmp, 128))
+                StoreValue(Add(block, Multiply(Add(rbase, 0), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Subtract(tmp10, tmp3), fshift)
+                idct_tmp = JPG__Clamp(Add(idct_tmp, 128))
+                StoreValue(Add(block, Multiply(Add(rbase, 7), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Add(tmp11, tmp2), fshift)
+                idct_tmp = JPG__Clamp(Add(idct_tmp, 128))
+                StoreValue(Add(block, Multiply(Add(rbase, 1), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Subtract(tmp11, tmp2), fshift)
+                idct_tmp = JPG__Clamp(Add(idct_tmp, 128))
+                StoreValue(Add(block, Multiply(Add(rbase, 6), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Add(tmp12, tmp1), fshift)
+                idct_tmp = JPG__Clamp(Add(idct_tmp, 128))
+                StoreValue(Add(block, Multiply(Add(rbase, 2), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Subtract(tmp12, tmp1), fshift)
+                idct_tmp = JPG__Clamp(Add(idct_tmp, 128))
+                StoreValue(Add(block, Multiply(Add(rbase, 5), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Add(tmp13, tmp0), fshift)
+                idct_tmp = JPG__Clamp(Add(idct_tmp, 128))
+                StoreValue(Add(block, Multiply(Add(rbase, 3), 8)), idct_tmp)
+                idct_tmp = JPG__Descale(Subtract(tmp13, tmp0), fshift)
+                idct_tmp = JPG__Clamp(Add(idct_tmp, 128))
+                StoreValue(Add(block, Multiply(Add(rbase, 4), 8)), idct_tmp)
+            }
+            row = Add(row, 1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// ===========================================================================
+// YCbCr -> RGB conversion (ITU-R BT.601)
+// R = Y + 1.402 * (Cr - 128)
+// G = Y - 0.344136 * (Cb - 128) - 0.714136 * (Cr - 128)
+// B = Y + 1.772 * (Cb - 128)
+//
+// Fixed-point (16-bit):
+// R = Y + ((91881 * (Cr-128)) >> 16)
+// G = Y - ((22554 * (Cb-128) + 46802 * (Cr-128)) >> 16)
+// B = Y + ((116130 * (Cb-128)) >> 16)
+// ===========================================================================
+Function.JPG__YCbCrToR {
+    Input: y: Integer
+    Input: cb: Integer
+    Input: cr: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(JPG__Clamp(Add(y, ShiftRight(Multiply(91881, Subtract(cr, 128)), 16))))
+    }
+}
+
+Function.JPG__YCbCrToG {
+    Input: y: Integer
+    Input: cb: Integer
+    Input: cr: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(JPG__Clamp(Subtract(y, ShiftRight(Add(Multiply(22554, Subtract(cb, 128)),
+                                                          Multiply(46802, Subtract(cr, 128))), 16))))
+    }
+}
+
+Function.JPG__YCbCrToB {
+    Input: y: Integer
+    Input: cb: Integer
+    Input: cr: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(JPG__Clamp(Add(y, ShiftRight(Multiply(116130, Subtract(cb, 128)), 16))))
+    }
+}
+
+// ===========================================================================
+// Decode one MCU's blocks (reads all state from JPGState globals)
+// ===========================================================================
+FixedPool.MCUState {
+    "blk_idx": Initialize=0
+    "vy":      Initialize=0
+    "hx":      Initialize=0
+    "baddr":   Initialize=0
+}
+
+Function.JPG__DecodeMCU {
+    Output: Integer
+    Body: {
+        MCUState.blk_idx = 0
+
+        // Y blocks: c0_hs * c0_vs
+        MCUState.vy = 0
+        WhileLoop LessThan(MCUState.vy, JPGState.c0_vs) {
+            MCUState.hx = 0
+            WhileLoop LessThan(MCUState.hx, JPGState.c0_hs) {
+                MCUState.baddr = Add(JPGState.blocks, Multiply(MCUState.blk_idx, 512))
+                DBState.block = MCUState.baddr
+                DBState.ctx = JPGState.c0_ctx
+                DBState.dc_pred = JPGState.dc_pred0
+                JPGState.dc_pred0 = JPG__DecodeBlock()
+                JPG__IDCT(MCUState.baddr)
+                MCUState.blk_idx = Add(MCUState.blk_idx, 1)
+                MCUState.hx = Add(MCUState.hx, 1)
+            }
+            MCUState.vy = Add(MCUState.vy, 1)
+        }
+
+        // Cb block
+        IfCondition GreaterThan(JPGState.num_comp, 1) ThenBlock: {
+            MCUState.baddr = Add(JPGState.blocks, Multiply(MCUState.blk_idx, 512))
+            DBState.block = MCUState.baddr
+            DBState.ctx = JPGState.c1_ctx
+            DBState.dc_pred = JPGState.dc_pred1
+            JPGState.dc_pred1 = JPG__DecodeBlock()
+            JPG__IDCT(MCUState.baddr)
+            MCUState.blk_idx = Add(MCUState.blk_idx, 1)
+        }
+
+        // Cr block
+        IfCondition GreaterThan(JPGState.num_comp, 2) ThenBlock: {
+            MCUState.baddr = Add(JPGState.blocks, Multiply(MCUState.blk_idx, 512))
+            DBState.block = MCUState.baddr
+            DBState.ctx = JPGState.c2_ctx
+            DBState.dc_pred = JPGState.dc_pred2
+            JPGState.dc_pred2 = JPG__DecodeBlock()
+            JPG__IDCT(MCUState.baddr)
+            MCUState.blk_idx = Add(MCUState.blk_idx, 1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// Write one MCU's pixels to output buffer
+Function.JPG__WriteMCUPixels {
+    Input: mcu_x: Integer
+    Input: mcu_y: Integer
+    Output: Integer
+    Body: {
+        mcu_w = Multiply(JPGState.max_h, 8)
+        mcu_h = Multiply(JPGState.max_v, 8)
+        cb_blk = Multiply(JPGState.c0_hs, JPGState.c0_vs)
+        cr_blk = Add(cb_blk, 1)
+
+        py = 0
+        WhileLoop LessThan(py, mcu_h) {
+            px = 0
+            WhileLoop LessThan(px, mcu_w) {
+                abs_x = Add(Multiply(mcu_x, mcu_w), px)
+                abs_y = Add(Multiply(mcu_y, mcu_h), py)
+
+                IfCondition And(LessThan(abs_x, JPGState.out_w), LessThan(abs_y, JPGState.out_h)) ThenBlock: {
+                    // Y block lookup
+                    y_blk_col = Divide(px, 8)
+                    y_blk_row = Divide(py, 8)
+                    y_blk = Add(Multiply(y_blk_row, JPGState.c0_hs), y_blk_col)
+                    y_in_x = Subtract(px, Multiply(y_blk_col, 8))
+                    y_in_y = Subtract(py, Multiply(y_blk_row, 8))
+                    y_off = Multiply(Add(Multiply(y_in_y, 8), y_in_x), 8)
+                    y_val = Dereference(Add(Add(JPGState.blocks, Multiply(y_blk, 512)), y_off))
+
+                    // Cb/Cr subsampled lookup
+                    cb_x = Divide(px, JPGState.max_h)
+                    cb_y = Divide(py, JPGState.max_v)
+                    cb_off = Multiply(Add(Multiply(cb_y, 8), cb_x), 8)
+                    cb_val = 128
+                    cr_val = 128
+
+                    IfCondition GreaterThan(JPGState.num_comp, 1) ThenBlock: {
+                        cb_val = Dereference(Add(Add(JPGState.blocks, Multiply(cb_blk, 512)), cb_off))
+                    }
+                    IfCondition GreaterThan(JPGState.num_comp, 2) ThenBlock: {
+                        cr_val = Dereference(Add(Add(JPGState.blocks, Multiply(cr_blk, 512)), cb_off))
+                    }
+
+                    r = JPG__YCbCrToR(y_val, cb_val, cr_val)
+                    g = JPG__YCbCrToG(y_val, cb_val, cr_val)
+                    b = JPG__YCbCrToB(y_val, cb_val, cr_val)
+
+                    dp = Multiply(Add(Multiply(abs_y, JPGState.out_w), abs_x), 4)
+                    SetByte(JPGState.pixels, dp, b)
+                    SetByte(JPGState.pixels, Add(dp, 1), g)
+                    SetByte(JPGState.pixels, Add(dp, 2), r)
+                    SetByte(JPGState.pixels, Add(dp, 3), 255)
+                }
+                px = Add(px, 1)
+            }
+            py = Add(py, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Full scan decode loop
+FixedPool.ScanState {
+    "mcu_w":  Initialize=0
+    "mcu_h":  Initialize=0
+    "mcus_x": Initialize=0
+    "mcus_y": Initialize=0
+    "mcu_x":  Initialize=0
+    "mcu_y":  Initialize=0
+}
+
+Function.JPG__DecodeScan {
+    Output: Integer
+    Body: {
+        ScanState.mcu_w = Multiply(JPGState.max_h, 8)
+        ScanState.mcu_h = Multiply(JPGState.max_v, 8)
+        ScanState.mcus_x = Divide(Add(JPGState.width, Subtract(ScanState.mcu_w, 1)), ScanState.mcu_w)
+        ScanState.mcus_y = Divide(Add(JPGState.height, Subtract(ScanState.mcu_h, 1)), ScanState.mcu_h)
+
+        ScanState.mcu_y = 0
+        WhileLoop LessThan(ScanState.mcu_y, ScanState.mcus_y) {
+            ScanState.mcu_x = 0
+            WhileLoop LessThan(ScanState.mcu_x, ScanState.mcus_x) {
+                JPG__DecodeMCU()
+                JPG__WriteMCUPixels(ScanState.mcu_x, ScanState.mcu_y)
+                ScanState.mcu_x = Add(ScanState.mcu_x, 1)
+            }
+            ScanState.mcu_y = Add(ScanState.mcu_y, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ===========================================================================
+// Main JPEG decoder entry point
+// All state stored in globals to avoid register clobber
+// ===========================================================================
+FixedPool.JPGParse {
+    "data":       Initialize=0
+    "data_len":   Initialize=0
+    "pos":        Initialize=0
+    "scan_start": Initialize=0
+    "done":       Initialize=0
+    "marker":     Initialize=0
+    "seg_len":    Initialize=0
+    "ci":         Initialize=0
+    "tmp_dc":     Initialize=0
+    "tmp_ac":     Initialize=0
+    "tmp_qt":     Initialize=0
+    "tmp_cb":     Initialize=0
+}
+
+Function.IMG_DecodeJPEG {
+    Input: data: Address
+    Input: data_len: Integer
+    Output: Integer
+    Body: {
+        JPGParse.data = data
+        JPGParse.data_len = data_len
+
+        // Verify SOI marker (FF D8)
+        IfCondition LessThan(JPGParse.data_len, 2) ThenBlock: { ReturnValue(-1) }
+        IfCondition Or(NotEqual(GetByte(JPGParse.data, 0), 255), NotEqual(GetByte(JPGParse.data, 1), JPGMarker.SOI)) ThenBlock: {
+            PrintMessage("[JPEG] bad SOI\n")
+            ReturnValue(-1)
+        }
+
+        // Allocate state
+        JPGState.qt_base = Allocate(2048)
+        MemorySet(JPGState.qt_base, 0, 2048)
+        JPGState.ht_dc_base = Allocate(1088)
+        MemorySet(JPGState.ht_dc_base, 0, 1088)
+        JPGState.ht_ac_base = Allocate(1088)
+        MemorySet(JPGState.ht_ac_base, 0, 1088)
+        JPGState.comp_base = Allocate(288)
+        MemorySet(JPGState.comp_base, 0, 288)
+        JPGState.width = 0
+        JPGState.height = 0
+        JPGState.num_comp = 0
+        JPGState.restart_int = 0
+
+        JPGState.zigzag = JPG__MakeZigzag()
+
+        // Parse markers
+        JPGParse.pos = 2
+        JPGParse.scan_start = 0
+        JPGParse.done = 0
+
+        WhileLoop EqualTo(JPGParse.done, 0) {
+            IfCondition GreaterEqual(JPGParse.pos, JPGParse.data_len) ThenBlock: {
+                JPGParse.done = 1
+            } ElseBlock: {
+                // Find FF marker
+                IfCondition NotEqual(GetByte(JPGParse.data, JPGParse.pos), 255) ThenBlock: {
+                    JPGParse.pos = Add(JPGParse.pos, 1)
+                } ElseBlock: {
+                    JPGParse.marker = GetByte(JPGParse.data, Add(JPGParse.pos, 1))
+                    JPGParse.pos = Add(JPGParse.pos, 2)
+
+                    // Skip padding FF bytes
+                    IfCondition EqualTo(JPGParse.marker, 255) ThenBlock: {
+                        JPGParse.pos = Subtract(JPGParse.pos, 1)
+                    }
+
+                    // EOI
+                    IfCondition EqualTo(JPGParse.marker, JPGMarker.EOI) ThenBlock: {
+                        JPGParse.done = 1
+                    }
+
+                    // SOF0
+                    IfCondition EqualTo(JPGParse.marker, JPGMarker.SOF0) ThenBlock: {
+                        JPGParse.seg_len = JPG__ReadU16(JPGParse.data, JPGParse.pos)
+                        JPG__ParseSOF0(Add(JPGParse.data, Add(JPGParse.pos, 2)))
+                        JPGParse.pos = Add(JPGParse.pos, JPGParse.seg_len)
+                    }
+
+                    // DHT
+                    IfCondition EqualTo(JPGParse.marker, JPGMarker.DHT) ThenBlock: {
+                        JPGParse.seg_len = JPG__ReadU16(JPGParse.data, JPGParse.pos)
+                        JPG__ParseDHT(Add(JPGParse.data, Add(JPGParse.pos, 2)), Subtract(JPGParse.seg_len, 2))
+                        JPGParse.pos = Add(JPGParse.pos, JPGParse.seg_len)
+                    }
+
+                    // DQT
+                    IfCondition EqualTo(JPGParse.marker, JPGMarker.DQT) ThenBlock: {
+                        JPGParse.seg_len = JPG__ReadU16(JPGParse.data, JPGParse.pos)
+                        JPG__ParseDQT(Add(JPGParse.data, Add(JPGParse.pos, 2)), Subtract(JPGParse.seg_len, 2))
+                        JPGParse.pos = Add(JPGParse.pos, JPGParse.seg_len)
+                    }
+
+                    // DRI
+                    IfCondition EqualTo(JPGParse.marker, JPGMarker.DRI) ThenBlock: {
+                        JPGParse.seg_len = JPG__ReadU16(JPGParse.data, JPGParse.pos)
+                        JPGState.restart_int = JPG__ReadU16(JPGParse.data, Add(JPGParse.pos, 2))
+                        JPGParse.pos = Add(JPGParse.pos, JPGParse.seg_len)
+                    }
+
+                    // SOS — start of scan (entropy-coded data follows)
+                    IfCondition EqualTo(JPGParse.marker, JPGMarker.SOS) ThenBlock: {
+                        JPGParse.seg_len = JPG__ReadU16(JPGParse.data, JPGParse.pos)
+                        JPG__ParseSOS(Add(JPGParse.data, Add(JPGParse.pos, 2)))
+                        JPGParse.scan_start = Add(JPGParse.pos, JPGParse.seg_len)
+                        JPGParse.done = 1
+                    }
+
+                    // APP0-APP15 — skip
+                    IfCondition And(GreaterEqual(JPGParse.marker, 224), LessEqual(JPGParse.marker, 239)) ThenBlock: {
+                        JPGParse.seg_len = JPG__ReadU16(JPGParse.data, JPGParse.pos)
+                        JPGParse.pos = Add(JPGParse.pos, JPGParse.seg_len)
+                    }
+                    // COM — skip
+                    IfCondition EqualTo(JPGParse.marker, JPGMarker.COM) ThenBlock: {
+                        JPGParse.seg_len = JPG__ReadU16(JPGParse.data, JPGParse.pos)
+                        JPGParse.pos = Add(JPGParse.pos, JPGParse.seg_len)
+                    }
+                }
+            }
+        }
+
+        IfCondition Or(EqualTo(JPGState.width, 0), EqualTo(JPGState.height, 0)) ThenBlock: {
+            PrintMessage("[JPEG] no SOF0\n")
+            ReturnValue(-1)
+        }
+
+        // Determine subsampling
+        JPGState.max_h = 1
+        JPGState.max_v = 1
+        JPGParse.ci = 0
+        WhileLoop LessThan(JPGParse.ci, JPGState.num_comp) {
+            JPGState.max_h = Dereference(Add(Add(JPGState.comp_base, Multiply(JPGParse.ci, COMPOff.SIZE)), COMPOff.HSAMP))
+            JPGState.max_v = Dereference(Add(Add(JPGState.comp_base, Multiply(JPGParse.ci, COMPOff.SIZE)), COMPOff.VSAMP))
+            JPGParse.ci = Add(JPGParse.ci, 1)
+        }
+        // max_h/max_v should be the maximum across components — fix: need proper max
+        JPGState.max_h = 1
+        JPGState.max_v = 1
+        JPGParse.ci = 0
+        WhileLoop LessThan(JPGParse.ci, JPGState.num_comp) {
+            IfCondition GreaterThan(Dereference(Add(Add(JPGState.comp_base, Multiply(JPGParse.ci, COMPOff.SIZE)), COMPOff.HSAMP)), JPGState.max_h) ThenBlock: {
+                JPGState.max_h = Dereference(Add(Add(JPGState.comp_base, Multiply(JPGParse.ci, COMPOff.SIZE)), COMPOff.HSAMP))
+            }
+            IfCondition GreaterThan(Dereference(Add(Add(JPGState.comp_base, Multiply(JPGParse.ci, COMPOff.SIZE)), COMPOff.VSAMP)), JPGState.max_v) ThenBlock: {
+                JPGState.max_v = Dereference(Add(Add(JPGState.comp_base, Multiply(JPGParse.ci, COMPOff.SIZE)), COMPOff.VSAMP))
+            }
+            JPGParse.ci = Add(JPGParse.ci, 1)
+        }
+
+        // Store Y sampling factors
+        JPGState.c0_hs = Dereference(Add(JPGState.comp_base, COMPOff.HSAMP))
+        JPGState.c0_vs = Dereference(Add(JPGState.comp_base, COMPOff.VSAMP))
+
+        // Build block decode contexts — use tmp_* fields to avoid overwriting parse state
+        // Component 0 (Y)
+        JPGParse.tmp_dc = Add(JPGState.ht_dc_base, Multiply(Dereference(Add(JPGState.comp_base, COMPOff.DCSEL)), 272))
+        JPGParse.tmp_ac = Add(JPGState.ht_ac_base, Multiply(Dereference(Add(JPGState.comp_base, COMPOff.ACSEL)), 272))
+        JPGParse.tmp_qt = Add(JPGState.qt_base, Multiply(Dereference(Add(JPGState.comp_base, COMPOff.QTSEL)), 512))
+        JPGState.c0_ctx = JPG__MakeBlockCtx(JPGParse.tmp_dc, JPGParse.tmp_ac, JPGParse.tmp_qt, JPGState.zigzag)
+
+        IfCondition GreaterThan(JPGState.num_comp, 1) ThenBlock: {
+            // Component 1 (Cb)
+            JPGParse.tmp_cb = Add(JPGState.comp_base, COMPOff.SIZE)
+            JPGParse.tmp_dc = Add(JPGState.ht_dc_base, Multiply(Dereference(Add(JPGParse.tmp_cb, COMPOff.DCSEL)), 272))
+            JPGParse.tmp_ac = Add(JPGState.ht_ac_base, Multiply(Dereference(Add(JPGParse.tmp_cb, COMPOff.ACSEL)), 272))
+            JPGParse.tmp_qt = Add(JPGState.qt_base, Multiply(Dereference(Add(JPGParse.tmp_cb, COMPOff.QTSEL)), 512))
+            JPGState.c1_ctx = JPG__MakeBlockCtx(JPGParse.tmp_dc, JPGParse.tmp_ac, JPGParse.tmp_qt, JPGState.zigzag)
+        }
+        IfCondition GreaterThan(JPGState.num_comp, 2) ThenBlock: {
+            // Component 2 (Cr)
+            JPGParse.tmp_cb = Add(JPGState.comp_base, Multiply(2, COMPOff.SIZE))
+            JPGParse.tmp_dc = Add(JPGState.ht_dc_base, Multiply(Dereference(Add(JPGParse.tmp_cb, COMPOff.DCSEL)), 272))
+            JPGParse.tmp_ac = Add(JPGState.ht_ac_base, Multiply(Dereference(Add(JPGParse.tmp_cb, COMPOff.ACSEL)), 272))
+            JPGParse.tmp_qt = Add(JPGState.qt_base, Multiply(Dereference(Add(JPGParse.tmp_cb, COMPOff.QTSEL)), 512))
+            JPGState.c2_ctx = JPG__MakeBlockCtx(JPGParse.tmp_dc, JPGParse.tmp_ac, JPGParse.tmp_qt, JPGState.zigzag)
+        }
+
+        // Allocate block buffer and output pixel buffer
+        JPGState.blocks = Allocate(Multiply(JPGConst.MCU_MAX_BLK, 512))
+        JPGState.out_w = JPGState.width
+        JPGState.out_h = JPGState.height
+        JPGState.pixels = Allocate(Multiply(Multiply(JPGState.out_w, JPGState.out_h), 4))
+        MemorySet(JPGState.pixels, 0, Multiply(Multiply(JPGState.out_w, JPGState.out_h), 4))
+
+        // Initialize bit reader at scan data
+        JPGState.data = JPGParse.data
+        JPGState.data_len = JPGParse.data_len
+        JPGState.byte_pos = JPGParse.scan_start
+        JPG__InitBitReader()
+
+        // Reset DC predictors
+        JPGState.dc_pred0 = 0
+        JPGState.dc_pred1 = 0
+        JPGState.dc_pred2 = 0
+
+        // Decode all MCUs
+        JPG__DecodeScan()
+
+        // Store result in image slot
+        JPGParse.ci = IMG__AllocSlot()
+        StoreValue(Add(IMG__SlotBase(JPGParse.ci), IMGConst.S_WIDTH), JPGState.out_w)
+        StoreValue(Add(IMG__SlotBase(JPGParse.ci), IMGConst.S_HEIGHT), JPGState.out_h)
+        StoreValue(Add(IMG__SlotBase(JPGParse.ci), IMGConst.S_PIXELS), JPGState.pixels)
+        StoreValue(Add(IMG__SlotBase(JPGParse.ci), IMGConst.S_BPP), 4)
+        StoreValue(Add(IMG__SlotBase(JPGParse.ci), IMGConst.S_STRIDE), Multiply(JPGState.out_w, 4))
+        StoreValue(Add(IMG__SlotBase(JPGParse.ci), IMGConst.S_VALID), 1)
+
+        ReturnValue(JPGParse.ci)
+    }
+}

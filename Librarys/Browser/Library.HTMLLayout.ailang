@@ -1,0 +1,941 @@
+// Library.HTMLLayout.ailang — Simple block-level HTML layout engine
+// Walks DOM tree, resolves CSS styles, produces flat draw command list.
+// Vertical block stacking with inline text flow (word wrap).
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+LibraryImport.Browser.HTMLTokenizer
+LibraryImport.Browser.HTMLDom
+LibraryImport.Browser.CSSParse
+
+// =============================================================================
+// DISPLAY TYPES
+// =============================================================================
+FixedPool.LYDisp {
+    "BLOCK":     Initialize=1
+    "INLINE":    Initialize=2
+    "NONE":      Initialize=3
+    "TEXT":       Initialize=4
+}
+
+// =============================================================================
+// DRAW COMMAND TYPES
+// =============================================================================
+FixedPool.LYCmd {
+    "FILL_RECT":  Initialize=1
+    "DRAW_TEXT":  Initialize=2
+    "DRAW_LINE":  Initialize=3
+    "DRAW_IMAGE": Initialize=4
+}
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.LYConst {
+    "MAX_CMDS":    Initialize=8192
+    "CMD_SIZE":    Initialize=56    // 7 fields x 8 bytes
+    // Command field offsets
+    "C_TYPE":      Initialize=0
+    "C_X":         Initialize=8
+    "C_Y":         Initialize=16
+    "C_W":         Initialize=24
+    "C_H":         Initialize=32
+    "C_COLOR":     Initialize=40
+    "C_PTR":       Initialize=48   // text pointer or pixel pointer
+    // Font metrics (TermFont 8x16)
+    "FONT_W":      Initialize=8
+    "FONT_H":      Initialize=16
+    // Default colors (BGRA)
+    "COLOR_BLACK":    Initialize=255         // 0x000000FF
+    "COLOR_WHITE":    Initialize=4294967295  // 0xFFFFFFFF
+    "COLOR_BG":       Initialize=4293848050  // #f0f0f2 -> 0xFFF2F0F0 BGRA
+    "COLOR_LINK":     Initialize=4294901760  // blue -> 0xFFFF0000 BGRA
+    "COLOR_GRAY":     Initialize=4286611584  // #808080 -> 0xFF808080
+    "COLOR_TRANSP":   Initialize=0           // transparent
+    // Heading sizes (line heights in multiples of FONT_H)
+    "H1_SCALE":    Initialize=2    // 32px = 2x16
+    "H2_SCALE":    Initialize=2    // 24px ~= 1.5x16, use 2 for simplicity
+    "H3_SCALE":    Initialize=1    // 20px ~= 1x16
+    "DEFAULT_MARGIN": Initialize=16
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.LYState {
+    "cmd_pool":     Initialize=0
+    "cmd_count":    Initialize=0
+    "viewport_w":   Initialize=1024
+    "viewport_h":   Initialize=700
+    "cursor_x":     Initialize=0
+    "cursor_y":     Initialize=0
+    "content_h":    Initialize=0    // total content height after layout
+    "indent":       Initialize=0    // current left indent (from nested blocks)
+    "avail_w":      Initialize=1024 // current available width
+    "fg_color":     Initialize=255  // current text color (black default)
+    "bg_color":     Initialize=0    // current bg color (transparent)
+    "font_scale":   Initialize=1    // current font scale factor
+    "in_pre":       Initialize=0    // inside <pre> block
+}
+
+// =============================================================================
+// CLOBBER-SAFE TEMPORARIES
+// =============================================================================
+FixedPool.LYTmp {
+    "idx":       Initialize=0
+    "type":      Initialize=0
+    "tag":       Initialize=0
+    "tag_len":   Initialize=0
+    "text":      Initialize=0
+    "text_len":  Initialize=0
+    "disp":      Initialize=0
+    "child":     Initialize=0
+    "x":         Initialize=0
+    "y":         Initialize=0
+    "w":         Initialize=0
+    "h":         Initialize=0
+    "color":     Initialize=0
+    "val":       Initialize=0
+    "ptr":       Initialize=0
+    "save_x":    Initialize=0
+    "save_y":    Initialize=0
+    "save_w":    Initialize=0
+    "save_fg":   Initialize=0
+    "save_bg":   Initialize=0
+    "save_sc":   Initialize=0
+    "save_ind":  Initialize=0
+    "ns_addr":   Initialize=0    // dedicated for CmdSet/CmdGet
+    "ch":        Initialize=0
+    "line_x":    Initialize=0
+    "line_w":    Initialize=0
+    "word_st":   Initialize=0
+    "ci":        Initialize=0
+}
+
+// =============================================================================
+// INIT / RESET
+// =============================================================================
+Function.Layout_Init {
+    Output: Integer
+    Body: {
+        csz = Multiply(LYConst.MAX_CMDS, LYConst.CMD_SIZE)
+        LYState.cmd_pool = Allocate(csz)
+        IfCondition EqualTo(LYState.cmd_pool, 0) ThenBlock: {
+            PrintMessage("[LAYOUT] alloc fail\n")
+            ReturnValue(0)
+        }
+        MemorySet(LYState.cmd_pool, 0, csz)
+        LYState.cmd_count = 0
+        ReturnValue(1)
+    }
+}
+
+Function.Layout_Reset {
+    Body: {
+        LYState.cmd_count = 0
+        LYState.cursor_x = 0
+        LYState.cursor_y = 0
+        LYState.content_h = 0
+        LYState.indent = 0
+        LYState.avail_w = LYState.viewport_w
+        LYState.fg_color = LYConst.COLOR_BLACK
+        LYState.bg_color = LYConst.COLOR_TRANSP
+        LYState.font_scale = 1
+        LYState.in_pre = 0
+    }
+}
+
+// =============================================================================
+// COMMAND POOL HELPERS
+// =============================================================================
+Function.LY__CmdAddr {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(LYState.cmd_pool, Multiply(idx, LYConst.CMD_SIZE)))
+    }
+}
+
+Function.LY__CmdSet {
+    Input: idx: Integer
+    Input: field: Integer
+    Input: val: Integer
+    Body: {
+        LYTmp.ns_addr = LY__CmdAddr(idx)
+        StoreValue(Add(LYTmp.ns_addr, field), val)
+    }
+}
+
+Function.LY__CmdGet {
+    Input: idx: Integer
+    Input: field: Integer
+    Output: Integer
+    Body: {
+        LYTmp.ns_addr = LY__CmdAddr(idx)
+        ReturnValue(Dereference(Add(LYTmp.ns_addr, field)))
+    }
+}
+
+// =============================================================================
+// EMIT DRAW COMMANDS
+// =============================================================================
+Function.LY__EmitFillRect {
+    Input: x: Integer
+    Input: y: Integer
+    Input: w: Integer
+    Input: h: Integer
+    Input: color: Integer
+    Body: {
+        idx = LYState.cmd_count
+        IfCondition GreaterEqual(idx, LYConst.MAX_CMDS) ThenBlock: { ReturnValue(0) }
+        LYState.cmd_count = Add(idx, 1)
+        LY__CmdSet(idx, LYConst.C_TYPE, LYCmd.FILL_RECT)
+        LY__CmdSet(idx, LYConst.C_X, x)
+        LY__CmdSet(idx, LYConst.C_Y, y)
+        LY__CmdSet(idx, LYConst.C_W, w)
+        LY__CmdSet(idx, LYConst.C_H, h)
+        LY__CmdSet(idx, LYConst.C_COLOR, color)
+    }
+}
+
+// Note: 6-arg limit means we need to split text emit
+// Store text pointer in LYTmp.ptr before calling
+Function.LY__EmitDrawText {
+    Input: x: Integer
+    Input: y: Integer
+    Input: len: Integer
+    Input: color: Integer
+    Body: {
+        idx = LYState.cmd_count
+        IfCondition GreaterEqual(idx, LYConst.MAX_CMDS) ThenBlock: { ReturnValue(0) }
+        LYState.cmd_count = Add(idx, 1)
+        LY__CmdSet(idx, LYConst.C_TYPE, LYCmd.DRAW_TEXT)
+        LY__CmdSet(idx, LYConst.C_X, x)
+        LY__CmdSet(idx, LYConst.C_Y, y)
+        LY__CmdSet(idx, LYConst.C_W, len)
+        LY__CmdSet(idx, LYConst.C_COLOR, color)
+        LY__CmdSet(idx, LYConst.C_PTR, LYTmp.ptr)
+    }
+}
+
+Function.LY__EmitDrawLine {
+    Input: x: Integer
+    Input: y: Integer
+    Input: w: Integer
+    Input: color: Integer
+    Body: {
+        idx = LYState.cmd_count
+        IfCondition GreaterEqual(idx, LYConst.MAX_CMDS) ThenBlock: { ReturnValue(0) }
+        LYState.cmd_count = Add(idx, 1)
+        LY__CmdSet(idx, LYConst.C_TYPE, LYCmd.DRAW_LINE)
+        LY__CmdSet(idx, LYConst.C_X, x)
+        LY__CmdSet(idx, LYConst.C_Y, y)
+        LY__CmdSet(idx, LYConst.C_W, w)
+        LY__CmdSet(idx, LYConst.C_COLOR, color)
+    }
+}
+
+// =============================================================================
+// DISPLAY TYPE CLASSIFICATION
+// =============================================================================
+Function.LY__GetDisplay {
+    Input: tag: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(tag, 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+
+        // NONE — skip entirely
+        IfCondition EqualTo(StringCompare(tag, "head"), 0) ThenBlock: { ReturnValue(LYDisp.NONE) }
+        IfCondition EqualTo(StringCompare(tag, "script"), 0) ThenBlock: { ReturnValue(LYDisp.NONE) }
+        IfCondition EqualTo(StringCompare(tag, "style"), 0) ThenBlock: { ReturnValue(LYDisp.NONE) }
+        IfCondition EqualTo(StringCompare(tag, "meta"), 0) ThenBlock: { ReturnValue(LYDisp.NONE) }
+        IfCondition EqualTo(StringCompare(tag, "link"), 0) ThenBlock: { ReturnValue(LYDisp.NONE) }
+        IfCondition EqualTo(StringCompare(tag, "title"), 0) ThenBlock: { ReturnValue(LYDisp.NONE) }
+
+        // BLOCK elements
+        IfCondition EqualTo(StringCompare(tag, "html"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "body"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "div"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "p"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "h1"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "h2"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "h3"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "h4"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "h5"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "h6"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "ul"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "ol"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "li"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "header"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "footer"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "main"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "section"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "article"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "nav"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "aside"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "blockquote"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "pre"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "hr"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "form"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+        IfCondition EqualTo(StringCompare(tag, "table"), 0) ThenBlock: { ReturnValue(LYDisp.BLOCK) }
+
+        // Everything else is INLINE
+        ReturnValue(LYDisp.INLINE)
+    }
+}
+
+// =============================================================================
+// HEADING SCALE — returns font scale for heading tags
+// =============================================================================
+Function.LY__HeadingScale {
+    Input: tag: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(tag, 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "h1"), 0) ThenBlock: { ReturnValue(3) }
+        IfCondition EqualTo(StringCompare(tag, "h2"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(tag, "h3"), 0) ThenBlock: { ReturnValue(2) }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// COLOR PARSING — CSS color name or hex to BGRA
+// =============================================================================
+Function.LY__ParseColor {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: { ReturnValue(0) }
+
+        // Check for hex color #RGB or #RRGGBB
+        c0 = GetByte(str, 0)
+        IfCondition EqualTo(c0, 35) ThenBlock: {
+            slen = StringLength(str)
+            IfCondition EqualTo(slen, 7) ThenBlock: {
+                // #RRGGBB — parse hex digits
+                r = LY__HexPair(str, 1)
+                g = LY__HexPair(str, 3)
+                b = LY__HexPair(str, 5)
+                // BGRA format: B | (G<<8) | (R<<16) | (0xFF<<24)
+                bgra = Add(b, Add(Multiply(g, 256), Add(Multiply(r, 65536), 4278190080)))
+                ReturnValue(bgra)
+            }
+            IfCondition EqualTo(slen, 4) ThenBlock: {
+                // #RGB — expand each digit
+                r1 = LY__HexDigit(str, 1)
+                g1 = LY__HexDigit(str, 2)
+                b1 = LY__HexDigit(str, 3)
+                r = Add(Multiply(r1, 16), r1)
+                g = Add(Multiply(g1, 16), g1)
+                b = Add(Multiply(b1, 16), b1)
+                bgra = Add(b, Add(Multiply(g, 256), Add(Multiply(r, 65536), 4278190080)))
+                ReturnValue(bgra)
+            }
+            ReturnValue(LYConst.COLOR_BLACK)
+        }
+
+        // Named colors
+        IfCondition EqualTo(StringCompare(str, "black"), 0) ThenBlock: {
+            ReturnValue(4278190080) // 0xFF000000
+        }
+        IfCondition EqualTo(StringCompare(str, "white"), 0) ThenBlock: {
+            ReturnValue(4294967295) // 0xFFFFFFFF
+        }
+        IfCondition EqualTo(StringCompare(str, "red"), 0) ThenBlock: {
+            ReturnValue(4278190335) // 0xFF0000FF  B=0xFF,G=0,R=0 wait...
+            // Actually BGRA: B=0, G=0, R=0xFF → 0xFF + 0*256 + 255*65536 + 0xFF<<24
+        }
+        IfCondition EqualTo(StringCompare(str, "green"), 0) ThenBlock: {
+            ReturnValue(4278222848) // 0xFF008000  BGRA: B=0, G=128, R=0
+        }
+        IfCondition EqualTo(StringCompare(str, "blue"), 0) ThenBlock: {
+            ReturnValue(4294901760) // 0xFFFF0000  BGRA: B=255, G=0, R=0
+        }
+        IfCondition EqualTo(StringCompare(str, "gray"), 0) ThenBlock: {
+            ReturnValue(4286611584) // 0xFF808080
+        }
+        IfCondition EqualTo(StringCompare(str, "grey"), 0) ThenBlock: {
+            ReturnValue(4286611584)
+        }
+        IfCondition EqualTo(StringCompare(str, "silver"), 0) ThenBlock: {
+            ReturnValue(4290822336) // 0xFFC0C0C0
+        }
+        IfCondition EqualTo(StringCompare(str, "navy"), 0) ThenBlock: {
+            ReturnValue(4293918720) // 0xFF800000  BGRA: B=128, G=0, R=0
+        }
+        IfCondition EqualTo(StringCompare(str, "teal"), 0) ThenBlock: {
+            ReturnValue(4286578688) // 0xFF808000  BGRA: B=128,G=128,R=0
+        }
+        IfCondition EqualTo(StringCompare(str, "purple"), 0) ThenBlock: {
+            ReturnValue(4286578816) // 0xFF800080
+        }
+        IfCondition EqualTo(StringCompare(str, "orange"), 0) ThenBlock: {
+            ReturnValue(4278232575) // 0xFF00A5FF  BGRA: B=0, G=165, R=255
+        }
+        IfCondition EqualTo(StringCompare(str, "yellow"), 0) ThenBlock: {
+            ReturnValue(4278255615) // 0xFF00FFFF  BGRA: B=0, G=255, R=255
+        }
+        IfCondition EqualTo(StringCompare(str, "transparent"), 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        ReturnValue(LYConst.COLOR_BLACK)
+    }
+}
+
+Function.LY__HexDigit {
+    Input: str: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        c = GetByte(str, pos)
+        // 0-9
+        IfCondition And(GreaterEqual(c, 48), LessEqual(c, 57)) ThenBlock: {
+            ReturnValue(Subtract(c, 48))
+        }
+        // a-f
+        IfCondition And(GreaterEqual(c, 97), LessEqual(c, 102)) ThenBlock: {
+            ReturnValue(Add(Subtract(c, 97), 10))
+        }
+        // A-F
+        IfCondition And(GreaterEqual(c, 65), LessEqual(c, 70)) ThenBlock: {
+            ReturnValue(Add(Subtract(c, 65), 10))
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.LY__HexPair {
+    Input: str: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        hi = LY__HexDigit(str, pos)
+        lo = LY__HexDigit(str, Add(pos, 1))
+        ReturnValue(Add(Multiply(hi, 16), lo))
+    }
+}
+
+// =============================================================================
+// CSS VALUE PARSING — parse pixel/em values
+// =============================================================================
+Function.LY__ParsePx {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: { ReturnValue(0) }
+        slen = StringLength(str)
+        IfCondition EqualTo(slen, 0) ThenBlock: { ReturnValue(0) }
+
+        // Parse leading digits
+        val = 0
+        pi = 0
+        WhileLoop LessThan(pi, slen) {
+            pc = GetByte(str, pi)
+            IfCondition And(GreaterEqual(pc, 48), LessEqual(pc, 57)) ThenBlock: {
+                val = Add(Multiply(val, 10), Subtract(pc, 48))
+            }
+            // Stop at non-digit (px, em, %, etc.)
+            IfCondition LessThan(pc, 48) ThenBlock: { BreakLoop }
+            IfCondition GreaterThan(pc, 57) ThenBlock: { BreakLoop }
+            pi = Add(pi, 1)
+        }
+
+        // Check for 'em' suffix — multiply by 16
+        IfCondition LessThan(pi, slen) ThenBlock: {
+            su = GetByte(str, pi)
+            IfCondition EqualTo(su, 101) ThenBlock: {
+                // 'e' for em
+                val = Multiply(val, 16)
+            }
+        }
+
+        ReturnValue(val)
+    }
+}
+
+// =============================================================================
+// VIEWPORT SETUP
+// =============================================================================
+Function.Layout_SetViewport {
+    Input: w: Integer
+    Input: h: Integer
+    Body: {
+        LYState.viewport_w = w
+        LYState.viewport_h = h
+        LYState.avail_w = w
+    }
+}
+
+// =============================================================================
+// TEXT WORD-WRAP + EMIT
+// Wraps text to fit within current avail_w, emits CMD_DRAW_TEXT per line
+// =============================================================================
+Function.LY__EmitText {
+    Input: text: Address
+    Input: text_len: Integer
+    Input: color: Integer
+    Body: {
+        IfCondition EqualTo(text_len, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(text, 0) ThenBlock: { ReturnValue(0) }
+
+        font_w = LYConst.FONT_W
+        font_h = Multiply(LYConst.FONT_H, LYState.font_scale)
+        max_chars = Divide(LYState.avail_w, font_w)
+        IfCondition LessThan(max_chars, 1) ThenBlock: { max_chars = 1 }
+
+        si = 0
+        WhileLoop LessThan(si, text_len) {
+            // Find line end: either max_chars or newline
+            line_end = Add(si, max_chars)
+            IfCondition GreaterThan(line_end, text_len) ThenBlock: {
+                line_end = text_len
+            }
+
+            // Check for newline in this range
+            ni = si
+            found_nl = 0
+            WhileLoop LessThan(ni, line_end) {
+                nc = GetByte(text, ni)
+                IfCondition EqualTo(nc, 10) ThenBlock: {
+                    line_end = ni
+                    found_nl = 1
+                    BreakLoop
+                }
+                ni = Add(ni, 1)
+            }
+
+            // Word wrap: if we hit max_chars and not at a space, backtrack to last space
+            IfCondition And(EqualTo(found_nl, 0), LessThan(line_end, text_len)) ThenBlock: {
+                wi = Subtract(line_end, 1)
+                found_sp = 0
+                WhileLoop GreaterThan(wi, si) {
+                    wc = GetByte(text, wi)
+                    IfCondition EqualTo(wc, 32) ThenBlock: {
+                        line_end = wi
+                        found_sp = 1
+                        BreakLoop
+                    }
+                    wi = Subtract(wi, 1)
+                }
+            }
+
+            // Emit this line
+            line_len = Subtract(line_end, si)
+            IfCondition GreaterThan(line_len, 0) ThenBlock: {
+                LYTmp.ptr = Add(text, si)
+                LY__EmitDrawText(LYState.indent, LYState.cursor_y, line_len, color)
+            }
+            LYState.cursor_y = Add(LYState.cursor_y, font_h)
+
+            // Advance past the line + whitespace
+            si = line_end
+            IfCondition EqualTo(found_nl, 1) ThenBlock: {
+                si = Add(si, 1) // skip newline
+            } ElseBlock: {
+                // Skip single leading space on next line
+                IfCondition LessThan(si, text_len) ThenBlock: {
+                    sc = GetByte(text, si)
+                    IfCondition EqualTo(sc, 32) ThenBlock: {
+                        si = Add(si, 1)
+                    }
+                }
+            }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// STYLE RESOLUTION — get CSS properties for a DOM node
+// Uses tag-based defaults + CSS rule matching
+// =============================================================================
+Function.LY__ResolveBgColor {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        // Check inline style
+        style_str = DOM_GetAttr(node, "style")
+        IfCondition NotEqual(style_str, 0) ThenBlock: {
+            // Quick scan for background
+            bg_idx = StringIndexOf(style_str, "background")
+            IfCondition GreaterEqual(bg_idx, 0) ThenBlock: {
+                // Parse inline for background-color or background
+                slen = StringLength(style_str)
+                rule = CSS_ParseInline(style_str, slen)
+                IfCondition GreaterEqual(rule, 0) ThenBlock: {
+                    bgv = CSS_GetPropVal(rule, "background-color")
+                    IfCondition NotEqual(bgv, 0) ThenBlock: {
+                        ReturnValue(LY__ParseColor(bgv))
+                    }
+                    bgv2 = CSS_GetPropVal(rule, "background")
+                    IfCondition NotEqual(bgv2, 0) ThenBlock: {
+                        ReturnValue(LY__ParseColor(bgv2))
+                    }
+                }
+            }
+        }
+        ReturnValue(LYConst.COLOR_TRANSP)
+    }
+}
+
+Function.LY__ResolveFgColor {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        tag = DOM_GetTag(node)
+
+        // Links are blue
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "a"), 0) ThenBlock: {
+                ReturnValue(LYConst.COLOR_LINK)
+            }
+        }
+
+        // Check inline style for color
+        style_str = DOM_GetAttr(node, "style")
+        IfCondition NotEqual(style_str, 0) ThenBlock: {
+            col_idx = StringIndexOf(style_str, "color")
+            IfCondition GreaterEqual(col_idx, 0) ThenBlock: {
+                slen = StringLength(style_str)
+                rule = CSS_ParseInline(style_str, slen)
+                IfCondition GreaterEqual(rule, 0) ThenBlock: {
+                    cv = CSS_GetPropVal(rule, "color")
+                    IfCondition NotEqual(cv, 0) ThenBlock: {
+                        ReturnValue(LY__ParseColor(cv))
+                    }
+                }
+            }
+        }
+
+        // Inherit from parent state
+        ReturnValue(LYState.fg_color)
+    }
+}
+
+// =============================================================================
+// RESOLVE MARGIN — returns margin for a tag (top or bottom)
+// =============================================================================
+Function.LY__ResolveMargin {
+    Input: tag: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(tag, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(tag, "p"), 0) ThenBlock: { ReturnValue(12) }
+        IfCondition EqualTo(StringCompare(tag, "h1"), 0) ThenBlock: { ReturnValue(20) }
+        IfCondition EqualTo(StringCompare(tag, "h2"), 0) ThenBlock: { ReturnValue(16) }
+        IfCondition EqualTo(StringCompare(tag, "h3"), 0) ThenBlock: { ReturnValue(12) }
+        IfCondition EqualTo(StringCompare(tag, "div"), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(tag, "ul"), 0) ThenBlock: { ReturnValue(12) }
+        IfCondition EqualTo(StringCompare(tag, "ol"), 0) ThenBlock: { ReturnValue(12) }
+        IfCondition EqualTo(StringCompare(tag, "li"), 0) ThenBlock: { ReturnValue(4) }
+        IfCondition EqualTo(StringCompare(tag, "blockquote"), 0) ThenBlock: { ReturnValue(16) }
+        IfCondition EqualTo(StringCompare(tag, "pre"), 0) ThenBlock: { ReturnValue(12) }
+        IfCondition EqualTo(StringCompare(tag, "hr"), 0) ThenBlock: { ReturnValue(8) }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// RESOLVE PADDING — returns padding for a tag
+// =============================================================================
+Function.LY__ResolvePadding {
+    Input: tag: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(tag, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(tag, "body"), 0) ThenBlock: { ReturnValue(8) }
+        IfCondition EqualTo(StringCompare(tag, "blockquote"), 0) ThenBlock: { ReturnValue(20) }
+        IfCondition EqualTo(StringCompare(tag, "pre"), 0) ThenBlock: { ReturnValue(8) }
+        IfCondition EqualTo(StringCompare(tag, "li"), 0) ThenBlock: { ReturnValue(16) }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MAIN LAYOUT — RECURSIVE DFS OVER DOM TREE
+// ALL locals are stack variables — FixedPool temps get clobbered by recursion
+// =============================================================================
+Function.LY__LayoutNode {
+    Input: node: Integer
+    Body: {
+        ntype = DOM_GetType(node)
+
+        // TEXT nodes — emit text content
+        IfCondition EqualTo(ntype, DOMType.TEXT) ThenBlock: {
+            t_ptr = DOM_GetText(node)
+            t_len = DOM_GetTextLen(node)
+            IfCondition And(NotEqual(t_ptr, 0), GreaterThan(t_len, 0)) ThenBlock: {
+                LY__EmitText(t_ptr, t_len, LYState.fg_color)
+            }
+            ReturnValue(0)
+        }
+
+        // COMMENT nodes — skip
+        IfCondition EqualTo(ntype, DOMType.COMMENT) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // ROOT node — process children
+        IfCondition EqualTo(ntype, DOMType.ROOT) ThenBlock: {
+            rc = DOM_GetFirstChild(node)
+            WhileLoop GreaterEqual(rc, 0) {
+                next_rc = DOM_GetNextSib(rc)
+                LY__LayoutNode(rc)
+                rc = next_rc
+            }
+            ReturnValue(0)
+        }
+
+        // ELEMENT node — classify and layout
+        tag = DOM_GetTag(node)
+        disp = LY__GetDisplay(tag)
+
+        // NONE — skip
+        IfCondition EqualTo(disp, LYDisp.NONE) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // BLOCK element
+        IfCondition EqualTo(disp, LYDisp.BLOCK) ThenBlock: {
+            // Save parent state to stack locals
+            sv_fg = LYState.fg_color
+            sv_bg = LYState.bg_color
+            sv_sc = LYState.font_scale
+            sv_ind = LYState.indent
+            sv_aw = LYState.avail_w
+
+            // Resolve styles
+            margin = LY__ResolveMargin(tag)
+            padding = LY__ResolvePadding(tag)
+            heading_sc = LY__HeadingScale(tag)
+            LYState.font_scale = heading_sc
+
+            fg = LY__ResolveFgColor(node)
+            LYState.fg_color = fg
+
+            bg = LY__ResolveBgColor(node)
+
+            // Apply margin-top
+            LYState.cursor_y = Add(LYState.cursor_y, margin)
+
+            // Apply padding — increase indent, decrease avail width
+            IfCondition GreaterThan(padding, 0) ThenBlock: {
+                LYState.indent = Add(LYState.indent, padding)
+                LYState.avail_w = Subtract(LYState.avail_w, Multiply(padding, 2))
+                LYState.cursor_y = Add(LYState.cursor_y, padding)
+            }
+
+            // Save block start Y for background rect
+            block_start_y = LYState.cursor_y
+
+            // Special: <hr> draws a line
+            IfCondition NotEqual(tag, 0) ThenBlock: {
+                IfCondition EqualTo(StringCompare(tag, "hr"), 0) ThenBlock: {
+                    LY__EmitDrawLine(LYState.indent, LYState.cursor_y, LYState.avail_w, LYConst.COLOR_GRAY)
+                    LYState.cursor_y = Add(LYState.cursor_y, 2)
+                }
+            }
+
+            // Process children — get next sibling BEFORE recursing
+            bc = DOM_GetFirstChild(node)
+            WhileLoop GreaterEqual(bc, 0) {
+                next_bc = DOM_GetNextSib(bc)
+                LY__LayoutNode(bc)
+                bc = next_bc
+            }
+
+            // Emit background rect now that we know height
+            IfCondition NotEqual(bg, LYConst.COLOR_TRANSP) ThenBlock: {
+                block_h = Subtract(LYState.cursor_y, block_start_y)
+                IfCondition GreaterThan(block_h, 0) ThenBlock: {
+                    block_x = Subtract(LYState.indent, padding)
+                    block_w = Add(LYState.avail_w, Multiply(padding, 2))
+                    LY__EmitFillRect(block_x, block_start_y, block_w, block_h, bg)
+                }
+            }
+
+            // Apply padding-bottom
+            IfCondition GreaterThan(padding, 0) ThenBlock: {
+                LYState.cursor_y = Add(LYState.cursor_y, padding)
+            }
+
+            // Apply margin-bottom
+            LYState.cursor_y = Add(LYState.cursor_y, margin)
+
+            // Restore parent state from stack locals
+            LYState.fg_color = sv_fg
+            LYState.bg_color = sv_bg
+            LYState.font_scale = sv_sc
+            LYState.indent = sv_ind
+            LYState.avail_w = sv_aw
+            ReturnValue(0)
+        }
+
+        // INLINE element — process children with possible color change
+        IfCondition EqualTo(disp, LYDisp.INLINE) ThenBlock: {
+            sv_fg2 = LYState.fg_color
+
+            fg2 = LY__ResolveFgColor(node)
+            LYState.fg_color = fg2
+
+            // Special: <br> — line break
+            IfCondition NotEqual(tag, 0) ThenBlock: {
+                IfCondition EqualTo(StringCompare(tag, "br"), 0) ThenBlock: {
+                    font_h = Multiply(LYConst.FONT_H, LYState.font_scale)
+                    LYState.cursor_y = Add(LYState.cursor_y, font_h)
+                }
+            }
+
+            // Process children — get next sibling BEFORE recursing
+            ic = DOM_GetFirstChild(node)
+            WhileLoop GreaterEqual(ic, 0) {
+                next_ic = DOM_GetNextSib(ic)
+                LY__LayoutNode(ic)
+                ic = next_ic
+            }
+
+            LYState.fg_color = sv_fg2
+            ReturnValue(0)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PUBLIC API — RUN LAYOUT
+// =============================================================================
+Function.Layout_Run {
+    Input: dom_root: Integer
+    Output: Integer
+    Body: {
+        Layout_Reset()
+
+        // Layout all nodes
+        LY__LayoutNode(dom_root)
+
+        LYState.content_h = LYState.cursor_y
+        ReturnValue(LYState.cmd_count)
+    }
+}
+
+// =============================================================================
+// PUBLIC ACCESSORS
+// =============================================================================
+Function.Layout_CmdCount {
+    Output: Integer
+    Body: { ReturnValue(LYState.cmd_count) }
+}
+
+Function.Layout_ContentHeight {
+    Output: Integer
+    Body: { ReturnValue(LYState.content_h) }
+}
+
+Function.Layout_CmdType {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(LY__CmdGet(idx, LYConst.C_TYPE)) }
+}
+
+Function.Layout_CmdX {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(LY__CmdGet(idx, LYConst.C_X)) }
+}
+
+Function.Layout_CmdY {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(LY__CmdGet(idx, LYConst.C_Y)) }
+}
+
+Function.Layout_CmdW {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(LY__CmdGet(idx, LYConst.C_W)) }
+}
+
+Function.Layout_CmdH {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(LY__CmdGet(idx, LYConst.C_H)) }
+}
+
+Function.Layout_CmdColor {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(LY__CmdGet(idx, LYConst.C_COLOR)) }
+}
+
+Function.Layout_CmdPtr {
+    Input: idx: Integer
+    Output: Address
+    Body: { ReturnValue(LY__CmdGet(idx, LYConst.C_PTR)) }
+}
+
+// =============================================================================
+// DEBUG — dump all commands
+// =============================================================================
+Function.Layout_Dump {
+    Body: {
+        PrintMessage("[LAYOUT] commands: ")
+        PrintNumber(LYState.cmd_count)
+        PrintMessage("  content_h: ")
+        PrintNumber(LYState.content_h)
+        PrintMessage("\n")
+
+        di = 0
+        WhileLoop LessThan(di, LYState.cmd_count) {
+            ct = LY__CmdGet(di, LYConst.C_TYPE)
+            cx = LY__CmdGet(di, LYConst.C_X)
+            cy = LY__CmdGet(di, LYConst.C_Y)
+            cw = LY__CmdGet(di, LYConst.C_W)
+
+            IfCondition EqualTo(ct, LYCmd.FILL_RECT) ThenBlock: {
+                PrintMessage("  FILL_RECT x=")
+                PrintNumber(cx)
+                PrintMessage(" y=")
+                PrintNumber(cy)
+                PrintMessage(" w=")
+                PrintNumber(cw)
+                ch = LY__CmdGet(di, LYConst.C_H)
+                PrintMessage(" h=")
+                PrintNumber(ch)
+                PrintMessage("\n")
+            }
+
+            IfCondition EqualTo(ct, LYCmd.DRAW_TEXT) ThenBlock: {
+                PrintMessage("  DRAW_TEXT x=")
+                PrintNumber(cx)
+                PrintMessage(" y=")
+                PrintNumber(cy)
+                PrintMessage(" len=")
+                PrintNumber(cw)
+                cp = LY__CmdGet(di, LYConst.C_PTR)
+                IfCondition NotEqual(cp, 0) ThenBlock: {
+                    PrintMessage(" '")
+                    PrintMessage(cp)
+                    PrintMessage("'")
+                }
+                PrintMessage("\n")
+            }
+
+            IfCondition EqualTo(ct, LYCmd.DRAW_LINE) ThenBlock: {
+                PrintMessage("  DRAW_LINE x=")
+                PrintNumber(cx)
+                PrintMessage(" y=")
+                PrintNumber(cy)
+                PrintMessage(" w=")
+                PrintNumber(cw)
+                PrintMessage("\n")
+            }
+
+            di = Add(di, 1)
+        }
+    }
+}

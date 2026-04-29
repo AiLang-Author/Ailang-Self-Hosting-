@@ -1,0 +1,997 @@
+// Library.HTMLDom.ailang — Browser-grade HTML DOM tree builder
+// Consumes token stream from HTMLTokenizer, builds a DOM tree with parent/child/sibling
+// links. Handles void elements, implicit close rules, bare attributes.
+// Based on Display/Content/Library.HTMLParse.ailang parser half, adapted for browser use.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+LibraryImport.Browser.HTMLTokenizer
+
+// =============================================================================
+// DOM NODE TYPES
+// =============================================================================
+FixedPool.DOMType {
+    "ELEMENT":  Initialize=1    // tag with attributes and children
+    "TEXT":     Initialize=2    // text content node
+    "ROOT":     Initialize=3    // document root (virtual)
+    "COMMENT":  Initialize=4    // comment node
+}
+
+// =============================================================================
+// NODE STRUCTURE — 112 bytes per node (expanded from display's 96)
+// =============================================================================
+FixedPool.DOMConst {
+    // Node field offsets
+    "N_TYPE":        Initialize=0      // DOMType value
+    "N_TAG_PTR":     Initialize=8      // interned tag name pointer
+    "N_TAG_LEN":     Initialize=16     // tag name length
+    "N_TEXT_PTR":    Initialize=24     // text content pointer (TEXT/COMMENT nodes)
+    "N_TEXT_LEN":    Initialize=32     // text content length
+    "N_PARENT":      Initialize=40     // parent node index (-1 = none)
+    "N_FIRST_CH":    Initialize=48     // first child index (-1 = none)
+    "N_LAST_CH":     Initialize=56     // last child index (-1 = none) [O(1) append]
+    "N_NEXT_SIB":    Initialize=64     // next sibling index (-1 = none)
+    "N_PREV_SIB":    Initialize=72     // previous sibling index (-1 = none) [bidirectional]
+    "N_CHILD_CT":    Initialize=80     // number of children
+    "N_ATTR_FIRST":  Initialize=88     // first attr index in attr pool (-1 = none)
+    "N_ATTR_CT":     Initialize=96     // number of attributes
+    "N_LINE":        Initialize=104    // source line number
+
+    // Node pool sizes
+    "NODE_SIZE":     Initialize=112
+    "MAX_NODES":     Initialize=2048
+
+    // Attribute entry: 32 bytes
+    "A_NAME_PTR":    Initialize=0
+    "A_NAME_LEN":    Initialize=8
+    "A_VAL_PTR":     Initialize=16
+    "A_VAL_LEN":     Initialize=24
+    "ATTR_SIZE":     Initialize=32
+    "MAX_ATTRS":     Initialize=4096
+
+    // Parent stack
+    "MAX_DEPTH":     Initialize=256
+}
+
+// =============================================================================
+// DOM STATE — runtime pools and counters
+// =============================================================================
+FixedPool.DOMState {
+    // Node pool
+    "node_pool":   Initialize=0
+    "node_count":  Initialize=0
+    "root":        Initialize=-1
+
+    // Attribute pool
+    "attr_pool":   Initialize=0
+    "attr_count":  Initialize=0
+
+    // Parent stack (flat array of node indices, no XArrays)
+    "stack":       Initialize=0
+    "stack_top":   Initialize=0    // index of top element (0 = root only)
+
+    // Parser cursor
+    "tok_pos":     Initialize=0
+    "tok_count":   Initialize=0
+    "error":       Initialize=0
+    "err_msg":     Initialize=0
+}
+
+// =============================================================================
+// CLOBBER-SAFE TEMPORARIES
+// =============================================================================
+FixedPool.DOMTmp {
+    "idx":         Initialize=0
+    "ptr":         Initialize=0
+    "len":         Initialize=0
+    "type":        Initialize=0
+    "parent":      Initialize=0
+    "child":       Initialize=0
+    "node":        Initialize=0
+    "tag":         Initialize=0
+    "tag_len":     Initialize=0
+    "attr_idx":    Initialize=0
+    "match":       Initialize=0
+    "first":       Initialize=0
+    "last":        Initialize=0
+    "count":       Initialize=0
+    "found":       Initialize=0
+    "ns_addr":     Initialize=0   // dedicated temp for NodeSet/NodeGet (avoids clobbering ptr)
+}
+
+// =============================================================================
+// INIT / RESET
+// =============================================================================
+Function.DOM_Init {
+    Output: Integer
+    Body: {
+        // Node pool
+        nsz = Multiply(DOMConst.MAX_NODES, DOMConst.NODE_SIZE)
+        DOMState.node_pool = Allocate(nsz)
+        IfCondition EqualTo(DOMState.node_pool, 0) ThenBlock: {
+            PrintMessage("[DOM] node alloc fail\n")
+            ReturnValue(0)
+        }
+        MemorySet(DOMState.node_pool, 0, nsz)
+        DOMState.node_count = 0
+        DOMState.root = -1
+
+        // Attribute pool
+        asz = Multiply(DOMConst.MAX_ATTRS, DOMConst.ATTR_SIZE)
+        DOMState.attr_pool = Allocate(asz)
+        IfCondition EqualTo(DOMState.attr_pool, 0) ThenBlock: {
+            PrintMessage("[DOM] attr alloc fail\n")
+            ReturnValue(0)
+        }
+        MemorySet(DOMState.attr_pool, 0, asz)
+        DOMState.attr_count = 0
+
+        // Parent stack (flat array of 8-byte indices)
+        ssz = Multiply(DOMConst.MAX_DEPTH, 8)
+        DOMState.stack = Allocate(ssz)
+        IfCondition EqualTo(DOMState.stack, 0) ThenBlock: {
+            PrintMessage("[DOM] stack alloc fail\n")
+            ReturnValue(0)
+        }
+        MemorySet(DOMState.stack, 0, ssz)
+        DOMState.stack_top = 0
+
+        DOMState.error = 0
+        ReturnValue(1)
+    }
+}
+
+Function.DOM_Reset {
+    Body: {
+        nsz = Multiply(DOMConst.MAX_NODES, DOMConst.NODE_SIZE)
+        MemorySet(DOMState.node_pool, 0, nsz)
+        DOMState.node_count = 0
+        DOMState.root = -1
+
+        asz = Multiply(DOMConst.MAX_ATTRS, DOMConst.ATTR_SIZE)
+        MemorySet(DOMState.attr_pool, 0, asz)
+        DOMState.attr_count = 0
+
+        DOMState.stack_top = 0
+        DOMState.tok_pos = 0
+        DOMState.tok_count = 0
+        DOMState.error = 0
+    }
+}
+
+// =============================================================================
+// NODE POOL — low-level access
+// =============================================================================
+Function.DOM__NodeAddr {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        off = Multiply(idx, DOMConst.NODE_SIZE)
+        ReturnValue(Add(DOMState.node_pool, off))
+    }
+}
+
+Function.DOM__NodeGet {
+    Input: idx: Integer
+    Input: field: Integer
+    Output: Integer
+    Body: {
+        DOMTmp.ns_addr = DOM__NodeAddr(idx)
+        ReturnValue(Dereference(Add(DOMTmp.ns_addr, field)))
+    }
+}
+
+Function.DOM__NodeSet {
+    Input: idx: Integer
+    Input: field: Integer
+    Input: val: Integer
+    Body: {
+        DOMTmp.ns_addr = DOM__NodeAddr(idx)
+        StoreValue(Add(DOMTmp.ns_addr, field), val)
+    }
+}
+
+Function.DOM__CreateNode {
+    Input: ntype: Integer
+    Output: Integer
+    Body: {
+        idx = DOMState.node_count
+        IfCondition GreaterEqual(idx, DOMConst.MAX_NODES) ThenBlock: {
+            PrintMessage("[DOM] node pool full\n")
+            ReturnValue(-1)
+        }
+        DOMState.node_count = Add(idx, 1)
+
+        DOM__NodeSet(idx, DOMConst.N_TYPE, ntype)
+        DOM__NodeSet(idx, DOMConst.N_TAG_PTR, 0)
+        DOM__NodeSet(idx, DOMConst.N_TAG_LEN, 0)
+        DOM__NodeSet(idx, DOMConst.N_TEXT_PTR, 0)
+        DOM__NodeSet(idx, DOMConst.N_TEXT_LEN, 0)
+        DOM__NodeSet(idx, DOMConst.N_PARENT, -1)
+        DOM__NodeSet(idx, DOMConst.N_FIRST_CH, -1)
+        DOM__NodeSet(idx, DOMConst.N_LAST_CH, -1)
+        DOM__NodeSet(idx, DOMConst.N_NEXT_SIB, -1)
+        DOM__NodeSet(idx, DOMConst.N_PREV_SIB, -1)
+        DOM__NodeSet(idx, DOMConst.N_CHILD_CT, 0)
+        DOM__NodeSet(idx, DOMConst.N_ATTR_FIRST, -1)
+        DOM__NodeSet(idx, DOMConst.N_ATTR_CT, 0)
+        DOM__NodeSet(idx, DOMConst.N_LINE, 0)
+        ReturnValue(idx)
+    }
+}
+
+// =============================================================================
+// O(1) CHILD APPEND — uses N_LAST_CH to skip sibling walk
+// =============================================================================
+Function.DOM__AppendChild {
+    Input: parent: Integer
+    Input: child: Integer
+    Body: {
+        DOM__NodeSet(child, DOMConst.N_PARENT, parent)
+
+        DOMTmp.last = DOM__NodeGet(parent, DOMConst.N_LAST_CH)
+
+        IfCondition EqualTo(DOMTmp.last, -1) ThenBlock: {
+            // First child
+            DOM__NodeSet(parent, DOMConst.N_FIRST_CH, child)
+        }
+        IfCondition NotEqual(DOMTmp.last, -1) ThenBlock: {
+            // Append after last child
+            DOM__NodeSet(DOMTmp.last, DOMConst.N_NEXT_SIB, child)
+            DOM__NodeSet(child, DOMConst.N_PREV_SIB, DOMTmp.last)
+        }
+
+        DOM__NodeSet(parent, DOMConst.N_LAST_CH, child)
+
+        DOMTmp.count = DOM__NodeGet(parent, DOMConst.N_CHILD_CT)
+        DOM__NodeSet(parent, DOMConst.N_CHILD_CT, Add(DOMTmp.count, 1))
+    }
+}
+
+// =============================================================================
+// ATTRIBUTE POOL — low-level access
+// =============================================================================
+Function.DOM__AttrAddr {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        off = Multiply(idx, DOMConst.ATTR_SIZE)
+        ReturnValue(Add(DOMState.attr_pool, off))
+    }
+}
+
+Function.DOM__AddAttr {
+    Input: node: Integer
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Input: val_ptr: Address
+    Input: val_len: Integer
+    Body: {
+        idx = DOMState.attr_count
+        IfCondition GreaterEqual(idx, DOMConst.MAX_ATTRS) ThenBlock: {
+            PrintMessage("[DOM] attr pool full\n")
+            ReturnValue(0)
+        }
+        DOMState.attr_count = Add(idx, 1)
+
+        DOMTmp.ptr = DOM__AttrAddr(idx)
+        StoreValue(Add(DOMTmp.ptr, DOMConst.A_NAME_PTR), name_ptr)
+        StoreValue(Add(DOMTmp.ptr, DOMConst.A_NAME_LEN), name_len)
+        StoreValue(Add(DOMTmp.ptr, DOMConst.A_VAL_PTR), val_ptr)
+        StoreValue(Add(DOMTmp.ptr, DOMConst.A_VAL_LEN), val_len)
+
+        // Set first attr index on node if first attribute
+        DOMTmp.first = DOM__NodeGet(node, DOMConst.N_ATTR_FIRST)
+        IfCondition EqualTo(DOMTmp.first, -1) ThenBlock: {
+            DOM__NodeSet(node, DOMConst.N_ATTR_FIRST, idx)
+        }
+        // Increment attr count
+        DOMTmp.count = DOM__NodeGet(node, DOMConst.N_ATTR_CT)
+        DOM__NodeSet(node, DOMConst.N_ATTR_CT, Add(DOMTmp.count, 1))
+    }
+}
+
+// Add bare attribute (no value, e.g. disabled, checked)
+Function.DOM__AddBareAttr {
+    Input: node: Integer
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Body: {
+        DOM__AddAttr(node, name_ptr, name_len, 0, 0)
+    }
+}
+
+// =============================================================================
+// PARENT STACK — flat array, no XArrays
+// =============================================================================
+Function.DOM__StackPush {
+    Input: node_idx: Integer
+    Body: {
+        IfCondition GreaterEqual(DOMState.stack_top, DOMConst.MAX_DEPTH) ThenBlock: {
+            PrintMessage("[DOM] stack overflow\n")
+            ReturnValue(0)
+        }
+        addr = Add(DOMState.stack, Multiply(DOMState.stack_top, 8))
+        StoreValue(addr, node_idx)
+        DOMState.stack_top = Add(DOMState.stack_top, 1)
+    }
+}
+
+Function.DOM__StackPop {
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(DOMState.stack_top, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        DOMState.stack_top = Subtract(DOMState.stack_top, 1)
+        addr = Add(DOMState.stack, Multiply(DOMState.stack_top, 8))
+        ReturnValue(Dereference(addr))
+    }
+}
+
+Function.DOM__StackPeek {
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(DOMState.stack_top, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        top = Subtract(DOMState.stack_top, 1)
+        addr = Add(DOMState.stack, Multiply(top, 8))
+        ReturnValue(Dereference(addr))
+    }
+}
+
+Function.DOM__StackSize {
+    Output: Integer
+    Body: {
+        ReturnValue(DOMState.stack_top)
+    }
+}
+
+// =============================================================================
+// VOID ELEMENT CHECK — elements that must not have children
+// =============================================================================
+Function.DOM__IsVoid {
+    Input: tag: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(tag, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(tag, "br"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "hr"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "img"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "input"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "meta"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "link"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "base"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "col"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "embed"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "source"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "track"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "wbr"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "area"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(tag, "param"), 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// IMPLICIT CLOSE RULES — browser-grade auto-close behavior
+// p closes p, li closes li, td closes td/th, th closes td/th,
+// tr closes tr, dd closes dd/dt, dt closes dd/dt, option closes option
+// =============================================================================
+Function.DOM__ShouldAutoClose {
+    Input: open_tag: Address
+    Input: new_tag: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(open_tag, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(new_tag, 0) ThenBlock: { ReturnValue(0) }
+
+        // p closes p
+        IfCondition EqualTo(StringCompare(open_tag, "p"), 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(new_tag, "p"), 0) ThenBlock: { ReturnValue(1) }
+            // Block elements also close p
+            IfCondition EqualTo(StringCompare(new_tag, "div"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "h1"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "h2"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "h3"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "h4"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "h5"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "h6"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "ul"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "ol"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "table"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "blockquote"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "pre"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "section"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "article"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "nav"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "header"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "footer"), 0) ThenBlock: { ReturnValue(1) }
+        }
+
+        // li closes li
+        IfCondition EqualTo(StringCompare(open_tag, "li"), 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(new_tag, "li"), 0) ThenBlock: { ReturnValue(1) }
+        }
+
+        // td closes td/th
+        IfCondition EqualTo(StringCompare(open_tag, "td"), 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(new_tag, "td"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "th"), 0) ThenBlock: { ReturnValue(1) }
+        }
+
+        // th closes td/th
+        IfCondition EqualTo(StringCompare(open_tag, "th"), 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(new_tag, "td"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "th"), 0) ThenBlock: { ReturnValue(1) }
+        }
+
+        // tr closes tr
+        IfCondition EqualTo(StringCompare(open_tag, "tr"), 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(new_tag, "tr"), 0) ThenBlock: { ReturnValue(1) }
+        }
+
+        // dd closes dd/dt
+        IfCondition EqualTo(StringCompare(open_tag, "dd"), 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(new_tag, "dd"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "dt"), 0) ThenBlock: { ReturnValue(1) }
+        }
+
+        // dt closes dd/dt
+        IfCondition EqualTo(StringCompare(open_tag, "dt"), 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(new_tag, "dd"), 0) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(StringCompare(new_tag, "dt"), 0) ThenBlock: { ReturnValue(1) }
+        }
+
+        // option closes option
+        IfCondition EqualTo(StringCompare(open_tag, "option"), 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(new_tag, "option"), 0) ThenBlock: { ReturnValue(1) }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// TOKEN CURSOR — reads from HTMLTokenizer's output
+// =============================================================================
+Function.DOM__CurType {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(DOMState.tok_pos, DOMState.tok_count) ThenBlock: {
+            ReturnValue(HTKType.EOF)
+        }
+        ReturnValue(HTK_GetType(DOMState.tok_pos))
+    }
+}
+
+Function.DOM__CurPtr {
+    Output: Address
+    Body: {
+        ReturnValue(HTK_GetPtr(DOMState.tok_pos))
+    }
+}
+
+Function.DOM__CurLen {
+    Output: Integer
+    Body: {
+        ReturnValue(HTK_GetLen(DOMState.tok_pos))
+    }
+}
+
+Function.DOM__Advance {
+    Body: {
+        DOMState.tok_pos = Add(DOMState.tok_pos, 1)
+    }
+}
+
+// =============================================================================
+// TREE BUILDER — BUILD DOM FROM TOKEN STREAM
+// =============================================================================
+Function.DOM_Build {
+    Output: Integer
+    Body: {
+        DOMState.tok_pos = 0
+        DOMState.tok_count = HTK_Count()
+        DOMState.error = 0
+        DOMState.stack_top = 0
+
+        // Create root node
+        root = DOM__CreateNode(DOMType.ROOT)
+        DOMState.root = root
+        DOM__StackPush(root)
+
+        ptt = DOM__CurType()
+
+        WhileLoop And(NotEqual(ptt, HTKType.EOF), EqualTo(DOMState.error, 0)) {
+
+            // ─── TAG OPEN ───
+            IfCondition EqualTo(ptt, HTKType.TAG_OPEN) ThenBlock: {
+                DOMTmp.tag = DOM__CurPtr()
+                DOMTmp.tag_len = DOM__CurLen()
+                DOM__Advance()
+
+                // Check implicit close rules before creating element
+                parent_top = DOM__StackPeek()
+                IfCondition NotEqual(parent_top, root) ThenBlock: {
+                    DOMTmp.ptr = DOM__NodeGet(parent_top, DOMConst.N_TAG_PTR)
+                    DOMTmp.match = DOM__ShouldAutoClose(DOMTmp.ptr, DOMTmp.tag)
+                    IfCondition EqualTo(DOMTmp.match, 1) ThenBlock: {
+                        DOM__StackPop()
+                    }
+                }
+
+                elem = DOM__CreateNode(DOMType.ELEMENT)
+                DOM__NodeSet(elem, DOMConst.N_TAG_PTR, DOMTmp.tag)
+                DOM__NodeSet(elem, DOMConst.N_TAG_LEN, DOMTmp.tag_len)
+
+                // Collect attributes
+                att = DOM__CurType()
+                WhileLoop Or(EqualTo(att, HTKType.ATTR_NAME), EqualTo(att, HTKType.ATTR_BARE)) {
+
+                    // Bare attribute (no value)
+                    IfCondition EqualTo(att, HTKType.ATTR_BARE) ThenBlock: {
+                        DOMTmp.ptr = DOM__CurPtr()
+                        DOMTmp.len = DOM__CurLen()
+                        DOM__Advance()
+                        DOM__AddBareAttr(elem, DOMTmp.ptr, DOMTmp.len)
+                    }
+
+                    // Named attribute with value
+                    IfCondition EqualTo(att, HTKType.ATTR_NAME) ThenBlock: {
+                        an_ptr = DOM__CurPtr()
+                        an_len = DOM__CurLen()
+                        DOM__Advance()
+
+                        // Expect ATTR_VALUE next
+                        avt = DOM__CurType()
+                        IfCondition EqualTo(avt, HTKType.ATTR_VALUE) ThenBlock: {
+                            av_ptr = DOM__CurPtr()
+                            av_len = DOM__CurLen()
+                            DOM__Advance()
+                            DOM__AddAttr(elem, an_ptr, an_len, av_ptr, av_len)
+                        }
+                        IfCondition NotEqual(avt, HTKType.ATTR_VALUE) ThenBlock: {
+                            // Treat as bare attribute if no value follows
+                            DOM__AddBareAttr(elem, an_ptr, an_len)
+                        }
+                    }
+
+                    att = DOM__CurType()
+                }
+
+                // Check for self-close or tag-end
+                end_tt = DOM__CurType()
+
+                IfCondition EqualTo(end_tt, HTKType.TAG_SELF_CLOSE) ThenBlock: {
+                    DOM__Advance()
+                    // Add to current parent, don't push
+                    DOMTmp.parent = DOM__StackPeek()
+                    DOM__AppendChild(DOMTmp.parent, elem)
+                }
+
+                IfCondition EqualTo(end_tt, HTKType.TAG_END) ThenBlock: {
+                    DOM__Advance()
+                    DOMTmp.parent = DOM__StackPeek()
+                    DOM__AppendChild(DOMTmp.parent, elem)
+
+                    // Void elements: don't push onto stack
+                    DOMTmp.tag = DOM__NodeGet(elem, DOMConst.N_TAG_PTR)
+                    is_void = DOM__IsVoid(DOMTmp.tag)
+                    IfCondition EqualTo(is_void, 0) ThenBlock: {
+                        DOM__StackPush(elem)
+                    }
+                }
+            }
+
+            // ─── TAG CLOSE ───
+            IfCondition EqualTo(ptt, HTKType.TAG_CLOSE) ThenBlock: {
+                close_name = DOM__CurPtr()
+                DOM__Advance()
+
+                // Pop matching element from stack
+                // Walk stack to find matching open tag (handles misnested HTML)
+                top = DOM__StackPeek()
+                IfCondition NotEqual(top, root) ThenBlock: {
+                    DOMTmp.ptr = DOM__NodeGet(top, DOMConst.N_TAG_PTR)
+                    DOMTmp.match = StringCompare(DOMTmp.ptr, close_name)
+
+                    IfCondition EqualTo(DOMTmp.match, 0) ThenBlock: {
+                        // Direct match — pop
+                        DOM__StackPop()
+                    }
+                    IfCondition NotEqual(DOMTmp.match, 0) ThenBlock: {
+                        // Scan stack for match (adoption agency simplified)
+                        // Walk backwards through stack to find matching tag
+                        DOMTmp.found = 0
+                        scan_i = Subtract(DOMState.stack_top, 1)
+                        WhileLoop And(GreaterThan(scan_i, 0), EqualTo(DOMTmp.found, 0)) {
+                            scan_addr = Add(DOMState.stack, Multiply(scan_i, 8))
+                            scan_node = Dereference(scan_addr)
+                            scan_tag = DOM__NodeGet(scan_node, DOMConst.N_TAG_PTR)
+                            sc = StringCompare(scan_tag, close_name)
+                            IfCondition EqualTo(sc, 0) ThenBlock: {
+                                // Found match — pop everything above
+                                DOMState.stack_top = scan_i
+                                DOMTmp.found = 1
+                            }
+                            scan_i = Subtract(scan_i, 1)
+                        }
+                        // If no match found, ignore the close tag (browser behavior)
+                    }
+                }
+            }
+
+            // ─── TEXT NODE ───
+            IfCondition EqualTo(ptt, HTKType.TEXT) ThenBlock: {
+                DOMTmp.ptr = DOM__CurPtr()
+                DOMTmp.len = DOM__CurLen()
+                DOM__Advance()
+
+                tnode = DOM__CreateNode(DOMType.TEXT)
+                DOM__NodeSet(tnode, DOMConst.N_TEXT_PTR, DOMTmp.ptr)
+                DOM__NodeSet(tnode, DOMConst.N_TEXT_LEN, DOMTmp.len)
+                DOMTmp.parent = DOM__StackPeek()
+                DOM__AppendChild(DOMTmp.parent, tnode)
+            }
+
+            // ─── COMMENT NODE ───
+            IfCondition EqualTo(ptt, HTKType.COMMENT) ThenBlock: {
+                DOMTmp.ptr = DOM__CurPtr()
+                DOMTmp.len = DOM__CurLen()
+                DOM__Advance()
+
+                cnode = DOM__CreateNode(DOMType.COMMENT)
+                DOM__NodeSet(cnode, DOMConst.N_TEXT_PTR, DOMTmp.ptr)
+                DOM__NodeSet(cnode, DOMConst.N_TEXT_LEN, DOMTmp.len)
+                DOMTmp.parent = DOM__StackPeek()
+                DOM__AppendChild(DOMTmp.parent, cnode)
+            }
+
+            // ─── DOCTYPE — skip ───
+            IfCondition EqualTo(ptt, HTKType.DOCTYPE) ThenBlock: {
+                DOM__Advance()
+            }
+
+            // ─── SKIP unknown token types ───
+            skip_open = EqualTo(ptt, HTKType.TAG_OPEN)
+            skip_close = EqualTo(ptt, HTKType.TAG_CLOSE)
+            skip_text = EqualTo(ptt, HTKType.TEXT)
+            skip_comment = EqualTo(ptt, HTKType.COMMENT)
+            skip_doctype = EqualTo(ptt, HTKType.DOCTYPE)
+            skip_known = Or(skip_open, Or(skip_close, Or(skip_text, Or(skip_comment, skip_doctype))))
+            IfCondition EqualTo(skip_known, 0) ThenBlock: {
+                DOM__Advance()
+            }
+
+            ptt = DOM__CurType()
+        }
+
+        ReturnValue(root)
+    }
+}
+
+// =============================================================================
+// PUBLIC API — CONVENIENCE
+// =============================================================================
+Function.DOM_ParseString {
+    Input: source: Address
+    Input: src_len: Integer
+    Output: Integer
+    Body: {
+        HTK_Reset()
+        DOM_Reset()
+
+        lex_ok = HTK_Tokenize(source, src_len)
+        IfCondition EqualTo(lex_ok, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        ReturnValue(DOM_Build())
+    }
+}
+
+// =============================================================================
+// PUBLIC ACCESSORS
+// =============================================================================
+Function.DOM_GetRoot {
+    Output: Integer
+    Body: { ReturnValue(DOMState.root) }
+}
+
+Function.DOM_NodeCount {
+    Output: Integer
+    Body: { ReturnValue(DOMState.node_count) }
+}
+
+Function.DOM_GetType {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_TYPE)) }
+}
+
+Function.DOM_GetTag {
+    Input: idx: Integer
+    Output: Address
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_TAG_PTR)) }
+}
+
+Function.DOM_GetTagLen {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_TAG_LEN)) }
+}
+
+Function.DOM_GetText {
+    Input: idx: Integer
+    Output: Address
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_TEXT_PTR)) }
+}
+
+Function.DOM_GetTextLen {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_TEXT_LEN)) }
+}
+
+Function.DOM_GetParent {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_PARENT)) }
+}
+
+Function.DOM_GetFirstChild {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_FIRST_CH)) }
+}
+
+Function.DOM_GetLastChild {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_LAST_CH)) }
+}
+
+Function.DOM_GetNextSib {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_NEXT_SIB)) }
+}
+
+Function.DOM_GetPrevSib {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_PREV_SIB)) }
+}
+
+Function.DOM_GetChildCount {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_CHILD_CT)) }
+}
+
+Function.DOM_AttrCount {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_ATTR_CT)) }
+}
+
+Function.DOM_AttrFirst {
+    Input: idx: Integer
+    Output: Integer
+    Body: { ReturnValue(DOM__NodeGet(idx, DOMConst.N_ATTR_FIRST)) }
+}
+
+// =============================================================================
+// ATTRIBUTE LOOKUP BY NAME
+// =============================================================================
+Function.DOM_GetAttr {
+    Input: node: Integer
+    Input: attr_name: Address
+    Output: Address
+    Body: {
+        DOMTmp.first = DOM__NodeGet(node, DOMConst.N_ATTR_FIRST)
+        IfCondition EqualTo(DOMTmp.first, -1) ThenBlock: { ReturnValue(0) }
+
+        DOMTmp.count = DOM__NodeGet(node, DOMConst.N_ATTR_CT)
+        IfCondition EqualTo(DOMTmp.count, 0) ThenBlock: { ReturnValue(0) }
+
+        ga_i = DOMTmp.first
+        ga_end = Add(DOMTmp.first, DOMTmp.count)
+        WhileLoop LessThan(ga_i, ga_end) {
+            DOMTmp.ptr = DOM__AttrAddr(ga_i)
+            ga_name = Dereference(Add(DOMTmp.ptr, DOMConst.A_NAME_PTR))
+            IfCondition NotEqual(ga_name, 0) ThenBlock: {
+                cmp = StringCompare(ga_name, attr_name)
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    ReturnValue(Dereference(Add(DOMTmp.ptr, DOMConst.A_VAL_PTR)))
+                }
+            }
+            ga_i = Add(ga_i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Get attribute name by index within a node
+Function.DOM_AttrName {
+    Input: node: Integer
+    Input: attr_offset: Integer
+    Output: Address
+    Body: {
+        DOMTmp.first = DOM__NodeGet(node, DOMConst.N_ATTR_FIRST)
+        IfCondition EqualTo(DOMTmp.first, -1) ThenBlock: { ReturnValue(0) }
+        real_idx = Add(DOMTmp.first, attr_offset)
+        DOMTmp.ptr = DOM__AttrAddr(real_idx)
+        ReturnValue(Dereference(Add(DOMTmp.ptr, DOMConst.A_NAME_PTR)))
+    }
+}
+
+// Get attribute value by index within a node
+Function.DOM_AttrVal {
+    Input: node: Integer
+    Input: attr_offset: Integer
+    Output: Address
+    Body: {
+        DOMTmp.first = DOM__NodeGet(node, DOMConst.N_ATTR_FIRST)
+        IfCondition EqualTo(DOMTmp.first, -1) ThenBlock: { ReturnValue(0) }
+        real_idx = Add(DOMTmp.first, attr_offset)
+        DOMTmp.ptr = DOM__AttrAddr(real_idx)
+        ReturnValue(Dereference(Add(DOMTmp.ptr, DOMConst.A_VAL_PTR)))
+    }
+}
+
+// =============================================================================
+// DFS SEARCH — find first node with matching tag name
+// =============================================================================
+Function.DOM_FindByTag {
+    Input: start: Integer
+    Input: tag: Address
+    Output: Integer
+    Body: {
+        IfCondition LessThan(start, 0) ThenBlock: { ReturnValue(-1) }
+
+        ntype = DOM__NodeGet(start, DOMConst.N_TYPE)
+        IfCondition EqualTo(ntype, DOMType.ELEMENT) ThenBlock: {
+            DOMTmp.ptr = DOM__NodeGet(start, DOMConst.N_TAG_PTR)
+            IfCondition NotEqual(DOMTmp.ptr, 0) ThenBlock: {
+                cmp = StringCompare(DOMTmp.ptr, tag)
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    ReturnValue(start)
+                }
+            }
+        }
+
+        // Search children
+        ch = DOM__NodeGet(start, DOMConst.N_FIRST_CH)
+        WhileLoop NotEqual(ch, -1) {
+            result = DOM_FindByTag(ch, tag)
+            IfCondition NotEqual(result, -1) ThenBlock: {
+                ReturnValue(result)
+            }
+            ch = DOM__NodeGet(ch, DOMConst.N_NEXT_SIB)
+        }
+
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// DFS SEARCH — find first node with matching id attribute
+// =============================================================================
+Function.DOM_FindById {
+    Input: start: Integer
+    Input: id: Address
+    Output: Integer
+    Body: {
+        IfCondition LessThan(start, 0) ThenBlock: { ReturnValue(-1) }
+
+        ntype = DOM__NodeGet(start, DOMConst.N_TYPE)
+        IfCondition EqualTo(ntype, DOMType.ELEMENT) ThenBlock: {
+            id_val = DOM_GetAttr(start, "id")
+            IfCondition NotEqual(id_val, 0) ThenBlock: {
+                cmp = StringCompare(id_val, id)
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    ReturnValue(start)
+                }
+            }
+        }
+
+        // Search children
+        ch = DOM__NodeGet(start, DOMConst.N_FIRST_CH)
+        WhileLoop NotEqual(ch, -1) {
+            result = DOM_FindById(ch, id)
+            IfCondition NotEqual(result, -1) ThenBlock: {
+                ReturnValue(result)
+            }
+            ch = DOM__NodeGet(ch, DOMConst.N_NEXT_SIB)
+        }
+
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// DEBUG — DUMP DOM TREE
+// =============================================================================
+Function.DOM_Dump {
+    Input: node: Integer
+    Input: depth: Integer
+    Body: {
+        IfCondition LessThan(node, 0) ThenBlock: { ReturnValue(0) }
+
+        // Indent
+        di = 0
+        WhileLoop LessThan(di, depth) {
+            PrintMessage("  ")
+            di = Add(di, 1)
+        }
+
+        ntype = DOM__NodeGet(node, DOMConst.N_TYPE)
+
+        IfCondition EqualTo(ntype, DOMType.ROOT) ThenBlock: {
+            PrintMessage("[ROOT]\n")
+        }
+        IfCondition EqualTo(ntype, DOMType.TEXT) ThenBlock: {
+            tp = DOM__NodeGet(node, DOMConst.N_TEXT_PTR)
+            PrintMessage("[TEXT] \"")
+            IfCondition NotEqual(tp, 0) ThenBlock: { PrintMessage(tp) }
+            PrintMessage("\"\n")
+        }
+        IfCondition EqualTo(ntype, DOMType.COMMENT) ThenBlock: {
+            tp = DOM__NodeGet(node, DOMConst.N_TEXT_PTR)
+            PrintMessage("[COMMENT] \"")
+            IfCondition NotEqual(tp, 0) ThenBlock: { PrintMessage(tp) }
+            PrintMessage("\"\n")
+        }
+        IfCondition EqualTo(ntype, DOMType.ELEMENT) ThenBlock: {
+            tname = DOM__NodeGet(node, DOMConst.N_TAG_PTR)
+            PrintMessage("<")
+            IfCondition NotEqual(tname, 0) ThenBlock: { PrintMessage(tname) }
+            PrintMessage(">")
+
+            // Print attributes
+            acount = DOM__NodeGet(node, DOMConst.N_ATTR_CT)
+            afirst = DOM__NodeGet(node, DOMConst.N_ATTR_FIRST)
+            IfCondition GreaterThan(acount, 0) ThenBlock: {
+                da_i = afirst
+                da_end = Add(afirst, acount)
+                WhileLoop LessThan(da_i, da_end) {
+                    DOMTmp.ptr = DOM__AttrAddr(da_i)
+                    da_n = Dereference(Add(DOMTmp.ptr, DOMConst.A_NAME_PTR))
+                    IfCondition NotEqual(da_n, 0) ThenBlock: {
+                        PrintMessage(" ")
+                        PrintMessage(da_n)
+                        da_v = Dereference(Add(DOMTmp.ptr, DOMConst.A_VAL_PTR))
+                        IfCondition NotEqual(da_v, 0) ThenBlock: {
+                            PrintMessage("=\"")
+                            PrintMessage(da_v)
+                            PrintMessage("\"")
+                        }
+                    }
+                    da_i = Add(da_i, 1)
+                }
+            }
+            PrintMessage("\n")
+        }
+
+        // Recurse children
+        dchild = DOM__NodeGet(node, DOMConst.N_FIRST_CH)
+        child_depth = Add(depth, 1)
+        WhileLoop NotEqual(dchild, -1) {
+            DOM_Dump(dchild, child_depth)
+            dchild = DOM__NodeGet(dchild, DOMConst.N_NEXT_SIB)
+        }
+    }
+}
+
+Function.DOM_DumpAll {
+    Body: {
+        PrintMessage("\n--- DOM TREE ---\n")
+        IfCondition GreaterEqual(DOMState.root, 0) ThenBlock: {
+            DOM_Dump(DOMState.root, 0)
+        }
+        PrintMessage("--- END DOM ---\n\n")
+    }
+}

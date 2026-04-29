@@ -1,0 +1,348 @@
+// ladybird_ipc.ailang
+// Native IPC launcher for Ladybird browser — NO Xvfb sandboxing needed.
+//
+// Unlike Chrome/VS Code which need Xvfb + xdotool + mmap framebuffer
+// capture, Ladybird is a first-class IPC citizen: its C++ integration
+// (~/ladybird/UI/Ailang/) connects directly to the Ailang display server,
+// creates its own window, manages its own ShmCanvas, and handles all
+// input/output natively. This launcher simply:
+//
+//   1. Fork/exec the Ladybird binary
+//   2. Wait for it to exit
+//   3. Clean up
+//
+// Architecture:
+//   - Ladybird binary handles: IPC connect, register("ladybird"),
+//     window.create, ShmCanvas create/attach/present, input dispatch,
+//     resize, and window.closed — all in native C++.
+//   - This launcher is just a process supervisor for the Start Menu.
+//
+// Prerequisites: ~/ladybird/Build/release/bin/Ladybird (compiled)
+//
+// Build: ./ailang.x Applications/ladybird_ipc.ailang ladybird_ipc.x
+// Run:   ./ladybird_ipc.x  (after SysDisplay.x is running)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.LBSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_STAT":      Initialize=4
+    "SYS_DUP2":      Initialize=33
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_KILL":      Initialize=62
+    "SYS_WAIT4":     Initialize=61
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_UNLINK":    Initialize=87
+    "SYS_GETUID":    Initialize=102
+    "SYS_SETUID":    Initialize=105
+    "SYS_SETGID":    Initialize=106
+}
+
+FixedPool.LBSig {
+    "SIGTERM":  Initialize=15
+    "WNOHANG":  Initialize=1
+}
+
+// PID file constants — O_WRONLY|O_CREAT|O_TRUNC = 1|64|512 = 577, mode 0644 = 420
+FixedPool.LBPid {
+    "O_WRCREAT": Initialize=577
+    "FMODE":     Initialize=420
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.LBState {
+    "running":       Initialize=1
+    "ladybird_pid":  Initialize=0
+}
+
+// =============================================================================
+// NUM TO STRING
+// =============================================================================
+Function.LB_NumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// PID FILE — write PID for crash recovery
+// =============================================================================
+Function.LB_WritePidFile {
+    Input: path: Address
+    Input: pid: Integer
+    Body: {
+        fd = SystemCall(LBSys.SYS_OPEN, path, LBPid.O_WRCREAT, LBPid.FMODE)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(16)
+        nlen = LB_NumToStr(pid, buf)
+        SetByte(buf, nlen, 10)
+        SystemCall(LBSys.SYS_WRITE, fd, buf, Add(nlen, 1), 0, 0)
+        SystemCall(LBSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        Deallocate(buf, 16)
+    }
+}
+
+// =============================================================================
+// PID FILE — read PID from file, returns 0 on failure
+// =============================================================================
+Function.LB_ReadPidFile {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        fd = SystemCall(LBSys.SYS_OPEN, path, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(16)
+        MemorySet(buf, 0, 16)
+        nr = SystemCall(LBSys.SYS_READ, fd, buf, 15, 0, 0)
+        SystemCall(LBSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(nr, 0) ThenBlock: {
+            Deallocate(buf, 16)
+            ReturnValue(0)
+        }
+        pid = 0
+        i = 0
+        WhileLoop LessThan(i, nr) {
+            ch = GetByte(buf, i)
+            IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: {
+                pid = Add(Multiply(pid, 10), Subtract(ch, 48))
+            } ElseBlock: {
+                IfCondition GreaterThan(pid, 0) ThenBlock: { i = nr }
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 16)
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// DROP PRIVILEGES — if running as root, drop to owner of /home/bob
+// =============================================================================
+Function.LB_DropPriv {
+    Body: {
+        uid = SystemCall(LBSys.SYS_GETUID, 0, 0, 0, 0, 0)
+        IfCondition NotEqual(uid, 0) ThenBlock: { ReturnValue(0) }
+
+        sb = Allocate(144)
+        sr = SystemCall(LBSys.SYS_STAT, "/home/bob", sb, 0, 0, 0)
+        IfCondition LessThan(sr, 0) ThenBlock: {
+            Deallocate(sb, 144)
+            ReturnValue(0)
+        }
+
+        ruid = Dereference(Add(sb, 28), "dword")
+        rgid = Dereference(Add(sb, 32), "dword")
+        Deallocate(sb, 144)
+
+        IfCondition EqualTo(ruid, 0) ThenBlock: { ReturnValue(0) }
+
+        SystemCall(LBSys.SYS_SETGID, rgid, 0, 0, 0, 0)
+        SystemCall(LBSys.SYS_SETUID, ruid, 0, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// CLEANUP STALE — kill orphaned Ladybird from prior crash
+// =============================================================================
+Function.LB_CleanupStale {
+    Body: {
+        PrintMessage("[Ladybird] Checking for orphaned processes...\n")
+
+        pid = LB_ReadPidFile("/tmp/ladybird_ailang.pid")
+        IfCondition GreaterThan(pid, 1) ThenBlock: {
+            kr = SystemCall(LBSys.SYS_KILL, pid, 9, 0, 0, 0)
+            IfCondition EqualTo(kr, 0) ThenBlock: {
+                PrintMessage("[Ladybird] Killed stale pid=")
+                PrintNumber(pid)
+                PrintMessage("\n")
+            }
+            // Wait 100ms for process to die
+            ts = Allocate(16)
+            StoreValue(ts, 0)
+            StoreValue(Add(ts, 8), 100000000)
+            SystemCall(LBSys.SYS_NANOSLEEP, ts, 0)
+            Deallocate(ts, 16)
+        }
+
+        SystemCall(LBSys.SYS_UNLINK, "/tmp/ladybird_ailang.pid", 0, 0, 0, 0)
+        PrintMessage("[Ladybird] Cleanup complete\n")
+    }
+}
+
+// =============================================================================
+// LAUNCH LADYBIRD — fork/exec the native binary
+// Ladybird handles its own IPC: connect, register, window.create,
+// ShmCanvas, input, resize — all in C++. We just exec and wait.
+// =============================================================================
+Function.LB_Launch {
+    Output: Integer
+    Body: {
+        pid = SystemCall(LBSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[Ladybird] fork failed\n")
+            ReturnValue(-1)
+        }
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // ===== CHILD =====
+            LB_DropPriv()
+
+            // Redirect stdout/stderr to log file — prevents TTY corruption
+            // while preserving output for debugging
+            logfd = SystemCall(LBSys.SYS_OPEN, "/tmp/ladybird_output.log", LBPid.O_WRCREAT, LBPid.FMODE)
+            IfCondition GreaterEqual(logfd, 0) ThenBlock: {
+                SystemCall(LBSys.SYS_DUP2, logfd, 1, 0, 0, 0)
+                SystemCall(LBSys.SYS_DUP2, logfd, 2, 0, 0, 0)
+                SystemCall(LBSys.SYS_CLOSE, logfd, 0, 0, 0, 0)
+            }
+
+            // argv: Ladybird binary + initial URL
+            argv = Allocate(24)
+            StoreValue(Add(argv, 0), "/home/bob/ladybird/Build/release/bin/Ladybird")
+            StoreValue(Add(argv, 8), "https://example.com")
+            StoreValue(Add(argv, 16), 0)
+
+            // envp: minimal environment + LD_LIBRARY_PATH for Ladybird's shared libs
+            envp = Allocate(40)
+            StoreValue(Add(envp, 0),  "HOME=/home/bob")
+            StoreValue(Add(envp, 8),  "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            StoreValue(Add(envp, 16), "LANG=en_US.UTF-8")
+            StoreValue(Add(envp, 24), "LD_LIBRARY_PATH=/home/bob/ladybird/Build/release/lib")
+            StoreValue(Add(envp, 32), 0)
+
+            SystemCall(LBSys.SYS_EXECVE, "/home/bob/ladybird/Build/release/bin/Ladybird", argv, envp)
+            PrintMessage("[Ladybird] execve failed\n")
+            SystemCall(LBSys.SYS_EXIT, 1)
+        }
+
+        // ===== PARENT =====
+        LBState.ladybird_pid = pid
+        LB_WritePidFile("/tmp/ladybird_ailang.pid", pid)
+        PrintMessage("[Ladybird] Launched pid=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// STOP — kill Ladybird, clean up PID file
+// =============================================================================
+Function.LB_Stop {
+    Body: {
+        IfCondition GreaterThan(LBState.ladybird_pid, 0) ThenBlock: {
+            SystemCall(LBSys.SYS_KILL, LBState.ladybird_pid, LBSig.SIGTERM, 0, 0, 0)
+            // Wait 200ms for graceful shutdown
+            ts = Allocate(16)
+            StoreValue(ts, 0)
+            StoreValue(Add(ts, 8), 200000000)
+            SystemCall(LBSys.SYS_NANOSLEEP, ts, 0)
+            Deallocate(ts, 16)
+
+            // Reap
+            status = Allocate(8)
+            wr = SystemCall(LBSys.SYS_WAIT4, LBState.ladybird_pid, status, LBSig.WNOHANG, 0, 0, 0)
+            IfCondition EqualTo(wr, 0) ThenBlock: {
+                // Still alive — SIGKILL
+                SystemCall(LBSys.SYS_KILL, LBState.ladybird_pid, 9, 0, 0, 0)
+                SystemCall(LBSys.SYS_WAIT4, LBState.ladybird_pid, status, 0, 0, 0)
+            }
+            Deallocate(status, 8)
+
+            PrintMessage("[Ladybird] Stopped pid=")
+            PrintNumber(LBState.ladybird_pid)
+            PrintMessage("\n")
+            LBState.ladybird_pid = 0
+        }
+
+        SystemCall(LBSys.SYS_UNLINK, "/tmp/ladybird_ailang.pid", 0, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Ladybird Browser — Native IPC Client\n")
+    PrintMessage("============================================\n\n")
+
+    // Kill any orphaned Ladybird from prior crash
+    LB_CleanupStale()
+
+    // Launch Ladybird — it connects to display server on its own
+    lr = LB_Launch()
+    IfCondition LessThan(lr, 0) ThenBlock: {
+        PrintMessage("[Ladybird] Failed to launch — is ~/ladybird/Build/release/bin/Ladybird compiled?\n")
+        HaltProgram
+    }
+
+    PrintMessage("[Ladybird] Waiting for process to exit...\n\n")
+
+    // ===== MAIN LOOP — just wait for Ladybird to exit =====
+    status = Allocate(8)
+    ts_poll = Allocate(16)
+    StoreValue(ts_poll, 0)
+    StoreValue(Add(ts_poll, 8), 100000000)
+
+    WhileLoop EqualTo(LBState.running, 1) {
+        wr = SystemCall(LBSys.SYS_WAIT4, LBState.ladybird_pid, status, LBSig.WNOHANG, 0, 0, 0)
+        IfCondition EqualTo(wr, LBState.ladybird_pid) ThenBlock: {
+            PrintMessage("[Ladybird] Process exited\n")
+            LBState.ladybird_pid = 0
+            LBState.running = 0
+        } ElseBlock: {
+            SystemCall(LBSys.SYS_NANOSLEEP, ts_poll, 0)
+        }
+    }
+
+    Deallocate(status, 8)
+    Deallocate(ts_poll, 16)
+
+    // Cleanup
+    LB_Stop()
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  Ladybird Browser finished\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)
