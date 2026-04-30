@@ -137,7 +137,7 @@ Documents/AILangSH/
 `LibraryImport.X` resolves `Librarys/Library.X.ailang` from project root.
 `Import.Applications.ClaudeCode.X` resolves
 `Applications/ClaudeCode/X.ailang`. Both must be invoked with the
-project root as CWD (e.g. `cd /mnt/c/Users/Sean/Documents/AILangSH`
+project root as CWD (e.g. `cd /path/to/AILangSH`
 before running `./ailang.x ...` or `./ClaudeCode.x`).
 
 User-private state (mode 0600) lives at `~/.claudecode/`:
@@ -317,7 +317,7 @@ non-Kitty terminal (detected via `KITTY_WINDOW_ID`).
 ## Build & run
 
 ```bash
-cd /mnt/c/Users/Sean/Documents/AILangSH
+cd /path/to/AILangSH
 
 # One command rebuilds all 8 binaries and installs to Applications/ClaudeCode/
 bash build.sh
