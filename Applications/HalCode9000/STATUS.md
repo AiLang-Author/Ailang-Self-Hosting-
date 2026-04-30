@@ -48,23 +48,48 @@ Replace the current boot sequence with:
 
 ## Multi-Agent Tool (Next Big Thing)
 
-The biggest gap. Planned as a new cc_tool `cc_agent_ipc` that:
-- Accepts a task description + tool subset
+Planned as a new cc_tool `cc_agent_ipc` that:
+- Accepts a task description + tool subset + session parent ID
 - Spins up a sub-agent conversation (separate history, same backend pool)
 - Returns the result as a tool response to the parent agent
 - Parent can fan out N sub-agents in parallel (each gets its own socket call)
 
-This is the foundation for: parallel file analysis, multi-pass review, code gen + test.
+**Prerequisite: cc_pgmem must exist first.** Sub-agents need somewhere to park
+findings that the parent can read without replaying the full sub-conversation.
+That's what `hc_context` provides. Build pgmem first, then cc_agent_ipc on top.
+
+## cc_pgmem — Postgres Memory Tool
+
+Full design in `DESIGN_PGMEM.md`. Summary:
+
+- **relmem → Postgres**: `op=sync` writes symbols/files into `hc_files` +
+  `hc_symbols` (FTS via tsvector/GIN). Replaces the flat JSON index.
+- **Working context**: `op=park` / `op=pickup` / `op=search` against `hc_context`.
+  Agents store findings, decisions, todos as structured rows.
+- **Replaces CLAUDE.md**: persistent-scope rows ARE the project knowledge.
+  Any session starts with `op=tree(scope=persistent)`.
+- **ACID compaction**: stale work plans are retired atomically — a summary row
+  is written and old rows are marked inactive in the same transaction.
+  Nothing is deleted; archaeology is always possible.
+- **Olympus tie-in (future)**: persistent decisions + compaction boundaries map
+  naturally onto Olympus commit/mana annotations. No pgmem changes needed —
+  Postgres trigger or webhook handles the fan-out when that integration exists.
+- **pgvector**: skip unless FTS proves concretely insufficient. tsvector handles
+  symbol lookup and context search well. Add the column + index only when there's
+  a specific failing query that vector search would fix.
 
 ## Roadmap (Parked, Priority Order)
 
-1. **Multi-agent tool** (`cc_agent_ipc.ailang`) — fan-out sub-agents as tools
-2. **Startup screen** — HAL text art + provider menu (UI.ailang rewrite)
-3. **`backends/OpenAI.ailang`** — second backend, covers 90% of the ecosystem
-4. **`providers/*.json`** — config files for Anthropic, OpenAI, Groq, Ollama, etc.
-5. **Token cost display** — per-turn cost from usage field × provider pricing
-6. **Wire backend selection** into agent loop
-7. **Per-turn cost display** in status area
+1. **cc_pgmem** (`cc_pgmem_ipc.ailang`) — Postgres memory tool, prerequisite for everything else
+   - Schema migration (`hc_projects`, `hc_files`, `hc_symbols`, `hc_sessions`, `hc_context`)
+   - `relmem op=sync` writes into `hc_files` + `hc_symbols`
+   - `op=park/pickup/search/compact/session_start/session_end`
+2. **Multi-agent tool** (`cc_agent_ipc.ailang`) — sub-agents as tools, built on cc_pgmem
+3. **Startup screen** — HAL text art slow-scroll + provider selection menu
+4. **`backends/OpenAI.ailang`** — covers OpenAI + all compatible clones
+5. **`providers/*.json`** — Anthropic, OpenAI, Groq, Ollama, etc.
+6. **Token cost display** — per-turn from usage field × provider pricing
+7. **Wire backend selection** into agent loop
 
 ## Backport From ClaudeCode
 
