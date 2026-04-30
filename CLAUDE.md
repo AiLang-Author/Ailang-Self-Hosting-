@@ -166,7 +166,7 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - `JSRT_ToString` returns JSValue pointer; use `JSRT_GetPayload()` to extract raw C string
 - `JSBridge__GetDomIdx` checks `__dom_idx` property on JS wrapper objects to map back to DOM nodes
 
-**Test suites**: `test_js_e2e.ailang` (9 tests, 31/32 assertions passing — variable-to-innerHTML assignment WIP), `bench_js.ailang` (fib(20) benchmark, 6.1x faster than V8).
+**Test suites**: `test_js_e2e.ailang` (9 tests, 31/32 assertions passing — variable-to-innerHTML assignment WIP), `bench_js.ailang` (7 micro-benchmarks, 5.9x faster than V8 overall; fib(20) 41x, arith 89x).
 
 **Status**: String literal innerHTML mutation works end-to-end. Variable-to-innerHTML assignment has a stack ordering issue in SET_PROP dispatch (obj resolves as NUMBER instead of OBJECT). Under investigation.
 
