@@ -27,15 +27,23 @@ LibraryImport.UtilArgs
 FixedPool.CCBashSys {
     "SYS_READ":      Initialize=0
     "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
     "SYS_CLOSE":     Initialize=3
+    "SYS_POLL":      Initialize=7
     "SYS_PIPE":      Initialize=22
     "SYS_DUP2":      Initialize=33
     "SYS_FORK":      Initialize=57
     "SYS_EXECVE":    Initialize=59
     "SYS_EXIT":      Initialize=60
     "SYS_WAIT4":     Initialize=61
+    "SYS_KILL":      Initialize=62
     "SYS_MKDIR":     Initialize=83
     "SYS_UNLINK":    Initialize=87
+    "SYS_TIME":      Initialize=201
+    "POLLIN":        Initialize=1
+    "O_RDONLY":      Initialize=0
+    "SIGKILL":       Initialize=9
+    "DEFAULT_TIMEOUT": Initialize=30
 }
 
 FixedPool.CCBashConst {
@@ -63,25 +71,77 @@ Function.CCBash_BuildSchema {
     }
 }
 
+// Read /proc/self/environ and build a char** envp array for execve.
+// Returns the pointer array (caller frees with Deallocate(envp, 8200)) and
+// stores the raw env data buffer in *env_data_out (caller frees 65536).
+// Returns 0 on failure — caller should still pass 0 to execve rather than crash.
+Function.CCBash_GetEnvp {
+    Input:  env_data_out: Address
+    Output: Address
+    Body: {
+        StoreValue(env_data_out, 0)
+        fd = SystemCall(CCBashSys.SYS_OPEN, "/proc/self/environ", CCBashSys.O_RDONLY, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        env_max  = 65536
+        env_data = Allocate(env_max)
+        n = SystemCall(CCBashSys.SYS_READ, fd, env_data, env_max, 0, 0)
+        SystemCall(CCBashSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(env_data, env_max)
+            ReturnValue(0)
+        }
+
+        // Walk null-separated entries; build char** pointer array (max 1025 entries).
+        envp_max = 8200
+        envp     = Allocate(envp_max)
+        pos = 0
+        idx = 0
+        WhileLoop LessThan(pos, n) {
+            start      = pos
+            end_found  = 0
+            WhileLoop LessThan(pos, n) {
+                IfCondition EqualTo(GetByte(env_data, pos), 0) ThenBlock: {
+                    end_found = 1
+                    pos = Add(pos, 1)
+                    BreakLoop
+                }
+                pos = Add(pos, 1)
+            }
+            IfCondition EqualTo(end_found, 1) ThenBlock: {
+                StoreValue(Add(envp, Multiply(idx, 8)), Add(env_data, start))
+                idx = Add(idx, 1)
+            }
+        }
+        StoreValue(Add(envp, Multiply(idx, 8)), 0)
+
+        StoreValue(env_data_out, env_data)
+        ReturnValue(envp)
+    }
+}
+
 // Fork+exec /bin/sh -c "<cmd>" with stdout+stderr -> pipe.
+// timeout_secs: wall-clock limit; 0 means use DEFAULT_TIMEOUT (30s).
 // Returns allocated string "exit=N\n<output>" on success, 0 on internal failure.
 Function.CCBash_Run {
-    Input: cmd: Address
+    Input: cmd:              Address
+    Input: timeout_secs:     Integer
     Input: out_truncated_ptr: Address
     Output: Address
     Body: {
         StoreValue(out_truncated_ptr, 0, "dword")
         IfCondition EqualTo(cmd, 0) ThenBlock: { ReturnValue(0) }
 
-        pf = Allocate(8)
-        pr = SystemCall(CCBashSys.SYS_PIPE, pf, 0, 0, 0, 0)
-        IfCondition LessThan(pr, 0) ThenBlock: {
-            Deallocate(pf, 8)
-            ReturnValue(0)
+        // Clamp timeout: 0 → default, cap at 55s so IPCDispatch's 60s fence always wins.
+        effective_timeout = timeout_secs
+        IfCondition LessEqual(effective_timeout, 0) ThenBlock: {
+            effective_timeout = CCBashSys.DEFAULT_TIMEOUT
         }
-        pipe_r = Dereference(pf, "dword")
-        pipe_w = Dereference(Add(pf, 4), "dword")
-        Deallocate(pf, 8)
+        IfCondition GreaterThan(effective_timeout, 55) ThenBlock: {
+            effective_timeout = 55
+        }
+        deadline = Add(SystemCall(CCBashSys.SYS_TIME, 0, 0, 0, 0, 0), effective_timeout)
 
         // Build argv: ["/bin/sh", "-c", cmd, NULL]
         argv = Allocate(32)
@@ -90,65 +150,148 @@ Function.CCBash_Run {
         StoreValue(Add(argv, 16), cmd)
         StoreValue(Add(argv, 24), 0)
 
+        // Capture current environment for the child.
+        env_data_holder = Allocate(8)
+        StoreValue(env_data_holder, 0)
+        envp     = CCBash_GetEnvp(env_data_holder)
+        env_data = Dereference(env_data_holder)
+        Deallocate(env_data_holder, 8)
+
+        pf = Allocate(8)
+        pr = SystemCall(CCBashSys.SYS_PIPE, pf, 0, 0, 0, 0)
+        IfCondition LessThan(pr, 0) ThenBlock: {
+            Deallocate(pf, 8)
+            Deallocate(argv, 32)
+            IfCondition NotEqual(envp,     0) ThenBlock: { Deallocate(envp,     8200) }
+            IfCondition NotEqual(env_data, 0) ThenBlock: { Deallocate(env_data, 65536) }
+            ReturnValue(0)
+        }
+        pipe_r = Dereference(pf, "dword")
+        pipe_w = Dereference(Add(pf, 4), "dword")
+        Deallocate(pf, 8)
+
         pid = SystemCall(CCBashSys.SYS_FORK, 0, 0, 0, 0, 0)
         IfCondition LessThan(pid, 0) ThenBlock: {
             SystemCall(CCBashSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
             SystemCall(CCBashSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
             Deallocate(argv, 32)
+            IfCondition NotEqual(envp,     0) ThenBlock: { Deallocate(envp,     8200) }
+            IfCondition NotEqual(env_data, 0) ThenBlock: { Deallocate(env_data, 65536) }
             ReturnValue(0)
         }
 
         IfCondition EqualTo(pid, 0) ThenBlock: {
-            // Child
+            // Child: redirect stdout+stderr to pipe, exec shell.
             SystemCall(CCBashSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
-            SystemCall(CCBashSys.SYS_DUP2, pipe_w, 1, 0, 0, 0)
-            SystemCall(CCBashSys.SYS_DUP2, pipe_w, 2, 0, 0, 0)
+            SystemCall(CCBashSys.SYS_DUP2,  pipe_w, 1, 0, 0, 0)
+            SystemCall(CCBashSys.SYS_DUP2,  pipe_w, 2, 0, 0, 0)
             SystemCall(CCBashSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
-            SystemCall(CCBashSys.SYS_EXECVE, "/bin/sh", argv, 0)
+            SystemCall(CCBashSys.SYS_EXECVE, "/bin/sh", argv, envp)
             SystemCall(CCBashSys.SYS_EXIT, 127, 0, 0, 0, 0)
         }
 
-        // Parent
+        // Parent: close write end.
         SystemCall(CCBashSys.SYS_CLOSE, pipe_w, 0, 0, 0, 0)
+        Deallocate(argv, 32)
+        IfCondition NotEqual(envp,     0) ThenBlock: { Deallocate(envp,     8200) }
+        IfCondition NotEqual(env_data, 0) ThenBlock: { Deallocate(env_data, 65536) }
 
-        // Drain stdout/stderr
-        out = Allocate(Add(CCBashConst.MAX_OUTPUT, 64))
-        body_off = 32   // leave room for "exit=NNN\n" prefix
-        used = 0
+        // Drain stdout+stderr via poll so we honor the deadline.
+        // pollfd: fd(4) events(2) revents(2) = 8 bytes.
+        pfd   = Allocate(8)
+        out   = Allocate(Add(CCBashConst.MAX_OUTPUT, 64))
+        body_off = 32
+        used  = 0
         chunk = Allocate(CCBashConst.READ_CHUNK)
+        timed_out = 0
+
         WhileLoop 1 {
+            // Deadline check first.
+            now = SystemCall(CCBashSys.SYS_TIME, 0, 0, 0, 0, 0)
+            IfCondition GreaterEqual(now, deadline) ThenBlock: {
+                timed_out = 1
+                BreakLoop
+            }
+
             free_room = Subtract(CCBashConst.MAX_OUTPUT, used)
             IfCondition LessEqual(free_room, 0) ThenBlock: {
                 StoreValue(out_truncated_ptr, 1, "dword")
-                // Drain remaining so child doesn't block on write
+                // Drain remaining within remaining time so child doesn't block on write.
                 WhileLoop 1 {
+                    now2 = SystemCall(CCBashSys.SYS_TIME, 0, 0, 0, 0, 0)
+                    IfCondition GreaterEqual(now2, deadline) ThenBlock: {
+                        timed_out = 1
+                        BreakLoop
+                    }
+                    remain_ms3 = Multiply(Subtract(deadline, now2), 1000)
+                    IfCondition GreaterThan(remain_ms3, 1000) ThenBlock: { remain_ms3 = 1000 }
+                    StoreValue(pfd, pipe_r, "dword")
+                    SetByte(pfd, 4, CCBashSys.POLLIN)
+                    SetByte(pfd, 5, 0)
+                    SetByte(pfd, 6, 0)
+                    SetByte(pfd, 7, 0)
+                    pr3 = SystemCall(CCBashSys.SYS_POLL, pfd, 1, remain_ms3, 0, 0)
+                    IfCondition LessEqual(pr3, 0) ThenBlock: { BreakLoop }
                     dn = SystemCall(CCBashSys.SYS_READ, pipe_r, chunk, CCBashConst.READ_CHUNK, 0, 0)
                     IfCondition LessEqual(dn, 0) ThenBlock: { BreakLoop }
                 }
                 BreakLoop
             }
-            want = CCBashConst.READ_CHUNK
-            IfCondition GreaterThan(want, free_room) ThenBlock: { want = free_room }
-            n = SystemCall(CCBashSys.SYS_READ, pipe_r, chunk, want, 0, 0)
-            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
-            i = 0
-            WhileLoop LessThan(i, n) {
-                SetByte(out, Add(body_off, Add(used, i)), GetByte(chunk, i))
-                i = Add(i, 1)
+
+            // Poll with up to 1s slices so deadline is checked each iteration.
+            remain_ms = Multiply(Subtract(deadline, now), 1000)
+            IfCondition GreaterThan(remain_ms, 1000) ThenBlock: { remain_ms = 1000 }
+            StoreValue(pfd, pipe_r, "dword")
+            SetByte(pfd, 4, CCBashSys.POLLIN)
+            SetByte(pfd, 5, 0)
+            SetByte(pfd, 6, 0)
+            SetByte(pfd, 7, 0)
+            poll_r = SystemCall(CCBashSys.SYS_POLL, pfd, 1, remain_ms, 0, 0)
+
+            IfCondition EqualTo(poll_r, 0) ThenBlock: {
+                // Poll slice expired, loop back to check deadline.
             }
-            used = Add(used, n)
+            IfCondition LessThan(poll_r, 0) ThenBlock: { BreakLoop }
+            IfCondition GreaterThan(poll_r, 0) ThenBlock: {
+                want = CCBashConst.READ_CHUNK
+                IfCondition GreaterThan(want, free_room) ThenBlock: { want = free_room }
+                n = SystemCall(CCBashSys.SYS_READ, pipe_r, chunk, want, 0, 0)
+                IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+                i = 0
+                WhileLoop LessThan(i, n) {
+                    SetByte(out, Add(body_off, Add(used, i)), GetByte(chunk, i))
+                    i = Add(i, 1)
+                }
+                used = Add(used, n)
+            }
         }
+
+        Deallocate(pfd, 8)
         Deallocate(chunk, CCBashConst.READ_CHUNK)
         SystemCall(CCBashSys.SYS_CLOSE, pipe_r, 0, 0, 0, 0)
 
-        // Wait for child
+        // Kill child if we hit the deadline.
+        IfCondition EqualTo(timed_out, 1) ThenBlock: {
+            SystemCall(CCBashSys.SYS_KILL, pid, CCBashSys.SIGKILL, 0, 0, 0)
+            timeout_note = "\n[timed out]"
+            tn_len = StringLength(timeout_note)
+            avail = Subtract(CCBashConst.MAX_OUTPUT, used)
+            IfCondition GreaterThan(tn_len, avail) ThenBlock: { tn_len = avail }
+            tn = 0
+            WhileLoop LessThan(tn, tn_len) {
+                SetByte(out, Add(body_off, Add(used, tn)), GetByte(timeout_note, tn))
+                tn = Add(tn, 1)
+            }
+            used = Add(used, tn_len)
+        }
+
+        // Wait for child (reap zombie; exit code is 137 on SIGKILL).
         status_buf = Allocate(8)
         StoreValue(status_buf, 0)
         SystemCall(CCBashSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
         raw_status = Dereference(status_buf, "dword")
         Deallocate(status_buf, 8)
-        Deallocate(argv, 32)
-        // POSIX: low byte holds termination signal, second byte holds exit code if WIFEXITED
+        // POSIX: bits 8-15 = exit code when WIFEXITED, bits 0-7 = signal number.
         exit_code = BitwiseAnd(RightShift(raw_status, 8), 255)
 
         // Build "exit=N\n" prefix in-place
@@ -265,10 +408,15 @@ Function.CCBash_HandleRequest {
                 CCBash_SendError(client_fd, id, "missing required argument 'command'")
                 ReturnValue(0)
             }
-            cmd = UtilArgs_GetString(validated, "command")
+            cmd          = UtilArgs_GetString(validated, "command")
+            timeout_str  = UtilArgs_GetString(validated, "timeout_secs")
+            timeout_secs = 0
+            IfCondition NotEqual(timeout_str, 0) ThenBlock: {
+                timeout_secs = StringToInt(timeout_str)
+            }
             trunc_holder = Allocate(8)
             StoreValue(trunc_holder, 0, "dword")
-            content = CCBash_Run(cmd, trunc_holder)
+            content = CCBash_Run(cmd, timeout_secs, trunc_holder)
             truncated = Dereference(trunc_holder, "dword")
             Deallocate(trunc_holder, 8)
             IfCondition EqualTo(content, 0) ThenBlock: {

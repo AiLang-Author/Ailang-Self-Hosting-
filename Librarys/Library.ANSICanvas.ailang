@@ -1,0 +1,1051 @@
+// Library.ANSICanvas.ailang — ANSI half-block terminal pixel canvas.
+//
+// Encodes BGRA pixel buffers as half-block (▀) ANSI truecolor sequences,
+// packing two pixels per character cell: top pixel = SGR foreground,
+// bottom pixel = SGR background. At 80×24 terminal the effective pixel
+// resolution is 80×48.
+//
+// Pixel format: BGRA — byte order B, G, R, A at offsets 0,1,2,3.
+// Matches the AILang display system surface format. Encoder swaps B↔R
+// when emitting SGR RGB parameters.
+//
+// Two encode modes:
+//   Full  — ANSICanvas.Encode      — redraws every cell. Use for first frame.
+//   Delta — ANSICanvas.EncodeDelta — only redraws changed cells. For a walking
+//           character on a static background, 90%+ of cells are skipped.
+//
+// Animation entry point:
+//   ANSICanvas.Animate(frames, count, w, h, fps, loops)
+//   frames = Address[] (8 bytes per entry, x86-64). Runs in alt screen.
+//   Must be called BEFORE UI.Init().
+//
+// Half-block ▀ (U+2580) UTF-8: E2 96 80.
+// Spec: ECMA-48 SGR, ITU-T T.416 truecolor (38;2;r;g;b / 48;2;r;g;b).
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.ANSI
+LibraryImport.StringUtils
+
+FixedPool.ANSICanvasSys {
+    "SYS_WRITE":     Initialize=1
+    "SYS_NANOSLEEP": Initialize=35
+    "STDOUT":        Initialize=1
+}
+
+FixedPool.ANSICanvasIO {
+    "SYS_READ":   Initialize=0
+    "SYS_OPEN":   Initialize=2
+    "SYS_CLOSE":  Initialize=3
+    "SYS_URANDOM": Initialize=2    // SYS_OPEN reused — /dev/urandom opened via SYS_OPEN
+    "O_RDONLY":   Initialize=0
+}
+
+// UTF-8 bytes for ▀ (U+2580 UPPER HALF BLOCK).
+FixedPool.ANSICanvasK {
+    "HALF_B0":  Initialize=226   // 0xE2
+    "HALF_B1":  Initialize=150   // 0x96
+    "HALF_B2":  Initialize=128   // 0x80
+}
+
+// =============================================================================
+// PIXEL BUFFER
+// =============================================================================
+
+Function.ANSICanvas.New {
+    Input:  width:  Integer
+    Input:  height: Integer
+    Output: Address
+    Body: { ReturnValue(Allocate(Multiply(Multiply(width, height), 4))) }
+}
+
+Function.ANSICanvas.Free {
+    Input: buf:    Address
+    Input: width:  Integer
+    Input: height: Integer
+    Body: {
+        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(0) }
+        Deallocate(buf, Multiply(Multiply(width, height), 4))
+    }
+}
+
+// Write one BGRA pixel at (x, y).
+Function.ANSICanvas.SetPixel {
+    Input: buf:   Address
+    Input: width: Integer
+    Input: x:     Integer
+    Input: y:     Integer
+    Input: b:     Integer
+    Input: g:     Integer
+    Input: r:     Integer
+    Input: a:     Integer
+    Body: {
+        off = Multiply(Add(Multiply(y, width), x), 4)
+        SetByte(buf, off,         b)
+        SetByte(buf, Add(off, 1), g)
+        SetByte(buf, Add(off, 2), r)
+        SetByte(buf, Add(off, 3), a)
+    }
+}
+
+// Fill entire canvas with one solid color (alpha=255).
+Function.ANSICanvas.Fill {
+    Input: buf:    Address
+    Input: width:  Integer
+    Input: height: Integer
+    Input: b:      Integer
+    Input: g:      Integer
+    Input: r:      Integer
+    Body: {
+        total = Multiply(width, height)
+        i = 0
+        WhileLoop LessThan(i, total) {
+            off = Multiply(i, 4)
+            SetByte(buf, off,         b)
+            SetByte(buf, Add(off, 1), g)
+            SetByte(buf, Add(off, 2), r)
+            SetByte(buf, Add(off, 3), 255)
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// LOW-LEVEL ENCODE HELPERS
+// =============================================================================
+
+// Append decimal integer to out_buf at pos. Returns new pos.
+Function.ANSICanvas_Int {
+    Input:  buf: Address
+    Input:  pos: Integer
+    Input:  val: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, pos, 48)
+            ReturnValue(Add(pos, 1))
+        }
+        tmp = Allocate(20)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, Add(pos, i), GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        Deallocate(tmp, 20)
+        ReturnValue(Add(pos, n))
+    }
+}
+
+// Append CSI row;col H (1-based cursor position). Returns new pos.
+Function.ANSICanvas_CursorPos {
+    Input:  buf: Address
+    Input:  pos: Integer
+    Input:  row: Integer
+    Input:  col: Integer
+    Output: Integer
+    Body: {
+        SetByte(buf, pos, 27)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 91)
+        pos = Add(pos, 1)
+        pos = ANSICanvas_Int(buf, pos, row)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        pos = ANSICanvas_Int(buf, pos, col)
+        SetByte(buf, pos, 72)
+        ReturnValue(Add(pos, 1))
+    }
+}
+
+// Append combined fg+bg SGR: CSI 38;2;fr;fgc;fb;48;2;br;bgc;bb m
+// fr/fgc/fb = foreground R/G/B, br/bgc/bb = background R/G/B.
+Function.ANSICanvas_SGR {
+    Input:  buf: Address
+    Input:  pos: Integer
+    Input:  fr:  Integer
+    Input:  fgc: Integer
+    Input:  fb:  Integer
+    Input:  br:  Integer
+    Input:  bgc: Integer
+    Input:  bb:  Integer
+    Output: Integer
+    Body: {
+        SetByte(buf, pos, 27)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 91)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 51)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 56)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 50)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        pos = ANSICanvas_Int(buf, pos, fr)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        pos = ANSICanvas_Int(buf, pos, fgc)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        pos = ANSICanvas_Int(buf, pos, fb)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 52)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 56)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 50)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        pos = ANSICanvas_Int(buf, pos, br)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        pos = ANSICanvas_Int(buf, pos, bgc)
+        SetByte(buf, pos, 59)
+        pos = Add(pos, 1)
+        pos = ANSICanvas_Int(buf, pos, bb)
+        SetByte(buf, pos, 109)
+        ReturnValue(Add(pos, 1))
+    }
+}
+
+// Append ▀ (E2 96 80). Returns pos+3.
+Function.ANSICanvas_Half {
+    Input:  buf: Address
+    Input:  pos: Integer
+    Output: Integer
+    Body: {
+        SetByte(buf, pos,         ANSICanvasK.HALF_B0)
+        SetByte(buf, Add(pos, 1), ANSICanvasK.HALF_B1)
+        SetByte(buf, Add(pos, 2), ANSICanvasK.HALF_B2)
+        ReturnValue(Add(pos, 3))
+    }
+}
+
+// Append ESC [ 0 m (SGR reset). Returns pos+4.
+Function.ANSICanvas_ResetSGR {
+    Input:  buf: Address
+    Input:  pos: Integer
+    Output: Integer
+    Body: {
+        SetByte(buf, pos,         27)
+        SetByte(buf, Add(pos, 1), 91)
+        SetByte(buf, Add(pos, 2), 48)
+        SetByte(buf, Add(pos, 3), 109)
+        ReturnValue(Add(pos, 4))
+    }
+}
+
+// Flush buf[0..pos) to stdout wrapped in CSI?2026h...CSI?2026l.
+// Three writes are fine — the terminal accumulates everything between h and l.
+Function.ANSICanvas_FlushSync {
+    Input: buf: Address
+    Input: pos: Integer
+    Body: {
+        sb = Allocate(10)
+        SetByte(sb, 0, 27)
+        SetByte(sb, 1, 91)
+        SetByte(sb, 2, 63)
+        SetByte(sb, 3, 50)
+        SetByte(sb, 4, 48)
+        SetByte(sb, 5, 50)
+        SetByte(sb, 6, 54)
+        SetByte(sb, 7, 104)
+        SystemCall(ANSICanvasSys.SYS_WRITE, ANSICanvasSys.STDOUT, sb, 8, 0, 0)
+        SystemCall(ANSICanvasSys.SYS_WRITE, ANSICanvasSys.STDOUT, buf, pos, 0, 0)
+        SetByte(sb, 7, 108)
+        SystemCall(ANSICanvasSys.SYS_WRITE, ANSICanvasSys.STDOUT, sb, 8, 0, 0)
+        Deallocate(sb, 10)
+    }
+}
+
+Function.ANSICanvas_Sleep {
+    Input: ms: Integer
+    Body: {
+        ts = Allocate(16)
+        sec = Divide(ms, 1000)
+        ns  = Multiply(Subtract(ms, Multiply(sec, 1000)), 1000000)
+        StoreValue(ts,        sec)
+        StoreValue(Add(ts,8), ns)
+        SystemCall(ANSICanvasSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        Deallocate(ts, 16)
+    }
+}
+
+// =============================================================================
+// FULL ENCODE
+// =============================================================================
+// Encode every cell. height must be even. Writes into out_buf at out_pos.
+// Run-length SGR: only re-emits when fg or bg changes from previous cell.
+
+Function.ANSICanvas.Encode {
+    Input:  pixels:  Address
+    Input:  width:   Integer
+    Input:  height:  Integer
+    Input:  out_buf: Address
+    Input:  out_pos: Integer
+    Output: Integer
+    Body: {
+        char_h = Divide(height, 2)
+        pos = out_pos
+
+        prev_fr  = -1
+        prev_fgc = -1
+        prev_fb  = -1
+        prev_br  = -1
+        prev_bgc = -1
+        prev_bb  = -1
+
+        cy = 0
+        WhileLoop LessThan(cy, char_h) {
+            pos = ANSICanvas_CursorPos(out_buf, pos, Add(cy, 1), 1)
+
+            cx = 0
+            WhileLoop LessThan(cx, width) {
+                top_off = Multiply(Add(Multiply(Multiply(cy, 2),              width), cx), 4)
+                bot_off = Multiply(Add(Multiply(Add(Multiply(cy, 2), 1), width), cx), 4)
+
+                // BGRA → RGB: R is at +2, G at +1, B at +0
+                fr  = GetByte(pixels, Add(top_off, 2))
+                fgc = GetByte(pixels, Add(top_off, 1))
+                fb  = GetByte(pixels, top_off)
+                br  = GetByte(pixels, Add(bot_off, 2))
+                bgc = GetByte(pixels, Add(bot_off, 1))
+                bb  = GetByte(pixels, bot_off)
+
+                fg_same = And(And(EqualTo(fr, prev_fr), EqualTo(fgc, prev_fgc)), EqualTo(fb, prev_fb))
+                bg_same = And(And(EqualTo(br, prev_br), EqualTo(bgc, prev_bgc)), EqualTo(bb, prev_bb))
+                IfCondition EqualTo(And(fg_same, bg_same), 0) ThenBlock: {
+                    pos = ANSICanvas_SGR(out_buf, pos, fr, fgc, fb, br, bgc, bb)
+                    prev_fr  = fr
+                    prev_fgc = fgc
+                    prev_fb  = fb
+                    prev_br  = br
+                    prev_bgc = bgc
+                    prev_bb  = bb
+                }
+
+                pos = ANSICanvas_Half(out_buf, pos)
+                cx = Add(cx, 1)
+            }
+            cy = Add(cy, 1)
+        }
+
+        ReturnValue(ANSICanvas_ResetSGR(out_buf, pos))
+    }
+}
+
+// =============================================================================
+// DELTA ENCODE
+// =============================================================================
+// Only redraws cells that changed between prev and curr.
+// Each dirty cell gets cursor-pos + SGR + ▀. Static cells cost zero bytes.
+
+Function.ANSICanvas.EncodeDelta {
+    Input:  prev:    Address
+    Input:  curr:    Address
+    Input:  width:   Integer
+    Input:  height:  Integer
+    Input:  out_buf: Address
+    Input:  out_pos: Integer
+    Output: Integer
+    Body: {
+        char_h = Divide(height, 2)
+        pos = out_pos
+
+        cy = 0
+        WhileLoop LessThan(cy, char_h) {
+            cx = 0
+            WhileLoop LessThan(cx, width) {
+                top_off = Multiply(Add(Multiply(Multiply(cy, 2),              width), cx), 4)
+                bot_off = Multiply(Add(Multiply(Add(Multiply(cy, 2), 1), width), cx), 4)
+
+                top_same = And(And(
+                    EqualTo(GetByte(prev, top_off),         GetByte(curr, top_off)),
+                    EqualTo(GetByte(prev, Add(top_off, 1)), GetByte(curr, Add(top_off, 1)))),
+                    EqualTo(GetByte(prev, Add(top_off, 2)), GetByte(curr, Add(top_off, 2))))
+
+                bot_same = And(And(
+                    EqualTo(GetByte(prev, bot_off),         GetByte(curr, bot_off)),
+                    EqualTo(GetByte(prev, Add(bot_off, 1)), GetByte(curr, Add(bot_off, 1)))),
+                    EqualTo(GetByte(prev, Add(bot_off, 2)), GetByte(curr, Add(bot_off, 2))))
+
+                IfCondition EqualTo(And(top_same, bot_same), 0) ThenBlock: {
+                    pos = ANSICanvas_CursorPos(out_buf, pos, Add(cy, 1), Add(cx, 1))
+
+                    fr  = GetByte(curr, Add(top_off, 2))
+                    fgc = GetByte(curr, Add(top_off, 1))
+                    fb  = GetByte(curr, top_off)
+                    br  = GetByte(curr, Add(bot_off, 2))
+                    bgc = GetByte(curr, Add(bot_off, 1))
+                    bb  = GetByte(curr, bot_off)
+
+                    pos = ANSICanvas_SGR(out_buf, pos, fr, fgc, fb, br, bgc, bb)
+                    pos = ANSICanvas_Half(out_buf, pos)
+                }
+
+                cx = Add(cx, 1)
+            }
+            cy = Add(cy, 1)
+        }
+
+        ReturnValue(ANSICanvas_ResetSGR(out_buf, pos))
+    }
+}
+
+// =============================================================================
+// BUFFER SIZING
+// =============================================================================
+// Safe upper-bound for an Encode call.
+// Worst case ~54 bytes per cell (cursor-pos + SGR + half-block) + 64 overhead.
+
+Function.ANSICanvas.EncodeBufferSize {
+    Input:  width:  Integer
+    Input:  height: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(Multiply(Multiply(width, Divide(height, 2)), 54), 64))
+    }
+}
+
+// =============================================================================
+// ANIMATE
+// =============================================================================
+// Play an array of BGRA frame buffers in the terminal.
+//
+//   frames      — Address[] (8 bytes/entry). Each entry → width*height*4 BGRA buf.
+//   frame_count — number of frames
+//   width       — pixel width (= terminal columns)
+//   height      — pixel height (= terminal rows * 2, must be even)
+//   fps         — playback rate, clamped to [1, 60]
+//   loops       — times to play (0 = play once)
+//
+// Call BEFORE UI.Init(). Restores normal screen + cursor on return.
+
+Function.ANSICanvas.Animate {
+    Input: frames:      Address
+    Input: frame_count: Integer
+    Input: width:       Integer
+    Input: height:      Integer
+    Input: fps:         Integer
+    Input: loops:       Integer
+    Body: {
+        IfCondition LessEqual(frame_count, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(fps, 0)         ThenBlock: { fps = 30 }
+        IfCondition GreaterThan(fps, 60)      ThenBlock: { fps = 60 }
+        frame_ms = Divide(1000, fps)
+
+        buf_sz  = ANSICanvas.EncodeBufferSize(width, height)
+        enc_buf = Allocate(buf_sz)
+
+        setup = ANSI.NewFrame()
+        sp = 0
+        sp = ANSI.Build_AltScreenEnter(setup, sp)
+        sp = ANSI.Build_HideCursor(setup, sp)
+        sp = ANSI.Build_ClearScreen(setup, sp)
+        ANSI.FlushFrameRaw(setup, sp)
+
+        total_plays = loops
+        IfCondition EqualTo(total_plays, 0) ThenBlock: { total_plays = 1 }
+
+        play = 0
+        WhileLoop LessThan(play, total_plays) {
+            fi = 0
+            WhileLoop LessThan(fi, frame_count) {
+                frame_ptr = Dereference(Add(frames, Multiply(fi, 8)))
+
+                enc_pos = 0
+                IfCondition EqualTo(fi, 0) ThenBlock: {
+                    enc_pos = ANSICanvas.Encode(frame_ptr, width, height, enc_buf, 0)
+                } ElseBlock: {
+                    prev_ptr = Dereference(Add(frames, Multiply(Subtract(fi, 1), 8)))
+                    enc_pos = ANSICanvas.EncodeDelta(prev_ptr, frame_ptr, width, height, enc_buf, 0)
+                }
+
+                ANSICanvas_FlushSync(enc_buf, enc_pos)
+                ANSICanvas_Sleep(frame_ms)
+                fi = Add(fi, 1)
+            }
+            play = Add(play, 1)
+        }
+
+        teardown = ANSI.NewFrame()
+        tp = 0
+        tp = ANSI.Build_ShowCursor(teardown, tp)
+        tp = ANSI.Build_ResetSGR(teardown, tp)
+        tp = ANSI.Build_AltScreenLeave(teardown, tp)
+        ANSI.FlushFrameRaw(teardown, tp)
+
+        Deallocate(enc_buf, buf_sz)
+    }
+}
+
+// =============================================================================
+// KITTY GRAPHICS PROTOCOL — direct bitmap rendering
+// =============================================================================
+// Transmits raw pixel frames via Kitty Graphics escape sequences (APC ESC_G).
+// The terminal renders pixels natively — no half-block character encoding.
+// Blobs are stored BGRA; each frame is swapped to RGBA on the fly because
+// Kitty's f=32 format is RGBA, not BGRA.
+// Caller provides two reusable scratch buffers to avoid per-frame allocation.
+//
+// Chunk format (4096 base64 chars per escape max):
+//   First:  ESC_G a=T,f=32,s=W,v=H,q=2,m=1;<b64>ESC\
+//   Middle: ESC_G m=1;<b64>ESC\
+//   Last:   ESC_G m=0;<b64>ESC\
+
+// Map 6-bit value 0..63 to base64 ASCII character.
+Function.ANSICanvas_B64Char {
+    Input:  val: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(val, 26) ThenBlock: {
+            ReturnValue(Add(65, val))
+        }
+        IfCondition LessThan(val, 52) ThenBlock: {
+            ReturnValue(Add(71, val))
+        }
+        IfCondition LessThan(val, 62) ThenBlock: {
+            ReturnValue(Subtract(val, 4))
+        }
+        IfCondition EqualTo(val, 62) ThenBlock: {
+            ReturnValue(43)
+        }
+        ReturnValue(47)
+    }
+}
+
+// Send one BGRA frame via Kitty Graphics Protocol.
+// rgba_buf : scratch buffer of width*height*4 bytes (reused across frames).
+// chunk_buf: scratch buffer of at least 4200 bytes (reused across frames).
+// Moves cursor to (1,1) so the image anchors at top-left of the terminal.
+Function.ANSICanvas_KittyFrame {
+    Input: pixels:    Address
+    Input: width:     Integer
+    Input: height:    Integer
+    Input: rgba_buf:  Address
+    Input: chunk_buf: Address
+    Body: {
+        total_px    = Multiply(width, height)
+        total_bytes = Multiply(total_px, 4)
+
+        // Swap BGRA → RGBA into rgba_buf
+        i = 0
+        WhileLoop LessThan(i, total_px) {
+            src = Multiply(i, 4)
+            SetByte(rgba_buf, src,         GetByte(pixels, Add(src, 2)))
+            SetByte(rgba_buf, Add(src, 1), GetByte(pixels, Add(src, 1)))
+            SetByte(rgba_buf, Add(src, 2), GetByte(pixels, src))
+            SetByte(rgba_buf, Add(src, 3), GetByte(pixels, Add(src, 3)))
+            i = Add(i, 1)
+        }
+
+        // Cursor home: ESC [ 1 ; 1 H
+        SetByte(chunk_buf, 0, 27)
+        SetByte(chunk_buf, 1, 91)
+        SetByte(chunk_buf, 2, 49)
+        SetByte(chunk_buf, 3, 59)
+        SetByte(chunk_buf, 4, 49)
+        SetByte(chunk_buf, 5, 72)
+        SystemCall(ANSICanvasSys.SYS_WRITE, ANSICanvasSys.STDOUT, chunk_buf, 6, 0, 0)
+
+        // Stream base64-encoded RGBA in 4096-char chunks (= 3072 raw bytes each).
+        chunk_max_src = 3072
+
+        src_pos   = 0
+        chunk_idx = 0
+
+        WhileLoop LessThan(src_pos, total_bytes) {
+            remain_src = Subtract(total_bytes, src_pos)
+            bytes_this = remain_src
+            IfCondition GreaterThan(bytes_this, chunk_max_src) ThenBlock: {
+                bytes_this = chunk_max_src
+            }
+
+            is_last = 0
+            IfCondition EqualTo(Add(src_pos, bytes_this), total_bytes) ThenBlock: {
+                is_last = 1
+            }
+
+            // Build Kitty escape header
+            cp = 0
+            SetByte(chunk_buf, cp, 27)
+            cp = Add(cp, 1)
+            SetByte(chunk_buf, cp, 95)
+            cp = Add(cp, 1)
+            SetByte(chunk_buf, cp, 71)
+            cp = Add(cp, 1)
+
+            // First chunk: a=T,f=32,s=W,v=H,q=2,
+            IfCondition EqualTo(chunk_idx, 0) ThenBlock: {
+                SetByte(chunk_buf, cp, 97)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 61)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 84)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 44)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 102)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 61)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 51)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 50)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 44)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 115)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 61)
+                cp = Add(cp, 1)
+                cp = ANSICanvas_Int(chunk_buf, cp, width)
+                SetByte(chunk_buf, cp, 44)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 118)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 61)
+                cp = Add(cp, 1)
+                cp = ANSICanvas_Int(chunk_buf, cp, height)
+                SetByte(chunk_buf, cp, 44)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 113)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 61)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 50)
+                cp = Add(cp, 1)
+                SetByte(chunk_buf, cp, 44)
+                cp = Add(cp, 1)
+            }
+
+            // m=0 (last chunk) or m=1 (more to come), then semicolon
+            SetByte(chunk_buf, cp, 109)
+            cp = Add(cp, 1)
+            SetByte(chunk_buf, cp, 61)
+            cp = Add(cp, 1)
+            IfCondition EqualTo(is_last, 1) ThenBlock: {
+                SetByte(chunk_buf, cp, 48)
+            } ElseBlock: {
+                SetByte(chunk_buf, cp, 49)
+            }
+            cp = Add(cp, 1)
+            SetByte(chunk_buf, cp, 59)
+            cp = Add(cp, 1)
+
+            // Base64-encode bytes_this bytes from rgba_buf[src_pos..]
+            local_pos = 0
+            WhileLoop LessThan(local_pos, bytes_this) {
+                remaining = Subtract(bytes_this, local_pos)
+                src_off   = Add(src_pos, local_pos)
+
+                b0 = GetByte(rgba_buf, src_off)
+                b1 = 0
+                b2 = 0
+                has_b1 = GreaterThan(remaining, 1)
+                has_b2 = GreaterThan(remaining, 2)
+
+                IfCondition EqualTo(has_b1, 1) ThenBlock: {
+                    b1 = GetByte(rgba_buf, Add(src_off, 1))
+                }
+                IfCondition EqualTo(has_b2, 1) ThenBlock: {
+                    b2 = GetByte(rgba_buf, Add(src_off, 2))
+                }
+
+                c0 = ANSICanvas_B64Char(Divide(b0, 4))
+                c1 = ANSICanvas_B64Char(Add(Multiply(Modulo(b0, 4), 16), Divide(b1, 16)))
+                c2 = 61
+                c3 = 61
+                IfCondition EqualTo(has_b1, 1) ThenBlock: {
+                    c2 = ANSICanvas_B64Char(Add(Multiply(Modulo(b1, 16), 4), Divide(b2, 64)))
+                }
+                IfCondition EqualTo(has_b2, 1) ThenBlock: {
+                    c3 = ANSICanvas_B64Char(Modulo(b2, 64))
+                }
+
+                SetByte(chunk_buf, cp,         c0)
+                SetByte(chunk_buf, Add(cp, 1), c1)
+                SetByte(chunk_buf, Add(cp, 2), c2)
+                SetByte(chunk_buf, Add(cp, 3), c3)
+                cp = Add(cp, 4)
+
+                IfCondition GreaterEqual(remaining, 3) ThenBlock: {
+                    local_pos = Add(local_pos, 3)
+                } ElseBlock: {
+                    local_pos = Add(local_pos, remaining)
+                }
+            }
+
+            // String Terminator: ESC backslash
+            SetByte(chunk_buf, cp, 27)
+            cp = Add(cp, 1)
+            SetByte(chunk_buf, cp, 92)
+            cp = Add(cp, 1)
+
+            SystemCall(ANSICanvasSys.SYS_WRITE, ANSICanvasSys.STDOUT, chunk_buf, cp, 0, 0)
+
+            src_pos   = Add(src_pos, bytes_this)
+            chunk_idx = Add(chunk_idx, 1)
+        }
+    }
+}
+
+// Play an array of BGRA frames via Kitty Graphics Protocol.
+// Allocates rgba + chunk scratch buffers once for the full animation.
+Function.ANSICanvas.KittyAnimate {
+    Input: frames:      Address
+    Input: frame_count: Integer
+    Input: width:       Integer
+    Input: height:      Integer
+    Input: fps:         Integer
+    Input: loops:       Integer
+    Body: {
+        IfCondition LessEqual(frame_count, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(fps, 0)         ThenBlock: { fps = 30 }
+        IfCondition GreaterThan(fps, 60)      ThenBlock: { fps = 60 }
+        frame_ms = Divide(1000, fps)
+
+        total_bytes = Multiply(Multiply(width, height), 4)
+        rgba_buf    = Allocate(total_bytes)
+        chunk_buf   = Allocate(4200)
+
+        setup = ANSI.NewFrame()
+        sp = 0
+        sp = ANSI.Build_AltScreenEnter(setup, sp)
+        sp = ANSI.Build_HideCursor(setup, sp)
+        sp = ANSI.Build_ClearScreen(setup, sp)
+        ANSI.FlushFrameRaw(setup, sp)
+
+        total_plays = loops
+        IfCondition EqualTo(total_plays, 0) ThenBlock: { total_plays = 1 }
+
+        play = 0
+        WhileLoop LessThan(play, total_plays) {
+            fi = 0
+            WhileLoop LessThan(fi, frame_count) {
+                frame_ptr = Dereference(Add(frames, Multiply(fi, 8)))
+                ANSICanvas_KittyFrame(frame_ptr, width, height, rgba_buf, chunk_buf)
+                ANSICanvas_Sleep(frame_ms)
+                fi = Add(fi, 1)
+            }
+            play = Add(play, 1)
+        }
+
+        teardown = ANSI.NewFrame()
+        tp = 0
+        tp = ANSI.Build_ShowCursor(teardown, tp)
+        tp = ANSI.Build_ResetSGR(teardown, tp)
+        tp = ANSI.Build_AltScreenLeave(teardown, tp)
+        ANSI.FlushFrameRaw(teardown, tp)
+
+        Deallocate(chunk_buf, 4200)
+        Deallocate(rgba_buf,  total_bytes)
+    }
+}
+
+// Returns 1 if running inside Kitty terminal (KITTY_WINDOW_ID present in env), 0 otherwise.
+// Reads /proc/self/environ directly — no shell, no subproc.
+Function.ANSICanvas_HasKitty {
+    Output: Integer
+    Body: {
+        envpath = "/proc/self/environ"
+        fd = SystemCall(ANSICanvasIO.SYS_OPEN, envpath, ANSICanvasIO.O_RDONLY, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        bufsz  = 65536
+        envbuf = Allocate(bufsz)
+        n      = SystemCall(ANSICanvasIO.SYS_READ, fd, envbuf, bufsz, 0, 0)
+        SystemCall(ANSICanvasIO.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        IfCondition LessEqual(n, 15) ThenBlock: {
+            Deallocate(envbuf, bufsz)
+            ReturnValue(0)
+        }
+
+        needle = "KITTY_WINDOW_ID"
+        nlen   = 15
+        found  = 0
+        i      = 0
+        limit  = Subtract(n, nlen)
+
+        WhileLoop LessEqual(i, limit) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, nlen) {
+                IfCondition NotEqual(GetByte(envbuf, Add(i, j)), GetByte(needle, j)) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                found = 1
+                BreakLoop
+            }
+            i = Add(i, 1)
+        }
+
+        Deallocate(envbuf, bufsz)
+        ReturnValue(found)
+    }
+}
+
+// =============================================================================
+// BLOB FILE I/O — load pre-baked .bgra splash files
+// =============================================================================
+// Blob format (written by tools/bake_splash.py):
+//   [0..3]   magic "BGRV" (0x42 0x47 0x52 0x56)
+//   [4]      version = 1
+//   [5..6]   width  (uint16 LE)
+//   [7..8]   height (uint16 LE)
+//   [9]      fps    (uint8)
+//   [10..13] frame_count (uint32 LE)
+//   [14..15] reserved
+//   [16..]   frame_count * width * height * 4 bytes raw BGRA
+
+// Read LE uint16 from buffer at byte offset.
+Function.ANSICanvas_LE16 {
+    Input:  buf: Address
+    Input:  off: Integer
+    Output: Integer
+    Body: {
+        lo = GetByte(buf, off)
+        hi = GetByte(buf, Add(off, 1))
+        ReturnValue(Add(lo, Multiply(hi, 256)))
+    }
+}
+
+// Read LE uint32 from buffer at byte offset.
+Function.ANSICanvas_LE32 {
+    Input:  buf: Address
+    Input:  off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        b3 = GetByte(buf, Add(off, 3))
+        ReturnValue(Add(Add(Add(b0, Multiply(b1, 256)), Multiply(b2, 65536)), Multiply(b3, 16777216)))
+    }
+}
+
+// Build path string "dir/splash_NN.bgra\0" for index 0..99.
+// Returns newly allocated null-terminated string. Caller must Deallocate.
+Function.ANSICanvas_SplashPath {
+    Input:  dir: Address
+    Input:  idx: Integer
+    Output: Address
+    Body: {
+        dlen   = StringLength(dir)
+        // "/splash_NN.bgra" = 15 chars + null = 16
+        total  = Add(dlen, 16)
+        path   = Allocate(total)
+        // Copy dir
+        i = 0
+        WhileLoop LessThan(i, dlen) {
+            SetByte(path, i, GetByte(dir, i))
+            i = Add(i, 1)
+        }
+        // Append "/splash_"
+        pfx = "/splash_"
+        j = 0
+        WhileLoop LessThan(j, 8) {
+            SetByte(path, Add(dlen, j), GetByte(pfx, j))
+            j = Add(j, 1)
+        }
+        // Two-digit index
+        SetByte(path, Add(dlen, 8), Add(48, Divide(idx, 10)))
+        SetByte(path, Add(dlen, 9), Add(48, Modulo(idx, 10)))
+        // ".bgra\0"
+        sfx = ".bgra"
+        k = 0
+        WhileLoop LessThan(k, 5) {
+            SetByte(path, Add(Add(dlen, 10), k), GetByte(sfx, k))
+            k = Add(k, 1)
+        }
+        SetByte(path, Add(dlen, 15), 0)
+        ReturnValue(path)
+    }
+}
+
+// Load a .bgra blob from disk. Returns frame pointer array (Address[]) or 0.
+// On success, sets *out_w, *out_h, *out_fps, *out_count, *out_data_ptr.
+// out_data_ptr receives the raw data allocation — caller must free both
+// the frames array and the data block when done.
+Function.ANSICanvas.LoadBlob {
+    Input:  path:          Address
+    Input:  out_w:         Address
+    Input:  out_h:         Address
+    Input:  out_fps:       Address
+    Input:  out_count:     Address
+    Input:  out_data_ptr:  Address
+    Output: Address
+    Body: {
+        fd = SystemCall(ANSICanvasIO.SYS_OPEN, path, ANSICanvasIO.O_RDONLY, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        header = Allocate(16)
+        n = SystemCall(ANSICanvasIO.SYS_READ, fd, header, 16, 0, 0)
+        IfCondition LessThan(n, 16) ThenBlock: {
+            Deallocate(header, 16)
+            SystemCall(ANSICanvasIO.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+
+        // Verify magic "BGRV"
+        ok = And(And(EqualTo(GetByte(header, 0), 66), EqualTo(GetByte(header, 1), 71)),
+                 And(EqualTo(GetByte(header, 2), 82), EqualTo(GetByte(header, 3), 86)))
+        IfCondition EqualTo(ok, 0) ThenBlock: {
+            Deallocate(header, 16)
+            SystemCall(ANSICanvasIO.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+
+        width       = ANSICanvas_LE16(header, 5)
+        height      = ANSICanvas_LE16(header, 7)
+        fps         = GetByte(header, 9)
+        frame_count = ANSICanvas_LE32(header, 10)
+        Deallocate(header, 16)
+
+        IfCondition Or(EqualTo(frame_count, 0), Or(EqualTo(width, 0), EqualTo(height, 0))) ThenBlock: {
+            SystemCall(ANSICanvasIO.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+
+        frame_size = Multiply(Multiply(width, height), 4)
+        total_data = Multiply(frame_count, frame_size)
+        data       = Allocate(total_data)
+
+        // Read all frame data in a loop (single read may not return everything)
+        bytes_read = 0
+        WhileLoop LessThan(bytes_read, total_data) {
+            chunk = SystemCall(ANSICanvasIO.SYS_READ, fd, Add(data, bytes_read),
+                               Subtract(total_data, bytes_read), 0, 0)
+            IfCondition LessEqual(chunk, 0) ThenBlock: { BreakLoop }
+            bytes_read = Add(bytes_read, chunk)
+        }
+        SystemCall(ANSICanvasIO.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        IfCondition LessThan(bytes_read, total_data) ThenBlock: {
+            Deallocate(data, total_data)
+            ReturnValue(0)
+        }
+
+        // Build frame pointer array
+        frames = Allocate(Multiply(frame_count, 8))
+        fi = 0
+        WhileLoop LessThan(fi, frame_count) {
+            StoreValue(Add(frames, Multiply(fi, 8)), Add(data, Multiply(fi, frame_size)))
+            fi = Add(fi, 1)
+        }
+
+        StoreValue(out_w,        width)
+        StoreValue(out_h,        height)
+        StoreValue(out_fps,      fps)
+        StoreValue(out_count,    frame_count)
+        StoreValue(out_data_ptr, data)
+        ReturnValue(frames)
+    }
+}
+
+// Free memory from a LoadBlob call.
+Function.ANSICanvas.FreeBlob {
+    Input: frames:      Address
+    Input: data:        Address
+    Input: frame_count: Integer
+    Input: width:       Integer
+    Input: height:      Integer
+    Body: {
+        IfCondition NotEqual(frames, 0) ThenBlock: {
+            Deallocate(frames, Multiply(frame_count, 8))
+        }
+        IfCondition NotEqual(data, 0) ThenBlock: {
+            Deallocate(data, Multiply(Multiply(Multiply(width, height), 4), frame_count))
+        }
+    }
+}
+
+// =============================================================================
+// RANDOM SPLASH — scan dir for splash_00..splash_99.bgra, pick one randomly
+// =============================================================================
+// Drop new .bgra files in the ClaudeCode folder with names splash_00.bgra,
+// splash_01.bgra, etc. and this function will pick a random one each launch.
+// Uses /dev/urandom for selection so it's genuinely random.
+
+Function.ANSICanvas.PlayRandomSplash {
+    Input: dir: Address
+    Body: {
+        // Count how many splash_NN.bgra files exist (scan 00..99)
+        count = 0
+        idx = 0
+        WhileLoop LessThan(idx, 100) {
+            probe = ANSICanvas_SplashPath(dir, idx)
+            fd = SystemCall(ANSICanvasIO.SYS_OPEN, probe, ANSICanvasIO.O_RDONLY, 0, 0, 0)
+            Deallocate(probe, Add(StringLength(dir), 16))
+            IfCondition LessThan(fd, 0) ThenBlock: { BreakLoop }
+            SystemCall(ANSICanvasIO.SYS_CLOSE, fd, 0, 0, 0, 0)
+            count = Add(count, 1)
+            idx = Add(idx, 1)
+        }
+
+        IfCondition EqualTo(count, 0) ThenBlock: { ReturnValue(0) }
+
+        // Pick random index via /dev/urandom
+        chosen = 0
+        IfCondition GreaterThan(count, 1) ThenBlock: {
+            rfd = SystemCall(ANSICanvasIO.SYS_OPEN, "/dev/urandom", ANSICanvasIO.O_RDONLY, 0, 0, 0)
+            IfCondition GreaterEqual(rfd, 0) ThenBlock: {
+                rbuf = Allocate(1)
+                SystemCall(ANSICanvasIO.SYS_READ, rfd, rbuf, 1, 0, 0)
+                SystemCall(ANSICanvasIO.SYS_CLOSE, rfd, 0, 0, 0, 0)
+                chosen = Modulo(GetByte(rbuf, 0), count)
+                Deallocate(rbuf, 1)
+            }
+        }
+
+        // Load and play chosen blob
+        path = ANSICanvas_SplashPath(dir, chosen)
+
+        w_buf   = Allocate(8)
+        h_buf   = Allocate(8)
+        fps_buf = Allocate(8)
+        cnt_buf = Allocate(8)
+        dat_buf = Allocate(8)
+
+        frames = ANSICanvas.LoadBlob(path, w_buf, h_buf, fps_buf, cnt_buf, dat_buf)
+        Deallocate(path, Add(StringLength(dir), 16))
+
+        IfCondition NotEqual(frames, 0) ThenBlock: {
+            w   = Dereference(w_buf)
+            h   = Dereference(h_buf)
+            fps = Dereference(fps_buf)
+            cnt = Dereference(cnt_buf)
+            dat = Dereference(dat_buf)
+
+            IfCondition EqualTo(ANSICanvas_HasKitty(), 1) ThenBlock: {
+                ANSICanvas.KittyAnimate(frames, cnt, w, h, fps, 0)
+            }
+            ANSICanvas.FreeBlob(frames, dat, cnt, w, h)
+        }
+
+        Deallocate(w_buf,   8)
+        Deallocate(h_buf,   8)
+        Deallocate(fps_buf, 8)
+        Deallocate(cnt_buf, 8)
+        Deallocate(dat_buf, 8)
+    }
+}
