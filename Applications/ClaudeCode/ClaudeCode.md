@@ -9,12 +9,11 @@ explains the *why*.
 
 ---
 
-## Current Status (2026-04-28)
+## Current Status (2026-04-29)
 
-**Functionally working end-to-end on the API-key path.**
-Verified live: text streaming, multi-turn conversation, tool dispatch
-(Read tool returns `/etc/hostname` content), all 6 tools register and
-respond.
+**Fully working end-to-end — UI polish complete.**
+Text streaming, multi-turn conversation, all 7 tools live. Animated mascot
+and wait-state color feedback working. Terminal fills to actual width.
 
 **Working components**
 - Auth-mode prompt: option 1 (subscription / OAuth) or option 2 (API key)
@@ -23,12 +22,24 @@ respond.
 - Streaming Messages API: SSE events parsed line-by-line, text deltas
   rendered live, tool_use blocks accumulated and dispatched on
   `message_stop`
-- 6 IPC tool services: Read, Head, LS, Write, Bash, WebFetch — each a
-  separate `cc_*_ipc.x` binary auto-launched by `ClaudeCode.x` at startup,
-  killed on quit
+- 7 IPC tool services: Read, Head, LS, Write, Bash, WebFetch, Relmem —
+  each a separate `cc_*_ipc.x` binary auto-launched at startup, killed on
+  quit. `bash build.sh` rebuilds all 8 binaries.
 - History ring buffer with tool_use/tool_result pairing-aware eviction
 - UTF-8-aware display-width counting
-- Anthropic orange truecolor (`#cc785c`) on supporting terminals
+- Raw-mode TUI via `Library.TUI` — bottom-pinned prompt, no cooked-mode
+  fighting
+- Animated mascot `─┤ · ├─` (evokes official Claude mark side-arm shape)
+  in prompt body row. Dot pendulum animation during model wait.
+- Wait-state color feedback: prompt rules/mascot turn orange (idle) →
+  red (waiting for model) → green (model done). Driven by `UI.SetState(0/1/2)`.
+- Terminal-width prompt rules: fills to actual terminal width (no 100-col
+  cap). Detects `TIOCGWINSZ` on init and `SIGWINCH`.
+- Kitty Graphics Protocol splash: `ANSICanvas.PlayRandomSplash(".")` plays
+  a random `.bgra` blob as animated Kitty frames before UI init. Skipped
+  silently on non-Kitty terminals.
+- 3-line session header (chat area): `╭───╮` / `─┤ · ├─` / `╰───╯` with
+  version, model, cwd
 
 **Blocked / pending**
 - **OAuth subscription flow (option 1)**: bound by Anthropic
@@ -38,17 +49,14 @@ respond.
   falls back to API key on session entry. Awaiting guidance on whether
   third-party clients should use `/v1/messages` with Bearer or
   `/v1/sessions/*`.
-- **TUI prompt pinning**: cooked-mode line input fights bottom-anchored
-  cursor positioning. Visible bugs: prompt floats inline after responses,
-  bottom rule sometimes wider than top rule on >100col terminals. Refactor
-  to raw-mode `Library.TUI` (which dnd_game uses successfully) is the
-  structural fix — task #26.
 - **Library.JSON hash collision** (workaround in place): reading the key
   `"name"` back from a populated object returns `"index"` due to XSHash
   bucket collision when the object also holds an `"input"` sub-object.
   Workaround: `Anthropic.ailang` keeps a parallel string-pointer array
   for tool name/id; `IPCDispatch` reads from there. Real fix should be
   filed against Library.JSON.
+- **Alt-screen cleanup on shutdown**: the back buffer isn't fully cleared
+  on exit. Terminal state restored but some artifacts remain.
 
 ---
 
@@ -115,14 +123,15 @@ Documents/AILangSH/
     ├── History.ailang                        message ring buffer (pairing-aware eviction)
     ├── IPCDispatch.ailang                    generic per-tool IPC client
     ├── Auth.ailang                           auth dispatcher: API key vs OAuth, with bootstrap UX
-    ├── splash.png / splash.ans               splash assets (text loaded at runtime)
+    ├── splash_00.bgra / splash_01.bgra       Kitty animated splash blobs (241 frames, 80×48px)
     └── cc_tools/
         ├── cc_read_ipc.ailang
         ├── cc_head_ipc.ailang
         ├── cc_ls_ipc.ailang
         ├── cc_write_ipc.ailang
         ├── cc_bash_ipc.ailang
-        └── cc_webfetch_ipc.ailang
+        ├── cc_webfetch_ipc.ailang
+        └── cc_relmem_ipc.ailang
 ```
 
 `LibraryImport.X` resolves `Librarys/Library.X.ailang` from project root.
@@ -208,7 +217,10 @@ Eviction prints a one-line warning. The user sees when context gets cut.
 Two-stage UX:
 
 **Stage 1: cooked-mode bootstrap** (kernel handles input, plain stdout)
-- Splash file scroll-in animation (loads `./splash.ans` if present)
+- Kitty splash: `ANSICanvas.PlayRandomSplash(".")` plays a random
+  `splash_NN.bgra` blob as animated Kitty frames. Skipped silently if
+  `KITTY_WINDOW_ID` is not set — half-block fallback was unacceptable
+  quality for photorealistic video.
 - Auth-mode prompt (1 = subscription / 2 = API key)
 - OAuth flow (if option 1) — browser launch + callback server
 - API key fallback walkthrough if no key set
@@ -216,32 +228,46 @@ Two-stage UX:
 
 **Stage 2: raw-mode chat** (we own the screen via `Library.TUI`)
 - `UI.Init()` grabs the terminal in raw mode (TUI alt-screen + non-canonical input)
-- `UI.SessionHeader()` paints the small mascot with version/model/cwd
-- Bottom-pinned 4-row prompt area: top rule / `> ` input / bottom rule / hint
-- Chat region scrolls naturally above the prompt
+- `UI.SessionHeader()` paints 3-line mascot header in chat area
+- Bottom-pinned 4-row prompt: top rule / mascot + `> ` input / bottom rule / hint
+- Prompt width fills the actual terminal (`UILayout.cols` from `TIOCGWINSZ`)
+- State-driven color: orange = idle, red = waiting for model, green = done
+- Animated `─┤ · ├─` mascot in body row; dot pendulum driven by
+  `UI.TickMascot()` on each `ChatPrint` — counter only, no draw/flush
+  (drawing during stream corrupts TUI; mascot redraws on next prompt repaint)
 - `UI.ReadLine()` handles input character-by-character via `TUI_GetKey`
-  (handles backspace, ESC=quit, prints to body row)
-- `UI.ChatPrint(s)` streams text into chat region with column tracking so
-  successive `text_delta` events don't overwrite each other
+- `UI.ChatPrint(s)` streams text into chat region with column tracking
 
 The transition between stages happens once per session (after auth).
 `UI.Shutdown()` restores the terminal on `/quit`.
 
+**Critical: never call `TUI_Refresh()` from inside `UI.ChatPrint`.** The
+TUI buffer flush must happen at the `ChatPrint` boundary only. Calling it
+mid-stream (e.g. from a mascot tick or input pump) corrupts cursor state
+and causes subsequent text deltas to overwrite chat content.
+
+**Critical: never call `TUI_GetKey()` (blocking read) from inside
+`UI.ChatPrint`.** Every call stalls streaming until a key is pressed.
+
 ---
 
-## Splash art loader
+## Splash art
 
-`UI.SplashFile(path, delay_ms)` reads any ANSI-art file from disk, prints
-each line centered with `delay_ms` between rows. Designed to be called
-in cooked mode (before `UI.Init()`) so the kernel scrolls the terminal
-naturally.
+`ANSICanvas.PlayRandomSplash(".")` (in `Librarys/Library.ANSICanvas.ailang`)
+scans `splash_00.bgra` … `splash_99.bgra` in the CWD, picks one via
+`/dev/urandom`, and streams it as Kitty Graphics Protocol animated frames.
 
-Generate art with chafa from any image:
+Blobs baked with `tools/bake_splash.py` from source MP4s:
 ```bash
-chafa --format=symbols --symbols=block --colors=truecolor --size=80 splash.png > splash.ans
+python3 tools/bake_splash.py "Welcome Claude code.mp4" splash_00.bgra
+python3 tools/bake_splash.py "claude code reverse.mp4"  splash_01.bgra
 ```
 
-Skip the splash entirely with `CC_NO_SPLASH=1`.
+Frame size: 80×48 px, 241 frames, 24 fps. BGRA pixel order (AILang
+native) — `ANSICanvas_KittyFrame` swaps to RGBA before transmitting.
+
+Skip the splash entirely with `CC_NO_SPLASH=1` or by running in a
+non-Kitty terminal (detected via `KITTY_WINDOW_ID`).
 
 ---
 
@@ -282,10 +308,9 @@ Skip the splash entirely with `CC_NO_SPLASH=1`.
   `client_id`. Likely we need a different audience claim or session API
   flow. Issue #54184 on `anthropics/claude-code` filed, awaiting reply.
 
-- **WSL terminal width**: the prompt rule used to span the entire
-  terminal width on wide terminals (191 cols). Now capped at 100 cells
-  via `UILayout.max_bar`. Any chafa-rendered splash should fit within
-  the same cap or it'll wrap.
+- **Alt-screen cleanup on shutdown**: back buffer not fully cleared on
+  exit. Terminal is restored but some content artifacts remain. Known,
+  deferred.
 
 ---
 
@@ -294,56 +319,29 @@ Skip the splash entirely with `CC_NO_SPLASH=1`.
 ```bash
 cd /mnt/c/Users/Sean/Documents/AILangSH
 
-# Build the entry binary
-./ailang.x Applications/ClaudeCode/ClaudeCode.ailang ClaudeCode.x
+# One command rebuilds all 8 binaries and installs to Applications/ClaudeCode/
+bash build.sh
 
-# Build all six tools
-for t in read head ls write bash webfetch; do
-  ./ailang.x Applications/ClaudeCode/cc_tools/cc_${t}_ipc.ailang cc_${t}_ipc.x
-done
-
-# Start each tool service in the background
-for t in cc_read_ipc cc_head_ipc cc_ls_ipc cc_write_ipc cc_bash_ipc cc_webfetch_ipc; do
-  ./$t.x &
-done
-
-# Set the API key (in WSL shell)
+# Set the API key (in WSL shell, or add to ~/.bashrc)
 export ANTHROPIC_API_KEY=sk-ant-...
 
 # Run
-./ClaudeCode.x
+cd Applications/ClaudeCode && ./ClaudeCode.x
 ```
 
-Output:
-```
-[ipcd] registered Read
-[ipcd] registered Head
-[ipcd] registered LS
-[ipcd] registered Write
-[ipcd] registered Bash
-[ipcd] registered WebFetch
-Claude Code (AILang Native) — Phase 1
-Type your message. /quit to exit.
-
->
-```
+`ClaudeCode.x` auto-forks all 7 tool services on startup and kills them on
+quit — no manual service management needed.
 
 ---
 
 ## Verification (smoke tests passed)
 
 - `cc_read_ipc` returns `/etc/hostname` content correctly.
-- `cc_head_ipc` returns 3 lines of `/etc/passwd` when `lines=3` (caught a
-  defaults bug — `UtilArgs.UA_ApplyDefaults` used GetString to detect
-  presence, which always returned 0 for int fields; fixed to use GetType).
+- `cc_head_ipc` returns 3 lines of `/etc/passwd` when `lines=3`.
 - `cc_bash_ipc` returns `exit=3 / hello / err` for
   `echo hello && echo err >&2; exit 3`.
-- `ClaudeCode` connects to all six services, fetches each schema, lists
-  registrations cleanly.
-
-What's not yet smoke-tested (requires real API key): live streaming, real
-tool dispatch in a real conversation. End-to-end test plan in `Verification`
-section of `~/.claude/plans/if-we-need-generic-lucky-hellman.md`.
+- Live end-to-end: text streaming, multi-turn, `Read` tool dispatch in a
+  real conversation — all verified against the live API.
 
 ---
 
