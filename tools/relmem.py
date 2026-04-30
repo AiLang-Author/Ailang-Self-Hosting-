@@ -376,6 +376,9 @@ def cmd_index(args) -> int:
     if not root.exists():
         print(f"error: {root} does not exist", file=sys.stderr)
         return 1
+    if root.is_file():
+        print(f"error: index requires a directory, not a file: {root}", file=sys.stderr)
+        return 1
 
     proot = _project_root(root)
     exts = {"." + e.lstrip(".") for e in args.ext.split(",")}

@@ -1,0 +1,182 @@
+// cc_webfetch_ipc.ailang — Claude Code WebFetch tool, IPC service.
+//
+// Fetches a URL and returns the response body. HTTPS via Library.HTTP
+// (curl-backed). For Phase 1, returns raw body — no markdown extraction
+// or content-type sniffing. The model can ask Bash to pipe through pandoc
+// or whatever it needs.
+//
+// Schema: url (required string).
+//
+// Build: ./ailang.x Applications/ClaudeCode/cc_tools/cc_webfetch_ipc.ailang cc_webfetch_ipc.x
+// Run:   ./cc_webfetch_ipc.x   (binds /tmp/ailang_cctools/WebFetch.sock)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+LibraryImport.HTTP
+
+FixedPool.CCWfSys {
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+}
+
+FixedPool.CCWfConst {
+    "SOCK_PATH":     Initialize=0, CanChange=True
+    "SOCK_DIR":      Initialize=0, CanChange=True
+    "MAX_OUTPUT":    Initialize=50000
+    "BACKLOG":       Initialize=8
+}
+
+FixedPool.CCWfState {
+    "schema":        Initialize=0, CanChange=True
+    "listen_fd":     Initialize=-1, CanChange=True
+    "running":       Initialize=1, CanChange=True
+}
+
+Function.CCWf_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("WebFetch", "Fetch a URL via HTTPS and return the raw response body")
+        UtilArgs_AddField(s, "url", "string", 1, "URL to fetch (http or https)", "url")
+        ReturnValue(s)
+    }
+}
+
+Function.CCWf_Do {
+    Input: url: Address
+    Input: out_truncated_ptr: Address
+    Output: Address
+    Body: {
+        StoreValue(out_truncated_ptr, 0, "dword")
+        IfCondition EqualTo(url, 0) ThenBlock: { ReturnValue(0) }
+        body = HTTP.Get(url, "")
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(0) }
+        // Truncate if oversize
+        blen = StringLength(body)
+        IfCondition GreaterThan(blen, CCWfConst.MAX_OUTPUT) ThenBlock: {
+            SetByte(body, CCWfConst.MAX_OUTPUT, 0)
+            StoreValue(out_truncated_ptr, 1, "dword")
+        }
+        ReturnValue(body)
+    }
+}
+
+Function.CCWf_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWf_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Input: truncated: Integer
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        IfCondition NotEqual(content, 0) ThenBlock: { JSON.SetString(resp, "content", content) }
+        IfCondition EqualTo(truncated, 1) ThenBlock: { JSON.SetBool(resp, "truncated", 1) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWf_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        schema_str = UtilArgs_ExportToolSchema(CCWfState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: { JSON.SetObject(resp, "schema", schema_obj) }
+        Socket.SendMsg(client_fd, JSON.SerializeObject(resp))
+    }
+}
+
+Function.CCWf_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: { CCWf_SendError(client_fd, 0, "invalid JSON")  ReturnValue(0) }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: { CCWf_SendError(client_fd, 0, "request must be a JSON object")  ReturnValue(0) }
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: { CCWf_SendError(client_fd, 0, "missing method")  ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: { CCWf_SendSchema(client_fd)  ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCWfState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCWf_SendError(client_fd, id, "missing required argument 'url'")  ReturnValue(0)
+            }
+            url = UtilArgs_GetString(validated, "url")
+            trunc_holder = Allocate(8)
+            StoreValue(trunc_holder, 0, "dword")
+            content = CCWf_Do(url, trunc_holder)
+            truncated = Dereference(trunc_holder, "dword")
+            Deallocate(trunc_holder, 8)
+            IfCondition EqualTo(content, 0) ThenBlock: {
+                CCWf_SendError(client_fd, id, "fetch failed (curl spawn or empty response)")
+            } ElseBlock: {
+                IfCondition EqualTo(truncated, 1) ThenBlock: {
+                    final = StringConcat(content, "\n[truncated]")
+                    CCWf_SendResult(client_fd, id, final, 1)
+                } ElseBlock: {
+                    CCWf_SendResult(client_fd, id, content, 0)
+                }
+            }
+            ReturnValue(0)
+        }
+        CCWf_SendError(client_fd, 0, "unknown method")
+    }
+}
+
+SubRoutine.Main {
+    CCWfConst.SOCK_DIR  = "/tmp/ailang_cctools"
+    CCWfConst.SOCK_PATH = "@halcode/WebFetch"
+    CCWfState.schema = CCWf_BuildSchema()
+    SystemCall(CCWfSys.SYS_MKDIR, CCWfConst.SOCK_DIR, 493, 0, 0, 0)
+    SystemCall(CCWfSys.SYS_UNLINK, CCWfConst.SOCK_PATH, 0, 0, 0, 0)
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: { Exit(1) }
+    Socket.BindUnix(fd, CCWfConst.SOCK_PATH)
+    Socket.Listen(fd, CCWfConst.BACKLOG)
+    CCWfState.listen_fd = fd
+    PrintMessage("[cc_webfetch_ipc] listening on ")  PrintMessage(CCWfConst.SOCK_PATH)  PrintMessage("\n")
+    WhileLoop EqualTo(CCWfState.running, 1) {
+        client_fd = Socket.Accept(CCWfState.listen_fd)
+        IfCondition GreaterEqual(client_fd, 0) ThenBlock: {
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCWf_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+    Exit(0)
+}
+
+RunTask(Main)

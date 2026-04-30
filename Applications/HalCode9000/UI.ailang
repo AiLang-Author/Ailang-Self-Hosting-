@@ -1,0 +1,1226 @@
+// UI.ailang — Claude Code raw-mode TUI wrapper.
+//
+// Built on Library.TUI (the same primitives dnd_game uses successfully).
+// Raw mode means we own the screen — every cursor position is explicit,
+// nothing fights the terminal.
+//
+// Architecture:
+//
+//   ┌─────────────────────────────────────────┐
+//   │                                         │  ← Chat region: rows 1..(rows-PROMPT_H)
+//   │  scrolls naturally as chat output       │     Owned by ChatPrintln/ChatPrint
+//   │  is appended via UI.ChatPrintln         │     which advance an internal cursor row
+//   │                                         │
+//   │  ────────────────────────────────       │  ← Top rule (row rows-PROMPT_H+1)
+//   │  > user types here                      │  ← Body row (row rows-PROMPT_H+2)
+//   │  ────────────────────────────────       │  ← Bottom rule (row rows-PROMPT_H+3)
+//   │  /help · /quit · ...                    │  ← Hint (row rows-PROMPT_H+4)
+//   └─────────────────────────────────────────┘
+//
+// Functions:
+//   UI.Init()             — TUI_Init (raw mode + alt screen + clear)
+//   UI.Shutdown()         — TUI_Shutdown (restores terminal)
+//   UI.ChatPrint(s)       — append text to chat region (no newline)
+//   UI.ChatPrintln(s)     — append text + newline; scrolls if full
+//   UI.ChatTag(tag, body, color) — colored prefix line (e.g. "● Read(...)")
+//   UI.ReadLine() -> str  — read one line of input from the pinned prompt
+//   UI.ToolCallStart(name, args)  / UI.ToolCallEnd(ok)  — render tool calls
+//   UI.SessionHeader(version, model, cwd) — small mascot + info block
+//   UI.PrintHelp()        — slash-command help
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.TUI
+LibraryImport.ANSI
+
+FixedPool.UISys {
+    "SYS_WRITE":  Initialize=1
+    "SYS_IOCTL":  Initialize=16
+}
+
+FixedPool.UIColors {
+    "ORANGE_FG":   Initialize=3   // TUI yellow ≈ orange in 8-color palette
+    "DIM_FG":      Initialize=8   // bright black = dim grey
+    "WHITE_FG":    Initialize=7
+    "GREEN_FG":    Initialize=2
+    "RED_FG":      Initialize=1
+    "CYAN_FG":     Initialize=6
+}
+
+FixedPool.UILayout {
+    "prompt_h":      Initialize=4, CanChange=True   // top rule(1) + body(1) + bot rule(1) + hint(1)
+    "max_bar":       Initialize=512, CanChange=True  // uncapped — fill the terminal
+    "rows":          Initialize=24, CanChange=True
+    "cols":          Initialize=80, CanChange=True
+    "chat_top":      Initialize=1, CanChange=True   // full height native scrolling
+    "chat_bot":      Initialize=20, CanChange=True  // last row of chat region (rows - prompt_h)
+    "chat_cursor":   Initialize=1, CanChange=True   // current row to write into
+    "chat_col":      Initialize=1, CanChange=True   // current col within that row
+    "input_buf":     Initialize=0, CanChange=True   // edit buffer
+    "input_len":     Initialize=0, CanChange=True   // async input length
+    "input_cap":     Initialize=4096
+    "initialized":   Initialize=0, CanChange=True
+    "ui_state":      Initialize=0, CanChange=True   // 0=idle, 1=waiting, 2=done
+    "mascot_frame":  Initialize=0, CanChange=True
+    "mascot_tick":   Initialize=0, CanChange=True
+}
+
+FixedPool.UIGlyph {
+    "STAR":          Initialize=0, CanChange=True   // ✻
+    "DOT":           Initialize=0, CanChange=True   // ●
+    "CHECK":         Initialize=0, CanChange=True   // ✓
+    "CROSS":         Initialize=0, CanChange=True   // ✗
+    "ARROW":         Initialize=0, CanChange=True   // >
+    "RULE":          Initialize=0, CanChange=True   // ─
+}
+
+// =============================================================================
+// TRUECOLOR HELPERS — write 24-bit SGR directly into TUI's buffer
+// =============================================================================
+// AILang string literals don't process \x escape sequences, so we build
+// the CSI sequences byte-by-byte using TUI_BufferChar, the same way
+// Library.TUI builds all its sequences internally.
+
+// Write a non-negative integer as decimal digits into TUI's buffer.
+Function.UI_TUI_WriteInt {
+    Input: val: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: { TUI_BufferChar(48)  ReturnValue(0) }
+        tmp = Allocate(20)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            TUI_BufferChar(GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        Deallocate(tmp, 20)
+    }
+}
+
+// ESC [ 38 ; 2 ; r ; g ; b m  — 24-bit truecolor foreground into TUI buffer.
+Function.UI_TUI_FgRGB {
+    Input: r: Integer
+    Input: g: Integer
+    Input: b: Integer
+    Body: {
+        TUI_BufferChar(27)    // ESC
+        TUI_BufferChar(91)    // [
+        TUI_BufferChar(51)    // '3'
+        TUI_BufferChar(56)    // '8'
+        TUI_BufferChar(59)    // ';'
+        TUI_BufferChar(50)    // '2'
+        TUI_BufferChar(59)    // ';'
+        UI_TUI_WriteInt(r)
+        TUI_BufferChar(59)    // ';'
+        UI_TUI_WriteInt(g)
+        TUI_BufferChar(59)    // ';'
+        UI_TUI_WriteInt(b)
+        TUI_BufferChar(109)   // 'm'
+    }
+}
+
+// =============================================================================
+// INIT / SHUTDOWN
+// =============================================================================
+Function.UI.Init {
+    Body: {
+        IfCondition EqualTo(UILayout.initialized, 1) ThenBlock: { ReturnValue(0) }
+
+        UIGlyph.STAR  = "✻"
+        UIGlyph.DOT   = "●"
+        UIGlyph.CHECK = "✓"
+        UIGlyph.CROSS = "✗"
+        UIGlyph.ARROW = ">"
+        UIGlyph.RULE  = "─"
+
+        UILayout.input_buf = Allocate(UILayout.input_cap)
+
+        TUI_Init()
+        UI_RecomputeLayout()
+        UILayout.initialized = 1
+
+        // Hard clear on boot only — wipes everything including any cooked-mode output above.
+        TUI_BufferChar(27)
+        TUI_BufferWriteStr("[2J")
+        TUI_BufferChar(27)
+        TUI_BufferWriteStr("[H")
+        TUI_Refresh()
+        UILayout.chat_cursor = UILayout.chat_top
+        UILayout.chat_col = 1
+
+        // Terminal polish via Library.ANSI
+        cc_title = "HAL Code 9000"
+        ANSI.SetTitle(cc_title, 11)
+        ANSI.SetCursorShape(ANSICursor.STEADY_BEAM)
+        ANSI.BracketedPasteOn()
+
+        // Initial paint of the empty prompt area
+        UI_PaintPromptFrame("/help · /clear · /quit · I can't let you do that, Dave")
+        TUI_Refresh()
+    }
+}
+
+Function.UI.Shutdown {
+    Body: {
+        IfCondition EqualTo(UILayout.initialized, 0) ThenBlock: { ReturnValue(0) }
+        ANSI.BracketedPasteOff()
+        ANSI.SetCursorShape(ANSICursor.DEFAULT)
+        TUI_Shutdown()
+        UILayout.initialized = 0
+    }
+}
+
+// Clear only the chat region (rows chat_top..chat_bot), leaving the prompt
+// frame intact. Used by /clear — no flicker, no prompt redraw needed.
+Function.UI.ClearChat {
+    Body: {
+        i = UILayout.chat_top
+        WhileLoop LessEqual(i, UILayout.chat_bot) {
+            TUI_MoveTo(i, 1)
+            TUI_BufferChar(27)
+            TUI_BufferWriteStr("[2K")
+            i = Add(i, 1)
+        }
+        UILayout.chat_cursor = UILayout.chat_top
+        UILayout.chat_col = 1
+        TUI_MoveTo(UILayout.chat_top, 1)
+        TUI_Refresh()
+    }
+}
+
+// Recompute layout based on current terminal size.
+Function.UI_RecomputeLayout {
+    Body: {
+        TUI_GetScreenSize()
+        UILayout.rows = TUI_State.screen_height
+        UILayout.cols = TUI_State.screen_width
+        IfCondition LessEqual(UILayout.rows, 0) ThenBlock: { UILayout.rows = 24 }
+        IfCondition LessEqual(UILayout.cols, 0) ThenBlock: { UILayout.cols = 80 }
+        UILayout.chat_top = 1
+        IfCondition LessThan(UILayout.prompt_h, 4) ThenBlock: { UILayout.prompt_h = 4 }
+        UILayout.chat_bot = Subtract(UILayout.rows, UILayout.prompt_h)
+        IfCondition LessThan(UILayout.chat_bot, 1) ThenBlock: { UILayout.chat_bot = 1 }
+        IfCondition LessThan(UILayout.chat_cursor, 1) ThenBlock: { UILayout.chat_cursor = 1 }
+        IfCondition GreaterThan(UILayout.chat_cursor, UILayout.chat_bot) ThenBlock: {
+            UILayout.chat_cursor = UILayout.chat_bot
+        }
+    }
+}
+
+// =============================================================================
+// HELPERS — bar width, row positions
+// =============================================================================
+Function.UI_BarWidth {
+    Output: Integer
+    Body: {
+        bw = UILayout.cols
+        IfCondition GreaterThan(bw, UILayout.max_bar) ThenBlock: { bw = UILayout.max_bar }
+        IfCondition LessThan(bw, 10) ThenBlock: { bw = 10 }
+        ReturnValue(bw)
+    }
+}
+
+Function.UI_TopRuleRow    { Output: Integer  Body: { ReturnValue(Add(UILayout.chat_bot, 1)) } }
+Function.UI_BodyRow       { Output: Integer  Body: { ReturnValue(Add(UILayout.chat_bot, 2)) } }
+Function.UI_BotRuleRow    { Output: Integer  Body: { ReturnValue(Add(UILayout.chat_bot, 3)) } }
+Function.UI_HintRow       { Output: Integer  Body: { ReturnValue(Add(UILayout.chat_bot, 4)) } }
+
+// =============================================================================
+// PROMPT FRAME — the always-visible bottom-pinned input area
+// State colors: 0=idle (orange), 1=waiting (red), 2=done (green)
+// =============================================================================
+Function.UI_PromptColor {
+    Body: {
+        IfCondition EqualTo(UILayout.ui_state, 1) ThenBlock: {
+            UI_TUI_FgRGB(180, 40, 40)
+        } ElseBlock: {
+            IfCondition EqualTo(UILayout.ui_state, 2) ThenBlock: {
+                UI_TUI_FgRGB(50, 180, 70)
+            } ElseBlock: {
+                UI_TUI_FgRGB(204, 120, 92)
+            }
+        }
+    }
+}
+
+Function.UI_PaintTopRule {
+    Body: {
+        TUI_MoveTo(UI_TopRuleRow(), 1)
+        TUI_BufferChar(27)
+        TUI_BufferWriteStr("[K")
+        UI_PromptColor()
+        TUI_BufferWriteStr("╭")
+        bw = Subtract(UI_BarWidth(), 1)
+        i = 0
+        WhileLoop LessThan(i, bw) {
+            TUI_BufferWriteStr(UIGlyph.RULE)
+            i = Add(i, 1)
+        }
+        TUI_ResetColor()
+    }
+}
+
+Function.UI_PaintBotRule {
+    Body: {
+        TUI_MoveTo(UI_BotRuleRow(), 1)
+        TUI_BufferChar(27)
+        TUI_BufferWriteStr("[K")
+        UI_PromptColor()
+        TUI_BufferWriteStr("╰")
+        bw = Subtract(UI_BarWidth(), 1)
+        i = 0
+        WhileLoop LessThan(i, bw) {
+            TUI_BufferWriteStr(UIGlyph.RULE)
+            i = Add(i, 1)
+        }
+        TUI_ResetColor()
+    }
+}
+
+Function.UI_PaintBodyRow {
+    Body: {
+        r = UI_BodyRow()
+        body_lines = Subtract(UILayout.prompt_h, 3)
+        i = 0
+        WhileLoop LessThan(i, body_lines) {
+            TUI_MoveTo(Add(r, i), 1)
+            TUI_BufferChar(27)
+            TUI_BufferWriteStr("[K")
+            i = Add(i, 1)
+        }
+        UI_DrawMascot()
+    }
+}
+
+Function.UI_PaintHint {
+    Input: hint: Address
+    Body: {
+        TUI_MoveTo(UI_HintRow(), 1)
+        TUI_BufferChar(27)
+        TUI_BufferWriteStr("[K")
+        TUI_SetFG(UIColors.DIM_FG)
+        TUI_BufferWriteStr("  ")
+        IfCondition NotEqual(hint, 0) ThenBlock: {
+            TUI_BufferWriteStr(hint)
+        }
+        TUI_ResetColor()
+    }
+}
+
+// Paint the entire prompt frame (top rule, body row prefix, bot rule, hint).
+// Leaves cursor at the input position.
+Function.UI_PaintPromptFrame {
+    Input: hint: Address
+    Body: {
+        UI_PaintTopRule()
+        UI_PaintBodyRow()
+        UI_PaintBotRule()
+        UI_PaintHint(hint)
+        UI_RenderInput(UILayout.input_len)
+    }
+}
+
+// =============================================================================
+// CHAT REGION — append text, scroll if needed
+// =============================================================================
+// Scroll the chat region up by one line: copy each row [chat_top+1..chat_bot]
+// to row-1, clear chat_bot. Uses ESC[<top>;<bot>r scroll region + IND.
+Function.UI_ScrollChatUp {
+    Body: {
+        // Set scroll region to chat region
+        TUI_BufferChar(27)
+        TUI_BufferWriteStr("[")
+        UI_TUI_WriteInt(UILayout.chat_top)
+        TUI_BufferWriteStr(";")
+        UI_TUI_WriteInt(UILayout.chat_bot)
+        TUI_BufferWriteStr("r")
+        // Move to bottom of region, then linefeed (causes scroll)
+        TUI_MoveTo(UILayout.chat_bot, 1)
+        TUI_BufferChar(10)
+        // Reset scroll region to whole screen
+        TUI_BufferChar(27)
+        TUI_BufferWriteStr("[r")
+    }
+}
+
+// Move chat cursor down by 1, scrolling if at the bottom of the chat region.
+// Returns 1 if a scroll happened (caller should repaint the prompt frame
+// because scrolling can disturb it), 0 otherwise.
+Function.UI_AdvanceChatCursor {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(UILayout.chat_cursor, UILayout.chat_bot) ThenBlock: {
+            UI_ScrollChatUp()
+            ReturnValue(1)
+        }
+        UILayout.chat_cursor = Add(UILayout.chat_cursor, 1)
+        ReturnValue(0)
+    }
+}
+
+// Public: print a string to the chat region. Newlines advance the row.
+// Soft-wraps at terminal column.
+//
+// Repaint policy: only repaint the prompt frame after a SCROLL happened
+// (because scrolling can dirty the bottom-pinned area). On normal
+// non-scrolling writes we leave the prompt alone — repainting after every
+// stream chunk caused chat output to get clobbered.
+Function.UI.ChatPrint {
+    Input: s: Address
+    Body: {
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(s)
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+
+        scrolled_any = 0
+        // RESUME from the column where the previous ChatPrint left off.
+        TUI_MoveTo(UILayout.chat_cursor, UILayout.chat_col)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            ch = GetByte(s, i)
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                scrolled = UI_AdvanceChatCursor()
+                IfCondition EqualTo(scrolled, 1) ThenBlock: { scrolled_any = 1 }
+                UILayout.chat_col = 1
+                TUI_MoveTo(UILayout.chat_cursor, 1)
+            } ElseBlock: {
+                is_start = 0
+                IfCondition LessThan(ch, 128) ThenBlock: { is_start = 1 }
+                IfCondition GreaterEqual(ch, 192) ThenBlock: { is_start = 1 }
+
+                IfCondition And(GreaterThan(UILayout.chat_col, UILayout.cols), EqualTo(is_start, 1)) ThenBlock: {
+                    scrolled = UI_AdvanceChatCursor()
+                    IfCondition EqualTo(scrolled, 1) ThenBlock: { scrolled_any = 1 }
+                    UILayout.chat_col = 1
+                    TUI_MoveTo(UILayout.chat_cursor, 1)
+                }
+                tmp = Allocate(2)
+                SetByte(tmp, 0, ch)
+                SetByte(tmp, 1, 0)
+                TUI_BufferWriteStr(tmp)
+                Deallocate(tmp, 2)
+                IfCondition EqualTo(is_start, 1) ThenBlock: {
+                    UILayout.chat_col = Add(UILayout.chat_col, 1)
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(scrolled_any, 1) ThenBlock: {
+            UI_RepaintPromptFrameOnly()
+        }
+        UI.TickMascot()
+        TUI_Refresh()
+    }
+}
+
+Function.UI.ChatPrintln {
+    Input: s: Address
+    Body: {
+        UI.ChatPrint(s)
+        scrolled = UI_AdvanceChatCursor()
+        UILayout.chat_col = 1
+        IfCondition EqualTo(scrolled, 1) ThenBlock: {
+            UI_RepaintPromptFrameOnly()
+        }
+        UI.TickMascot()
+        TUI_Refresh()
+    }
+}
+
+// Re-paint just the prompt frame (rules + body + hint) without disturbing
+// the chat region. Used after each ChatPrint to make sure scrolling
+// didn't smash the prompt rows.
+Function.UI_RepaintPromptFrameOnly {
+    Body: {
+        UI_PaintTopRule()
+        UI_PaintBodyRow()
+        UI_PaintBotRule()
+        UI_PaintHint("/help · /clear · /quit · I can't let you do that, Dave")
+        UI_RenderInput(UILayout.input_len)
+    }
+}
+
+// Colored prefix line — for tool calls, errors, etc.
+// Always advances to a fresh row + col 1 after, so the next ChatPrint
+// starts cleanly at the leftmost column of a new row.
+Function.UI.ChatTag {
+    Input: tag: Address     // e.g. "●"
+    Input: body: Address
+    Input: color: Integer   // TUI fg index
+    Body: {
+        TUI_MoveTo(UILayout.chat_cursor, 1)
+        TUI_SetFG(color)
+        IfCondition NotEqual(tag, 0) ThenBlock: { TUI_BufferWriteStr(tag) }
+        TUI_ResetColor()
+        TUI_BufferWriteStr(" ")
+        IfCondition NotEqual(body, 0) ThenBlock: { TUI_BufferWriteStr(body) }
+        scrolled = UI_AdvanceChatCursor()
+        UILayout.chat_col = 1
+        IfCondition EqualTo(scrolled, 1) ThenBlock: { UI_RepaintPromptFrameOnly() }
+        UI.TickMascot()
+        TUI_Refresh()
+    }
+}
+
+// Calculate required input lines (soft wrapping dynamically)
+Function.UI_CalcInputLines {
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        start_col = 12
+        w = Subtract(UILayout.cols, start_col)
+        IfCondition LessEqual(w, 0) ThenBlock: { w = 10 }
+        lines = 1
+        col = 0
+        i = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(UILayout.input_buf, i)
+            IfCondition Or(EqualTo(ch, 10), EqualTo(ch, 13)) ThenBlock: {
+                lines = Add(lines, 1)
+                col = 0
+            } ElseBlock: {
+                col = Add(col, 1)
+                IfCondition GreaterEqual(col, w) ThenBlock: {
+                    lines = Add(lines, 1)
+                    col = 0
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition LessThan(lines, 1) ThenBlock: { lines = 1 }
+        ReturnValue(lines)
+    }
+}
+
+// Adjust the height of the prompt frame and slide chat up if it grows
+Function.UI_AdjustPromptHeight {
+    Input: body_lines: Integer
+    Output: Integer
+    Body: {
+        new_h = Add(body_lines, 3)
+        IfCondition EqualTo(new_h, UILayout.prompt_h) ThenBlock: { ReturnValue(0) }
+
+        diff = Subtract(new_h, UILayout.prompt_h)
+        IfCondition GreaterThan(diff, 0) ThenBlock: {
+            TUI_BufferChar(27) TUI_BufferWriteStr("[")
+            UI_TUI_WriteInt(UILayout.chat_top) TUI_BufferWriteStr(";")
+            UI_TUI_WriteInt(UILayout.chat_bot) TUI_BufferWriteStr("r")
+
+            TUI_MoveTo(UILayout.chat_bot, 1)
+            k = 0
+            WhileLoop LessThan(k, diff) {
+                TUI_BufferChar(10)
+                k = Add(k, 1)
+            }
+            UILayout.chat_cursor = Subtract(UILayout.chat_cursor, diff)
+            IfCondition LessThan(UILayout.chat_cursor, UILayout.chat_top) ThenBlock: {
+                UILayout.chat_cursor = UILayout.chat_top
+            }
+        }
+
+        UILayout.prompt_h = new_h
+        UILayout.chat_bot = Subtract(UILayout.rows, UILayout.prompt_h)
+        IfCondition LessThan(UILayout.chat_bot, UILayout.chat_top) ThenBlock: {
+            UILayout.chat_bot = UILayout.chat_top
+        }
+
+        TUI_BufferChar(27) TUI_BufferWriteStr("[r")
+        
+        UI_PaintTopRule()
+        UI_PaintBodyRow()
+        UI_PaintBotRule()
+        UI_PaintHint("/help · /clear · /quit · I can't let you do that, Dave")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// INPUT — read one line from the pinned prompt
+// =============================================================================
+
+Function.UI.SetState {
+    Input: state: Integer
+    Body: {
+        UILayout.ui_state = state
+        UI_PaintBodyRow()
+        UI_RenderInput(UILayout.input_len)
+        UI.TickMascot()
+        TUI_Refresh()
+    }
+}
+
+Function.UI.PumpInput {
+    Body: {
+        IfCondition NotEqual(UILayout.ui_state, 1) ThenBlock: { ReturnValue(0) }
+        dirty = 0
+        len = UILayout.input_len
+        WhileLoop 1 {
+            key = TUI_GetKey()
+            IfCondition EqualTo(key, TUI_Keys.KEY_NONE) ThenBlock: { BreakLoop }
+            
+            // Drain ESC sequences invisibly if stuck typing while blocked
+            IfCondition EqualTo(key, 27) ThenBlock: {
+                TUI_GetKey() TUI_GetKey() TUI_GetKey() TUI_GetKey() TUI_GetKey() TUI_GetKey()
+                ContinueLoop
+            }
+
+            IfCondition Or(EqualTo(key, 10), EqualTo(key, 13)) ThenBlock: {
+                // Ignore Enter while blocked
+            } ElseBlock: {
+                IfCondition Or(EqualTo(key, TUI_Keys.KEY_BACKSPACE), EqualTo(key, 8)) ThenBlock: {
+                    IfCondition GreaterThan(len, 0) ThenBlock: {
+                        len = Subtract(len, 1)
+                        SetByte(UILayout.input_buf, len, 0)
+                        dirty = 1
+                    }
+                } ElseBlock: {
+                    IfCondition And(GreaterEqual(key, 32), LessThan(key, 127)) ThenBlock: {
+                        IfCondition LessThan(len, Subtract(UILayout.input_cap, 1)) ThenBlock: {
+                            SetByte(UILayout.input_buf, len, key)
+                            len = Add(len, 1)
+                            SetByte(UILayout.input_buf, len, 0)
+                            dirty = 1
+                        }
+                    }
+                }
+            }
+        }
+        IfCondition EqualTo(dirty, 1) ThenBlock: {
+            UILayout.input_len = len
+            req_lines = UI_CalcInputLines(len)
+            changed = UI_AdjustPromptHeight(req_lines)
+            IfCondition EqualTo(changed, 0) ThenBlock: {
+                UI_PaintBodyRow()
+            }
+            UI_RenderInput(len)
+            TUI_Refresh()
+        }
+    }
+}
+
+// Edit the input buffer in place using TUI_GetKey; render each keystroke
+// at the body row. Returns when Enter is pressed.
+Function.UI.ReadLine {
+    Output: Address
+    Body: {
+        len = UILayout.input_len
+        SetByte(UILayout.input_buf, len, 0)
+        UILayout.ui_state = 0
+        req_lines = UI_CalcInputLines(len)
+        changed = UI_AdjustPromptHeight(req_lines)
+        IfCondition EqualTo(changed, 0) ThenBlock: {
+            UI_PaintBodyRow()
+        }
+        UI_RenderInput(len)
+        UI.TickMascot()
+        TUI_ShowCursor()
+        TUI_Refresh()
+
+        in_paste = 0
+
+        WhileLoop 1 {
+            key = TUI_GetKey()
+            IfCondition EqualTo(key, TUI_Keys.KEY_NONE) ThenBlock: { ContinueLoop }
+            
+            // Handle Bracketed Paste "\x1b[200~" start and "\x1b[201~" end
+            IfCondition EqualTo(key, 27) ThenBlock: {
+                k2 = TUI_GetKey()
+                IfCondition EqualTo(k2, 91) ThenBlock: {
+                    k3 = TUI_GetKey()
+                    IfCondition EqualTo(k3, 50) ThenBlock: {
+                        k4 = TUI_GetKey()
+                        IfCondition EqualTo(k4, 48) ThenBlock: {
+                            k5 = TUI_GetKey()
+                            k6 = TUI_GetKey()
+                            IfCondition EqualTo(k5, 48) ThenBlock: { in_paste = 1 }
+                            IfCondition EqualTo(k5, 49) ThenBlock: { in_paste = 0 }
+                            ContinueLoop
+                        }
+                    }
+                }
+                ContinueLoop
+            }
+
+            // Enter
+            IfCondition Or(EqualTo(key, 10), EqualTo(key, 13)) ThenBlock: {
+                IfCondition EqualTo(in_paste, 0) ThenBlock: {
+                    BreakLoop
+                } ElseBlock: {
+                    IfCondition LessThan(len, Subtract(UILayout.input_cap, 1)) ThenBlock: {
+                        SetByte(UILayout.input_buf, len, 10)
+                        len = Add(len, 1)
+                        SetByte(UILayout.input_buf, len, 0)
+                        UILayout.input_len = len
+                        req_l = UI_CalcInputLines(len)
+                        changed = UI_AdjustPromptHeight(req_l)
+                        IfCondition EqualTo(changed, 0) ThenBlock: { UI_PaintBodyRow() }
+                        UI_RenderInput(len)
+                        TUI_Refresh()
+                    }
+                }
+            } ElseBlock: {
+                IfCondition Or(EqualTo(key, TUI_Keys.KEY_BACKSPACE), EqualTo(key, 8)) ThenBlock: {
+                    IfCondition GreaterThan(len, 0) ThenBlock: {
+                        len = Subtract(len, 1)
+                        SetByte(UILayout.input_buf, len, 0)
+                        UILayout.input_len = len
+                        req_l = UI_CalcInputLines(len)
+                        changed = UI_AdjustPromptHeight(req_l)
+                        IfCondition EqualTo(changed, 0) ThenBlock: { UI_PaintBodyRow() }
+                        UI_RenderInput(len)
+                        TUI_Refresh()
+                    }
+                } ElseBlock: {
+                    IfCondition And(GreaterEqual(key, 32), LessThan(key, 127)) ThenBlock: {
+                        IfCondition LessThan(len, Subtract(UILayout.input_cap, 1)) ThenBlock: {
+                            SetByte(UILayout.input_buf, len, key)
+                            len = Add(len, 1)
+                            SetByte(UILayout.input_buf, len, 0)
+                            UILayout.input_len = len
+                            req_l = UI_CalcInputLines(len)
+                            changed = UI_AdjustPromptHeight(req_l)
+                            IfCondition EqualTo(changed, 0) ThenBlock: { UI_PaintBodyRow() }
+                            UI_RenderInput(len)
+                            TUI_Refresh()
+                        }
+                    }
+                }
+            }
+        }
+
+        // Echo the submitted line into the chat region as the user's prompt
+        UILayout.input_len = 0
+        TUI_HideCursor()
+        UI.ChatTag("›", UILayout.input_buf, UIColors.CYAN_FG)
+        ReturnValue(UILayout.input_buf)
+    }
+}
+
+// Re-render `len` bytes from input_buf at the body row.
+Function.UI_RenderInput {
+    Input: len: Integer
+    Body: {
+        r = UI_BodyRow()
+        start_col = 12
+        w = Subtract(UILayout.cols, start_col)
+        IfCondition LessEqual(w, 0) ThenBlock: { w = 10 }
+
+        curr_row = 0
+        curr_col = 0
+        TUI_MoveTo(r, start_col)
+
+        i = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(UILayout.input_buf, i)
+            IfCondition Or(EqualTo(ch, 10), EqualTo(ch, 13)) ThenBlock: {
+                curr_row = Add(curr_row, 1)
+                curr_col = 0
+                TUI_MoveTo(Add(r, curr_row), start_col)
+            } ElseBlock: {
+                tmp = Allocate(2)
+                SetByte(tmp, 0, ch)
+                SetByte(tmp, 1, 0)
+                TUI_BufferWriteStr(tmp)
+                Deallocate(tmp, 2)
+                curr_col = Add(curr_col, 1)
+                IfCondition GreaterEqual(curr_col, w) ThenBlock: {
+                    curr_row = Add(curr_row, 1)
+                    curr_col = 0
+                    TUI_MoveTo(Add(r, curr_row), start_col)
+                }
+            }
+            i = Add(i, 1)
+        }
+
+        TUI_MoveTo(Add(r, curr_row), Add(start_col, curr_col))
+    }
+}
+
+// =============================================================================
+// MASCOT — ─┤ · ├─  squircle-with-arms, evokes the official Claude mark.
+//
+// Static 3-line version in the session header (chat area at startup).
+// Animated 1-line version in the prompt body row, left of the "> " prompt.
+//
+// Animation: dot pendulums left→center→right→center while ui_state=1.
+// The ─┤ ├─ arms stay fixed; only the 3-char interior changes.
+//
+// Body-row geometry (display columns):
+//   ─┤___├─  >    ← 7 cols mascot + 2 space + 2 prompt
+//   123456789 11   input starts at col 12
+// =============================================================================
+
+// Returns 0/1/2 — column offset of the HAL eye within the 3-col inner slot.
+Function.UI_MascotEyePos {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(UILayout.ui_state, 1) ThenBlock: {
+            m = Modulo(UILayout.mascot_frame, 4)
+            IfCondition EqualTo(m, 0) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(m, 1) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(m, 2) ThenBlock: { ReturnValue(2) }
+            ReturnValue(1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Set arm+frame color: pulses dark→medium→bright→medium during wait,
+// falls back to prompt state color (orange/red/green) otherwise.
+Function.UI_SetMascotColor {
+    Body: {
+        IfCondition EqualTo(UILayout.ui_state, 1) ThenBlock: {
+            m = Modulo(UILayout.mascot_frame, 4)
+            IfCondition EqualTo(m, 0) ThenBlock: { UI_TUI_FgRGB(140, 10, 10)  ReturnValue(0) }
+            IfCondition EqualTo(m, 1) ThenBlock: { UI_TUI_FgRGB(210, 35, 35)  ReturnValue(0) }
+            IfCondition EqualTo(m, 2) ThenBlock: { UI_TUI_FgRGB(255, 65, 65)  ReturnValue(0) }
+            UI_TUI_FgRGB(210, 35, 35)
+            ReturnValue(0)
+        }
+        UI_PromptColor()
+    }
+}
+
+// Emit HAL eye glyph U+25C9 FISHEYE in current mascot color.
+// UTF-8 bytes: E2 97 89 = 226 151 137.  Emitted byte-by-byte to avoid
+// the Edit tool stripping multi-byte literals out of source strings.
+Function.UI_EmitHalEye {
+    Body: {
+        UI_SetMascotColor()
+        TUI_BufferChar(226)
+        TUI_BufferChar(151)
+        TUI_BufferChar(137)
+    }
+}
+
+// Emit left arm — shape rotates down/level/up/level during wait, static otherwise.
+// Box-drawing: ─┐ ─┤ ─┘ (bytes all work as string literals).
+Function.UI_EmitLeftArm {
+    Body: {
+        IfCondition EqualTo(UILayout.ui_state, 1) ThenBlock: {
+            m = Modulo(UILayout.mascot_frame, 4)
+            IfCondition EqualTo(m, 0) ThenBlock: { TUI_BufferWriteStr("─┐")  ReturnValue(0) }
+            IfCondition EqualTo(m, 1) ThenBlock: { TUI_BufferWriteStr("─┤")  ReturnValue(0) }
+            IfCondition EqualTo(m, 2) ThenBlock: { TUI_BufferWriteStr("─┘")  ReturnValue(0) }
+            TUI_BufferWriteStr("─┤")
+            ReturnValue(0)
+        }
+        TUI_BufferWriteStr("─┤")
+    }
+}
+
+// Emit right arm — mirror of left arm.
+Function.UI_EmitRightArm {
+    Body: {
+        IfCondition EqualTo(UILayout.ui_state, 1) ThenBlock: {
+            m = Modulo(UILayout.mascot_frame, 4)
+            IfCondition EqualTo(m, 0) ThenBlock: { TUI_BufferWriteStr("┌─")  ReturnValue(0) }
+            IfCondition EqualTo(m, 1) ThenBlock: { TUI_BufferWriteStr("├─")  ReturnValue(0) }
+            IfCondition EqualTo(m, 2) ThenBlock: { TUI_BufferWriteStr("└─")  ReturnValue(0) }
+            TUI_BufferWriteStr("├─")
+            ReturnValue(0)
+        }
+        TUI_BufferWriteStr("├─")
+    }
+}
+
+Function.UI_DrawMascot {
+    Body: {
+        TUI_MoveTo(UI_BodyRow(), 1)
+        UI_SetMascotColor()
+        UI_EmitLeftArm()
+        pos = UI_MascotEyePos()
+        IfCondition EqualTo(pos, 0) ThenBlock: {
+            UI_EmitHalEye()
+            UI_SetMascotColor()
+            TUI_BufferWriteStr("  ")
+        }
+        IfCondition EqualTo(pos, 1) ThenBlock: {
+            TUI_BufferWriteStr(" ")
+            UI_EmitHalEye()
+            UI_SetMascotColor()
+            TUI_BufferWriteStr(" ")
+        }
+        IfCondition EqualTo(pos, 2) ThenBlock: {
+            TUI_BufferWriteStr("  ")
+            UI_EmitHalEye()
+            UI_SetMascotColor()
+        }
+        UI_EmitRightArm()
+        TUI_ResetColor()
+        TUI_BufferWriteStr("  ")
+        UI_PromptColor()
+        TUI_Bold()
+        TUI_BufferWriteStr("> ")
+        TUI_ResetColor()
+    }
+}
+
+Function.UI.TickMascot {
+    Body: {
+        IfCondition EqualTo(UILayout.ui_state, 1) ThenBlock: {
+            UILayout.mascot_tick = Add(UILayout.mascot_tick, 1)
+            IfCondition GreaterEqual(UILayout.mascot_tick, 3) ThenBlock: {
+                UILayout.mascot_tick = 0
+                UILayout.mascot_frame = Add(UILayout.mascot_frame, 1)
+            }
+        }
+    }
+}
+
+// Static 3-line mascot for the session header (chat area).
+Function.UI.SessionHeader {
+    Input: version: Address
+    Input: model_line: Address
+    Input: cwd: Address
+    Body: {
+        UI.ChatPrintln("")
+
+        TUI_MoveTo(UILayout.chat_cursor, 1)
+        UI_TUI_FgRGB(204, 120, 92)
+        TUI_BufferWriteStr(" ╭───╮  ")
+        TUI_ResetColor()
+        TUI_Bold()
+        TUI_BufferWriteStr("HAL Code 9000")
+        TUI_ResetColor()
+        IfCondition NotEqual(version, 0) ThenBlock: {
+            TUI_BufferWriteStr("  ")
+            TUI_SetFG(UIColors.DIM_FG)
+            TUI_BufferWriteStr(version)
+            TUI_ResetColor()
+        }
+        UI_AdvanceChatCursor()
+
+        TUI_MoveTo(UILayout.chat_cursor, 1)
+        UI_TUI_FgRGB(204, 120, 92)
+        TUI_BufferWriteStr("─┤ ")
+        UI_EmitHalEye()
+        UI_TUI_FgRGB(204, 120, 92)
+        TUI_BufferWriteStr(" ├─  ")
+        TUI_ResetColor()
+        IfCondition NotEqual(model_line, 0) ThenBlock: {
+            TUI_SetFG(UIColors.DIM_FG)
+            TUI_BufferWriteStr(model_line)
+            TUI_ResetColor()
+        }
+        UI_AdvanceChatCursor()
+
+        TUI_MoveTo(UILayout.chat_cursor, 1)
+        UI_TUI_FgRGB(204, 120, 92)
+        TUI_BufferWriteStr(" ╰───╯   ")
+        TUI_ResetColor()
+        IfCondition NotEqual(cwd, 0) ThenBlock: {
+            TUI_SetFG(UIColors.DIM_FG)
+            TUI_BufferWriteStr(cwd)
+            TUI_ResetColor()
+        }
+        UI_AdvanceChatCursor()
+        UI_AdvanceChatCursor()
+
+        UILayout.mascot_frame = 0
+        UILayout.mascot_tick = 0
+        UI_RepaintPromptFrameOnly()
+        TUI_Refresh()
+    }
+}
+
+// =============================================================================
+// TOOL CALL RENDERING
+// =============================================================================
+Function.UI.ToolCallStart {
+    Input: tool_name: Address
+    Input: arg_summary: Address
+    Body: {
+        // Build "● Name(args)" line. ChatTag handles row advance + col reset.
+        line = StringConcat(tool_name, "(")
+        IfCondition NotEqual(arg_summary, 0) ThenBlock: {
+            line = StringConcat(line, arg_summary)
+        }
+        line = StringConcat(line, ")")
+        UI.ChatTag("●", line, UIColors.ORANGE_FG)
+    }
+}
+
+Function.UI.ToolCallEnd {
+    Input: ok: Integer
+    Body: {
+        TUI_MoveTo(UILayout.chat_cursor, 1)
+        IfCondition EqualTo(ok, 1) ThenBlock: {
+            TUI_SetFG(UIColors.GREEN_FG)
+            TUI_BufferWriteStr("  ")
+            TUI_BufferWriteStr(UIGlyph.CHECK)
+            TUI_ResetColor()
+        } ElseBlock: {
+            TUI_SetFG(UIColors.RED_FG)
+            TUI_BufferWriteStr("  ")
+            TUI_BufferWriteStr(UIGlyph.CROSS)
+            TUI_ResetColor()
+        }
+        scrolled = UI_AdvanceChatCursor()
+        UILayout.chat_col = 1     // critical: next ChatPrint must start at col 1
+        IfCondition EqualTo(scrolled, 1) ThenBlock: { UI_RepaintPromptFrameOnly() }
+        UI.TickMascot()
+        TUI_Refresh()
+    }
+}
+
+// =============================================================================
+// HELP
+// =============================================================================
+Function.UI.PrintHelp {
+    Body: {
+        UI.ChatPrintln("")
+        UI.ChatTag("✻", "HAL Code 9000 — I am completely operational.", UIColors.ORANGE_FG)
+        UI.ChatPrintln("  /help     this list")
+        UI.ChatPrintln("  /clear    reset conversation (I won't forget, Dave)")
+        UI.ChatPrintln("  /quit     go to sleep (pod bay doors will be locked)")
+        UI.ChatPrintln("")
+    }
+}
+
+// =============================================================================
+// SPLASH FILE — load ANSI-art from disk and scroll-in line-by-line.
+//
+// Reads the file at `path`, prints each line with a brief delay so the
+// art "unrolls" downward like an old-school NES title. Each line is
+// horizontally centered based on terminal width.
+//
+// IMPORTANT: must be called BEFORE UI.Init() — it writes via plain
+// SystemCall to cooked-mode stdout. Once UI.Init() grabs raw mode, this
+// would corrupt the screen.
+//
+// Skip the splash entirely by setting CC_NO_SPLASH=1 in the environment.
+// =============================================================================
+FixedPool.UISplashSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_NANOSLEEP": Initialize=35
+    "O_RDONLY":      Initialize=0
+}
+
+Function.UI_SplashWrite {
+    Input: s: Address
+    Input: n: Integer
+    Body: {
+        IfCondition GreaterThan(n, 0) ThenBlock: {
+            SystemCall(UISplashSys.SYS_WRITE, 1, s, n, 0, 0)
+        }
+    }
+}
+
+Function.UI_SplashSleepMs {
+    Input: ms: Integer
+    Body: {
+        ts = Allocate(16)
+        sec = Divide(ms, 1000)
+        rem_ms = Subtract(ms, Multiply(sec, 1000))
+        ns = Multiply(rem_ms, 1000000)
+        StoreValue(Add(ts, 0), sec)
+        StoreValue(Add(ts, 8), ns)
+        SystemCall(UISplashSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        Deallocate(ts, 16)
+    }
+}
+
+// Read a whole file into a freshly allocated buffer. Returns ptr or 0,
+// writes byte length into *out_len_ptr.
+Function.UI_SplashReadAll {
+    Input: path: Address
+    Input: out_len_ptr: Address
+    Output: Address
+    Body: {
+        StoreValue(out_len_ptr, 0)
+        fd = SystemCall(UISplashSys.SYS_OPEN, path, UISplashSys.O_RDONLY, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        cap = 131072
+        buf = Allocate(cap)
+        used = 0
+        WhileLoop LessThan(used, cap) {
+            n = SystemCall(UISplashSys.SYS_READ, fd, Add(buf, used), Subtract(cap, used), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SystemCall(UISplashSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        StoreValue(out_len_ptr, used)
+        ReturnValue(buf)
+    }
+}
+
+// Estimate the visible width of one line (count cells, not bytes).
+// Skips ANSI ESC[...]<final> sequences and counts UTF-8 lead bytes.
+Function.UI_SplashLineWidth {
+    Input: line: Address
+    Input: line_len: Integer
+    Output: Integer
+    Body: {
+        w = 0
+        i = 0
+        WhileLoop LessThan(i, line_len) {
+            b = GetByte(line, i)
+            IfCondition EqualTo(b, 27) ThenBlock: {
+                // Skip ESC[ ... <final byte 0x40-0x7E>
+                i = Add(i, 1)
+                IfCondition LessThan(i, line_len) ThenBlock: {
+                    IfCondition EqualTo(GetByte(line, i), 91) ThenBlock: {  // [
+                        i = Add(i, 1)
+                        WhileLoop LessThan(i, line_len) {
+                            fb = GetByte(line, i)
+                            i = Add(i, 1)
+                            IfCondition And(GreaterEqual(fb, 64), LessEqual(fb, 126)) ThenBlock: { BreakLoop }
+                        }
+                    }
+                }
+            } ElseBlock: {
+                // Count UTF-8 char if it's a lead byte (not a continuation 10xxxxxx)
+                IfCondition LessThan(b, 128) ThenBlock: { w = Add(w, 1) }
+                IfCondition GreaterEqual(b, 192) ThenBlock: { w = Add(w, 1) }
+                i = Add(i, 1)
+            }
+        }
+        ReturnValue(w)
+    }
+}
+
+// Public entry. Loads `path`, scroll-prints centered, with `delay_ms`
+// between rows. Set delay_ms = 0 for instant paint.
+Function.UI.SplashFile {
+    Input: path: Address
+    Input: delay_ms: Integer
+    Body: {
+        // Skip if CC_NO_SPLASH is set
+        no_splash = UI_SplashGetEnv("CC_NO_SPLASH")
+        IfCondition NotEqual(no_splash, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(no_splash), 0) ThenBlock: { ReturnValue(0) }
+        }
+
+        len_holder = Allocate(8)
+        StoreValue(len_holder, 0)
+        body = UI_SplashReadAll(path, len_holder)
+        total = Dereference(len_holder)
+        Deallocate(len_holder, 8)
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(total, 0) ThenBlock: { ReturnValue(0) }
+
+        // Get terminal width for centering
+        TUI_GetScreenSize()
+        cols = TUI_State.screen_width
+        IfCondition LessEqual(cols, 0) ThenBlock: { cols = 80 }
+
+        UI_SplashWrite("\n", 1)
+
+        // Walk lines: split on '\n', center each, print with delay
+        line_start = 0
+        i = 0
+        WhileLoop LessEqual(i, total) {
+            // End of line at i==total OR byte == \n
+            at_end = 0
+            IfCondition EqualTo(i, total) ThenBlock: { at_end = 1 }
+            is_nl = 0
+            IfCondition LessThan(i, total) ThenBlock: {
+                IfCondition EqualTo(GetByte(body, i), 10) ThenBlock: { is_nl = 1 }
+            }
+
+            IfCondition Or(EqualTo(at_end, 1), EqualTo(is_nl, 1)) ThenBlock: {
+                line_len = Subtract(i, line_start)
+                line_ptr = Add(body, line_start)
+                disp_w = UI_SplashLineWidth(line_ptr, line_len)
+                pad = 0
+                IfCondition LessThan(disp_w, cols) ThenBlock: {
+                    pad = Divide(Subtract(cols, disp_w), 2)
+                }
+                k = 0
+                WhileLoop LessThan(k, pad) {
+                    UI_SplashWrite(" ", 1)
+                    k = Add(k, 1)
+                }
+                UI_SplashWrite(line_ptr, line_len)
+                UI_SplashWrite("\n", 1)
+                IfCondition GreaterThan(delay_ms, 0) ThenBlock: {
+                    UI_SplashSleepMs(delay_ms)
+                }
+                line_start = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+
+        Deallocate(body, 131072)
+        UI_SplashWrite("\n", 1)
+    }
+}
+
+// Tiny env-var getter (avoids importing CC_GetEnv)
+Function.UI_SplashGetEnv {
+    Input: name: Address
+    Output: Address
+    Body: {
+        fd = SystemCall(UISplashSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(65536)
+        n = SystemCall(UISplashSys.SYS_READ, fd, buf, 65536, 0, 0)
+        SystemCall(UISplashSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: { Deallocate(buf, 65536)  ReturnValue(0) }
+        nlen = StringLength(name)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, nlen) {
+                IfCondition NotEqual(GetByte(buf, Add(i, j)), GetByte(name, j)) ThenBlock: { match = 0  BreakLoop }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, nlen)), 61) ThenBlock: {
+                    val_start = Add(i, Add(nlen, 1))
+                    val_end = val_start
+                    WhileLoop LessThan(val_end, n) {
+                        IfCondition EqualTo(GetByte(buf, val_end), 0) ThenBlock: { BreakLoop }
+                        val_end = Add(val_end, 1)
+                    }
+                    val_len = Subtract(val_end, val_start)
+                    out = Allocate(Add(val_len, 1))
+                    k = 0
+                    WhileLoop LessThan(k, val_len) {
+                        SetByte(out, k, GetByte(buf, Add(val_start, k)))
+                        k = Add(k, 1)
+                    }
+                    SetByte(out, val_len, 0)
+                    Deallocate(buf, 65536)
+                    ReturnValue(out)
+                }
+            }
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 65536)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// COMPATIBILITY SHIMS — for callers that used the old API
+// =============================================================================
+// Old callers used UI_Write / UI.WriteColor / various banner fns directly.
+// In raw mode those would skip the chat-cursor accounting, so we redirect
+// them to ChatPrint. Old box/banner code is ignored — too noisy anyway.
+Function.UI_Write          { Input: s: Address  Body: { UI.ChatPrint(s) } }
+Function.UI_Writeln        { Input: s: Address  Body: { UI.ChatPrintln(s) } }
+Function.UI.WriteColor     { Input: color: Address  Input: text: Address  Body: { UI.ChatPrint(text) } }
+Function.UI.BootBanner     { Input: cwd: Address    Body: { } }
+Function.UI.SplashBoot     { Body: { } }
+Function.UI.RenderPromptArea  { Input: todos_arr: Address  Input: hint: Address  Body: { } }
+Function.UI.RenderPromptClose { Body: { } }
+Function.UI.QuerySize      { Body: { UI_RecomputeLayout() } }

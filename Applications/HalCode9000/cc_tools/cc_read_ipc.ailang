@@ -1,0 +1,348 @@
+// cc_read_ipc.ailang — Claude Code Read tool, IPC service.
+//
+// Reads a file from disk and returns its contents. Forks the existing
+// cat_util semantics down to a single primitive (no -n, -E, -A flags —
+// the model doesn't need them; if it wants them it can call Bash).
+//
+// Speaks the standard cc_tools envelope:
+//
+//   Request:  {"method":"call",   "id":"<tool_use_id>", "args":{"path":"/etc/hostname"}}
+//   Request:  {"method":"schema"}
+//
+//   Response: {"method":"result", "id":"<tool_use_id>", "ok":true,
+//              "content":"...","truncated":false}
+//   Response: {"method":"schema_response", "schema": {...}}
+//   Error:    {"method":"result", "id":"<tool_use_id>", "ok":false,
+//              "error":"ENOENT: /missing"}
+//
+// Wire framing: 4-byte BE length prefix + JSON body, matching the rest of
+// the AILang IPC ecosystem (Library.Socket SendMsg/RecvMsg).
+//
+// Build: ./ailang.x Applications/ClaudeCode/cc_tools/cc_read_ipc.ailang cc_read_ipc.x
+// Run:   ./cc_read_ipc.x   (binds /tmp/ailang_cctools/Read.sock)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.UtilArgs
+
+FixedPool.CCReadSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_LSEEK":     Initialize=8
+    "SYS_MKDIR":     Initialize=83
+    "SYS_UNLINK":    Initialize=87
+    "SYS_FSTAT":     Initialize=5
+}
+
+FixedPool.CCReadConst {
+    "SOCK_PATH":     Initialize=0, CanChange=True
+    "SOCK_DIR":      Initialize=0, CanChange=True
+    "MAX_OUTPUT":    Initialize=50000   // 60KB headroom under Socket 64KB ceiling
+    "BACKLOG":       Initialize=8
+}
+
+FixedPool.CCReadState {
+    "schema":        Initialize=0, CanChange=True
+    "listen_fd":     Initialize=-1, CanChange=True
+    "running":       Initialize=1, CanChange=True
+}
+
+// =============================================================================
+// SCHEMA
+// =============================================================================
+Function.CCRead_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("Read", "Read a file from disk and return its contents")
+        UtilArgs_AddField(s, "path", "path", 1, "Absolute path to the file to read", "path")
+        UtilArgs_AddField(s, "offset", "int", 0, "Byte offset to start reading from", "offset")
+        UtilArgs_SetDefault(s, "offset", "0")
+        UtilArgs_AddField(s, "limit", "int", 0, "Max bytes to read (0 = all up to MAX_OUTPUT)", "limit")
+        UtilArgs_SetDefault(s, "limit", "0")
+        ReturnValue(s)
+    }
+}
+
+// =============================================================================
+// CORE READ — given validated args, return result string (caller frees)
+// Sets out_truncated_ptr to 1 if response was truncated.
+// On error, returns 0 and writes errno-ish reason to err_buf (256 bytes).
+// =============================================================================
+Function.CCRead_DoRead {
+    Input: args: Address
+    Input: out_truncated_ptr: Address
+    Input: err_buf: Address
+    Output: Address
+    Body: {
+        path = UtilArgs_GetString(args, "path")
+        offset = UtilArgs_GetInt(args, "offset")
+        limit = UtilArgs_GetInt(args, "limit")
+        StoreValue(out_truncated_ptr, 0, "dword")
+
+        IfCondition EqualTo(path, 0) ThenBlock: {
+            SetByte(err_buf, 0, 0)
+            err_msg = "missing path"
+            i = 0
+            WhileLoop LessThan(i, StringLength(err_msg)) {
+                SetByte(err_buf, i, GetByte(err_msg, i))
+                i = Add(i, 1)
+            }
+            SetByte(err_buf, StringLength(err_msg), 0)
+            ReturnValue(0)
+        }
+
+        fd = SystemCall(CCReadSys.SYS_OPEN, path, 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            prefix = "open failed: "
+            i = 0
+            WhileLoop LessThan(i, StringLength(prefix)) {
+                SetByte(err_buf, i, GetByte(prefix, i))
+                i = Add(i, 1)
+            }
+            j = 0
+            WhileLoop LessThan(j, StringLength(path)) {
+                SetByte(err_buf, Add(i, j), GetByte(path, j))
+                j = Add(j, 1)
+            }
+            SetByte(err_buf, Add(i, j), 0)
+            ReturnValue(0)
+        }
+
+        IfCondition GreaterThan(offset, 0) ThenBlock: {
+            SystemCall(CCReadSys.SYS_LSEEK, fd, offset, 0, 0, 0)
+        }
+
+        want = CCReadConst.MAX_OUTPUT
+        IfCondition GreaterThan(limit, 0) ThenBlock: {
+            IfCondition LessThan(limit, want) ThenBlock: { want = limit }
+        }
+
+        // Allocate want+1 for null terminator
+        buf = Allocate(Add(want, 1))
+        total = 0
+        WhileLoop LessThan(total, want) {
+            n = SystemCall(CCReadSys.SYS_READ, fd, Add(buf, total), Subtract(want, total), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            total = Add(total, n)
+        }
+        SetByte(buf, total, 0)
+
+        // Try one more byte to see if there's more — if so, mark truncated.
+        IfCondition EqualTo(limit, 0) ThenBlock: {
+            // Check if we hit MAX_OUTPUT exactly — then there might be more
+            IfCondition GreaterEqual(total, CCReadConst.MAX_OUTPUT) ThenBlock: {
+                probe = Allocate(1)
+                pn = SystemCall(CCReadSys.SYS_READ, fd, probe, 1, 0, 0)
+                Deallocate(probe, 1)
+                IfCondition GreaterThan(pn, 0) ThenBlock: {
+                    StoreValue(out_truncated_ptr, 1, "dword")
+                }
+            }
+        } ElseBlock: {
+            // limit was specified — truncated only if we read >= limit and there's more
+            IfCondition GreaterEqual(total, limit) ThenBlock: {
+                probe = Allocate(1)
+                pn = SystemCall(CCReadSys.SYS_READ, fd, probe, 1, 0, 0)
+                Deallocate(probe, 1)
+                IfCondition GreaterThan(pn, 0) ThenBlock: {
+                    StoreValue(out_truncated_ptr, 1, "dword")
+                }
+            }
+        }
+
+        SystemCall(CCReadSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// REQUEST DISPATCH
+// =============================================================================
+Function.CCRead_SendError {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: error_msg: Address
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 0)
+        JSON.SetString(resp, "error", error_msg)
+        out = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, out)
+    }
+}
+
+Function.CCRead_SendResult {
+    Input: client_fd: Integer
+    Input: id: Address
+    Input: content: Address
+    Input: truncated: Integer
+    Body: {
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "result")
+        IfCondition NotEqual(id, 0) ThenBlock: { JSON.SetString(resp, "id", id) }
+        JSON.SetBool(resp, "ok", 1)
+        IfCondition NotEqual(content, 0) ThenBlock: { JSON.SetString(resp, "content", content) }
+        IfCondition EqualTo(truncated, 1) ThenBlock: { JSON.SetBool(resp, "truncated", 1) }
+        out = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, out)
+    }
+}
+
+Function.CCRead_SendSchema {
+    Input: client_fd: Integer
+    Body: {
+        // Build {"method":"schema_response","schema":<tool_schema_json_obj>}
+        // ExportToolSchema returns a serialized string; we re-parse so we can
+        // nest as an object inside the response (cleaner than string-in-string).
+        schema_str = UtilArgs_ExportToolSchema(CCReadState.schema)
+        parsed = ParseJSON(schema_str)
+        schema_obj = JSON.AsObject(parsed)
+        resp = JSON.NewObject()
+        JSON.SetString(resp, "method", "schema_response")
+        IfCondition NotEqual(schema_obj, 0) ThenBlock: {
+            JSON.SetObject(resp, "schema", schema_obj)
+        }
+        out = JSON.SerializeObject(resp)
+        Socket.SendMsg(client_fd, out)
+    }
+}
+
+Function.CCRead_HandleRequest {
+    Input: client_fd: Integer
+    Input: req_str: Address
+    Body: {
+        parsed = ParseJSON(req_str)
+        IfCondition EqualTo(parsed, 0) ThenBlock: {
+            CCRead_SendError(client_fd, 0, "invalid JSON")
+            ReturnValue(0)
+        }
+        obj = JSON.AsObject(parsed)
+        IfCondition EqualTo(obj, 0) ThenBlock: {
+            CCRead_SendError(client_fd, 0, "request must be a JSON object")
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+
+        method = JSON.GetString(obj, "method")
+        IfCondition EqualTo(method, 0) ThenBlock: {
+            CCRead_SendError(client_fd, 0, "missing method")
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+
+        IfCondition EqualTo(StringCompare(method, "schema"), 0) ThenBlock: {
+            CCRead_SendSchema(client_fd)
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+
+        IfCondition EqualTo(StringCompare(method, "call"), 0) ThenBlock: {
+            id = JSON.GetString(obj, "id")
+            args = JSON.GetObject(obj, "args")
+            validated = UtilArgs_ParseIPC(CCReadState.schema, args)
+            IfCondition EqualTo(validated, 0) ThenBlock: {
+                CCRead_SendError(client_fd, id, "missing required argument 'path'")
+                JSON.Free(parsed)
+                ReturnValue(0)
+            }
+            err_buf = Allocate(256)
+            SetByte(err_buf, 0, 0)
+            trunc_holder = Allocate(8)
+            StoreValue(trunc_holder, 0, "dword")
+            content = CCRead_DoRead(validated, trunc_holder, err_buf)
+            truncated = Dereference(trunc_holder, "dword")
+            Deallocate(trunc_holder, 8)
+            IfCondition EqualTo(content, 0) ThenBlock: {
+                CCRead_SendError(client_fd, id, err_buf)
+            } ElseBlock: {
+                // If truncated, append a marker line to content
+                IfCondition EqualTo(truncated, 1) ThenBlock: {
+                    marker = "\n[truncated: more bytes available]"
+                    final = StringConcat(content, marker)
+                    CCRead_SendResult(client_fd, id, final, 1)
+                } ElseBlock: {
+                    CCRead_SendResult(client_fd, id, content, 0)
+                }
+            }
+            Deallocate(err_buf, 256)
+            JSON.Free(parsed)
+            ReturnValue(0)
+        }
+
+        CCRead_SendError(client_fd, 0, "unknown method")
+        JSON.Free(parsed)
+    }
+}
+
+// =============================================================================
+// MAIN — set up socket, accept loop
+// =============================================================================
+SubRoutine.Main {
+    CCReadConst.SOCK_DIR  = "/tmp/ailang_cctools"
+    CCReadConst.SOCK_PATH = "@halcode/Read"
+    CCReadState.schema = CCRead_BuildSchema()
+
+    // mkdir (ignore EEXIST = -17)
+    SystemCall(CCReadSys.SYS_MKDIR, CCReadConst.SOCK_DIR, 493, 0, 0, 0)
+    // unlink stale socket
+    SystemCall(CCReadSys.SYS_UNLINK, CCReadConst.SOCK_PATH, 0, 0, 0, 0)
+
+    fd = Socket.Create(1, 1)
+    IfCondition LessThan(fd, 0) ThenBlock: {
+        PrintMessage("[cc_read_ipc] socket create failed\n")
+        Exit(1)
+    }
+    br = Socket.BindUnix(fd, CCReadConst.SOCK_PATH)
+    IfCondition LessThan(br, 0) ThenBlock: {
+        PrintMessage("[cc_read_ipc] bind failed\n")
+        Socket.Close(fd)
+        Exit(1)
+    }
+    lr = Socket.Listen(fd, CCReadConst.BACKLOG)
+    IfCondition LessThan(lr, 0) ThenBlock: {
+        PrintMessage("[cc_read_ipc] listen failed\n")
+        Socket.Close(fd)
+        Exit(1)
+    }
+    CCReadState.listen_fd = fd
+
+    PrintMessage("[cc_read_ipc] listening on ")
+    PrintMessage(CCReadConst.SOCK_PATH)
+    PrintMessage("\n")
+
+    WhileLoop EqualTo(CCReadState.running, 1) {
+        client_fd = Socket.Accept(CCReadState.listen_fd)
+        IfCondition LessThan(client_fd, 0) ThenBlock: {
+            // accept failed; loop and try again
+        } ElseBlock: {
+            // Per-connection request loop: keep handling messages until disconnect
+            done = 0
+            WhileLoop EqualTo(done, 0) {
+                req = Socket.RecvMsg(client_fd)
+                IfCondition EqualTo(req, 0) ThenBlock: { done = 1 }
+                IfCondition EqualTo(req, -1) ThenBlock: {
+                    // bad message, continue with this client
+                }
+                IfCondition NotEqual(req, 0) ThenBlock: {
+                    IfCondition NotEqual(req, -1) ThenBlock: {
+                        CCRead_HandleRequest(client_fd, req)
+                    }
+                }
+            }
+            Socket.Close(client_fd)
+        }
+    }
+
+    Socket.Close(CCReadState.listen_fd)
+    Exit(0)
+}
+
+RunTask(Main)

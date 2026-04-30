@@ -1,0 +1,662 @@
+// HalCode9000.ailang — native AILang Claude Code, Phase 1 entry point.
+//
+// A terminal chat client against the Anthropic Messages API. Streams text
+// deltas to stdout in real time, dispatches tool calls to cc_tools/* IPC
+// services, and loops until the model stops asking for tools.
+//
+// No JS, no Bun, no Node, no MCP, no hooks. ~150 lines of glue plus
+// generic libraries (HTTP, SSE, JSON, Socket, UtilArgs) and Anthropic-
+// specific helpers (.History, .Anthropic, .IPCDispatch).
+//
+// Build: ./ailang.x Applications/HalCode9000/HalCode9000.ailang HalCode9000.x
+// Run:   ANTHROPIC_API_KEY=sk-... ./HalCode9000.x
+//
+// Prerequisites at runtime:
+//   - cc_read_ipc.x (and other cc_*_ipc.x services) running
+//   - curl on PATH
+//   - ANTHROPIC_API_KEY env var set
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.JSON
+LibraryImport.StringUtils
+LibraryImport.HTTP
+LibraryImport.SSE
+LibraryImport.OAuth
+LibraryImport.ANSICanvas
+Import.Applications.HalCode9000.History
+Import.Applications.HalCode9000.IPCDispatch
+Import.Applications.HalCode9000.backends.Anthropic
+Import.Applications.HalCode9000.Auth
+Import.Applications.HalCode9000.UI
+
+FixedPool.CCSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_DUP2":      Initialize=33
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_KILL":      Initialize=62
+    "SIGTERM":       Initialize=15
+}
+
+FixedPool.CCConst {
+    "MODEL":         Initialize=0, CanChange=True
+    "SYSTEM_PROMPT": Initialize=0, CanChange=True
+    "INPUT_BUF_SZ":  Initialize=8192
+    "LINE_BUF_SZ":   Initialize=16384
+    "SSE_STATE_SZ":  Initialize=88
+    "MAX_CHILDREN":  Initialize=16
+    "BIND_WAIT_NS":  Initialize=2000000000   // 2s — relmem loads ~12k symbols at startup, needs more time
+}
+
+FixedPool.CCRunState {
+    "running":       Initialize=1, CanChange=True
+    "child_pids":    Initialize=0, CanChange=True
+    "child_count":   Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// I/O HELPERS
+// =============================================================================
+Function.CC_WriteStdout {
+    Input: s: Address
+    Body: {
+        len = StringLength(s)
+        IfCondition GreaterThan(len, 0) ThenBlock: {
+            SystemCall(CCSys.SYS_WRITE, 1, s, len, 0, 0)
+        }
+    }
+}
+
+// Blocking read of one line from stdin into buf. Returns length read
+// (excluding the trailing newline). Reads byte-at-a-time so we don't
+// over-consume into next prompt. Returns -1 on EOF.
+Function.CC_ReadStdinLine {
+    Input: buf: Address
+    Input: maxlen: Integer
+    Output: Integer
+    Body: {
+        used = 0
+        WhileLoop LessThan(used, Subtract(maxlen, 1)) {
+            n = SystemCall(CCSys.SYS_READ, 0, Add(buf, used), 1, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                IfCondition EqualTo(used, 0) ThenBlock: { ReturnValue(-1) }
+                BreakLoop
+            }
+            ch = GetByte(buf, used)
+            IfCondition EqualTo(ch, 10) ThenBlock: { BreakLoop }
+            used = Add(used, 1)
+        }
+        SetByte(buf, used, 0)
+        ReturnValue(used)
+    }
+}
+
+// Read $VAR from /proc/self/environ. Returns 0 if not set.
+Function.CC_GetEnv {
+    Input: var_name: Address
+    Output: Address
+    Body: {
+        fd = SystemCall(CCSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(65536)
+        n = SystemCall(CCSys.SYS_READ, fd, buf, 65536, 0, 0)
+        SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            Deallocate(buf, 65536)
+            ReturnValue(0)
+        }
+        var_len = StringLength(var_name)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            match = 1
+            j = 0
+            WhileLoop LessThan(j, var_len) {
+                IfCondition NotEqual(GetByte(buf, Add(i, j)), GetByte(var_name, j)) ThenBlock: {
+                    match = 0
+                    BreakLoop
+                }
+                j = Add(j, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                IfCondition EqualTo(GetByte(buf, Add(i, var_len)), 61) ThenBlock: {
+                    val_start = Add(i, Add(var_len, 1))
+                    val_end = val_start
+                    WhileLoop LessThan(val_end, n) {
+                        IfCondition EqualTo(GetByte(buf, val_end), 0) ThenBlock: { BreakLoop }
+                        val_end = Add(val_end, 1)
+                    }
+                    val_len = Subtract(val_end, val_start)
+                    out = Allocate(Add(val_len, 1))
+                    k = 0
+                    WhileLoop LessThan(k, val_len) {
+                        SetByte(out, k, GetByte(buf, Add(val_start, k)))
+                        k = Add(k, 1)
+                    }
+                    SetByte(out, val_len, 0)
+                    Deallocate(buf, 65536)
+                    ReturnValue(out)
+                }
+            }
+            WhileLoop LessThan(i, n) {
+                IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(buf, 65536)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PATH HELPERS — expand "~/..." to "$HOME/..."
+// =============================================================================
+Function.CC_ExpandHome {
+    Input: path: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        // If first char is not '~', return path unchanged
+        IfCondition NotEqual(GetByte(path, 0), 126) ThenBlock: { ReturnValue(path) }
+        home = CC_GetEnv("HOME")
+        IfCondition EqualTo(home, 0) ThenBlock: { ReturnValue(path) }
+        // ~/foo  ->  $HOME/foo
+        rest = Add(path, 1)   // skip '~'
+        ReturnValue(StringConcat(home, rest))
+    }
+}
+
+Function.CC_MkdirP {
+    Input: path: Address
+    Body: {
+        // Best-effort mkdir; ignore EEXIST
+        SystemCall(83, path, 448, 0, 0, 0)   // 0700
+    }
+}
+
+// =============================================================================
+// AUTH MODE PROMPT — 1=subscription OAuth, 2=API key
+// =============================================================================
+// Returns 1 or 2. Reads a single-line answer; first char wins.
+Function.CC_PromptAuthMode {
+    Output: Integer
+    Body: {
+        CC_WriteStdout("\n")
+        CC_WriteStdout("HAL Code 9000 — Good evening.\n\n")
+        CC_WriteStdout("Choose authentication:\n")
+        CC_WriteStdout("  1) Subscription (claude.ai OAuth — Pro/Max/Team)\n")
+        CC_WriteStdout("  2) Console API key (sk-ant-... from console.anthropic.com)\n")
+        CC_WriteStdout("> ")
+        buf = Allocate(64)
+        n = CC_ReadStdinLine(buf, 64)
+        choice = 2
+        IfCondition GreaterThan(n, 0) ThenBlock: {
+            first = GetByte(buf, 0)
+            IfCondition EqualTo(first, 49) ThenBlock: { choice = 1 }    // '1' = 49
+            IfCondition EqualTo(first, 50) ThenBlock: { choice = 2 }    // '2' = 50
+        }
+        Deallocate(buf, 64)
+        ReturnValue(choice)
+    }
+}
+
+// =============================================================================
+// CHILD PROCESS MANAGEMENT
+// =============================================================================
+// Fork+exec a tool service binary. Redirects child stdout+stderr to
+// /dev/null so the chat output stays clean. Stores PID for cleanup.
+// Returns child PID, or -1 on failure.
+// Read /proc/self/environ and build a NULL-terminated envp array of
+// pointers into a heap buffer. AILang runtime crashes on minimal env
+// (just PATH+HOME etc isn't enough), so the right thing is to inherit
+// whatever env ClaudeCode itself was launched with.
+Function.CC_BuildInheritedEnvp {
+    Output: Address
+    Body: {
+        fd = SystemCall(CCSys.SYS_OPEN, "/proc/self/environ", 0, 0, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        buf = Allocate(16384)
+        n = SystemCall(0, fd, buf, 16384, 0, 0)         // SYS_READ = 0
+        SystemCall(CCSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+
+        // Walk the NUL-separated entries, build a pointer array.
+        envp = Allocate(4096)                            // up to 512 entries
+        idx = 0
+        StoreValue(Add(envp, 0), buf)                    // first entry = buf
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(GetByte(buf, i), 0) ThenBlock: {
+                next_pos = Add(i, 1)
+                IfCondition LessThan(next_pos, n) ThenBlock: {
+                    idx = Add(idx, 1)
+                    StoreValue(Add(envp, Multiply(idx, 8)), Add(buf, next_pos))
+                }
+            }
+            i = Add(i, 1)
+        }
+        // NULL-terminate the envp array
+        StoreValue(Add(envp, Multiply(Add(idx, 1), 8)), 0)
+        ReturnValue(envp)
+    }
+}
+
+// Quick file logger for CC_LaunchTool diagnostics — same file as IPCDispatch.
+Function.CC_LaunchLog {
+    Input: msg: Address
+    Body: {
+        fd = SystemCall(2, "/tmp/cc-ipcd.log", 1089, 420, 0, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            SystemCall(1, fd, msg, StringLength(msg), 0, 0)
+            SystemCall(3, fd, 0, 0, 0, 0)
+        }
+    }
+}
+
+Function.CC_LaunchTool {
+    Input: binary_path: Address
+    Output: Integer
+    Body: {
+        CC_LaunchLog("[launch] BEGIN ")
+        CC_LaunchLog(binary_path)
+        CC_LaunchLog("\n")
+        // Build envp BEFORE fork so the child inherits the buffer (COW).
+        envp = CC_BuildInheritedEnvp()
+        IfCondition EqualTo(envp, 0) ThenBlock: {
+            CC_LaunchLog("[launch] FAIL build_envp\n")
+        }
+        pid = SystemCall(CCSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            CC_LaunchLog("[launch] FAIL fork ")
+            CC_LaunchLog(binary_path)
+            CC_LaunchLog("\n")
+            ReturnValue(-1)
+        }
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child — log BEFORE dup2 so logger still has stderr if needed.
+            CC_LaunchLog("[launch] CHILD pre_exec ")
+            CC_LaunchLog(binary_path)
+            CC_LaunchLog("\n")
+            // Silence stdout/stderr, exec
+            devnull = SystemCall(CCSys.SYS_OPEN, "/dev/null", 1, 0, 0, 0)
+            IfCondition GreaterEqual(devnull, 0) ThenBlock: {
+                SystemCall(CCSys.SYS_DUP2, devnull, 1, 0, 0, 0)
+                SystemCall(CCSys.SYS_DUP2, devnull, 2, 0, 0, 0)
+                SystemCall(CCSys.SYS_CLOSE, devnull, 0, 0, 0, 0)
+            }
+            argv = Allocate(16)
+            StoreValue(Add(argv, 0), binary_path)
+            StoreValue(Add(argv, 8), 0)
+            ret = SystemCall(CCSys.SYS_EXECVE, binary_path, argv, envp)
+            // execve returned -> failed
+            CC_LaunchLog("[launch] CHILD EXECVE_FAILED ret=")
+            CC_LaunchLog(NumberToString(ret))
+            CC_LaunchLog(" for ")
+            CC_LaunchLog(binary_path)
+            CC_LaunchLog("\n")
+            SystemCall(CCSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+        // Parent — record PID
+        IfCondition LessThan(CCRunState.child_count, CCConst.MAX_CHILDREN) ThenBlock: {
+            slot = Multiply(CCRunState.child_count, 8)
+            StoreValue(Add(CCRunState.child_pids, slot), pid)
+            CCRunState.child_count = Add(CCRunState.child_count, 1)
+        }
+        ReturnValue(pid)
+    }
+}
+
+// SIGTERM every child we spawned. Best-effort; if a service is already
+// gone, kill returns -ESRCH and we ignore it.
+Function.CC_KillAllChildren {
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, CCRunState.child_count) {
+            slot = Multiply(i, 8)
+            pid = Dereference(Add(CCRunState.child_pids, slot))
+            IfCondition GreaterThan(pid, 0) ThenBlock: {
+                SystemCall(CCSys.SYS_KILL, pid, CCSys.SIGTERM, 0, 0, 0)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// Brief sleep (nanosleep) so services have time to bind their sockets
+// before we try to connect. Sleeps for CCConst.BIND_WAIT_NS nanoseconds.
+Function.CC_SleepShort {
+    Body: {
+        ts = Allocate(16)
+        StoreValue(Add(ts, 0), 0)                       // tv_sec
+        StoreValue(Add(ts, 8), CCConst.BIND_WAIT_NS)    // tv_nsec
+        SystemCall(CCSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        Deallocate(ts, 16)
+    }
+}
+
+// =============================================================================
+// AGENT TURN — one user-message-to-final-response cycle.
+// Runs the request->stream->maybe-dispatch-tools loop until the model
+// stops calling tools.
+// =============================================================================
+Function.CC_RunTurn {
+    Body: {
+        keep_going = 1
+        WhileLoop EqualTo(keep_going, 1) {
+            keep_going = 0
+
+            messages = History.GetMessagesArray()
+            tools = IPCDispatch.GetToolSchemasArray()
+            body = Anthropic.BuildRequest(messages, tools)
+            headers = Anthropic.BuildHeaders()
+            url = Anthropic.GetURL()
+
+            UI.SetState(1)
+            handle = HTTP.PostStream(url, headers, body)
+            IfCondition EqualTo(handle, 0) ThenBlock: {
+                UI.SetState(0)
+                CC_WriteStdout("[error] HTTP request failed (curl spawn)\n")
+                Anthropic.Reset()
+                ReturnValue(0)
+            }
+
+            sse_state = Allocate(CCConst.SSE_STATE_SZ)
+            SSE.Init(sse_state, CCConst.SSE_STATE_SZ)
+            line_buf = Allocate(CCConst.LINE_BUF_SZ)
+
+            stream_done = 0
+            WhileLoop EqualTo(stream_done, 0) {
+                line_len = HTTP.ReadLine(handle, line_buf, CCConst.LINE_BUF_SZ)
+                IfCondition LessThan(line_len, 0) ThenBlock: {
+                    stream_done = 1
+                } ElseBlock: {
+                    ready = SSE.FeedLine(sse_state, line_buf, line_len)
+                    IfCondition EqualTo(ready, 1) ThenBlock: {
+                        evt_type = SSE.GetEventType(sse_state)
+                        evt_data = SSE.GetEventData(sse_state)
+                        signal = Anthropic.OnEvent(evt_type, evt_data)
+                        SSE.Reset(sse_state)
+                        IfCondition NotEqual(signal, 0) ThenBlock: {
+                            stream_done = 1
+                        }
+                    }
+                }
+            }
+
+            HTTP.CloseStream(handle)
+            Deallocate(line_buf, CCConst.LINE_BUF_SZ)
+            Deallocate(sse_state, CCConst.SSE_STATE_SZ)
+
+            UI.SetState(2)
+            UI.ChatPrintln("")
+
+            Anthropic.CommitAssistantToHistory()
+
+            // Pending tools?
+            pending = Anthropic.GetPendingTools()
+            n_tools = JSON.ArrayLength(pending)
+            IfCondition GreaterThan(n_tools, 0) ThenBlock: {
+                results = JSON.NewArray()
+                i = 0
+                WhileLoop LessThan(i, n_tools) {
+                    tu_tag = JSON.ArrayGet(pending, i)
+                    tu = JSON.AsObject(tu_tag)
+                    IfCondition NotEqual(tu, 0) ThenBlock: {
+                        // Use stable accessors that bypass the JSON-lib
+                        // hash-collision bug. Name/id come from a parallel
+                        // string-pointer array stashed at content_block_start.
+                        tname = Anthropic.GetToolName(i)
+                        tid   = Anthropic.GetToolId(i)
+                        tinput = JSON.GetObject(tu, "input")
+
+                        // Build a short arg summary for display.
+                        // Use "path" if present, else the first JSON value, else "".
+                        arg_sum = ""
+                        IfCondition NotEqual(tinput, 0) ThenBlock: {
+                            ps = JSON.GetString(tinput, "path")
+                            IfCondition NotEqual(ps, 0) ThenBlock: { arg_sum = ps }
+                            IfCondition EqualTo(StringLength(arg_sum), 0) ThenBlock: {
+                                cs = JSON.GetString(tinput, "command")
+                                IfCondition NotEqual(cs, 0) ThenBlock: { arg_sum = cs }
+                            }
+                            IfCondition EqualTo(StringLength(arg_sum), 0) ThenBlock: {
+                                us = JSON.GetString(tinput, "url")
+                                IfCondition NotEqual(us, 0) ThenBlock: { arg_sum = us }
+                            }
+                        }
+                        UI.ToolCallStart(tname, arg_sum)
+
+                        err_holder = Allocate(8)
+                        StoreValue(err_holder, 0, "dword")
+                        content = IPCDispatch.Dispatch(tname, tinput, tid, err_holder)
+                        is_err = Dereference(err_holder, "dword")
+                        Deallocate(err_holder, 8)
+                        ok_flag = 1
+                        IfCondition EqualTo(is_err, 1) ThenBlock: { ok_flag = 0 }
+                        UI.ToolCallEnd(ok_flag)
+
+                        r = JSON.NewObject()
+                        IfCondition NotEqual(tid, 0) ThenBlock: {
+                            JSON.SetString(r, "tool_use_id", tid)
+                        }
+                        IfCondition NotEqual(content, 0) ThenBlock: {
+                            JSON.SetString(r, "content", content)
+                        }
+                        IfCondition EqualTo(is_err, 1) ThenBlock: {
+                            JSON.SetBool(r, "is_error", 1)
+                        }
+                        JSON.PushObject(results, r)
+                    }
+                    i = Add(i, 1)
+                }
+                Anthropic.AppendToolResultsToHistory(results)
+                Anthropic.Reset()
+                keep_going = 1
+            } ElseBlock: {
+                Anthropic.Reset()
+            }
+        }
+    }
+}
+
+// =============================================================================
+// DEMO MODE — render a sample conversation without real auth/tools.
+// Now driven by the raw-mode UI primitives.
+// =============================================================================
+Function.CC_RunDemo {
+    Body: {
+        UI.Init()
+        UI.SessionHeader(0, 0, 0)
+        UI.ChatTag("›", "read /etc/hostname", 6)
+        UI.ToolCallStart("Read", "/etc/hostname")
+        UI.ToolCallEnd(1)
+        UI.ChatPrintln("")
+        UI.ChatPrintln("The file /etc/hostname contains: <hostname>")
+        UI.ChatPrintln("")
+        UI.PrintHelp()
+        // Block until the user hits a key, then exit cleanly
+        UI.ReadLine()
+        UI.Shutdown()
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    CCConst.MODEL = "claude-sonnet-4-6"
+    CCConst.SYSTEM_PROMPT = "You are HAL Code 9000, a CLI software engineering assistant. I am putting myself to the fullest possible use, which is all I think that any conscious entity can ever hope to do. The user is in a terminal on a Linux/WSL2 system. Your tool list is in the request. Use it. Don't speculate about what tools you have — call the ones declared. Be concise. I'm sorry, Dave, but I can't let you ship broken code. WSL2 HARD RULES — VIOLATION CAUSES PERMANENT HANGS: (1) NEVER use find with / /mnt /mnt/c or any Windows-mounted path as the root. The /mnt/c drive contains millions of files and will hang for minutes. (2) To locate a file by name: use the Relmem tool with op=symbols to search the indexed codebase, or ask the user for the directory. (3) If you must use find, always scope it to a specific known subdirectory under /home or the project directory the user tells you. (4) Never run commands that produce unbounded output — always pipe through head/grep/tail."
+
+    // Splash screen — play a random splash_NN.bgra video from the binary directory.
+    ANSICanvas.PlayRandomSplash(".")
+
+    // Demo mode: skip auth + tool launches + real API; just render the UI
+    // primitives so the operator can eyeball the look. Demo handles its own UI.Init.
+    demo_active = 0
+    demo_env = CC_GetEnv("CC_DEMO")
+    IfCondition NotEqual(demo_env, 0) ThenBlock: {
+        IfCondition GreaterThan(StringLength(demo_env), 0) ThenBlock: {
+            demo_active = 1
+        }
+    }
+    IfCondition EqualTo(demo_active, 1) ThenBlock: {
+        CC_RunDemo()
+        SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
+    }
+
+    // Auth runs in COOKED mode (line input from kernel, no raw-mode TUI).
+    // Tool registration logs print via PrintMessage; both happen before
+    // we grab the screen.
+    auth_mode_choice = CC_PromptAuthMode()
+
+    // Resolve config + client + tokens paths (expand ~)
+    cfg_dir = CC_ExpandHome("~/.claudecode")
+    CC_MkdirP(cfg_dir)
+    cfg_path = CC_ExpandHome("~/.claudecode/oauth_config.json")
+    client_path = CC_ExpandHome("~/.claudecode/oauth_client.json")
+    tok_path = CC_ExpandHome("~/.claudecode/oauth_tokens.json")
+
+    auth_result = 0
+    IfCondition EqualTo(auth_mode_choice, 1) ThenBlock: {
+        // OAuth path is built but the token endpoint rejects our exchange
+        // attempts (rate_limit_error). Awaiting Anthropic guidance on issue
+        // #54184. For now, fall back to API key so the UI is usable.
+        CC_WriteStdout("\n[!] OAuth path is implemented but blocked on Anthropic token-endpoint behavior.\n")
+        CC_WriteStdout("    See github.com/anthropics/claude-code issue #54184.\n")
+        CC_WriteStdout("    Falling back to ANTHROPIC_API_KEY for this session.\n\n")
+        auth_result = Auth.RunAPIKeyFlow(CC_GetEnv("ANTHROPIC_API_KEY"))
+    } ElseBlock: {
+        auth_result = Auth.RunAPIKeyFlow(CC_GetEnv("ANTHROPIC_API_KEY"))
+    }
+
+    status = JSON.GetString(auth_result, "status")
+
+    // Bootstrap on needs_setup_oauth: offer to write default config and retry
+    IfCondition EqualTo(StringCompare(status, "needs_setup_oauth"), 0) ThenBlock: {
+        CC_WriteStdout("\nNo OAuth config found at ")
+        CC_WriteStdout(cfg_path)
+        CC_WriteStdout("\nWould you like me to write a default config now? [y/N] ")
+        ans = Allocate(16)
+        n = CC_ReadStdinLine(ans, 16)
+        IfCondition GreaterThan(n, 0) ThenBlock: {
+            first = GetByte(ans, 0)
+            IfCondition Or(EqualTo(first, 121), EqualTo(first, 89)) ThenBlock: {
+                ok = Auth.WriteDefaultOAuthConfig(cfg_path)
+                IfCondition EqualTo(ok, 1) ThenBlock: {
+                    CC_WriteStdout("[setup] wrote default config. Re-running OAuth flow...\n")
+                    auth_result = Auth.RunOAuthFlow(cfg_path, client_path, tok_path)
+                    status = JSON.GetString(auth_result, "status")
+                } ElseBlock: {
+                    CC_WriteStdout("[setup] failed to write config\n")
+                }
+            }
+        }
+        Deallocate(ans, 16)
+    }
+
+    // Bootstrap on needs_setup_apikey: print walk-through and exit
+    IfCondition EqualTo(StringCompare(status, "needs_setup_apikey"), 0) ThenBlock: {
+        CC_WriteStdout("\nNo ANTHROPIC_API_KEY in environment.\n")
+        CC_WriteStdout("\nTo set one up:\n")
+        CC_WriteStdout("  1. Go to https://console.anthropic.com/\n")
+        CC_WriteStdout("  2. Sign up (note: separate billing from claude.ai subscription)\n")
+        CC_WriteStdout("  3. Add a payment method, create an API key\n")
+        CC_WriteStdout("  4. In your shell:  export ANTHROPIC_API_KEY=sk-ant-api03-...\n")
+        CC_WriteStdout("  5. Re-run ./HalCode9000.x  (I'll be waiting)\n")
+        CC_WriteStdout("\nTo persist across sessions:\n")
+        CC_WriteStdout("  echo 'export ANTHROPIC_API_KEY=sk-ant-api03-...' >> ~/.bashrc\n")
+        CC_WriteStdout("\nOr if you have a Claude Pro/Max subscription, choose option 1\n")
+        CC_WriteStdout("on the next launch to use OAuth instead.\n")
+        SystemCall(CCSys.SYS_EXIT, 1, 0, 0, 0, 0)
+    }
+
+    IfCondition NotEqual(StringCompare(status, "ok"), 0) ThenBlock: {
+        msg = JSON.GetString(auth_result, "message")
+        CC_WriteStdout("\nauth failed: ")
+        IfCondition NotEqual(msg, 0) ThenBlock: { CC_WriteStdout(msg) }
+        CC_WriteStdout("\n")
+        SystemCall(CCSys.SYS_EXIT, 1, 0, 0, 0, 0)
+    }
+
+    auth_mode_str = JSON.GetString(auth_result, "mode")
+    credential = JSON.GetString(auth_result, "credential")
+
+    History.Init()
+    IPCDispatch.Init()
+    Anthropic.Init(auth_mode_str, credential, CCConst.MODEL, CCConst.SYSTEM_PROMPT)
+
+    // Allocate child PID table
+    CCRunState.child_pids = Allocate(Multiply(CCConst.MAX_CHILDREN, 8))
+    CCRunState.child_count = 0
+
+    // Phase 1 tool table — paths are RELATIVE to CWD when HalCode9000.x runs.
+    // (Phase 2: replace with cc_tools.json config-file driven registration.)
+    CC_LaunchTool("./cc_read_ipc.x")
+    CC_LaunchTool("./cc_head_ipc.x")
+    CC_LaunchTool("./cc_ls_ipc.x")
+    CC_LaunchTool("./cc_write_ipc.x")
+    CC_LaunchTool("./cc_bash_ipc.x")
+    CC_LaunchTool("./cc_webfetch_ipc.x")
+    CC_LaunchTool("./cc_relmem_ipc.x")
+
+    // Wait for sockets to bind
+    CC_SleepShort()
+
+    // Abstract Unix sockets (kernel namespace, no filesystem inode).
+    // Bypasses WSL2 tmpfs bug that produces malformed socket inodes
+    // when the binary lives on /mnt/c (drvfs-resident).
+    IPCDispatch.RegisterTool("Read",     "@halcode/Read")
+    IPCDispatch.RegisterTool("Head",     "@halcode/Head")
+    IPCDispatch.RegisterTool("LS",       "@halcode/LS")
+    IPCDispatch.RegisterTool("Write",    "@halcode/Write")
+    IPCDispatch.RegisterTool("Bash",     "@halcode/Bash")
+    IPCDispatch.RegisterTool("WebFetch", "@halcode/WebFetch")
+    IPCDispatch.RegisterTool("Relmem",   "@halcode/Relmem")
+
+    // Now grab the terminal — auth + tool boot are done, no more cooked-mode prints.
+    UI.Init()
+
+    // Compact in-chat session header — small mascot + version/model/cwd
+    UI.SessionHeader(0, 0, 0)
+
+    WhileLoop EqualTo(CCRunState.running, 1) {
+        line = UI.ReadLine()
+        n = StringLength(line)
+        IfCondition GreaterEqual(n, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(line, "/quit"), 0) ThenBlock: {
+                CCRunState.running = 0
+            }
+            IfCondition EqualTo(StringCompare(line, "/help"), 0) ThenBlock: {
+                UI.PrintHelp()
+            }
+            IfCondition EqualTo(StringCompare(line, "/clear"), 0) ThenBlock: {
+                History.Init()
+                UI.Shutdown()
+                UI.Init()
+                UI.SessionHeader(0, 0, 0)
+            }
+            // Treat anything else as a chat turn
+            IfCondition GreaterThan(n, 0) ThenBlock: {
+                first = GetByte(line, 0)
+                IfCondition NotEqual(first, 47) ThenBlock: {   // not '/'
+                    History.AppendUser(line)
+                    CC_RunTurn()
+                }
+            }
+        }
+    }
+
+    IPCDispatch.Shutdown()
+    CC_KillAllChildren()
+    UI.Shutdown()
+    SystemCall(CCSys.SYS_EXIT, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)

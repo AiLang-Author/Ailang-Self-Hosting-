@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# build.sh — rebuild all ClaudeCode binaries in one command.
+# build.sh — rebuild ClaudeCode and HalCode9000 binaries.
 #
 # Usage:
-#   ./build.sh                     # rebuild everything (7 binaries)
-#   ./build.sh --no-tools          # rebuild just ClaudeCode.x (fast iteration)
-#   ./build.sh --tools-only        # rebuild only the 6 cc_*_ipc tools
+#   ./build.sh                     # rebuild everything
+#   ./build.sh --no-tools          # rebuild just the main binaries (fast iteration)
+#   ./build.sh --tools-only        # rebuild only the cc_*_ipc tools
+#   ./build.sh --hal               # rebuild only HalCode9000 + its tools
+#   ./build.sh --claude            # rebuild only ClaudeCode + its tools
 #   ./build.sh --quiet             # suppress per-file [ok] output
 #   ./build.sh --no-copy           # build to /tmp only, don't touch project root
 #
@@ -29,14 +31,19 @@ BUILD_TOOLS=1
 QUIET=0
 COPY=1
 
+BUILD_CLAUDE=1
+BUILD_HAL=1
+
 for arg in "$@"; do
     case "$arg" in
         --no-tools)    BUILD_TOOLS=0 ;;
         --tools-only)  BUILD_MAIN=0 ;;
+        --hal)         BUILD_CLAUDE=0 ;;
+        --claude)      BUILD_HAL=0 ;;
         --quiet|-q)    QUIET=1 ;;
         --no-copy)     COPY=0 ;;
         --help|-h)
-            sed -n '2,16p' "$0" | sed 's/^# \?//'
+            sed -n '2,17p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -77,81 +84,95 @@ build_one() {
     return 1
 }
 
+build_app() {
+    local app_dir="$1"     # e.g. Applications/ClaudeCode
+    local main_src="$2"    # e.g. Applications/ClaudeCode/ClaudeCode.ailang
+    local main_bin="$3"    # e.g. ClaudeCode.x
+    local tools_dir="$4"   # e.g. Applications/ClaudeCode/cc_tools
+    local tmp_prefix="$5"  # e.g. cc  (produces /tmp/cc_bash_ipc.x)
+
+    local install_dir="$ROOT/$app_dir"
+
+    if [[ $BUILD_TOOLS -eq 1 ]]; then
+        log "Building ${app_dir} cc_tools..."
+        local t local_tools=("${TOOLS[@]}")
+        for t in "${local_tools[@]}"; do
+            build_one "${tools_dir}/cc_${t}_ipc.ailang" \
+                      "/tmp/${tmp_prefix}_cc_${t}_ipc.x" \
+                      "${tmp_prefix}_cc_${t}_ipc"
+        done
+        if [[ -f "${tools_dir}/cc_relmem_ipc.ailang" ]]; then
+            build_one "${tools_dir}/cc_relmem_ipc.ailang" \
+                      "/tmp/${tmp_prefix}_cc_relmem_ipc.x" \
+                      "${tmp_prefix}_cc_relmem_ipc"
+            local_tools+=(relmem)
+        fi
+        _BUILT_TOOLS=("${local_tools[@]}")
+    fi
+
+    if [[ $BUILD_MAIN -eq 1 ]]; then
+        log "Building ${main_bin}..."
+        build_one "$main_src" "/tmp/${main_bin}" "${main_bin%.x}"
+    fi
+
+    if [[ $COPY -eq 1 ]]; then
+        log "Installing to $install_dir..."
+        local busy=()
+        local t
+        for t in "${_BUILT_TOOLS[@]}"; do
+            local bin="${install_dir}/cc_${t}_ipc.x"
+            if [[ -x "$bin" ]] && fuser "$bin" &>/dev/null; then
+                busy+=("cc_${t}_ipc.x")
+            fi
+        done
+        local mbin="${install_dir}/${main_bin}"
+        if [[ $BUILD_MAIN -eq 1 ]] && [[ -x "$mbin" ]] && fuser "$mbin" &>/dev/null; then
+            busy+=("$main_bin")
+        fi
+        if [[ ${#busy[@]} -gt 0 ]]; then
+            echo "" >&2
+            echo "build.sh: cannot install — these binaries are currently running:" >&2
+            printf '  %s\n' "${busy[@]}" >&2
+            echo "Quit the app, then re-run build.sh." >&2
+            echo "(All builds succeeded; rerun with --no-copy to skip install.)" >&2
+            exit 3
+        fi
+
+        if [[ $BUILD_TOOLS -eq 1 ]]; then
+            for t in "${_BUILT_TOOLS[@]}"; do
+                cp "/tmp/${tmp_prefix}_cc_${t}_ipc.x" "${install_dir}/cc_${t}_ipc.x.new"
+                mv "${install_dir}/cc_${t}_ipc.x.new" "${install_dir}/cc_${t}_ipc.x"
+            done
+        fi
+        if [[ $BUILD_MAIN -eq 1 ]]; then
+            cp "/tmp/${main_bin}" "${install_dir}/${main_bin}.new"
+            mv "${install_dir}/${main_bin}.new" "${install_dir}/${main_bin}"
+        fi
+    fi
+}
+
+_BUILT_TOOLS=()
 log "build.sh: starting"
 
-if [[ $BUILD_TOOLS -eq 1 ]]; then
-    log "Building cc_tools..."
-    for t in "${TOOLS[@]}"; do
-        build_one "Applications/ClaudeCode/cc_tools/cc_${t}_ipc.ailang" \
-                  "/tmp/cc_${t}_ipc.x" \
-                  "cc_${t}_ipc"
-    done
-
-    # cc_relmem_ipc is treated specially: source might not exist (sibling agent
-    # building it). If source is missing we skip; if present we build.
-    if [[ -f Applications/ClaudeCode/cc_tools/cc_relmem_ipc.ailang ]]; then
-        build_one "Applications/ClaudeCode/cc_tools/cc_relmem_ipc.ailang" \
-                  "/tmp/cc_relmem_ipc.x" \
-                  "cc_relmem_ipc"
-        TOOLS+=(relmem)
-    elif [[ -x ./cc_relmem_ipc.x ]]; then
-        log "  [skip] cc_relmem_ipc (source missing, keeping existing binary)"
-    fi
+if [[ $BUILD_CLAUDE -eq 1 ]]; then
+    build_app "Applications/ClaudeCode" \
+              "Applications/ClaudeCode/ClaudeCode.ailang" \
+              "ClaudeCode.x" \
+              "Applications/ClaudeCode/cc_tools" \
+              "cc"
 fi
 
-if [[ $BUILD_MAIN -eq 1 ]]; then
-    log "Building ClaudeCode..."
-    build_one "Applications/ClaudeCode/ClaudeCode.ailang" \
-              "/tmp/ClaudeCode.x" \
-              "ClaudeCode"
-fi
-
-# ---- copy phase: atomic-ish replace in install dir -------------------------
-# All ClaudeCode binaries live together in Applications/ClaudeCode/. Run with:
-#   cd Applications/ClaudeCode && ./ClaudeCode.x
-INSTALL_DIR="$ROOT/Applications/ClaudeCode"
-
-if [[ $COPY -eq 1 ]]; then
-    log "Installing to $INSTALL_DIR..."
-
-    # Refuse to overwrite a running binary — the kernel returns ETXTBSY
-    # ("Text file busy") which would leave the install half-done.
-    busy=()
-    for t in "${TOOLS[@]}"; do
-        if [[ -x "$INSTALL_DIR/cc_${t}_ipc.x" ]] && fuser "$INSTALL_DIR/cc_${t}_ipc.x" &>/dev/null; then
-            busy+=("cc_${t}_ipc.x")
-        fi
-    done
-    if [[ $BUILD_MAIN -eq 1 ]] && [[ -x "$INSTALL_DIR/ClaudeCode.x" ]] && fuser "$INSTALL_DIR/ClaudeCode.x" &>/dev/null; then
-        busy+=("ClaudeCode.x")
-    fi
-    if [[ ${#busy[@]} -gt 0 ]]; then
-        echo "" >&2
-        echo "build.sh: cannot install — these binaries are currently running:" >&2
-        printf '  %s\n' "${busy[@]}" >&2
-        echo "Quit ClaudeCode, then re-run build.sh." >&2
-        echo "(All builds succeeded; rerun with --no-copy if you want to keep /tmp/* and skip install.)" >&2
-        exit 3
-    fi
-
-    # Stage to .new files, then rename. Rename is atomic per-file on the
-    # same filesystem; sequential renames mean a brief window where the
-    # set is half-old half-new, but no individual file is half-written.
-    if [[ $BUILD_TOOLS -eq 1 ]]; then
-        for t in "${TOOLS[@]}"; do
-            cp "/tmp/cc_${t}_ipc.x" "$INSTALL_DIR/cc_${t}_ipc.x.new"
-            mv "$INSTALL_DIR/cc_${t}_ipc.x.new" "$INSTALL_DIR/cc_${t}_ipc.x"
-        done
-    fi
-    if [[ $BUILD_MAIN -eq 1 ]]; then
-        cp "/tmp/ClaudeCode.x" "$INSTALL_DIR/ClaudeCode.x.new"
-        mv "$INSTALL_DIR/ClaudeCode.x.new" "$INSTALL_DIR/ClaudeCode.x"
-    fi
+if [[ $BUILD_HAL -eq 1 ]]; then
+    build_app "Applications/HalCode9000" \
+              "Applications/HalCode9000/HalCode9000.ailang" \
+              "HalCode9000.x" \
+              "Applications/HalCode9000/cc_tools" \
+              "hal"
 fi
 
 log ""
 log "build.sh: done"
-
 if [[ $COPY -eq 1 && $BUILD_MAIN -eq 1 ]]; then
-    log "Run:  cd Applications/ClaudeCode && ./ClaudeCode.x"
+    [[ $BUILD_CLAUDE -eq 1 ]] && log "Run:  cd Applications/ClaudeCode  && ./ClaudeCode.x"
+    [[ $BUILD_HAL    -eq 1 ]] && log "Run:  cd Applications/HalCode9000 && ./HalCode9000.x"
 fi
