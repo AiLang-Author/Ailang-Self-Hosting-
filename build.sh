@@ -1,12 +1,10 @@
 #!/usr/bin/env bash
-# build.sh — rebuild ClaudeCode and HalCode9000 binaries.
+# build.sh — rebuild HalCode9000 and its cc_tools.
 #
 # Usage:
 #   ./build.sh                     # rebuild everything
-#   ./build.sh --no-tools          # rebuild just the main binaries (fast iteration)
+#   ./build.sh --no-tools          # rebuild just the main binary (fast iteration)
 #   ./build.sh --tools-only        # rebuild only the cc_*_ipc tools
-#   ./build.sh --hal               # rebuild only HalCode9000 + its tools
-#   ./build.sh --claude            # rebuild only ClaudeCode + its tools
 #   ./build.sh --quiet             # suppress per-file [ok] output
 #   ./build.sh --no-copy           # build to /tmp only, don't touch project root
 #
@@ -31,19 +29,14 @@ BUILD_TOOLS=1
 QUIET=0
 COPY=1
 
-BUILD_CLAUDE=1
-BUILD_HAL=1
-
 for arg in "$@"; do
     case "$arg" in
         --no-tools)    BUILD_TOOLS=0 ;;
         --tools-only)  BUILD_MAIN=0 ;;
-        --hal)         BUILD_CLAUDE=0 ;;
-        --claude)      BUILD_HAL=0 ;;
         --quiet|-q)    QUIET=1 ;;
         --no-copy)     COPY=0 ;;
         --help|-h)
-            sed -n '2,17p' "$0" | sed 's/^# \?//'
+            sed -n '2,13p' "$0" | sed 's/^# \?//'
             exit 0
             ;;
         *)
@@ -60,7 +53,7 @@ if [[ ! -x ./ailang.x ]]; then
 fi
 
 # Tool list: bare names, expanded both for source and binary
-TOOLS=(read head ls write bash webfetch)
+TOOLS=(read head ls write bash webfetch edit find grep git)
 
 # ---- build phase: everything goes to /tmp first ----------------------------
 log() { [[ $QUIET -eq 1 ]] || echo "$@"; }
@@ -78,9 +71,9 @@ build_one() {
 
     echo "  [FAIL] $label  (see $logf)" >&2
     # Surface the first real error line; AILang produces a lot of progress noise.
-    grep -m1 -iE "ERROR|Unknown|FATAL|Failed" "$logf" \
+    grep -iE "ERROR|Unknown|FATAL|Failed" "$logf" \
         | grep -vE "^\[POOL|^\[LOAD|^\[STORE|JParse\.error|XERROR|^\[FUNCDEF|OPT-TRY|ARITH |^\[IO\]|^\[FILE\]" \
-        | head -3 >&2
+        | head -3 >&2 || true
     return 1
 }
 
@@ -178,25 +171,12 @@ build_app() {
 _BUILT_TOOLS=()
 log "build.sh: starting"
 
-if [[ $BUILD_CLAUDE -eq 1 ]]; then
-    build_app "Applications/ClaudeCode" \
-              "Applications/ClaudeCode/ClaudeCode.ailang" \
-              "ClaudeCode.x" \
-              "Applications/ClaudeCode/cc_tools" \
-              "cc"
-fi
-
-if [[ $BUILD_HAL -eq 1 ]]; then
-    build_app "Applications/HalCode9000" \
-              "Applications/HalCode9000/HalCode9000.ailang" \
-              "HalCode9000.x" \
-              "Applications/HalCode9000/cc_tools" \
-              "hal"
-fi
+build_app "Applications/HalCode9000" \
+          "Applications/HalCode9000/HalCode9000.ailang" \
+          "HalCode9000.x" \
+          "Applications/HalCode9000/cc_tools" \
+          "hal"
 
 log ""
 log "build.sh: done"
-if [[ $COPY -eq 1 && $BUILD_MAIN -eq 1 ]]; then
-    [[ $BUILD_CLAUDE -eq 1 ]] && log "Run:  cd Applications/ClaudeCode  && ./ClaudeCode.x"
-    [[ $BUILD_HAL    -eq 1 ]] && log "Run:  cd Applications/HalCode9000 && ./HalCode9000.x"
-fi
+[[ $COPY -eq 1 && $BUILD_MAIN -eq 1 ]] && log "Run:  cd Applications/HalCode9000 && ./HalCode9000.x"
