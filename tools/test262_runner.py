@@ -89,7 +89,7 @@ DEFAULT_CATEGORIES = [
 ]
 
 UNSUPPORTED_FEATURES = {
-    "arrow-function", "class", "destructuring-binding",
+    "class", "destructuring-binding",
     "destructuring-assignment", "for-of", "generators", "template",
     "Symbol", "Symbol.iterator", "Symbol.toPrimitive", "Symbol.hasInstance",
     "Symbol.species", "Symbol.match", "Symbol.replace", "Symbol.search",
