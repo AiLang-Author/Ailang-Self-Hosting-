@@ -88,93 +88,10 @@ DEFAULT_CATEGORIES = [
     "expressions/unary-plus",
 ]
 
-UNSUPPORTED_FEATURES = {
-    "class", "destructuring-binding",
-    "destructuring-assignment", "for-of", "generators", "template",
-    "Symbol", "Symbol.iterator", "Symbol.toPrimitive", "Symbol.hasInstance",
-    "Symbol.species", "Symbol.match", "Symbol.replace", "Symbol.search",
-    "Symbol.split", "Symbol.toStringTag", "Symbol.unscopables",
-    "Proxy", "Promise", "WeakMap", "WeakSet", "WeakRef",
-    "Map", "Set", "RegExp", "BigInt", "ArrayBuffer", "DataView",
-    "SharedArrayBuffer", "Atomics", "TypedArray", "Float16Array",
-    "async-functions", "async-iteration", "top-level-await",
-    "import.meta", "dynamic-import", "import-assertions",
-    "optional-chaining", "nullish-coalescing",
-    "numeric-separator-literal", "optional-catch-binding",
-    "rest-parameters", "spread", "default-parameters",
-    "computed-property-names", "object-spread", "object-rest",
-    "String.prototype.matchAll", "String.prototype.replaceAll",
-    "String.prototype.trimStart", "String.prototype.trimEnd",
-    "Array.prototype.flat", "Array.prototype.flatMap",
-    "Array.prototype.includes", "Array.prototype.at",
-    "Object.entries", "Object.values", "Object.fromEntries",
-    "globalThis", "AggregateError", "FinalizationRegistry",
-    "logical-assignment-operators", "Intl",
-    "new.target", "super",
-    "tail-call-optimization", "Reflect", "Reflect.construct",
-    "Reflect.set", "Reflect.get",
-    "json-superset", "well-formed-json-stringify",
-    "string-trimming", "coalesce-expression",
-    "exponentiation", "u180e",
-    "caller",
-}
-
-UNSUPPORTED_SOURCE_PATTERNS = [
-    r'\beval\s*\(',
-    r'\bwith\s*\(',
-    r'"use strict"',
-    r"'use strict'",
-    r'\bnew\s+Error\s*\(',
-    r'\bnew\s+TypeError\s*\(',
-    r'\bnew\s+ReferenceError\s*\(',
-    r'\bnew\s+SyntaxError\s*\(',
-    r'\bnew\s+RangeError\s*\(',
-    r'\bnew\s+URIError\s*\(',
-    r'\bnew\s+EvalError\s*\(',
-    r'\bString\.prototype\b',
-    r'\bObject\s*\.\s*defineProperty\b',
-    r'\bObject\s*\.\s*getOwnPropertyDescriptor\b',
-    r'\bObject\s*\.\s*keys\b',
-    r'\bObject\s*\.\s*create\b',
-    r'\bObject\s*\.\s*freeze\b',
-    r'\bObject\s*\.\s*seal\b',
-    r'\bObject\s*\.\s*is\b',
-    r'\bObject\s*\.\s*assign\b',
-    r'\bJSON\s*\.',
-    r'\b__proto__\b',
-    r'\bObject\s*\.\s*getPrototypeOf\b',
-    r'\bObject\s*\.\s*setPrototypeOf\b',
-    r'\bArray\s*\.\s*isArray\b',
-    r'\bArray\s*\.\s*from\b',
-    r'\bencodeURI\b',
-    r'\bdecodeURI\b',
-    r'\bsetTimeout\b',
-    r'\bsetInterval\b',
-    r'\barguments\b',
-    r'\.\s*call\s*\(',
-    r'\.\s*apply\s*\(',
-    r'\.\s*bind\s*\(',
-    r'\.\s*hasOwnProperty\s*\(',
-    r'\.\s*toString\s*\(',
-    r'\.\s*valueOf\s*\(',
-    r'\.\s*prototype\b',
-    r'\.\s*constructor\b',
-    r'\blet\b',
-    r'\bconst\b',
-    r'(?<!["\'])/[^/\n]+/[gimsuy]*(?=\s*[;,.\)\]\}])',  # regex literal
-    r'=>',  # arrow function
-    r'`',   # template literal
-    r'\bclass\b',
-    r'\.\.\.',  # spread/rest
-    r'\byield\b',
-    r'\bawait\b',
-    r'\basync\b',
-    r'\bimport\b',
-    r'\bexport\b',
-]
-
-# Compiled combined pattern for fast matching
-_UNSUPPORTED_RE = re.compile("|".join(UNSUPPORTED_SOURCE_PATTERNS))
+# NO SKIPS — full spec conformance target. Every test runs.
+UNSUPPORTED_FEATURES = set()
+UNSUPPORTED_SOURCE_PATTERNS = []
+_UNSUPPORTED_RE = None
 
 POLYFILL = """\
 var __test262_failed = 0;
@@ -321,36 +238,7 @@ def parse_frontmatter(source):
 # =============================================================================
 
 def should_skip(source, meta):
-    """Return (True, reason) if test should be skipped, else (False, '')."""
-    flags = set(meta.get("flags", []))
-
-    if "onlyStrict" in flags:
-        return True, "onlyStrict"
-    if "module" in flags:
-        return True, "module"
-    if "async" in flags:
-        return True, "async"
-    if "noStrict" in flags and "raw" in flags:
-        pass  # OK
-
-    features = set(meta.get("features", []))
-    unsup = features & UNSUPPORTED_FEATURES
-    if unsup:
-        return True, f"feature:{next(iter(unsup))}"
-
-    includes = meta.get("includes", [])
-    for inc in includes:
-        if inc not in ("assert.js", "sta.js", "propertyHelper.js", "compareArray.js"):
-            return True, f"include:{inc}"
-
-    # Strip comments before checking source patterns (avoids false positives
-    # from words like "in", "new Error" appearing in comments/descriptions)
-    code_only = strip_comments(source)
-    if _UNSUPPORTED_RE.search(code_only):
-        m = _UNSUPPORTED_RE.search(code_only)
-        snippet = m.group(0)[:30]
-        return True, f"source:{snippet}"
-
+    """No skips — every test runs."""
     return False, ""
 
 
