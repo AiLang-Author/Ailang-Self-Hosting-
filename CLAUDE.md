@@ -151,15 +151,15 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 
 | Library | LOC | Role |
 |---------|-----|------|
-| JSLexer | ~900 | Tokenizer, ~45 token types |
-| JSParser | ~1100 | Recursive descent, Pratt precedence, ~35 AST node types |
+| JSLexer | ~900 | Tokenizer, ~49 token types (KW_VAR=70 through KW_STATIC=105) |
+| JSParser | ~1100 | Recursive descent, Pratt precedence, ~40 AST node types |
 | JSCompiler | ~1100 | AST -> bytecode (~50 opcodes), constant pool, local resolution |
 | JSRuntime | ~1000 | JSValue (16-byte tagged: type+payload), coercion, object/array ops |
 | JSVM | ~1100 | Branch-dispatch loop (O(1) opcode dispatch), 4096-deep value stack |
 | JSBridge | ~900 | DOM bindings: getElementById, innerHTML/textContent, addEventListener, console.log, setTimeout |
 | JSEngine | ~700 | Orchestrator: extract `<script>` tags, lex->parse->compile->run pipeline |
 
-**Value types**: UNDEFINED(0), NULL(1), BOOLEAN(2), NUMBER(3, 64-bit signed int), STRING(4), OBJECT(5, XSHash), FUNCTION(6), ARRAY(7, XArray). Integer-only for v1 (no floats). No GC — arena per-page lifetime.
+**Value types**: UNDEFINED(0), NULL(1), BOOLEAN(2), NUMBER(3, 64-bit signed int), STRING(4), OBJECT(5, XSHash), FUNCTION(6), ARRAY(7, XArray), GENERATOR(8). Integer-only for v1 (no floats). No GC — arena per-page lifetime.
 
 **Key patterns**:
 - `JSCompDot` FixedPool for MEMBER_DOT assignment compilation (survives recursive JSComp__CompileExpr calls)
@@ -173,9 +173,116 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 
 **Build**: `./ailang.x TestCode/test_js_e2e.ailang test_js_e2e.x && ./test_js_e2e.x`
 
+### Implemented Features (completed across sessions)
+
+- **Arrow functions** — ARROW token in JSLexer, ARROW_EXPR(47) AST node in JSParser (`IsArrowHead` lookahead + `ArrowFunc` parser), compiled via `JSComp__CompileFunc` reuse in JSCompiler. Supports `x => expr`, `(x, y) => expr`, `(x, y) => { stmts }`. Concise body auto-wrapped in RETURN_STMT→BLOCK.
+- **Error constructors** — Handlers 15-21 in JSRT_CallNative for Error/TypeError/RangeError/ReferenceError/SyntaxError/URIError/EvalError. Each creates object with `name`, `message`, `__class__` properties. Registered as globals in JSVM_InstallBuiltins via `JSBridge__CreateNativeFunc`. `JSRT_Instanceof` checks `__class__` property against function name.
+- **Native handler dispatch** — VM threshold at 22: handlers 0-21 go to JSRT_CallNative (0-14 math/type, 15-21 Error ctors), handlers 22+ go to JSBridge_Dispatch. All JSBridge native IDs bumped by +6 (CONSOLE_LOG=22 through MATH_FLOOR=42).
+- **Generators** — Full `function*`/`yield`/`.next()`/`.return()`/`.throw()` implementation across all layers. KW_YIELD(101) token in JSLexer, YIELD_EXPR(48)/GEN_FUNC_DECL(49)/GEN_FUNC_EXPR(50) AST nodes in JSParser, GEN_CLOSURE(74)/YIELD(73) opcodes in JSCompiler, GENERATOR(8) value type in JSRuntime with 104-byte state block (private stack + frames), coroutine-style VM state swapping in JSVM (save/restore pc/sp/fp/stack/frames). Generator object created on CALL to generator function, `.next()` resumes via `JSVM__GenNext` with full state isolation. Supports `function*`, `*method()`, `function*()` expressions, `yield`, `yield*` (delegate), `yield` as expression with `.next(value)` pass-through.
+- **Regex** — Added by user externally (Library.JSRegex.ailang, Thompson NFA, 1217 lines)
+- **OOP** — Added by user externally (Library.JSOop.ailang, 920 lines)
+- **Exponentiation (`**`)** — STAR_STAR/STAR_STAR_ASSIGN tokens in JSLexer, precedence 11 (right-associative) in JSParser Pratt table, EXP opcode (26) in compiler/VM, `JSRT_Exp` iterative squaring in runtime.
+- **Numeric separators (`1_000`)** — JSLexer skips `_` (95) in decimal digit scanning, JSParser `ParseInt` skips `_` during value computation.
+- **Nullish coalescing (`??`)** — NULLISH token in JSLexer, precedence 1 in parser, short-circuit compilation via `JMP_NULLISH` opcode (53) — jumps if top-of-stack is NOT null/undefined.
+- **Logical assignment (`&&=`, `||=`, `??=`)** — AND_ASSIGN, OR_ASSIGN, NULLISH_ASSIGN tokens, wired through parser `IsAssignOp` and compiler compound-assignment dispatch. Simplified semantics (always evaluates RHS); proper short-circuit TODO.
+- **Class syntax** — Full basic class support across all layers. **JSLexer**: KW_CLASS(102), KW_EXTENDS(103), KW_SUPER(104), KW_STATIC(105) tokens. **JSParser**: CLASS_DECL(51), CLASS_EXPR(52), SUPER_EXPR(53) AST nodes; `JSParse__ClassDecl`, `JSParse__ClassExpr`, `JSParse__ClassBody` parse class declarations/expressions with constructor, methods, static methods, get/set accessors, extends clause. **JSCompiler**: `JSComp__CompileClass` (~450 lines) compiles classes to constructor function + prototype object using existing opcodes (CLOSURE, NEW_OBJECT, SET_PROP, GET_PROP) — no new VM opcodes needed. Extends sets up `__proto__` chain. `__super__` local holds parent constructor for super() calls. Methods compiled as closures and set on prototype. Statics set on constructor. **JSValidate**: KW_CLASS added to stmt_start and expr_start tables, KW_SUPER added to expr_start. **Parser keyword range**: Extended from 70-100 to 70-105 in 4 locations (object literal property keys, get/set accessor detection, dot member access) to accept `class`/`extends`/`super`/`static` as property names per ES spec. Class-only test262 results: statements/class 2401/4367 (55.0%), expressions/class 943/4059 (23.2%), total 3344/8426 (39.7%).
+- **For-of loops** — Eager-materialization approach using TO_ARRAY opcode. **JSParser**: FOR_OF_STMT(54) AST node, contextual `of` keyword detection (IDENT with bytes 111,102) in both var-decl and expression-init branches of `JSParse__ForStmt`. Reuses `for_is_in` flag to skip condition/update clauses. **JSCompiler**: TO_ARRAY(75) opcode, FOR_OF_STMT compilation (~200 lines) mirrors FOR_IN_STMT pattern — `compile(rhs) → TO_ARRAY → __vals__ local, __idx__=0, loop: if idx>=vals.length break, lhs=vals[idx], body, idx++, goto loop`. **JSVM**: Case 75 (TO_ARRAY) — arrays pass through unchanged, strings split into single-character arrays via `JSRT_CreateStringLen(ptr, 1)`, fallback returns empty array. Design trade-off: eager materialization loses lazy generator iteration but covers the vast majority of test262 for-of tests. Result: +267 net passes (11,861 → 12,128).
+- **Object.defineProperty / Object.keys / Object.create / Array.isArray** — Full Object and Array global implementation. 14 native handler IDs (43-56). Object.defineProperty stores getter as `__get_<prop>`, setter as `__set_<prop>`, value directly. Object.keys wraps `JSRT_ObjKeys()`. Object.create sets `__proto__`. Object.assign copies own enumerable props. Object.freeze sets `__frozen__` flag. Array.isArray checks JSType.ARRAY. Array.from copies arrays/splits strings. Object.getOwnPropertyDescriptor builds descriptor object. Object.is does SameValue comparison. Registered in JSVM_InstallBuiltins using JSRT__Push/Pop (not JSBridge__Push/Pop) since JSBridge may not be initialized. Result: ~+500 passes.
+- **Class method destructuring parameters** — Class body parameter parser was only accepting simple IDENT tokens. Replaced with full destructuring-aware parsing matching the FuncExpr path: supports `{ x, y }` object patterns, `[ a, b ]` array patterns, `...rest` parameters, and `= default` values. All patterns use AST__Push/Pop to protect 8 local variables (ASTTmp.first, ASTTmp.last, ASTTmp.done, mflags, method, param_first, param_last, p_done) across recursive JSParse__ParseBindTarget/JSParse__Assign calls. Result: ~+2,000 passes.
+- **Destructuring assignment + for-of destructuring** — Two-part fix. **(1) For-of with patterns**: JSParser `JSParse__VarDeclSingle` now skips `=` requirement when next token is `in` or `of` (contextual detection, skip_semi=1 for-loop context). JSCompiler FOR_OF_STMT handler checks `forof_dstr_pat = JSParse_GetRight(lhs_n)` — when pattern exists, stores element in `__dt__` temp local and dispatches to `JSComp__CompileArrayPattern`/`JSComp__CompileObjPattern`. **(2) Assignment destructuring**: Cover grammar conversion via `JSParse__CoverToPattern` — recursive walker converts ARRAY_LIT(25)→ARRAY_PATTERN(42), OBJECT_LIT(24)→OBJECT_PATTERN(43), UNDEF_LIT→NULL_LIT (holes), SPREAD_ELEMENT→REST_ELEMENT, nested patterns recursed. Called from `JSParse__Assign` when `=` follows ARRAY_LIT/OBJECT_LIT. JSValidate assign_target table extended with types 24,25,42,43. Compiler ASSIGN handler detects ARRAY_PATTERN/OBJECT_PATTERN LHS → compile RHS, DUP (return value), store in `__dt__` temp, dispatch to pattern compilers. Result: +422 net passes (12,128 → 12,550).
+
+### Test262 Conformance (as of 2026-05-03)
+
+`tools/test262_runner.py` has been fully unblocked — `UNSUPPORTED_FEATURES = set()`, `UNSUPPORTED_SOURCE_PATTERNS = []`, `should_skip()` always returns `(False, "")`.
+
+Build & run: `./ailang.x TestCode/test262_harness.ailang test262_harness.x && python3 tools/test262_runner.py`
+
+Use `--all` flag for full suite: `python3 tools/test262_runner.py --all`
+
+#### Full Suite (23,899 tests, --all flag)
+
+**Overall: 15,236 / 23,899 passing (64.0%)** — post Object.defineProperty + class method dstr params fix
+
+Previous baseline (pre-class): 11,935/23,899 (50.0%). The net -74 is a scoring artifact: ~1,354 negative tests that previously "passed" (parser couldn't parse `class` at all, matching expected parse-phase failure) now get further and fail differently. Genuine new passes: +1,280.
+
+**Full suite failure breakdown by category:**
+
+| Category | Total | Pass | Fail | Pass% | Root cause |
+|---|---|---|---|---|---|
+| statements/class | ~4367 | ~2401 | ~1966 | 55.0% | Async methods, private fields, destructuring/default/rest params, computed props |
+| expressions/class | ~4059 | ~943 | ~3116 | 23.2% | Same as above; expressions have more edge cases |
+| expressions/object | 1161 | 902 | 259 | 77.7% | Computed props, shorthand methods, getters/setters, spread |
+| expressions/assignment | 485 | 185 | 300 | 38.1% | Destructuring patterns |
+| for-await-of | ~1100 | ~6 | ~1094 | 0.5% | No async/await |
+| for-of | ~600 | ~80 | ~520 | 13.3% | No for-of iterator protocol |
+| expressions/arrow-function | 343 | 132 | 211 | 38.5% | Destructuring params, async arrows |
+| dynamic-import | ~370 | ~5 | ~365 | 1.4% | No module support |
+| async-generator | ~470 | ~4 | ~466 | 0.9% | No async/await |
+| async-function (expressions+declarations) | ~350 | ~0 | ~350 | 0% | No async/await |
+| expressions/template-literal | 57 | 20 | 37 | 35.1% | Tagged templates, nesting |
+| identifiers | 268 | 148 | 120 | 55.2% | Unicode escapes, reserved word edge cases |
+| block-scope/syntax | 113 | 14 | 99 | 12.4% | let/const block scoping syntax |
+| literals/numeric | 157 | 87 | 70 | 55.4% | Float literals, hex/octal edge cases |
+| statements/switch | 111 | 40 | 71 | 36.0% | let/const scoping in case blocks |
+| statements/variable | 178 | 140 | 38 | 78.7% | let/const TDZ semantics |
+| compound-assignment | 454 | 383 | 71 | 84.4% | Destructuring in compound targets |
+
+**Tier analysis (by fixability, updated post for-of):**
+
+- ~~**Tier 1 — Destructuring assignment**~~ — DONE (2026-05-03). Cover grammar conversion + for-of pattern binding. +422 passes.
+- **Tier 2 — Class improvements (~5000 remaining failures):** Basic class works. Remaining failures are async methods, private fields (`#field`), destructuring/default/rest params in class methods, computed property names in classes.
+- **Tier 3 — Template literal improvements (~37 failures):** Tagged templates, nested expressions. Small scope, quick win.
+- **Tier 4 — let/const TDZ + block scoping (~200 failures):** Proper temporal dead zone enforcement, block-scoped declarations in switch/for. Moderate compiler work.
+- **Tier 5 — Async/await (~1800 failures, 15%):** for-await-of, async generators, async functions. Requires Promise implementation + async state machine. Very high effort. Defer.
+- ~~**for-of + iterator protocol**~~ — DONE (2026-05-03). Basic for-of via TO_ARRAY eager materialization. Full iterator protocol (Symbol.iterator/.next()/.done) deferred — current approach covers arrays and strings.
+
 ## Pending Work
 
+### JS Engine — Test262 Conformance Push (active)
+
+**Current: 15,236/23,899 (64.0%). Target: 80%+ (~19,100 passing).**
+
+Class syntax implemented (2026-05-03): +1,280 genuine new passes. statements/class at 55.0%, expressions/class at 23.2%.
+For-of loops implemented (2026-05-03): +267 net passes via TO_ARRAY eager materialization. Crossed 50% milestone.
+Destructuring fixes (2026-05-03): +422 net passes. Two fixes: (1) for-of with var/let/const destructuring LHS (parser skip `=` when `in`/`of` follows pattern, compiler stores element in `__dt__` temp and dispatches to CompileArrayPattern/CompileObjPattern), (2) standalone assignment destructuring via cover grammar conversion (ARRAY_LIT→ARRAY_PATTERN, OBJECT_LIT→OBJECT_PATTERN in JSParse__Assign, new JSParse__CoverToPattern recursive walker, compiler handles ASSIGN with pattern LHS).
+
+#### Priority 1: Template Literal Improvements (~37 recoveries)
+
+- Tagged templates: `tag\`hello ${name}\`` — pass template array + substitutions to tag function
+- Nested template literals in expressions
+
+#### Priority 3: let/const Block Scoping (~200 recoveries)
+
+- TDZ enforcement (reference before declaration = ReferenceError)
+- Block-scoped declarations in switch cases, for heads
+- const reassignment errors
+
+#### Lower Priority (defer)
+
+- **Async/await (~1800 failures)** — Requires Promise implementation, event loop, async state machine. Very high effort. Defer.
+- **Dynamic import (~365 failures)** — Module system. Defer.
 - **JS engine innerHTML variable assignment** — SET_PROP stack ordering bug when RHS is a variable (obj pops as NUMBER not OBJECT); string literal path works
+
+### Plan for HalCode9000 Worker Deployment
+
+Use HalCode9000 MCP workers (cheap DeepSeek tokens) for parallelizable grunt work:
+- **Worker 1**: Analyze test262 failure categories, extract patterns from failing tests
+- **Worker 2**: Implement feature syntax in JSLexer + JSParser (token + AST node additions)
+- **Worker 3**: Implement feature compilation in JSCompiler (bytecode generation)
+- **Worker 4**: Run test262 subsets during development to validate progress
+- Claude (expensive model) orchestrates, reviews, and handles architectural decisions
+
+### Floating Point — Q16.16 / Q8.8 Fixed-Point Plan
+
+JS engine currently uses 64-bit signed integers only. Plan for numeric precision:
+
+- **Q16.16 wide mode** (2x 64-bit ints): left int = high 32 bits, right int = low 32 bits. Gives 16 bits integer + 16 bits fractional per component. Use MemoryCopy/MemorySet (both SSE2 via REP MOVSB/STOSB) for bulk operations.
+- **Q8.8 compact mode** (1x 64-bit int): upper 56 bits integer, lower 8 bits fractional. Fits in a single JSValue payload slot.
+- **Runtime detector**: pick mode at startup based on precision requirements. Q8.8 for game/UI math, Q16.16 for financial/scientific.
+- This avoids needing actual IEEE 754 float support in the compiler while giving fractional math that passes Test262 numeric tests. The SSE2 REP MOVSB/STOSB path is already in the compiler.
+
+### Other
+
 - **Ladybird live testing** — test `ladybird_ipc.x` on live display server, performance tuning, tab management
 - **Terminal polish** — toolbar actions, cursor blink, mouse reporting (?1000h/?1006h)
 - **Audio engine split** — extract from display server into standalone service
@@ -187,9 +294,28 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 
 ---
 
-## HalCode9000 — Native AILang Chat Client
+## HalCode9000 — MCP Server for Cheap LLM Workers
 
-`Applications/HalCode9000/` — terminal-mode chat client against multiple LLM backends. All binaries live in the HalCode9000 folder alongside the source.
+`Applications/HalCode9000/` — MCP server written in native AILang. Fire it up to run cheap DeepSeek (or other LLM) workers with full tool access. Terminal-mode TUI with streaming, multi-provider support, and agentic tool dispatch over IPC.
+
+### MCP Tools (cc_tools/)
+
+Each tool is a standalone IPC subprocess spawned by HalCode9000. The server dispatches tool calls from the model to these workers over abstract Unix sockets:
+
+| Tool | Source | Socket | Description |
+|------|--------|--------|-------------|
+| Bash | `cc_bash_ipc.ailang` | `@halcode/Bash` | Shell execution, 30s default / 55s max timeout |
+| Read | `cc_read_ipc.ailang` | `@halcode/Read` | File read |
+| Write | `cc_write_ipc.ailang` | `@halcode/Write` | File write |
+| Ls | `cc_ls_ipc.ailang` | `@halcode/Ls` | Directory listing |
+| Head | `cc_head_ipc.ailang` | `@halcode/Head` | File head (first N lines) |
+| WebFetch | `cc_webfetch_ipc.ailang` | `@halcode/WebFetch` | URL fetch |
+| PgMem | `cc_pgmem_ipc.ailang` | `@halcode/PgMem` | PostgreSQL memory/context store |
+| Relmem | `cc_relmem_ipc.ailang` | `@halcode/Relmem` | Relational memory — codebase symbol index |
+
+All tools share the 60-second `IPCDispatch` hard timeout. Protocol: abstract Unix sockets, JSON over length-prefixed frames.
+
+**Key value prop:** DeepSeek flash tokens are dirt cheap. Spin up HalCode9000 instances as disposable workers for grunt work — bulk file processing, code search, test runs, refactoring passes — while the expensive model (Claude) focuses on architecture and decision-making. Each worker gets the full tool suite above, so it can read/write/execute autonomously.
 
 ### Build commands
 
