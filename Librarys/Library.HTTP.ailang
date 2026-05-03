@@ -33,7 +33,9 @@ LibraryImport.StringUtils
 FixedPool.HSys {
     "SYS_READ":      Initialize=0
     "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
     "SYS_CLOSE":     Initialize=3
+    "SYS_POLL":      Initialize=7
     "SYS_PIPE":      Initialize=22
     "SYS_DUP2":      Initialize=33
     "SYS_FORK":      Initialize=57
@@ -142,10 +144,13 @@ Function.HTTP_BuildArgv {
     Body: {
         n_hdr = HTTP_CountHeaders(headers_str)
 
-        // Slot count: curl, -sS, -N, [optional 4 POST args], 2*n_hdr (-H VAL), url, NULL
+        // Slot count: curl, -sS, -N, --limit-rate 1M, --connect-timeout 10, -m 180,
+        //   [opt 6 POST], 2*n_hdr, url, NULL
+        // POST gets 2 extra slots for -H "Expect:" which suppresses the automatic
+        // Expect: 100-continue header curl injects for bodies > 1024 bytes.
         post_slots = 0
-        IfCondition EqualTo(with_post, 1) ThenBlock: { post_slots = 4 }
-        slots = Add(Add(Add(3, post_slots), Multiply(n_hdr, 2)), 2)
+        IfCondition EqualTo(with_post, 1) ThenBlock: { post_slots = 6 }
+        slots = Add(Add(Add(9, post_slots), Multiply(n_hdr, 2)), 2)
         bytes = Multiply(slots, 8)
 
         argv = Allocate(bytes)
@@ -160,6 +165,18 @@ Function.HTTP_BuildArgv {
         idx = Add(idx, 1)
         StoreValue(Add(argv, Multiply(idx, 8)), "-N")
         idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "--limit-rate")
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "1M")
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "--connect-timeout")
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "10")
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "-m")
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "180")
+        idx = Add(idx, 1)
         IfCondition EqualTo(with_post, 1) ThenBlock: {
             StoreValue(Add(argv, Multiply(idx, 8)), "-X")
             idx = Add(idx, 1)
@@ -168,6 +185,10 @@ Function.HTTP_BuildArgv {
             StoreValue(Add(argv, Multiply(idx, 8)), "--data-binary")
             idx = Add(idx, 1)
             StoreValue(Add(argv, Multiply(idx, 8)), "@-")
+            idx = Add(idx, 1)
+            StoreValue(Add(argv, Multiply(idx, 8)), "-H")
+            idx = Add(idx, 1)
+            StoreValue(Add(argv, Multiply(idx, 8)), "Expect:")
             idx = Add(idx, 1)
         }
 
@@ -257,6 +278,11 @@ Function.HTTP_SpawnCurl {
             SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
             SystemCall(HSys.SYS_DUP2, out_write, 1, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, out_write, 0, 0, 0, 0)
+            null_fd = SystemCall(HSys.SYS_OPEN, "/dev/null", 1, 0, 0, 0)
+            IfCondition GreaterEqual(null_fd, 0) ThenBlock: {
+                SystemCall(HSys.SYS_DUP2, null_fd, 2, 0, 0, 0)
+                SystemCall(HSys.SYS_CLOSE, null_fd, 0, 0, 0, 0)
+            }
             SystemCall(HSys.SYS_EXECVE, HConst.CURL_PATH, argv, 0)
             SystemCall(HSys.SYS_EXIT, 1, 0, 0, 0, 0)
         }
@@ -269,7 +295,12 @@ Function.HTTP_SpawnCurl {
         IfCondition NotEqual(body_str, 0) ThenBlock: {
             blen = StringLength(body_str)
             IfCondition GreaterThan(blen, 0) ThenBlock: {
-                SystemCall(HSys.SYS_WRITE, in_write, body_str, blen, 0, 0)
+                written = 0
+                WhileLoop LessThan(written, blen) {
+                    w = SystemCall(HSys.SYS_WRITE, in_write, Add(body_str, written), Subtract(blen, written), 0, 0)
+                    IfCondition LessEqual(w, 0) ThenBlock: { BreakLoop }
+                    written = Add(written, w)
+                }
             }
         }
         SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
@@ -291,12 +322,28 @@ Function.HTTP_SpawnCurl {
 }
 
 // =============================================================================
+// PUBLIC: STREAMING GET
+// =============================================================================
+Function.HTTP.GetStream {
+    Input: url: Address
+    Input: headers_str: Address
+    Input: conn_to: Integer
+    Input: max_to: Integer
+    Output: Address
+    Body: {
+        ReturnValue(HTTP_SpawnCurl(url, headers_str, 0, 0))
+    }
+}
+
+// =============================================================================
 // PUBLIC: STREAMING POST
 // =============================================================================
 Function.HTTP.PostStream {
     Input: url: Address
     Input: headers_str: Address
     Input: body_str: Address
+    Input: conn_to: Integer
+    Input: max_to: Integer
     Output: Address
     Body: {
         ReturnValue(HTTP_SpawnCurl(url, headers_str, body_str, 1))
@@ -407,6 +454,124 @@ Function.HTTP.ReadLine {
             IfCondition LessEqual(n, 0) ThenBlock: {
                 StoreValue(Add(handle, HHandleOff.EOF), 1, "dword")
                 // Loop around — next iteration handles tail or returns -1
+            } ElseBlock: {
+                StoreValue(Add(handle, HHandleOff.BUF_END), Add(tail_len, n), "dword")
+            }
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// PUBLIC: READ LINE WITH TIMEOUT
+// Like ReadLine but polls before blocking. Returns -2 when timeout_ms
+// elapses with no data available — caller should tick animations and retry.
+// Returns -1 on EOF, >= 0 on success (line length).
+//
+// struct pollfd layout: fd(dword@0) + events(dword@4 = POLLIN|revents=0).
+// SYS_POLL(7): poll(pfd, 1, timeout_ms). 0=timeout, >0=ready, <0=error.
+// =============================================================================
+Function.HTTP.ReadLineTimeout {
+    Input: handle: Address
+    Input: out_buf: Address
+    Input: maxlen: Integer
+    Input: timeout_ms: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(-1) }
+        line_buf = Dereference(Add(handle, HHandleOff.LINE_BUF))
+        fd = Dereference(Add(handle, HHandleOff.STDOUT_FD), "dword")
+
+        WhileLoop 1 {
+            pos = Dereference(Add(handle, HHandleOff.BUF_POS), "dword")
+            end = Dereference(Add(handle, HHandleOff.BUF_END), "dword")
+
+            scan = pos
+            found = -1
+            WhileLoop LessThan(scan, end) {
+                IfCondition EqualTo(GetByte(line_buf, scan), 10) ThenBlock: {
+                    found = scan
+                    BreakLoop
+                }
+                scan = Add(scan, 1)
+            }
+
+            IfCondition GreaterEqual(found, 0) ThenBlock: {
+                line_len = Subtract(found, pos)
+                IfCondition GreaterThan(line_len, 0) ThenBlock: {
+                    last = GetByte(line_buf, Subtract(found, 1))
+                    IfCondition EqualTo(last, 13) ThenBlock: {
+                        line_len = Subtract(line_len, 1)
+                    }
+                }
+                copy_n = line_len
+                IfCondition GreaterThan(copy_n, maxlen) ThenBlock: { copy_n = maxlen }
+                j = 0
+                WhileLoop LessThan(j, copy_n) {
+                    SetByte(out_buf, j, GetByte(line_buf, Add(pos, j)))
+                    j = Add(j, 1)
+                }
+                StoreValue(Add(handle, HHandleOff.BUF_POS), Add(found, 1), "dword")
+                ReturnValue(copy_n)
+            }
+
+            eof_flag = Dereference(Add(handle, HHandleOff.EOF), "dword")
+            IfCondition EqualTo(eof_flag, 1) ThenBlock: {
+                tail_len = Subtract(end, pos)
+                IfCondition GreaterThan(tail_len, 0) ThenBlock: {
+                    copy_n = tail_len
+                    IfCondition GreaterThan(copy_n, maxlen) ThenBlock: { copy_n = maxlen }
+                    j = 0
+                    WhileLoop LessThan(j, copy_n) {
+                        SetByte(out_buf, j, GetByte(line_buf, Add(pos, j)))
+                        j = Add(j, 1)
+                    }
+                    StoreValue(Add(handle, HHandleOff.BUF_POS), end, "dword")
+                    ReturnValue(copy_n)
+                }
+                ReturnValue(-1)
+            }
+
+            // Compact buffer: move [pos,end) to front
+            tail_len = Subtract(end, pos)
+            IfCondition GreaterThan(tail_len, 0) ThenBlock: {
+                k = 0
+                WhileLoop LessThan(k, tail_len) {
+                    SetByte(line_buf, k, GetByte(line_buf, Add(pos, k)))
+                    k = Add(k, 1)
+                }
+            }
+            StoreValue(Add(handle, HHandleOff.BUF_POS), 0, "dword")
+            StoreValue(Add(handle, HHandleOff.BUF_END), tail_len, "dword")
+
+            free_space = Subtract(HConst.READ_BUF_SZ, tail_len)
+            IfCondition LessEqual(free_space, 0) ThenBlock: {
+                copy_n = HConst.READ_BUF_SZ
+                IfCondition GreaterThan(copy_n, maxlen) ThenBlock: { copy_n = maxlen }
+                j = 0
+                WhileLoop LessThan(j, copy_n) {
+                    SetByte(out_buf, j, GetByte(line_buf, j))
+                    j = Add(j, 1)
+                }
+                StoreValue(Add(handle, HHandleOff.BUF_POS), HConst.READ_BUF_SZ, "dword")
+                ReturnValue(copy_n)
+            }
+
+            // poll(fd, POLLIN=1, timeout_ms) — return -2 if no data yet
+            pfd = Allocate(8)
+            StoreValue(pfd, fd, "dword")
+            StoreValue(Add(pfd, 4), 1, "dword")   // events=POLLIN(1), revents=0
+            pr = SystemCall(HSys.SYS_POLL, pfd, 1, timeout_ms, 0, 0)
+            Deallocate(pfd, 8)
+            IfCondition EqualTo(pr, 0) ThenBlock: { ReturnValue(-2) }
+            IfCondition LessThan(pr, 0) ThenBlock: {
+                StoreValue(Add(handle, HHandleOff.EOF), 1, "dword")
+                ReturnValue(-1)
+            }
+
+            n = SystemCall(HSys.SYS_READ, fd, Add(line_buf, tail_len), free_space, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                StoreValue(Add(handle, HHandleOff.EOF), 1, "dword")
             } ElseBlock: {
                 StoreValue(Add(handle, HHandleOff.BUF_END), Add(tail_len, n), "dword")
             }

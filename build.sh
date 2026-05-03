@@ -107,6 +107,30 @@ build_app() {
                       "${tmp_prefix}_cc_relmem_ipc"
             local_tools+=(relmem)
         fi
+        if [[ -f "${tools_dir}/cc_pgmem_ipc.ailang" ]]; then
+            build_one "${tools_dir}/cc_pgmem_ipc.ailang" \
+                      "/tmp/${tmp_prefix}_cc_pgmem_ipc.x" \
+                      "${tmp_prefix}_cc_pgmem_ipc"
+            local_tools+=(pgmem)
+        fi
+    if [[ -f "${tools_dir}/cc_agent_ipc.ailang" ]]; then
+        build_one "${tools_dir}/cc_agent_ipc.ailang" \
+                  "/tmp/${tmp_prefix}_cc_agent_ipc.x" \
+                  "${tmp_prefix}_cc_agent_ipc"
+        local_tools+=(agent)
+    fi
+    if [[ -f "${tools_dir}/cc_js_ipc.ailang" ]]; then
+        build_one "${tools_dir}/cc_js_ipc.ailang" \
+                  "/tmp/${tmp_prefix}_cc_js_ipc.x" \
+                  "${tmp_prefix}_cc_js_ipc"
+        local_tools+=(js)
+    fi
+    if [[ -f "${tools_dir}/cc_mcp_ipc.ailang" ]] && [[ -s "${tools_dir}/cc_mcp_ipc.ailang" ]]; then
+        build_one "${tools_dir}/cc_mcp_ipc.ailang" \
+                  "/tmp/${tmp_prefix}_cc_mcp_ipc.x" \
+                  "${tmp_prefix}_cc_mcp_ipc"
+        local_tools+=(mcp)
+    fi
         _BUILT_TOOLS=("${local_tools[@]}")
     fi
 

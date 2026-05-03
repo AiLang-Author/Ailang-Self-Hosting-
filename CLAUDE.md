@@ -2,6 +2,7 @@
 
 ## Hard Rules
 
+- **ALWAYS use `master` branch** — never `main`. The `main` branch is a dead orphan with no common ancestor; delete it if it appears.
 - **NEVER read image files** (PNG, JPG, JPEG, BMP, GIF, ICO, SVG, WebP, TIFF, TGA, TVG, etc.) with the Read tool. This causes crashes. No exceptions.
 
 ## Architecture Notes
@@ -183,3 +184,106 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - **Start Menu UI** — side navigation, categories, running-app indicators
 - **Encryption at rest** — login gates master key, per-service keys
 - **SSE2 optimization** — FB_ClearBuffer, compiler integer SSE2 emit
+
+---
+
+## HalCode9000 — Native AILang Chat Client
+
+`Applications/HalCode9000/` — terminal-mode chat client against multiple LLM backends. All binaries live in the HalCode9000 folder alongside the source.
+
+### Build commands
+
+```
+cd /mnt/c/Users/Sean/Documents/AILangSH
+./ailang.x Applications/HalCode9000/HalCode9000.ailang Applications/HalCode9000/HalCode9000.x
+./ailang.x Applications/HalCode9000/cc_tools/cc_bash_ipc.ailang     Applications/HalCode9000/cc_bash_ipc.x
+./ailang.x Applications/HalCode9000/cc_tools/cc_read_ipc.ailang     Applications/HalCode9000/cc_read_ipc.x
+./ailang.x Applications/HalCode9000/cc_tools/cc_write_ipc.ailang    Applications/HalCode9000/cc_write_ipc.x
+./ailang.x Applications/HalCode9000/cc_tools/cc_ls_ipc.ailang       Applications/HalCode9000/cc_ls_ipc.x
+./ailang.x Applications/HalCode9000/cc_tools/cc_head_ipc.ailang     Applications/HalCode9000/cc_head_ipc.x
+./ailang.x Applications/HalCode9000/cc_tools/cc_webfetch_ipc.ailang Applications/HalCode9000/cc_webfetch_ipc.x
+./ailang.x Applications/HalCode9000/cc_tools/cc_pgmem_ipc.ailang    Applications/HalCode9000/cc_pgmem_ipc.x
+./ailang.x Applications/HalCode9000/cc_tools/cc_relmem_ipc.ailang   Applications/HalCode9000/cc_relmem_ipc.x
+cd Applications/HalCode9000 && ./HalCode9000.x
+```
+
+HalCode9000.ailang imports backends/ and UI.ailang transitively — a single compile of HalCode9000.ailang rebuilds everything except the cc_tools.
+
+### Provider menu (startup)
+
+```
+1. Anthropic  (claude-sonnet-4-6)
+2. OpenAI     (gpt-4o)
+3. Grok       (xAI) — grok-3-mini-fast  ← NOTE: Grok/xAI, NOT Groq (different company)
+4. Gemini     (gemini-2.0-flash)
+5. Local      (localhost:11434, ollama)
+6. DeepSeek   (deepseek-v4-flash)
+```
+
+Option 3 is **Grok by xAI** (`api.x.ai`). The HalCode9000.ailang currently labels it "Groq" — needs renaming to "Grok / xAI".
+
+### UI layout (5-row prompt, as of 2026-04-30)
+
+```
+[chat scrollback region]
+ ─────────────────────────  ← top rule (straight ─, no ╭/╰)
+ > input here               ← body row (1 row)
+ ─────────────────────────  ← bottom rule
+   ↑1234 ↓567   /help · /clear · /quit   ← hint row (tok_in/tok_out left, commands right-aligned)
+```
+
+- `UILayout.prompt_h = 5` (quote + top_rule + body + bot_rule + hint)
+- `UI.SetTokens(in, out)` — stores to UILayout.tok_in/tok_out, repaints hint row
+- `UI.SetQuote(text)` — paints a dim status/quote line above the prompt box
+- `UI.AnimTick()` — ticks mascot animation during model TTFT wait (call from idle poll loop)
+- `UI.ChatPrintDim(s)` — dim+italic print for DeepSeek reasoning_content stream
+
+### Known UI.ailang issue to never repeat
+
+The Write tool wrote a literal `\n` (backslash-n, 0x5c 0x6e) at the end of UI.ailang as part of a test marker comment. The AILang lexer saw `\` at column 1 as "Unknown character" and refused to compile. Fixed by trimming the trailing garbage bytes. **Never append `\n` as literal text to .ailang files** — it must be an actual newline byte.
+
+### DeepSeek tool_calls fix (backends/OpenAI.ailang)
+
+Library.JSON's XSHash dropped `tool_calls` when `reasoning_content` was also present in the same object (root cause unclear — bucket collision or ordering). Fix: `OpenAI_BuildAssistantMsgStr()` builds the entire assistant message as raw JSON via `StringConcat` + `JSON.EscapeString`, then `ParseJSON` back. Bypasses XSHash for that object entirely.
+
+**Critical**: OpenAI `arguments` field must be a JSON-encoded STRING (not inline object): `"arguments": "{\"path\":\"/etc/hostname\"}"`. Use `JSON.EscapeString(args_ptr)` before inserting.
+
+### Token display
+
+Both Anthropic and OpenAI backends now call `UI.SetTokens(in, out)` after each turn instead of printing dim text to chat. Anthropic reads `message.usage.input_tokens` from `message_start` event, `usage.output_tokens` from `message_delta` event.
+
+### Relmem (cc_relmem_ipc) — current state and pending redesign
+
+**Current state (2026-04-30):**
+- Index at `~/.claude/relmem/index.json` (~4MB, already built)
+- Socket: `@halcode/Relmem` (abstract Unix socket, bypasses WSL2 tmpfs)
+- Path guard added to `Op_Index`: rejects `/`, `/mnt`, `/mnt/c*`, `/home` — returns error instead of hanging
+
+**Pending redesign (user-specified):**
+`Op_Index` must be redesigned to **require model interaction** rather than walking the filesystem itself:
+1. **Clear** — drop existing index entries for the project path
+2. **Stash** — model uses Bash to enumerate files (e.g. `find <path> -name "*.ailang" | head -500`); op=index without a `files` param should return instructions for this step
+3. **Grep into results** — op=index with `files=<newline-separated-paths>` processes each listed file using grep-style symbol extraction (not the full AILang AST Walker)
+
+This replaces the recursive `Walker_Walk` entirely. The bespoke `Walker_RecurseDir` / `Walker_ProcessFile` / `Parser_Dispatch` chain stays for now but `Op_Index` should no longer call it. Until redesign is done, the path guard prevents hangs.
+
+### WSL2 Hard Rules (system prompt rules 1-5)
+
+Encoded in `CCConst.SYSTEM_PROMPT` in `HalCode9000.ailang`:
+1. NEVER `find /`, `/mnt`, `/mnt/c` — unbounded, hangs permanently
+2. Use `Relmem op=symbols` to locate files in the indexed codebase
+3. If using `find`, scope to a specific known subdirectory
+4. Never produce unbounded output — always pipe through `head`/`grep`/`tail`
+5. NEVER `Relmem op=index` with broad paths — index already built, use `op=symbols`
+
+### Known crash: ~1700 output tokens causes death
+
+Observed consistently: model responses that reach approximately 1700 tokens cause a crash/hang. Not a one-time event — reproducible. Likely a history buffer overflow or a per-turn output buffer cap in the streaming path. **Not yet diagnosed or fixed.** Check `CCHistory`, `AgentLoop.ailang` turn buffer, and `TUI_BufferWriteStr` overflow.
+
+### Bash tool timeout
+
+`cc_bash_ipc.ailang`: `DEFAULT_TIMEOUT = 30` seconds. `timeout_secs=0` from the model maps to 30s, capped at 55s (so IPCDispatch's 60s fence always fires last). Already implemented.
+
+### IPCDispatch
+
+60-second hard timeout on all tool calls via `Socket.SetRecvTimeout(fd, 60000)`. After timeout: returns `"tool TIMED OUT (60s): <name>"` to model. `IPCDispatch_Reconnect` called to flush stale socket state.
