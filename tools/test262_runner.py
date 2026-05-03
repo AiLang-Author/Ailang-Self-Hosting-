@@ -86,6 +86,38 @@ DEFAULT_CATEGORIES = [
     "expressions/unsigned-right-shift",
     "expressions/unary-minus",
     "expressions/unary-plus",
+    "expressions/exponentiation",
+    "expressions/coalesce",
+    "expressions/logical-assignment",
+    "expressions/instanceof",
+    "expressions/in",
+    "expressions/new",
+    "expressions/array",
+    "expressions/arrow-function",
+    "expressions/template-literal",
+    "arguments-object",
+    "computed-property-names",
+    "destructuring",
+    "function-code",
+    "identifiers",
+    "keywords",
+    "literals",
+    "types",
+    "white-space",
+    "comments",
+    "line-terminators",
+    "punctuators",
+    "rest-parameters",
+    "asi",
+    "block-scope",
+    "future-reserved-words",
+    "reserved-words",
+    "directive-prologue",
+    "global-code",
+    "source-text",
+    "identifier-resolution",
+    "eval-code",
+    "statementList",
 ]
 
 # NO SKIPS — full spec conformance target. Every test runs.
@@ -271,9 +303,15 @@ def preprocess(source):
 # RUNNER
 # =============================================================================
 
-def discover_tests(test262_dir, categories):
-    """Yield .js test file paths for the given categories."""
+def discover_tests(test262_dir, categories, discover_all=False):
+    """Yield .js test file paths for the given categories (or all if discover_all)."""
     test_root = Path(test262_dir) / "test" / "language"
+    if discover_all:
+        for js_file in sorted(test_root.rglob("*.js")):
+            if js_file.name.startswith("_"):
+                continue
+            yield str(js_file)
+        return
     for cat in categories:
         cat_dir = test_root / cat
         if not cat_dir.exists():
@@ -429,6 +467,8 @@ def main():
                         help="Per-test timeout in seconds")
     parser.add_argument("--fail-only", action="store_true",
                         help="In verbose mode, only show failures")
+    parser.add_argument("--all", action="store_true",
+                        help="Run ALL tests under test/language/ (not just default categories)")
     args = parser.parse_args()
 
     # Validate
@@ -445,7 +485,7 @@ def main():
     categories = args.categories.split(",") if args.categories else DEFAULT_CATEGORIES
 
     # Discover tests
-    test_files = list(discover_tests(args.test262, categories))
+    test_files = list(discover_tests(args.test262, categories, discover_all=args.all))
     if not test_files:
         print("No test files found for specified categories.", file=sys.stderr)
         sys.exit(1)
