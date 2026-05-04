@@ -1,0 +1,409 @@
+# AILang Self-Hosting Compiler Architecture
+## Reference Document v1.1
+
+### Overview
+
+The self-hosting compiler is built in AILang to compile AILang source to native x86-64 ELF executables. It follows a **modular architecture** with clear separation between:
+
+1. **Frontend** - Lexing and Parsing (COMPLETE)
+2. **AST** - Abstract Syntax Tree manipulation (COMPLETE)
+3. **Compile** - AST → Instructions (one file per construct)
+4. **CodeEmit** - Instructions → Bytes (pure byte emission) (COMPLETE)
+5. **Output** - Bytes → ELF executable (COMPLETE)
+
+### Design Principles
+
+- **Separation of Concerns**: Compile modules call Emit functions, never emit bytes directly
+- **One Construct = One File**: Easy to test, modify, maintain
+- **No Monolithic Compiler**: Each module has Init/Process/Cleanup pattern
+- **Clear Interfaces**: Modules communicate through well-defined function signatures
+- **Architecture Separation**: CodeEmit/X86/ for x86-64, CodeEmit/RISCV/ for future targets
+
+---
+
+## File Structure
+
+```
+Librarys/
+├── XArrays.ailang                    # Dynamic array library
+│
+└── Compiler/
+    │
+    ├── Frontend/                     # Lexer, Parser, AST ✓
+    │   │
+    │   ├── Lexer/
+    │   │   ├── Library.CLexerTypes.ailang      ✓
+    │   │   ├── Library.CLexerCore.ailang       ✓
+    │   │   ├── Library.CLexerKeywords.ailang   ✓
+    │   │   ├── Library.CLexerStrings.ailang    ✓
+    │   │   ├── Library.CLexerNumbers.ailang    ✓
+    │   │   ├── Library.CLexerOperators.ailang  ✓
+    │   │   ├── Library.CLexerIdentifiers.ailang ✓
+    │   │   └── Library.CLexerMain.ailang       ✓
+    │   │
+    │   ├── Parser/
+    │   │   ├── Library.CParserTypes.ailang      ✓
+    │   │   ├── Library.CParserCore.ailang       ✓
+    │   │   ├── Library.CParserExpressions.ailang ✓
+    │   │   ├── Library.CParserStatements.ailang  ✓
+    │   │   ├── Library.CParserDeclarations.ailang ✓
+    │   │   └── Library.CParserMain.ailang       ✓
+    │   │
+    │   └── AST/
+    │       ├── Library.CASTTypes.ailang    ✓
+    │       ├── Library.CASTCore.ailang     ✓
+    │       ├── Library.CASTNodes.ailang    ✓
+    │       ├── Library.CASTDebug.ailang    ✓
+    │       └── Library.CSemanticCore.ailang ✓
+    │
+    ├── Compile/                      # AST → Instructions
+    │   │
+    │   ├── Library.CCompileMain.ailang       ✓ Main dispatcher
+    │   ├── Library.CCompileTypes.ailang        Compile state, VarEntry
+    │   │
+    │   └── Modules/                  # One file per primitive group
+    │       ├── Library.CCompileFunc.ailang       Function, SubRoutine, UserCall
+    │       ├── Library.CCompileStmt.ailang       If, While, Assignment, Return
+    │       ├── Library.CCompileExpr.ailang       Expressions, variable loading
+    │       ├── Library.CCompileArith.ailang      Add, Subtract, Multiply, Divide
+    │       ├── Library.CCompileCompare.ailang    EqualTo, LessThan, GreaterThan
+    │       ├── Library.CCompileLogic.ailang      And, Or, Not
+    │       ├── Library.CCompileBitwise.ailang    BitAnd, BitOr, ShiftLeft
+    │       ├── Library.CCompileIO.ailang         PrintMessage, PrintNumber
+    │       ├── Library.CCompileString.ailang     String operations
+    │       ├── Library.CCompileMem.ailang        Allocate, StoreValue, Dereference
+    │       ├── Library.CCompileArray.ailang      ArrayCreate, ArrayGet, ArraySet
+    │       ├── Library.CCompileXArray.ailang     XArray operations
+    │       └── Library.CCompileSystem.ailang     SystemCall, Exit
+    │
+    ├── CodeEmit/                     # Instructions → Bytes ✓
+    │   │
+    │   ├── Library.CEmitTypes.ailang    ✓ Emit state, Reg, CC, Syscall constants
+    │   ├── Library.CEmitCore.ailang     ✓ Buffer mgmt, labels, fixups
+    │   │
+    │   ├── X86/                      # x86-64 target ✓
+    │   │   ├── Library.CEmitX86Reg.ailang    ✓ MOV reg,reg / MOV reg,imm
+    │   │   ├── Library.CEmitX86Mem.ailang    ✓ Load/store, addressing modes
+    │   │   ├── Library.CEmitX86Stack.ailang  ✓ PUSH, POP, prologue/epilogue
+    │   │   ├── Library.CEmitX86Arith.ailang  ✓ ADD, SUB, MUL, DIV, INC, DEC
+    │   │   ├── Library.CEmitX86Logic.ailang  ✓ AND, OR, XOR, NOT, shifts
+    │   │   ├── Library.CEmitX86Cmp.ailang    ✓ CMP, TEST, SETcc
+    │   │   ├── Library.CEmitX86Jump.ailang   ✓ JMP, Jcc, CALL, RET
+    │   │   └── Library.CEmitX86Sys.ailang    ✓ SYSCALL, NOP, fences, CMOVcc
+    │   │
+    │   └── RISCV/                    # RISC-V target (future)
+    │       ├── Library.CEmitRISCV.ailang
+    │       └── Library.CEmitRISCVSys.ailang
+    │
+    ├── Output/                       # Binary output generation ✓
+    │   ├── Library.CELFTypes.ailang     ✓ ELF64 constants, header structs
+    │   ├── Library.CELFBuilder.ailang   ✓ ELF executable builder
+    │   └── Library.COutput.ailang       ✓ File I/O, write executable
+    │
+    └── Modules/                      # Shared/utility modules
+        └── (reserved for future use)
+```
+
+---
+
+## Import Paths
+
+```ailang
+// Frontend
+LibraryImport.Compiler.Frontend.Lexer.CLexerMain
+LibraryImport.Compiler.Frontend.Parser.CParserMain
+LibraryImport.Compiler.Frontend.AST.CASTCore
+
+// Compile
+LibraryImport.Compiler.Compile.CCompileMain
+LibraryImport.Compiler.Compile.Modules.CCompileArith
+
+// CodeEmit (architecture-agnostic)
+LibraryImport.Compiler.CodeEmit.CEmitTypes
+LibraryImport.Compiler.CodeEmit.CEmitCore
+
+// CodeEmit (x86-64 specific)
+LibraryImport.Compiler.CodeEmit.X86.CEmitX86Reg
+LibraryImport.Compiler.CodeEmit.X86.CEmitX86Mem
+LibraryImport.Compiler.CodeEmit.X86.CEmitX86Stack
+LibraryImport.Compiler.CodeEmit.X86.CEmitX86Arith
+LibraryImport.Compiler.CodeEmit.X86.CEmitX86Logic
+LibraryImport.Compiler.CodeEmit.X86.CEmitX86Cmp
+LibraryImport.Compiler.CodeEmit.X86.CEmitX86Jump
+LibraryImport.Compiler.CodeEmit.X86.CEmitX86Sys
+
+// Output
+LibraryImport.Compiler.Output.CELFTypes
+LibraryImport.Compiler.Output.CELFBuilder
+LibraryImport.Compiler.Output.COutput
+```
+
+---
+
+## Build Status
+
+### Phase 1: Foundation ✓ COMPLETE
+- [x] Lexer - tokenization
+- [x] Parser - AST generation
+- [x] AST module - node types, creation, traversal
+- [x] CEmitTypes - Reg enum, CC enum, Syscall numbers, fixup types
+- [x] CEmitCore - buffer management, labels, fixups, strings
+
+### Phase 2: Code Emission ✓ COMPLETE
+- [x] CEmitX86Reg - register moves, immediates
+- [x] CEmitX86Mem - memory access, addressing modes
+- [x] CEmitX86Stack - push/pop, prologue/epilogue
+- [x] CEmitX86Arith - arithmetic operations
+- [x] CEmitX86Logic - bitwise operations, shifts
+- [x] CEmitX86Cmp - comparisons, SETcc
+- [x] CEmitX86Jump - jumps, calls, returns
+- [x] CEmitX86Sys - syscall, misc instructions
+
+### Phase 3: Output ✓ COMPLETE
+- [x] CELFTypes - ELF64 constants, header structures
+- [x] CELFBuilder - ELF executable generation
+- [x] COutput - file I/O operations
+
+### Phase 4: Compiler Modules (CURRENT)
+- [x] CCompileMain - dispatcher skeleton
+- [ ] CCompileArith - Add, Subtract, Multiply, Divide
+- [ ] CCompileIO - PrintMessage, PrintNumber
+- [ ] CCompileExpr - expression evaluation, variable loading
+- [ ] CCompileFunc - Function, SubRoutine compilation
+
+**Test Target**: `PrintNumber(Add(1, 2))`
+
+### Phase 5: Statements & Control Flow
+- [ ] CCompileStmt - Assignment, Return, Block
+- [ ] CCompileStmt - If, While
+- [ ] Loop context (break, continue)
+
+### Phase 6: Memory & Pools
+- [ ] CCompileMem - Allocate, StoreValue, Dereference
+- [ ] CCompilePool - FixedPool access
+
+### Phase 7: Full Compiler
+- [ ] CCompileCompare - EqualTo, LessThan, etc.
+- [ ] CCompileLogic - And, Or, Not
+- [ ] CCompileBitwise - BitAnd, BitOr, shifts
+- [ ] CCompileString - string operations
+- [ ] CCompileArray - array operations
+- [ ] CCompileXArray - XArray operations
+- [ ] CCompileSystem - SystemCall, Exit
+
+### Phase 8: Self-Hosting
+- [ ] Compile the compiler with itself!
+
+---
+
+## Compilation Pipeline
+
+```
+Source Code (.ailang)
+    │
+    ▼
+┌─────────────────────┐
+│  CLexerMain         │  Lex_Tokenize(source)
+│  (Lexer)            │  → Token stream
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  CParserMain        │  Parse_Program()
+│  (Parser)           │  → AST
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  CCompileMain       │  Compile_Program(ast)
+│  (Compiler)         │  → Calls CCompile* modules
+│  + CCompile*        │  → Calls X86_* emit functions
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  CEmitCore          │  Emit_ResolveFixups()
+│  (Fixups)           │  → Patched code/data buffers
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  CELFBuilder        │  ELF_Build(code, data)
+│  (ELF Generation)   │  → ELF binary in memory
+└─────────────────────┘
+    │
+    ▼
+┌─────────────────────┐
+│  COutput            │  Output_WriteExecutable()
+│  (File I/O)         │  → Executable file on disk
+└─────────────────────┘
+```
+
+---
+
+## Module Dispatch Pattern
+
+The compiler uses a **try-compile** dispatch pattern for function calls:
+
+```ailang
+Function.Compile_FunctionCall {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        // Try each module until one handles the call
+        result = CompileArith_TryCompile(node)
+        IfCondition EqualTo(result, 1) ThenBlock: { ReturnValue(1) }
+        
+        result = CompileCompare_TryCompile(node)
+        IfCondition EqualTo(result, 1) ThenBlock: { ReturnValue(1) }
+        
+        result = CompileIO_TryCompile(node)
+        IfCondition EqualTo(result, 1) ThenBlock: { ReturnValue(1) }
+        
+        // ... more modules ...
+        
+        // Finally try user-defined functions
+        result = CompileFunc_UserCall(node)
+        IfCondition EqualTo(result, 1) ThenBlock: { ReturnValue(1) }
+        
+        // Unknown function
+        Compile_Error("Unknown function", AST_GetLine(node))
+        ReturnValue(0)
+    }
+}
+```
+
+Each module's `TryCompile` returns:
+- `1` if it handled the operation
+- `0` if not its responsibility (try next module)
+
+---
+
+## Example: Compiling `x = Add(1, 2)`
+
+```
+1. Parser creates AST:
+   ASSIGNMENT
+   ├── DATA1: "x"
+   └── CALL
+       ├── DATA1: "Add"
+       ├── NUMBER (value=1)
+       └── NUMBER (value=2)
+
+2. CCompileMain.Compile_Node sees ASSIGNMENT
+   → Dispatches to CompileStmt_Assignment
+
+3. CompileStmt_Assignment:
+   a) Compile the value expression
+   b) Store result to variable
+
+4. Compile_Expression sees CALL node
+   → Dispatches to Compile_FunctionCall
+
+5. Compile_FunctionCall tries modules:
+   → CompileArith_TryCompile sees "Add"
+   → Returns 1 (handled)
+
+6. CompileArith_Add:
+   a) Compile_Expression(arg2)  → X86_MovRaxImm64(2)
+   b) X86_PushRax()
+   c) Compile_Expression(arg1)  → X86_MovRaxImm64(1)
+   d) X86_PopRbx()
+   e) X86_AddRaxRbx()           → Result in RAX
+
+7. Back in Assignment:
+   → X86_MovRbpOffsetRax(x_offset)
+
+8. Code bytes now in Emit.code buffer
+```
+
+---
+
+## Key Data Structures
+
+### Emit State (CEmitTypes)
+```ailang
+FixedPool.Emit {
+    "code": Initialize=0, CanChange=True      // Code buffer
+    "code_size": Initialize=0, CanChange=True
+    "data": Initialize=0, CanChange=True      // Data buffer (strings)
+    "data_size": Initialize=0, CanChange=True
+    "labels": Initialize=0, CanChange=True    // Label array
+    "label_count": Initialize=0, CanChange=True
+    "fixups": Initialize=0, CanChange=True    // Fixup array
+    "fixup_count": Initialize=0, CanChange=True
+}
+```
+
+### Compile State (CCompileMain)
+```ailang
+FixedPool.Compile {
+    "ast": Initialize=0, CanChange=True
+    "functions": Initialize=0, CanChange=True   // Function registry
+    "variables": Initialize=0, CanChange=True   // Variable registry
+    "current_func": Initialize=0, CanChange=True
+    "stack_offset": Initialize=0, CanChange=True
+    "label_counter": Initialize=0, CanChange=True
+    "loop_stack": Initialize=0, CanChange=True  // For break/continue
+    "error": Initialize=0, CanChange=True
+}
+```
+
+---
+
+## Register Conventions
+
+| Register | Purpose |
+|----------|---------|
+| RAX | Return value, arithmetic result |
+| RBX | Secondary operand for binary ops |
+| RCX | Shift count, loop counter |
+| RDX | Division remainder, arg3 |
+| RSI | Syscall arg2, string source |
+| RDI | Syscall arg1, string dest |
+| RBP | Stack frame base |
+| RSP | Stack pointer |
+| R8-R9 | Syscall args 5-6 |
+| R10 | Syscall arg4 |
+| R11 | Scratch (clobbered by syscall) |
+| R12-R13 | Temp registers for nested expressions |
+| R14 | Reserved (future use) |
+| R15 | Pool table base pointer |
+
+---
+
+## Known Issues / Notes
+
+1. **Pool Variable Collision**: Field names must be unique across all pools. CParserTypes uses P_ prefix to avoid collision with CLexerTypes.
+
+2. **Pool Table Size**: Minimum 16KB (2048 slots) to handle large library imports.
+
+3. **Import Order**: Libraries are discovered AFTER pool table allocation.
+
+4. **Register Allocation**: R15 reserved for pool table base. R12, R13 for temps in nested expressions. Use stack for depth > 2.
+
+5. **String Table**: Data section strings stored via `Emit_AddString()`, returns offset for LEA instruction.
+
+6. **Label/Fixup System**: Forward jumps use fixups, resolved by `Emit_ResolveFixups()` after all code emitted.
+
+---
+
+## Console Application
+
+The `ailang_console.ailang` provides interactive testing:
+
+```
+ailang> load test.ailang     # Load source file
+ailang> compile              # Run compilation
+ailang> build output         # Generate executable
+ailang> tokens on            # Show token stream
+ailang> ast on               # Show AST dump
+ailang> status               # Show compiler state
+ailang> quit                 # Exit
+```
+
+---
+
+*Document Version: 1.1*
+*Date: December 25, 2025*
+*Status: Foundation complete, compiler modules in progress*
