@@ -21,6 +21,16 @@ FixedPool.JSValidConst {
     // Table sizes — must be >= max token/AST type value
     "TOK_TABLE_SIZE":    Initialize=256
     "AST_TABLE_SIZE":    Initialize=64
+    // Scope tracking — redeclaration detection
+    "MAX_SCOPE_DEPTH":   Initialize=16
+    "MAX_SCOPE_NAMES":   Initialize=64
+    // Entry size: ptr(8) + len(8) + kind(8) = 24 bytes
+    "SCOPE_ENTRY_SIZE":  Initialize=24
+    // Scope slab size: 64 names * 24 bytes = 1536 bytes per scope level
+    "SCOPE_SLAB_SIZE":   Initialize=1536
+    // Kind values: 0=var (allows redecl), 1=let/const/class/function-in-block
+    "KIND_VAR":          Initialize=0
+    "KIND_LEXICAL":      Initialize=1
 }
 
 // =============================================================================
@@ -33,6 +43,22 @@ FixedPool.JSValidState {
     "stmt_start":        Initialize=0
     "expr_start":        Initialize=0
     "after_token":       Initialize=0
+    // Scope tracking for redeclaration detection
+    "scope_depth":       Initialize=0
+    "scope_counts":      Initialize=0
+    "scope_names":       Initialize=0
+}
+
+// Temporaries for scope operations — must be in FixedPool to survive calls
+FixedPool.JSValidTmp {
+    "i":          Initialize=0
+    "addr":       Initialize=0
+    "ep":         Initialize=0
+    "el":         Initialize=0
+    "ek":         Initialize=0
+    "match":      Initialize=0
+    "j":          Initialize=0
+    "base":       Initialize=0
 }
 
 // =============================================================================
@@ -147,6 +173,15 @@ Function.JSValidate_Init {
         SetByte(JSValidState.expr_start, 125, 1)    // TMPL_FULL
         SetByte(JSValidState.expr_start, 126, 1)    // TMPL_HEAD
 
+        // --- Scope tracking tables for redeclaration detection ---
+        // scope_counts: array of 16 integers (8 bytes each) = 128 bytes
+        JSValidState.scope_counts = Arena_Alloc(128)
+        MemorySet(JSValidState.scope_counts, 0, 128)
+        // scope_names: 16 slabs * 1536 bytes = 24576 bytes
+        JSValidState.scope_names = Arena_Alloc(24576)
+        MemorySet(JSValidState.scope_names, 0, 24576)
+        JSValidState.scope_depth = 0
+
         JSValidState.initialized = 1
         ReturnValue(1)
     }
@@ -207,5 +242,141 @@ Function.JSValidate_CanStartStmt {
             ReturnValue(0)
         }
         ReturnValue(GetByte(JSValidState.stmt_start, tok_type))
+    }
+}
+
+// =============================================================================
+// SCOPE TRACKING — lexical redeclaration detection
+// =============================================================================
+
+// String equality check: compare two ptr+len pairs byte-by-byte
+// Returns 1 if equal, 0 if not. Uses JSValidTmp fields for loop state.
+Function.JSValidate__StrEq {
+    Input: p1: Address
+    Input: l1: Integer
+    Input: p2: Address
+    Input: l2: Integer
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(l1, l2) ThenBlock: { ReturnValue(0) }
+        JSValidTmp.i = 0
+        WhileLoop LessThan(JSValidTmp.i, l1) {
+            IfCondition NotEqual(GetByte(p1, JSValidTmp.i), GetByte(p2, JSValidTmp.i)) ThenBlock: {
+                ReturnValue(0)
+            }
+            JSValidTmp.i = Add(JSValidTmp.i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Push a new scope level. Called when entering { block } or switch body.
+Function.JSValidate_PushScope {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(JSValidState.scope_depth, JSValidConst.MAX_SCOPE_DEPTH) ThenBlock: {
+            ReturnValue(0)
+        }
+        // Zero the count for the new scope level
+        StoreValue(Add(JSValidState.scope_counts, Multiply(JSValidState.scope_depth, 8)), 0)
+        JSValidState.scope_depth = Add(JSValidState.scope_depth, 1)
+        ReturnValue(1)
+    }
+}
+
+// Pop current scope level. Called when leaving } block or switch body.
+Function.JSValidate_PopScope {
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(JSValidState.scope_depth, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        JSValidState.scope_depth = Subtract(JSValidState.scope_depth, 1)
+        // Reset count for the popped scope
+        StoreValue(Add(JSValidState.scope_counts, Multiply(JSValidState.scope_depth, 8)), 0)
+        ReturnValue(1)
+    }
+}
+
+// Reset all scope state. Called at start of each compilation unit.
+Function.JSValidate_ResetScopes {
+    Output: Integer
+    Body: {
+        JSValidState.scope_depth = 0
+        MemorySet(JSValidState.scope_counts, 0, 128)
+        ReturnValue(1)
+    }
+}
+
+// Declare a binding in the current scope. Returns 1 if OK, 0 if redeclaration error.
+// kind: 0 = var (allows same-scope redecl with other vars), 1 = lexical (let/const/class/func-in-block)
+// Rules:
+//   - let/const/class cannot redeclare ANY existing name in same scope
+//   - var cannot redeclare a let/const/class in same scope
+//   - var CAN redeclare another var in same scope
+Function.JSValidate_DeclareBinding {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Input: kind: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(JSValidState.scope_depth, 0) ThenBlock: {
+            // No scope active — allow (top-level var decls outside blocks)
+            ReturnValue(1)
+        }
+
+        // Get current scope index (depth - 1)
+        JSValidTmp.base = Subtract(JSValidState.scope_depth, 1)
+
+        // Get count of names in current scope
+        JSValidTmp.i = Dereference(Add(JSValidState.scope_counts, Multiply(JSValidTmp.base, 8)))
+
+
+        // Search existing names in this scope for a match
+        JSValidTmp.addr = Add(JSValidState.scope_names, Multiply(JSValidTmp.base, JSValidConst.SCOPE_SLAB_SIZE))
+        JSValidTmp.j = 0
+        WhileLoop LessThan(JSValidTmp.j, JSValidTmp.i) {
+            JSValidTmp.ep = Dereference(Add(JSValidTmp.addr, Multiply(JSValidTmp.j, JSValidConst.SCOPE_ENTRY_SIZE)))
+            JSValidTmp.el = Dereference(Add(Add(JSValidTmp.addr, Multiply(JSValidTmp.j, JSValidConst.SCOPE_ENTRY_SIZE)), 8))
+            JSValidTmp.ek = Dereference(Add(Add(JSValidTmp.addr, Multiply(JSValidTmp.j, JSValidConst.SCOPE_ENTRY_SIZE)), 16))
+
+            // Quick length check first
+            IfCondition EqualTo(JSValidTmp.el, name_len) ThenBlock: {
+                // SSE2-accelerated memory comparison
+                JSValidTmp.match = MemCompare(name_ptr, JSValidTmp.ep, name_len)
+                IfCondition EqualTo(JSValidTmp.match, 0) ThenBlock: {
+                    // Found a matching name! Check redeclaration rules:
+                    // - If new binding is lexical (kind=1): ALWAYS error
+                    // - If new binding is var (kind=0): error only if existing is lexical
+                    IfCondition EqualTo(kind, JSValidConst.KIND_LEXICAL) ThenBlock: {
+                        ReturnValue(0)
+                    }
+                    // kind=0 (var) — error if existing is lexical
+                    IfCondition EqualTo(JSValidTmp.ek, JSValidConst.KIND_LEXICAL) ThenBlock: {
+                        ReturnValue(0)
+                    }
+                    // var redeclaring var — allowed, just return OK
+                    ReturnValue(1)
+                }
+            }
+            JSValidTmp.j = Add(JSValidTmp.j, 1)
+        }
+
+        // No duplicate found — add the binding
+        IfCondition GreaterEqual(JSValidTmp.i, JSValidConst.MAX_SCOPE_NAMES) ThenBlock: {
+            // Scope full — silently allow (don't crash)
+            ReturnValue(1)
+        }
+
+        // Store: [ptr, len, kind] at entry index i
+        JSValidTmp.addr = Add(JSValidTmp.addr, Multiply(JSValidTmp.i, JSValidConst.SCOPE_ENTRY_SIZE))
+        StoreValue(JSValidTmp.addr, name_ptr)
+        StoreValue(Add(JSValidTmp.addr, 8), name_len)
+        StoreValue(Add(JSValidTmp.addr, 16), kind)
+
+        // Increment count
+        StoreValue(Add(JSValidState.scope_counts, Multiply(JSValidTmp.base, 8)), Add(JSValidTmp.i, 1))
+
+        ReturnValue(1)
     }
 }

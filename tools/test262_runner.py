@@ -26,7 +26,9 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # =============================================================================
@@ -140,7 +142,9 @@ EPILOGUE = """
 if (__test262_failed) { __force_fail__(); }
 """
 
-TMP_FILE = "/tmp/test262_current.js"
+TMP_FILE = "/tmp/test262_current.js"  # legacy single-thread path
+_thread_local = threading.local()
+_ORIG_PATH = b"/tmp/test262_current.js"  # 23 bytes — must match harness binary
 
 # =============================================================================
 # FRONTMATTER PARSER
@@ -345,21 +349,22 @@ def run_test(harness, test_path, timeout, verbose=False):
     processed = preprocess(source)
     full_source = POLYFILL + processed + EPILOGUE
 
-    # Write to temp file
+    # Write to per-worker temp file
+    tmp_path = getattr(_thread_local, 'tmp_path', TMP_FILE)
     try:
-        with open(TMP_FILE, "w") as f:
+        with open(tmp_path, "w") as f:
             f.write(full_source)
     except Exception as e:
         return {"path": test_path, "status": "error", "reason": f"write:{e}", "time_ms": 0}
 
-    # Execute
+    harness_bin = getattr(_thread_local, 'harness', harness)
     is_negative = meta.get("negative", False)
     neg_phase = meta.get("negative_phase", "runtime")
 
     t0 = time.monotonic()
     try:
         result = subprocess.run(
-            [harness],
+            [harness_bin],
             timeout=timeout,
             capture_output=True,
         )
@@ -451,6 +456,51 @@ def print_report(results, test262_dir):
 # MAIN
 # =============================================================================
 
+def _make_worker_harness(base_harness, worker_id):
+    """Create a per-worker harness binary with a unique temp file path.
+
+    Binary-patches the hardcoded '/tmp/test262_current.js' string in the ELF
+    to '/tmp/test262_wNNNNNNN.js' (same 24-byte length, null-terminated).
+    Returns (harness_path, tmp_js_path)."""
+    new_name = f"test262_w{worker_id:06d}"           # 14 chars
+    new_path = f"/tmp/{new_name}.js"                 # 23 chars — same as original
+    new_path_b = new_path.encode("ascii")
+
+    harness_data = open(base_harness, "rb").read()
+    # Replace ALL occurrences of the original path (both the ReadTextFile arg
+    # and the error message contain the same string).  Since both paths are the
+    # same byte-length, the ELF layout is preserved.
+    assert len(new_path_b) == len(_ORIG_PATH), \
+        f"path length mismatch: {len(new_path_b)} vs {len(_ORIG_PATH)}"
+    patched = harness_data.replace(_ORIG_PATH, new_path_b)
+
+    worker_bin = f"/tmp/test262_harness_w{worker_id}.x"
+    with open(worker_bin, "wb") as f:
+        f.write(patched)
+    os.chmod(worker_bin, 0o755)
+    return worker_bin, new_path
+
+
+def _worker_init(harness_path, tmp_path):
+    """Called once per thread to set thread-local state."""
+    _thread_local.harness = harness_path
+    _thread_local.tmp_path = tmp_path
+
+
+_progress_lock = threading.Lock()
+_progress_count = 0
+
+
+def _run_test_parallel(args_tuple):
+    """Wrapper for ThreadPoolExecutor — unpacks args and tracks progress."""
+    global _progress_count
+    harness, test_path, timeout = args_tuple
+    r = run_test(harness, test_path, timeout)
+    with _progress_lock:
+        _progress_count += 1
+    return r
+
+
 def main():
     parser = argparse.ArgumentParser(description="Test262 conformance runner for Ailang JS engine")
     parser.add_argument("--categories", type=str, default=None,
@@ -469,6 +519,8 @@ def main():
                         help="In verbose mode, only show failures")
     parser.add_argument("--all", action="store_true",
                         help="Run ALL tests under test/language/ (not just default categories)")
+    parser.add_argument("--jobs", "-j", type=int, default=0,
+                        help="Parallel workers (0=auto, 1=sequential)")
     args = parser.parse_args()
 
     # Validate
@@ -483,6 +535,7 @@ def main():
         sys.exit(1)
 
     categories = args.categories.split(",") if args.categories else DEFAULT_CATEGORIES
+    njobs = args.jobs if args.jobs > 0 else os.cpu_count() or 4
 
     # Discover tests
     test_files = list(discover_tests(args.test262, categories, discover_all=args.all))
@@ -492,31 +545,92 @@ def main():
 
     print(f"Test262 Conformance — Ailang JS Engine")
     print(f"Tests discovered: {len(test_files)}")
-    print(f"Categories: {len(categories)}")
+    print(f"Workers: {njobs}")
     print()
 
-    # Run tests
-    results = []
     t_start = time.monotonic()
 
-    for i, tf in enumerate(test_files):
-        r = run_test(args.harness, tf, args.timeout, args.verbose)
-        results.append(r)
+    if njobs == 1 or args.verbose:
+        # Sequential mode (also used for verbose since output ordering matters)
+        results = []
+        for i, tf in enumerate(test_files):
+            r = run_test(args.harness, tf, args.timeout, args.verbose)
+            results.append(r)
+            if args.verbose:
+                short = os.path.relpath(tf, args.test262)
+                if args.fail_only and r["status"] in ("pass", "skip"):
+                    pass
+                else:
+                    status_sym = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP",
+                                  "timeout": "T/O ", "error": "ERR "}
+                    sym = status_sym.get(r["status"], "????")
+                    extra = f"  ({r['reason']})" if r["reason"] else ""
+                    print(f"  [{sym}] {short}{extra}")
+            if not args.verbose and (i + 1) % 100 == 0:
+                print(f"  ... {i + 1}/{len(test_files)} tests completed", flush=True)
+    else:
+        # Parallel mode — each worker thread owns a dedicated harness binary
+        # with a unique temp file path binary-patched in. Workers pull tests
+        # from a shared queue so there are no race conditions on temp files.
+        import queue
 
-        if args.verbose:
-            short = os.path.relpath(tf, args.test262)
-            if args.fail_only and r["status"] in ("pass", "skip"):
-                pass
-            else:
-                status_sym = {"pass": "PASS", "fail": "FAIL", "skip": "SKIP",
-                              "timeout": "T/O ", "error": "ERR "}
-                sym = status_sym.get(r["status"], "????")
-                extra = f"  ({r['reason']})" if r["reason"] else ""
-                print(f"  [{sym}] {short}{extra}")
+        worker_assets = []
+        for wid in range(njobs):
+            h_path, t_path = _make_worker_harness(args.harness, wid)
+            worker_assets.append((h_path, t_path))
 
-        # Progress every 100 tests (non-verbose)
-        if not args.verbose and (i + 1) % 100 == 0:
-            print(f"  ... {i + 1}/{len(test_files)} tests completed", flush=True)
+        results = [None] * len(test_files)
+        total = len(test_files)
+        work_q = queue.Queue()
+        for i, tf in enumerate(test_files):
+            work_q.put((i, tf))
+
+        done_count = [0]
+        done_lock = threading.Lock()
+
+        def _worker_thread(wid):
+            h_path, t_path = worker_assets[wid]
+            _thread_local.tmp_path = t_path
+            _thread_local.harness = h_path
+            while True:
+                try:
+                    idx, test_path = work_q.get_nowait()
+                except queue.Empty:
+                    return
+                r = run_test(h_path, test_path, args.timeout)
+                results[idx] = r
+                with done_lock:
+                    done_count[0] += 1
+
+        # Progress reporter thread
+        stop_progress = threading.Event()
+        def _progress_reporter():
+            while not stop_progress.is_set():
+                with done_lock:
+                    d = done_count[0]
+                print(f"  ... {d}/{total} tests completed", flush=True)
+                stop_progress.wait(3.0)
+
+        pt = threading.Thread(target=_progress_reporter, daemon=True)
+        pt.start()
+
+        threads = []
+        for wid in range(njobs):
+            t = threading.Thread(target=_worker_thread, args=(wid,))
+            t.start()
+            threads.append(t)
+        for t in threads:
+            t.join()
+
+        stop_progress.set()
+        pt.join(timeout=1)
+
+        # Cleanup worker binaries
+        for h_path, t_path in worker_assets:
+            try: os.unlink(h_path)
+            except: pass
+            try: os.unlink(t_path)
+            except: pass
 
     t_total = time.monotonic() - t_start
 

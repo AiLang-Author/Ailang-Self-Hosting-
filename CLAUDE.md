@@ -191,7 +191,7 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - **Class method destructuring parameters** — Class body parameter parser was only accepting simple IDENT tokens. Replaced with full destructuring-aware parsing matching the FuncExpr path: supports `{ x, y }` object patterns, `[ a, b ]` array patterns, `...rest` parameters, and `= default` values. All patterns use AST__Push/Pop to protect 8 local variables (ASTTmp.first, ASTTmp.last, ASTTmp.done, mflags, method, param_first, param_last, p_done) across recursive JSParse__ParseBindTarget/JSParse__Assign calls. Result: ~+2,000 passes.
 - **Destructuring assignment + for-of destructuring** — Two-part fix. **(1) For-of with patterns**: JSParser `JSParse__VarDeclSingle` now skips `=` requirement when next token is `in` or `of` (contextual detection, skip_semi=1 for-loop context). JSCompiler FOR_OF_STMT handler checks `forof_dstr_pat = JSParse_GetRight(lhs_n)` — when pattern exists, stores element in `__dt__` temp local and dispatches to `JSComp__CompileArrayPattern`/`JSComp__CompileObjPattern`. **(2) Assignment destructuring**: Cover grammar conversion via `JSParse__CoverToPattern` — recursive walker converts ARRAY_LIT(25)→ARRAY_PATTERN(42), OBJECT_LIT(24)→OBJECT_PATTERN(43), UNDEF_LIT→NULL_LIT (holes), SPREAD_ELEMENT→REST_ELEMENT, nested patterns recursed. Called from `JSParse__Assign` when `=` follows ARRAY_LIT/OBJECT_LIT. JSValidate assign_target table extended with types 24,25,42,43. Compiler ASSIGN handler detects ARRAY_PATTERN/OBJECT_PATTERN LHS → compile RHS, DUP (return value), store in `__dt__` temp, dispatch to pattern compilers. Result: +422 net passes (12,128 → 12,550).
 
-### Test262 Conformance (as of 2026-05-03)
+### Test262 Conformance (as of 2026-05-04)
 
 `tools/test262_runner.py` has been fully unblocked — `UNSUPPORTED_FEATURES = set()`, `UNSUPPORTED_SOURCE_PATTERNS = []`, `should_skip()` always returns `(False, "")`.
 
@@ -201,9 +201,15 @@ Use `--all` flag for full suite: `python3 tools/test262_runner.py --all`
 
 #### Full Suite (23,899 tests, --all flag)
 
-**Overall: 15,236 / 23,899 passing (64.0%)** — post Object.defineProperty + class method dstr params fix
+**Overall: 17,759 / 23,899 passing (74.5%)** — post optional chaining, template literals, catch destructuring, parallel runner
 
-Previous baseline (pre-class): 11,935/23,899 (50.0%). The net -74 is a scoring artifact: ~1,354 negative tests that previously "passed" (parser couldn't parse `class` at all, matching expected parse-phase failure) now get further and fail differently. Genuine new passes: +1,280.
+Previous: 17,488/23,899 (73.4%). Net +271 from template literal fixes, optional chaining, catch param destructuring/parameterless catch, scope infrastructure (WIP).
+
+#### Benchmark Results
+
+- **SunSpider 1.0**: 26/26 passing (100%) — all tests execute correctly
+- **Octane**: 8/8 core benchmarks parse+execute (richards, deltablue, crypto, raytrace, earley-boyer, navier-stokes, splay, code-load)
+- **Internal micro-benchmarks**: 6.3ms total (fib(20)=0.147ms, loop 100k=5.4ms, arith 50k=0.14ms)
 
 **Full suite failure breakdown by category:**
 
@@ -240,7 +246,7 @@ Previous baseline (pre-class): 11,935/23,899 (50.0%). The net -74 is a scoring a
 
 ### JS Engine — Test262 Conformance Push (active)
 
-**Current: 15,236/23,899 (64.0%). Target: 80%+ (~19,100 passing).**
+**Current: 17,759/23,899 (74.5%). Target: 80%+ (~19,100 passing).**
 
 Class syntax implemented (2026-05-03): +1,280 genuine new passes. statements/class at 55.0%, expressions/class at 23.2%.
 For-of loops implemented (2026-05-03): +267 net passes via TO_ARRAY eager materialization. Crossed 50% milestone.
