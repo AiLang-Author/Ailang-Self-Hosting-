@@ -1,0 +1,1032 @@
+// Library.JSJIT.ailang — Method JIT compiler for the JS bytecode VM
+// Compiles JS bytecode functions to native code on first call.
+// Uses dual-buffer mailbox allocator with ping-pong GC.
+//
+// Architecture:
+//   - Bump allocator into mmap'd RWX pages (2MB default)
+//   - Two buffers (A/B): active writes forward, cold buffer swept on flip
+//   - Entry table: func_idx → native_addr (direct index, O(1) lookup)
+//   - Trampoline: register setup → call native → writeback VM state
+//   - Bail stubs: return to interpreter for complex/rare opcodes
+//
+// PORTABILITY:
+//   Uses CEmitCoreArch (Emit_*) for all code generation. Architecture is
+//   selected by Emit.target at init time. When ARM64 backend exists, this
+//   JIT works on ARM without modification.
+//
+// Register Convention (inside JIT'd code):
+//   RAX  — scratch / TOS cache / return value
+//   RBX  — scratch (callee-saved, pushed by trampoline)
+//   RCX  — scratch / arg passing
+//   RDX  — scratch / 128-bit multiply upper
+//   RSI  — scratch / arg passing
+//   RDI  — scratch / arg passing
+//   RBP  — locals base pointer (frame)
+//   R12  — VM stack base (JSVMState.stack)
+//   R13  — VM stack pointer (sp index)
+//   R14  — const pool base
+//   R15  — reserved
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Browser.JSRuntime
+LibraryImport.Compiler.CodeEmit.CEmitCore
+LibraryImport.Compiler.CodeEmit.CEmitCoreArch
+LibraryImport.Compiler.CodeEmit.CEmitTypes
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.JITConst {
+    // Memory
+    "DEFAULT_BUF_SIZE":  Initialize=2097152    // 2MB per buffer
+    "ALIGN":             Initialize=16         // Code alignment (instruction fetch)
+    "MAX_ENTRIES":       Initialize=1024       // Max JIT'd functions
+    "ENTRY_SIZE":        Initialize=32         // [func_idx(8), native_addr(8), code_size(8), call_count(8)]
+
+    // mmap constants
+    "PROT_RWX":          Initialize=7          // PROT_READ|PROT_WRITE|PROT_EXEC
+    "MAP_ANON_PRIV":     Initialize=34         // MAP_PRIVATE|MAP_ANONYMOUS
+    "SYS_MMAP":          Initialize=9
+    "SYS_MUNMAP":        Initialize=11
+    "SYS_MREMAP":        Initialize=25
+    "MREMAP_MAYMOVE":    Initialize=1
+
+    // Thresholds
+    "GROW_THRESHOLD":    Initialize=90         // Grow if >90% used before flip
+    "SHRINK_THRESHOLD":  Initialize=25         // Shrink if <25% used for 10 flips
+    "SHRINK_INTERVAL":   Initialize=10         // Check shrink every N flips
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.JITState {
+    "buf_a":         Initialize=0    // Buffer A base address
+    "buf_b":         Initialize=0    // Buffer B base address
+    "buf_size":      Initialize=0    // Current size per buffer
+    "active":        Initialize=0    // 0=A, 1=B
+    "head":          Initialize=0    // Write cursor in active buffer
+    "tail":          Initialize=0    // End of active buffer
+    "entries":       Initialize=0    // Entry table base (Arena allocated)
+    "count":         Initialize=0    // Number of compiled entries
+    "enabled":       Initialize=0    // 1=JIT active
+    "flip_count":    Initialize=0    // Total flips
+    "peak_usage":    Initialize=0    // Peak bytes used in a buffer (for shrink)
+    "initialized":   Initialize=0
+    "locals_ptr":    Initialize=0    // Pre-computed locals base pointer for current call
+    "param_block":   Initialize=0    // 32-byte block: [stack_base, sp, locals_ptr, const_pool]
+}
+
+// Temporaries for JIT compilation (clobber-safe)
+FixedPool.JITTmp {
+    "emit_ptr":      Initialize=0    // Saved Emit.code pointer (for restore)
+    "emit_cap":      Initialize=0    // Saved Emit.code_capacity
+    "emit_size":     Initialize=0    // Saved Emit.code_size
+    "emit_start":    Initialize=0    // Start of current function's code in buffer
+    "pc":            Initialize=0    // Bytecode read cursor during compilation
+    "op":            Initialize=0    // Current opcode being compiled
+    "arg":           Initialize=0    // Current opcode argument
+    "i":             Initialize=0    // Loop counter
+    "addr":          Initialize=0    // Temp address
+    "val":           Initialize=0    // Temp value
+    "patch":         Initialize=0    // Jump patch location
+    "labels":        Initialize=0    // Arena-allocated label→native_offset map
+    "label_count":   Initialize=0    // Number of bytecode labels
+}
+
+// =============================================================================
+// INIT — Allocate executable buffers and entry table
+// =============================================================================
+Function.JIT_Init {
+    Output: Integer
+    Body: {
+        JITState.buf_size = JITConst.DEFAULT_BUF_SIZE
+
+        // mmap buffer A: RWX anonymous private
+        JITState.buf_a = SystemCall(JITConst.SYS_MMAP, 0, JITState.buf_size, JITConst.PROT_RWX, JITConst.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(JITState.buf_a, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // mmap buffer B
+        JITState.buf_b = SystemCall(JITConst.SYS_MMAP, 0, JITState.buf_size, JITConst.PROT_RWX, JITConst.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(JITState.buf_b, 0) ThenBlock: {
+            SystemCall(JITConst.SYS_MUNMAP, JITState.buf_a, JITState.buf_size)
+            ReturnValue(0)
+        }
+
+        // Set active to buffer A
+        JITState.active = 0
+        JITState.head = JITState.buf_a
+        JITState.tail = Add(JITState.buf_a, JITState.buf_size)
+
+        // Allocate entry table (1024 entries x 32 bytes = 32KB)
+        JITState.entries = Arena_Alloc(Multiply(JITConst.MAX_ENTRIES, JITConst.ENTRY_SIZE))
+        MemorySet(JITState.entries, 0, Multiply(JITConst.MAX_ENTRIES, JITConst.ENTRY_SIZE))
+        JITState.count = 0
+
+        // Allocate param block (32 bytes) — stable address for JIT code to load from
+        JITState.param_block = Arena_Alloc(32)
+        MemorySet(JITState.param_block, 0, 32)
+
+        JITState.flip_count = 0
+        JITState.peak_usage = 0
+        JITState.enabled = 0
+        JITState.initialized = 1
+
+        // JIT initialized silently
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// ALLOCATOR — Bump allocate from active buffer
+// =============================================================================
+
+// Allocate `size` bytes of executable memory. Returns pointer or 0 on fail.
+Function.JIT_Alloc {
+    Input: size: Integer
+    Output: Address
+    Body: {
+        save_size = size
+        // Align size up to 16 bytes
+        save_size = And(Add(save_size, 15), -16)
+
+        // Check if fits in current buffer
+        IfCondition GreaterThan(Add(JITState.head, save_size), JITState.tail) ThenBlock: {
+            // Track peak usage before flip
+            JITTmp.val = Subtract(JITState.head, JITState.buf_a)
+            IfCondition EqualTo(JITState.active, 1) ThenBlock: {
+                JITTmp.val = Subtract(JITState.head, JITState.buf_b)
+            }
+            IfCondition GreaterThan(JITTmp.val, JITState.peak_usage) ThenBlock: {
+                JITState.peak_usage = JITTmp.val
+            }
+
+            // Flip to other buffer
+            JIT_Flip()
+
+            // Check again after flip
+            IfCondition GreaterThan(Add(JITState.head, save_size), JITState.tail) ThenBlock: {
+                JIT_Grow()
+                IfCondition GreaterThan(Add(JITState.head, save_size), JITState.tail) ThenBlock: {
+                    ReturnValue(0)
+                }
+            }
+        }
+
+        // Bump allocate
+        JITTmp.addr = JITState.head
+        JITState.head = Add(JITState.head, save_size)
+        ReturnValue(JITTmp.addr)
+    }
+}
+
+// Flip active buffer — switch from A to B or B to A
+Function.JIT_Flip {
+    Output: Integer
+    Body: {
+        JITState.flip_count = Add(JITState.flip_count, 1)
+
+        IfCondition EqualTo(JITState.active, 0) ThenBlock: {
+            JITState.active = 1
+            JITState.head = JITState.buf_b
+            JITState.tail = Add(JITState.buf_b, JITState.buf_size)
+        } ElseBlock: {
+            JITState.active = 0
+            JITState.head = JITState.buf_a
+            JITState.tail = Add(JITState.buf_a, JITState.buf_size)
+        }
+
+        JIT_InvalidateBuffer()
+
+        IfCondition EqualTo(Modulo(JITState.flip_count, JITConst.SHRINK_INTERVAL), 0) ThenBlock: {
+            JITTmp.val = Divide(Multiply(JITState.peak_usage, 100), JITState.buf_size)
+            IfCondition LessThan(JITTmp.val, JITConst.SHRINK_THRESHOLD) ThenBlock: {
+                JIT_Shrink()
+            }
+            JITState.peak_usage = 0
+        }
+
+        ReturnValue(1)
+    }
+}
+
+// Invalidate all JIT entries pointing into the now-active (previously cold) buffer
+Function.JIT_InvalidateBuffer {
+    Output: Integer
+    Body: {
+        JITTmp.i = 0
+        WhileLoop LessThan(JITTmp.i, JITState.count) {
+            JITTmp.addr = Add(JITState.entries, Multiply(JITTmp.i, JITConst.ENTRY_SIZE))
+            JITTmp.val = Dereference(Add(JITTmp.addr, 8))
+
+            IfCondition NotEqual(JITTmp.val, 0) ThenBlock: {
+                IfCondition EqualTo(JITState.active, 0) ThenBlock: {
+                    IfCondition And(GreaterEqual(JITTmp.val, JITState.buf_a), LessThan(JITTmp.val, Add(JITState.buf_a, JITState.buf_size))) ThenBlock: {
+                        StoreValue(Add(JITTmp.addr, 8), 0)
+                    }
+                } ElseBlock: {
+                    IfCondition And(GreaterEqual(JITTmp.val, JITState.buf_b), LessThan(JITTmp.val, Add(JITState.buf_b, JITState.buf_size))) ThenBlock: {
+                        StoreValue(Add(JITTmp.addr, 8), 0)
+                    }
+                }
+            }
+
+            JITTmp.i = Add(JITTmp.i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Grow both buffers (double size)
+Function.JIT_Grow {
+    Output: Integer
+    Body: {
+        JITTmp.val = Multiply(JITState.buf_size, 2)
+
+        JITTmp.addr = SystemCall(JITConst.SYS_MREMAP, JITState.buf_a, JITState.buf_size, JITTmp.val, JITConst.MREMAP_MAYMOVE)
+        IfCondition LessThan(JITTmp.addr, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        JITState.buf_a = JITTmp.addr
+
+        JITTmp.addr = SystemCall(JITConst.SYS_MREMAP, JITState.buf_b, JITState.buf_size, JITTmp.val, JITConst.MREMAP_MAYMOVE)
+        IfCondition LessThan(JITTmp.addr, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        JITState.buf_b = JITTmp.addr
+
+        JITState.buf_size = JITTmp.val
+
+        IfCondition EqualTo(JITState.active, 0) ThenBlock: {
+            JITState.tail = Add(JITState.buf_a, JITState.buf_size)
+        } ElseBlock: {
+            JITState.tail = Add(JITState.buf_b, JITState.buf_size)
+        }
+
+        ReturnValue(1)
+    }
+}
+
+// Shrink both buffers (halve size, minimum 2MB)
+Function.JIT_Shrink {
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(JITState.buf_size, JITConst.DEFAULT_BUF_SIZE) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        JITTmp.val = Divide(JITState.buf_size, 2)
+
+        SystemCall(JITConst.SYS_MUNMAP, JITState.buf_a, JITState.buf_size)
+        SystemCall(JITConst.SYS_MUNMAP, JITState.buf_b, JITState.buf_size)
+
+        JITState.buf_a = SystemCall(JITConst.SYS_MMAP, 0, JITTmp.val, JITConst.PROT_RWX, JITConst.MAP_ANON_PRIV, -1, 0)
+        JITState.buf_b = SystemCall(JITConst.SYS_MMAP, 0, JITTmp.val, JITConst.PROT_RWX, JITConst.MAP_ANON_PRIV, -1, 0)
+        JITState.buf_size = JITTmp.val
+
+        IfCondition EqualTo(JITState.active, 0) ThenBlock: {
+            JITState.head = JITState.buf_a
+            JITState.tail = Add(JITState.buf_a, JITState.buf_size)
+        } ElseBlock: {
+            JITState.head = JITState.buf_b
+            JITState.tail = Add(JITState.buf_b, JITState.buf_size)
+        }
+
+        MemorySet(JITState.entries, 0, Multiply(JITConst.MAX_ENTRIES, JITConst.ENTRY_SIZE))
+        JITState.count = 0
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// ENTRY TABLE — Map function index -> native code address
+// =============================================================================
+
+// Look up native address for a function index. Returns 0 if not compiled.
+Function.JIT_Lookup {
+    Input: func_idx: Integer
+    Output: Address
+    Body: {
+        save_idx = func_idx
+        IfCondition GreaterEqual(save_idx, JITConst.MAX_ENTRIES) ThenBlock: {
+            ReturnValue(0)
+        }
+        JITTmp.addr = Add(JITState.entries, Multiply(save_idx, JITConst.ENTRY_SIZE))
+        ReturnValue(Dereference(Add(JITTmp.addr, 8)))
+    }
+}
+
+// Register a compiled function in the entry table
+Function.JIT_Register {
+    Input: func_idx: Integer
+    Input: native_addr: Address
+    Input: code_size: Integer
+    Output: Integer
+    Body: {
+        save_idx = func_idx
+        save_addr = native_addr
+        save_size = code_size
+
+        IfCondition GreaterEqual(save_idx, JITConst.MAX_ENTRIES) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        JITTmp.addr = Add(JITState.entries, Multiply(save_idx, JITConst.ENTRY_SIZE))
+        StoreValue(JITTmp.addr, save_idx)
+        StoreValue(Add(JITTmp.addr, 8), save_addr)
+        StoreValue(Add(JITTmp.addr, 16), save_size)
+        StoreValue(Add(JITTmp.addr, 24), 0)
+
+        IfCondition GreaterEqual(save_idx, JITState.count) ThenBlock: {
+            JITState.count = Add(save_idx, 1)
+        }
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// EMIT REDIRECTION — Point CEmit at our JIT buffer
+// =============================================================================
+
+// Save the compiler's current emit state and redirect to our JIT buffer
+Function.JIT__RedirectEmit {
+    Input: buf_ptr: Address
+    Input: buf_size: Integer
+    Output: Integer
+    Body: {
+        // Save current compiler emit state
+        JITTmp.emit_ptr = Emit.code
+        JITTmp.emit_cap = Emit.code_capacity
+        JITTmp.emit_size = Emit.code_size
+
+        // Redirect to JIT buffer
+        Emit.code = buf_ptr
+        Emit.code_capacity = buf_size
+        Emit.code_size = 0
+
+        ReturnValue(1)
+    }
+}
+
+// Restore the compiler's emit state
+Function.JIT__RestoreEmit {
+    Output: Integer
+    Body: {
+        Emit.code = JITTmp.emit_ptr
+        Emit.code_capacity = JITTmp.emit_cap
+        Emit.code_size = JITTmp.emit_size
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// TRAMPOLINE — Emit function prologue/epilogue using CEmit ARCH
+// =============================================================================
+
+// Emit the standard JIT function prologue:
+// Save callee-saved registers, load VM state into registers
+Function.JIT__EmitPrologue {
+    Output: Integer
+    Body: {
+        // Save callee-saved registers
+        Emit_PushRbx()
+        Emit_PushR12()
+        Emit_PushR13()
+        Emit_PushRbp()
+        Emit_PushR14()
+
+        // Load param block base address (stable, allocated once at init)
+        Emit_MovRaxImm64(JITState.param_block)
+
+        // Load VM stack base: r12 = param_block[0]
+        Emit_MovRbxRax()
+        Emit_MovRaxDerefRax()
+        Emit_MovR12Rax()
+
+        // Load VM stack pointer: r13 = param_block[8]
+        Emit_MovRaxDerefRbxOffset(8)
+        Emit_MovR13Rax()
+
+        // Load locals base pointer: rbp = param_block[16]
+        Emit_MovRaxDerefRbxOffset(16)
+        Emit_PushRax()
+        Emit_PopRbp()
+
+        // Load const pool base: r14 = param_block[24]
+        Emit_MovRaxDerefRbxOffset(24)
+        Emit_MovR14Rax()
+
+        ReturnValue(1)
+    }
+}
+
+// Emit function epilogue: save VM state back and return
+Function.JIT__EmitEpilogue {
+    Output: Integer
+    Body: {
+        // Write r13 (sp) back to param_block[8]
+        Emit_MovRaxImm64(JITState.param_block)
+        Emit_MovRbxR13()
+        Emit_MovDerefRaxOffsetRbx(8)
+
+        // Restore callee-saved registers (reverse order)
+        Emit_PopR14()
+        Emit_PopRbp()
+        Emit_PopR13()
+        Emit_PopR12()
+        Emit_PopRbx()
+        Emit_Ret()
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// OPCODE COMPILATION — Translate bytecode to native via CEmit ARCH
+// =============================================================================
+
+// Emit: stack[r13] = rax; r13++
+// Uses r12 as stack base, r13 as index
+Function.JIT__EmitStackPush {
+    Output: Integer
+    Body: {
+        // We need: mov [r12 + r13*8], rax; inc r13
+        // CEmit arch-neutral doesn't have scaled-index addressing directly
+        // Compute address: rbx = r13 * 8 + r12
+        Emit_MovRbxR13()
+        Emit_ShlRbxImm8(3)          // rbx = r13 * 8
+        Emit_AddRbxR12()            // rbx = r12 + r13*8
+        Emit_MovDerefRbxRax()       // [rbx] = rax
+        Emit_IncR13()               // r13++
+        ReturnValue(1)
+    }
+}
+
+// Emit: r13--; rax = stack[r13]
+Function.JIT__EmitStackPop {
+    Output: Integer
+    Body: {
+        Emit_DecR13()               // r13--
+        // Compute address: rbx = r13 * 8 + r12
+        Emit_MovRbxR13()
+        Emit_ShlRbxImm8(3)
+        Emit_AddRbxR12()
+        Emit_MovRaxDerefRbx()       // rax = [rbx]
+        ReturnValue(1)
+    }
+}
+
+// Compile PUSH_CONST: load constant from pool, push to stack
+Function.JIT__CompilePushConst {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        save_idx = idx
+        // const_pool entries are 16 bytes: [type(8), payload(8)]
+        // We push the JSValue address: r14 + idx*16
+        Emit_MovRaxR14()
+        Emit_AddRaxImm32(Multiply(save_idx, 16))
+        JIT__EmitStackPush()
+        ReturnValue(1)
+    }
+}
+
+// Compile GET_LOCAL: load local variable, push to stack
+Function.JIT__CompileGetLocal {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        save_idx = idx
+        // Full 64-bit address computation: rax = rbp + idx*8; rax = [rax]
+        Emit_MovRaxRbp()
+        Emit_AddRaxImm32(Multiply(save_idx, 8))
+        Emit_MovRaxDerefRax()
+        JIT__EmitStackPush()
+        ReturnValue(1)
+    }
+}
+
+// Compile SET_LOCAL: pop from stack, store to local
+Function.JIT__CompileSetLocal {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        save_idx = idx
+        JIT__EmitStackPop()
+        // rax = value to store; rbx = rbp + idx*8; [rbx] = rax
+        Emit_PushRax()
+        Emit_MovRaxRbp()
+        Emit_AddRaxImm32(Multiply(save_idx, 8))
+        Emit_MovRbxRax()
+        Emit_PopRax()
+        Emit_MovDerefRbxRax()
+        ReturnValue(1)
+    }
+}
+
+// Compile PUSH_UNDEF: push 0 (undefined sentinel address)
+Function.JIT__CompilePushUndef {
+    Output: Integer
+    Body: {
+        Emit_XorRaxRax()
+        JIT__EmitStackPush()
+        ReturnValue(1)
+    }
+}
+
+// Compile PUSH_TRUE/PUSH_FALSE/PUSH_NULL with immediate value
+Function.JIT__CompilePushImm {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        save_val = val
+        Emit_MovRaxImm64(save_val)
+        JIT__EmitStackPush()
+        ReturnValue(1)
+    }
+}
+
+// Compile POP: just decrement sp
+Function.JIT__CompilePop {
+    Output: Integer
+    Body: {
+        Emit_DecR13()
+        ReturnValue(1)
+    }
+}
+
+// Compile DUP: duplicate top of stack
+Function.JIT__CompileDup {
+    Output: Integer
+    Body: {
+        // Read TOS without decrementing: stack[(r13-1)*8 + r12]
+        // Compute: rbx = (r13-1) * 8 + r12
+        Emit_MovRbxR13()
+        Emit_DecRbx()
+        Emit_ShlRbxImm8(3)
+        Emit_AddRbxR12()
+        Emit_MovRaxDerefRbx()       // rax = TOS
+        JIT__EmitStackPush()        // push copy
+        ReturnValue(1)
+    }
+}
+
+// Compile RETURN: leave return value on stack for JSVM to pop, emit epilogue
+Function.JIT__CompileReturn {
+    Output: Integer
+    Body: {
+        // Do NOT pop — JSVM's CALL handler will pop the return value after JIT_Execute
+        JIT__EmitEpilogue()
+        ReturnValue(1)
+    }
+}
+
+// Compile HALT: just epilogue
+Function.JIT__CompileHalt {
+    Output: Integer
+    Body: {
+        JIT__EmitEpilogue()
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// ARITHMETIC — Call JSRT functions via CEmit
+// =============================================================================
+
+// Generic: emit call to a binary JSRT function (Add, Sub, Mul, Div, etc.)
+// Pops two values, calls func(a, b), pushes result
+Function.JIT__CompileBinaryCall {
+    Input: func_addr: Address
+    Output: Integer
+    Body: {
+        save_func = func_addr
+
+        // Pop b -> rsi (second arg, SysV ABI)
+        JIT__EmitStackPop()
+        Emit_MovRsiRax()
+
+        // Pop a -> rdi (first arg, SysV ABI)
+        JIT__EmitStackPop()
+        Emit_MovRdiRax()
+
+        // Align stack to 16 bytes before call (5 pushes = 40 bytes, need even)
+        // Save r12/r13 across call (caller-saved in our convention but callee-saved in ABI)
+        // Actually r12/r13 are callee-saved per ABI, so JSRT_* will preserve them
+
+        // Load function address and call
+        Emit_MovRaxImm64(save_func)
+        Emit_CallRax()
+
+        // Result in rax — push it
+        JIT__EmitStackPush()
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// COMPARISON — Call JSRT comparison functions
+// =============================================================================
+
+Function.JIT__CompileUnaryCall {
+    Input: func_addr: Address
+    Output: Integer
+    Body: {
+        save_func = func_addr
+
+        // Pop a -> rdi
+        JIT__EmitStackPop()
+        Emit_MovRdiRax()
+
+        Emit_MovRaxImm64(save_func)
+        Emit_CallRax()
+
+        JIT__EmitStackPush()
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// JUMP COMPILATION — Using CEmit labels/fixups
+// =============================================================================
+
+// Compile JMP: unconditional jump. Returns label_id for patching.
+Function.JIT__CompileJmp {
+    Output: Integer
+    Body: {
+        JITTmp.val = Emit_CreateLabel()
+        Emit_Jmp(JITTmp.val)
+        ReturnValue(JITTmp.val)
+    }
+}
+
+// Compile JMP_FALSE: pop, test, conditional jump. Returns label_id.
+Function.JIT__CompileJmpFalse {
+    Output: Integer
+    Body: {
+        JIT__EmitStackPop()
+        Emit_TestRaxRax()
+        JITTmp.val = Emit_CreateLabel()
+        Emit_Jz(JITTmp.val)
+        ReturnValue(JITTmp.val)
+    }
+}
+
+// Compile JMP_TRUE: pop, test, conditional jump. Returns label_id.
+Function.JIT__CompileJmpTrue {
+    Output: Integer
+    Body: {
+        JIT__EmitStackPop()
+        Emit_TestRaxRax()
+        JITTmp.val = Emit_CreateLabel()
+        Emit_Jnz(JITTmp.val)
+        ReturnValue(JITTmp.val)
+    }
+}
+
+// Mark a label at the current emit position (for backward jumps / targets)
+Function.JIT__MarkLabel {
+    Input: label_id: Integer
+    Output: Integer
+    Body: {
+        Emit_MarkLabel(label_id)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// BYTECODE OFFSET → LABEL MAPPING
+// =============================================================================
+
+// Get or create a label for a bytecode offset.
+// Uses arena-allocated array: labels[bc_offset] = label_id (0 = none yet)
+Function.JIT__GetLabel {
+    Input: bc_offset: Integer
+    Output: Integer
+    Body: {
+        save_off = bc_offset
+        JITTmp.addr = Add(JITTmp.labels, Multiply(save_off, 8))
+        JITTmp.val = Dereference(JITTmp.addr)
+        IfCondition EqualTo(JITTmp.val, 0) ThenBlock: {
+            // Create new label and store (add 1 to distinguish from "no label")
+            JITTmp.val = Add(Emit_CreateLabel(), 1)
+            StoreValue(JITTmp.addr, JITTmp.val)
+        }
+        // Return actual label_id (subtract 1 since we stored id+1)
+        ReturnValue(Subtract(JITTmp.val, 1))
+    }
+}
+
+// =============================================================================
+// MAIN COMPILATION ENTRY POINT
+// =============================================================================
+
+// Compile a bytecode function to native code.
+// Input: bytecode pointer, length, function index
+// Returns native code address, or 0 on failure.
+Function.JIT_Compile {
+    Input: code_ptr: Address
+    Input: code_len: Integer
+    Input: func_idx: Integer
+    Output: Address
+    Body: {
+        save_code = code_ptr
+        save_len = code_len
+        save_idx = func_idx
+
+        IfCondition EqualTo(JITState.enabled, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Allocate worst-case space: 48 bytes per bytecode byte
+        JITTmp.val = Add(Multiply(save_len, 48), 512)
+        JITTmp.emit_start = JIT_Alloc(JITTmp.val)
+        IfCondition EqualTo(JITTmp.emit_start, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Allocate label map for this function (one label slot per byte offset)
+        JITTmp.labels = Arena_Alloc(Multiply(Add(save_len, 1), 8))
+        MemorySet(JITTmp.labels, 0, Multiply(Add(save_len, 1), 8))
+
+        // Redirect CEmit to write into our JIT buffer
+        JIT__RedirectEmit(JITTmp.emit_start, JITTmp.val)
+
+        // Emit prologue
+        JIT__EmitPrologue()
+
+        // Walk bytecode and compile each opcode
+        JITTmp.pc = 0
+        JITTmp.val = 1   // success flag
+        WhileLoop And(LessThan(JITTmp.pc, save_len), EqualTo(JITTmp.val, 1)) {
+            // Check if any jump targets this bytecode offset — mark label
+            JITTmp.addr = Add(JITTmp.labels, Multiply(JITTmp.pc, 8))
+            JITTmp.i = Dereference(JITTmp.addr)
+            IfCondition NotEqual(JITTmp.i, 0) ThenBlock: {
+                Emit_MarkLabel(Subtract(JITTmp.i, 1))
+            }
+
+            JITTmp.op = GetByte(save_code, JITTmp.pc)
+            JITTmp.pc = Add(JITTmp.pc, 1)
+
+            // Read 16-bit argument for opcodes that need it
+            JITTmp.arg = 0
+            IfCondition LessThan(JITTmp.pc, Subtract(save_len, 1)) ThenBlock: {
+                JITTmp.arg = Add(Multiply(GetByte(save_code, JITTmp.pc), 256), GetByte(save_code, Add(JITTmp.pc, 1)))
+            }
+
+            // Dispatch opcode compilation
+            Branch JITTmp.op {
+                Case 0: {
+                    // HALT — stop compilation
+                    JIT__CompileHalt()
+                    JITTmp.pc = save_len
+                }
+                Case 1: {
+                    // PUSH_CONST idx
+                    JIT__CompilePushConst(JITTmp.arg)
+                    JITTmp.pc = Add(JITTmp.pc, 2)
+                }
+                Case 2: {
+                    // PUSH_UNDEF
+                    JIT__CompilePushUndef()
+                }
+                Case 3: {
+                    // PUSH_NULL
+                    JIT__CompilePushImm(0)
+                }
+                Case 4: {
+                    // PUSH_TRUE
+                    JIT__CompilePushImm(1)
+                }
+                Case 5: {
+                    // PUSH_FALSE
+                    JIT__CompilePushImm(0)
+                }
+                Case 6: {
+                    // POP
+                    JIT__CompilePop()
+                }
+                Case 7: {
+                    // DUP
+                    JIT__CompileDup()
+                }
+                Case 10: {
+                    // GET_LOCAL
+                    JIT__CompileGetLocal(JITTmp.arg)
+                    JITTmp.pc = Add(JITTmp.pc, 2)
+                }
+                Case 11: {
+                    // SET_LOCAL
+                    JIT__CompileSetLocal(JITTmp.arg)
+                    JITTmp.pc = Add(JITTmp.pc, 2)
+                }
+                Case 20: {
+                    // ADD
+                    JIT__CompileBinaryCall(AddressOf(JSRT_Add))
+                }
+                Case 21: {
+                    // SUB
+                    JIT__CompileBinaryCall(AddressOf(JSRT_Sub))
+                }
+                Case 22: {
+                    // MUL
+                    JIT__CompileBinaryCall(AddressOf(JSRT_Mul))
+                }
+                Case 23: {
+                    // DIV
+                    JIT__CompileBinaryCall(AddressOf(JSRT_Div))
+                }
+                Case 24: {
+                    // MOD
+                    JIT__CompileBinaryCall(AddressOf(JSRT_Mod))
+                }
+                Case 30: {
+                    // EQUAL
+                    JIT__CompileBinaryCall(AddressOf(JSRT_Equal))
+                }
+                Case 31: {
+                    // NOT_EQUAL
+                    JIT__CompileBinaryCall(AddressOf(JSRT_NotEqual))
+                }
+                Case 32: {
+                    // STRICT_EQUAL
+                    JIT__CompileBinaryCall(AddressOf(JSRT_StrictEqual))
+                }
+                Case 33: {
+                    // STRICT_NOT_EQUAL
+                    JIT__CompileBinaryCall(AddressOf(JSRT_StrictNotEqual))
+                }
+                Case 34: {
+                    // LESS_THAN
+                    JIT__CompileBinaryCall(AddressOf(JSRT_LessThan))
+                }
+                Case 35: {
+                    // LESS_EQUAL
+                    JIT__CompileBinaryCall(AddressOf(JSRT_LessEqual))
+                }
+                Case 36: {
+                    // GREATER_THAN
+                    JIT__CompileBinaryCall(AddressOf(JSRT_GreaterThan))
+                }
+                Case 37: {
+                    // GREATER_EQUAL
+                    JIT__CompileBinaryCall(AddressOf(JSRT_GreaterEqual))
+                }
+                Case 40: {
+                    // TYPEOF
+                    JIT__CompileUnaryCall(AddressOf(JSRT_TypeOf))
+                }
+                Case 41: {
+                    // NEGATE
+                    JIT__CompileUnaryCall(AddressOf(JSRT_Negate))
+                }
+                Case 42: {
+                    // NOT
+                    JIT__CompileUnaryCall(AddressOf(JSRT_Not))
+                }
+                Case 43: {
+                    // BITWISE_NOT
+                    JIT__CompileUnaryCall(AddressOf(JSRT_BitwiseNot))
+                }
+                Case 50: {
+                    // JMP offset (16-bit signed offset from AFTER the arg)
+                    JITTmp.pc = Add(JITTmp.pc, 2)
+                    // Target bytecode offset = pc + signed_offset
+                    // arg is unsigned 16-bit; convert to signed
+                    JITTmp.i = JITTmp.arg
+                    IfCondition GreaterEqual(JITTmp.i, 32768) ThenBlock: {
+                        JITTmp.i = Subtract(JITTmp.i, 65536)
+                    }
+                    JITTmp.i = Add(JITTmp.pc, JITTmp.i)
+                    // Get/create label for target
+                    JITTmp.addr = JIT__GetLabel(JITTmp.i)
+                    Emit_Jmp(JITTmp.addr)
+                }
+                Case 51: {
+                    // JMP_FALSE offset
+                    JITTmp.pc = Add(JITTmp.pc, 2)
+                    JITTmp.i = JITTmp.arg
+                    IfCondition GreaterEqual(JITTmp.i, 32768) ThenBlock: {
+                        JITTmp.i = Subtract(JITTmp.i, 65536)
+                    }
+                    JITTmp.i = Add(JITTmp.pc, JITTmp.i)
+                    JIT__EmitStackPop()
+                    Emit_TestRaxRax()
+                    JITTmp.addr = JIT__GetLabel(JITTmp.i)
+                    Emit_Jz(JITTmp.addr)
+                }
+                Case 52: {
+                    // JMP_TRUE offset
+                    JITTmp.pc = Add(JITTmp.pc, 2)
+                    JITTmp.i = JITTmp.arg
+                    IfCondition GreaterEqual(JITTmp.i, 32768) ThenBlock: {
+                        JITTmp.i = Subtract(JITTmp.i, 65536)
+                    }
+                    JITTmp.i = Add(JITTmp.pc, JITTmp.i)
+                    JIT__EmitStackPop()
+                    Emit_TestRaxRax()
+                    JITTmp.addr = JIT__GetLabel(JITTmp.i)
+                    Emit_Jnz(JITTmp.addr)
+                }
+                Case 56: {
+                    // RETURN — emit epilogue and stop compilation
+                    JIT__CompileReturn()
+                    JITTmp.pc = save_len
+                }
+                Default: {
+                    // Unsupported opcode — bail (function stays interpreted)
+                    JITTmp.val = 0
+                }
+            }
+        }
+
+        // Check if there's a trailing label to mark (e.g. jump past end)
+        IfCondition EqualTo(JITTmp.val, 1) ThenBlock: {
+            JITTmp.addr = Add(JITTmp.labels, Multiply(JITTmp.pc, 8))
+            JITTmp.i = Dereference(JITTmp.addr)
+            IfCondition NotEqual(JITTmp.i, 0) ThenBlock: {
+                Emit_MarkLabel(Subtract(JITTmp.i, 1))
+            }
+        }
+
+        IfCondition EqualTo(JITTmp.val, 0) ThenBlock: {
+            // Compilation failed — restore emit state and bail
+            JIT__RestoreEmit()
+            ReturnValue(0)
+        }
+
+        // Resolve all jump fixups within our emitted code
+        Emit_ResolveFixups()
+
+        // Get final code size
+        JITTmp.val = Emit.code_size
+
+        // Restore compiler's emit state
+        JIT__RestoreEmit()
+
+        // Register in entry table
+        JIT_Register(save_idx, JITTmp.emit_start, JITTmp.val)
+
+        ReturnValue(JITTmp.emit_start)
+    }
+}
+
+// =============================================================================
+// EXECUTE — Call into JIT'd native code
+// =============================================================================
+
+// Execute a JIT'd function by calling its native address directly.
+// The trampoline (prologue/epilogue) handles register setup/teardown.
+// Caller must have already pushed the call frame and locals onto the VM stack.
+Function.JIT_Execute {
+    Input: native_addr: Address
+    Output: Integer
+    Body: {
+        save_addr = native_addr
+
+        // Compute locals_ptr = stack + locals_base * 8
+        // locals_base is in the current frame at offset 16
+        jit_fidx = Subtract(JSVMState.fp, 1)
+        jit_faddr = Add(JSVMState.frames, Multiply(jit_fidx, 40))
+        jit_lb = Dereference(Add(jit_faddr, 16))
+        JITState.locals_ptr = Add(JSVMState.stack, Multiply(jit_lb, 8))
+
+        // Write param block: [stack_base(0), sp(8), locals_ptr(16), const_pool(24)]
+        StoreValue(JITState.param_block, JSVMState.stack)
+        StoreValue(Add(JITState.param_block, 8), JSVMState.sp)
+        StoreValue(Add(JITState.param_block, 16), JITState.locals_ptr)
+        StoreValue(Add(JITState.param_block, 24), JSVMState.const_pool)
+
+        // Call native code — it has its own prologue/epilogue
+        CallIndirect(save_addr)
+
+        // Read sp back from param block (JIT epilogue wrote it there)
+        JSVMState.sp = Dereference(Add(JITState.param_block, 8))
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SHUTDOWN
+// =============================================================================
+Function.JIT_Shutdown {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(JITState.initialized, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        SystemCall(JITConst.SYS_MUNMAP, JITState.buf_a, JITState.buf_size)
+        SystemCall(JITConst.SYS_MUNMAP, JITState.buf_b, JITState.buf_size)
+        JITState.enabled = 0
+        JITState.initialized = 0
+        ReturnValue(1)
+    }
+}

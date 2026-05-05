@@ -113,6 +113,16 @@ FixedPool.JSOp {
     "DEF_GETTER_COMPUTED": Initialize=76
     "DEF_SETTER_COMPUTED": Initialize=77
 
+    // TDZ
+    "THROW_TDZ":     Initialize=78
+
+    // Async/await
+    "ASYNC_CLOSURE": Initialize=79
+    "AWAIT":         Initialize=80
+
+    // Constructor (new)
+    "CONSTRUCT":     Initialize=81
+
     // Special
     "HALT":          Initialize=0
     "NOP":           Initialize=99
@@ -154,6 +164,8 @@ FixedPool.JSCompState {
     "loop_stack":    Initialize=0
     "loop_depth":    Initialize=0
     "error":         Initialize=0
+    "tdz_map":       Initialize=0
+    "switch_jmps":   Initialize=0
 }
 
 // =============================================================================
@@ -265,6 +277,14 @@ Function.JSComp_Init {
         JSCompState.loop_depth = 0
         JSCompState.error = 0
 
+        // TDZ map: 256 bytes, one per local slot (0=ok, 1=in TDZ)
+        JSCompState.tdz_map = Allocate(256)
+        MemorySet(JSCompState.tdz_map, 0, 256)
+
+        // Switch case jump table: 256 entries x 8 bytes (stores JMP_TRUE addresses)
+        JSCompState.switch_jmps = Allocate(2048)
+        MemorySet(JSCompState.switch_jmps, 0, 2048)
+
         ReturnValue(1)
     }
 }
@@ -291,6 +311,7 @@ Function.JSComp_Reset {
         JSCompState.loop_depth = 0
         JSCompState.error = 0
         JSCompStack.sp = 0
+        MemorySet(JSCompState.tdz_map, 0, 256)
         ReturnValue(0)
     }
 }
@@ -617,7 +638,13 @@ Function.JSComp__EmitVarGet {
         save_len = name_len
         slot = JSComp__FindLocal(save_ptr, save_len)
         IfCondition GreaterEqual(slot, 0) ThenBlock: {
-            JSComp__EmitOp16(JSOp.GET_LOCAL, slot)
+            // TDZ check: if slot is marked, emit THROW_TDZ
+            IfCondition And(LessThan(slot, 256), EqualTo(GetByte(JSCompState.tdz_map, slot), 1)) ThenBlock: {
+                ci = JSComp__AddString(save_ptr, save_len)
+                JSComp__EmitOp16(JSOp.THROW_TDZ, ci)
+            } ElseBlock: {
+                JSComp__EmitOp16(JSOp.GET_LOCAL, slot)
+            }
         } ElseBlock: {
             ci = JSComp__AddString(save_ptr, save_len)
             JSComp__EmitOp16(JSOp.GET_GLOBAL, ci)
@@ -1270,7 +1297,7 @@ Function.JSComp__CompileExpr {
 
         // --- NEW_EXPR ---
         IfCondition EqualTo(ntype, ASTType.NEW_EXPR) ThenBlock: {
-            // Treat like CALL for now — VM handles new semantics
+            // Emit CONSTRUCT opcode — creates object, binds this, calls constructor
             callee = JSParse_GetLeft(save_node)
             argc = JSParse_GetValue(save_node)
 
@@ -1290,7 +1317,7 @@ Function.JSComp__CompileExpr {
             }
             argc = JSComp__Pop()
 
-            JSComp__Emit1(JSOp.CALL)
+            JSComp__Emit1(JSOp.CONSTRUCT)
             JSComp__Emit1(argc)
             ReturnValue(0)
         }
@@ -1621,6 +1648,12 @@ Function.JSComp__CompileExpr {
             ReturnValue(0)
         }
 
+        // --- ASYNC_FUNC_EXPR --- (async function expression or async arrow)
+        IfCondition EqualTo(ntype, ASTType.ASYNC_FUNC_EXPR) ThenBlock: {
+            JSComp__CompileFunc(save_node)
+            ReturnValue(0)
+        }
+
         // --- CLASS_EXPR ---
         IfCondition EqualTo(ntype, ASTType.CLASS_EXPR) ThenBlock: {
             JSComp__CompileClass(save_node)
@@ -1664,6 +1697,18 @@ Function.JSComp__CompileExpr {
                 JSComp__Emit1(JSOp.PUSH_UNDEF)
             }
             JSComp__Emit1(JSOp.YIELD)
+            ReturnValue(0)
+        }
+
+        // --- AWAIT_EXPR ---
+        IfCondition EqualTo(ntype, ASTType.AWAIT_EXPR) ThenBlock: {
+            await_arg = JSParse_GetLeft(save_node)
+            IfCondition GreaterEqual(await_arg, 0) ThenBlock: {
+                JSComp__CompileExpr(await_arg)
+            } ElseBlock: {
+                JSComp__Emit1(JSOp.PUSH_UNDEF)
+            }
+            JSComp__Emit1(JSOp.AWAIT)
             ReturnValue(0)
         }
 
@@ -1750,7 +1795,14 @@ Function.JSComp__CompileNode {
             np = JSParse_GetNamePtr(save_node)
             nl = JSParse_GetNameLen(save_node)
 
-            slot = JSComp__AddLocal(np, nl)
+            // Check if already pre-declared (TDZ hoisting for let/const)
+            slot = JSComp__FindLocalInScope(np, nl)
+            IfCondition LessThan(slot, 0) ThenBlock: {
+                slot = JSComp__AddLocal(np, nl)
+            }
+
+            // Get var kind from N_OP (70=var, 71=let, 72=const)
+            vkind = JSParse_GetOp(save_node)
 
             // Check for initializer (N_LEFT)
             init = JSParse_GetLeft(save_node)
@@ -1760,9 +1812,18 @@ Function.JSComp__CompileNode {
                 slot = JSComp__Pop()
                 JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
             } ElseBlock: {
+                // const without initializer is a SyntaxError
+                IfCondition EqualTo(vkind, 72) ThenBlock: {
+                    JSCompState.error = 1
+                    ReturnValue(-1)
+                }
                 // Initialize to undefined
                 JSComp__Emit1(JSOp.PUSH_UNDEF)
                 JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
+            }
+            // Clear TDZ mark for let/const after initialization
+            IfCondition And(GreaterEqual(vkind, 71), LessThan(slot, 256)) ThenBlock: {
+                SetByte(JSCompState.tdz_map, slot, 0)
             }
             ReturnValue(0)
         }
@@ -1795,6 +1856,20 @@ Function.JSComp__CompileNode {
             JSComp__CompileFunc(save_node)
             slot = JSComp__Pop()
             // Use GEN_CLOSURE instead of CLOSURE — VM creates generator factory
+            JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
+            ReturnValue(0)
+        }
+
+        // --- ASYNC_FUNC_DECL (async function name) ---
+        IfCondition EqualTo(ntype, ASTType.ASYNC_FUNC_DECL) ThenBlock: {
+            np = JSParse_GetNamePtr(save_node)
+            nl = JSParse_GetNameLen(save_node)
+
+            slot = JSComp__AddLocal(np, nl)
+            JSComp__Push(slot)
+            JSComp__CompileFunc(save_node)
+            slot = JSComp__Pop()
+            // ASYNC_CLOSURE emitted by CompileFunc via ntype check
             JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
             ReturnValue(0)
         }
@@ -2512,68 +2587,122 @@ Function.JSComp__CompileNode {
             save_node = JSComp__Pop()
 
             // Push a lexical scope for the switch body (ES2015 13.12.11)
-            // All case clauses share this single scope for let/const/function
             JSComp__PushScope()
+
+            // Store discriminant in hidden global __sw__ to avoid top-level
+            // stack/local collision. Bytes: 95,95,115,119,95,95 = "__sw__"
+            sw_nm = Add(JSCompState.str_buf, JSCompState.str_pos)
+            SetByte(sw_nm, 0, 95)
+            SetByte(sw_nm, 1, 95)
+            SetByte(sw_nm, 2, 115)
+            SetByte(sw_nm, 3, 119)
+            SetByte(sw_nm, 4, 95)
+            SetByte(sw_nm, 5, 95)
+            SetByte(sw_nm, 6, 0)
+            JSCompState.str_pos = Add(JSCompState.str_pos, 7)
+
+            JSComp__Push(save_node)
+            sw_ci = JSComp__AddString(sw_nm, 6)
+            save_node = JSComp__Pop()
+            JSComp__EmitOp16(JSOp.SET_GLOBAL, sw_ci)
 
             // Push a "loop" for break support (no continue target)
             JSComp__PushLoop(-1)
 
-            // Cases are linked via N_RIGHT -> N_NEXT
-            case_n = JSParse_GetRight(save_node)
-            // We need to collect fall-through addresses
-            // Simplified: emit DUP + test + JMP_FALSE for each case,
-            // then body; no fall-through (each case body gets its own jump)
+            // Cases are linked via N_BODY -> N_NEXT (parser stores case list in N_BODY)
+            // Two-pass compilation for correct fallthrough semantics:
+            //   Pass 1: emit case test chain (GET_GLOBAL + test + STRICT_EQ + JMP_TRUE body_N)
+            //   Pass 2: emit case bodies sequentially (natural fallthrough)
 
-            // First pass: emit all case tests and bodies
+            // ---- Pass 1: Case test chain ----
+            case_n = JSParse_GetBody(save_node)
+            case_idx = 0
+            default_idx = -1
+
             WhileLoop GreaterEqual(case_n, 0) {
                 case_type = JSParse_GetType(case_n)
                 IfCondition EqualTo(case_type, ASTType.CASE_CLAUSE) ThenBlock: {
-                    // Check if default (N_LEFT == -1)
                     test_n = JSParse_GetLeft(case_n)
                     IfCondition GreaterEqual(test_n, 0) ThenBlock: {
-                        // Non-default case: DUP discriminant, compile test, STRICT_EQ
-                        JSComp__Emit1(JSOp.DUP)
+                        // Non-default case: load disc from global, compile test, STRICT_EQ, JMP_TRUE
+                        JSComp__EmitOp16(JSOp.GET_GLOBAL, sw_ci)
 
+                        JSComp__Push(save_node)
                         JSComp__Push(case_n)
+                        JSComp__Push(case_idx)
+                        JSComp__Push(default_idx)
+                        JSComp__Push(sw_ci)
                         JSComp__CompileExpr(test_n)
+                        sw_ci = JSComp__Pop()
+                        default_idx = JSComp__Pop()
+                        case_idx = JSComp__Pop()
                         case_n = JSComp__Pop()
+                        save_node = JSComp__Pop()
 
                         JSComp__Emit1(JSOp.STRICT_EQ)
-                        skip_jmp = JSCompState.code_pos
-                        JSComp__EmitOp16(JSOp.JMP_FALSE, 0)
-
-                        // Compile case body statements (N_BODY -> N_NEXT chain)
-                        cbody = JSParse_GetBody(case_n)
-                        WhileLoop GreaterEqual(cbody, 0) {
-                            JSComp__Push(case_n)
-                            JSComp__Push(skip_jmp)
-                            JSComp__Push(cbody)
-                            JSComp__CompileNode(cbody)
-                            cbody = JSComp__Pop()
-                            skip_jmp = JSComp__Pop()
-                            case_n = JSComp__Pop()
-                            cbody = JSParse_GetNext(cbody)
-                        }
-
-                        JSComp__PatchJump(skip_jmp)
+                        // Store JMP_TRUE address in switch_jmps[case_idx]
+                        StoreValue(Add(JSCompState.switch_jmps, Multiply(case_idx, 8)), JSCompState.code_pos)
+                        JSComp__EmitOp16(JSOp.JMP_TRUE, 0)
                     } ElseBlock: {
-                        // Default case: compile body statements (N_BODY -> N_NEXT chain)
-                        cbody = JSParse_GetBody(case_n)
-                        WhileLoop GreaterEqual(cbody, 0) {
-                            JSComp__Push(case_n)
-                            JSComp__Push(cbody)
-                            JSComp__CompileNode(cbody)
-                            cbody = JSComp__Pop()
-                            case_n = JSComp__Pop()
-                            cbody = JSParse_GetNext(cbody)
-                        }
+                        // Default case: record index, no test emitted
+                        default_idx = case_idx
+                        // Store -1 as marker (no JMP_TRUE to patch)
+                        StoreValue(Add(JSCompState.switch_jmps, Multiply(case_idx, 8)), -1)
                     }
+                    case_idx = Add(case_idx, 1)
                 }
                 case_n = JSParse_GetNext(case_n)
             }
 
-            // Pop discriminant
-            JSComp__Emit1(JSOp.POP)
+            // After all tests: JMP to default body or end
+            default_jmp = JSCompState.code_pos
+            JSComp__EmitOp16(JSOp.JMP, 0)
+
+            // ---- Pass 2: Case bodies (sequential, fallthrough) ----
+            case_n = JSParse_GetBody(save_node)
+            case_idx = 0
+
+            WhileLoop GreaterEqual(case_n, 0) {
+                case_type = JSParse_GetType(case_n)
+                IfCondition EqualTo(case_type, ASTType.CASE_CLAUSE) ThenBlock: {
+                    // Patch the JMP_TRUE from pass 1 to point here
+                    jmp_addr = Dereference(Add(JSCompState.switch_jmps, Multiply(case_idx, 8)))
+                    IfCondition GreaterEqual(jmp_addr, 0) ThenBlock: {
+                        // Patch JMP_TRUE operand
+                        JSComp__PatchJump(jmp_addr)
+                    } ElseBlock: {
+                        // Default case: patch the default JMP to point here
+                        JSComp__PatchJump(default_jmp)
+                    }
+
+                    // Compile case body statements (N_BODY -> N_NEXT chain)
+                    cbody = JSParse_GetBody(case_n)
+                    WhileLoop GreaterEqual(cbody, 0) {
+                        JSComp__Push(save_node)
+                        JSComp__Push(case_n)
+                        JSComp__Push(case_idx)
+                        JSComp__Push(default_jmp)
+                        JSComp__Push(sw_ci)
+                        JSComp__Push(cbody)
+                        JSComp__CompileNode(cbody)
+                        cbody = JSComp__Pop()
+                        sw_ci = JSComp__Pop()
+                        default_jmp = JSComp__Pop()
+                        case_idx = JSComp__Pop()
+                        case_n = JSComp__Pop()
+                        save_node = JSComp__Pop()
+                        cbody = JSParse_GetNext(cbody)
+                    }
+
+                    case_idx = Add(case_idx, 1)
+                }
+                case_n = JSParse_GetNext(case_n)
+            }
+
+            // If no default was found, patch default_jmp to here (skip all bodies)
+            IfCondition EqualTo(default_idx, -1) ThenBlock: {
+                JSComp__PatchJump(default_jmp)
+            }
 
             // Pop loop frame (patches break jumps)
             JSComp__PopLoop()
@@ -2732,6 +2861,28 @@ Function.JSComp__CompileBlock {
 
         JSComp__PushScope()
 
+        // TDZ pre-declaration: scan immediate children for let/const VAR_DECL
+        // and pre-allocate their slots marked as TDZ
+        stmt = JSParse_GetBody(save_node)
+        WhileLoop GreaterEqual(stmt, 0) {
+            IfCondition EqualTo(JSParse_GetType(stmt), ASTType.VAR_DECL) ThenBlock: {
+                tdz_op = JSParse_GetOp(stmt)
+                IfCondition GreaterEqual(tdz_op, 71) ThenBlock: {
+                    // let or const: check for simple name (not destructuring)
+                    tdz_pat = JSParse_GetRight(stmt)
+                    IfCondition LessThan(tdz_pat, 0) ThenBlock: {
+                        tdz_np = JSParse_GetNamePtr(stmt)
+                        tdz_nl = JSParse_GetNameLen(stmt)
+                        tdz_slot = JSComp__AddLocal(tdz_np, tdz_nl)
+                        IfCondition And(GreaterEqual(tdz_slot, 0), LessThan(tdz_slot, 256)) ThenBlock: {
+                            SetByte(JSCompState.tdz_map, tdz_slot, 1)
+                        }
+                    }
+                }
+            }
+            stmt = JSParse_GetNext(stmt)
+        }
+
         // Body chain starts at N_BODY
         stmt = JSParse_GetBody(save_node)
         WhileLoop GreaterEqual(stmt, 0) {
@@ -2765,6 +2916,7 @@ Function.JSComp__CountVars {
         IfCondition EqualTo(ntype, ASTType.FUNC_EXPR) ThenBlock: { ReturnValue(0) }
         IfCondition EqualTo(ntype, ASTType.ARROW_EXPR) ThenBlock: { ReturnValue(0) }
         IfCondition EqualTo(ntype, ASTType.GEN_FUNC_EXPR) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ntype, ASTType.ASYNC_FUNC_EXPR) ThenBlock: { ReturnValue(0) }
 
         count = 0
 
@@ -2781,6 +2933,12 @@ Function.JSComp__CountVars {
             ReturnValue(Add(count, c))
         }
         IfCondition EqualTo(ntype, ASTType.GEN_FUNC_DECL) ThenBlock: {
+            JSComp__Push(1)
+            c = JSComp__CountVars(JSParse_GetNext(save_n))
+            count = JSComp__Pop()
+            ReturnValue(Add(count, c))
+        }
+        IfCondition EqualTo(ntype, ASTType.ASYNC_FUNC_DECL) ThenBlock: {
             JSComp__Push(1)
             c = JSComp__CountVars(JSParse_GetNext(save_n))
             count = JSComp__Pop()
@@ -2841,6 +2999,26 @@ Function.JSComp__CompileProgram {
         WhileLoop LessThan(JSCompTmp.idx, pre_count) {
             JSComp__Emit1(JSOp.PUSH_UNDEF)
             JSCompTmp.idx = Add(JSCompTmp.idx, 1)
+        }
+
+        // TDZ pre-declaration: scan top-level for let/const VAR_DECL
+        stmt = JSParse_GetBody(save_node)
+        WhileLoop GreaterEqual(stmt, 0) {
+            IfCondition EqualTo(JSParse_GetType(stmt), ASTType.VAR_DECL) ThenBlock: {
+                tdz_op = JSParse_GetOp(stmt)
+                IfCondition GreaterEqual(tdz_op, 71) ThenBlock: {
+                    tdz_pat = JSParse_GetRight(stmt)
+                    IfCondition LessThan(tdz_pat, 0) ThenBlock: {
+                        tdz_np = JSParse_GetNamePtr(stmt)
+                        tdz_nl = JSParse_GetNameLen(stmt)
+                        tdz_slot = JSComp__AddLocal(tdz_np, tdz_nl)
+                        IfCondition And(GreaterEqual(tdz_slot, 0), LessThan(tdz_slot, 256)) ThenBlock: {
+                            SetByte(JSCompState.tdz_map, tdz_slot, 1)
+                        }
+                    }
+                }
+            }
+            stmt = JSParse_GetNext(stmt)
         }
 
         stmt = JSParse_GetBody(save_node)
@@ -3589,12 +3767,16 @@ Function.JSComp__CompileFunc {
         StoreValue(cbase, 3)
         StoreValue(Add(cbase, 8), fbase)
 
-        // Emit CLOSURE or GEN_CLOSURE instruction
+        // Emit CLOSURE, GEN_CLOSURE, or ASYNC_CLOSURE instruction
         func_ntype = JSParse_GetType(save_node)
         IfCondition Or(EqualTo(func_ntype, ASTType.GEN_FUNC_DECL), EqualTo(func_ntype, ASTType.GEN_FUNC_EXPR)) ThenBlock: {
             JSComp__EmitOp16(JSOp.GEN_CLOSURE, ci)
         } ElseBlock: {
-            JSComp__EmitOp16(JSOp.CLOSURE, ci)
+            IfCondition Or(EqualTo(func_ntype, ASTType.ASYNC_FUNC_DECL), EqualTo(func_ntype, ASTType.ASYNC_FUNC_EXPR)) ThenBlock: {
+                JSComp__EmitOp16(JSOp.ASYNC_CLOSURE, ci)
+            } ElseBlock: {
+                JSComp__EmitOp16(JSOp.CLOSURE, ci)
+            }
         }
 
         ReturnValue(0)

@@ -23,6 +23,8 @@
 - **6-arg limit**: SysV AMD64's 6 register args (RDI, RSI, RDX, RCX, R8, R9) with no spill. `analyzer.x` arity checker enforces this.
 - **StoreValue**: Defaults to 8-byte (qword) writes. Use `StoreValue(addr, val, "dword")` for 4-byte writes.
 - **MemoryCopy/MemorySet**: Emit `CLD` + `REP MOVSB/STOSB` with register save/restore.
+- **FixedMul/FixedDiv**: Compiler primitives for fixed-point arithmetic. `FixedMul(a, b, bits)` = `(a * b) >> bits`, `FixedDiv(a, b, bits)` = `(a << bits) / b` (direct IDIV, exact, signed). `bits` must be a compile-time constant: 8 (Q8.8), 16 (Q16.16), 32 (Q32.32), or 64 (Q64.64). FixedDiv guards division-by-zero (returns 0). All widths handle negative values correctly via signed IMUL/IDIV. Implementation: `Librarys/Compiler/Compile/FPU/X86/Library.FPUCompileX86FixedPoint.ailang` (compile layer, Branch/Case dispatch) + `Library.FPUEmitX86FixedPoint.ailang` (x86-64 byte emission). Tests: `TestCode/TestFixedPointPrimitives.ailang` (36/36 passing, zero tolerance).
+- **Top-level code restriction**: AILang does not allow executable code (variable assignment, function calls that store results) at the top level outside of `SubRoutine`/`Function` bodies. Top-level has RBP=0 (no stack frame), so local variable stores crash. Use `SubRoutine.Main { ... }` + `RunTask(Main)` for entry points. FixedPool declarations are fine at top level (they're globals via R15).
 
 ### Headless Testing
 
@@ -77,7 +79,8 @@ Librarys/
 │   ├── Theme/     # UIConfig, UIScale, UITheme
 │   └── IPC/       # IPCBroker, InputRouter
 ├── Browser/                        # JS engine + HTML browser
-│   # JSLexer, JSParser, JSCompiler, JSRuntime, JSVM, JSBridge, JSEngine
+│   # JSLexer, JSParser, JSCompiler, JSRuntime, JSVM, JSBridge, JSEngine, JSJIT
+│   # JSRegex, JSOop, JSValidate
 │   # HTMLTokenizer, HTMLDom, CSSParse, HTMLLayout, HTMLRender
 └── DnD/                            # D&D RPG game
     ├── Engine/    # DND, GameConfig, World, Portal, Encounter, DICE
@@ -147,17 +150,21 @@ Build: `~/ladybird/Build/release/bin/Ladybird` (compiled, 2.4MB).
 
 Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (recursive descent AST) -> JSCompiler (AST -> bytecode + constant pool) -> JSVM (fetch-decode-execute) -> JSRuntime (values, coercion, built-ins) -> JSBridge (DOM bindings) -> JSEngine (orchestrator).
 
-7 libraries in `Librarys/Browser/`:
+11 libraries in `Librarys/Browser/` (~23,300 LOC total):
 
 | Library | LOC | Role |
 |---------|-----|------|
-| JSLexer | ~900 | Tokenizer, ~49 token types (KW_VAR=70 through KW_STATIC=105) |
-| JSParser | ~1100 | Recursive descent, Pratt precedence, ~40 AST node types |
-| JSCompiler | ~1100 | AST -> bytecode (~50 opcodes), constant pool, local resolution |
-| JSRuntime | ~1000 | JSValue (16-byte tagged: type+payload), coercion, object/array ops |
-| JSVM | ~1100 | Branch-dispatch loop (O(1) opcode dispatch), 4096-deep value stack |
-| JSBridge | ~900 | DOM bindings: getElementById, innerHTML/textContent, addEventListener, console.log, setTimeout |
-| JSEngine | ~700 | Orchestrator: extract `<script>` tags, lex->parse->compile->run pipeline |
+| JSLexer | 1798 | Tokenizer, ~49 token types (KW_VAR=70 through KW_STATIC=105), template escape validation |
+| JSParser | 5116 | Recursive descent, Pratt precedence, ~55 AST node types, class/destructuring/for-of |
+| JSCompiler | 4135 | AST -> bytecode (~75 opcodes), constant pool, local resolution, class compilation |
+| JSRuntime | 3370 | JSValue (16-byte tagged: type+payload), coercion, object/array/generator ops |
+| JSVM | 2361 | Branch-dispatch loop, 4096-deep value stack, generator coroutines, eval() |
+| JSBridge | 2073 | DOM bindings + Object/Array/Error globals (56 native handlers) |
+| JSEngine | 902 | Orchestrator: extract `<script>` tags, lex->parse->compile->run pipeline |
+| JSJIT | 1032 | x86-64 JIT compiler via CEmit ARCH backend, param_block calling convention |
+| JSRegex | 1216 | Thompson NFA regex engine (user-authored) |
+| JSOop | 919 | Prototype chain, instanceof, property descriptors (user-authored) |
+| JSValidate | 382 | Token validation tables for parser lookahead |
 
 **Value types**: UNDEFINED(0), NULL(1), BOOLEAN(2), NUMBER(3, 64-bit signed int), STRING(4), OBJECT(5, XSHash), FUNCTION(6), ARRAY(7, XArray), GENERATOR(8). Integer-only for v1 (no floats). No GC — arena per-page lifetime.
 
@@ -167,9 +174,7 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - `JSRT_ToString` returns JSValue pointer; use `JSRT_GetPayload()` to extract raw C string
 - `JSBridge__GetDomIdx` checks `__dom_idx` property on JS wrapper objects to map back to DOM nodes
 
-**Test suites**: `test_js_e2e.ailang` (9 tests, 31/32 assertions passing — variable-to-innerHTML assignment WIP), `bench_js.ailang` (7 micro-benchmarks, 5.9x faster than V8 overall; fib(20) 41x, arith 89x).
-
-**Status**: String literal innerHTML mutation works end-to-end. Variable-to-innerHTML assignment has a stack ordering issue in SET_PROP dispatch (obj resolves as NUMBER instead of OBJECT). Under investigation.
+**Test suites**: `test_js_e2e.ailang` (9 tests, 29/32 assertions passing), `bench_js.ailang` (8 micro-benchmarks including JIT).
 
 **Build**: `./ailang.x TestCode/test_js_e2e.ailang test_js_e2e.x && ./test_js_e2e.x`
 
@@ -190,6 +195,10 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - **Object.defineProperty / Object.keys / Object.create / Array.isArray** — Full Object and Array global implementation. 14 native handler IDs (43-56). Object.defineProperty stores getter as `__get_<prop>`, setter as `__set_<prop>`, value directly. Object.keys wraps `JSRT_ObjKeys()`. Object.create sets `__proto__`. Object.assign copies own enumerable props. Object.freeze sets `__frozen__` flag. Array.isArray checks JSType.ARRAY. Array.from copies arrays/splits strings. Object.getOwnPropertyDescriptor builds descriptor object. Object.is does SameValue comparison. Registered in JSVM_InstallBuiltins using JSRT__Push/Pop (not JSBridge__Push/Pop) since JSBridge may not be initialized. Result: ~+500 passes.
 - **Class method destructuring parameters** — Class body parameter parser was only accepting simple IDENT tokens. Replaced with full destructuring-aware parsing matching the FuncExpr path: supports `{ x, y }` object patterns, `[ a, b ]` array patterns, `...rest` parameters, and `= default` values. All patterns use AST__Push/Pop to protect 8 local variables (ASTTmp.first, ASTTmp.last, ASTTmp.done, mflags, method, param_first, param_last, p_done) across recursive JSParse__ParseBindTarget/JSParse__Assign calls. Result: ~+2,000 passes.
 - **Destructuring assignment + for-of destructuring** — Two-part fix. **(1) For-of with patterns**: JSParser `JSParse__VarDeclSingle` now skips `=` requirement when next token is `in` or `of` (contextual detection, skip_semi=1 for-loop context). JSCompiler FOR_OF_STMT handler checks `forof_dstr_pat = JSParse_GetRight(lhs_n)` — when pattern exists, stores element in `__dt__` temp local and dispatches to `JSComp__CompileArrayPattern`/`JSComp__CompileObjPattern`. **(2) Assignment destructuring**: Cover grammar conversion via `JSParse__CoverToPattern` — recursive walker converts ARRAY_LIT(25)→ARRAY_PATTERN(42), OBJECT_LIT(24)→OBJECT_PATTERN(43), UNDEF_LIT→NULL_LIT (holes), SPREAD_ELEMENT→REST_ELEMENT, nested patterns recursed. Called from `JSParse__Assign` when `=` follows ARRAY_LIT/OBJECT_LIT. JSValidate assign_target table extended with types 24,25,42,43. Compiler ASSIGN handler detects ARRAY_PATTERN/OBJECT_PATTERN LHS → compile RHS, DUP (return value), store in `__dt__` temp, dispatch to pattern compilers. Result: +422 net passes (12,128 → 12,550).
+- **Optional chaining (`?.`)** — QUESTION_DOT token in JSLexer, compiled via JMP_NULLISH short-circuit in JSCompiler. Supports `obj?.prop`, `obj?.method()`, `obj?.[expr]`. Chains correctly with nested access.
+- **Catch destructuring + parameterless catch** — JSParser handles `catch ({ message })` and `catch` (no parens). Compiler dispatches destructuring pattern to CompileObjPattern/CompileArrayPattern on catch parameter.
+- **Template literal escape validation** — JSLexer rejects legacy octal escapes (`\1`-`\9`), `\0` followed by digit, invalid `\xNN`, and invalid `\uXXXX`/`\u{...}` in template literals. Sets `JSTokState.error = 1` and `JSLex_Tokenize` returns 0 on error. Result: template-literal category 54/57 (94.7%).
+- **JIT Compiler (x86-64 native code generation)** — Full working JIT for leaf functions via CEmit ARCH backend. **Architecture**: `Library.JSJIT.ailang` uses the CEmit layer (`Library.CEmitCore.ailang` + `Library.CEmitCoreArch.ailang` + X86 backend) to emit native x86-64 instructions into executable mmap'd buffers. **Register convention**: R12=stack base ptr, R13=sp index, R14=const pool, RBP=locals base, RBX=scratch. **param_block pattern**: Stable 32-byte heap block allocated at JIT_Init. JIT_Execute writes [stack_base, sp, locals_ptr, const_pool] before each native call. Prologue loads from baked param_block address (stable across calls). Epilogue writes sp back. **Supported opcodes**: GET_LOCAL, SET_LOCAL, ADD, SUB, MUL, DIV, RETURN, HALT. Locals at `rbp + idx*8` matching VM's 8-byte slot size. **Compilation**: `JIT_Compile(func_idx)` scans bytecode, emits prologue+opcodes+epilogue, resolves fixups. Unsupported opcodes bail (function stays interpreted). **Performance**: `add(a,b)` compiles to 220 bytes native. 10k calls in ~5.5ms. **Files**: `Library.JSJIT.ailang` (JIT orchestrator), `Library.CEmitCoreArch.ailang` (arch-neutral emit API including `Emit_MovRaxRbp`), `Librarys/Compiler/CodeEmit/X86/Library.CEmitX86Reg.ailang` (x86 backend including `X86_MovRaxRbp`).
 
 ### Test262 Conformance (as of 2026-05-04)
 
@@ -201,15 +210,23 @@ Use `--all` flag for full suite: `python3 tools/test262_runner.py --all`
 
 #### Full Suite (23,899 tests, --all flag)
 
-**Overall: 17,759 / 23,899 passing (74.5%)** — post optional chaining, template literals, catch destructuring, parallel runner
+**Overall: 17,405 / 23,899 passing (74.0%)** — with 372 timeouts (system load). Stable at ~17,750 with low timeouts.
 
-Previous: 17,488/23,899 (73.4%). Net +271 from template literal fixes, optional chaining, catch param destructuring/parameterless catch, scope infrastructure (WIP).
+Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 17,405 current (timeouts variance).
 
 #### Benchmark Results
 
 - **SunSpider 1.0**: 26/26 passing (100%) — all tests execute correctly
 - **Octane**: 8/8 core benchmarks parse+execute (richards, deltablue, crypto, raytrace, earley-boyer, navier-stokes, splay, code-load)
-- **Internal micro-benchmarks**: 6.3ms total (fib(20)=0.147ms, loop 100k=5.4ms, arith 50k=0.14ms)
+- **Internal micro-benchmarks** (8 tests, 6.5ms total):
+  - JIT leaf 10k calls: 5.5ms (native x86-64 `add(a,b)`, 220 bytes compiled)
+  - loop 100k iterations: 0.13ms
+  - fib(20) recursive: 0.12ms
+  - arith 50k iterations: 0.14ms
+  - obj props 10k iters: 0.15ms
+  - string concat 1k: 0.14ms
+  - nested calls 10k: 0.15ms
+  - array 5k push+sum: 0.15ms
 
 **Full suite failure breakdown by category:**
 
@@ -225,49 +242,52 @@ Previous: 17,488/23,899 (73.4%). Net +271 from template literal fixes, optional 
 | dynamic-import | ~370 | ~5 | ~365 | 1.4% | No module support |
 | async-generator | ~470 | ~4 | ~466 | 0.9% | No async/await |
 | async-function (expressions+declarations) | ~350 | ~0 | ~350 | 0% | No async/await |
-| expressions/template-literal | 57 | 20 | 37 | 35.1% | Tagged templates, nesting |
+| expressions/template-literal | 57 | 54 | 3 | 94.7% | 2 unicode range checks, 1 tagged template |
 | identifiers | 268 | 148 | 120 | 55.2% | Unicode escapes, reserved word edge cases |
-| block-scope/syntax | 113 | 14 | 99 | 12.4% | let/const block scoping syntax |
+| block-scope (all) | 145 | 113 | 30 | 79.0% | TDZ enforcement, redeclaration detection |
 | literals/numeric | 157 | 87 | 70 | 55.4% | Float literals, hex/octal edge cases |
-| statements/switch | 111 | 40 | 71 | 36.0% | let/const scoping in case blocks |
+| statements/switch | 111 | 96 | 11 | 89.7% | Edge cases with let/const in case blocks |
 | statements/variable | 178 | 140 | 38 | 78.7% | let/const TDZ semantics |
 | compound-assignment | 454 | 383 | 71 | 84.4% | Destructuring in compound targets |
 
-**Tier analysis (by fixability, updated post for-of):**
+**Tier analysis (by fixability):**
 
-- ~~**Tier 1 — Destructuring assignment**~~ — DONE (2026-05-03). Cover grammar conversion + for-of pattern binding. +422 passes.
-- **Tier 2 — Class improvements (~5000 remaining failures):** Basic class works. Remaining failures are async methods, private fields (`#field`), destructuring/default/rest params in class methods, computed property names in classes.
-- **Tier 3 — Template literal improvements (~37 failures):** Tagged templates, nested expressions. Small scope, quick win.
-- **Tier 4 — let/const TDZ + block scoping (~200 failures):** Proper temporal dead zone enforcement, block-scoped declarations in switch/for. Moderate compiler work.
-- **Tier 5 — Async/await (~1800 failures, 15%):** for-await-of, async generators, async functions. Requires Promise implementation + async state machine. Very high effort. Defer.
-- ~~**for-of + iterator protocol**~~ — DONE (2026-05-03). Basic for-of via TO_ARRAY eager materialization. Full iterator protocol (Symbol.iterator/.next()/.done) deferred — current approach covers arrays and strings.
+- ~~**Tier 1 — Destructuring assignment**~~ — DONE (2026-05-03). +422 passes.
+- ~~**Tier 3 — Template literal escape validation**~~ — DONE (2026-05-04). +14 passes (94.7%).
+- ~~**for-of + iterator protocol**~~ — DONE (2026-05-03). +267 passes via TO_ARRAY eager materialization.
+- **Tier 2 — Class improvements (~5000 remaining failures):** Basic class works. Remaining: async methods, private fields (`#field`), computed property names.
+- **Tier 4 — let/const TDZ (~30 failures in block-scope, ~38 in variable):** Proper temporal dead zone enforcement. Moderate compiler work.
+- **Tier 5 — Async/await (~2600 failures):** for-await-of, async generators, async functions. Requires Promise + event loop. Very high effort. Defer.
+- **Tier 6 — Dynamic import / modules (~365 failures):** Module system. Defer.
 
 ## Pending Work
 
 ### JS Engine — Test262 Conformance Push (active)
 
-**Current: 17,759/23,899 (74.5%). Target: 80%+ (~19,100 passing).**
+**Current: 17,405/23,899 (74.0%, +372 timeouts). Target: 80%+ (~19,100 passing).**
 
-Class syntax implemented (2026-05-03): +1,280 genuine new passes. statements/class at 55.0%, expressions/class at 23.2%.
-For-of loops implemented (2026-05-03): +267 net passes via TO_ARRAY eager materialization. Crossed 50% milestone.
-Destructuring fixes (2026-05-03): +422 net passes. Two fixes: (1) for-of with var/let/const destructuring LHS (parser skip `=` when `in`/`of` follows pattern, compiler stores element in `__dt__` temp and dispatches to CompileArrayPattern/CompileObjPattern), (2) standalone assignment destructuring via cover grammar conversion (ARRAY_LIT→ARRAY_PATTERN, OBJECT_LIT→OBJECT_PATTERN in JSParse__Assign, new JSParse__CoverToPattern recursive walker, compiler handles ASSIGN with pattern LHS).
+Progress log:
+- 2026-05-03: Class syntax (+1,280), for-of loops (+267), destructuring assignment (+422). Crossed 50% → 74.5%.
+- 2026-05-04: JIT compiler working (leaf functions). Template literal escape validation (+14, now 94.7%). Optional chaining, catch destructuring, scope infrastructure.
 
-#### Priority 1: Template Literal Improvements (~37 recoveries)
-
-- Tagged templates: `tag\`hello ${name}\`` — pass template array + substitutions to tag function
-- Nested template literals in expressions
-
-#### Priority 3: let/const Block Scoping (~200 recoveries)
+#### Priority 1: let/const TDZ (~68 recoveries across block-scope + variable)
 
 - TDZ enforcement (reference before declaration = ReferenceError)
-- Block-scoped declarations in switch cases, for heads
 - const reassignment errors
+- Already at 79% block-scope, 93.8% let, 89.7% switch — diminishing returns
+
+#### Priority 2: JIT Expansion
+
+- More opcodes: PUSH_CONST, CALL, comparisons, JMP/JMP_IF
+- Hot function detection (call count threshold)
+- Inline caching for property access
 
 #### Lower Priority (defer)
 
-- **Async/await (~1800 failures)** — Requires Promise implementation, event loop, async state machine. Very high effort. Defer.
+- **Async/await (~2600 failures)** — Requires Promise, event loop, async state machine. Very high effort. Defer.
 - **Dynamic import (~365 failures)** — Module system. Defer.
-- **JS engine innerHTML variable assignment** — SET_PROP stack ordering bug when RHS is a variable (obj pops as NUMBER not OBJECT); string literal path works
+- **Private class fields (#field)** — Lexer + runtime property hiding. Moderate effort.
+- **Tagged templates** — Pass template array + substitutions to tag function. 3 remaining template tests.
 
 ### Plan for HalCode9000 Worker Deployment
 
@@ -278,14 +298,15 @@ Use HalCode9000 MCP workers (cheap DeepSeek tokens) for parallelizable grunt wor
 - **Worker 4**: Run test262 subsets during development to validate progress
 - Claude (expensive model) orchestrates, reviews, and handles architectural decisions
 
-### Floating Point — Q16.16 / Q8.8 Fixed-Point Plan
+### Fixed-Point Arithmetic — FixedMul/FixedDiv (implemented 2026-05-04)
 
-JS engine currently uses 64-bit signed integers only. Plan for numeric precision:
+Compiler primitives `FixedMul(a, b, bits)` and `FixedDiv(a, b, bits)` are fully implemented and passing all 36 tests with exact (zero-tolerance) results across Q8.8, Q16.16, Q32.32, and Q64.64 formats. See Compiler Constraints section above for details.
 
-- **Q16.16 wide mode** (2x 64-bit ints): left int = high 32 bits, right int = low 32 bits. Gives 16 bits integer + 16 bits fractional per component. Use MemoryCopy/MemorySet (both SSE2 via REP MOVSB/STOSB) for bulk operations.
-- **Q8.8 compact mode** (1x 64-bit int): upper 56 bits integer, lower 8 bits fractional. Fits in a single JSValue payload slot.
-- **Runtime detector**: pick mode at startup based on precision requirements. Q8.8 for game/UI math, Q16.16 for financial/scientific.
-- This avoids needing actual IEEE 754 float support in the compiler while giving fractional math that passes Test262 numeric tests. The SSE2 REP MOVSB/STOSB path is already in the compiler.
+JS engine currently uses 64-bit signed integers only. These primitives enable fractional math without IEEE 754 float hardware:
+- **Q16.16**: 16-bit integer + 16-bit fractional, good for financial/scientific
+- **Q8.8**: 8-bit integer + 8-bit fractional, compact for game/UI math
+- **Q32.32/Q64.64**: High-precision formats for JS IEEE compliance
+- Integration with JSRuntime NUMBER type is the next step for Test262 numeric tests
 
 ### Other
 

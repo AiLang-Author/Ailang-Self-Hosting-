@@ -17,6 +17,7 @@
 LibraryImport.Browser.JSRuntime
 LibraryImport.Browser.JSCompiler
 LibraryImport.Browser.JSBridge
+LibraryImport.Browser.JSJIT
 LibraryImport.Arena
 LibraryImport.XArrays
 LibraryImport.StringUtils
@@ -28,7 +29,7 @@ LibraryImport.HashMap
 FixedPool.JSVMConst {
     "MAX_STACK":     Initialize=4096
     "MAX_FRAMES":    Initialize=256
-    "FRAME_SIZE":    Initialize=40
+    "FRAME_SIZE":    Initialize=48
 }
 
 // =============================================================================
@@ -239,6 +240,7 @@ Function.JSVM__PushFrame {
         StoreValue(Add(faddr, 16), save_lb)
         StoreValue(Add(faddr, 24), save_pc)
         StoreValue(Add(faddr, 32), save_lc)
+        StoreValue(Add(faddr, 40), 0)
         JSVMState.fp = Add(JSVMState.fp, 1)
         ReturnValue(0)
     }
@@ -450,6 +452,9 @@ Function.JSVM_Init {
         JSVMGen.is_gen_exec = 0
         JSVMGen.active_gs = 0
 
+        // Initialize JIT compiler (mmap executable buffers, entry table)
+        JIT_Init()
+
         ReturnValue(1)
     }
 }
@@ -507,6 +512,689 @@ Function.JSVM_Load {
 }
 
 // =============================================================================
+// STRING METHOD DISPATCH — execute string methods with receiver
+// =============================================================================
+Function.JSVM__DispatchStringMethod {
+    Input: method_id: Integer
+    Input: receiver: Address
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_id = method_id
+        save_recv = receiver
+        save_args = args
+        save_argc = argc
+
+        // Get the raw string pointer from receiver JSValue
+        // (may be 0 for static methods like String.fromCharCode)
+        str_ptr = 0
+        str_len = 0
+        IfCondition NotEqual(save_recv, 0) ThenBlock: {
+            recv_type = JSRT_GetType(save_recv)
+            IfCondition EqualTo(recv_type, JSType.STRING) ThenBlock: {
+                str_ptr = JSRT_GetPayload(save_recv)
+                str_len = StringLength(str_ptr)
+            }
+        }
+
+        // ─── charAt (62) ───
+        IfCondition EqualTo(save_id, 62) ThenBlock: {
+            idx = 0
+            IfCondition GreaterThan(save_argc, 0) ThenBlock: {
+                a0 = Dereference(save_args)
+                idx = JSRT_ToNumber(a0)
+            }
+            oob = 0
+            IfCondition LessThan(idx, 0) ThenBlock: { oob = 1 }
+            IfCondition GreaterEqual(idx, str_len) ThenBlock: { oob = 1 }
+            IfCondition EqualTo(oob, 1) ThenBlock: {
+                // Out of bounds — return empty string
+                ebuf = Allocate(1)
+                SetByte(ebuf, 0, 0)
+                ReturnValue(JSRT_CreateString(ebuf))
+            }
+            cbuf = Allocate(2)
+            SetByte(cbuf, 0, GetByte(str_ptr, idx))
+            SetByte(cbuf, 1, 0)
+            ReturnValue(JSRT_CreateString(cbuf))
+        }
+
+        // ─── charCodeAt (63) ───
+        IfCondition EqualTo(save_id, 63) ThenBlock: {
+            idx = 0
+            IfCondition GreaterThan(save_argc, 0) ThenBlock: {
+                a0 = Dereference(save_args)
+                idx = JSRT_ToNumber(a0)
+            }
+            oob = 0
+            IfCondition LessThan(idx, 0) ThenBlock: { oob = 1 }
+            IfCondition GreaterEqual(idx, str_len) ThenBlock: { oob = 1 }
+            IfCondition EqualTo(oob, 1) ThenBlock: {
+                // NaN → return -1 (integer-only engine, NaN not representable)
+                ReturnValue(JSRT_CreateNumber(-1))
+            }
+            code = GetByte(str_ptr, idx)
+            ReturnValue(JSRT_CreateNumber(code))
+        }
+
+        // ─── indexOf (64) ───
+        IfCondition EqualTo(save_id, 64) ThenBlock: {
+            IfCondition EqualTo(save_argc, 0) ThenBlock: {
+                ReturnValue(JSRT_CreateNumber(-1))
+            }
+            a0 = Dereference(save_args)
+            search_ptr = JSRT_GetPayload(a0)
+            search_len = StringLength(search_ptr)
+            IfCondition EqualTo(search_len, 0) ThenBlock: {
+                ReturnValue(JSRT_CreateNumber(0))
+            }
+            // Linear search
+            si = 0
+            found = -1
+            WhileLoop LessEqual(Add(si, search_len), str_len) {
+                IfCondition EqualTo(found, -1) ThenBlock: {
+                    match = 1
+                    mi = 0
+                    WhileLoop LessThan(mi, search_len) {
+                        IfCondition NotEqual(GetByte(str_ptr, Add(si, mi)), GetByte(search_ptr, mi)) ThenBlock: {
+                            match = 0
+                            mi = search_len
+                        }
+                        mi = Add(mi, 1)
+                    }
+                    IfCondition EqualTo(match, 1) ThenBlock: {
+                        found = si
+                    }
+                }
+                si = Add(si, 1)
+            }
+            ReturnValue(JSRT_CreateNumber(found))
+        }
+
+        // ─── substring (65) ───
+        IfCondition EqualTo(save_id, 65) ThenBlock: {
+            start = 0
+            end_idx = str_len
+            IfCondition GreaterThan(save_argc, 0) ThenBlock: {
+                a0 = Dereference(save_args)
+                start = JSRT_ToNumber(a0)
+            }
+            IfCondition GreaterThan(save_argc, 1) ThenBlock: {
+                a1 = Dereference(Add(save_args, 8))
+                end_idx = JSRT_ToNumber(a1)
+            }
+            // Clamp
+            IfCondition LessThan(start, 0) ThenBlock: { start = 0 }
+            IfCondition GreaterThan(start, str_len) ThenBlock: { start = str_len }
+            IfCondition LessThan(end_idx, 0) ThenBlock: { end_idx = 0 }
+            IfCondition GreaterThan(end_idx, str_len) ThenBlock: { end_idx = str_len }
+            // Swap if start > end
+            IfCondition GreaterThan(start, end_idx) ThenBlock: {
+                tmp_s = start
+                start = end_idx
+                end_idx = tmp_s
+            }
+            sub_len = Subtract(end_idx, start)
+            ReturnValue(JSRT_CreateStringLen(Add(str_ptr, start), sub_len))
+        }
+
+        // ─── slice (66) ───
+        IfCondition EqualTo(save_id, 66) ThenBlock: {
+            start = 0
+            end_idx = str_len
+            IfCondition GreaterThan(save_argc, 0) ThenBlock: {
+                a0 = Dereference(save_args)
+                start = JSRT_ToNumber(a0)
+            }
+            IfCondition GreaterThan(save_argc, 1) ThenBlock: {
+                a1 = Dereference(Add(save_args, 8))
+                end_idx = JSRT_ToNumber(a1)
+            }
+            // Negative indices
+            IfCondition LessThan(start, 0) ThenBlock: {
+                start = Add(str_len, start)
+                IfCondition LessThan(start, 0) ThenBlock: { start = 0 }
+            }
+            IfCondition LessThan(end_idx, 0) ThenBlock: {
+                end_idx = Add(str_len, end_idx)
+                IfCondition LessThan(end_idx, 0) ThenBlock: { end_idx = 0 }
+            }
+            IfCondition GreaterThan(start, str_len) ThenBlock: { start = str_len }
+            IfCondition GreaterThan(end_idx, str_len) ThenBlock: { end_idx = str_len }
+            IfCondition GreaterEqual(start, end_idx) ThenBlock: {
+                ebuf = Allocate(1)
+                SetByte(ebuf, 0, 0)
+                ReturnValue(JSRT_CreateString(ebuf))
+            }
+            sub_len = Subtract(end_idx, start)
+            ReturnValue(JSRT_CreateStringLen(Add(str_ptr, start), sub_len))
+        }
+
+        // ─── replace (67) — simple first-occurrence string replace ───
+        IfCondition EqualTo(save_id, 67) ThenBlock: {
+            IfCondition LessThan(save_argc, 2) ThenBlock: {
+                ReturnValue(save_recv)
+            }
+            a0 = Dereference(save_args)
+            a1 = Dereference(Add(save_args, 8))
+            search_ptr = JSRT_GetPayload(a0)
+            repl_ptr = JSRT_GetPayload(a1)
+            search_len = StringLength(search_ptr)
+            repl_len = StringLength(repl_ptr)
+            // Find first occurrence
+            si = 0
+            found = -1
+            WhileLoop LessEqual(Add(si, search_len), str_len) {
+                IfCondition EqualTo(found, -1) ThenBlock: {
+                    match = 1
+                    mi = 0
+                    WhileLoop LessThan(mi, search_len) {
+                        IfCondition NotEqual(GetByte(str_ptr, Add(si, mi)), GetByte(search_ptr, mi)) ThenBlock: {
+                            match = 0
+                            mi = search_len
+                        }
+                        mi = Add(mi, 1)
+                    }
+                    IfCondition EqualTo(match, 1) ThenBlock: { found = si }
+                }
+                si = Add(si, 1)
+            }
+            IfCondition EqualTo(found, -1) ThenBlock: {
+                ReturnValue(save_recv)
+            }
+            // Build result: prefix + replacement + suffix
+            new_len = Add(Subtract(str_len, search_len), repl_len)
+            rbuf = Allocate(Add(new_len, 1))
+            IfCondition GreaterThan(found, 0) ThenBlock: {
+                MemoryCopy(rbuf, str_ptr, found)
+            }
+            IfCondition GreaterThan(repl_len, 0) ThenBlock: {
+                MemoryCopy(Add(rbuf, found), repl_ptr, repl_len)
+            }
+            suffix_start = Add(found, search_len)
+            suffix_len = Subtract(str_len, suffix_start)
+            IfCondition GreaterThan(suffix_len, 0) ThenBlock: {
+                MemoryCopy(Add(rbuf, Add(found, repl_len)), Add(str_ptr, suffix_start), suffix_len)
+            }
+            SetByte(rbuf, new_len, 0)
+            ReturnValue(JSRT_CreateString(rbuf))
+        }
+
+        // ─── split (68) ───
+        IfCondition EqualTo(save_id, 68) ThenBlock: {
+            result_arr = JSRT_CreateArray()
+            IfCondition EqualTo(save_argc, 0) ThenBlock: {
+                JSRT_ArrPush(result_arr, save_recv)
+                ReturnValue(result_arr)
+            }
+            a0 = Dereference(save_args)
+            sep_ptr = JSRT_GetPayload(a0)
+            sep_len = StringLength(sep_ptr)
+            IfCondition EqualTo(sep_len, 0) ThenBlock: {
+                // Split into chars
+                ci = 0
+                WhileLoop LessThan(ci, str_len) {
+                    ch_val = JSRT_CreateStringLen(Add(str_ptr, ci), 1)
+                    JSRT_ArrPush(result_arr, ch_val)
+                    ci = Add(ci, 1)
+                }
+                ReturnValue(result_arr)
+            }
+            // Split by separator
+            pos = 0
+            WhileLoop LessEqual(pos, str_len) {
+                // Find next separator
+                found_at = -1
+                si = pos
+                WhileLoop LessEqual(Add(si, sep_len), str_len) {
+                    IfCondition EqualTo(found_at, -1) ThenBlock: {
+                        match = 1
+                        mi = 0
+                        WhileLoop LessThan(mi, sep_len) {
+                            IfCondition NotEqual(GetByte(str_ptr, Add(si, mi)), GetByte(sep_ptr, mi)) ThenBlock: {
+                                match = 0
+                                mi = sep_len
+                            }
+                            mi = Add(mi, 1)
+                        }
+                        IfCondition EqualTo(match, 1) ThenBlock: { found_at = si }
+                    }
+                    si = Add(si, 1)
+                }
+                IfCondition EqualTo(found_at, -1) ThenBlock: {
+                    // No more separators — push rest
+                    part_len = Subtract(str_len, pos)
+                    part_val = JSRT_CreateStringLen(Add(str_ptr, pos), part_len)
+                    JSRT_ArrPush(result_arr, part_val)
+                    pos = Add(str_len, 1)
+                } ElseBlock: {
+                    part_len = Subtract(found_at, pos)
+                    part_val = JSRT_CreateStringLen(Add(str_ptr, pos), part_len)
+                    JSRT_ArrPush(result_arr, part_val)
+                    pos = Add(found_at, sep_len)
+                }
+            }
+            ReturnValue(result_arr)
+        }
+
+        // ─── trim (69) ───
+        IfCondition EqualTo(save_id, 69) ThenBlock: {
+            // Trim leading whitespace
+            ls = 0
+            trim_go = 1
+            WhileLoop EqualTo(trim_go, 1) {
+                IfCondition GreaterEqual(ls, str_len) ThenBlock: {
+                    trim_go = 0
+                } ElseBlock: {
+                    ch = GetByte(str_ptr, ls)
+                    is_ws = 0
+                    IfCondition EqualTo(ch, 32) ThenBlock: { is_ws = 1 }
+                    IfCondition EqualTo(ch, 9) ThenBlock: { is_ws = 1 }
+                    IfCondition EqualTo(ch, 10) ThenBlock: { is_ws = 1 }
+                    IfCondition EqualTo(ch, 13) ThenBlock: { is_ws = 1 }
+                    IfCondition EqualTo(is_ws, 1) ThenBlock: {
+                        ls = Add(ls, 1)
+                    } ElseBlock: {
+                        trim_go = 0
+                    }
+                }
+            }
+            // Trim trailing whitespace
+            re = str_len
+            trim_go = 1
+            WhileLoop EqualTo(trim_go, 1) {
+                IfCondition LessEqual(re, ls) ThenBlock: {
+                    trim_go = 0
+                } ElseBlock: {
+                    ch = GetByte(str_ptr, Subtract(re, 1))
+                    is_ws = 0
+                    IfCondition EqualTo(ch, 32) ThenBlock: { is_ws = 1 }
+                    IfCondition EqualTo(ch, 9) ThenBlock: { is_ws = 1 }
+                    IfCondition EqualTo(ch, 10) ThenBlock: { is_ws = 1 }
+                    IfCondition EqualTo(ch, 13) ThenBlock: { is_ws = 1 }
+                    IfCondition EqualTo(is_ws, 1) ThenBlock: {
+                        re = Subtract(re, 1)
+                    } ElseBlock: {
+                        trim_go = 0
+                    }
+                }
+            }
+            sub_len = Subtract(re, ls)
+            ReturnValue(JSRT_CreateStringLen(Add(str_ptr, ls), sub_len))
+        }
+
+        // ─── toLowerCase (70) ───
+        IfCondition EqualTo(save_id, 70) ThenBlock: {
+            lbuf = Allocate(Add(str_len, 1))
+            li = 0
+            WhileLoop LessThan(li, str_len) {
+                ch = GetByte(str_ptr, li)
+                SetByte(lbuf, li, ch)
+                IfCondition GreaterEqual(ch, 65) ThenBlock: {
+                    IfCondition LessEqual(ch, 90) ThenBlock: {
+                        SetByte(lbuf, li, Add(ch, 32))
+                    }
+                }
+                li = Add(li, 1)
+            }
+            SetByte(lbuf, str_len, 0)
+            ReturnValue(JSRT_CreateString(lbuf))
+        }
+
+        // ─── toUpperCase (71) ───
+        IfCondition EqualTo(save_id, 71) ThenBlock: {
+            ubuf = Allocate(Add(str_len, 1))
+            ui = 0
+            WhileLoop LessThan(ui, str_len) {
+                ch = GetByte(str_ptr, ui)
+                SetByte(ubuf, ui, ch)
+                IfCondition GreaterEqual(ch, 97) ThenBlock: {
+                    IfCondition LessEqual(ch, 122) ThenBlock: {
+                        SetByte(ubuf, ui, Subtract(ch, 32))
+                    }
+                }
+                ui = Add(ui, 1)
+            }
+            SetByte(ubuf, str_len, 0)
+            ReturnValue(JSRT_CreateString(ubuf))
+        }
+
+        // ─── String.fromCharCode (72) — static, recv is ignored ───
+        IfCondition EqualTo(save_id, 72) ThenBlock: {
+            // Build string from char code arguments
+            fcbuf = Allocate(Add(save_argc, 1))
+            fi = 0
+            WhileLoop LessThan(fi, save_argc) {
+                a_val = Dereference(Add(save_args, Multiply(fi, 8)))
+                code = JSRT_ToNumber(a_val)
+                valid_code = 0
+                IfCondition GreaterEqual(code, 0) ThenBlock: {
+                    IfCondition LessEqual(code, 127) ThenBlock: {
+                        valid_code = 1
+                    }
+                }
+                IfCondition EqualTo(valid_code, 1) ThenBlock: {
+                    SetByte(fcbuf, fi, code)
+                } ElseBlock: {
+                    SetByte(fcbuf, fi, 63)
+                }
+                fi = Add(fi, 1)
+            }
+            SetByte(fcbuf, save_argc, 0)
+            ReturnValue(JSRT_CreateString(fcbuf))
+        }
+
+        // ─── substr (73) — substr(start, length) ───
+        IfCondition EqualTo(save_id, 73) ThenBlock: {
+            start = 0
+            sub_count = str_len
+            IfCondition GreaterThan(save_argc, 0) ThenBlock: {
+                a0 = Dereference(save_args)
+                start = JSRT_ToNumber(a0)
+            }
+            IfCondition GreaterThan(save_argc, 1) ThenBlock: {
+                a1 = Dereference(Add(save_args, 8))
+                sub_count = JSRT_ToNumber(a1)
+            }
+            // Negative start
+            IfCondition LessThan(start, 0) ThenBlock: {
+                start = Add(str_len, start)
+                IfCondition LessThan(start, 0) ThenBlock: { start = 0 }
+            }
+            IfCondition GreaterThan(start, str_len) ThenBlock: { start = str_len }
+            // Clamp length
+            IfCondition LessThan(sub_count, 0) ThenBlock: { sub_count = 0 }
+            IfCondition GreaterThan(Add(start, sub_count), str_len) ThenBlock: {
+                sub_count = Subtract(str_len, start)
+            }
+            ReturnValue(JSRT_CreateStringLen(Add(str_ptr, start), sub_count))
+        }
+
+        // ─── lastIndexOf (74) ───
+        IfCondition EqualTo(save_id, 74) ThenBlock: {
+            IfCondition EqualTo(save_argc, 0) ThenBlock: {
+                ReturnValue(JSRT_CreateNumber(-1))
+            }
+            a0 = Dereference(save_args)
+            search_ptr = JSRT_GetPayload(a0)
+            search_len = StringLength(search_ptr)
+            IfCondition EqualTo(search_len, 0) ThenBlock: {
+                ReturnValue(JSRT_CreateNumber(str_len))
+            }
+            // Search from end
+            found = -1
+            si = Subtract(str_len, search_len)
+            WhileLoop GreaterEqual(si, 0) {
+                match = 1
+                mi = 0
+                WhileLoop LessThan(mi, search_len) {
+                    IfCondition NotEqual(GetByte(str_ptr, Add(si, mi)), GetByte(search_ptr, mi)) ThenBlock: {
+                        match = 0
+                        mi = search_len
+                    }
+                    mi = Add(mi, 1)
+                }
+                IfCondition EqualTo(match, 1) ThenBlock: {
+                    IfCondition EqualTo(found, -1) ThenBlock: {
+                        found = si
+                    }
+                }
+                si = Subtract(si, 1)
+            }
+            ReturnValue(JSRT_CreateNumber(found))
+        }
+
+        // ─── concat (75) ───
+        IfCondition EqualTo(save_id, 75) ThenBlock: {
+            IfCondition EqualTo(save_argc, 0) ThenBlock: {
+                ReturnValue(save_recv)
+            }
+            // Concat all args
+            total_len = str_len
+            ci = 0
+            WhileLoop LessThan(ci, save_argc) {
+                a_val = Dereference(Add(save_args, Multiply(ci, 8)))
+                a_ptr = JSRT_GetPayload(a_val)
+                total_len = Add(total_len, StringLength(a_ptr))
+                ci = Add(ci, 1)
+            }
+            cbuf = Allocate(Add(total_len, 1))
+            MemoryCopy(cbuf, str_ptr, str_len)
+            cpos = str_len
+            ci = 0
+            WhileLoop LessThan(ci, save_argc) {
+                a_val = Dereference(Add(save_args, Multiply(ci, 8)))
+                a_ptr = JSRT_GetPayload(a_val)
+                a_len = StringLength(a_ptr)
+                IfCondition GreaterThan(a_len, 0) ThenBlock: {
+                    MemoryCopy(Add(cbuf, cpos), a_ptr, a_len)
+                }
+                cpos = Add(cpos, a_len)
+                ci = Add(ci, 1)
+            }
+            SetByte(cbuf, total_len, 0)
+            ReturnValue(JSRT_CreateString(cbuf))
+        }
+
+        // ─── Array constructor (76) — new Array(n) or Array(a,b,c) ───
+        IfCondition EqualTo(save_id, 76) ThenBlock: {
+            IfCondition EqualTo(save_argc, 1) ThenBlock: {
+                a0 = Dereference(save_args)
+                a0_type = JSRT_GetType(a0)
+                IfCondition EqualTo(a0_type, JSType.NUMBER) ThenBlock: {
+                    // new Array(n) — create array with n empty slots
+                    n = JSRT_ToNumber(a0)
+                    arr = JSRT_CreateArray()
+                    ai = 0
+                    WhileLoop LessThan(ai, n) {
+                        JSRT_ArrPush(arr, JSRT_Undefined())
+                        ai = Add(ai, 1)
+                    }
+                    ReturnValue(arr)
+                }
+            }
+            // Array(a, b, c) — create array with elements
+            arr = JSRT_CreateArray()
+            ai = 0
+            WhileLoop LessThan(ai, save_argc) {
+                a_val = Dereference(Add(save_args, Multiply(ai, 8)))
+                JSRT_ArrPush(arr, a_val)
+                ai = Add(ai, 1)
+            }
+            ReturnValue(arr)
+        }
+
+        // Unknown method
+        ReturnValue(JSRT_Undefined())
+    }
+}
+
+// =============================================================================
+// STRING METHOD MATCHING — returns JSNativeID or 0
+// =============================================================================
+Function.JSVM__MatchStringMethod {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        save_name = name
+        c0 = GetByte(save_name, 0)
+        c1 = GetByte(save_name, 1)
+
+        // charAt (99 104 97 114 65 116 0)
+        IfCondition EqualTo(c0, 99) ThenBlock: {
+            IfCondition EqualTo(c1, 104) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 97) ThenBlock: {
+                    IfCondition EqualTo(GetByte(save_name, 3), 114) ThenBlock: {
+                        // charA vs charC
+                        c4 = GetByte(save_name, 4)
+                        IfCondition EqualTo(c4, 65) ThenBlock: {
+                            // charAt (65 116 0)
+                            IfCondition EqualTo(GetByte(save_name, 5), 116) ThenBlock: {
+                                IfCondition EqualTo(GetByte(save_name, 6), 0) ThenBlock: {
+                                    ReturnValue(JSNativeID.STR_CHAR_AT)
+                                }
+                            }
+                        }
+                        // charCodeAt (67 111 100 101 65 116 0)
+                        IfCondition EqualTo(c4, 67) ThenBlock: {
+                            IfCondition EqualTo(GetByte(save_name, 5), 111) ThenBlock: {
+                                IfCondition EqualTo(GetByte(save_name, 6), 100) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(save_name, 7), 101) ThenBlock: {
+                                        IfCondition EqualTo(GetByte(save_name, 8), 65) ThenBlock: {
+                                            IfCondition EqualTo(GetByte(save_name, 9), 116) ThenBlock: {
+                                                IfCondition EqualTo(GetByte(save_name, 10), 0) ThenBlock: {
+                                                    ReturnValue(JSNativeID.STR_CHAR_CODE_AT)
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // concat (99 111 110 99 97 116 0)
+            IfCondition EqualTo(c1, 111) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 110) ThenBlock: {
+                    IfCondition EqualTo(GetByte(save_name, 3), 99) ThenBlock: {
+                        IfCondition EqualTo(GetByte(save_name, 4), 97) ThenBlock: {
+                            IfCondition EqualTo(GetByte(save_name, 5), 116) ThenBlock: {
+                                IfCondition EqualTo(GetByte(save_name, 6), 0) ThenBlock: {
+                                    ReturnValue(JSNativeID.STR_CONCAT)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // indexOf (105 110 100 101 120 79 102 0)
+        IfCondition EqualTo(c0, 105) ThenBlock: {
+            IfCondition EqualTo(c1, 110) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 100) ThenBlock: {
+                    IfCondition EqualTo(GetByte(save_name, 3), 101) ThenBlock: {
+                        IfCondition EqualTo(GetByte(save_name, 4), 120) ThenBlock: {
+                            IfCondition EqualTo(GetByte(save_name, 5), 79) ThenBlock: {
+                                IfCondition EqualTo(GetByte(save_name, 6), 102) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(save_name, 7), 0) ThenBlock: {
+                                        ReturnValue(JSNativeID.STR_INDEX_OF)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // substring (115 117 98 115 116 114 105 110 103 0)
+        IfCondition EqualTo(c0, 115) ThenBlock: {
+            IfCondition EqualTo(c1, 117) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 98) ThenBlock: {
+                    // substr vs substring
+                    c3 = GetByte(save_name, 3)
+                    IfCondition EqualTo(c3, 115) ThenBlock: {
+                        // substring (115 116 114 105 110 103 0)
+                        IfCondition EqualTo(GetByte(save_name, 4), 116) ThenBlock: {
+                            IfCondition EqualTo(GetByte(save_name, 5), 114) ThenBlock: {
+                                IfCondition EqualTo(GetByte(save_name, 6), 105) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(save_name, 7), 110) ThenBlock: {
+                                        IfCondition EqualTo(GetByte(save_name, 8), 103) ThenBlock: {
+                                            IfCondition EqualTo(GetByte(save_name, 9), 0) ThenBlock: {
+                                                ReturnValue(JSNativeID.STR_SUBSTRING)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // substr (114 0)
+                    IfCondition EqualTo(c3, 116) ThenBlock: {
+                        IfCondition EqualTo(GetByte(save_name, 4), 114) ThenBlock: {
+                            IfCondition EqualTo(GetByte(save_name, 5), 0) ThenBlock: {
+                                ReturnValue(JSNativeID.STR_SUBSTR)
+                            }
+                        }
+                    }
+                }
+            }
+            // slice (115 108 105 99 101 0)
+            IfCondition EqualTo(c1, 108) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 105) ThenBlock: {
+                    IfCondition EqualTo(GetByte(save_name, 3), 99) ThenBlock: {
+                        IfCondition EqualTo(GetByte(save_name, 4), 101) ThenBlock: {
+                            IfCondition EqualTo(GetByte(save_name, 5), 0) ThenBlock: {
+                                ReturnValue(JSNativeID.STR_SLICE)
+                            }
+                        }
+                    }
+                }
+            }
+            // split (115 112 108 105 116 0)
+            IfCondition EqualTo(c1, 112) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 108) ThenBlock: {
+                    IfCondition EqualTo(GetByte(save_name, 3), 105) ThenBlock: {
+                        IfCondition EqualTo(GetByte(save_name, 4), 116) ThenBlock: {
+                            IfCondition EqualTo(GetByte(save_name, 5), 0) ThenBlock: {
+                                ReturnValue(JSNativeID.STR_SPLIT)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // trim (116 114 105 109 0)
+        IfCondition EqualTo(c0, 116) ThenBlock: {
+            IfCondition EqualTo(c1, 114) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 105) ThenBlock: {
+                    IfCondition EqualTo(GetByte(save_name, 3), 109) ThenBlock: {
+                        IfCondition EqualTo(GetByte(save_name, 4), 0) ThenBlock: {
+                            ReturnValue(JSNativeID.STR_TRIM)
+                        }
+                    }
+                }
+            }
+            // toLowerCase (116 111 76 111 ...)
+            IfCondition EqualTo(c1, 111) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 76) ThenBlock: {
+                    ReturnValue(JSNativeID.STR_TO_LOWER)
+                }
+                IfCondition EqualTo(GetByte(save_name, 2), 85) ThenBlock: {
+                    ReturnValue(JSNativeID.STR_TO_UPPER)
+                }
+            }
+        }
+
+        // replace (114 101 112 108 97 99 101 0)
+        IfCondition EqualTo(c0, 114) ThenBlock: {
+            IfCondition EqualTo(c1, 101) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 112) ThenBlock: {
+                    ReturnValue(JSNativeID.STR_REPLACE)
+                }
+            }
+        }
+
+        // lastIndexOf (108 97 115 116 73 ...)
+        IfCondition EqualTo(c0, 108) ThenBlock: {
+            IfCondition EqualTo(c1, 97) ThenBlock: {
+                IfCondition EqualTo(GetByte(save_name, 2), 115) ThenBlock: {
+                    IfCondition EqualTo(GetByte(save_name, 3), 116) ThenBlock: {
+                        ReturnValue(JSNativeID.STR_LAST_INDEX_OF)
+                    }
+                }
+            }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
 // STEP — execute a single bytecode instruction
 // Returns: 1 = still running, 0 = halted, -1 = error
 // =============================================================================
@@ -526,6 +1214,15 @@ Function.JSVM_Step {
         // Fetch opcode
         op = JSVM__ReadByte()
         JSVMState.steps = Add(JSVMState.steps, 1)
+
+        // DEBUG TRACE
+        PrintMessage("[STEP ")
+        PrintNumber(JSVMState.steps)
+        PrintMessage(" OP=")
+        PrintNumber(op)
+        PrintMessage(" SP=")
+        PrintNumber(JSVMState.sp)
+        PrintMessage("]\n")
 
         // Check step limit
         IfCondition GreaterEqual(JSVMState.steps, JSVMState.max_steps) ThenBlock: {
@@ -664,6 +1361,41 @@ Function.JSVM_Step {
                         JSVM__StackPush(JSRT_CreateNumber(alen))
                         ReturnValue(1)
                     }
+                }
+
+                // String property/method access
+                IfCondition EqualTo(obj_type, JSType.STRING) ThenBlock: {
+                    // Check "length" first (108 101 110 103 116 104 0)
+                    c0 = GetByte(cpay, 0)
+                    IfCondition EqualTo(c0, 108) ThenBlock: {
+                        IfCondition EqualTo(GetByte(cpay, 1), 101) ThenBlock: {
+                            IfCondition EqualTo(GetByte(cpay, 2), 110) ThenBlock: {
+                                IfCondition EqualTo(GetByte(cpay, 3), 103) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(cpay, 4), 116) ThenBlock: {
+                                        IfCondition EqualTo(GetByte(cpay, 5), 104) ThenBlock: {
+                                            IfCondition EqualTo(GetByte(cpay, 6), 0) ThenBlock: {
+                                                str_ptr = JSRT_GetPayload(obj)
+                                                slen = StringLength(str_ptr)
+                                                JSVM__StackPush(JSRT_CreateNumber(slen))
+                                                ReturnValue(1)
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Match string method names and create bound native func
+                    str_method_id = JSVM__MatchStringMethod(cpay)
+                    IfCondition GreaterThan(str_method_id, 0) ThenBlock: {
+                        sm_func = JSBridge__CreateNativeFunc(str_method_id, cpay, 1)
+                        JSRT_FuncSetEnv(sm_func, obj)
+                        JSVM__StackPush(sm_func)
+                        ReturnValue(1)
+                    }
+                    // Fall through to undefined
+                    JSVM__StackPush(JSRT_Undefined())
+                    ReturnValue(1)
                 }
 
                 // Check for getter: __get_<name>
@@ -1187,6 +1919,17 @@ Function.JSVM_Step {
                         ReturnValue(1)
                     }
 
+                    // Handler IDs 62-76: String/Array methods (env = receiver)
+                    IfCondition GreaterEqual(handler_id, 62) ThenBlock: {
+                        IfCondition LessEqual(handler_id, 76) ThenBlock: {
+                            str_recv = JSRT_FuncGetEnv(func_val)
+                            native_result = JSVM__DispatchStringMethod(handler_id, str_recv, arg_buf, argc)
+                            Deallocate(arg_buf, Multiply(Add(argc, 1), 8))
+                            JSVM__StackPush(native_result)
+                            ReturnValue(1)
+                        }
+                    }
+
                     // Handler IDs 0-21: JSRuntime built-ins (0-14 math/type, 15-21 Error ctors)
                     // Handler IDs 22+: JSBridge DOM/timer natives
                     IfCondition GreaterEqual(handler_id, 22) ThenBlock: {
@@ -1234,6 +1977,10 @@ Function.JSVM_Step {
                     ReturnValue(1)
                 }
 
+                // Async function (env == 65) — execute normally, AWAIT handles promise unwrapping
+                // No special call handling needed; the function runs eagerly
+                // and AWAIT opcode unwraps any promises in-flight.
+
                 // Get function descriptor fields
                 func_params = JSRT_FuncGetParams(func_val)
                 func_locals = JSRT_FuncGetLocals(func_val)
@@ -1259,7 +2006,37 @@ Function.JSVM_Step {
 
                 Deallocate(arg_buf, Multiply(Add(argc, 1), 8))
 
-                // Jump to function code
+                // === JIT CHECK ===
+                // If JIT is enabled, try to execute native code instead of interpreting
+                IfCondition EqualTo(JITState.enabled, 1) ThenBlock: {
+                    jit_native = JIT_Lookup(func_bc)
+                    IfCondition EqualTo(jit_native, 0) ThenBlock: {
+                        // Not compiled yet — try to compile
+                        // code_len: from func_bc to end of bytecode (or next RETURN)
+                        jit_code_len = Subtract(JSVMState.code_len, func_bc)
+                        jit_native = JIT_Compile(Add(JSVMState.code, func_bc), jit_code_len, func_bc)
+                    }
+                    IfCondition NotEqual(jit_native, 0) ThenBlock: {
+                        // Execute JIT'd code
+                        JIT_Execute(jit_native)
+                        // JIT code ran the function body and returned.
+                        // The JIT's RETURN opcode popped the return value and wrote sp back.
+                        // Now we pop the frame and push the return value.
+                        jit_ret = JSVM__StackPop()
+                        jit_frame = JSVM__PopFrame()
+                        IfCondition EqualTo(jit_frame, 0) ThenBlock: {
+                            JSVM__StackPush(jit_ret)
+                            JSVMState.halted = 1
+                            ReturnValue(0)
+                        }
+                        JSVMState.pc = Dereference(jit_frame)
+                        JSVMState.sp = Dereference(Add(jit_frame, 8))
+                        JSVM__StackPush(jit_ret)
+                        ReturnValue(1)
+                    }
+                }
+
+                // Jump to function code (interpreter fallback)
                 JSVMState.pc = func_bc
                 ReturnValue(1)
             }
@@ -1317,6 +2094,16 @@ Function.JSVM_Step {
                     JSVM__StackPush(ret_val)
                     JSVMState.halted = 1
                     ReturnValue(0)
+                }
+
+                // Check if this was a constructor frame (offset 40 = this_obj)
+                ctor_this = Dereference(Add(frame, 40))
+                IfCondition NotEqual(ctor_this, 0) ThenBlock: {
+                    // Constructor return: if ret_val is not an object, use this_obj
+                    rv_type = JSRT_GetType(ret_val)
+                    IfCondition NotEqual(rv_type, JSType.OBJECT) ThenBlock: {
+                        ret_val = ctor_this
+                    }
                 }
 
                 // Restore state
@@ -1518,6 +2305,35 @@ Function.JSVM_Step {
                 ReturnValue(1)
             }
 
+            // THROW_TDZ (78) — ReferenceError: cannot access variable before initialization
+            // 2-byte operand: const pool index of variable name string
+            Case 78: {
+                ci = GetByte(JSVMState.code, JSVMState.pc)
+                ci = Add(Multiply(ci, 256), GetByte(JSVMState.code, Add(JSVMState.pc, 1)))
+                JSVMState.pc = Add(JSVMState.pc, 2)
+                // Create ReferenceError object with message
+                tdz_err = JSRT_CreateObject()
+                JSRT_ObjSet(tdz_err, "name", JSRT_CreateString("ReferenceError"))
+                JSRT_ObjSet(tdz_err, "message", JSRT_CreateString("Cannot access variable before initialization"))
+                JSRT_ObjSet(tdz_err, "__class__", JSRT_CreateString("ReferenceError"))
+                // Throw it
+                IfCondition GreaterThan(JSVMState.exc_sp, 0) ThenBlock: {
+                    JSVMState.exc_sp = Subtract(JSVMState.exc_sp, 1)
+                    ebase = Add(JSVMState.exc_stack, Multiply(JSVMState.exc_sp, 16))
+                    catch_addr = Dereference(ebase)
+                    saved_sp = Dereference(Add(ebase, 8))
+                    IfCondition LessThan(saved_sp, 0) ThenBlock: { saved_sp = 0 }
+                    IfCondition GreaterThan(saved_sp, JSVMConst.MAX_STACK) ThenBlock: { saved_sp = JSVMConst.MAX_STACK }
+                    JSVMState.sp = saved_sp
+                    JSVM__StackPush(tdz_err)
+                    JSVMState.pc = catch_addr
+                } ElseBlock: {
+                    JSVMState.error = 1
+                    JSVMState.halted = 1
+                }
+                ReturnValue(1)
+            }
+
             // OBJ_KEYS (66) — pop object, push array of key strings
             Case 66: {
                 obj = JSVM__StackPop()
@@ -1608,6 +2424,113 @@ Function.JSVM_Step {
                     pi = Add(pi, 1)
                 }
 
+                JSVMState.pc = func_bc
+                ReturnValue(1)
+            }
+
+            // CONSTRUCT (81) — new Foo(args) constructor call
+            // Stack: [..., func, arg0, arg1, ..., argN-1]
+            // Creates new object, binds this, calls constructor, returns object
+            Case 81: {
+                argc = JSVM__ReadByte()
+
+                // Pop arguments into temp buffer
+                arg_buf = Allocate(Multiply(Add(argc, 1), 8))
+                MemorySet(arg_buf, 0, Multiply(Add(argc, 1), 8))
+
+                ai = Subtract(argc, 1)
+                WhileLoop GreaterEqual(ai, 0) {
+                    arg_v = JSVM__StackPop()
+                    StoreValue(Add(arg_buf, Multiply(ai, 8)), arg_v)
+                    ai = Subtract(ai, 1)
+                }
+
+                // Pop function (constructor)
+                func_val = JSVM__StackPop()
+                ft = JSRT_GetType(func_val)
+                IfCondition NotEqual(ft, JSType.FUNCTION) ThenBlock: {
+                    Deallocate(arg_buf, Multiply(Add(argc, 1), 8))
+                    JSVM__StackPush(JSRT_Undefined())
+                    ReturnValue(1)
+                }
+
+                // Create new object for this
+                new_obj = JSRT_CreateObject()
+
+                // Set prototype: new_obj.__proto__ = func.prototype
+                proto_val = JSRT_ObjGet(func_val, "prototype")
+                proto_type = JSRT_GetType(proto_val)
+                IfCondition EqualTo(proto_type, JSType.OBJECT) ThenBlock: {
+                    JSRT_ObjSet(new_obj, "__proto__", proto_val)
+                }
+
+                // Check if native constructor
+                func_bc = JSRT_FuncGetBC(func_val)
+                IfCondition LessThan(func_bc, 0) ThenBlock: {
+                    // Native constructor — dispatch and return result or new_obj
+                    handler_id = Subtract(-1, func_bc)
+                    // String/Array method dispatch (62-76)
+                    IfCondition GreaterEqual(handler_id, 62) ThenBlock: {
+                        IfCondition LessEqual(handler_id, 76) ThenBlock: {
+                            native_result = JSVM__DispatchStringMethod(handler_id, new_obj, arg_buf, argc)
+                            Deallocate(arg_buf, Multiply(Add(argc, 1), 8))
+                            nr_type = JSRT_GetType(native_result)
+                            IfCondition Or(EqualTo(nr_type, JSType.OBJECT), EqualTo(nr_type, JSType.ARRAY)) ThenBlock: {
+                                JSVM__StackPush(native_result)
+                            } ElseBlock: {
+                                JSVM__StackPush(new_obj)
+                            }
+                            ReturnValue(1)
+                        }
+                    }
+                    IfCondition GreaterEqual(handler_id, 22) ThenBlock: {
+                        native_result = JSBridge_Dispatch(handler_id, arg_buf, argc)
+                    } ElseBlock: {
+                        native_result = JSRT_CallNative(handler_id, arg_buf, argc)
+                    }
+                    Deallocate(arg_buf, Multiply(Add(argc, 1), 8))
+                    // If native returned an object/array, use that; otherwise use new_obj
+                    nr_type = JSRT_GetType(native_result)
+                    IfCondition Or(EqualTo(nr_type, JSType.OBJECT), EqualTo(nr_type, JSType.ARRAY)) ThenBlock: {
+                        JSVM__StackPush(native_result)
+                    } ElseBlock: {
+                        JSVM__StackPush(new_obj)
+                    }
+                    ReturnValue(1)
+                }
+
+                // Bind this: set global "this" to new_obj
+                JSVM__SetGlobal("this", new_obj)
+
+                // Set up call frame (same as CALL)
+                func_params = JSRT_FuncGetParams(func_val)
+                func_locals = JSRT_FuncGetLocals(func_val)
+
+                save_pc = JSVMState.pc
+                save_sp = JSVMState.sp
+                locals_base = JSVMState.sp
+
+                JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+
+                // Mark frame as constructor: store new_obj at frame offset 40
+                faddr = Add(JSVMState.frames, Multiply(Subtract(JSVMState.fp, 1), JSVMConst.FRAME_SIZE))
+                StoreValue(Add(faddr, 40), new_obj)
+
+                // Push locals onto stack (initialize args, rest to undefined)
+                pi = 0
+                WhileLoop LessThan(pi, func_locals) {
+                    IfCondition LessThan(pi, argc) ThenBlock: {
+                        pval = Dereference(Add(arg_buf, Multiply(pi, 8)))
+                        JSVM__StackPush(pval)
+                    } ElseBlock: {
+                        JSVM__StackPush(JSRT_Undefined())
+                    }
+                    pi = Add(pi, 1)
+                }
+
+                Deallocate(arg_buf, Multiply(Add(argc, 1), 8))
+
+                // Jump to constructor code
                 JSVMState.pc = func_bc
                 ReturnValue(1)
             }
@@ -1718,6 +2641,70 @@ Function.JSVM_Step {
                 ReturnValue(1)
             }
 
+            // ASYNC_CLOSURE (79) — like CLOSURE but marks function as async
+            // Async functions run eagerly to completion (single-threaded cooperative)
+            // The return value is wrapped in a resolved Promise
+            Case 79: {
+                cidx = JSVM__Read16()
+                cval = JSVM__LoadConst(cidx)
+                // Mark the function as async by setting env to magic value 65 (0x41 = 'A')
+                JSRT_FuncSetEnv(cval, 65)
+                JSVM__StackPush(cval)
+                ReturnValue(1)
+            }
+
+            // AWAIT (80) — in eager mode, just unwrap Promises synchronously
+            // If TOS is a Promise (object with __state__), extract __value__
+            // Otherwise, pass through (non-thenable values resolve immediately)
+            Case 80: {
+                await_val = JSVM__StackPop()
+                await_type = JSRT_GetType(await_val)
+                // Check if it's a Promise object
+                IfCondition EqualTo(await_type, JSType.OBJECT) ThenBlock: {
+                    // Check for __state__ property (our Promise marker)
+                    p_state = JSRT_ObjGet(await_val, "__state__")
+                    ps_type = JSRT_GetType(p_state)
+                    IfCondition EqualTo(ps_type, JSType.NUMBER) ThenBlock: {
+                        // It's a Promise — check state
+                        ps_val = JSRT_GetPayload(p_state)
+                        IfCondition EqualTo(ps_val, 1) ThenBlock: {
+                            // Fulfilled: extract value
+                            resolved = JSRT_ObjGet(await_val, "__value__")
+                            JSVM__StackPush(resolved)
+                        } ElseBlock: {
+                            IfCondition EqualTo(ps_val, 2) ThenBlock: {
+                                // Rejected: throw the rejection reason
+                                rej_val = JSRT_ObjGet(await_val, "__value__")
+                                IfCondition GreaterThan(JSVMState.exc_sp, 0) ThenBlock: {
+                                    JSVMState.exc_sp = Subtract(JSVMState.exc_sp, 1)
+                                    ebase = Add(JSVMState.exc_stack, Multiply(JSVMState.exc_sp, 16))
+                                    catch_addr = Dereference(ebase)
+                                    saved_sp = Dereference(Add(ebase, 8))
+                                    IfCondition LessThan(saved_sp, 0) ThenBlock: { saved_sp = 0 }
+                                    IfCondition GreaterThan(saved_sp, JSVMConst.MAX_STACK) ThenBlock: { saved_sp = JSVMConst.MAX_STACK }
+                                    JSVMState.sp = saved_sp
+                                    JSVM__StackPush(rej_val)
+                                    JSVMState.pc = catch_addr
+                                } ElseBlock: {
+                                    JSVMState.error = 1
+                                    JSVMState.halted = 1
+                                }
+                            } ElseBlock: {
+                                // Pending: in eager mode, resolve to undefined
+                                JSVM__StackPush(JSRT_Undefined())
+                            }
+                        }
+                    } ElseBlock: {
+                        // Not a Promise, pass through (thenable check could go here)
+                        JSVM__StackPush(await_val)
+                    }
+                } ElseBlock: {
+                    // Non-object: pass through (await 42 === 42)
+                    JSVM__StackPush(await_val)
+                }
+                ReturnValue(1)
+            }
+
             // NOP (99)
             Case 99: {
                 ReturnValue(1)
@@ -1744,12 +2731,8 @@ Function.JSVM_Step {
 Function.JSVM_Run {
     Output: Address
     Body: {
-        JSVMTmp.done = 0
-        WhileLoop EqualTo(JSVMTmp.done, 0) {
-            rc = JSVM_Step()
-            IfCondition Or(EqualTo(JSVMState.halted, 1), EqualTo(JSVMState.error, 1)) ThenBlock: {
-                JSVMTmp.done = 1
-            }
+        WhileLoop And(EqualTo(JSVMState.halted, 0), EqualTo(JSVMState.error, 0)) {
+            JSVM_Step()
         }
         // Return top of stack if any
         IfCondition GreaterThan(JSVMState.sp, 0) ThenBlock: {
@@ -1924,7 +2907,7 @@ Function.JSVM_InstallBuiltins {
         JSVM__SetGlobal("console", console_obj)
 
         // Create Math object and install as global
-        math_obj = JSRT_CreateMath()
+        math_obj = JSBridge__CreateMathObj()
         JSVM__SetGlobal("Math", math_obj)
 
         // Install undefined, null, NaN, Infinity as globals
@@ -2011,8 +2994,8 @@ Function.JSVM_InstallBuiltins {
         obj_global = JSRT__Pop()
         JSRT_ObjSet(obj_global, "getOwnPropertyDescriptor", gopd_func)
 
-        // Install Array global with isArray, from
-        arr_global = JSRT_CreateObject()
+        // Install Array as constructor function with isArray, from
+        arr_global = JSBridge__CreateNativeFunc(JSNativeID.ARR_CTOR, "Array", 1)
         JSVM__SetGlobal("Array", arr_global)
         JSRT__Push(arr_global)
         aia_func = JSBridge__CreateNativeFunc(JSNativeID.ARR_IS_ARRAY, "isArray", 1)
@@ -2022,6 +3005,26 @@ Function.JSVM_InstallBuiltins {
         af_func = JSBridge__CreateNativeFunc(JSNativeID.ARR_FROM, "from", 1)
         arr_global = JSRT__Pop()
         JSRT_ObjSet(arr_global, "from", af_func)
+
+        // Install String global with fromCharCode
+        str_global = JSRT_CreateObject()
+        JSVM__SetGlobal("String", str_global)
+        JSRT__Push(str_global)
+        fcc_func = JSBridge__CreateNativeFunc(JSNativeID.STR_FROM_CHAR_CODE, "fromCharCode", 1)
+        str_global = JSRT__Pop()
+        JSRT_ObjSet(str_global, "fromCharCode", fcc_func)
+
+        // Install Promise global with resolve, reject
+        promise_global = JSBridge__CreateNativeFunc(JSNativeID.PROMISE_CTOR, "Promise", 1)
+        JSVM__SetGlobal("Promise", promise_global)
+        JSRT__Push(promise_global)
+        pr_func = JSBridge__CreateNativeFunc(JSNativeID.PROMISE_RESOLVE, "resolve", 1)
+        promise_global = JSRT__Pop()
+        JSRT_ObjSet(promise_global, "resolve", pr_func)
+        JSRT__Push(promise_global)
+        pj_func = JSBridge__CreateNativeFunc(JSNativeID.PROMISE_REJECT, "reject", 1)
+        promise_global = JSRT__Pop()
+        JSRT_ObjSet(promise_global, "reject", pj_func)
 
         ReturnValue(1)
     }
