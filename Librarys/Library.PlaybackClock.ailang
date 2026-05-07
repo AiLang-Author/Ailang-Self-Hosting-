@@ -1,0 +1,394 @@
+// Library.PlaybackClock.ailang
+// Wall-clock anchored playback synchronization over /dev/shm.
+//
+// A 64-byte shared memory region that all pipeline nodes can read.
+// The presenter (orchestrator) writes control state; demuxers and
+// decoders read it to coordinate timing, pause, seek, and stop.
+//
+// Timing is anchored to CLOCK_MONOTONIC. Audio hardware position
+// provides drift correction. The monotonic clock is the mechanism;
+// audio is the authority.
+//
+// Layout (64 bytes):
+//   [0]  state           (STOPPED=0, PLAYING=1, PAUSED=2, SEEKING=3)
+//   [8]  epoch_usec      (CLOCK_MONOTONIC value at play start)
+//   [16] pause_offset    (accumulated pause time in usec)
+//   [24] rate_num        (playback rate numerator, 1000 = 1.0x)
+//   [32] rate_den        (playback rate denominator, 1000)
+//   [40] seek_target     (target PTS in usec, written by presenter)
+//   [48] audio_hw_pos    (frames written to ALSA, written by presenter)
+//   [56] pause_start     (MONOTONIC when pause began, internal)
+//
+// Orthogonal: no dependency on any other media component.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+
+// =============================================================================
+// FIELD OFFSETS
+// =============================================================================
+FixedPool.PCFields {
+    "STATE":        Initialize=0
+    "EPOCH":        Initialize=8
+    "PAUSE_OFF":    Initialize=16
+    "RATE_NUM":     Initialize=24
+    "RATE_DEN":     Initialize=32
+    "SEEK_TARGET":  Initialize=40
+    "AUDIO_HW_POS": Initialize=48
+    "PAUSE_START":  Initialize=56
+}
+
+FixedPool.PCConst {
+    "SHM_SIZE": Initialize=64
+}
+
+// Playback states
+FixedPool.PCState {
+    "STOPPED":  Initialize=0
+    "PLAYING":  Initialize=1
+    "PAUSED":   Initialize=2
+    "SEEKING":  Initialize=3
+}
+
+// Syscall constants
+FixedPool.PCSys {
+    "SYS_OPEN":         Initialize=2
+    "SYS_CLOSE":        Initialize=3
+    "SYS_MMAP":         Initialize=9
+    "SYS_MUNMAP":       Initialize=11
+    "SYS_FTRUNCATE":    Initialize=77
+    "SYS_UNLINK":       Initialize=87
+    "SYS_CLOCK_GETTIME": Initialize=228
+    "CLOCK_MONOTONIC":  Initialize=1
+}
+
+FixedPool.PCMmap {
+    "O_RDWR":        Initialize=2
+    "O_CREAT_RDWR":  Initialize=66
+    "MODE_0666":     Initialize=438
+    "PROT_RW":       Initialize=3
+    "MAP_SHARED":    Initialize=1
+}
+
+// =============================================================================
+// PATH BUILDER — "/dev/shm/ailang_media_clock_<name>"
+// =============================================================================
+Function.PlaybackClock_BuildPath {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        prefix = "/dev/shm/ailang_media_clock_"
+        prefix_len = 27
+        name_len = StringLength(name)
+        total = Add(prefix_len, Add(name_len, 1))
+        path = Allocate(total)
+        MemoryCopy(path, prefix, prefix_len)
+        MemoryCopy(Add(path, prefix_len), name, name_len)
+        SetByte(path, Add(prefix_len, name_len), 0)
+        ReturnValue(path)
+    }
+}
+
+// =============================================================================
+// GET MONOTONIC TIME — returns microseconds from CLOCK_MONOTONIC
+// Uses a 16-byte stack buffer for timespec {tv_sec, tv_nsec}
+// =============================================================================
+Function.PlaybackClock_MonoUsec {
+    Output: Integer
+    Body: {
+        ts = Allocate(16)
+        SystemCall(PCSys.SYS_CLOCK_GETTIME, PCSys.CLOCK_MONOTONIC, ts, 0, 0, 0, 0)
+        sec  = Dereference(ts)
+        nsec = Dereference(Add(ts, 8))
+        Deallocate(ts, 16)
+        // sec * 1000000 + nsec / 1000
+        ReturnValue(Add(Multiply(sec, 1000000), Divide(nsec, 1000)))
+    }
+}
+
+// =============================================================================
+// CREATE — presenter calls this to create the clock shm
+// =============================================================================
+Function.PlaybackClock_Create {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        path = PlaybackClock_BuildPath(name)
+
+        fd = SystemCall(PCSys.SYS_OPEN, path, PCMmap.O_CREAT_RDWR, PCMmap.MODE_0666)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[PlaybackClock] open failed: ")
+            PrintString(path)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        SystemCall(PCSys.SYS_FTRUNCATE, fd, PCConst.SHM_SIZE, 0, 0, 0, 0)
+
+        ptr = SystemCall(PCSys.SYS_MMAP, 0, PCConst.SHM_SIZE, PCMmap.PROT_RW, PCMmap.MAP_SHARED, fd, 0)
+        SystemCall(PCSys.SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+
+        IfCondition LessThan(ptr, 0) ThenBlock: {
+            PrintMessage("[PlaybackClock] mmap failed\n")
+            ReturnValue(0)
+        }
+
+        // Initialize to STOPPED, rate 1.0x
+        StoreValue(Add(ptr, PCFields.STATE),        PCState.STOPPED)
+        StoreValue(Add(ptr, PCFields.EPOCH),         0)
+        StoreValue(Add(ptr, PCFields.PAUSE_OFF),     0)
+        StoreValue(Add(ptr, PCFields.RATE_NUM),      1000)
+        StoreValue(Add(ptr, PCFields.RATE_DEN),      1000)
+        StoreValue(Add(ptr, PCFields.SEEK_TARGET),   0)
+        StoreValue(Add(ptr, PCFields.AUDIO_HW_POS),  0)
+        StoreValue(Add(ptr, PCFields.PAUSE_START),   0)
+
+        PrintMessage("[PlaybackClock] created: ")
+        PrintString(path)
+        PrintMessage("\n")
+
+        ReturnValue(ptr)
+    }
+}
+
+// =============================================================================
+// OPEN — other nodes call this to open an existing clock
+// =============================================================================
+Function.PlaybackClock_Open {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        path = PlaybackClock_BuildPath(name)
+
+        fd = SystemCall(PCSys.SYS_OPEN, path, PCMmap.O_RDWR, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[PlaybackClock] open failed: ")
+            PrintString(path)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        ptr = SystemCall(PCSys.SYS_MMAP, 0, PCConst.SHM_SIZE, PCMmap.PROT_RW, PCMmap.MAP_SHARED, fd, 0)
+        SystemCall(PCSys.SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+
+        IfCondition LessThan(ptr, 0) ThenBlock: {
+            PrintMessage("[PlaybackClock] mmap failed\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[PlaybackClock] opened: ")
+        PrintString(path)
+        PrintMessage("\n")
+
+        ReturnValue(ptr)
+    }
+}
+
+// =============================================================================
+// DESTROY — unmap + unlink
+// =============================================================================
+Function.PlaybackClock_Destroy {
+    Input: clock: Integer
+    Input: name:  Address
+    Body: {
+        IfCondition NotEqual(clock, 0) ThenBlock: {
+            SystemCall(PCSys.SYS_MUNMAP, clock, PCConst.SHM_SIZE, 0, 0, 0, 0)
+        }
+        path = PlaybackClock_BuildPath(name)
+        SystemCall(PCSys.SYS_UNLINK, path, 0, 0, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// CLOSE — unmap only (non-owner nodes)
+// =============================================================================
+Function.PlaybackClock_Close {
+    Input: clock: Integer
+    Body: {
+        IfCondition NotEqual(clock, 0) ThenBlock: {
+            SystemCall(PCSys.SYS_MUNMAP, clock, PCConst.SHM_SIZE, 0, 0, 0, 0)
+        }
+    }
+}
+
+// =============================================================================
+// PLAY — start playback, anchor epoch to now
+// =============================================================================
+Function.PlaybackClock_Play {
+    Input: clock: Integer
+    Body: {
+        now = PlaybackClock_MonoUsec()
+        StoreValue(Add(clock, PCFields.EPOCH),      now)
+        StoreValue(Add(clock, PCFields.PAUSE_OFF),   0)
+        StoreValue(Add(clock, PCFields.PAUSE_START), 0)
+        StoreValue(Add(clock, PCFields.AUDIO_HW_POS), 0)
+        StoreValue(Add(clock, PCFields.STATE),       PCState.PLAYING)
+    }
+}
+
+// =============================================================================
+// PAUSE — freeze playback, record pause start time
+// =============================================================================
+Function.PlaybackClock_Pause {
+    Input: clock: Integer
+    Body: {
+        state = Dereference(Add(clock, PCFields.STATE))
+        IfCondition NotEqual(state, PCState.PLAYING) ThenBlock: {
+            ReturnValue(0)
+        }
+        now = PlaybackClock_MonoUsec()
+        StoreValue(Add(clock, PCFields.PAUSE_START), now)
+        StoreValue(Add(clock, PCFields.STATE),       PCState.PAUSED)
+    }
+}
+
+// =============================================================================
+// RESUME — resume from pause, accumulate pause duration
+// =============================================================================
+Function.PlaybackClock_Resume {
+    Input: clock: Integer
+    Body: {
+        state = Dereference(Add(clock, PCFields.STATE))
+        IfCondition NotEqual(state, PCState.PAUSED) ThenBlock: {
+            ReturnValue(0)
+        }
+        now = PlaybackClock_MonoUsec()
+        pause_start = Dereference(Add(clock, PCFields.PAUSE_START))
+        pause_dur = Subtract(now, pause_start)
+        old_off = Dereference(Add(clock, PCFields.PAUSE_OFF))
+        StoreValue(Add(clock, PCFields.PAUSE_OFF), Add(old_off, pause_dur))
+        StoreValue(Add(clock, PCFields.PAUSE_START), 0)
+        StoreValue(Add(clock, PCFields.STATE), PCState.PLAYING)
+    }
+}
+
+// =============================================================================
+// STOP — halt playback
+// =============================================================================
+Function.PlaybackClock_Stop {
+    Input: clock: Integer
+    Body: {
+        StoreValue(Add(clock, PCFields.STATE), PCState.STOPPED)
+    }
+}
+
+// =============================================================================
+// SEEK — set seek target, demuxer will act on it
+// Re-anchors epoch so that MediaTime returns target after seek completes
+// =============================================================================
+Function.PlaybackClock_Seek {
+    Input: clock:      Integer
+    Input: target_usec: Integer
+    Body: {
+        StoreValue(Add(clock, PCFields.SEEK_TARGET), target_usec)
+        StoreValue(Add(clock, PCFields.STATE), PCState.SEEKING)
+    }
+}
+
+// =============================================================================
+// SEEK COMPLETE — called by demuxer after it has seeked and flushed
+// Re-anchors the epoch so MediaTime starts from seek_target
+// =============================================================================
+Function.PlaybackClock_SeekDone {
+    Input: clock: Integer
+    Body: {
+        target = Dereference(Add(clock, PCFields.SEEK_TARGET))
+        now = PlaybackClock_MonoUsec()
+        // epoch = now - target, so MediaTime() returns target immediately
+        StoreValue(Add(clock, PCFields.EPOCH), Subtract(now, target))
+        StoreValue(Add(clock, PCFields.PAUSE_OFF), 0)
+        StoreValue(Add(clock, PCFields.STATE), PCState.PLAYING)
+    }
+}
+
+// =============================================================================
+// MEDIA TIME — current playback position in microseconds
+// =============================================================================
+Function.PlaybackClock_MediaTime {
+    Input: clock: Integer
+    Output: Integer
+    Body: {
+        state = Dereference(Add(clock, PCFields.STATE))
+
+        IfCondition EqualTo(state, PCState.STOPPED) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        epoch     = Dereference(Add(clock, PCFields.EPOCH))
+        pause_off = Dereference(Add(clock, PCFields.PAUSE_OFF))
+        rate_num  = Dereference(Add(clock, PCFields.RATE_NUM))
+        rate_den  = Dereference(Add(clock, PCFields.RATE_DEN))
+
+        IfCondition EqualTo(state, PCState.PAUSED) ThenBlock: {
+            pause_start = Dereference(Add(clock, PCFields.PAUSE_START))
+            elapsed = Subtract(Subtract(pause_start, epoch), pause_off)
+            media = Divide(Multiply(elapsed, rate_num), rate_den)
+            ReturnValue(media)
+        }
+
+        // PLAYING or SEEKING
+        now = PlaybackClock_MonoUsec()
+        elapsed = Subtract(Subtract(now, epoch), pause_off)
+        media = Divide(Multiply(elapsed, rate_num), rate_den)
+        ReturnValue(media)
+    }
+}
+
+// =============================================================================
+// SET RATE — change playback speed (num/den, e.g. 2000/1000 = 2x)
+// =============================================================================
+Function.PlaybackClock_SetRate {
+    Input: clock: Integer
+    Input: num:   Integer
+    Input: den:   Integer
+    Body: {
+        // Re-anchor epoch to current media time at old rate before changing
+        state = Dereference(Add(clock, PCFields.STATE))
+        IfCondition EqualTo(state, PCState.PLAYING) ThenBlock: {
+            cur_media = PlaybackClock_MediaTime(clock)
+            now = PlaybackClock_MonoUsec()
+            // New epoch = now - cur_media (at new rate, media_time = (now - epoch) * num/den)
+            // We want cur_media = (now - new_epoch) * new_num/new_den
+            // new_epoch = now - cur_media * new_den / new_num
+            new_epoch = Subtract(now, Divide(Multiply(cur_media, den), num))
+            StoreValue(Add(clock, PCFields.EPOCH), new_epoch)
+            StoreValue(Add(clock, PCFields.PAUSE_OFF), 0)
+        }
+        StoreValue(Add(clock, PCFields.RATE_NUM), num)
+        StoreValue(Add(clock, PCFields.RATE_DEN), den)
+    }
+}
+
+// =============================================================================
+// SET AUDIO HW POS — presenter writes ALSA frames_written for drift check
+// =============================================================================
+Function.PlaybackClock_SetAudioHWPos {
+    Input: clock:  Integer
+    Input: frames: Integer
+    Body: {
+        StoreValue(Add(clock, PCFields.AUDIO_HW_POS), frames)
+    }
+}
+
+// =============================================================================
+// GET STATE — read current state (for demuxers/decoders to poll)
+// =============================================================================
+Function.PlaybackClock_GetState {
+    Input: clock: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Dereference(Add(clock, PCFields.STATE)))
+    }
+}
+
+// =============================================================================
+// GET SEEK TARGET — read seek target PTS
+// =============================================================================
+Function.PlaybackClock_GetSeekTarget {
+    Input: clock: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Dereference(Add(clock, PCFields.SEEK_TARGET)))
+    }
+}

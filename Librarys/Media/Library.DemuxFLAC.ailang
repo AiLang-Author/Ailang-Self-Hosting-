@@ -1,0 +1,565 @@
+// Library.DemuxFLAC.ailang
+// Standalone FLAC demuxer process.
+//
+// Reads a FLAC file, parses the fLaC header and metadata blocks, then
+// streams the raw FLAC data to an audio PacketRing in fixed-size chunks.
+// The FLAC decoder (libFLAC) handles frame boundary detection — we just
+// need to feed it a valid FLAC byte stream.
+//
+// First packet: CONFIG-flagged, contains the fLaC magic + all metadata
+// blocks (STREAMINFO, SEEKTABLE, VORBIS_COMMENT, etc.). The decoder
+// uses this to initialize.
+//
+// Subsequent packets: raw FLAC stream data in PKT_CHUNK_SIZE chunks.
+//
+// On seek: re-sends the CONFIG packet, then resumes from the estimated
+// byte offset. Uses SEEKTABLE if present for frame-accurate seeking.
+//
+// Usage:
+//   ./demux_flac.x --file /path/to.flac --ring audio_ring --clock clk0
+//
+// Orthogonal: speaks only PacketRing + PlaybackClock. No video output.
+//
+// FLAC format:
+//   "fLaC" magic (4 bytes)
+//   Metadata blocks:
+//     [1-byte header: bit7=last, bits6-0=type] [3-byte BE size] [data...]
+//     Type 0 = STREAMINFO (34 bytes, mandatory first)
+//     Type 3 = SEEKTABLE (array of 18-byte seek points)
+//   Audio frames:
+//     Sync code 0xFFF8/0xFFF9, frame header, subframes, CRC-16
+//
+// Build: ./ailang.x Librarys/Media/Library.DemuxFLAC.ailang demux_flac.x
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.PacketRing
+LibraryImport.PlaybackClock
+LibraryImport.UtilArgs
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.DFSys {
+    "SYS_READ":      Initialize=0
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_EXIT":      Initialize=60
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_LSEEK":     Initialize=8
+    "O_RDONLY":      Initialize=0
+}
+
+FixedPool.DFConst {
+    "PKT_CHUNK_SIZE":  Initialize=8192
+    "RING_CAPACITY":   Initialize=4194304
+    "MAX_METADATA":    Initialize=65536
+    "MAX_SEEKTABLE":   Initialize=1024
+}
+
+// Seek point storage: 18 bytes each (8 sample_number + 8 stream_offset + 2 frame_samples)
+// We store as: 24 bytes each (8 sample_num + 8 byte_offset + 8 frame_samples)
+FixedPool.DFState {
+    "seek_table":        Initialize=0
+    "seek_count":        Initialize=0
+    "total_samples":     Initialize=0
+    "sample_rate":       Initialize=0
+    "channels":          Initialize=0
+    "bps":               Initialize=0
+    "min_block_size":    Initialize=0
+    "max_block_size":    Initialize=0
+    "data_start":        Initialize=0
+    "file_size":         Initialize=0
+    "metadata_buf":      Initialize=0
+    "metadata_size":     Initialize=0
+}
+
+// =============================================================================
+// ARGUMENT SCHEMA
+// =============================================================================
+Function.DF_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("demux_flac", "FLAC demuxer — extract audio to PacketRing")
+        UtilArgs_AddField(s, "file",  "path",   1, "FLAC file path",        "file")
+        UtilArgs_AddField(s, "ring",  "string", 1, "Audio PacketRing name", "ring")
+        UtilArgs_AddField(s, "clock", "string", 1, "PlaybackClock name",    "clock")
+        UtilArgs_SetShort(s, "file",  "f")
+        UtilArgs_SetShort(s, "ring",  "r")
+        UtilArgs_SetShort(s, "clock", "c")
+        ReturnValue(s)
+    }
+}
+
+// =============================================================================
+// READ BIG-ENDIAN 24 — read 24-bit big-endian from buffer
+// =============================================================================
+Function.DF_ReadBE24 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        ReturnValue(Add(Add(ShiftLeft(b0, 16), ShiftLeft(b1, 8)), b2))
+    }
+}
+
+// =============================================================================
+// READ BIG-ENDIAN 32 — read 32-bit big-endian from buffer
+// =============================================================================
+Function.DF_ReadBE32 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        b3 = GetByte(buf, Add(off, 3))
+        ReturnValue(Add(Add(ShiftLeft(b0, 24), ShiftLeft(b1, 16)), Add(ShiftLeft(b2, 8), b3)))
+    }
+}
+
+// =============================================================================
+// READ BIG-ENDIAN 16 — read 16-bit big-endian from buffer
+// =============================================================================
+Function.DF_ReadBE16 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        ReturnValue(Add(ShiftLeft(b0, 8), b1))
+    }
+}
+
+// =============================================================================
+// READ LE32 — read 32-bit little-endian (for seek table byte offsets)
+// =============================================================================
+Function.DF_ReadLE32 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        b3 = GetByte(buf, Add(off, 3))
+        ReturnValue(Add(Add(b0, ShiftLeft(b1, 8)), Add(ShiftLeft(b2, 16), ShiftLeft(b3, 24))))
+    }
+}
+
+// =============================================================================
+// PARSE STREAMINFO — extract stream parameters from STREAMINFO block
+// =============================================================================
+// STREAMINFO layout (34 bytes):
+//   [0..1]   min_block_size (BE16)
+//   [2..3]   max_block_size (BE16)
+//   [4..6]   min_frame_size (BE24)
+//   [7..9]   max_frame_size (BE24)
+//   [10..13] sample_rate (20 bits) | channels-1 (3 bits) | bps-1 (5 bits) | total_samples high 4 bits
+//   [14..17] total_samples low 32 bits
+//   [18..33] MD5 signature
+Function.DF_ParseStreamInfo {
+    Input: data: Address
+    Input: size: Integer
+    Body: {
+        IfCondition LessThan(size, 34) ThenBlock: {
+            PrintMessage("[DemuxFLAC] STREAMINFO too short\n")
+            ReturnValue(0)
+        }
+
+        DFState.min_block_size = DF_ReadBE16(data, 0)
+        DFState.max_block_size = DF_ReadBE16(data, 2)
+
+        // Bytes 10-13: packed sample_rate(20) | channels-1(3) | bps-1(5) | total_hi(4)
+        w0 = DF_ReadBE32(data, 10)
+
+        DFState.sample_rate = ShiftRight(w0, 12)
+        DFState.channels = Add(BitwiseAnd(ShiftRight(w0, 9), 7), 1)
+        DFState.bps = Add(BitwiseAnd(ShiftRight(w0, 4), 31), 1)
+
+        // Total samples: high 4 bits from w0, low 32 from bytes 14-17
+        total_hi = BitwiseAnd(w0, 15)
+        total_lo = DF_ReadBE32(data, 14)
+        DFState.total_samples = Add(ShiftLeft(total_hi, 32), total_lo)
+
+        PrintMessage("[DemuxFLAC] STREAMINFO: rate=")
+        PrintNumber(DFState.sample_rate)
+        PrintMessage(" ch=")
+        PrintNumber(DFState.channels)
+        PrintMessage(" bps=")
+        PrintNumber(DFState.bps)
+        PrintMessage(" total_samples=")
+        PrintNumber(DFState.total_samples)
+        PrintMessage(" block=")
+        PrintNumber(DFState.min_block_size)
+        PrintMessage("-")
+        PrintNumber(DFState.max_block_size)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// PARSE SEEKTABLE — extract seek points for efficient seeking
+// =============================================================================
+// Each seek point: 18 bytes
+//   [0..7]   sample number (BE64, but we read low 32 for practical sizes)
+//   [8..15]  byte offset from first frame (BE64, read low 32)
+//   [16..17] number of samples in frame (BE16)
+// Placeholder points have sample number 0xFFFFFFFFFFFFFFFF — skip them.
+Function.DF_ParseSeekTable {
+    Input: data: Address
+    Input: size: Integer
+    Body: {
+        num_points = Divide(size, 18)
+        IfCondition GreaterThan(num_points, DFConst.MAX_SEEKTABLE) ThenBlock: {
+            num_points = DFConst.MAX_SEEKTABLE
+        }
+
+        // Allocate seek table: 24 bytes per point (sample_num, byte_offset, frame_samples)
+        DFState.seek_table = Allocate(Multiply(num_points, 24))
+        count = 0
+        i = 0
+
+        WhileLoop LessThan(i, num_points) {
+            off = Multiply(i, 18)
+
+            // Check for placeholder (0xFF in all 8 bytes of sample number)
+            is_placeholder = 1
+            j = 0
+            WhileLoop LessThan(j, 8) {
+                IfCondition NotEqual(GetByte(data, Add(off, j)), 255) ThenBlock: {
+                    is_placeholder = 0
+                }
+                j = Add(j, 1)
+            }
+
+            IfCondition EqualTo(is_placeholder, 0) ThenBlock: {
+                // Read sample number (low 32 bits — bytes 4-7 of the 8-byte field)
+                sample_num = DF_ReadBE32(data, Add(off, 4))
+                // Read byte offset (low 32 bits — bytes 12-15 of the 8-byte field)
+                byte_off = DF_ReadBE32(data, Add(off, 12))
+                // Read frame samples
+                frame_samps = DF_ReadBE16(data, Add(off, 16))
+
+                // Store in our table
+                entry = Add(DFState.seek_table, Multiply(count, 24))
+                StoreValue(entry, sample_num)
+                StoreValue(Add(entry, 8), byte_off)
+                StoreValue(Add(entry, 16), frame_samps)
+                count = Add(count, 1)
+            }
+
+            i = Add(i, 1)
+        }
+
+        DFState.seek_count = count
+        PrintMessage("[DemuxFLAC] SEEKTABLE: ")
+        PrintNumber(count)
+        PrintMessage(" seek points\n")
+    }
+}
+
+// =============================================================================
+// FIND SEEK BYTE — given a target sample, find nearest byte offset
+// =============================================================================
+Function.DF_FindSeekByte {
+    Input: target_sample: Integer
+    Output: Integer
+    Body: {
+        // If we have a seek table, use it
+        IfCondition GreaterThan(DFState.seek_count, 0) ThenBlock: {
+            best_off = 0
+            i = 0
+            WhileLoop LessThan(i, DFState.seek_count) {
+                entry = Add(DFState.seek_table, Multiply(i, 24))
+                sn = Dereference(entry)
+                IfCondition LessEqual(sn, target_sample) ThenBlock: {
+                    best_off = Dereference(Add(entry, 8))
+                }
+                i = Add(i, 1)
+            }
+            ReturnValue(best_off)
+        }
+
+        // No seek table — estimate byte offset linearly
+        // byte_offset ≈ target_sample * data_size / total_samples
+        data_size = Subtract(DFState.file_size, DFState.data_start)
+        IfCondition GreaterThan(DFState.total_samples, 0) ThenBlock: {
+            // Avoid overflow: divide first, then multiply
+            est = Divide(Multiply(Divide(data_size, 1000), target_sample), Divide(DFState.total_samples, 1000))
+            ReturnValue(est)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    PrintMessage("[DemuxFLAC] starting\n")
+
+    // Parse args
+    schema = DF_BuildSchema()
+    args = UtilArgs_ParseCLI(schema)
+    IfCondition EqualTo(args, 0) ThenBlock: {
+        PrintMessage("[DemuxFLAC] argument error\n")
+        SystemCall(DFSys.SYS_EXIT, 1)
+    }
+
+    filepath   = UtilArgs_GetString(args, "file")
+    ring_name  = UtilArgs_GetString(args, "ring")
+    clock_name = UtilArgs_GetString(args, "clock")
+
+    PrintMessage("[DemuxFLAC] file: ")
+    PrintString(filepath)
+    PrintMessage("\n[DemuxFLAC] ring: ")
+    PrintString(ring_name)
+    PrintMessage("\n[DemuxFLAC] clock: ")
+    PrintString(clock_name)
+    PrintMessage("\n")
+
+    // Open the FLAC file
+    flac_fd = SystemCall(DFSys.SYS_OPEN, filepath, DFSys.O_RDONLY, 0)
+    IfCondition LessThan(flac_fd, 0) ThenBlock: {
+        PrintMessage("[DemuxFLAC] cannot open file\n")
+        SystemCall(DFSys.SYS_EXIT, 1)
+    }
+
+    // Get file size via lseek to end
+    DFState.file_size = SystemCall(DFSys.SYS_LSEEK, flac_fd, 0, 2, 0, 0)
+    SystemCall(DFSys.SYS_LSEEK, flac_fd, 0, 0, 0, 0, 0)
+    PrintMessage("[DemuxFLAC] file size: ")
+    PrintNumber(DFState.file_size)
+    PrintMessage("\n")
+
+    // Read header — allocate large buffer for all metadata
+    meta_buf = Allocate(DFConst.MAX_METADATA)
+
+    // Read first 4 bytes: must be "fLaC" (0x66 0x4C 0x61 0x43)
+    hdr_read = SystemCall(DFSys.SYS_READ, flac_fd, meta_buf, 4, 0, 0, 0)
+    IfCondition LessThan(hdr_read, 4) ThenBlock: {
+        PrintMessage("[DemuxFLAC] file too short\n")
+        SystemCall(DFSys.SYS_EXIT, 1)
+    }
+    IfCondition Not(And(And(EqualTo(GetByte(meta_buf, 0), 102), EqualTo(GetByte(meta_buf, 1), 76)), And(EqualTo(GetByte(meta_buf, 2), 97), EqualTo(GetByte(meta_buf, 3), 67)))) ThenBlock: {
+        PrintMessage("[DemuxFLAC] not a FLAC file (bad magic)\n")
+        SystemCall(DFSys.SYS_EXIT, 1)
+    }
+
+    // Parse metadata blocks
+    meta_total = 4
+    is_last = 0
+    WhileLoop EqualTo(is_last, 0) {
+        // Read 4-byte metadata block header
+        blk_hdr = Allocate(4)
+        rn = SystemCall(DFSys.SYS_READ, flac_fd, blk_hdr, 4, 0, 0, 0)
+        IfCondition LessThan(rn, 4) ThenBlock: {
+            PrintMessage("[DemuxFLAC] truncated metadata block header\n")
+            Deallocate(blk_hdr, 4)
+            is_last = 1
+        }
+
+        IfCondition EqualTo(is_last, 0) ThenBlock: {
+            hb = GetByte(blk_hdr, 0)
+            is_last = ShiftRight(hb, 7)
+            blk_type = BitwiseAnd(hb, 127)
+            blk_size = DF_ReadBE24(blk_hdr, 1)
+
+            // Copy block header into meta_buf
+            IfCondition LessThan(Add(meta_total, Add(4, blk_size)), DFConst.MAX_METADATA) ThenBlock: {
+                SetByte(meta_buf, meta_total, GetByte(blk_hdr, 0))
+                SetByte(meta_buf, Add(meta_total, 1), GetByte(blk_hdr, 1))
+                SetByte(meta_buf, Add(meta_total, 2), GetByte(blk_hdr, 2))
+                SetByte(meta_buf, Add(meta_total, 3), GetByte(blk_hdr, 3))
+            }
+            Deallocate(blk_hdr, 4)
+            meta_total = Add(meta_total, 4)
+
+            // Read block data
+            IfCondition GreaterThan(blk_size, 0) ThenBlock: {
+                blk_data = Allocate(blk_size)
+                rn = SystemCall(DFSys.SYS_READ, flac_fd, blk_data, blk_size, 0, 0, 0)
+
+                // Copy into meta_buf
+                IfCondition LessThan(Add(meta_total, blk_size), DFConst.MAX_METADATA) ThenBlock: {
+                    MemoryCopy(Add(meta_buf, meta_total), blk_data, blk_size)
+                }
+
+                // Parse specific block types
+                IfCondition EqualTo(blk_type, 0) ThenBlock: {
+                    DF_ParseStreamInfo(blk_data, blk_size)
+                }
+                IfCondition EqualTo(blk_type, 3) ThenBlock: {
+                    DF_ParseSeekTable(blk_data, blk_size)
+                }
+
+                Deallocate(blk_data, blk_size)
+                meta_total = Add(meta_total, blk_size)
+            }
+
+            PrintMessage("[DemuxFLAC] metadata block type=")
+            PrintNumber(blk_type)
+            PrintMessage(" size=")
+            PrintNumber(blk_size)
+            PrintMessage("\n")
+        }
+    }
+
+    DFState.metadata_buf = meta_buf
+    DFState.metadata_size = meta_total
+
+    // Record where audio data starts
+    // Current file position = after all metadata blocks
+    DFState.data_start = meta_total
+
+    PrintMessage("[DemuxFLAC] metadata total: ")
+    PrintNumber(meta_total)
+    PrintMessage(" bytes, data starts at offset ")
+    PrintNumber(DFState.data_start)
+    PrintMessage("\n")
+
+    // Compute duration
+    duration_usec = 0
+    IfCondition GreaterThan(DFState.sample_rate, 0) ThenBlock: {
+        duration_usec = Divide(Multiply(DFState.total_samples, 1000000), DFState.sample_rate)
+        PrintMessage("[DemuxFLAC] duration: ")
+        PrintNumber(Divide(duration_usec, 1000000))
+        PrintMessage("s\n")
+    }
+
+    // Open (create) the audio PacketRing
+    ring = PacketRing_Create(ring_name, DFConst.RING_CAPACITY)
+    IfCondition EqualTo(ring, 0) ThenBlock: {
+        PrintMessage("[DemuxFLAC] failed to create ring\n")
+        SystemCall(DFSys.SYS_EXIT, 1)
+    }
+
+    // Open the PlaybackClock
+    clock = PlaybackClock_Open(clock_name)
+    IfCondition EqualTo(clock, 0) ThenBlock: {
+        PrintMessage("[DemuxFLAC] failed to open clock\n")
+        SystemCall(DFSys.SYS_EXIT, 1)
+    }
+
+    // Send CONFIG packet: the entire FLAC header (fLaC + metadata blocks)
+    PacketRing_Write(ring, meta_buf, meta_total, 0, PRPktFlag.CONFIG)
+    PrintMessage("[DemuxFLAC] sent CONFIG packet (")
+    PrintNumber(meta_total)
+    PrintMessage(" bytes)\n")
+
+    // Main demux loop: read chunks of FLAC data, compute PTS, write to ring
+    read_buf = Allocate(DFConst.PKT_CHUNK_SIZE)
+    bytes_sent = 0
+    data_size = Subtract(DFState.file_size, DFState.data_start)
+
+    ts_wait = Allocate(16)
+    StoreValue(ts_wait, 0)
+    StoreValue(Add(ts_wait, 8), 1000000)
+
+    WhileLoop LessThan(bytes_sent, data_size) {
+        // Check clock state
+        state = PlaybackClock_GetState(clock)
+
+        IfCondition EqualTo(state, PCState.STOPPED) ThenBlock: {
+            PrintMessage("[DemuxFLAC] clock STOPPED, exiting\n")
+            bytes_sent = data_size
+        }
+
+        IfCondition EqualTo(state, PCState.PAUSED) ThenBlock: {
+            SystemCall(DFSys.SYS_NANOSLEEP, ts_wait, 0)
+        }
+
+        IfCondition EqualTo(state, PCState.SEEKING) ThenBlock: {
+            // Seek to target
+            target = PlaybackClock_GetSeekTarget(clock)
+            // Convert target_usec to sample number
+            target_sample = Divide(Multiply(target, DFState.sample_rate), 1000000)
+            // Find byte offset
+            target_byte = DF_FindSeekByte(target_sample)
+            // Clamp
+            IfCondition GreaterThan(target_byte, data_size) ThenBlock: {
+                target_byte = data_size
+            }
+            // Seek in file
+            SystemCall(DFSys.SYS_LSEEK, flac_fd, Add(DFState.data_start, target_byte), 0, 0, 0, 0)
+            bytes_sent = target_byte
+
+            // Flush the ring and re-send CONFIG
+            PacketRing_Reset(ring)
+            PacketRing_Write(ring, meta_buf, meta_total, 0, PRPktFlag.CONFIG)
+
+            // Signal seek done
+            PlaybackClock_SeekDone(clock)
+            PrintMessage("[DemuxFLAC] seeked to ")
+            PrintNumber(Divide(target, 1000000))
+            PrintMessage("s (byte offset ")
+            PrintNumber(target_byte)
+            PrintMessage(")\n")
+        }
+
+        IfCondition EqualTo(state, PCState.PLAYING) ThenBlock: {
+            // Calculate how much to read
+            remaining = Subtract(data_size, bytes_sent)
+            chunk = DFConst.PKT_CHUNK_SIZE
+            IfCondition GreaterThan(chunk, remaining) ThenBlock: {
+                chunk = remaining
+            }
+
+            IfCondition GreaterThan(chunk, 0) ThenBlock: {
+                n = SystemCall(DFSys.SYS_READ, flac_fd, read_buf, chunk, 0, 0, 0)
+                IfCondition LessEqual(n, 0) ThenBlock: {
+                    bytes_sent = data_size
+                }
+                IfCondition GreaterThan(n, 0) ThenBlock: {
+                    // Compute PTS: estimate based on byte position
+                    // pts = bytes_sent / data_size * duration_usec
+                    pts_usec = 0
+                    IfCondition GreaterThan(data_size, 0) ThenBlock: {
+                        // Avoid overflow: (bytes_sent / 1000) * (duration_usec / (data_size / 1000))
+                        ds_k = Divide(data_size, 1000)
+                        IfCondition GreaterThan(ds_k, 0) ThenBlock: {
+                            pts_usec = Multiply(Divide(bytes_sent, 1000), Divide(duration_usec, ds_k))
+                        }
+                    }
+
+                    // Try to write to ring
+                    wrote = PacketRing_Write(ring, read_buf, n, pts_usec, PRPktFlag.NONE)
+                    IfCondition EqualTo(wrote, 0) ThenBlock: {
+                        // Ring full — backpressure, wait 1ms and retry
+                        SystemCall(DFSys.SYS_NANOSLEEP, ts_wait, 0)
+                    }
+                    IfCondition EqualTo(wrote, 1) ThenBlock: {
+                        bytes_sent = Add(bytes_sent, n)
+                    }
+                }
+            }
+        }
+    }
+
+    // Signal EOF
+    PacketRing_SignalEOF(ring)
+    PrintMessage("[DemuxFLAC] finished, sent ")
+    PrintNumber(bytes_sent)
+    PrintMessage(" bytes\n")
+
+    // Cleanup
+    Deallocate(read_buf, DFConst.PKT_CHUNK_SIZE)
+    Deallocate(ts_wait, 16)
+    IfCondition NotEqual(DFState.seek_table, 0) ThenBlock: {
+        Deallocate(DFState.seek_table, Multiply(DFState.seek_count, 24))
+    }
+    // Don't deallocate meta_buf — it's used by the ring consumer
+    SystemCall(DFSys.SYS_CLOSE, flac_fd, 0, 0, 0, 0, 0)
+    PlaybackClock_Close(clock)
+
+    SystemCall(DFSys.SYS_EXIT, 0)
+}
+
+RunTask(Main)

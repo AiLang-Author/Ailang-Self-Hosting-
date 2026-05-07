@@ -1,0 +1,1272 @@
+// Library.DemuxMP4.ailang
+// Standalone MP4/MOV (ISO BMFF) demuxer process.
+//
+// Parses the box hierarchy to extract H.264/H.265 video and AAC audio
+// packets with correct PTS timestamps. Writes to two PacketRings
+// (one for video, one for audio).
+//
+// ISO BMFF structure:
+//   ftyp                    — file type
+//   moov                    — movie metadata
+//     mvhd                  — movie header (timescale, duration)
+//     trak (video)          — video track
+//       tkhd                — track header
+//       mdia
+//         mdhd              — media header (timescale)
+//         hdlr              — handler (vide/soun)
+//         minf/stbl         — sample table
+//           stsd            — sample description (codec: avc1, hvc1, mp4a)
+//           stts            — time-to-sample (delta per sample)
+//           stsc            — sample-to-chunk mapping
+//           stsz            — sample sizes
+//           stco/co64       — chunk offsets
+//           stss            — sync samples (keyframes) [video only]
+//           ctts            — composition time offsets [optional]
+//     trak (audio)          — audio track (same structure)
+//   mdat                    — raw media data
+//
+// Usage:
+//   ./demux_mp4.x --file video.mp4 --vring vid_ring --aring aud_ring --clock clk0
+//
+// Build: ./ailang.x Librarys/Media/Library.DemuxMP4.ailang demux_mp4.x
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.PacketRing
+LibraryImport.PlaybackClock
+LibraryImport.UtilArgs
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.M4Sys {
+    "SYS_READ":      Initialize=0
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_LSEEK":     Initialize=8
+    "SYS_EXIT":      Initialize=60
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_OPENAT":    Initialize=257
+    "O_RDONLY":      Initialize=0
+    "AT_FDCWD":      Initialize=-100
+    "SEEK_SET":      Initialize=0
+    "SEEK_CUR":      Initialize=1
+}
+
+FixedPool.M4Const {
+    "MAX_TRACKS":      Initialize=8
+    "MAX_SAMPLES":     Initialize=500000
+    "RING_CAPACITY":   Initialize=4194304
+    "READ_BUF_SIZE":   Initialize=65536
+    "TRACK_SIZE":      Initialize=320
+}
+
+// Track field offsets (320 bytes per track)
+FixedPool.M4Track {
+    "ACTIVE":       Initialize=0
+    "HANDLER":      Initialize=8      // 0=unknown, 1=video, 2=audio
+    "CODEC":        Initialize=16     // fourcc as integer
+    "TIMESCALE":    Initialize=24
+    "DURATION":     Initialize=32
+    "SAMPLE_COUNT": Initialize=40
+    "STTS_PTR":     Initialize=48     // pointer to stts entries
+    "STTS_COUNT":   Initialize=56
+    "STSC_PTR":     Initialize=64     // pointer to stsc entries
+    "STSC_COUNT":   Initialize=72
+    "STSZ_PTR":     Initialize=80     // pointer to stsz array (4 bytes each)
+    "STSZ_COUNT":   Initialize=88
+    "STSZ_DEFAULT": Initialize=96     // default sample size (0 = variable)
+    "STCO_PTR":     Initialize=104    // pointer to stco array (8 bytes each)
+    "STCO_COUNT":   Initialize=112
+    "STSS_PTR":     Initialize=120    // pointer to stss array (4 bytes each)
+    "STSS_COUNT":   Initialize=128
+    "CTTS_PTR":     Initialize=136
+    "CTTS_COUNT":   Initialize=144
+    "WIDTH":        Initialize=152
+    "HEIGHT":       Initialize=160
+    "SAMPLE_RATE":  Initialize=168
+    "CHANNELS":     Initialize=176
+    "BITS_PER_SAMPLE": Initialize=184
+    "CODEC_DATA":   Initialize=192    // pointer to codec config (SPS/PPS, AudioSpecificConfig)
+    "CODEC_DATA_SZ": Initialize=200
+    "CUR_SAMPLE":   Initialize=208    // current sample index during demux
+    "CUR_PTS":      Initialize=216    // current PTS in timescale units
+    "VIDEO_TRACK":  Initialize=224    // 1 if this is the chosen video track
+    "AUDIO_TRACK":  Initialize=232    // 1 if this is the chosen audio track
+}
+
+// Handler types
+FixedPool.M4Handler {
+    "UNKNOWN": Initialize=0
+    "VIDEO":   Initialize=1
+    "AUDIO":   Initialize=2
+}
+
+// =============================================================================
+// CMDLINE ARGS
+// =============================================================================
+Function.M4_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("demux_mp4", "MP4/MOV (ISO BMFF) demuxer — extract video+audio to PacketRings")
+        UtilArgs_AddField(s, "file",  "path",   1, "MP4 file path",           "file")
+        UtilArgs_AddField(s, "vring", "string", 1, "Video PacketRing name",   "vring")
+        UtilArgs_AddField(s, "aring", "string", 1, "Audio PacketRing name",   "aring")
+        UtilArgs_AddField(s, "clock", "string", 1, "PlaybackClock name",      "clock")
+        UtilArgs_SetShort(s, "file",  "f")
+        UtilArgs_SetShort(s, "vring", "v")
+        UtilArgs_SetShort(s, "aring", "a")
+        UtilArgs_SetShort(s, "clock", "c")
+        ReturnValue(s)
+    }
+}
+
+// =============================================================================
+// READ HELPERS — big-endian (MP4 is always big-endian)
+// =============================================================================
+Function.M4_ReadBE16 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        hi = GetByte(buf, off)
+        lo = GetByte(buf, Add(off, 1))
+        ReturnValue(Add(ShiftLeft(hi, 8), lo))
+    }
+}
+
+Function.M4_ReadBE32 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        b3 = GetByte(buf, Add(off, 3))
+        ReturnValue(Add(Add(ShiftLeft(b0, 24), ShiftLeft(b1, 16)), Add(ShiftLeft(b2, 8), b3)))
+    }
+}
+
+Function.M4_ReadBE64 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        hi = M4_ReadBE32(buf, off)
+        lo = M4_ReadBE32(buf, Add(off, 4))
+        ReturnValue(Add(ShiftLeft(hi, 32), lo))
+    }
+}
+
+// =============================================================================
+// READ FROM FD — read exactly N bytes at current position
+// =============================================================================
+Function.M4_ReadExact {
+    Input: fd:  Integer
+    Input: buf: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        got = 0
+        WhileLoop LessThan(got, len) {
+            n = SystemCall(M4Sys.SYS_READ, fd, Add(buf, got), Subtract(len, got))
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                ReturnValue(got)
+            }
+            got = Add(got, n)
+        }
+        ReturnValue(got)
+    }
+}
+
+// =============================================================================
+// FOURCC TO INT — pack 4 ASCII bytes into integer for comparison
+// =============================================================================
+Function.M4_FourCC {
+    Input: a: Integer
+    Input: b: Integer
+    Input: c: Integer
+    Input: d: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(Add(ShiftLeft(a, 24), ShiftLeft(b, 16)), Add(ShiftLeft(c, 8), d)))
+    }
+}
+
+// =============================================================================
+// GET TRACK POINTER — base + index * TRACK_SIZE
+// =============================================================================
+Function.M4_GetTrack {
+    Input: tracks: Address
+    Input: idx:    Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(tracks, Multiply(idx, M4Const.TRACK_SIZE)))
+    }
+}
+
+// =============================================================================
+// PARSE STTS — time-to-sample box
+// Each entry: [4 bytes BE sample_count] [4 bytes BE sample_delta]
+// =============================================================================
+Function.M4_ParseSTTS {
+    Input: fd:    Integer
+    Input: track: Address
+    Input: box_start: Integer
+    Input: box_size:  Integer
+    Body: {
+        // Skip version(1) + flags(3) = 4 bytes, already past 8-byte box header
+        buf4 = Allocate(8)
+        M4_ReadExact(fd, buf4, 4)
+        // entry_count
+        M4_ReadExact(fd, buf4, 4)
+        count = M4_ReadBE32(buf4, 0)
+
+        IfCondition GreaterThan(count, 50000) ThenBlock: {
+            count = 50000
+        }
+
+        // Allocate: 8 bytes per entry (sample_count + sample_delta)
+        data = Allocate(Multiply(count, 8))
+        n = M4_ReadExact(fd, data, Multiply(count, 8))
+
+        StoreValue(Add(track, M4Track.STTS_PTR), data)
+        StoreValue(Add(track, M4Track.STTS_COUNT), count)
+
+        Deallocate(buf4, 8)
+
+        PrintMessage("[MP4] stts: ")
+        PrintNumber(count)
+        PrintMessage(" entries\n")
+    }
+}
+
+// =============================================================================
+// PARSE STSC — sample-to-chunk box
+// Each entry: [4B first_chunk] [4B samples_per_chunk] [4B sample_desc_idx]
+// =============================================================================
+Function.M4_ParseSTSC {
+    Input: fd:    Integer
+    Input: track: Address
+    Body: {
+        buf4 = Allocate(8)
+        M4_ReadExact(fd, buf4, 4)
+        M4_ReadExact(fd, buf4, 4)
+        count = M4_ReadBE32(buf4, 0)
+
+        IfCondition GreaterThan(count, 50000) ThenBlock: {
+            count = 50000
+        }
+
+        data = Allocate(Multiply(count, 12))
+        M4_ReadExact(fd, data, Multiply(count, 12))
+
+        StoreValue(Add(track, M4Track.STSC_PTR), data)
+        StoreValue(Add(track, M4Track.STSC_COUNT), count)
+
+        Deallocate(buf4, 8)
+
+        PrintMessage("[MP4] stsc: ")
+        PrintNumber(count)
+        PrintMessage(" entries\n")
+    }
+}
+
+// =============================================================================
+// PARSE STSZ — sample size box
+// If default_size != 0, all samples are that size.
+// Otherwise, per-sample sizes follow.
+// =============================================================================
+Function.M4_ParseSTSZ {
+    Input: fd:    Integer
+    Input: track: Address
+    Body: {
+        buf = Allocate(12)
+        M4_ReadExact(fd, buf, 12)
+
+        default_size = M4_ReadBE32(buf, 4)
+        count = M4_ReadBE32(buf, 8)
+
+        StoreValue(Add(track, M4Track.STSZ_DEFAULT), default_size)
+        StoreValue(Add(track, M4Track.STSZ_COUNT), count)
+        StoreValue(Add(track, M4Track.SAMPLE_COUNT), count)
+
+        IfCondition EqualTo(default_size, 0) ThenBlock: {
+            // Variable sizes — read array
+            IfCondition GreaterThan(count, M4Const.MAX_SAMPLES) ThenBlock: {
+                count = M4Const.MAX_SAMPLES
+            }
+            data = Allocate(Multiply(count, 4))
+            M4_ReadExact(fd, data, Multiply(count, 4))
+            StoreValue(Add(track, M4Track.STSZ_PTR), data)
+        }
+
+        Deallocate(buf, 12)
+
+        PrintMessage("[MP4] stsz: ")
+        PrintNumber(count)
+        PrintMessage(" samples, default=")
+        PrintNumber(default_size)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// PARSE STCO — chunk offset box (32-bit offsets)
+// =============================================================================
+Function.M4_ParseSTCO {
+    Input: fd:    Integer
+    Input: track: Address
+    Body: {
+        buf4 = Allocate(8)
+        M4_ReadExact(fd, buf4, 4)
+        M4_ReadExact(fd, buf4, 4)
+        count = M4_ReadBE32(buf4, 0)
+
+        IfCondition GreaterThan(count, M4Const.MAX_SAMPLES) ThenBlock: {
+            count = M4Const.MAX_SAMPLES
+        }
+
+        // Store as 8-byte offsets for uniformity with co64
+        data = Allocate(Multiply(count, 8))
+        raw = Allocate(Multiply(count, 4))
+        M4_ReadExact(fd, raw, Multiply(count, 4))
+
+        i = 0
+        WhileLoop LessThan(i, count) {
+            off32 = M4_ReadBE32(raw, Multiply(i, 4))
+            StoreValue(Add(data, Multiply(i, 8)), off32)
+            i = Add(i, 1)
+        }
+        Deallocate(raw, Multiply(count, 4))
+
+        StoreValue(Add(track, M4Track.STCO_PTR), data)
+        StoreValue(Add(track, M4Track.STCO_COUNT), count)
+
+        Deallocate(buf4, 8)
+
+        PrintMessage("[MP4] stco: ")
+        PrintNumber(count)
+        PrintMessage(" chunks\n")
+    }
+}
+
+// =============================================================================
+// PARSE CO64 — chunk offset box (64-bit offsets)
+// =============================================================================
+Function.M4_ParseCO64 {
+    Input: fd:    Integer
+    Input: track: Address
+    Body: {
+        buf4 = Allocate(8)
+        M4_ReadExact(fd, buf4, 4)
+        M4_ReadExact(fd, buf4, 4)
+        count = M4_ReadBE32(buf4, 0)
+
+        IfCondition GreaterThan(count, M4Const.MAX_SAMPLES) ThenBlock: {
+            count = M4Const.MAX_SAMPLES
+        }
+
+        data = Allocate(Multiply(count, 8))
+        M4_ReadExact(fd, data, Multiply(count, 8))
+
+        // Convert from big-endian in place
+        i = 0
+        WhileLoop LessThan(i, count) {
+            off = Multiply(i, 8)
+            val = M4_ReadBE64(data, off)
+            StoreValue(Add(data, off), val)
+            i = Add(i, 1)
+        }
+
+        StoreValue(Add(track, M4Track.STCO_PTR), data)
+        StoreValue(Add(track, M4Track.STCO_COUNT), count)
+
+        Deallocate(buf4, 8)
+
+        PrintMessage("[MP4] co64: ")
+        PrintNumber(count)
+        PrintMessage(" chunks\n")
+    }
+}
+
+// =============================================================================
+// PARSE STSS — sync sample (keyframe) box
+// =============================================================================
+Function.M4_ParseSTSS {
+    Input: fd:    Integer
+    Input: track: Address
+    Body: {
+        buf4 = Allocate(8)
+        M4_ReadExact(fd, buf4, 4)
+        M4_ReadExact(fd, buf4, 4)
+        count = M4_ReadBE32(buf4, 0)
+
+        IfCondition GreaterThan(count, M4Const.MAX_SAMPLES) ThenBlock: {
+            count = M4Const.MAX_SAMPLES
+        }
+
+        data = Allocate(Multiply(count, 4))
+        M4_ReadExact(fd, data, Multiply(count, 4))
+
+        StoreValue(Add(track, M4Track.STSS_PTR), data)
+        StoreValue(Add(track, M4Track.STSS_COUNT), count)
+
+        Deallocate(buf4, 8)
+
+        PrintMessage("[MP4] stss: ")
+        PrintNumber(count)
+        PrintMessage(" keyframes\n")
+    }
+}
+
+// =============================================================================
+// PARSE CTTS — composition time offset box
+// =============================================================================
+Function.M4_ParseCTTS {
+    Input: fd:    Integer
+    Input: track: Address
+    Body: {
+        buf4 = Allocate(8)
+        M4_ReadExact(fd, buf4, 4)
+        M4_ReadExact(fd, buf4, 4)
+        count = M4_ReadBE32(buf4, 0)
+
+        IfCondition GreaterThan(count, 50000) ThenBlock: {
+            count = 50000
+        }
+
+        data = Allocate(Multiply(count, 8))
+        M4_ReadExact(fd, data, Multiply(count, 8))
+
+        StoreValue(Add(track, M4Track.CTTS_PTR), data)
+        StoreValue(Add(track, M4Track.CTTS_COUNT), count)
+
+        Deallocate(buf4, 8)
+
+        PrintMessage("[MP4] ctts: ")
+        PrintNumber(count)
+        PrintMessage(" entries\n")
+    }
+}
+
+// =============================================================================
+// GET SAMPLE SIZE — from stsz table
+// =============================================================================
+Function.M4_GetSampleSize {
+    Input: track:  Address
+    Input: sample: Integer
+    Output: Integer
+    Body: {
+        def_sz = Dereference(Add(track, M4Track.STSZ_DEFAULT))
+        IfCondition NotEqual(def_sz, 0) ThenBlock: {
+            ReturnValue(def_sz)
+        }
+        ptr = Dereference(Add(track, M4Track.STSZ_PTR))
+        ReturnValue(M4_ReadBE32(ptr, Multiply(sample, 4)))
+    }
+}
+
+// =============================================================================
+// GET SAMPLE OFFSET — from stsc + stco tables
+// Walk stsc to find which chunk this sample belongs to, then compute offset
+// =============================================================================
+Function.M4_GetSampleOffset {
+    Input: track:  Address
+    Input: sample: Integer
+    Output: Integer
+    Body: {
+        stsc_ptr   = Dereference(Add(track, M4Track.STSC_PTR))
+        stsc_count = Dereference(Add(track, M4Track.STSC_COUNT))
+        stco_ptr   = Dereference(Add(track, M4Track.STCO_PTR))
+
+        // Walk stsc entries to find which chunk/offset for this sample
+        // stsc entry: [4B first_chunk (1-based)] [4B samples_per_chunk] [4B desc_idx]
+        cur_sample = 0
+        entry = 0
+
+        WhileLoop LessThan(entry, stsc_count) {
+            first_chunk = M4_ReadBE32(stsc_ptr, Multiply(entry, 12))
+            spc = M4_ReadBE32(stsc_ptr, Add(Multiply(entry, 12), 4))
+
+            // How many chunks use this spc?
+            IfCondition LessThan(Add(entry, 1), stsc_count) ThenBlock: {
+                next_first = M4_ReadBE32(stsc_ptr, Multiply(Add(entry, 1), 12))
+                num_chunks = Subtract(next_first, first_chunk)
+            } ElseBlock: {
+                // Last entry — goes to end of chunks
+                num_chunks = Subtract(Dereference(Add(track, M4Track.STCO_COUNT)), Subtract(first_chunk, 1))
+            }
+
+            samples_in_run = Multiply(num_chunks, spc)
+
+            IfCondition LessThan(sample, Add(cur_sample, samples_in_run)) ThenBlock: {
+                // Sample is in this stsc run
+                sample_in_run = Subtract(sample, cur_sample)
+                chunk_in_run = Divide(sample_in_run, spc)
+                sample_in_chunk = Modulo(sample_in_run, spc)
+
+                // Chunk index (0-based)
+                chunk_idx = Add(Subtract(first_chunk, 1), chunk_in_run)
+
+                // Get chunk file offset
+                chunk_offset = Dereference(Add(stco_ptr, Multiply(chunk_idx, 8)))
+
+                // Add offsets for samples before this one in the chunk
+                offset = chunk_offset
+                s = 0
+                base_sample = Add(cur_sample, Multiply(chunk_in_run, spc))
+                WhileLoop LessThan(s, sample_in_chunk) {
+                    offset = Add(offset, M4_GetSampleSize(track, Add(base_sample, s)))
+                    s = Add(s, 1)
+                }
+
+                ReturnValue(offset)
+            }
+
+            cur_sample = Add(cur_sample, samples_in_run)
+            entry = Add(entry, 1)
+        }
+
+        // Shouldn't reach here
+        PrintMessage("[MP4] ERROR: sample offset not found for sample ")
+        PrintNumber(sample)
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// GET SAMPLE PTS — from stts table
+// Walk stts entries accumulating deltas until we reach the target sample
+// Returns PTS in timescale units
+// =============================================================================
+Function.M4_GetSamplePTS {
+    Input: track:  Address
+    Input: sample: Integer
+    Output: Integer
+    Body: {
+        stts_ptr   = Dereference(Add(track, M4Track.STTS_PTR))
+        stts_count = Dereference(Add(track, M4Track.STTS_COUNT))
+
+        pts = 0
+        cur_sample = 0
+
+        entry = 0
+        WhileLoop LessThan(entry, stts_count) {
+            sc = M4_ReadBE32(stts_ptr, Multiply(entry, 8))
+            sd = M4_ReadBE32(stts_ptr, Add(Multiply(entry, 8), 4))
+
+            IfCondition LessEqual(Add(cur_sample, sc), sample) ThenBlock: {
+                pts = Add(pts, Multiply(sc, sd))
+                cur_sample = Add(cur_sample, sc)
+            } ElseBlock: {
+                remaining = Subtract(sample, cur_sample)
+                pts = Add(pts, Multiply(remaining, sd))
+                cur_sample = sample
+                entry = stts_count
+            }
+
+            entry = Add(entry, 1)
+        }
+
+        ReturnValue(pts)
+    }
+}
+
+// =============================================================================
+// IS KEYFRAME — check stss table
+// =============================================================================
+Function.M4_IsKeyframe {
+    Input: track:  Address
+    Input: sample: Integer
+    Output: Integer
+    Body: {
+        stss_ptr   = Dereference(Add(track, M4Track.STSS_PTR))
+        stss_count = Dereference(Add(track, M4Track.STSS_COUNT))
+
+        // No stss = all samples are keyframes (audio, or all-intra video)
+        IfCondition EqualTo(stss_count, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // Binary search in stss (1-based sample numbers in file)
+        sample_1 = Add(sample, 1)
+        lo = 0
+        hi = Subtract(stss_count, 1)
+
+        WhileLoop LessEqual(lo, hi) {
+            mid = Divide(Add(lo, hi), 2)
+            val = M4_ReadBE32(stss_ptr, Multiply(mid, 4))
+            IfCondition EqualTo(val, sample_1) ThenBlock: {
+                ReturnValue(1)
+            }
+            IfCondition LessThan(val, sample_1) ThenBlock: {
+                lo = Add(mid, 1)
+            } ElseBlock: {
+                hi = Subtract(mid, 1)
+            }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// FIND NEAREST KEYFRAME — for seeking, find keyframe at or before sample
+// =============================================================================
+Function.M4_FindKeyframe {
+    Input: track:  Address
+    Input: sample: Integer
+    Output: Integer
+    Body: {
+        stss_ptr   = Dereference(Add(track, M4Track.STSS_PTR))
+        stss_count = Dereference(Add(track, M4Track.STSS_COUNT))
+
+        IfCondition EqualTo(stss_count, 0) ThenBlock: {
+            ReturnValue(sample)
+        }
+
+        sample_1 = Add(sample, 1)
+        best = 0
+
+        i = 0
+        WhileLoop LessThan(i, stss_count) {
+            val = M4_ReadBE32(stss_ptr, Multiply(i, 4))
+            IfCondition LessEqual(val, sample_1) ThenBlock: {
+                best = Subtract(val, 1)
+            } ElseBlock: {
+                i = stss_count
+            }
+            i = Add(i, 1)
+        }
+
+        ReturnValue(best)
+    }
+}
+
+// =============================================================================
+// PTS TO USEC — convert PTS in timescale units to microseconds
+// =============================================================================
+Function.M4_PTStoUsec {
+    Input: pts:       Integer
+    Input: timescale: Integer
+    Output: Integer
+    Body: {
+        // pts * 1000000 / timescale
+        // Avoid overflow: (pts / timescale) * 1000000 + (pts % timescale) * 1000000 / timescale
+        whole = Multiply(Divide(pts, timescale), 1000000)
+        frac  = Divide(Multiply(Modulo(pts, timescale), 1000000), timescale)
+        ReturnValue(Add(whole, frac))
+    }
+}
+
+// =============================================================================
+// USEC TO SAMPLE — find sample index for a given PTS in microseconds
+// =============================================================================
+Function.M4_UsecToSample {
+    Input: track:     Address
+    Input: target_usec: Integer
+    Output: Integer
+    Body: {
+        timescale = Dereference(Add(track, M4Track.TIMESCALE))
+        target_pts = Divide(Multiply(target_usec, timescale), 1000000)
+        count = Dereference(Add(track, M4Track.SAMPLE_COUNT))
+
+        stts_ptr   = Dereference(Add(track, M4Track.STTS_PTR))
+        stts_count = Dereference(Add(track, M4Track.STTS_COUNT))
+
+        pts = 0
+        cur_sample = 0
+
+        entry = 0
+        WhileLoop LessThan(entry, stts_count) {
+            sc = M4_ReadBE32(stts_ptr, Multiply(entry, 8))
+            sd = M4_ReadBE32(stts_ptr, Add(Multiply(entry, 8), 4))
+
+            end_pts = Add(pts, Multiply(sc, sd))
+            IfCondition GreaterEqual(end_pts, target_pts) ThenBlock: {
+                // Target is in this stts run
+                IfCondition GreaterThan(sd, 0) ThenBlock: {
+                    offset_samples = Divide(Subtract(target_pts, pts), sd)
+                    ReturnValue(Add(cur_sample, offset_samples))
+                }
+                ReturnValue(cur_sample)
+            }
+            pts = end_pts
+            cur_sample = Add(cur_sample, sc)
+            entry = Add(entry, 1)
+        }
+
+        // Past end
+        ReturnValue(Subtract(count, 1))
+    }
+}
+
+// =============================================================================
+// PARSE MOOV — recursive box parser for the moov container
+// This is the heart of MP4 demuxing.
+// =============================================================================
+Function.M4_ParseBoxes {
+    Input: fd:          Integer
+    Input: end_offset:  Integer
+    Input: tracks:      Address
+    Input: track_count: Address
+    Input: depth:       Integer
+    Input: cur_handler: Integer
+    Body: {
+        hdr = Allocate(16)
+
+        WhileLoop 1 {
+            cur_pos = SystemCall(M4Sys.SYS_LSEEK, fd, 0, M4Sys.SEEK_CUR)
+            IfCondition GreaterEqual(cur_pos, end_offset) ThenBlock: {
+                Deallocate(hdr, 16)
+                ReturnValue(0)
+            }
+
+            n = M4_ReadExact(fd, hdr, 8)
+            IfCondition LessThan(n, 8) ThenBlock: {
+                Deallocate(hdr, 16)
+                ReturnValue(0)
+            }
+
+            box_size = M4_ReadBE32(hdr, 0)
+            box_type = M4_ReadBE32(hdr, 4)
+
+            // Handle size=1 (64-bit extended size)
+            IfCondition EqualTo(box_size, 1) ThenBlock: {
+                M4_ReadExact(fd, hdr, 8)
+                box_size = M4_ReadBE64(hdr, 0)
+            }
+
+            IfCondition EqualTo(box_size, 0) ThenBlock: {
+                Deallocate(hdr, 16)
+                ReturnValue(0)
+            }
+
+            box_end = Add(cur_pos, box_size)
+            content_start = Add(cur_pos, 8)
+
+            // Container boxes — recurse into them
+            // moov, trak, mdia, minf, stbl, edts, udta, dinf
+            fcc_moov = M4_FourCC(109, 111, 111, 118)
+            fcc_trak = M4_FourCC(116, 114, 97, 107)
+            fcc_mdia = M4_FourCC(109, 100, 105, 97)
+            fcc_minf = M4_FourCC(109, 105, 110, 102)
+            fcc_stbl = M4_FourCC(115, 116, 98, 108)
+
+            is_container = 0
+            IfCondition EqualTo(box_type, fcc_moov) ThenBlock: { is_container = 1 }
+            IfCondition EqualTo(box_type, fcc_mdia) ThenBlock: { is_container = 1 }
+            IfCondition EqualTo(box_type, fcc_minf) ThenBlock: { is_container = 1 }
+            IfCondition EqualTo(box_type, fcc_stbl) ThenBlock: { is_container = 1 }
+
+            // trak — allocate a new track entry before recursing
+            IfCondition EqualTo(box_type, fcc_trak) ThenBlock: {
+                tc = Dereference(track_count)
+                IfCondition LessThan(tc, M4Const.MAX_TRACKS) ThenBlock: {
+                    trk = M4_GetTrack(tracks, tc)
+                    StoreValue(Add(trk, M4Track.ACTIVE), 1)
+                    StoreValue(track_count, Add(tc, 1))
+                    PrintMessage("[MP4] trak #")
+                    PrintNumber(tc)
+                    PrintMessage("\n")
+                    M4_ParseBoxes(fd, box_end, tracks, track_count, Add(depth, 1), 0)
+                }
+                SystemCall(M4Sys.SYS_LSEEK, fd, box_end, M4Sys.SEEK_SET)
+            }
+
+            IfCondition And(EqualTo(is_container, 1), NotEqual(box_type, fcc_trak)) ThenBlock: {
+                M4_ParseBoxes(fd, box_end, tracks, track_count, Add(depth, 1), cur_handler)
+                SystemCall(M4Sys.SYS_LSEEK, fd, box_end, M4Sys.SEEK_SET)
+            }
+
+            IfCondition EqualTo(is_container, 0) ThenBlock: {
+                // Leaf boxes — parse specific ones
+                tc = Dereference(track_count)
+                IfCondition GreaterThan(tc, 0) ThenBlock: {
+                    trk = M4_GetTrack(tracks, Subtract(tc, 1))
+
+                    // mdhd — media header (timescale)
+                    fcc_mdhd = M4_FourCC(109, 100, 104, 100)
+                    IfCondition EqualTo(box_type, fcc_mdhd) ThenBlock: {
+                        mbuf = Allocate(32)
+                        M4_ReadExact(fd, mbuf, 32)
+                        version = GetByte(mbuf, 0)
+                        IfCondition EqualTo(version, 0) ThenBlock: {
+                            ts = M4_ReadBE32(mbuf, 12)
+                            dur = M4_ReadBE32(mbuf, 16)
+                        } ElseBlock: {
+                            ts = M4_ReadBE32(mbuf, 20)
+                            dur = M4_ReadBE64(mbuf, 24)
+                        }
+                        StoreValue(Add(trk, M4Track.TIMESCALE), ts)
+                        StoreValue(Add(trk, M4Track.DURATION), dur)
+                        PrintMessage("[MP4] mdhd: timescale=")
+                        PrintNumber(ts)
+                        PrintMessage(" duration=")
+                        PrintNumber(dur)
+                        PrintMessage("\n")
+                        Deallocate(mbuf, 32)
+                    }
+
+                    // hdlr — handler type (vide/soun)
+                    fcc_hdlr = M4_FourCC(104, 100, 108, 114)
+                    IfCondition EqualTo(box_type, fcc_hdlr) ThenBlock: {
+                        hbuf = Allocate(16)
+                        M4_ReadExact(fd, hbuf, 12)
+                        handler_type = M4_ReadBE32(hbuf, 8)
+                        fcc_vide = M4_FourCC(118, 105, 100, 101)
+                        fcc_soun = M4_FourCC(115, 111, 117, 110)
+                        IfCondition EqualTo(handler_type, fcc_vide) ThenBlock: {
+                            StoreValue(Add(trk, M4Track.HANDLER), M4Handler.VIDEO)
+                            PrintMessage("[MP4] handler: video\n")
+                        }
+                        IfCondition EqualTo(handler_type, fcc_soun) ThenBlock: {
+                            StoreValue(Add(trk, M4Track.HANDLER), M4Handler.AUDIO)
+                            PrintMessage("[MP4] handler: audio\n")
+                        }
+                        Deallocate(hbuf, 16)
+                    }
+
+                    // stts
+                    fcc_stts = M4_FourCC(115, 116, 116, 115)
+                    IfCondition EqualTo(box_type, fcc_stts) ThenBlock: {
+                        M4_ParseSTTS(fd, trk, cur_pos, box_size)
+                    }
+
+                    // stsc
+                    fcc_stsc = M4_FourCC(115, 116, 115, 99)
+                    IfCondition EqualTo(box_type, fcc_stsc) ThenBlock: {
+                        M4_ParseSTSC(fd, trk)
+                    }
+
+                    // stsz
+                    fcc_stsz = M4_FourCC(115, 116, 115, 122)
+                    IfCondition EqualTo(box_type, fcc_stsz) ThenBlock: {
+                        M4_ParseSTSZ(fd, trk)
+                    }
+
+                    // stco
+                    fcc_stco = M4_FourCC(115, 116, 99, 111)
+                    IfCondition EqualTo(box_type, fcc_stco) ThenBlock: {
+                        M4_ParseSTCO(fd, trk)
+                    }
+
+                    // co64
+                    fcc_co64 = M4_FourCC(99, 111, 54, 52)
+                    IfCondition EqualTo(box_type, fcc_co64) ThenBlock: {
+                        M4_ParseCO64(fd, trk)
+                    }
+
+                    // stss
+                    fcc_stss = M4_FourCC(115, 116, 115, 115)
+                    IfCondition EqualTo(box_type, fcc_stss) ThenBlock: {
+                        M4_ParseSTSS(fd, trk)
+                    }
+
+                    // ctts
+                    fcc_ctts = M4_FourCC(99, 116, 116, 115)
+                    IfCondition EqualTo(box_type, fcc_ctts) ThenBlock: {
+                        M4_ParseCTTS(fd, trk)
+                    }
+
+                    // stsd — sample description (codec identification)
+                    fcc_stsd = M4_FourCC(115, 116, 115, 100)
+                    IfCondition EqualTo(box_type, fcc_stsd) ThenBlock: {
+                        sbuf = Allocate(96)
+                        M4_ReadExact(fd, sbuf, 8)
+                        // entry_count at offset 4
+                        // First entry starts at offset 8
+                        // Entry: [4B size] [4B format] ...
+                        M4_ReadExact(fd, sbuf, 8)
+                        entry_size = M4_ReadBE32(sbuf, 0)
+                        codec_fcc  = M4_ReadBE32(sbuf, 4)
+                        StoreValue(Add(trk, M4Track.CODEC), codec_fcc)
+
+                        handler = Dereference(Add(trk, M4Track.HANDLER))
+                        IfCondition EqualTo(handler, M4Handler.VIDEO) ThenBlock: {
+                            // Video stsd entry: 6B reserved, 2B data_ref_idx, rest is codec-specific
+                            // Width at offset 24, height at offset 26 (from entry start after size+type)
+                            M4_ReadExact(fd, sbuf, 70)
+                            w = M4_ReadBE16(sbuf, 16)
+                            h = M4_ReadBE16(sbuf, 18)
+                            StoreValue(Add(trk, M4Track.WIDTH), w)
+                            StoreValue(Add(trk, M4Track.HEIGHT), h)
+                            PrintMessage("[MP4] stsd video: ")
+                            PrintNumber(w)
+                            PrintMessage("x")
+                            PrintNumber(h)
+                        }
+                        IfCondition EqualTo(handler, M4Handler.AUDIO) ThenBlock: {
+                            // Audio stsd: 6B reserved, 2B data_ref_idx, 8B reserved
+                            // channels at offset 16, sample_size at 18, sr_fixed at 24
+                            M4_ReadExact(fd, sbuf, 28)
+                            ch = M4_ReadBE16(sbuf, 16)
+                            bps = M4_ReadBE16(sbuf, 18)
+                            sr = ShiftRight(M4_ReadBE32(sbuf, 24), 16)
+                            StoreValue(Add(trk, M4Track.CHANNELS), ch)
+                            StoreValue(Add(trk, M4Track.BITS_PER_SAMPLE), bps)
+                            StoreValue(Add(trk, M4Track.SAMPLE_RATE), sr)
+                            PrintMessage("[MP4] stsd audio: ch=")
+                            PrintNumber(ch)
+                            PrintMessage(" sr=")
+                            PrintNumber(sr)
+                        }
+
+                        PrintMessage(" codec=0x")
+                        PrintNumber(codec_fcc)
+                        PrintMessage("\n")
+                        Deallocate(sbuf, 96)
+                    }
+                }
+
+                // Skip to box end
+                SystemCall(M4Sys.SYS_LSEEK, fd, box_end, M4Sys.SEEK_SET)
+            }
+        }
+
+        Deallocate(hdr, 16)
+    }
+}
+
+// =============================================================================
+// DEMUX LOOP — iterate samples, read from file, write to rings
+// =============================================================================
+Function.M4_DemuxSamples {
+    Input: fd:         Integer
+    Input: vid_track:  Address
+    Input: aud_track:  Address
+    Input: vid_ring:   Integer
+    Input: aud_ring:   Integer
+    Input: clock:      Integer
+    Body: {
+        read_buf = Allocate(M4Const.READ_BUF_SIZE)
+        ts_wait = Allocate(16)
+        StoreValue(ts_wait, 0)
+        StoreValue(Add(ts_wait, 8), 1000000)
+
+        vid_total = 0
+        aud_total = 0
+        IfCondition NotEqual(vid_track, 0) ThenBlock: {
+            vid_total = Dereference(Add(vid_track, M4Track.SAMPLE_COUNT))
+            StoreValue(Add(vid_track, M4Track.CUR_SAMPLE), 0)
+        }
+        IfCondition NotEqual(aud_track, 0) ThenBlock: {
+            aud_total = Dereference(Add(aud_track, M4Track.SAMPLE_COUNT))
+            StoreValue(Add(aud_track, M4Track.CUR_SAMPLE), 0)
+        }
+
+        vid_done = 0
+        aud_done = 0
+        IfCondition EqualTo(vid_total, 0) ThenBlock: { vid_done = 1 }
+        IfCondition EqualTo(aud_total, 0) ThenBlock: { aud_done = 1 }
+
+        PrintMessage("[MP4] demuxing: vid_samples=")
+        PrintNumber(vid_total)
+        PrintMessage(" aud_samples=")
+        PrintNumber(aud_total)
+        PrintMessage("\n")
+
+        WhileLoop Or(EqualTo(vid_done, 0), EqualTo(aud_done, 0)) {
+            // Check clock
+            state = PlaybackClock_GetState(clock)
+            IfCondition EqualTo(state, PCState.STOPPED) ThenBlock: {
+                vid_done = 1
+                aud_done = 1
+            }
+            IfCondition EqualTo(state, PCState.PAUSED) ThenBlock: {
+                SystemCall(M4Sys.SYS_NANOSLEEP, ts_wait, 0)
+            }
+            IfCondition EqualTo(state, PCState.SEEKING) ThenBlock: {
+                target = PlaybackClock_GetSeekTarget(clock)
+                // Seek video to nearest keyframe
+                IfCondition NotEqual(vid_track, 0) ThenBlock: {
+                    vs = M4_UsecToSample(vid_track, target)
+                    vs = M4_FindKeyframe(vid_track, vs)
+                    StoreValue(Add(vid_track, M4Track.CUR_SAMPLE), vs)
+                    vid_done = 0
+                    PacketRing_Reset(vid_ring)
+                }
+                // Seek audio to matching position
+                IfCondition NotEqual(aud_track, 0) ThenBlock: {
+                    as2 = M4_UsecToSample(aud_track, target)
+                    StoreValue(Add(aud_track, M4Track.CUR_SAMPLE), as2)
+                    aud_done = 0
+                    PacketRing_Reset(aud_ring)
+                }
+                PlaybackClock_SeekDone(clock)
+                PrintMessage("[MP4] seeked\n")
+            }
+
+            IfCondition EqualTo(state, PCState.PLAYING) ThenBlock: {
+                // Interleave: send whichever track has the earlier PTS
+                vid_pts_usec = 999999999999
+                aud_pts_usec = 999999999999
+
+                IfCondition EqualTo(vid_done, 0) ThenBlock: {
+                    vs = Dereference(Add(vid_track, M4Track.CUR_SAMPLE))
+                    IfCondition GreaterEqual(vs, vid_total) ThenBlock: {
+                        vid_done = 1
+                    } ElseBlock: {
+                        vp = M4_GetSamplePTS(vid_track, vs)
+                        vid_pts_usec = M4_PTStoUsec(vp, Dereference(Add(vid_track, M4Track.TIMESCALE)))
+                    }
+                }
+
+                IfCondition EqualTo(aud_done, 0) ThenBlock: {
+                    as2 = Dereference(Add(aud_track, M4Track.CUR_SAMPLE))
+                    IfCondition GreaterEqual(as2, aud_total) ThenBlock: {
+                        aud_done = 1
+                    } ElseBlock: {
+                        ap = M4_GetSamplePTS(aud_track, as2)
+                        aud_pts_usec = M4_PTStoUsec(ap, Dereference(Add(aud_track, M4Track.TIMESCALE)))
+                    }
+                }
+
+                // Send the earlier one
+                send_video = 0
+                IfCondition And(EqualTo(vid_done, 0), Or(EqualTo(aud_done, 1), LessEqual(vid_pts_usec, aud_pts_usec))) ThenBlock: {
+                    send_video = 1
+                }
+
+                IfCondition EqualTo(send_video, 1) ThenBlock: {
+                    vs = Dereference(Add(vid_track, M4Track.CUR_SAMPLE))
+                    sz = M4_GetSampleSize(vid_track, vs)
+                    off = M4_GetSampleOffset(vid_track, vs)
+                    kf = M4_IsKeyframe(vid_track, vs)
+
+                    IfCondition LessEqual(sz, M4Const.READ_BUF_SIZE) ThenBlock: {
+                        SystemCall(M4Sys.SYS_LSEEK, fd, off, M4Sys.SEEK_SET)
+                        M4_ReadExact(fd, read_buf, sz)
+                        pflags = 0
+                        IfCondition EqualTo(kf, 1) ThenBlock: { pflags = PRPktFlag.KEYFRAME }
+
+                        wrote = PacketRing_Write(vid_ring, read_buf, sz, vid_pts_usec, pflags)
+                        IfCondition EqualTo(wrote, 1) ThenBlock: {
+                            StoreValue(Add(vid_track, M4Track.CUR_SAMPLE), Add(vs, 1))
+                        } ElseBlock: {
+                            SystemCall(M4Sys.SYS_NANOSLEEP, ts_wait, 0)
+                        }
+                    } ElseBlock: {
+                        // Sample too large — skip it
+                        PrintMessage("[MP4] WARNING: sample too large, skipping: ")
+                        PrintNumber(sz)
+                        PrintMessage("\n")
+                        StoreValue(Add(vid_track, M4Track.CUR_SAMPLE), Add(vs, 1))
+                    }
+                } ElseBlock: {
+                    IfCondition EqualTo(aud_done, 0) ThenBlock: {
+                        as2 = Dereference(Add(aud_track, M4Track.CUR_SAMPLE))
+                        sz = M4_GetSampleSize(aud_track, as2)
+                        off = M4_GetSampleOffset(aud_track, as2)
+
+                        IfCondition LessEqual(sz, M4Const.READ_BUF_SIZE) ThenBlock: {
+                            SystemCall(M4Sys.SYS_LSEEK, fd, off, M4Sys.SEEK_SET)
+                            M4_ReadExact(fd, read_buf, sz)
+
+                            wrote = PacketRing_Write(aud_ring, read_buf, sz, aud_pts_usec, PRPktFlag.NONE)
+                            IfCondition EqualTo(wrote, 1) ThenBlock: {
+                                StoreValue(Add(aud_track, M4Track.CUR_SAMPLE), Add(as2, 1))
+                            } ElseBlock: {
+                                SystemCall(M4Sys.SYS_NANOSLEEP, ts_wait, 0)
+                            }
+                        } ElseBlock: {
+                            StoreValue(Add(aud_track, M4Track.CUR_SAMPLE), Add(as2, 1))
+                        }
+                    }
+                }
+            }
+        }
+
+        // Signal EOF on both rings
+        IfCondition NotEqual(vid_ring, 0) ThenBlock: { PacketRing_SignalEOF(vid_ring) }
+        IfCondition NotEqual(aud_ring, 0) ThenBlock: { PacketRing_SignalEOF(aud_ring) }
+
+        Deallocate(read_buf, M4Const.READ_BUF_SIZE)
+        Deallocate(ts_wait, 16)
+
+        PrintMessage("[MP4] demux complete\n")
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    PrintMessage("[DemuxMP4] starting\n")
+
+    // Parse args via UtilArgs schema
+    schema = M4_BuildSchema()
+    args = UtilArgs_ParseCLI(schema)
+    IfCondition EqualTo(args, 0) ThenBlock: {
+        PrintMessage("[DemuxMP4] argument error\n")
+        SystemCall(M4Sys.SYS_EXIT, 1)
+    }
+
+    filepath      = UtilArgs_GetString(args, "file")
+    vid_ring_name = UtilArgs_GetString(args, "vring")
+    aud_ring_name = UtilArgs_GetString(args, "aring")
+    clock_name    = UtilArgs_GetString(args, "clock")
+
+    PrintMessage("[DemuxMP4] file: ")
+    PrintString(filepath)
+    PrintMessage("\n")
+
+    // Open file
+    mp4_fd = SystemCall(M4Sys.SYS_OPEN, filepath, M4Sys.O_RDONLY, 0)
+    IfCondition LessThan(mp4_fd, 0) ThenBlock: {
+        PrintMessage("[DemuxMP4] cannot open file\n")
+        SystemCall(M4Sys.SYS_EXIT, 1)
+    }
+
+    // Get file size via lseek
+    file_size = SystemCall(M4Sys.SYS_LSEEK, mp4_fd, 0, 2)
+    SystemCall(M4Sys.SYS_LSEEK, mp4_fd, 0, M4Sys.SEEK_SET)
+    PrintMessage("[DemuxMP4] file size: ")
+    PrintNumber(file_size)
+    PrintMessage("\n")
+
+    // Allocate track array
+    tracks = Allocate(Multiply(M4Const.MAX_TRACKS, M4Const.TRACK_SIZE))
+    // Zero it
+    i = 0
+    t_total = Multiply(M4Const.MAX_TRACKS, M4Const.TRACK_SIZE)
+    WhileLoop LessThan(i, t_total) {
+        SetByte(tracks, i, 0)
+        i = Add(i, 1)
+    }
+    track_count_ptr = Allocate(8)
+    StoreValue(track_count_ptr, 0)
+
+    // Find and parse moov box
+    // Scan top-level boxes for moov
+    hdr = Allocate(16)
+    moov_found = 0
+
+    WhileLoop EqualTo(moov_found, 0) {
+        cur = SystemCall(M4Sys.SYS_LSEEK, mp4_fd, 0, M4Sys.SEEK_CUR)
+        IfCondition GreaterEqual(cur, file_size) ThenBlock: {
+            moov_found = 2
+        }
+        IfCondition EqualTo(moov_found, 0) ThenBlock: {
+            n = M4_ReadExact(mp4_fd, hdr, 8)
+            IfCondition LessThan(n, 8) ThenBlock: {
+                moov_found = 2
+            }
+            IfCondition EqualTo(moov_found, 0) ThenBlock: {
+                bsz = M4_ReadBE32(hdr, 0)
+                btype = M4_ReadBE32(hdr, 4)
+
+                IfCondition EqualTo(bsz, 1) ThenBlock: {
+                    M4_ReadExact(mp4_fd, hdr, 8)
+                    bsz = M4_ReadBE64(hdr, 0)
+                }
+
+                fcc_moov = M4_FourCC(109, 111, 111, 118)
+                IfCondition EqualTo(btype, fcc_moov) ThenBlock: {
+                    moov_end = Add(cur, bsz)
+                    PrintMessage("[DemuxMP4] found moov at offset ")
+                    PrintNumber(cur)
+                    PrintMessage(" size=")
+                    PrintNumber(bsz)
+                    PrintMessage("\n")
+                    M4_ParseBoxes(mp4_fd, moov_end, tracks, track_count_ptr, 0, 0)
+                    moov_found = 1
+                } ElseBlock: {
+                    // Skip this box
+                    SystemCall(M4Sys.SYS_LSEEK, mp4_fd, Add(cur, bsz), M4Sys.SEEK_SET)
+                }
+            }
+        }
+    }
+
+    Deallocate(hdr, 16)
+
+    IfCondition NotEqual(moov_found, 1) ThenBlock: {
+        PrintMessage("[DemuxMP4] moov box not found!\n")
+        SystemCall(M4Sys.SYS_EXIT, 1)
+    }
+
+    // Find the first video and audio tracks
+    tc = Dereference(track_count_ptr)
+    PrintMessage("[DemuxMP4] found ")
+    PrintNumber(tc)
+    PrintMessage(" tracks\n")
+
+    vid_track = 0
+    aud_track = 0
+    i = 0
+    WhileLoop LessThan(i, tc) {
+        trk = M4_GetTrack(tracks, i)
+        handler = Dereference(Add(trk, M4Track.HANDLER))
+        IfCondition And(EqualTo(handler, M4Handler.VIDEO), EqualTo(vid_track, 0)) ThenBlock: {
+            vid_track = trk
+            StoreValue(Add(trk, M4Track.VIDEO_TRACK), 1)
+            PrintMessage("[DemuxMP4] using track ")
+            PrintNumber(i)
+            PrintMessage(" for video\n")
+        }
+        IfCondition And(EqualTo(handler, M4Handler.AUDIO), EqualTo(aud_track, 0)) ThenBlock: {
+            aud_track = trk
+            StoreValue(Add(trk, M4Track.AUDIO_TRACK), 1)
+            PrintMessage("[DemuxMP4] using track ")
+            PrintNumber(i)
+            PrintMessage(" for audio\n")
+        }
+        i = Add(i, 1)
+    }
+
+    // Create rings
+    vid_ring = 0
+    aud_ring = 0
+    IfCondition NotEqual(vid_track, 0) ThenBlock: {
+        vid_ring = PacketRing_Create(vid_ring_name, M4Const.RING_CAPACITY)
+    }
+    IfCondition NotEqual(aud_track, 0) ThenBlock: {
+        aud_ring = PacketRing_Create(aud_ring_name, M4Const.RING_CAPACITY)
+    }
+
+    // Open clock
+    clock = PlaybackClock_Open(clock_name)
+    IfCondition EqualTo(clock, 0) ThenBlock: {
+        PrintMessage("[DemuxMP4] failed to open clock\n")
+        SystemCall(M4Sys.SYS_EXIT, 1)
+    }
+
+    // Print track info
+    IfCondition NotEqual(vid_track, 0) ThenBlock: {
+        PrintMessage("[DemuxMP4] video: ")
+        PrintNumber(Dereference(Add(vid_track, M4Track.WIDTH)))
+        PrintMessage("x")
+        PrintNumber(Dereference(Add(vid_track, M4Track.HEIGHT)))
+        PrintMessage(" samples=")
+        PrintNumber(Dereference(Add(vid_track, M4Track.SAMPLE_COUNT)))
+        PrintMessage(" timescale=")
+        PrintNumber(Dereference(Add(vid_track, M4Track.TIMESCALE)))
+        PrintMessage("\n")
+    }
+    IfCondition NotEqual(aud_track, 0) ThenBlock: {
+        PrintMessage("[DemuxMP4] audio: sr=")
+        PrintNumber(Dereference(Add(aud_track, M4Track.SAMPLE_RATE)))
+        PrintMessage(" ch=")
+        PrintNumber(Dereference(Add(aud_track, M4Track.CHANNELS)))
+        PrintMessage(" samples=")
+        PrintNumber(Dereference(Add(aud_track, M4Track.SAMPLE_COUNT)))
+        PrintMessage("\n")
+    }
+
+    // Demux
+    M4_DemuxSamples(mp4_fd, vid_track, aud_track, vid_ring, aud_ring, clock)
+
+    // Cleanup
+    SystemCall(M4Sys.SYS_CLOSE, mp4_fd, 0, 0, 0, 0, 0)
+    PlaybackClock_Close(clock)
+
+    PrintMessage("[DemuxMP4] exiting\n")
+    SystemCall(M4Sys.SYS_EXIT, 0)
+}
+
+RunTask(Main)

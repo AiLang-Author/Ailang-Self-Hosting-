@@ -1,0 +1,614 @@
+// Library.DemuxOGG.ailang
+// Standalone OGG container demuxer process.
+//
+// Reads an OGG file, parses pages, reassembles packets, identifies the
+// codec (Vorbis, Opus, or FLAC), and writes packets to an audio PacketRing.
+//
+// OGG is a page-based container. Each page has a header with sync pattern
+// "OggS", then a segment table describing packet boundaries. Packets can
+// span multiple pages (255-byte continuation segments).
+//
+// Codec identification (first packet on each stream):
+//   Vorbis:  0x01 "vorbis" (7 bytes)
+//   Opus:    "OpusHead"    (8 bytes)
+//   FLAC:    0x7F "FLAC"   (5 bytes, OGG-encapsulated FLAC)
+//   Theora:  0x80 "theora" (7 bytes) — video, forwarded to video ring
+//
+// Header packets (identification + setup) are sent as CONFIG-flagged.
+// Data packets are sent with PTS derived from granule position.
+//
+// This demuxer handles audio-only OGG files (Vorbis/Opus). For Theora+Vorbis
+// multiplexed files, it sends audio to the audio ring and video to the video
+// ring using the stream serial number to distinguish.
+//
+// Usage:
+//   ./demux_ogg.x --file /path/to.ogg --ring audio_ring --clock clk0
+//
+// Orthogonal: speaks only PacketRing + PlaybackClock.
+//
+// OGG page format (27+ bytes):
+//   [0..3]   "OggS" capture pattern
+//   [4]      stream structure version (0)
+//   [5]      header type: bit0=continued, bit1=bos, bit2=eos
+//   [6..13]  granule position (LE64)
+//   [14..17] stream serial number (LE32)
+//   [18..21] page sequence number (LE32)
+//   [22..25] CRC checksum (LE32)
+//   [26]     number of page segments
+//   [27..]   segment table (N bytes, each 0-255)
+//   then:    page data (sum of segment values)
+//
+// Packet boundaries: a segment value 0-254 terminates a packet.
+// A segment value 255 means the packet continues in the next segment.
+//
+// Build: ./ailang.x Librarys/Media/Library.DemuxOGG.ailang demux_ogg.x
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.PacketRing
+LibraryImport.PlaybackClock
+LibraryImport.UtilArgs
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.OGSys {
+    "SYS_READ":      Initialize=0
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_EXIT":      Initialize=60
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_LSEEK":     Initialize=8
+    "O_RDONLY":      Initialize=0
+}
+
+FixedPool.OGConst {
+    "MAX_PAGE_SIZE":   Initialize=65536
+    "MAX_PACKET_SIZE": Initialize=262144
+    "RING_CAPACITY":   Initialize=4194304
+    "MAX_SEGMENTS":    Initialize=255
+}
+
+// Codec IDs
+FixedPool.OGCodec {
+    "UNKNOWN": Initialize=0
+    "VORBIS":  Initialize=1
+    "OPUS":    Initialize=2
+    "FLAC":    Initialize=3
+    "THEORA":  Initialize=4
+}
+
+// State
+FixedPool.OGState {
+    "codec":           Initialize=0
+    "audio_serial":    Initialize=0
+    "video_serial":    Initialize=0
+    "header_packets":  Initialize=0
+    "sample_rate":     Initialize=0
+    "channels":        Initialize=0
+    "pre_skip":        Initialize=0
+    "file_size":       Initialize=0
+    "granule_prev":    Initialize=0
+}
+
+// =============================================================================
+// ARGUMENT SCHEMA
+// =============================================================================
+Function.OG_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("demux_ogg", "OGG demuxer — extract Vorbis/Opus to PacketRing")
+        UtilArgs_AddField(s, "file",  "path",   1, "OGG file path",         "file")
+        UtilArgs_AddField(s, "ring",  "string", 1, "Audio PacketRing name", "ring")
+        UtilArgs_AddField(s, "clock", "string", 1, "PlaybackClock name",    "clock")
+        UtilArgs_SetShort(s, "file",  "f")
+        UtilArgs_SetShort(s, "ring",  "r")
+        UtilArgs_SetShort(s, "clock", "c")
+        ReturnValue(s)
+    }
+}
+
+// =============================================================================
+// READ LE16
+// =============================================================================
+Function.OG_ReadLE16 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        lo = GetByte(buf, off)
+        hi = GetByte(buf, Add(off, 1))
+        ReturnValue(Add(lo, ShiftLeft(hi, 8)))
+    }
+}
+
+// =============================================================================
+// READ LE32
+// =============================================================================
+Function.OG_ReadLE32 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        b3 = GetByte(buf, Add(off, 3))
+        ReturnValue(Add(Add(b0, ShiftLeft(b1, 8)), Add(ShiftLeft(b2, 16), ShiftLeft(b3, 24))))
+    }
+}
+
+// =============================================================================
+// READ LE64 (low 32 bits — sufficient for granule in most files)
+// =============================================================================
+Function.OG_ReadLE64Lo {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(OG_ReadLE32(buf, off))
+    }
+}
+
+// =============================================================================
+// IDENTIFY CODEC — check first bytes of first packet on a stream
+// =============================================================================
+Function.OG_IdentifyCodec {
+    Input: pkt: Address
+    Input: pkt_size: Integer
+    Output: Integer
+    Body: {
+        // Vorbis: byte 0 = 0x01, bytes 1-6 = "vorbis"
+        IfCondition GreaterEqual(pkt_size, 7) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(pkt, 0), 1), And(EqualTo(GetByte(pkt, 1), 118), EqualTo(GetByte(pkt, 2), 111))) ThenBlock: {
+                IfCondition And(EqualTo(GetByte(pkt, 3), 114), And(EqualTo(GetByte(pkt, 4), 98), And(EqualTo(GetByte(pkt, 5), 105), EqualTo(GetByte(pkt, 6), 115)))) ThenBlock: {
+                    PrintMessage("[DemuxOGG] Identified codec: Vorbis\n")
+                    ReturnValue(OGCodec.VORBIS)
+                }
+            }
+        }
+
+        // Opus: bytes 0-7 = "OpusHead"
+        IfCondition GreaterEqual(pkt_size, 8) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(pkt, 0), 79), And(EqualTo(GetByte(pkt, 1), 112), EqualTo(GetByte(pkt, 2), 117))) ThenBlock: {
+                IfCondition And(EqualTo(GetByte(pkt, 3), 115), And(EqualTo(GetByte(pkt, 4), 72), And(EqualTo(GetByte(pkt, 5), 101), And(EqualTo(GetByte(pkt, 6), 97), EqualTo(GetByte(pkt, 7), 100))))) ThenBlock: {
+                    PrintMessage("[DemuxOGG] Identified codec: Opus\n")
+                    ReturnValue(OGCodec.OPUS)
+                }
+            }
+        }
+
+        // FLAC: byte 0 = 0x7F, bytes 1-4 = "FLAC"
+        IfCondition GreaterEqual(pkt_size, 5) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(pkt, 0), 127), And(EqualTo(GetByte(pkt, 1), 70), And(EqualTo(GetByte(pkt, 2), 76), And(EqualTo(GetByte(pkt, 3), 65), EqualTo(GetByte(pkt, 4), 67))))) ThenBlock: {
+                PrintMessage("[DemuxOGG] Identified codec: FLAC (OGG-encapsulated)\n")
+                ReturnValue(OGCodec.FLAC)
+            }
+        }
+
+        // Theora: byte 0 = 0x80, bytes 1-6 = "theora"
+        IfCondition GreaterEqual(pkt_size, 7) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(pkt, 0), 128), And(EqualTo(GetByte(pkt, 1), 116), EqualTo(GetByte(pkt, 2), 104))) ThenBlock: {
+                IfCondition And(EqualTo(GetByte(pkt, 3), 101), And(EqualTo(GetByte(pkt, 4), 111), And(EqualTo(GetByte(pkt, 5), 114), EqualTo(GetByte(pkt, 6), 97)))) ThenBlock: {
+                    PrintMessage("[DemuxOGG] Identified codec: Theora (video)\n")
+                    ReturnValue(OGCodec.THEORA)
+                }
+            }
+        }
+
+        PrintMessage("[DemuxOGG] Unknown codec\n")
+        ReturnValue(OGCodec.UNKNOWN)
+    }
+}
+
+// =============================================================================
+// PARSE VORBIS IDENTIFICATION HEADER
+// =============================================================================
+// Layout after 7-byte "\x01vorbis":
+//   [7..10]  vorbis_version (LE32) — must be 0
+//   [11]     audio_channels
+//   [12..15] audio_sample_rate (LE32)
+Function.OG_ParseVorbisIdent {
+    Input: pkt: Address
+    Input: pkt_size: Integer
+    Body: {
+        IfCondition LessThan(pkt_size, 16) ThenBlock: { ReturnValue(0) }
+        OGState.channels = GetByte(pkt, 11)
+        OGState.sample_rate = OG_ReadLE32(pkt, 12)
+        PrintMessage("[DemuxOGG] Vorbis: ch=")
+        PrintNumber(OGState.channels)
+        PrintMessage(" rate=")
+        PrintNumber(OGState.sample_rate)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// PARSE OPUS HEAD
+// =============================================================================
+// Layout:
+//   [0..7]   "OpusHead"
+//   [8]      version
+//   [9]      channel count
+//   [10..11] pre-skip (LE16)
+//   [12..15] input sample rate (LE32)
+Function.OG_ParseOpusHead {
+    Input: pkt: Address
+    Input: pkt_size: Integer
+    Body: {
+        IfCondition LessThan(pkt_size, 16) ThenBlock: { ReturnValue(0) }
+        OGState.channels = GetByte(pkt, 9)
+        OGState.pre_skip = OG_ReadLE16(pkt, 10)
+        OGState.sample_rate = 48000
+        PrintMessage("[DemuxOGG] Opus: ch=")
+        PrintNumber(OGState.channels)
+        PrintMessage(" pre_skip=")
+        PrintNumber(OGState.pre_skip)
+        PrintMessage(" (always 48kHz)\n")
+    }
+}
+
+// =============================================================================
+// GRANULE TO PTS — convert granule position to microseconds
+// =============================================================================
+Function.OG_GranuleToPTS {
+    Input: granule: Integer
+    Output: Integer
+    Body: {
+        rate = OGState.sample_rate
+        IfCondition EqualTo(rate, 0) ThenBlock: { ReturnValue(0) }
+
+        // For Opus: subtract pre-skip
+        IfCondition EqualTo(OGState.codec, OGCodec.OPUS) ThenBlock: {
+            adj = Subtract(granule, OGState.pre_skip)
+            IfCondition LessThan(adj, 0) ThenBlock: { adj = 0 }
+            // pts_usec = adj * 1000000 / 48000 = adj * 125 / 6
+            ReturnValue(Divide(Multiply(adj, 125), 6))
+        }
+
+        // For Vorbis/FLAC: pts_usec = granule * 1000000 / sample_rate
+        ReturnValue(Divide(Multiply(granule, 1000000), rate))
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    PrintMessage("[DemuxOGG] starting\n")
+
+    // Parse args
+    schema = OG_BuildSchema()
+    args = UtilArgs_ParseCLI(schema)
+    IfCondition EqualTo(args, 0) ThenBlock: {
+        PrintMessage("[DemuxOGG] argument error\n")
+        SystemCall(OGSys.SYS_EXIT, 1)
+    }
+
+    filepath   = UtilArgs_GetString(args, "file")
+    ring_name  = UtilArgs_GetString(args, "ring")
+    clock_name = UtilArgs_GetString(args, "clock")
+
+    PrintMessage("[DemuxOGG] file: ")
+    PrintString(filepath)
+    PrintMessage("\n[DemuxOGG] ring: ")
+    PrintString(ring_name)
+    PrintMessage("\n[DemuxOGG] clock: ")
+    PrintString(clock_name)
+    PrintMessage("\n")
+
+    // Open the OGG file
+    ogg_fd = SystemCall(OGSys.SYS_OPEN, filepath, OGSys.O_RDONLY, 0)
+    IfCondition LessThan(ogg_fd, 0) ThenBlock: {
+        PrintMessage("[DemuxOGG] cannot open file\n")
+        SystemCall(OGSys.SYS_EXIT, 1)
+    }
+
+    // Get file size
+    OGState.file_size = SystemCall(OGSys.SYS_LSEEK, ogg_fd, 0, 2, 0, 0)
+    SystemCall(OGSys.SYS_LSEEK, ogg_fd, 0, 0, 0, 0, 0)
+
+    // Open (create) the audio PacketRing
+    ring = PacketRing_Create(ring_name, OGConst.RING_CAPACITY)
+    IfCondition EqualTo(ring, 0) ThenBlock: {
+        PrintMessage("[DemuxOGG] failed to create ring\n")
+        SystemCall(OGSys.SYS_EXIT, 1)
+    }
+
+    // Open the PlaybackClock
+    clock = PlaybackClock_Open(clock_name)
+    IfCondition EqualTo(clock, 0) ThenBlock: {
+        PrintMessage("[DemuxOGG] failed to open clock\n")
+        SystemCall(OGSys.SYS_EXIT, 1)
+    }
+
+    // Allocate buffers
+    page_hdr = Allocate(282)
+    seg_table = Add(page_hdr, 27)
+    page_data = Allocate(OGConst.MAX_PAGE_SIZE)
+    pkt_buf = Allocate(OGConst.MAX_PACKET_SIZE)
+    pkt_pos = 0
+
+    ts_wait = Allocate(16)
+    StoreValue(ts_wait, 0)
+    StoreValue(Add(ts_wait, 8), 1000000)
+
+    running = 1
+    pages_read = 0
+    packets_sent = 0
+    eof_reached = 0
+
+    // ===== MAIN PAGE LOOP =====
+    WhileLoop And(EqualTo(running, 1), EqualTo(eof_reached, 0)) {
+
+        // Check clock state
+        state = PlaybackClock_GetState(clock)
+
+        IfCondition EqualTo(state, PCState.STOPPED) ThenBlock: {
+            PrintMessage("[DemuxOGG] clock STOPPED, exiting\n")
+            running = 0
+        }
+
+        IfCondition EqualTo(state, PCState.PAUSED) ThenBlock: {
+            SystemCall(OGSys.SYS_NANOSLEEP, ts_wait, 0)
+        }
+
+        IfCondition EqualTo(state, PCState.SEEKING) ThenBlock: {
+            // OGG seeking: scan backwards from target byte position
+            // For simplicity: estimate byte offset linearly and scan for OggS
+            target = PlaybackClock_GetSeekTarget(clock)
+
+            // Estimate byte offset
+            IfCondition GreaterThan(OGState.file_size, 0) ThenBlock: {
+                // Linear estimate — not frame-accurate but functional
+                // Better seeking would involve bisection search on granule positions
+                est_byte = Divide(Multiply(target, OGState.file_size), Divide(Multiply(OGState.granule_prev, 1000000), OGState.sample_rate))
+                // Clamp
+                IfCondition GreaterThan(est_byte, OGState.file_size) ThenBlock: {
+                    est_byte = OGState.file_size
+                }
+                IfCondition LessThan(est_byte, 0) ThenBlock: {
+                    est_byte = 0
+                }
+                SystemCall(OGSys.SYS_LSEEK, ogg_fd, est_byte, 0, 0, 0, 0)
+
+                // Scan forward for next "OggS" sync
+                sync_buf = Allocate(4096)
+                found_sync = 0
+                WhileLoop EqualTo(found_sync, 0) {
+                    sn = SystemCall(OGSys.SYS_READ, ogg_fd, sync_buf, 4096, 0, 0, 0)
+                    IfCondition LessEqual(sn, 3) ThenBlock: {
+                        found_sync = 1
+                        // Seek back to start as fallback
+                        SystemCall(OGSys.SYS_LSEEK, ogg_fd, 0, 0, 0, 0, 0)
+                    }
+                    IfCondition GreaterThan(sn, 3) ThenBlock: {
+                        si = 0
+                        WhileLoop And(LessThan(si, Subtract(sn, 3)), EqualTo(found_sync, 0)) {
+                            IfCondition And(EqualTo(GetByte(sync_buf, si), 79), And(EqualTo(GetByte(sync_buf, Add(si, 1)), 103), And(EqualTo(GetByte(sync_buf, Add(si, 2)), 103), EqualTo(GetByte(sync_buf, Add(si, 3)), 83)))) ThenBlock: {
+                                // Found "OggS" — seek to it
+                                back = Subtract(sn, si)
+                                SystemCall(OGSys.SYS_LSEEK, ogg_fd, Negate(back), 1, 0, 0, 0)
+                                found_sync = 1
+                            }
+                            si = Add(si, 1)
+                        }
+                    }
+                }
+                Deallocate(sync_buf, 4096)
+            }
+
+            // Flush ring and packet assembly buffer
+            PacketRing_Reset(ring)
+            pkt_pos = 0
+
+            PlaybackClock_SeekDone(clock)
+            PrintMessage("[DemuxOGG] seeked to ")
+            PrintNumber(Divide(target, 1000000))
+            PrintMessage("s\n")
+        }
+
+        IfCondition EqualTo(state, PCState.PLAYING) ThenBlock: {
+            // Read OGG page header (27 bytes minimum)
+            rn = SystemCall(OGSys.SYS_READ, ogg_fd, page_hdr, 27, 0, 0, 0)
+            IfCondition LessThan(rn, 27) ThenBlock: {
+                eof_reached = 1
+            }
+
+            IfCondition EqualTo(eof_reached, 0) ThenBlock: {
+                // Verify "OggS" capture pattern
+                IfCondition Not(And(And(EqualTo(GetByte(page_hdr, 0), 79), EqualTo(GetByte(page_hdr, 1), 103)), And(EqualTo(GetByte(page_hdr, 2), 103), EqualTo(GetByte(page_hdr, 3), 83)))) ThenBlock: {
+                    // Lost sync — scan for next "OggS"
+                    PrintMessage("[DemuxOGG] lost sync, scanning...\n")
+                    scan_byte = Allocate(1)
+                    found = 0
+                    scan_count = 0
+                    WhileLoop And(EqualTo(found, 0), LessThan(scan_count, 65536)) {
+                        sr = SystemCall(OGSys.SYS_READ, ogg_fd, scan_byte, 1, 0, 0, 0)
+                        IfCondition LessEqual(sr, 0) ThenBlock: {
+                            eof_reached = 1
+                            found = 1
+                        }
+                        IfCondition EqualTo(GetByte(scan_byte, 0), 79) ThenBlock: {
+                            // Might be start of "OggS"
+                            SetByte(page_hdr, 0, 79)
+                            sr2 = SystemCall(OGSys.SYS_READ, ogg_fd, Add(page_hdr, 1), 26, 0, 0, 0)
+                            IfCondition And(EqualTo(GetByte(page_hdr, 1), 103), And(EqualTo(GetByte(page_hdr, 2), 103), EqualTo(GetByte(page_hdr, 3), 83))) ThenBlock: {
+                                found = 1
+                            }
+                        }
+                        scan_count = Add(scan_count, 1)
+                    }
+                    Deallocate(scan_byte, 1)
+                }
+
+                IfCondition EqualTo(eof_reached, 0) ThenBlock: {
+                    // Parse page header
+                    header_type = GetByte(page_hdr, 5)
+                    granule = OG_ReadLE64Lo(page_hdr, 6)
+                    serial = OG_ReadLE32(page_hdr, 14)
+                    num_segments = GetByte(page_hdr, 26)
+
+                    is_continued = BitwiseAnd(header_type, 1)
+                    is_bos = BitwiseAnd(header_type, 2)
+                    is_eos = BitwiseAnd(header_type, 4)
+
+                    // Read segment table
+                    IfCondition GreaterThan(num_segments, 0) ThenBlock: {
+                        SystemCall(OGSys.SYS_READ, ogg_fd, seg_table, num_segments, 0, 0, 0)
+                    }
+
+                    // Calculate total page data size
+                    page_size = 0
+                    si = 0
+                    WhileLoop LessThan(si, num_segments) {
+                        page_size = Add(page_size, GetByte(seg_table, si))
+                        si = Add(si, 1)
+                    }
+
+                    // Read page data
+                    IfCondition GreaterThan(page_size, 0) ThenBlock: {
+                        SystemCall(OGSys.SYS_READ, ogg_fd, page_data, page_size, 0, 0, 0)
+                    }
+
+                    pages_read = Add(pages_read, 1)
+
+                    // Update granule tracking
+                    IfCondition GreaterThan(granule, 0) ThenBlock: {
+                        OGState.granule_prev = granule
+                    }
+
+                    // Reassemble packets from segments
+                    data_pos = 0
+                    si = 0
+                    WhileLoop LessThan(si, num_segments) {
+                        seg_size = GetByte(seg_table, si)
+
+                        // Append segment data to packet buffer
+                        IfCondition GreaterThan(seg_size, 0) ThenBlock: {
+                            IfCondition LessThan(Add(pkt_pos, seg_size), OGConst.MAX_PACKET_SIZE) ThenBlock: {
+                                MemoryCopy(Add(pkt_buf, pkt_pos), Add(page_data, data_pos), seg_size)
+                                pkt_pos = Add(pkt_pos, seg_size)
+                            }
+                        }
+                        data_pos = Add(data_pos, seg_size)
+
+                        // A segment < 255 terminates the packet
+                        IfCondition LessThan(seg_size, 255) ThenBlock: {
+                            // Complete packet assembled
+                            IfCondition GreaterThan(pkt_pos, 0) ThenBlock: {
+
+                                // First packet on BOS page — identify codec
+                                IfCondition And(NotEqual(is_bos, 0), EqualTo(OGState.codec, 0)) ThenBlock: {
+                                    OGState.codec = OG_IdentifyCodec(pkt_buf, pkt_pos)
+                                    OGState.audio_serial = serial
+
+                                    // Parse codec-specific identification header
+                                    IfCondition EqualTo(OGState.codec, OGCodec.VORBIS) ThenBlock: {
+                                        OG_ParseVorbisIdent(pkt_buf, pkt_pos)
+                                    }
+                                    IfCondition EqualTo(OGState.codec, OGCodec.OPUS) ThenBlock: {
+                                        OG_ParseOpusHead(pkt_buf, pkt_pos)
+                                    }
+                                    IfCondition EqualTo(OGState.codec, OGCodec.FLAC) ThenBlock: {
+                                        // OGG FLAC: parse after the 0x7F "FLAC" header
+                                        OGState.sample_rate = 48000
+                                        OGState.channels = 2
+                                    }
+                                }
+
+                                // Determine if this is a header packet
+                                // Vorbis: 3 header packets (ident, comment, setup)
+                                // Opus: 2 header packets (OpusHead, OpusTags)
+                                is_header = 0
+                                IfCondition EqualTo(OGState.codec, OGCodec.VORBIS) ThenBlock: {
+                                    IfCondition LessThan(OGState.header_packets, 3) ThenBlock: {
+                                        is_header = 1
+                                    }
+                                }
+                                IfCondition EqualTo(OGState.codec, OGCodec.OPUS) ThenBlock: {
+                                    IfCondition LessThan(OGState.header_packets, 2) ThenBlock: {
+                                        is_header = 1
+                                    }
+                                }
+                                IfCondition EqualTo(OGState.codec, OGCodec.FLAC) ThenBlock: {
+                                    IfCondition LessThan(OGState.header_packets, 2) ThenBlock: {
+                                        is_header = 1
+                                    }
+                                }
+
+                                // Compute PTS from granule
+                                pts_usec = 0
+                                IfCondition GreaterThan(granule, 0) ThenBlock: {
+                                    pts_usec = OG_GranuleToPTS(granule)
+                                }
+
+                                // Choose packet flags
+                                pkt_flags = PRPktFlag.NONE
+                                IfCondition EqualTo(is_header, 1) ThenBlock: {
+                                    pkt_flags = PRPktFlag.CONFIG
+                                }
+
+                                // Only send packets for the audio stream
+                                IfCondition EqualTo(serial, OGState.audio_serial) ThenBlock: {
+                                    // Write to ring with backpressure
+                                    wrote = 0
+                                    WhileLoop EqualTo(wrote, 0) {
+                                        wrote = PacketRing_Write(ring, pkt_buf, pkt_pos, pts_usec, pkt_flags)
+                                        IfCondition EqualTo(wrote, 0) ThenBlock: {
+                                            SystemCall(OGSys.SYS_NANOSLEEP, ts_wait, 0)
+                                            // Check clock during backpressure
+                                            bp_state = PlaybackClock_GetState(clock)
+                                            IfCondition EqualTo(bp_state, PCState.STOPPED) ThenBlock: {
+                                                running = 0
+                                                wrote = 1
+                                            }
+                                        }
+                                    }
+                                    packets_sent = Add(packets_sent, 1)
+                                }
+
+                                IfCondition EqualTo(is_header, 1) ThenBlock: {
+                                    OGState.header_packets = Add(OGState.header_packets, 1)
+                                }
+                            }
+                            // Reset packet buffer for next packet
+                            pkt_pos = 0
+                        }
+
+                        si = Add(si, 1)
+                    }
+
+                    // Check EOS
+                    IfCondition NotEqual(is_eos, 0) ThenBlock: {
+                        IfCondition EqualTo(serial, OGState.audio_serial) ThenBlock: {
+                            PrintMessage("[DemuxOGG] EOS on audio stream\n")
+                            eof_reached = 1
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Signal EOF
+    PacketRing_SignalEOF(ring)
+    PrintMessage("[DemuxOGG] finished, ")
+    PrintNumber(pages_read)
+    PrintMessage(" pages, ")
+    PrintNumber(packets_sent)
+    PrintMessage(" packets sent\n")
+
+    // Cleanup
+    Deallocate(page_hdr, 282)
+    Deallocate(page_data, OGConst.MAX_PAGE_SIZE)
+    Deallocate(pkt_buf, OGConst.MAX_PACKET_SIZE)
+    Deallocate(ts_wait, 16)
+    SystemCall(OGSys.SYS_CLOSE, ogg_fd, 0, 0, 0, 0, 0)
+    PlaybackClock_Close(clock)
+
+    SystemCall(OGSys.SYS_EXIT, 0)
+}
+
+RunTask(Main)

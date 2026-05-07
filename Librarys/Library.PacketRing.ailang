@@ -1,0 +1,539 @@
+// Library.PacketRing.ailang
+// Lock-free SPSC (single-producer, single-consumer) ring buffer over /dev/shm
+// for cross-process variable-size media packet transport.
+//
+// Every packet in the data region is length-prefixed:
+//   [4 bytes] packet_size    (payload bytes)
+//   [8 bytes] pts_usec       (presentation timestamp, microseconds)
+//   [4 bytes] flags          (KEYFRAME, CONFIG, etc.)
+//   [N bytes] payload
+//
+// Header layout (64 bytes at start of shm region):
+//   [0]  write_pos   (byte offset into data region, producer writes)
+//   [8]  read_pos    (byte offset into data region, consumer writes)
+//   [16] capacity    (data region size in bytes, power of 2)
+//   [24] flags       (FLUSH=1, EOF=2, ERROR=4)
+//   [32] wrap_pos    (write wrap sentinel — producer writes)
+//   [40] reserved
+//   [48] reserved
+//   [56] reserved
+//
+// The data region starts at offset 64.
+//
+// Orthogonal: no dependency on any other media component.
+// Used by demuxers, decoders, mixer, presenter — all speak this layout.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+
+// =============================================================================
+// HEADER FIELD OFFSETS
+// =============================================================================
+FixedPool.PRFields {
+    "WRITE_POS":  Initialize=0
+    "READ_POS":   Initialize=8
+    "CAPACITY":   Initialize=16
+    "FLAGS":      Initialize=24
+    "WRAP_POS":   Initialize=32
+    "RESERVED1":  Initialize=40
+    "RESERVED2":  Initialize=48
+    "RESERVED3":  Initialize=56
+}
+
+FixedPool.PRConst {
+    "HEADER_SIZE":   Initialize=64
+    "PKT_HDR_SIZE":  Initialize=16
+}
+
+// Packet header field offsets (relative to packet start)
+FixedPool.PRPkt {
+    "SIZE":    Initialize=0
+    "PTS_LO":  Initialize=4
+    "PTS_HI":  Initialize=8     // high 32 bits (unused for now, zero)
+    "FLAGS":   Initialize=12
+}
+
+// Ring-level flags
+FixedPool.PRFlag {
+    "NONE":   Initialize=0
+    "FLUSH":  Initialize=1
+    "EOF":    Initialize=2
+    "ERROR":  Initialize=4
+}
+
+// Per-packet flags
+FixedPool.PRPktFlag {
+    "NONE":      Initialize=0
+    "KEYFRAME":  Initialize=1
+    "CONFIG":    Initialize=2
+}
+
+// Syscall constants
+FixedPool.PRSys {
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_MMAP":      Initialize=9
+    "SYS_MUNMAP":    Initialize=11
+    "SYS_FTRUNCATE": Initialize=77
+    "SYS_UNLINK":    Initialize=87
+}
+
+FixedPool.PRMmap {
+    "O_RDWR":        Initialize=2
+    "O_CREAT_RDWR":  Initialize=66
+    "MODE_0666":     Initialize=438
+    "PROT_RW":       Initialize=3
+    "MAP_SHARED":    Initialize=1
+}
+
+// =============================================================================
+// PATH BUILDER — "/dev/shm/ailang_media_ring_<name>"
+// =============================================================================
+Function.PacketRing_BuildPath {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        prefix = "/dev/shm/ailang_media_ring_"
+        prefix_len = 26
+        name_len = StringLength(name)
+        total = Add(prefix_len, Add(name_len, 1))
+        path = Allocate(total)
+        MemoryCopy(path, prefix, prefix_len)
+        MemoryCopy(Add(path, prefix_len), name, name_len)
+        SetByte(path, Add(prefix_len, name_len), 0)
+        ReturnValue(path)
+    }
+}
+
+// =============================================================================
+// CREATE — producer calls this to create the shm ring
+// capacity must be a power of 2 (e.g. 4194304 = 4MB)
+// Returns pointer to mmap'd region (header at offset 0, data at offset 64)
+// =============================================================================
+Function.PacketRing_Create {
+    Input: name:     Address
+    Input: capacity: Integer
+    Output: Integer
+    Body: {
+        path = PacketRing_BuildPath(name)
+        shm_size = Add(PRConst.HEADER_SIZE, capacity)
+
+        // open(path, O_CREAT|O_RDWR, 0666)
+        fd = SystemCall(PRSys.SYS_OPEN, path, PRMmap.O_CREAT_RDWR, PRMmap.MODE_0666)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[PacketRing] open failed: ")
+            PrintString(path)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        // ftruncate
+        SystemCall(PRSys.SYS_FTRUNCATE, fd, shm_size, 0, 0, 0, 0)
+
+        // mmap(0, size, PROT_RW, MAP_SHARED, fd, 0)
+        ptr = SystemCall(PRSys.SYS_MMAP, 0, shm_size, PRMmap.PROT_RW, PRMmap.MAP_SHARED, fd, 0)
+        SystemCall(PRSys.SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+
+        IfCondition LessThan(ptr, 0) ThenBlock: {
+            PrintMessage("[PacketRing] mmap failed\n")
+            ReturnValue(0)
+        }
+
+        // Initialize header
+        StoreValue(Add(ptr, PRFields.WRITE_POS), 0)
+        StoreValue(Add(ptr, PRFields.READ_POS),  0)
+        StoreValue(Add(ptr, PRFields.CAPACITY),   capacity)
+        StoreValue(Add(ptr, PRFields.FLAGS),      0)
+        StoreValue(Add(ptr, PRFields.WRAP_POS),   capacity)
+        StoreValue(Add(ptr, PRFields.RESERVED1),  0)
+        StoreValue(Add(ptr, PRFields.RESERVED2),  0)
+        StoreValue(Add(ptr, PRFields.RESERVED3),  0)
+
+        PrintMessage("[PacketRing] created: ")
+        PrintString(path)
+        PrintMessage(" capacity=")
+        PrintNumber(capacity)
+        PrintMessage("\n")
+
+        ReturnValue(ptr)
+    }
+}
+
+// =============================================================================
+// OPEN — consumer calls this to open an existing shm ring
+// =============================================================================
+Function.PacketRing_Open {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        path = PacketRing_BuildPath(name)
+
+        // open(path, O_RDWR)
+        fd = SystemCall(PRSys.SYS_OPEN, path, PRMmap.O_RDWR, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[PacketRing] open failed: ")
+            PrintString(path)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        // Read capacity from header — first mmap just the header
+        hdr_ptr = SystemCall(PRSys.SYS_MMAP, 0, PRConst.HEADER_SIZE, PRMmap.PROT_RW, PRMmap.MAP_SHARED, fd, 0)
+        IfCondition LessThan(hdr_ptr, 0) ThenBlock: {
+            SystemCall(PRSys.SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+            PrintMessage("[PacketRing] header mmap failed\n")
+            ReturnValue(0)
+        }
+        capacity = Dereference(Add(hdr_ptr, PRFields.CAPACITY))
+        SystemCall(PRSys.SYS_MUNMAP, hdr_ptr, PRConst.HEADER_SIZE, 0, 0, 0, 0)
+
+        // Now mmap the full region
+        shm_size = Add(PRConst.HEADER_SIZE, capacity)
+        ptr = SystemCall(PRSys.SYS_MMAP, 0, shm_size, PRMmap.PROT_RW, PRMmap.MAP_SHARED, fd, 0)
+        SystemCall(PRSys.SYS_CLOSE, fd, 0, 0, 0, 0, 0)
+
+        IfCondition LessThan(ptr, 0) ThenBlock: {
+            PrintMessage("[PacketRing] full mmap failed\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[PacketRing] opened: ")
+        PrintString(path)
+        PrintMessage(" capacity=")
+        PrintNumber(capacity)
+        PrintMessage("\n")
+
+        ReturnValue(ptr)
+    }
+}
+
+// =============================================================================
+// DESTROY — unmap and unlink shm file
+// =============================================================================
+Function.PacketRing_Destroy {
+    Input: ring: Integer
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+        capacity = Dereference(Add(ring, PRFields.CAPACITY))
+        shm_size = Add(PRConst.HEADER_SIZE, capacity)
+        SystemCall(PRSys.SYS_MUNMAP, ring, shm_size, 0, 0, 0, 0)
+
+        path = PacketRing_BuildPath(name)
+        SystemCall(PRSys.SYS_UNLINK, path, 0, 0, 0, 0, 0)
+
+        PrintMessage("[PacketRing] destroyed: ")
+        PrintString(path)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// CLOSE — unmap only (consumer side, doesn't unlink)
+// =============================================================================
+Function.PacketRing_Close {
+    Input: ring: Integer
+    Body: {
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+        capacity = Dereference(Add(ring, PRFields.CAPACITY))
+        shm_size = Add(PRConst.HEADER_SIZE, capacity)
+        SystemCall(PRSys.SYS_MUNMAP, ring, shm_size, 0, 0, 0, 0)
+    }
+}
+
+// =============================================================================
+// AVAILABLE BYTES — how many bytes can be read
+// Uses simple linear distance: write_pos - read_pos, with wrap handling
+// =============================================================================
+Function.PacketRing_Available {
+    Input: ring: Integer
+    Output: Integer
+    Body: {
+        wp = Dereference(Add(ring, PRFields.WRITE_POS))
+        rp = Dereference(Add(ring, PRFields.READ_POS))
+        IfCondition GreaterEqual(wp, rp) ThenBlock: {
+            ReturnValue(Subtract(wp, rp))
+        }
+        // Wrapped: data from rp..wrap_pos + 0..wp
+        wrap = Dereference(Add(ring, PRFields.WRAP_POS))
+        ReturnValue(Add(Subtract(wrap, rp), wp))
+    }
+}
+
+// =============================================================================
+// FREE SPACE — how many contiguous bytes can be written before wrapping
+// =============================================================================
+Function.PacketRing_FreeSpace {
+    Input: ring: Integer
+    Output: Integer
+    Body: {
+        wp  = Dereference(Add(ring, PRFields.WRITE_POS))
+        rp  = Dereference(Add(ring, PRFields.READ_POS))
+        cap = Dereference(Add(ring, PRFields.CAPACITY))
+
+        IfCondition GreaterEqual(wp, rp) ThenBlock: {
+            // Free space = capacity - wp + rp, minus 1 to never fill completely
+            ReturnValue(Subtract(Add(Subtract(cap, wp), rp), 1))
+        }
+        // wp < rp: free = rp - wp - 1
+        ReturnValue(Subtract(Subtract(rp, wp), 1))
+    }
+}
+
+// =============================================================================
+// WRITE — enqueue a packet (producer side)
+// Returns 1 on success, 0 if not enough space
+// =============================================================================
+Function.PacketRing_Write {
+    Input: ring:     Integer
+    Input: data:     Address
+    Input: size:     Integer
+    Input: pts:      Integer
+    Input: flags:    Integer
+    Output: Integer
+    Body: {
+        // Total bytes needed: 16-byte packet header + payload
+        total = Add(PRConst.PKT_HDR_SIZE, size)
+
+        wp  = Dereference(Add(ring, PRFields.WRITE_POS))
+        rp  = Dereference(Add(ring, PRFields.READ_POS))
+        cap = Dereference(Add(ring, PRFields.CAPACITY))
+
+        // Calculate free space
+        IfCondition GreaterEqual(wp, rp) ThenBlock: {
+            free = Subtract(Add(Subtract(cap, wp), rp), 1)
+            IfCondition LessThan(free, total) ThenBlock: {
+                ReturnValue(0)
+            }
+            // Check if packet fits before end of buffer
+            tail_room = Subtract(cap, wp)
+            IfCondition LessThan(tail_room, total) ThenBlock: {
+                // Not enough room at end — wrap
+                // Set wrap sentinel so reader knows to skip
+                StoreValue(Add(ring, PRFields.WRAP_POS), wp)
+                wp = 0
+                // Recheck free space after wrap
+                new_free = Subtract(rp, 1)
+                IfCondition LessThan(new_free, total) ThenBlock: {
+                    ReturnValue(0)
+                }
+            }
+        } ElseBlock: {
+            free = Subtract(Subtract(rp, wp), 1)
+            IfCondition LessThan(free, total) ThenBlock: {
+                ReturnValue(0)
+            }
+        }
+
+        // Write packet header at data region + wp
+        base = Add(Add(ring, PRConst.HEADER_SIZE), wp)
+        StoreValue(Add(base, PRPkt.SIZE),   size, "dword")
+        StoreValue(Add(base, PRPkt.PTS_LO), pts, "dword")
+        // Store high 32 bits of pts
+        pts_hi = ShiftRight(pts, 32)
+        StoreValue(Add(base, PRPkt.PTS_HI), pts_hi, "dword")
+        StoreValue(Add(base, PRPkt.FLAGS),  flags, "dword")
+
+        // Copy payload
+        IfCondition GreaterThan(size, 0) ThenBlock: {
+            MemoryCopy(Add(base, PRConst.PKT_HDR_SIZE), data, size)
+        }
+
+        // Advance write_pos
+        new_wp = Add(wp, total)
+        IfCondition GreaterEqual(new_wp, cap) ThenBlock: {
+            new_wp = 0
+            StoreValue(Add(ring, PRFields.WRAP_POS), cap)
+        }
+        StoreValue(Add(ring, PRFields.WRITE_POS), new_wp)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// READ — dequeue a packet (consumer side)
+// Reads packet header + payload into out_buf.
+// Sets out_size, out_pts, out_flags via caller-provided addresses.
+// Returns 1 on success, 0 if ring empty.
+// out_buf must be large enough for the payload.
+// =============================================================================
+Function.PacketRing_Read {
+    Input: ring:      Integer
+    Input: out_buf:   Address
+    Input: out_size:  Address
+    Input: out_pts:   Address
+    Input: out_flags: Address
+    Output: Integer
+    Body: {
+        wp = Dereference(Add(ring, PRFields.WRITE_POS))
+        rp = Dereference(Add(ring, PRFields.READ_POS))
+
+        // Check for wrap: if rp >= wrap_pos, reset to 0
+        wrap = Dereference(Add(ring, PRFields.WRAP_POS))
+        IfCondition GreaterEqual(rp, wrap) ThenBlock: {
+            rp = 0
+        }
+
+        // Empty check
+        IfCondition EqualTo(rp, wp) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Read packet header
+        base = Add(Add(ring, PRConst.HEADER_SIZE), rp)
+        pkt_size = Dereference32(Add(base, PRPkt.SIZE))
+        pts_lo   = Dereference32(Add(base, PRPkt.PTS_LO))
+        pts_hi   = Dereference32(Add(base, PRPkt.PTS_HI))
+        pkt_flags = Dereference32(Add(base, PRPkt.FLAGS))
+
+        // Reconstruct 64-bit PTS
+        pts = Add(pts_lo, ShiftLeft(pts_hi, 32))
+
+        // Write out metadata
+        StoreValue(out_size,  pkt_size)
+        StoreValue(out_pts,   pts)
+        StoreValue(out_flags, pkt_flags)
+
+        // Copy payload to out_buf
+        IfCondition GreaterThan(pkt_size, 0) ThenBlock: {
+            MemoryCopy(out_buf, Add(base, PRConst.PKT_HDR_SIZE), pkt_size)
+        }
+
+        // Advance read_pos
+        total = Add(PRConst.PKT_HDR_SIZE, pkt_size)
+        new_rp = Add(rp, total)
+        cap = Dereference(Add(ring, PRFields.CAPACITY))
+        IfCondition GreaterEqual(new_rp, cap) ThenBlock: {
+            new_rp = 0
+        }
+        StoreValue(Add(ring, PRFields.READ_POS), new_rp)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PEEK — read packet metadata without consuming
+// Returns 1 if a packet is available, 0 if empty
+// =============================================================================
+Function.PacketRing_Peek {
+    Input: ring:      Integer
+    Input: out_size:  Address
+    Input: out_pts:   Address
+    Input: out_flags: Address
+    Output: Integer
+    Body: {
+        wp = Dereference(Add(ring, PRFields.WRITE_POS))
+        rp = Dereference(Add(ring, PRFields.READ_POS))
+
+        wrap = Dereference(Add(ring, PRFields.WRAP_POS))
+        IfCondition GreaterEqual(rp, wrap) ThenBlock: {
+            rp = 0
+        }
+
+        IfCondition EqualTo(rp, wp) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        base = Add(Add(ring, PRConst.HEADER_SIZE), rp)
+        pkt_size  = Dereference32(Add(base, PRPkt.SIZE))
+        pts_lo    = Dereference32(Add(base, PRPkt.PTS_LO))
+        pts_hi    = Dereference32(Add(base, PRPkt.PTS_HI))
+        pkt_flags = Dereference32(Add(base, PRPkt.FLAGS))
+
+        pts = Add(pts_lo, ShiftLeft(pts_hi, 32))
+
+        StoreValue(out_size,  pkt_size)
+        StoreValue(out_pts,   pts)
+        StoreValue(out_flags, pkt_flags)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SIGNAL FLAGS — set ring-level control flags
+// =============================================================================
+Function.PacketRing_SignalEOF {
+    Input: ring: Integer
+    Body: {
+        cur = Dereference(Add(ring, PRFields.FLAGS))
+        StoreValue(Add(ring, PRFields.FLAGS), BitwiseOr(cur, PRFlag.EOF))
+    }
+}
+
+Function.PacketRing_SignalFlush {
+    Input: ring: Integer
+    Body: {
+        cur = Dereference(Add(ring, PRFields.FLAGS))
+        StoreValue(Add(ring, PRFields.FLAGS), BitwiseOr(cur, PRFlag.FLUSH))
+    }
+}
+
+Function.PacketRing_SignalError {
+    Input: ring: Integer
+    Body: {
+        cur = Dereference(Add(ring, PRFields.FLAGS))
+        StoreValue(Add(ring, PRFields.FLAGS), BitwiseOr(cur, PRFlag.ERROR))
+    }
+}
+
+// =============================================================================
+// CHECK FLAGS
+// =============================================================================
+Function.PacketRing_IsEOF {
+    Input: ring: Integer
+    Output: Integer
+    Body: {
+        f = Dereference(Add(ring, PRFields.FLAGS))
+        ReturnValue(BitwiseAnd(f, PRFlag.EOF))
+    }
+}
+
+Function.PacketRing_IsFlush {
+    Input: ring: Integer
+    Output: Integer
+    Body: {
+        f = Dereference(Add(ring, PRFields.FLAGS))
+        ReturnValue(BitwiseAnd(f, PRFlag.FLUSH))
+    }
+}
+
+Function.PacketRing_IsError {
+    Input: ring: Integer
+    Output: Integer
+    Body: {
+        f = Dereference(Add(ring, PRFields.FLAGS))
+        IfCondition NotEqual(BitwiseAnd(f, PRFlag.ERROR), 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CLEAR FLAGS — used after handling flush/eof
+// =============================================================================
+Function.PacketRing_ClearFlags {
+    Input: ring: Integer
+    Body: {
+        StoreValue(Add(ring, PRFields.FLAGS), 0)
+    }
+}
+
+// =============================================================================
+// RESET — clear all data, reset positions (used on seek/flush)
+// =============================================================================
+Function.PacketRing_Reset {
+    Input: ring: Integer
+    Body: {
+        cap = Dereference(Add(ring, PRFields.CAPACITY))
+        StoreValue(Add(ring, PRFields.WRITE_POS), 0)
+        StoreValue(Add(ring, PRFields.READ_POS),  0)
+        StoreValue(Add(ring, PRFields.WRAP_POS),   cap)
+        StoreValue(Add(ring, PRFields.FLAGS),      0)
+    }
+}

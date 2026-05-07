@@ -1,0 +1,1353 @@
+// Library.DemuxMKV.ailang
+// Standalone MKV/WebM demuxer process (EBML/Matroska container).
+//
+// Reads an MKV or WebM file, parses the EBML header and Matroska elements,
+// extracts video and audio tracks, and writes compressed packets to
+// separate PacketRings.
+//
+// Supports: VP8, VP9, AV1, H.264, H.265 video; Opus, Vorbis, AAC, MP3 audio.
+//
+// EBML format:
+//   Variable-length element IDs (1-4 bytes, leading-zero count → width)
+//   Variable-length sizes (1-8 bytes, VINT)
+//   Matroska element hierarchy:
+//     EBML Header → Segment → Info, Tracks, Clusters
+//     Cluster → Timecode + SimpleBlock/BlockGroup
+//
+// Usage:
+//   ./demux_mkv.x --file video.mkv --vring vid_ring --aring aud_ring --clock clk0
+//
+// Build: ./ailang.x Librarys/Media/Library.DemuxMKV.ailang demux_mkv.x
+//
+// Orthogonal: speaks only PacketRing + PlaybackClock.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.PacketRing
+LibraryImport.PlaybackClock
+LibraryImport.UtilArgs
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.MKSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_LSEEK":     Initialize=8
+    "SYS_EXIT":      Initialize=60
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_OPENAT":    Initialize=257
+    "O_RDONLY":      Initialize=0
+    "AT_FDCWD":      Initialize=-100
+    "SEEK_SET":      Initialize=0
+    "SEEK_CUR":      Initialize=1
+    "SEEK_END":      Initialize=2
+    "STDOUT":        Initialize=1
+    "STDERR":        Initialize=2
+}
+
+// =============================================================================
+// EBML/MATROSKA ELEMENT IDs
+// =============================================================================
+FixedPool.EBML {
+    // EBML Header
+    "EBML_HEADER":          Initialize=0x1A45DFA3
+    "EBML_VERSION":         Initialize=0x4286
+    "EBML_READ_VERSION":    Initialize=0x42F7
+    "EBML_MAX_ID_LEN":      Initialize=0x42F2
+    "EBML_MAX_SIZE_LEN":    Initialize=0x42F3
+    "EBML_DOCTYPE":         Initialize=0x4282
+    "EBML_DOCTYPE_VER":     Initialize=0x4287
+    "EBML_DOCTYPE_READ_VER": Initialize=0x4285
+
+    // Segment
+    "SEGMENT":              Initialize=0x18538067
+
+    // Segment Info
+    "INFO":                 Initialize=0x1549A966
+    "TIMECODE_SCALE":       Initialize=0x2AD7B1
+    "DURATION":             Initialize=0x4489
+    "MUXING_APP":           Initialize=0x4D80
+    "WRITING_APP":          Initialize=0x5741
+
+    // Tracks
+    "TRACKS":               Initialize=0x1654AE6B
+    "TRACK_ENTRY":          Initialize=0xAE
+    "TRACK_NUMBER":         Initialize=0xD7
+    "TRACK_UID":            Initialize=0x73C5
+    "TRACK_TYPE":           Initialize=0x83
+    "CODEC_ID":             Initialize=0x86
+    "CODEC_PRIVATE":        Initialize=0x63A2
+    "DEFAULT_DURATION":     Initialize=0x23E383
+
+    // Video
+    "VIDEO":                Initialize=0xE0
+    "PIXEL_WIDTH":          Initialize=0xB0
+    "PIXEL_HEIGHT":         Initialize=0xBA
+
+    // Audio
+    "AUDIO":                Initialize=0xE1
+    "SAMPLING_FREQ":        Initialize=0xB5
+    "CHANNELS":             Initialize=0x9F
+    "BIT_DEPTH":            Initialize=0x6264
+
+    // Cluster
+    "CLUSTER":              Initialize=0x1F43B675
+    "CLUSTER_TIMECODE":     Initialize=0xE7
+    "SIMPLE_BLOCK":         Initialize=0xA3
+    "BLOCK_GROUP":          Initialize=0xA0
+    "BLOCK":                Initialize=0xA1
+    "BLOCK_DURATION":       Initialize=0x9B
+    "REFERENCE_BLOCK":      Initialize=0xFB
+
+    // Seek / Cues (for seeking)
+    "SEEK_HEAD":            Initialize=0x114D9B74
+    "CUES":                 Initialize=0x1C53BB6B
+    "CUE_POINT":            Initialize=0xBB
+    "CUE_TIME":             Initialize=0xB3
+    "CUE_TRACK_POS":        Initialize=0xB7
+    "CUE_TRACK":            Initialize=0xF7
+    "CUE_CLUSTER_POS":      Initialize=0xF1
+}
+
+// Track types
+FixedPool.MKTrackType {
+    "VIDEO":  Initialize=1
+    "AUDIO":  Initialize=2
+}
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.MKConst {
+    "READ_BUF_SIZE":    Initialize=65536
+    "MAX_CODEC_PRIV":   Initialize=65536
+    "MAX_FRAME_SIZE":   Initialize=4194304
+    "RING_CAPACITY":    Initialize=4194304
+    "MAX_TRACKS":       Initialize=8
+    "MAX_CUES":         Initialize=4096
+
+    // Track struct layout (per track, 128 bytes)
+    "TRK_NUMBER":       Initialize=0
+    "TRK_TYPE":         Initialize=8
+    "TRK_CODEC_ID_PTR": Initialize=16
+    "TRK_CODEC_ID_LEN": Initialize=24
+    "TRK_CODEC_PRIV_PTR": Initialize=32
+    "TRK_CODEC_PRIV_LEN": Initialize=40
+    "TRK_DEF_DURATION": Initialize=48
+    "TRK_WIDTH":        Initialize=56
+    "TRK_HEIGHT":       Initialize=64
+    "TRK_SAMPLE_RATE":  Initialize=72
+    "TRK_CHANNELS":     Initialize=80
+    "TRK_BIT_DEPTH":    Initialize=88
+    "TRK_RING":         Initialize=96
+    "TRK_SENT_CONFIG":  Initialize=104
+    "TRK_SIZE":         Initialize=128
+
+    // Cue point (24 bytes): time_ns, track, cluster_pos
+    "CUE_TIME_OFF":     Initialize=0
+    "CUE_TRACK_OFF":    Initialize=8
+    "CUE_POS_OFF":      Initialize=16
+    "CUE_SIZE":         Initialize=24
+}
+
+// =============================================================================
+// ARGUMENT SCHEMA
+// =============================================================================
+Function.MK_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("demux_mkv", "MKV/WebM (EBML) demuxer — extract video+audio to PacketRings")
+        UtilArgs_AddField(s, "file",  "path",   1, "MKV/WebM file path",      "file")
+        UtilArgs_AddField(s, "vring", "string", 1, "Video PacketRing name",   "vring")
+        UtilArgs_AddField(s, "aring", "string", 1, "Audio PacketRing name",   "aring")
+        UtilArgs_AddField(s, "clock", "string", 1, "PlaybackClock name",      "clock")
+        UtilArgs_SetShort(s, "file",  "f")
+        UtilArgs_SetShort(s, "vring", "v")
+        UtilArgs_SetShort(s, "aring", "a")
+        UtilArgs_SetShort(s, "clock", "c")
+        ReturnValue(s)
+    }
+}
+
+// =============================================================================
+// FILE I/O HELPERS
+// =============================================================================
+
+// Buffered reader state (global)
+FixedPool.MKReader {
+    "FD":        Initialize=0
+    "BUF":       Initialize=0
+    "BUF_POS":   Initialize=0
+    "BUF_LEN":   Initialize=0
+    "FILE_POS":  Initialize=0
+}
+
+Function.MK_ReaderInit {
+    Input: fd: Integer
+    Output: Integer
+    Body: {
+        StoreValue(AddressOf(MKReader.FD), fd)
+        buf = Allocate(MKConst.READ_BUF_SIZE)
+        StoreValue(AddressOf(MKReader.BUF), buf)
+        StoreValue(AddressOf(MKReader.BUF_POS), 0)
+        StoreValue(AddressOf(MKReader.BUF_LEN), 0)
+        StoreValue(AddressOf(MKReader.FILE_POS), 0)
+        ReturnValue(1)
+    }
+}
+
+// Read exactly n bytes into dst. Returns bytes read (0 = EOF/error).
+Function.MK_ReadBytes {
+    Input: dst: Address
+    Input: count: Integer
+    Output: Integer
+    Body: {
+        total = 0
+        WhileLoop LessThan(total, count) {
+            avail = Subtract(MKReader.BUF_LEN, MKReader.BUF_POS)
+            IfCondition EqualTo(avail, 0) ThenBlock: {
+                // Refill buffer
+                n = SystemCall(MKSys.SYS_READ, MKReader.FD, MKReader.BUF, MKConst.READ_BUF_SIZE, 0, 0, 0)
+                IfCondition LessEqual(n, 0) ThenBlock: {
+                    ReturnValue(total)
+                }
+                StoreValue(AddressOf(MKReader.BUF_POS), 0)
+                StoreValue(AddressOf(MKReader.BUF_LEN), n)
+                avail = n
+            }
+            want = Subtract(count, total)
+            IfCondition GreaterThan(want, avail) ThenBlock: {
+                want = avail
+            }
+            MemoryCopy(Add(dst, total), Add(MKReader.BUF, MKReader.BUF_POS), want)
+            StoreValue(AddressOf(MKReader.BUF_POS), Add(MKReader.BUF_POS, want))
+            StoreValue(AddressOf(MKReader.FILE_POS), Add(MKReader.FILE_POS, want))
+            total = Add(total, want)
+        }
+        ReturnValue(total)
+    }
+}
+
+// Read a single byte. Returns -1 on EOF.
+Function.MK_ReadByte {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(MKReader.BUF_POS, MKReader.BUF_LEN) ThenBlock: {
+            n = SystemCall(MKSys.SYS_READ, MKReader.FD, MKReader.BUF, MKConst.READ_BUF_SIZE, 0, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                ReturnValue(-1)
+            }
+            StoreValue(AddressOf(MKReader.BUF_POS), 0)
+            StoreValue(AddressOf(MKReader.BUF_LEN), n)
+        }
+        b = GetByte(MKReader.BUF, MKReader.BUF_POS)
+        StoreValue(AddressOf(MKReader.BUF_POS), Add(MKReader.BUF_POS, 1))
+        StoreValue(AddressOf(MKReader.FILE_POS), Add(MKReader.FILE_POS, 1))
+        ReturnValue(b)
+    }
+}
+
+// Seek to absolute position (flushes read buffer)
+Function.MK_Seek {
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        SystemCall(MKSys.SYS_LSEEK, MKReader.FD, pos, MKSys.SEEK_SET, 0, 0, 0)
+        StoreValue(AddressOf(MKReader.BUF_POS), 0)
+        StoreValue(AddressOf(MKReader.BUF_LEN), 0)
+        StoreValue(AddressOf(MKReader.FILE_POS), pos)
+        ReturnValue(pos)
+    }
+}
+
+// Skip n bytes forward
+Function.MK_Skip {
+    Input: count: Integer
+    Output: Integer
+    Body: {
+        avail = Subtract(MKReader.BUF_LEN, MKReader.BUF_POS)
+        IfCondition LessEqual(count, avail) ThenBlock: {
+            StoreValue(AddressOf(MKReader.BUF_POS), Add(MKReader.BUF_POS, count))
+            StoreValue(AddressOf(MKReader.FILE_POS), Add(MKReader.FILE_POS, count))
+            ReturnValue(count)
+        }
+        // Skip past buffer, then seek
+        new_pos = Add(MKReader.FILE_POS, count)
+        MK_Seek(new_pos)
+        ReturnValue(count)
+    }
+}
+
+// Get current file position
+Function.MK_Tell {
+    Output: Integer
+    Body: {
+        ReturnValue(MKReader.FILE_POS)
+    }
+}
+
+// =============================================================================
+// EBML VINT READER — variable-length integer
+// =============================================================================
+// EBML uses VINT: leading zeros count extra bytes.
+//   1xxxxxxx = 1 byte  (max 0x7F)
+//   01xxxxxx xxxxxxxx = 2 bytes (max 0x3FFF)
+//   001xxxxx ... = 3 bytes
+//   0001xxxx ... = 4 bytes
+//   ...up to 8 bytes
+//
+// For element IDs, the leading-one bit is KEPT.
+// For element sizes, the leading-one bit is STRIPPED.
+
+// Read VINT, return value. For IDs: keep leading bit. For sizes: strip it.
+// mode: 0 = size (strip), 1 = id (keep)
+Function.MK_ReadVINT {
+    Input: mode: Integer
+    Output: Integer
+    Body: {
+        first = MK_ReadByte()
+        IfCondition LessThan(first, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+
+        // Count leading zeros to find width
+        width = 0
+        mask = 128
+        WhileLoop And(GreaterThan(mask, 0), EqualTo(BitwiseAnd(first, mask), 0)) {
+            width = Add(width, 1)
+            mask = ShiftRight(mask, 1)
+        }
+        // width = number of leading zeros; total bytes = width + 1
+        total_bytes = Add(width, 1)
+
+        IfCondition EqualTo(mode, 0) ThenBlock: {
+            // Size mode: strip leading one-bit
+            val = BitwiseAnd(first, Subtract(mask, 1))
+        }
+        IfCondition EqualTo(mode, 1) ThenBlock: {
+            // ID mode: keep as-is
+            val = first
+        }
+
+        // Read remaining bytes
+        i = 1
+        WhileLoop LessThan(i, total_bytes) {
+            b = MK_ReadByte()
+            IfCondition LessThan(b, 0) ThenBlock: {
+                ReturnValue(-1)
+            }
+            val = BitwiseOr(ShiftLeft(val, 8), b)
+            i = Add(i, 1)
+        }
+
+        ReturnValue(val)
+    }
+}
+
+// Read element ID
+Function.MK_ReadID {
+    Output: Integer
+    Body: {
+        ReturnValue(MK_ReadVINT(1))
+    }
+}
+
+// Read element size
+Function.MK_ReadSize {
+    Output: Integer
+    Body: {
+        ReturnValue(MK_ReadVINT(0))
+    }
+}
+
+// Read unsigned integer from element body (big-endian, 1-8 bytes)
+Function.MK_ReadUInt {
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        val = 0
+        i = 0
+        WhileLoop LessThan(i, len) {
+            b = MK_ReadByte()
+            val = BitwiseOr(ShiftLeft(val, 8), b)
+            i = Add(i, 1)
+        }
+        ReturnValue(val)
+    }
+}
+
+// Read float from element body (4 or 8 bytes, IEEE 754)
+// Returns integer representation — caller treats as fixed-point for sample rate etc.
+// For simplicity: if 4 bytes, read as uint32 float bits.
+// We'll handle sample rate by detecting common values.
+Function.MK_ReadFloat {
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        val = MK_ReadUInt(len)
+        // For 4-byte IEEE 754 float, we do a rough conversion
+        // Common audio sample rates: 8000, 11025, 22050, 44100, 48000, 96000
+        // Common video: 23.976, 24, 25, 29.97, 30, 60
+        // Since Ailang doesn't have float, just return the raw bits
+        // The caller will use known-value matching
+        ReturnValue(val)
+    }
+}
+
+// =============================================================================
+// FLOAT CONVERSION — IEEE 754 double bits to integer
+// =============================================================================
+// 48000.0 as double = 0x40E7700000000000
+// 44100.0 as double = 0x40E5888000000000
+// 22050.0 as double = 0x40D5888000000000
+// 16000.0 as double = 0x40CF400000000000
+// 8000.0  as double = 0x40BF400000000000
+// 96000.0 as double = 0x40F7700000000000
+// We match known double-precision representations.
+Function.MK_FloatToSampleRate {
+    Input: bits: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(bits, 0x40E7700000000000) ThenBlock: { ReturnValue(48000) }
+        IfCondition EqualTo(bits, 0x40E5888000000000) ThenBlock: { ReturnValue(44100) }
+        IfCondition EqualTo(bits, 0x40D5888000000000) ThenBlock: { ReturnValue(22050) }
+        IfCondition EqualTo(bits, 0x40CF400000000000) ThenBlock: { ReturnValue(16000) }
+        IfCondition EqualTo(bits, 0x40BF400000000000) ThenBlock: { ReturnValue(8000) }
+        IfCondition EqualTo(bits, 0x40F7700000000000) ThenBlock: { ReturnValue(96000) }
+        // 32000.0 = 0x40DF400000000000
+        IfCondition EqualTo(bits, 0x40DF400000000000) ThenBlock: { ReturnValue(32000) }
+        // 24000.0 = 0x40D7700000000000
+        IfCondition EqualTo(bits, 0x40D7700000000000) ThenBlock: { ReturnValue(24000) }
+        // Default: assume 48000
+        PrintMessage("[DemuxMKV] unknown sample rate float bits, defaulting 48000\n")
+        ReturnValue(48000)
+    }
+}
+
+// =============================================================================
+// CODEC ID STRING MATCHING
+// =============================================================================
+// Match known codec ID strings. Codec IDs in MKV are ASCII: "V_VP9", "A_OPUS", etc.
+// Returns a numeric codec identifier for the presenter to use.
+FixedPool.MKCodec {
+    "UNKNOWN":   Initialize=0
+    "VP8":       Initialize=1
+    "VP9":       Initialize=2
+    "AV1":       Initialize=3
+    "H264":      Initialize=4
+    "H265":      Initialize=5
+    "OPUS":      Initialize=10
+    "VORBIS":    Initialize=11
+    "AAC":       Initialize=12
+    "MP3":       Initialize=13
+    "FLAC":      Initialize=14
+    "PCM":       Initialize=15
+}
+
+Function.MK_MatchCodecID {
+    Input: ptr: Address
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        // Video codecs
+        // "V_VP9" = 5 bytes
+        IfCondition EqualTo(len, 5) ThenBlock: {
+            IfCondition And(And(EqualTo(GetByte(ptr, 0), 86), EqualTo(GetByte(ptr, 1), 95)),
+                           And(EqualTo(GetByte(ptr, 2), 86), And(EqualTo(GetByte(ptr, 3), 80), EqualTo(GetByte(ptr, 4), 57)))) ThenBlock: {
+                ReturnValue(MKCodec.VP9)
+            }
+        }
+        // "V_VP8" = 5 bytes
+        IfCondition EqualTo(len, 5) ThenBlock: {
+            IfCondition And(And(EqualTo(GetByte(ptr, 0), 86), EqualTo(GetByte(ptr, 1), 95)),
+                           And(EqualTo(GetByte(ptr, 2), 86), And(EqualTo(GetByte(ptr, 3), 80), EqualTo(GetByte(ptr, 4), 56)))) ThenBlock: {
+                ReturnValue(MKCodec.VP8)
+            }
+        }
+        // "V_AV1" = 5 bytes
+        IfCondition EqualTo(len, 5) ThenBlock: {
+            IfCondition And(And(EqualTo(GetByte(ptr, 0), 86), EqualTo(GetByte(ptr, 1), 95)),
+                           And(EqualTo(GetByte(ptr, 2), 65), And(EqualTo(GetByte(ptr, 3), 86), EqualTo(GetByte(ptr, 4), 49)))) ThenBlock: {
+                ReturnValue(MKCodec.AV1)
+            }
+        }
+        // "V_MPEG4/ISO/AVC" = 15 bytes (H.264)
+        IfCondition EqualTo(len, 15) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(ptr, 0), 86), EqualTo(GetByte(ptr, 2), 77)) ThenBlock: {
+                ReturnValue(MKCodec.H264)
+            }
+        }
+        // "V_MPEGH/ISO/HEVC" = 17 bytes (H.265)
+        IfCondition EqualTo(len, 17) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(ptr, 0), 86), EqualTo(GetByte(ptr, 2), 77)) ThenBlock: {
+                ReturnValue(MKCodec.H265)
+            }
+        }
+
+        // Audio codecs
+        // "A_OPUS" = 6 bytes
+        IfCondition EqualTo(len, 6) ThenBlock: {
+            IfCondition And(And(EqualTo(GetByte(ptr, 0), 65), EqualTo(GetByte(ptr, 1), 95)),
+                           And(EqualTo(GetByte(ptr, 2), 79), EqualTo(GetByte(ptr, 3), 80))) ThenBlock: {
+                ReturnValue(MKCodec.OPUS)
+            }
+        }
+        // "A_VORBIS" = 8 bytes
+        IfCondition EqualTo(len, 8) ThenBlock: {
+            IfCondition And(And(EqualTo(GetByte(ptr, 0), 65), EqualTo(GetByte(ptr, 1), 95)),
+                           And(EqualTo(GetByte(ptr, 2), 86), EqualTo(GetByte(ptr, 3), 79))) ThenBlock: {
+                ReturnValue(MKCodec.VORBIS)
+            }
+        }
+        // "A_AAC" prefix (various subtypes: A_AAC, A_AAC/MPEG2/LC, etc.)
+        IfCondition GreaterEqual(len, 5) ThenBlock: {
+            IfCondition And(And(EqualTo(GetByte(ptr, 0), 65), EqualTo(GetByte(ptr, 1), 95)),
+                           And(EqualTo(GetByte(ptr, 2), 65), EqualTo(GetByte(ptr, 3), 65))) ThenBlock: {
+                ReturnValue(MKCodec.AAC)
+            }
+        }
+        // "A_MPEG/L3" = 9 bytes (MP3)
+        IfCondition EqualTo(len, 9) ThenBlock: {
+            IfCondition And(EqualTo(GetByte(ptr, 0), 65), EqualTo(GetByte(ptr, 2), 77)) ThenBlock: {
+                ReturnValue(MKCodec.MP3)
+            }
+        }
+        // "A_FLAC" = 6 bytes
+        IfCondition EqualTo(len, 6) ThenBlock: {
+            IfCondition And(And(EqualTo(GetByte(ptr, 0), 65), EqualTo(GetByte(ptr, 1), 95)),
+                           And(EqualTo(GetByte(ptr, 2), 70), EqualTo(GetByte(ptr, 3), 76))) ThenBlock: {
+                ReturnValue(MKCodec.FLAC)
+            }
+        }
+
+        ReturnValue(MKCodec.UNKNOWN)
+    }
+}
+
+// =============================================================================
+// TRACK STORAGE
+// =============================================================================
+// Global track array — up to MAX_TRACKS tracks, each MKConst.TRK_SIZE bytes
+FixedPool.MKState {
+    "TRACKS_PTR":       Initialize=0
+    "NUM_TRACKS":       Initialize=0
+    "VIDEO_TRACK_NUM":  Initialize=0
+    "AUDIO_TRACK_NUM":  Initialize=0
+    "VIDEO_RING":       Initialize=0
+    "AUDIO_RING":       Initialize=0
+    "CLOCK":            Initialize=0
+    "TIMECODE_SCALE":   Initialize=1000000
+    "DURATION_NS":      Initialize=0
+    "SEGMENT_START":    Initialize=0
+    "CUES_PTR":         Initialize=0
+    "NUM_CUES":         Initialize=0
+}
+
+Function.MK_GetTrack {
+    Input: idx: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(MKState.TRACKS_PTR, Multiply(idx, MKConst.TRK_SIZE)))
+    }
+}
+
+Function.MK_FindTrackByNum {
+    Input: num: Integer
+    Output: Address
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, MKState.NUM_TRACKS) {
+            trk = MK_GetTrack(i)
+            IfCondition EqualTo(LoadValue(Add(trk, MKConst.TRK_NUMBER)), num) ThenBlock: {
+                ReturnValue(trk)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PARSE EBML HEADER
+// =============================================================================
+Function.MK_ParseEBMLHeader {
+    Output: Integer
+    Body: {
+        id = MK_ReadID()
+        IfCondition NotEqual(id, EBML.EBML_HEADER) ThenBlock: {
+            PrintMessage("[DemuxMKV] not an EBML file\n")
+            ReturnValue(0)
+        }
+        size = MK_ReadSize()
+        // Skip header contents (we don't need version info for playback)
+        MK_Skip(size)
+        PrintMessage("[DemuxMKV] EBML header OK\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PARSE SEGMENT INFO — extract timecode_scale and duration
+// =============================================================================
+Function.MK_ParseInfo {
+    Input: size: Integer
+    Output: Integer
+    Body: {
+        end_pos = Add(MK_Tell(), size)
+        WhileLoop LessThan(MK_Tell(), end_pos) {
+            eid = MK_ReadID()
+            esz = MK_ReadSize()
+            IfCondition LessThan(eid, 0) ThenBlock: { ReturnValue(1) }
+
+            IfCondition EqualTo(eid, EBML.TIMECODE_SCALE) ThenBlock: {
+                val = MK_ReadUInt(esz)
+                StoreValue(AddressOf(MKState.TIMECODE_SCALE), val)
+                PrintMessage("[DemuxMKV] timecode_scale=")
+                PrintNumber(val)
+                PrintMessage("ns\n")
+            }
+            IfCondition EqualTo(eid, EBML.DURATION) ThenBlock: {
+                // Duration is float * timecode_scale
+                val = MK_ReadFloat(esz)
+                // For now just skip — we compute duration from cluster timestamps
+                PrintMessage("[DemuxMKV] duration element found\n")
+            }
+            IfCondition And(NotEqual(eid, EBML.TIMECODE_SCALE), NotEqual(eid, EBML.DURATION)) ThenBlock: {
+                MK_Skip(esz)
+            }
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PARSE TRACK ENTRY
+// =============================================================================
+Function.MK_ParseTrackEntry {
+    Input: size: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(MKState.NUM_TRACKS, MKConst.MAX_TRACKS) ThenBlock: {
+            MK_Skip(size)
+            ReturnValue(1)
+        }
+
+        trk_idx = MKState.NUM_TRACKS
+        trk = MK_GetTrack(trk_idx)
+        // Zero out track struct
+        MemorySet(trk, 0, MKConst.TRK_SIZE)
+
+        end_pos = Add(MK_Tell(), size)
+        WhileLoop LessThan(MK_Tell(), end_pos) {
+            eid = MK_ReadID()
+            esz = MK_ReadSize()
+            IfCondition LessThan(eid, 0) ThenBlock: { ReturnValue(1) }
+
+            IfCondition EqualTo(eid, EBML.TRACK_NUMBER) ThenBlock: {
+                val = MK_ReadUInt(esz)
+                StoreValue(Add(trk, MKConst.TRK_NUMBER), val)
+            }
+            IfCondition EqualTo(eid, EBML.TRACK_TYPE) ThenBlock: {
+                val = MK_ReadUInt(esz)
+                StoreValue(Add(trk, MKConst.TRK_TYPE), val)
+            }
+            IfCondition EqualTo(eid, EBML.CODEC_ID) ThenBlock: {
+                buf = Allocate(esz)
+                MK_ReadBytes(buf, esz)
+                StoreValue(Add(trk, MKConst.TRK_CODEC_ID_PTR), buf)
+                StoreValue(Add(trk, MKConst.TRK_CODEC_ID_LEN), esz)
+            }
+            IfCondition EqualTo(eid, EBML.CODEC_PRIVATE) ThenBlock: {
+                IfCondition LessEqual(esz, MKConst.MAX_CODEC_PRIV) ThenBlock: {
+                    buf = Allocate(esz)
+                    MK_ReadBytes(buf, esz)
+                    StoreValue(Add(trk, MKConst.TRK_CODEC_PRIV_PTR), buf)
+                    StoreValue(Add(trk, MKConst.TRK_CODEC_PRIV_LEN), esz)
+                }
+                IfCondition GreaterThan(esz, MKConst.MAX_CODEC_PRIV) ThenBlock: {
+                    MK_Skip(esz)
+                }
+            }
+            IfCondition EqualTo(eid, EBML.DEFAULT_DURATION) ThenBlock: {
+                val = MK_ReadUInt(esz)
+                StoreValue(Add(trk, MKConst.TRK_DEF_DURATION), val)
+            }
+            IfCondition EqualTo(eid, EBML.VIDEO) ThenBlock: {
+                // Parse video sub-element
+                vend = Add(MK_Tell(), esz)
+                WhileLoop LessThan(MK_Tell(), vend) {
+                    vid = MK_ReadID()
+                    vsz = MK_ReadSize()
+                    IfCondition EqualTo(vid, EBML.PIXEL_WIDTH) ThenBlock: {
+                        val = MK_ReadUInt(vsz)
+                        StoreValue(Add(trk, MKConst.TRK_WIDTH), val)
+                    }
+                    IfCondition EqualTo(vid, EBML.PIXEL_HEIGHT) ThenBlock: {
+                        val = MK_ReadUInt(vsz)
+                        StoreValue(Add(trk, MKConst.TRK_HEIGHT), val)
+                    }
+                    IfCondition And(NotEqual(vid, EBML.PIXEL_WIDTH), NotEqual(vid, EBML.PIXEL_HEIGHT)) ThenBlock: {
+                        MK_Skip(vsz)
+                    }
+                }
+            }
+            IfCondition EqualTo(eid, EBML.AUDIO) ThenBlock: {
+                // Parse audio sub-element
+                aend = Add(MK_Tell(), esz)
+                WhileLoop LessThan(MK_Tell(), aend) {
+                    aid = MK_ReadID()
+                    asz = MK_ReadSize()
+                    IfCondition EqualTo(aid, EBML.SAMPLING_FREQ) ThenBlock: {
+                        raw = MK_ReadFloat(asz)
+                        rate = MK_FloatToSampleRate(raw)
+                        StoreValue(Add(trk, MKConst.TRK_SAMPLE_RATE), rate)
+                    }
+                    IfCondition EqualTo(aid, EBML.CHANNELS) ThenBlock: {
+                        val = MK_ReadUInt(asz)
+                        StoreValue(Add(trk, MKConst.TRK_CHANNELS), val)
+                    }
+                    IfCondition EqualTo(aid, EBML.BIT_DEPTH) ThenBlock: {
+                        val = MK_ReadUInt(asz)
+                        StoreValue(Add(trk, MKConst.TRK_BIT_DEPTH), val)
+                    }
+                    IfCondition And(And(NotEqual(aid, EBML.SAMPLING_FREQ), NotEqual(aid, EBML.CHANNELS)), NotEqual(aid, EBML.BIT_DEPTH)) ThenBlock: {
+                        MK_Skip(asz)
+                    }
+                }
+            }
+
+            // Skip unrecognized elements
+            IfCondition And(And(And(And(NotEqual(eid, EBML.TRACK_NUMBER), NotEqual(eid, EBML.TRACK_TYPE)),
+                                   And(NotEqual(eid, EBML.CODEC_ID), NotEqual(eid, EBML.CODEC_PRIVATE))),
+                               And(NotEqual(eid, EBML.DEFAULT_DURATION), NotEqual(eid, EBML.VIDEO))),
+                           NotEqual(eid, EBML.AUDIO)) ThenBlock: {
+                MK_Skip(esz)
+            }
+        }
+
+        StoreValue(AddressOf(MKState.NUM_TRACKS), Add(MKState.NUM_TRACKS, 1))
+
+        // Log track info
+        tnum = LoadValue(Add(trk, MKConst.TRK_NUMBER))
+        ttype = LoadValue(Add(trk, MKConst.TRK_TYPE))
+        codec_ptr = LoadValue(Add(trk, MKConst.TRK_CODEC_ID_PTR))
+        codec_len = LoadValue(Add(trk, MKConst.TRK_CODEC_ID_LEN))
+        codec_id = MK_MatchCodecID(codec_ptr, codec_len)
+
+        PrintMessage("[DemuxMKV] track ")
+        PrintNumber(tnum)
+        IfCondition EqualTo(ttype, MKTrackType.VIDEO) ThenBlock: {
+            PrintMessage(" video codec=")
+            PrintNumber(codec_id)
+            w = LoadValue(Add(trk, MKConst.TRK_WIDTH))
+            h = LoadValue(Add(trk, MKConst.TRK_HEIGHT))
+            PrintMessage(" ")
+            PrintNumber(w)
+            PrintMessage("x")
+            PrintNumber(h)
+        }
+        IfCondition EqualTo(ttype, MKTrackType.AUDIO) ThenBlock: {
+            PrintMessage(" audio codec=")
+            PrintNumber(codec_id)
+            rate = LoadValue(Add(trk, MKConst.TRK_SAMPLE_RATE))
+            ch = LoadValue(Add(trk, MKConst.TRK_CHANNELS))
+            PrintMessage(" rate=")
+            PrintNumber(rate)
+            PrintMessage(" ch=")
+            PrintNumber(ch)
+        }
+        PrintMessage("\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PARSE TRACKS
+// =============================================================================
+Function.MK_ParseTracks {
+    Input: size: Integer
+    Output: Integer
+    Body: {
+        end_pos = Add(MK_Tell(), size)
+        WhileLoop LessThan(MK_Tell(), end_pos) {
+            eid = MK_ReadID()
+            esz = MK_ReadSize()
+            IfCondition EqualTo(eid, EBML.TRACK_ENTRY) ThenBlock: {
+                MK_ParseTrackEntry(esz)
+            }
+            IfCondition NotEqual(eid, EBML.TRACK_ENTRY) ThenBlock: {
+                MK_Skip(esz)
+            }
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PARSE CUES (for seeking)
+// =============================================================================
+Function.MK_ParseCues {
+    Input: size: Integer
+    Output: Integer
+    Body: {
+        end_pos = Add(MK_Tell(), size)
+
+        cues_buf = Allocate(Multiply(MKConst.MAX_CUES, MKConst.CUE_SIZE))
+        StoreValue(AddressOf(MKState.CUES_PTR), cues_buf)
+        num = 0
+
+        WhileLoop And(LessThan(MK_Tell(), end_pos), LessThan(num, MKConst.MAX_CUES)) {
+            eid = MK_ReadID()
+            esz = MK_ReadSize()
+
+            IfCondition EqualTo(eid, EBML.CUE_POINT) ThenBlock: {
+                cpend = Add(MK_Tell(), esz)
+                cue_time = 0
+                cue_track = 0
+                cue_pos = 0
+
+                WhileLoop LessThan(MK_Tell(), cpend) {
+                    cid = MK_ReadID()
+                    csz = MK_ReadSize()
+
+                    IfCondition EqualTo(cid, EBML.CUE_TIME) ThenBlock: {
+                        cue_time = MK_ReadUInt(csz)
+                    }
+                    IfCondition EqualTo(cid, EBML.CUE_TRACK_POS) ThenBlock: {
+                        tpend = Add(MK_Tell(), csz)
+                        WhileLoop LessThan(MK_Tell(), tpend) {
+                            tid = MK_ReadID()
+                            tsz = MK_ReadSize()
+                            IfCondition EqualTo(tid, EBML.CUE_TRACK) ThenBlock: {
+                                cue_track = MK_ReadUInt(tsz)
+                            }
+                            IfCondition EqualTo(tid, EBML.CUE_CLUSTER_POS) ThenBlock: {
+                                cue_pos = MK_ReadUInt(tsz)
+                            }
+                            IfCondition And(NotEqual(tid, EBML.CUE_TRACK), NotEqual(tid, EBML.CUE_CLUSTER_POS)) ThenBlock: {
+                                MK_Skip(tsz)
+                            }
+                        }
+                    }
+                    IfCondition And(NotEqual(cid, EBML.CUE_TIME), NotEqual(cid, EBML.CUE_TRACK_POS)) ThenBlock: {
+                        MK_Skip(csz)
+                    }
+                }
+
+                // Store cue point
+                cue = Add(cues_buf, Multiply(num, MKConst.CUE_SIZE))
+                // Convert cue_time (in timecode units) to nanoseconds
+                cue_ns = Multiply(cue_time, MKState.TIMECODE_SCALE)
+                StoreValue(Add(cue, MKConst.CUE_TIME_OFF), cue_ns)
+                StoreValue(Add(cue, MKConst.CUE_TRACK_OFF), cue_track)
+                StoreValue(Add(cue, MKConst.CUE_POS_OFF), cue_pos)
+                num = Add(num, 1)
+            }
+            IfCondition NotEqual(eid, EBML.CUE_POINT) ThenBlock: {
+                MK_Skip(esz)
+            }
+        }
+
+        StoreValue(AddressOf(MKState.NUM_CUES), num)
+        PrintMessage("[DemuxMKV] parsed ")
+        PrintNumber(num)
+        PrintMessage(" cue points\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// FIND NEAREST CUE — for seeking
+// =============================================================================
+Function.MK_FindCue {
+    Input: target_ns: Integer
+    Output: Integer
+    Body: {
+        // Return cluster position for cue point <= target_ns
+        best = 0
+        best_pos = 0
+        i = 0
+        WhileLoop LessThan(i, MKState.NUM_CUES) {
+            cue = Add(MKState.CUES_PTR, Multiply(i, MKConst.CUE_SIZE))
+            cue_ns = LoadValue(Add(cue, MKConst.CUE_TIME_OFF))
+            IfCondition LessEqual(cue_ns, target_ns) ThenBlock: {
+                pos = LoadValue(Add(cue, MKConst.CUE_POS_OFF))
+                IfCondition GreaterEqual(cue_ns, best) ThenBlock: {
+                    best = cue_ns
+                    best_pos = pos
+                }
+            }
+            i = Add(i, 1)
+        }
+        // Position is relative to Segment start
+        ReturnValue(Add(MKState.SEGMENT_START, best_pos))
+    }
+}
+
+// =============================================================================
+// SEND CODEC PRIVATE DATA (config packets)
+// =============================================================================
+Function.MK_SendCodecPrivate {
+    Input: trk: Address
+    Output: Integer
+    Body: {
+        sent = LoadValue(Add(trk, MKConst.TRK_SENT_CONFIG))
+        IfCondition EqualTo(sent, 1) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        priv_ptr = LoadValue(Add(trk, MKConst.TRK_CODEC_PRIV_PTR))
+        priv_len = LoadValue(Add(trk, MKConst.TRK_CODEC_PRIV_LEN))
+        IfCondition EqualTo(priv_len, 0) ThenBlock: {
+            StoreValue(Add(trk, MKConst.TRK_SENT_CONFIG), 1)
+            ReturnValue(1)
+        }
+
+        ring = LoadValue(Add(trk, MKConst.TRK_RING))
+        IfCondition EqualTo(ring, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Write config packet with CONFIG flag
+        wrote = PacketRing_Write(ring, priv_ptr, priv_len, 0, PRPktFlag.CONFIG)
+        IfCondition EqualTo(wrote, 1) ThenBlock: {
+            StoreValue(Add(trk, MKConst.TRK_SENT_CONFIG), 1)
+            PrintMessage("[DemuxMKV] sent codec private data (")
+            PrintNumber(priv_len)
+            PrintMessage(" bytes)\n")
+        }
+        ReturnValue(wrote)
+    }
+}
+
+// =============================================================================
+// PROCESS SIMPLE BLOCK
+// =============================================================================
+// SimpleBlock format:
+//   VINT track_number
+//   int16_t timecode (relative to cluster timecode, big-endian)
+//   uint8_t flags: bit 7=keyframe, bit 0=discardable
+//   remainder = frame data
+Function.MK_ProcessSimpleBlock {
+    Input: block_data: Address
+    Input: block_size: Integer
+    Input: cluster_ts_ns: Integer
+    Output: Integer
+    Body: {
+        // Read track number VINT from block_data
+        // We parse it manually from the buffer
+        first = GetByte(block_data, 0)
+        trk_num = 0
+        hdr_bytes = 0
+
+        // VINT: count leading zeros
+        IfCondition GreaterEqual(BitwiseAnd(first, 128), 128) ThenBlock: {
+            // 1 byte: strip leading bit
+            trk_num = BitwiseAnd(first, 127)
+            hdr_bytes = 1
+        }
+        IfCondition And(LessThan(BitwiseAnd(first, 128), 128), GreaterEqual(BitwiseAnd(first, 64), 64)) ThenBlock: {
+            // 2 bytes
+            trk_num = BitwiseOr(ShiftLeft(BitwiseAnd(first, 63), 8), GetByte(block_data, 1))
+            hdr_bytes = 2
+        }
+        IfCondition And(And(LessThan(BitwiseAnd(first, 128), 128), LessThan(BitwiseAnd(first, 64), 64)), GreaterEqual(BitwiseAnd(first, 32), 32)) ThenBlock: {
+            // 3 bytes
+            trk_num = BitwiseOr(BitwiseOr(ShiftLeft(BitwiseAnd(first, 31), 16), ShiftLeft(GetByte(block_data, 1), 8)), GetByte(block_data, 2))
+            hdr_bytes = 3
+        }
+
+        // Timecode: 2 bytes big-endian signed relative to cluster
+        tc_hi = GetByte(block_data, hdr_bytes)
+        tc_lo = GetByte(block_data, Add(hdr_bytes, 1))
+        rel_tc = BitwiseOr(ShiftLeft(tc_hi, 8), tc_lo)
+        // Sign extend from 16 bits
+        IfCondition GreaterEqual(rel_tc, 32768) ThenBlock: {
+            rel_tc = Subtract(rel_tc, 65536)
+        }
+
+        // Flags byte
+        flags_byte = GetByte(block_data, Add(hdr_bytes, 2))
+        is_keyframe = ShiftRight(BitwiseAnd(flags_byte, 128), 7)
+
+        // Frame data starts at hdr_bytes + 3
+        frame_off = Add(hdr_bytes, 3)
+        frame_size = Subtract(block_size, frame_off)
+        frame_ptr = Add(block_data, frame_off)
+
+        // Compute absolute PTS in nanoseconds
+        abs_ns = Add(cluster_ts_ns, Multiply(rel_tc, MKState.TIMECODE_SCALE))
+        // Convert ns -> usec for PacketRing
+        pts_usec = Divide(abs_ns, 1000)
+
+        // Find the track
+        trk = MK_FindTrackByNum(trk_num)
+        IfCondition EqualTo(trk, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        ring = LoadValue(Add(trk, MKConst.TRK_RING))
+        IfCondition EqualTo(ring, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // Send codec private data if not yet sent
+        MK_SendCodecPrivate(trk)
+
+        // Set packet flags
+        pkt_flags = 0
+        IfCondition EqualTo(is_keyframe, 1) ThenBlock: {
+            pkt_flags = PRPktFlag.KEYFRAME
+        }
+
+        // Write frame to ring (with backpressure)
+        wrote = PacketRing_Write(ring, frame_ptr, frame_size, pts_usec, pkt_flags)
+        ReturnValue(wrote)
+    }
+}
+
+// =============================================================================
+// PARSE CLUSTER — extract blocks and send to rings
+// =============================================================================
+Function.MK_ParseCluster {
+    Input: size: Integer
+    Output: Integer
+    Body: {
+        end_pos = Add(MK_Tell(), size)
+        cluster_tc = 0
+        cluster_ts_ns = 0
+        frame_buf = Allocate(MKConst.MAX_FRAME_SIZE)
+
+        WhileLoop LessThan(MK_Tell(), end_pos) {
+            // Check clock state
+            state = PlaybackClock_GetState(MKState.CLOCK)
+            IfCondition EqualTo(state, PCState.STOPPED) ThenBlock: {
+                Deallocate(frame_buf, MKConst.MAX_FRAME_SIZE)
+                ReturnValue(-1)
+            }
+            IfCondition EqualTo(state, PCState.PAUSED) ThenBlock: {
+                ts_wait = Allocate(16)
+                StoreValue(ts_wait, 0)
+                StoreValue(Add(ts_wait, 8), 1000000)
+                SystemCall(MKSys.SYS_NANOSLEEP, ts_wait, 0)
+                Deallocate(ts_wait, 16)
+            }
+
+            eid = MK_ReadID()
+            esz = MK_ReadSize()
+            IfCondition LessThan(eid, 0) ThenBlock: {
+                Deallocate(frame_buf, MKConst.MAX_FRAME_SIZE)
+                ReturnValue(0)
+            }
+
+            IfCondition EqualTo(eid, EBML.CLUSTER_TIMECODE) ThenBlock: {
+                cluster_tc = MK_ReadUInt(esz)
+                cluster_ts_ns = Multiply(cluster_tc, MKState.TIMECODE_SCALE)
+            }
+
+            IfCondition EqualTo(eid, EBML.SIMPLE_BLOCK) ThenBlock: {
+                IfCondition LessEqual(esz, MKConst.MAX_FRAME_SIZE) ThenBlock: {
+                    MK_ReadBytes(frame_buf, esz)
+                    wrote = MK_ProcessSimpleBlock(frame_buf, esz, cluster_ts_ns)
+                    // If ring full, retry with backpressure
+                    WhileLoop EqualTo(wrote, 0) {
+                        s = PlaybackClock_GetState(MKState.CLOCK)
+                        IfCondition EqualTo(s, PCState.STOPPED) ThenBlock: {
+                            Deallocate(frame_buf, MKConst.MAX_FRAME_SIZE)
+                            ReturnValue(-1)
+                        }
+                        ts_wait = Allocate(16)
+                        StoreValue(ts_wait, 0)
+                        StoreValue(Add(ts_wait, 8), 500000)
+                        SystemCall(MKSys.SYS_NANOSLEEP, ts_wait, 0)
+                        Deallocate(ts_wait, 16)
+                        wrote = MK_ProcessSimpleBlock(frame_buf, esz, cluster_ts_ns)
+                    }
+                }
+                IfCondition GreaterThan(esz, MKConst.MAX_FRAME_SIZE) ThenBlock: {
+                    PrintMessage("[DemuxMKV] block too large, skipping\n")
+                    MK_Skip(esz)
+                }
+            }
+
+            IfCondition EqualTo(eid, EBML.BLOCK_GROUP) ThenBlock: {
+                // Parse BlockGroup: contains Block + optional BlockDuration/ReferenceBlock
+                bgend = Add(MK_Tell(), esz)
+                WhileLoop LessThan(MK_Tell(), bgend) {
+                    bid = MK_ReadID()
+                    bsz = MK_ReadSize()
+                    IfCondition EqualTo(bid, EBML.BLOCK) ThenBlock: {
+                        IfCondition LessEqual(bsz, MKConst.MAX_FRAME_SIZE) ThenBlock: {
+                            MK_ReadBytes(frame_buf, bsz)
+                            // Block has same format as SimpleBlock but without keyframe flag in byte
+                            MK_ProcessSimpleBlock(frame_buf, bsz, cluster_ts_ns)
+                        }
+                        IfCondition GreaterThan(bsz, MKConst.MAX_FRAME_SIZE) ThenBlock: {
+                            MK_Skip(bsz)
+                        }
+                    }
+                    IfCondition NotEqual(bid, EBML.BLOCK) ThenBlock: {
+                        MK_Skip(bsz)
+                    }
+                }
+            }
+
+            // Skip unknown elements
+            IfCondition And(And(NotEqual(eid, EBML.CLUSTER_TIMECODE), NotEqual(eid, EBML.SIMPLE_BLOCK)), NotEqual(eid, EBML.BLOCK_GROUP)) ThenBlock: {
+                MK_Skip(esz)
+            }
+        }
+
+        Deallocate(frame_buf, MKConst.MAX_FRAME_SIZE)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    PrintMessage("[DemuxMKV] starting\n")
+
+    // Parse args via UtilArgs schema
+    schema = MK_BuildSchema()
+    args = UtilArgs_ParseCLI(schema)
+    IfCondition EqualTo(args, 0) ThenBlock: {
+        PrintMessage("[DemuxMKV] argument error\n")
+        SystemCall(MKSys.SYS_EXIT, 1)
+    }
+
+    filepath   = UtilArgs_GetString(args, "file")
+    vring_name = UtilArgs_GetString(args, "vring")
+    aring_name = UtilArgs_GetString(args, "aring")
+    clock_name = UtilArgs_GetString(args, "clock")
+
+    PrintMessage("[DemuxMKV] file: ")
+    PrintString(filepath)
+    PrintMessage("\n[DemuxMKV] vring: ")
+    PrintString(vring_name)
+    PrintMessage("\n[DemuxMKV] aring: ")
+    PrintString(aring_name)
+    PrintMessage("\n[DemuxMKV] clock: ")
+    PrintString(clock_name)
+    PrintMessage("\n")
+
+    // Open file
+    mkv_fd = SystemCall(MKSys.SYS_OPEN, filepath, MKSys.O_RDONLY, 0)
+    IfCondition LessThan(mkv_fd, 0) ThenBlock: {
+        PrintMessage("[DemuxMKV] cannot open file\n")
+        SystemCall(MKSys.SYS_EXIT, 1)
+    }
+
+    // Init buffered reader
+    MK_ReaderInit(mkv_fd)
+
+    // Allocate track storage
+    tracks_mem = Allocate(Multiply(MKConst.MAX_TRACKS, MKConst.TRK_SIZE))
+    MemorySet(tracks_mem, 0, Multiply(MKConst.MAX_TRACKS, MKConst.TRK_SIZE))
+    StoreValue(AddressOf(MKState.TRACKS_PTR), tracks_mem)
+
+    // Parse EBML header
+    ok = MK_ParseEBMLHeader()
+    IfCondition EqualTo(ok, 0) ThenBlock: {
+        SystemCall(MKSys.SYS_EXIT, 1)
+    }
+
+    // Read Segment element
+    seg_id = MK_ReadID()
+    IfCondition NotEqual(seg_id, EBML.SEGMENT) ThenBlock: {
+        PrintMessage("[DemuxMKV] expected Segment element\n")
+        SystemCall(MKSys.SYS_EXIT, 1)
+    }
+    seg_size = MK_ReadSize()
+    StoreValue(AddressOf(MKState.SEGMENT_START), MK_Tell())
+    seg_end = Add(MK_Tell(), seg_size)
+
+    PrintMessage("[DemuxMKV] segment at offset ")
+    PrintNumber(MKState.SEGMENT_START)
+    PrintMessage(" size=")
+    PrintNumber(seg_size)
+    PrintMessage("\n")
+
+    // First pass: scan for Info, Tracks, Cues (before clusters)
+    // These are usually at the beginning of the segment
+    found_tracks = 0
+
+    WhileLoop And(LessThan(MK_Tell(), seg_end), EqualTo(found_tracks, 0)) {
+        eid = MK_ReadID()
+        esz = MK_ReadSize()
+        IfCondition LessThan(eid, 0) ThenBlock: {
+            found_tracks = 1
+        }
+
+        IfCondition EqualTo(eid, EBML.INFO) ThenBlock: {
+            MK_ParseInfo(esz)
+        }
+        IfCondition EqualTo(eid, EBML.TRACKS) ThenBlock: {
+            MK_ParseTracks(esz)
+            found_tracks = 1
+        }
+        IfCondition EqualTo(eid, EBML.CUES) ThenBlock: {
+            MK_ParseCues(esz)
+        }
+        IfCondition EqualTo(eid, EBML.SEEK_HEAD) ThenBlock: {
+            MK_Skip(esz)
+        }
+        IfCondition EqualTo(eid, EBML.CLUSTER) ThenBlock: {
+            // Hit first cluster before Tracks? Shouldn't happen in valid MKV
+            // but break out and use what we have
+            found_tracks = 1
+            // Seek back to cluster start
+            MK_Seek(Subtract(MK_Tell(), esz))
+        }
+        IfCondition And(And(And(NotEqual(eid, EBML.INFO), NotEqual(eid, EBML.TRACKS)),
+                           And(NotEqual(eid, EBML.CUES), NotEqual(eid, EBML.SEEK_HEAD))),
+                       NotEqual(eid, EBML.CLUSTER)) ThenBlock: {
+            MK_Skip(esz)
+        }
+    }
+
+    IfCondition EqualTo(MKState.NUM_TRACKS, 0) ThenBlock: {
+        PrintMessage("[DemuxMKV] no tracks found\n")
+        SystemCall(MKSys.SYS_EXIT, 1)
+    }
+
+    // Select first video and first audio track
+    i = 0
+    WhileLoop LessThan(i, MKState.NUM_TRACKS) {
+        trk = MK_GetTrack(i)
+        ttype = LoadValue(Add(trk, MKConst.TRK_TYPE))
+        tnum = LoadValue(Add(trk, MKConst.TRK_NUMBER))
+
+        IfCondition And(EqualTo(ttype, MKTrackType.VIDEO), EqualTo(MKState.VIDEO_TRACK_NUM, 0)) ThenBlock: {
+            StoreValue(AddressOf(MKState.VIDEO_TRACK_NUM), tnum)
+        }
+        IfCondition And(EqualTo(ttype, MKTrackType.AUDIO), EqualTo(MKState.AUDIO_TRACK_NUM, 0)) ThenBlock: {
+            StoreValue(AddressOf(MKState.AUDIO_TRACK_NUM), tnum)
+        }
+        i = Add(i, 1)
+    }
+
+    // Create PacketRings
+    vring = 0
+    IfCondition NotEqual(MKState.VIDEO_TRACK_NUM, 0) ThenBlock: {
+        vring = PacketRing_Create(vring_name, MKConst.RING_CAPACITY)
+        StoreValue(AddressOf(MKState.VIDEO_RING), vring)
+        vtrk = MK_FindTrackByNum(MKState.VIDEO_TRACK_NUM)
+        StoreValue(Add(vtrk, MKConst.TRK_RING), vring)
+        PrintMessage("[DemuxMKV] video track ")
+        PrintNumber(MKState.VIDEO_TRACK_NUM)
+        PrintMessage(" -> ring created\n")
+    }
+
+    aring = 0
+    IfCondition NotEqual(MKState.AUDIO_TRACK_NUM, 0) ThenBlock: {
+        aring = PacketRing_Create(aring_name, MKConst.RING_CAPACITY)
+        StoreValue(AddressOf(MKState.AUDIO_RING), aring)
+        atrk = MK_FindTrackByNum(MKState.AUDIO_TRACK_NUM)
+        StoreValue(Add(atrk, MKConst.TRK_RING), aring)
+        PrintMessage("[DemuxMKV] audio track ")
+        PrintNumber(MKState.AUDIO_TRACK_NUM)
+        PrintMessage(" -> ring created\n")
+    }
+
+    // Open clock
+    clock = PlaybackClock_Open(clock_name)
+    IfCondition EqualTo(clock, 0) ThenBlock: {
+        PrintMessage("[DemuxMKV] failed to open clock\n")
+        SystemCall(MKSys.SYS_EXIT, 1)
+    }
+    StoreValue(AddressOf(MKState.CLOCK), clock)
+
+    // Seek back to find first cluster
+    // We need to re-scan from segment start since we consumed Tracks
+    MK_Seek(MKState.SEGMENT_START)
+
+    // Main cluster loop
+    running = 1
+    ts_wait = Allocate(16)
+    StoreValue(ts_wait, 0)
+    StoreValue(Add(ts_wait, 8), 1000000)
+
+    WhileLoop And(EqualTo(running, 1), LessThan(MK_Tell(), seg_end)) {
+        // Check clock state for seek
+        state = PlaybackClock_GetState(clock)
+        IfCondition EqualTo(state, PCState.STOPPED) ThenBlock: {
+            running = 0
+        }
+        IfCondition EqualTo(state, PCState.SEEKING) ThenBlock: {
+            target_usec = PlaybackClock_GetSeekTarget(clock)
+            target_ns = Multiply(target_usec, 1000)
+
+            // Flush both rings
+            IfCondition NotEqual(vring, 0) ThenBlock: {
+                PacketRing_Reset(vring)
+                // Re-send codec private on next block
+                vtrk = MK_FindTrackByNum(MKState.VIDEO_TRACK_NUM)
+                StoreValue(Add(vtrk, MKConst.TRK_SENT_CONFIG), 0)
+            }
+            IfCondition NotEqual(aring, 0) ThenBlock: {
+                PacketRing_Reset(aring)
+                atrk = MK_FindTrackByNum(MKState.AUDIO_TRACK_NUM)
+                StoreValue(Add(atrk, MKConst.TRK_SENT_CONFIG), 0)
+            }
+
+            // Find nearest cue point
+            IfCondition GreaterThan(MKState.NUM_CUES, 0) ThenBlock: {
+                seek_pos = MK_FindCue(target_ns)
+                MK_Seek(seek_pos)
+                PrintMessage("[DemuxMKV] seeked to cluster at ")
+                PrintNumber(seek_pos)
+                PrintMessage("\n")
+            }
+            // If no cues, we can't seek efficiently — just continue from current pos
+            PlaybackClock_SeekDone(clock)
+        }
+        IfCondition EqualTo(state, PCState.PAUSED) ThenBlock: {
+            SystemCall(MKSys.SYS_NANOSLEEP, ts_wait, 0)
+        }
+
+        IfCondition EqualTo(running, 1) ThenBlock: {
+            eid = MK_ReadID()
+            esz = MK_ReadSize()
+            IfCondition LessThan(eid, 0) ThenBlock: {
+                running = 0
+            }
+
+            IfCondition EqualTo(eid, EBML.CLUSTER) ThenBlock: {
+                result = MK_ParseCluster(esz)
+                IfCondition EqualTo(result, -1) ThenBlock: {
+                    running = 0
+                }
+            }
+            IfCondition And(NotEqual(eid, EBML.CLUSTER), GreaterEqual(eid, 0)) ThenBlock: {
+                // Skip non-cluster elements (Cues at end of file, etc.)
+                MK_Skip(esz)
+            }
+        }
+    }
+
+    // Signal EOF on both rings
+    IfCondition NotEqual(vring, 0) ThenBlock: {
+        PacketRing_SignalEOF(vring)
+    }
+    IfCondition NotEqual(aring, 0) ThenBlock: {
+        PacketRing_SignalEOF(aring)
+    }
+
+    PrintMessage("[DemuxMKV] finished\n")
+
+    // Cleanup
+    Deallocate(ts_wait, 16)
+    Deallocate(tracks_mem, Multiply(MKConst.MAX_TRACKS, MKConst.TRK_SIZE))
+    SystemCall(MKSys.SYS_CLOSE, mkv_fd, 0, 0, 0, 0, 0)
+    PlaybackClock_Close(clock)
+
+    SystemCall(MKSys.SYS_EXIT, 0)
+}
+
+RunTask(Main)

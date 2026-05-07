@@ -1,0 +1,1363 @@
+// videoplayer2.ailang
+// Media Presenter — orchestrates the atomized media pipeline.
+//
+// Architecture:
+//   - Fork/exec demuxer process  → writes compressed packets to shm rings
+//   - Fork/exec decoder processes → read packets, write decoded output to shm rings
+//   - Presenter reads decoded rings, blits video to ShmCanvas, feeds audio to ALSA
+//   - PlaybackClock (shm) provides wall-clock anchored timing for all nodes
+//   - Audio-driven frame scheduling: present video when clock says it's time
+//
+// Pipeline (audio-only, e.g. WAV):
+//   demux_wav.x → [pkt_audio ring] → decode_pcm.x → [dec_audio ring] → presenter → ALSA
+//
+// Pipeline (video+audio, e.g. MP4):
+//   demux_mp4.x → [pkt_video ring] → decode_h264.x → [dec_video ring] → presenter → ShmCanvas
+//               → [pkt_audio ring] → decode_aac.x  → [dec_audio ring] → presenter → ALSA
+//
+// Pipeline (video+audio, e.g. MKV/WebM):
+//   demux_mkv.x → [pkt_video ring] → decode_vp9.x  → [dec_video ring] → presenter → ShmCanvas
+//               → [pkt_audio ring] → decode_opus.x → [dec_audio ring] → presenter → ALSA
+//
+// Pipeline (audio-only, e.g. MP3):
+//   demux_mp3.x → [pkt_audio ring] → decode_mp3.x → [dec_audio ring] → presenter → ALSA
+//
+// Pipeline (audio-only, e.g. FLAC):
+//   demux_flac.x → [pkt_audio ring] → decode_flac.x → [dec_audio ring] → presenter → ALSA
+//
+// Pipeline (audio-only, e.g. OGG/Opus):
+//   demux_ogg.x → [pkt_audio ring] → decode_opus.x → [dec_audio ring] → presenter → ALSA
+//
+// Pipeline (video+audio, e.g. MKV/H.265):
+//   demux_mkv.x → [pkt_video ring] → decode_h265.x → [dec_video ring] → presenter → ShmCanvas
+//               → [pkt_audio ring] → decode_opus.x  → [dec_audio ring] → presenter → ALSA
+//
+// Pipeline (video+audio, e.g. MKV/AV1):
+//   demux_mkv.x → [pkt_video ring] → decode_av1.x  → [dec_video ring] → presenter → ShmCanvas
+//               → [pkt_audio ring] → decode_opus.x  → [dec_audio ring] → presenter → ALSA
+//
+// Orthogonal: presenter reads from named rings. It doesn't care what produced
+// the data. A mixer can be inserted between decoder and presenter with zero
+// code changes — just change the audio ring name.
+//
+// Build: ./ailang.x Applications/videoplayer2.ailang videoplayer2.x
+// Run:   ./videoplayer2.x  (after SysDisplay.x is running)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.HashMap
+LibraryImport.ShmCanvas
+LibraryImport.Display.Render.AudioEngine
+LibraryImport.PacketRing
+LibraryImport.PlaybackClock
+LibraryImport.MediaProbe
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.VPSys {
+    "SYS_READ":      Initialize=0
+    "SYS_CLOSE":     Initialize=3
+    "SYS_PIPE":      Initialize=22
+    "SYS_DUP2":      Initialize=33
+    "SYS_FCNTL":     Initialize=72
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_KILL":      Initialize=62
+    "SYS_WAIT4":     Initialize=61
+    "SYS_NANOSLEEP": Initialize=35
+}
+
+FixedPool.VPSignal {
+    "SIGTERM":  Initialize=15
+    "WNOHANG":  Initialize=1
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.VPState {
+    "running":      Initialize=1
+    "win_id":       Initialize=0
+    "sock":         Initialize=0
+    "canvas_w":     Initialize=640
+    "canvas_h":     Initialize=480
+    "playing":      Initialize=0
+    "paused":       Initialize=0
+    "file_path":    Initialize=0
+    "audio_ok":     Initialize=0
+    "audio_buf":    Initialize=0
+    "frames_presented": Initialize=0
+    "frames_dropped":   Initialize=0
+    "frame_size":   Initialize=0
+    "vid_frame_buf":  Initialize=0
+    "have_video":     Initialize=0
+    "have_audio":     Initialize=0
+    "pending_frame":  Initialize=0
+    "pending_pts":    Initialize=0
+}
+
+// Process IDs for child processes
+FixedPool.VPChild {
+    "demux_pid":      Initialize=0
+    "video_dec_pid":  Initialize=0
+    "audio_dec_pid":  Initialize=0
+}
+
+// Ring pointers (mmap'd shm)
+FixedPool.VPRing {
+    "pkt_video":   Initialize=0
+    "pkt_audio":   Initialize=0
+    "dec_video":   Initialize=0
+    "dec_audio":   Initialize=0
+}
+
+// PlaybackClock pointer
+FixedPool.VPClock {
+    "ptr":         Initialize=0
+}
+
+// Session ID (for ring/clock naming)
+FixedPool.VPSession {
+    "id":          Initialize=0
+}
+
+FixedPool.VPFiles {
+    "default": Initialize=0
+}
+
+// =============================================================================
+// RING NAMES — built from session ID
+// =============================================================================
+Function.VP_RingName {
+    Input: prefix: Address
+    Output: Integer
+    Body: {
+        // e.g. "pkt_video_0" — simple for now
+        plen = StringLength(prefix)
+        buf = Allocate(Add(plen, 4))
+        MemoryCopy(buf, prefix, plen)
+        SetByte(buf, plen, 95)
+        SetByte(buf, Add(plen, 1), 48)
+        SetByte(buf, Add(plen, 2), 0)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// NUMBER TO STRING
+// =============================================================================
+Function.VP_NumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// FORMAT TIME — seconds to "MM:SS" string
+// =============================================================================
+Function.VP_FormatTime {
+    Input: secs: Integer
+    Input: buf: Address
+    Body: {
+        m = Divide(secs, 60)
+        s = Modulo(secs, 60)
+        SetByte(buf, 0, Add(48, Divide(m, 10)))
+        SetByte(buf, 1, Add(48, Modulo(m, 10)))
+        SetByte(buf, 2, 58)
+        SetByte(buf, 3, Add(48, Divide(s, 10)))
+        SetByte(buf, 4, Add(48, Modulo(s, 10)))
+        SetByte(buf, 5, 0)
+    }
+}
+
+// =============================================================================
+// IPC HELPERS
+// =============================================================================
+Function.VP_SetLabel {
+    Input: sock: Integer
+    Input: id: Address
+    Input: text: Address
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.setlabel")
+        JSON.SetNumber(req, "win_id", VPState.win_id)
+        JSON.SetString(req, "id", id)
+        JSON.SetString(req, "text", text)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+// =============================================================================
+// FORK/EXEC HELPER — launch a child process
+// argv is a null-terminated array of string pointers
+// Returns PID (>0) or -1 on failure
+// =============================================================================
+Function.VP_ForkExec {
+    Input: binary: Address
+    Input: argv:   Address
+    Output: Integer
+    Body: {
+        pid = SystemCall(VPSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[VP] fork failed\n")
+            ReturnValue(-1)
+        }
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child
+            SystemCall(VPSys.SYS_EXECVE, binary, argv, 0)
+            PrintMessage("[VP] execve failed: ")
+            PrintString(binary)
+            PrintMessage("\n")
+            SystemCall(VPSys.SYS_EXIT, 1, 0, 0, 0, 0)
+        }
+        // Parent
+        PrintMessage("[VP] launched ")
+        PrintString(binary)
+        PrintMessage(" pid=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// KILL CHILD — send SIGTERM and reap
+// =============================================================================
+Function.VP_KillChild {
+    Input: pid: Integer
+    Body: {
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            SystemCall(VPSys.SYS_KILL, pid, VPSignal.SIGTERM, 0, 0, 0)
+            status_buf = Allocate(8)
+            SystemCall(VPSys.SYS_WAIT4, pid, status_buf, VPSignal.WNOHANG, 0, 0, 0)
+            Deallocate(status_buf, 8)
+        }
+    }
+}
+
+// =============================================================================
+// LAUNCH PIPELINE — detect format, create rings/clock, fork demuxer + decoders
+// =============================================================================
+Function.VP_LaunchPipeline {
+    Input: filepath: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(filepath, 0) ThenBlock: {
+            PrintMessage("[VP] No file path\n")
+            ReturnValue(-1)
+        }
+
+        // Detect container format
+        fmt = MediaProbe_DetectFile(filepath)
+        fname = MediaProbe_FormatName(fmt)
+        PrintMessage("[VP] Detected format: ")
+        PrintString(fname)
+        PrintMessage("\n")
+
+        // Create PlaybackClock
+        clock_name = VP_RingName("clock")
+        clock = PlaybackClock_Create(clock_name)
+        IfCondition EqualTo(clock, 0) ThenBlock: {
+            PrintMessage("[VP] Failed to create clock\n")
+            ReturnValue(-1)
+        }
+        VPClock.ptr = clock
+
+        // Determine what streams we have based on format
+        VPState.have_video = 0
+        VPState.have_audio = 0
+
+        // For now: WAV = audio only, MP4/MKV = video + audio
+        IfCondition EqualTo(fmt, MPFormat.WAV) ThenBlock: {
+            VPState.have_audio = 1
+        }
+        IfCondition EqualTo(fmt, MPFormat.MP4) ThenBlock: {
+            VPState.have_video = 1
+            VPState.have_audio = 1
+        }
+        IfCondition EqualTo(fmt, MPFormat.MKV) ThenBlock: {
+            VPState.have_video = 1
+            VPState.have_audio = 1
+        }
+        IfCondition EqualTo(fmt, MPFormat.FLAC) ThenBlock: {
+            VPState.have_audio = 1
+        }
+        IfCondition EqualTo(fmt, MPFormat.MP3) ThenBlock: {
+            VPState.have_audio = 1
+        }
+        IfCondition EqualTo(fmt, MPFormat.OGG) ThenBlock: {
+            VPState.have_audio = 1
+        }
+
+        // Create audio packet ring (demuxer -> decoder)
+        IfCondition EqualTo(VPState.have_audio, 1) ThenBlock: {
+            pkt_audio_name = VP_RingName("pkt_audio")
+            // Ring created by demuxer, not us — it's the producer
+            // We just need the name. The decoder will open it.
+            // Store name for cleanup
+        }
+
+        // Create decoded audio ring (decoder -> presenter)
+        // The decoder creates this as producer
+        dec_audio_name = VP_RingName("dec_audio")
+
+        // ===== LAUNCH DEMUXER =====
+        pkt_a_name = VP_RingName("pkt_audio")
+        pkt_v_name = VP_RingName("pkt_video")
+
+        IfCondition EqualTo(fmt, MPFormat.WAV) ThenBlock: {
+            // demux_wav.x --file <path> --ring <ring> --clock <clock>
+            demux_bin = "./demux_wav.x"
+            argv = Allocate(56)
+            StoreValue(Add(argv, 0),  demux_bin)
+            StoreValue(Add(argv, 8),  "--file")
+            StoreValue(Add(argv, 16), filepath)
+            StoreValue(Add(argv, 24), "--ring")
+            StoreValue(Add(argv, 32), pkt_a_name)
+            StoreValue(Add(argv, 40), "--clock")
+            StoreValue(Add(argv, 48), clock_name)
+            // null terminator not needed — execve reads until count
+            dpid = VP_ForkExec(demux_bin, argv)
+            VPChild.demux_pid = dpid
+            Deallocate(argv, 56)
+        }
+
+        IfCondition EqualTo(fmt, MPFormat.MP4) ThenBlock: {
+            // demux_mp4.x --file <path> --vring <vr> --aring <ar> --clock <clk>
+            demux_bin = "./demux_mp4.x"
+            argv = Allocate(80)
+            StoreValue(Add(argv, 0),  demux_bin)
+            StoreValue(Add(argv, 8),  "--file")
+            StoreValue(Add(argv, 16), filepath)
+            StoreValue(Add(argv, 24), "--vring")
+            StoreValue(Add(argv, 32), pkt_v_name)
+            StoreValue(Add(argv, 40), "--aring")
+            StoreValue(Add(argv, 48), pkt_a_name)
+            StoreValue(Add(argv, 56), "--clock")
+            StoreValue(Add(argv, 64), clock_name)
+            StoreValue(Add(argv, 72), 0)
+            dpid = VP_ForkExec(demux_bin, argv)
+            VPChild.demux_pid = dpid
+            Deallocate(argv, 80)
+        }
+
+        IfCondition EqualTo(fmt, MPFormat.MKV) ThenBlock: {
+            // demux_mkv.x --file <path> --vring <vr> --aring <ar> --clock <clk>
+            demux_bin = "./demux_mkv.x"
+            argv = Allocate(80)
+            StoreValue(Add(argv, 0),  demux_bin)
+            StoreValue(Add(argv, 8),  "--file")
+            StoreValue(Add(argv, 16), filepath)
+            StoreValue(Add(argv, 24), "--vring")
+            StoreValue(Add(argv, 32), pkt_v_name)
+            StoreValue(Add(argv, 40), "--aring")
+            StoreValue(Add(argv, 48), pkt_a_name)
+            StoreValue(Add(argv, 56), "--clock")
+            StoreValue(Add(argv, 64), clock_name)
+            StoreValue(Add(argv, 72), 0)
+            dpid = VP_ForkExec(demux_bin, argv)
+            VPChild.demux_pid = dpid
+            Deallocate(argv, 80)
+        }
+
+        IfCondition EqualTo(fmt, MPFormat.MP3) ThenBlock: {
+            // demux_mp3.x --file <path> --ring <ring> --clock <clock>
+            demux_bin = "./demux_mp3.x"
+            argv = Allocate(56)
+            StoreValue(Add(argv, 0),  demux_bin)
+            StoreValue(Add(argv, 8),  "--file")
+            StoreValue(Add(argv, 16), filepath)
+            StoreValue(Add(argv, 24), "--ring")
+            StoreValue(Add(argv, 32), pkt_a_name)
+            StoreValue(Add(argv, 40), "--clock")
+            StoreValue(Add(argv, 48), clock_name)
+            dpid = VP_ForkExec(demux_bin, argv)
+            VPChild.demux_pid = dpid
+            Deallocate(argv, 56)
+        }
+
+        IfCondition EqualTo(fmt, MPFormat.FLAC) ThenBlock: {
+            // demux_flac.x --file <path> --ring <ring> --clock <clock>
+            demux_bin = "./demux_flac.x"
+            argv = Allocate(56)
+            StoreValue(Add(argv, 0),  demux_bin)
+            StoreValue(Add(argv, 8),  "--file")
+            StoreValue(Add(argv, 16), filepath)
+            StoreValue(Add(argv, 24), "--ring")
+            StoreValue(Add(argv, 32), pkt_a_name)
+            StoreValue(Add(argv, 40), "--clock")
+            StoreValue(Add(argv, 48), clock_name)
+            dpid = VP_ForkExec(demux_bin, argv)
+            VPChild.demux_pid = dpid
+            Deallocate(argv, 56)
+        }
+
+        IfCondition EqualTo(fmt, MPFormat.OGG) ThenBlock: {
+            // demux_ogg.x --file <path> --ring <ring> --clock <clock>
+            demux_bin = "./demux_ogg.x"
+            argv = Allocate(56)
+            StoreValue(Add(argv, 0),  demux_bin)
+            StoreValue(Add(argv, 8),  "--file")
+            StoreValue(Add(argv, 16), filepath)
+            StoreValue(Add(argv, 24), "--ring")
+            StoreValue(Add(argv, 32), pkt_a_name)
+            StoreValue(Add(argv, 40), "--clock")
+            StoreValue(Add(argv, 48), clock_name)
+            dpid = VP_ForkExec(demux_bin, argv)
+            VPChild.demux_pid = dpid
+            Deallocate(argv, 56)
+        }
+
+        // ===== LAUNCH VIDEO DECODER =====
+        dec_video_name = VP_RingName("dec_video")
+        IfCondition EqualTo(VPState.have_video, 1) ThenBlock: {
+            // Detect video codec from container format
+            // MP4 → H.264 (most common), MKV → VP9 (most common for WebM)
+            // The decoder is chosen at launch; for multi-codec we'd read codec info
+            // from the demuxer, but for now: MP4=H.264, MKV/WebM=VP9
+
+            IfCondition EqualTo(fmt, MPFormat.MP4) ThenBlock: {
+                vdec_bin = "./decode_h264.x"
+            }
+            IfCondition EqualTo(fmt, MPFormat.MKV) ThenBlock: {
+                vdec_bin = "./decode_vp9.x"
+            }
+
+            argv = Allocate(40)
+            StoreValue(Add(argv, 0),  vdec_bin)
+            StoreValue(Add(argv, 8),  pkt_v_name)
+            StoreValue(Add(argv, 16), dec_video_name)
+            StoreValue(Add(argv, 24), clock_name)
+            StoreValue(Add(argv, 32), 0)
+            vpid = VP_ForkExec(vdec_bin, argv)
+            VPChild.video_dec_pid = vpid
+            Deallocate(argv, 40)
+
+            // Allocate frame buffer for video (BGRA)
+            fsz = Multiply(Multiply(VPState.canvas_w, VPState.canvas_h), 4)
+            VPState.frame_size = fsz
+            VPState.vid_frame_buf = Allocate(fsz)
+            PrintMessage("[VP] Video frame buffer: ")
+            PrintNumber(fsz)
+            PrintMessage(" bytes\n")
+        }
+
+        // ===== LAUNCH AUDIO DECODER =====
+        IfCondition EqualTo(VPState.have_audio, 1) ThenBlock: {
+            IfCondition EqualTo(fmt, MPFormat.WAV) ThenBlock: {
+                // PCM pass-through decoder
+                adec_bin = "./decode_pcm.x"
+            }
+            IfCondition EqualTo(fmt, MPFormat.MP4) ThenBlock: {
+                // MP4 audio is typically AAC
+                adec_bin = "./decode_aac.x"
+            }
+            IfCondition EqualTo(fmt, MPFormat.MKV) ThenBlock: {
+                // MKV/WebM audio is typically Opus
+                adec_bin = "./decode_opus.x"
+            }
+            IfCondition EqualTo(fmt, MPFormat.MP3) ThenBlock: {
+                adec_bin = "./decode_mp3.x"
+            }
+            IfCondition EqualTo(fmt, MPFormat.FLAC) ThenBlock: {
+                adec_bin = "./decode_flac.x"
+            }
+            IfCondition EqualTo(fmt, MPFormat.OGG) ThenBlock: {
+                // OGG audio is typically Opus (modern) or Vorbis (legacy)
+                // Default to Opus — Vorbis support can be added later
+                adec_bin = "./decode_opus.x"
+            }
+
+            argv = Allocate(40)
+            StoreValue(Add(argv, 0),  adec_bin)
+            StoreValue(Add(argv, 8),  pkt_a_name)
+            StoreValue(Add(argv, 16), dec_audio_name)
+            StoreValue(Add(argv, 24), clock_name)
+            StoreValue(Add(argv, 32), 0)
+            apid = VP_ForkExec(adec_bin, argv)
+            VPChild.audio_dec_pid = apid
+            Deallocate(argv, 40)
+
+            // Open the decoded audio ring (we're the consumer)
+            // Wait briefly for decoder to create it
+            ts_wait = Allocate(16)
+            StoreValue(ts_wait, 0)
+            StoreValue(Add(ts_wait, 8), 50000000)
+            SystemCall(VPSys.SYS_NANOSLEEP, ts_wait, 0)
+            Deallocate(ts_wait, 16)
+
+            dec_a = PacketRing_Open(dec_audio_name)
+            VPRing.dec_audio = dec_a
+            IfCondition EqualTo(dec_a, 0) ThenBlock: {
+                PrintMessage("[VP] Warning: could not open decoded audio ring\n")
+            }
+        }
+
+        // Open decoded video ring (we're the consumer)
+        IfCondition EqualTo(VPState.have_video, 1) ThenBlock: {
+            ts_wait = Allocate(16)
+            StoreValue(ts_wait, 0)
+            StoreValue(Add(ts_wait, 8), 50000000)
+            SystemCall(VPSys.SYS_NANOSLEEP, ts_wait, 0)
+            Deallocate(ts_wait, 16)
+
+            dec_v = PacketRing_Open(dec_video_name)
+            VPRing.dec_video = dec_v
+            IfCondition EqualTo(dec_v, 0) ThenBlock: {
+                PrintMessage("[VP] Warning: could not open decoded video ring\n")
+            }
+        }
+
+        // Start the clock
+        PlaybackClock_Play(clock)
+
+        // Reset audio
+        IfCondition EqualTo(VPState.audio_ok, 1) ThenBlock: {
+            Mixer_ResetClock()
+        }
+
+        VPState.playing = 1
+        VPState.paused = 0
+        VPState.frames_presented = 0
+        VPState.frames_dropped = 0
+        VPState.pending_frame = 0
+
+        PrintMessage("[VP] Pipeline launched\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// STOP PIPELINE — stop clock, kill children, destroy rings
+// =============================================================================
+Function.VP_StopPipeline {
+    Body: {
+        clock = VPClock.ptr
+        IfCondition NotEqual(clock, 0) ThenBlock: {
+            PlaybackClock_Stop(clock)
+        }
+
+        // Kill children
+        VP_KillChild(VPChild.demux_pid)
+        VP_KillChild(VPChild.audio_dec_pid)
+        VP_KillChild(VPChild.video_dec_pid)
+        VPChild.demux_pid = 0
+        VPChild.audio_dec_pid = 0
+        VPChild.video_dec_pid = 0
+
+        // Close rings (consumer side)
+        IfCondition NotEqual(VPRing.dec_audio, 0) ThenBlock: {
+            PacketRing_Close(VPRing.dec_audio)
+            VPRing.dec_audio = 0
+        }
+        IfCondition NotEqual(VPRing.dec_video, 0) ThenBlock: {
+            PacketRing_Close(VPRing.dec_video)
+            VPRing.dec_video = 0
+        }
+
+        // Destroy rings + clock (we own cleanup)
+        PacketRing_Destroy(0, VP_RingName("pkt_audio"))
+        PacketRing_Destroy(0, VP_RingName("pkt_video"))
+        PacketRing_Destroy(0, VP_RingName("dec_audio"))
+        PacketRing_Destroy(0, VP_RingName("dec_video"))
+
+        IfCondition NotEqual(clock, 0) ThenBlock: {
+            PlaybackClock_Destroy(clock, VP_RingName("clock"))
+            VPClock.ptr = 0
+        }
+
+        // Free video frame buffer
+        IfCondition NotEqual(VPState.vid_frame_buf, 0) ThenBlock: {
+            Deallocate(VPState.vid_frame_buf, VPState.frame_size)
+            VPState.vid_frame_buf = 0
+        }
+
+        // Reset ALSA state
+        IfCondition EqualTo(VPState.audio_ok, 1) ThenBlock: {
+            Audio_Drop()
+            Audio_Prepare()
+            AppBus.write_pos = 0
+            AppBus.read_pos  = 0
+            MixerState.mix_pending = 0
+            Mixer_ResetClock()
+        }
+
+        VPState.playing = 0
+        VPState.paused = 0
+        VPState.have_video = 0
+        VPState.have_audio = 0
+        VPState.pending_frame = 0
+
+        PrintMessage("[VP] Pipeline stopped\n")
+    }
+}
+
+// =============================================================================
+// YUV420 → BGRA CONVERSION — convert decoded video frame for display
+// =============================================================================
+// Input: YUV420 packed buffer (Y plane, then U, then V)
+// Output: BGRA pixels written to dst
+// Uses integer-only BT.601 conversion:
+//   R = clamp(( 298*(Y-16) + 409*(Cr-128) + 128) >> 8)
+//   G = clamp(( 298*(Y-16) - 100*(Cb-128) - 208*(Cr-128) + 128) >> 8)
+//   B = clamp(( 298*(Y-16) + 516*(Cb-128) + 128) >> 8)
+Function.VP_YUV420toBGRA {
+    Input: yuv: Address
+    Input: dst: Address
+    Input: w: Integer
+    Input: h: Integer
+    Body: {
+        y_plane = yuv
+        u_plane = Add(yuv, Multiply(w, h))
+        v_plane = Add(u_plane, Multiply(Divide(w, 2), Divide(h, 2)))
+        half_w = Divide(w, 2)
+
+        row = 0
+        WhileLoop LessThan(row, h) {
+            col = 0
+            WhileLoop LessThan(col, w) {
+                y_idx = Add(Multiply(row, w), col)
+                uv_row = Divide(row, 2)
+                uv_col = Divide(col, 2)
+                uv_idx = Add(Multiply(uv_row, half_w), uv_col)
+
+                yv = GetByte(y_plane, y_idx)
+                cb = GetByte(u_plane, uv_idx)
+                cr = GetByte(v_plane, uv_idx)
+
+                // BT.601 integer math
+                c = Multiply(298, Subtract(yv, 16))
+                r = ShiftRight(Add(Add(c, Multiply(409, Subtract(cr, 128))), 128), 8)
+                g = ShiftRight(Add(Subtract(Subtract(c, Multiply(100, Subtract(cb, 128))), Multiply(208, Subtract(cr, 128))), 128), 8)
+                b = ShiftRight(Add(Add(c, Multiply(516, Subtract(cb, 128))), 128), 8)
+
+                // Clamp 0-255
+                IfCondition LessThan(r, 0) ThenBlock: { r = 0 }
+                IfCondition GreaterThan(r, 255) ThenBlock: { r = 255 }
+                IfCondition LessThan(g, 0) ThenBlock: { g = 0 }
+                IfCondition GreaterThan(g, 255) ThenBlock: { g = 255 }
+                IfCondition LessThan(b, 0) ThenBlock: { b = 0 }
+                IfCondition GreaterThan(b, 255) ThenBlock: { b = 255 }
+
+                // BGRA pixel (little-endian: B, G, R, A)
+                px_off = Multiply(y_idx, 4)
+                SetByte(dst, px_off, b)
+                SetByte(dst, Add(px_off, 1), g)
+                SetByte(dst, Add(px_off, 2), r)
+                SetByte(dst, Add(px_off, 3), 255)
+
+                col = Add(col, 1)
+            }
+            row = Add(row, 1)
+        }
+    }
+}
+
+// =============================================================================
+// PRESENT VIDEO FRAME — read decoded YUV from ring, convert, blit to canvas
+// =============================================================================
+// Decoded frame format from decoder shim:
+//   [0..3]  uint32_t width
+//   [4..7]  uint32_t height
+//   [8..]   packed YUV420
+Function.VP_PresentVideoFrame {
+    Input: sock: Integer
+    Input: media_now: Integer
+    Body: {
+        ring = VPRing.dec_video
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        // If we have a pending frame from a previous tick, check if it's time
+        IfCondition EqualTo(VPState.pending_frame, 1) ThenBlock: {
+            IfCondition LessEqual(VPState.pending_pts, media_now) ThenBlock: {
+                // Present the frame
+                ShmCanvas_Present(sock, VPState.win_id)
+                VPState.pending_frame = 0
+                VPState.frames_presented = Add(VPState.frames_presented, 1)
+            }
+            ReturnValue(0)
+        }
+
+        // Try to peek at next frame
+        peek_size = Allocate(8)
+        peek_pts  = Allocate(8)
+        peek_flags = Allocate(8)
+
+        got = PacketRing_Peek(ring, peek_size, peek_pts, peek_flags)
+        IfCondition EqualTo(got, 0) ThenBlock: {
+            Deallocate(peek_size, 8)
+            Deallocate(peek_pts, 8)
+            Deallocate(peek_flags, 8)
+            ReturnValue(0)
+        }
+
+        fpts = Dereference(peek_pts)
+
+        // If frame PTS is in the future, wait
+        IfCondition GreaterThan(fpts, Add(media_now, 2000)) ThenBlock: {
+            Deallocate(peek_size, 8)
+            Deallocate(peek_pts, 8)
+            Deallocate(peek_flags, 8)
+            ReturnValue(0)
+        }
+
+        // If frame is too late (>50ms behind), drop it
+        IfCondition LessThan(fpts, Subtract(media_now, 50000)) ThenBlock: {
+            // Drop: consume and discard
+            discard = Allocate(Dereference(peek_size))
+            PacketRing_Read(ring, discard, peek_size, peek_pts, peek_flags)
+            Deallocate(discard, Dereference(peek_size))
+            Deallocate(peek_size, 8)
+            Deallocate(peek_pts, 8)
+            Deallocate(peek_flags, 8)
+            VPState.frames_dropped = Add(VPState.frames_dropped, 1)
+            ReturnValue(0)
+        }
+
+        // Read the frame
+        fsz = Dereference(peek_size)
+        fbuf = Allocate(fsz)
+        out_size = Allocate(8)
+        out_pts = Allocate(8)
+        out_flags = Allocate(8)
+        PacketRing_Read(ring, fbuf, out_size, out_pts, out_flags)
+
+        // Parse header: width, height
+        fw = LoadValue(fbuf, "dword")
+        fh = LoadValue(Add(fbuf, 4), "dword")
+        yuv_data = Add(fbuf, 8)
+
+        // Convert YUV→BGRA into canvas
+        // Scale/crop to canvas size if needed
+        cw = VPState.canvas_w
+        ch = VPState.canvas_h
+
+        IfCondition And(EqualTo(fw, cw), EqualTo(fh, ch)) ThenBlock: {
+            // Exact match: convert directly into canvas buffer
+            canvas_buf = ShmCanvas_GetBuffer()
+            IfCondition NotEqual(canvas_buf, 0) ThenBlock: {
+                VP_YUV420toBGRA(yuv_data, canvas_buf, fw, fh)
+            }
+        }
+        IfCondition Or(NotEqual(fw, cw), NotEqual(fh, ch)) ThenBlock: {
+            // Size mismatch: convert to temp buffer then blit with basic scaling
+            // For simplicity: convert to vid_frame_buf at source resolution, then
+            // nearest-neighbor scale to canvas
+            tmpbuf = VPState.vid_frame_buf
+            IfCondition NotEqual(tmpbuf, 0) ThenBlock: {
+                VP_YUV420toBGRA(yuv_data, tmpbuf, fw, fh)
+                // Blit scaled to canvas
+                canvas_buf = ShmCanvas_GetBuffer()
+                IfCondition NotEqual(canvas_buf, 0) ThenBlock: {
+                    dy = 0
+                    WhileLoop LessThan(dy, ch) {
+                        sy = Divide(Multiply(dy, fh), ch)
+                        dx = 0
+                        WhileLoop LessThan(dx, cw) {
+                            sx = Divide(Multiply(dx, fw), cw)
+                            src_off = Multiply(Add(Multiply(sy, fw), sx), 4)
+                            dst_off = Multiply(Add(Multiply(dy, cw), dx), 4)
+                            // Copy 4 bytes (BGRA pixel)
+                            SetByte(canvas_buf, dst_off, GetByte(tmpbuf, src_off))
+                            SetByte(canvas_buf, Add(dst_off, 1), GetByte(tmpbuf, Add(src_off, 1)))
+                            SetByte(canvas_buf, Add(dst_off, 2), GetByte(tmpbuf, Add(src_off, 2)))
+                            SetByte(canvas_buf, Add(dst_off, 3), 255)
+                            dx = Add(dx, 1)
+                        }
+                        dy = Add(dy, 1)
+                    }
+                }
+            }
+        }
+
+        // Mark frame for presentation at its PTS
+        VPState.pending_pts = Dereference(out_pts)
+        VPState.pending_frame = 1
+
+        // If PTS is already past, present immediately
+        IfCondition LessEqual(VPState.pending_pts, media_now) ThenBlock: {
+            ShmCanvas_Present(sock, VPState.win_id)
+            VPState.pending_frame = 0
+            VPState.frames_presented = Add(VPState.frames_presented, 1)
+        }
+
+        Deallocate(fbuf, fsz)
+        Deallocate(out_size, 8)
+        Deallocate(out_pts, 8)
+        Deallocate(out_flags, 8)
+        Deallocate(peek_size, 8)
+        Deallocate(peek_pts, 8)
+        Deallocate(peek_flags, 8)
+    }
+}
+
+// =============================================================================
+// DRAIN DECODED AUDIO — read from dec_audio ring, feed to AudioEngine mixer
+// =============================================================================
+Function.VP_DrainDecodedAudio {
+    Body: {
+        ring = VPRing.dec_audio
+        IfCondition EqualTo(ring, 0) ThenBlock: {
+            Mixer_DrainTick()
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(VPState.audio_ok, 0) ThenBlock: { ReturnValue(0) }
+
+        abuf = VPState.audio_buf
+        out_size  = Allocate(8)
+        out_pts   = Allocate(8)
+        out_flags = Allocate(8)
+
+        total_fed = 0
+        done = 0
+        WhileLoop And(LessThan(total_fed, 131072), EqualTo(done, 0)) {
+            got = PacketRing_Read(ring, abuf, out_size, out_pts, out_flags)
+            IfCondition EqualTo(got, 0) ThenBlock: {
+                done = 1
+            }
+            IfCondition EqualTo(got, 1) ThenBlock: {
+                pkt_sz = Dereference(out_size)
+                Mixer_AppWrite(abuf, pkt_sz)
+                total_fed = Add(total_fed, pkt_sz)
+            }
+        }
+
+        Deallocate(out_size, 8)
+        Deallocate(out_pts, 8)
+        Deallocate(out_flags, 8)
+
+        // Always push to ALSA
+        Mixer_DrainTick()
+    }
+}
+
+// =============================================================================
+// POLL IPC MESSAGES
+// =============================================================================
+Function.VP_PollMessages {
+    Input: sock: Integer
+    Body: {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: { ReturnValue(0) }
+
+        pmsg = ParseJSON(msg)
+        IfCondition NotEqual(pmsg, 0) ThenBlock: {
+            mobj = JSON.AsObject(pmsg)
+            method = JSON.GetString(mobj, "method")
+            IfCondition NotEqual(method, 0) ThenBlock: {
+
+                cmp = StringCompare(method, "window.closed")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    PrintMessage("[VP] Window closed\n")
+                    VP_StopPipeline()
+                    VPState.running = 0
+                }
+
+                cmp = StringCompare(method, "input.action")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    action = JSON.GetString(mobj, "action")
+                    IfCondition NotEqual(action, 0) ThenBlock: {
+                        VP_HandleAction(sock, action)
+                    }
+                }
+
+                cmp = StringCompare(method, "input.key")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    kc = JSON.GetNumber(mobj, "keycode")
+                    VP_HandleKey(sock, kc)
+                }
+
+                cmp = StringCompare(method, "window.resized")
+                IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    rw = JSON.GetNumber(mobj, "width")
+                    rh = JSON.GetNumber(mobj, "height")
+                    VP_HandleResize(sock, rw, rh)
+                }
+            }
+            JSON.Free(pmsg)
+        }
+    }
+}
+
+// =============================================================================
+// ACTION HANDLER
+// =============================================================================
+Function.VP_HandleAction {
+    Input: sock: Integer
+    Input: action: Address
+    Body: {
+        clock = VPClock.ptr
+
+        // v.play — start or resume
+        cmp = StringCompare(action, "v.play")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(VPState.paused, 1) ThenBlock: {
+                // Resume
+                IfCondition NotEqual(clock, 0) ThenBlock: {
+                    PlaybackClock_Resume(clock)
+                }
+                VPState.paused = 0
+                VP_SetLabel(sock, "status", "Playing")
+                PrintMessage("[VP] Resumed\n")
+            } ElseBlock: {
+                IfCondition EqualTo(VPState.playing, 0) ThenBlock: {
+                    fpath = VPState.file_path
+                    IfCondition EqualTo(fpath, 0) ThenBlock: {
+                        VP_SetLabel(sock, "status", "No file loaded")
+                        ReturnValue(0)
+                    }
+                    r = VP_LaunchPipeline(fpath)
+                    IfCondition LessThan(r, 0) ThenBlock: {
+                        VP_SetLabel(sock, "status", "Launch failed")
+                        ReturnValue(0)
+                    }
+                    VP_SetLabel(sock, "status", "Playing")
+                    PrintMessage("[VP] Playing: ")
+                    PrintString(fpath)
+                    PrintMessage("\n")
+                }
+            }
+            ReturnValue(1)
+        }
+
+        // v.paus — pause
+        cmp = StringCompare(action, "v.paus")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition And(EqualTo(VPState.playing, 1), EqualTo(VPState.paused, 0)) ThenBlock: {
+                IfCondition NotEqual(clock, 0) ThenBlock: {
+                    PlaybackClock_Pause(clock)
+                }
+                VPState.paused = 1
+                VP_SetLabel(sock, "status", "Paused")
+                PrintMessage("[VP] Paused\n")
+            }
+            ReturnValue(1)
+        }
+
+        // v.stop — stop playback
+        cmp = StringCompare(action, "v.stop")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            VP_StopPipeline()
+            ShmCanvas_Clear(4278190080)
+            ShmCanvas_Present(sock, VPState.win_id)
+            VP_SetLabel(sock, "status", "Stopped")
+            VP_SetLabel(sock, "pos", "00:00")
+            PrintMessage("[VP] Stopped\n")
+            ReturnValue(1)
+        }
+
+        // v.seek.fwd — seek forward 10s
+        cmp = StringCompare(action, "v.seek.fwd")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition And(NotEqual(clock, 0), EqualTo(VPState.playing, 1)) ThenBlock: {
+                cur = PlaybackClock_MediaTime(clock)
+                PlaybackClock_Seek(clock, Add(cur, 10000000))
+                PrintMessage("[VP] Seek +10s\n")
+            }
+            ReturnValue(1)
+        }
+
+        // v.seek.bck — seek backward 10s
+        cmp = StringCompare(action, "v.seek.bck")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition And(NotEqual(clock, 0), EqualTo(VPState.playing, 1)) ThenBlock: {
+                cur = PlaybackClock_MediaTime(clock)
+                target = Subtract(cur, 10000000)
+                IfCondition LessThan(target, 0) ThenBlock: {
+                    target = 0
+                }
+                PlaybackClock_Seek(clock, target)
+                PrintMessage("[VP] Seek -10s\n")
+            }
+            ReturnValue(1)
+        }
+
+        // doc.open — File > Open
+        cmp = StringCompare(action, "doc.open")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            IfCondition EqualTo(VPState.playing, 1) ThenBlock: {
+                VP_StopPipeline()
+            }
+            VPState.file_path = VPFiles.default
+            PrintMessage("[VP] File > Open: ")
+            IfCondition NotEqual(VPState.file_path, 0) ThenBlock: {
+                PrintString(VPState.file_path)
+            }
+            PrintMessage("\n")
+            VP_HandleAction(sock, "v.play")
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// KEY HANDLER
+// =============================================================================
+Function.VP_HandleKey {
+    Input: sock: Integer
+    Input: keycode: Integer
+    Body: {
+        // Space (57) — toggle play/pause
+        IfCondition EqualTo(keycode, 57) ThenBlock: {
+            IfCondition EqualTo(VPState.paused, 1) ThenBlock: {
+                VP_HandleAction(sock, "v.play")
+            } ElseBlock: {
+                IfCondition EqualTo(VPState.playing, 1) ThenBlock: {
+                    VP_HandleAction(sock, "v.paus")
+                } ElseBlock: {
+                    VP_HandleAction(sock, "v.play")
+                }
+            }
+            ReturnValue(1)
+        }
+
+        // S (31) — stop
+        IfCondition EqualTo(keycode, 31) ThenBlock: {
+            VP_HandleAction(sock, "v.stop")
+            ReturnValue(1)
+        }
+
+        // Right arrow (106) — seek forward
+        IfCondition EqualTo(keycode, 106) ThenBlock: {
+            VP_HandleAction(sock, "v.seek.fwd")
+            ReturnValue(1)
+        }
+
+        // Left arrow (105) — seek backward
+        IfCondition EqualTo(keycode, 105) ThenBlock: {
+            VP_HandleAction(sock, "v.seek.bck")
+            ReturnValue(1)
+        }
+
+        // Up (103) — volume up
+        IfCondition EqualTo(keycode, 103) ThenBlock: {
+            newvol = Add(MixerState.master_vol, 64)
+            Mixer_SetMasterVol(newvol)
+            PrintMessage("[VP] Master vol=")
+            PrintNumber(MixerState.master_vol)
+            PrintMessage("/1024\n")
+            ReturnValue(1)
+        }
+
+        // Down (108) — volume down
+        IfCondition EqualTo(keycode, 108) ThenBlock: {
+            newvol = Subtract(MixerState.master_vol, 64)
+            Mixer_SetMasterVol(newvol)
+            PrintMessage("[VP] Master vol=")
+            PrintNumber(MixerState.master_vol)
+            PrintMessage("/1024\n")
+            ReturnValue(1)
+        }
+
+        // M (50) — mute toggle
+        IfCondition EqualTo(keycode, 50) ThenBlock: {
+            IfCondition EqualTo(MixerState.master_vol, 0) ThenBlock: {
+                Mixer_SetMasterVol(256)
+                PrintMessage("[VP] Unmuted\n")
+            } ElseBlock: {
+                Mixer_SetMasterVol(0)
+                PrintMessage("[VP] Muted\n")
+            }
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// HANDLE RESIZE
+// =============================================================================
+Function.VP_HandleResize {
+    Input: sock: Integer
+    Input: new_w: Integer
+    Input: new_h: Integer
+    Body: {
+        IfCondition LessEqual(new_w, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(new_h, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition And(EqualTo(new_w, VPState.canvas_w), EqualTo(new_h, VPState.canvas_h)) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        was_playing = VPState.playing
+
+        IfCondition EqualTo(VPState.playing, 1) ThenBlock: {
+            VP_StopPipeline()
+        }
+
+        ShmCanvas_Destroy(VPState.win_id)
+        VPState.canvas_w = new_w
+        VPState.canvas_h = new_h
+
+        PrintMessage("[VP] Resize: ")
+        PrintNumber(new_w)
+        PrintMessage("x")
+        PrintNumber(new_h)
+        PrintMessage("\n")
+
+        wid = VPState.win_id
+        buf = ShmCanvas_Create(wid, new_w, new_h)
+        IfCondition EqualTo(buf, 0) ThenBlock: {
+            PrintMessage("[VP] ShmCanvas_Create failed after resize\n")
+            ReturnValue(0)
+        }
+        ShmCanvas_Attach(sock, wid, new_w, new_h)
+        ShmCanvas_Clear(4278190080)
+        ShmCanvas_Present(sock, wid)
+
+        IfCondition EqualTo(was_playing, 1) ThenBlock: {
+            fpath = VPState.file_path
+            IfCondition NotEqual(fpath, 0) ThenBlock: {
+                VP_LaunchPipeline(fpath)
+                PrintMessage("[VP] Restarted pipeline at new resolution\n")
+            }
+        }
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Media Presenter — Atomized Pipeline v2\n")
+    PrintMessage("============================================\n\n")
+
+    VPFiles.default = "/home/bob/test_audio.wav"
+    VPState.file_path = VPFiles.default
+
+    // Connect to display server
+    sock_path = "/tmp/ailang_display.sock"
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[VP] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[VP] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[VP] Connected to display server\n")
+    VPState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"videoplayer\"}")
+    PrintMessage("[VP] Sent register\n")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Media Player\",\"w\":640,\"h\":480,\"html\":\"config/videoplayer.html\"}")
+    PrintMessage("[VP] Sent window.create\n")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[VP] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        VPState.win_id = wid
+        PrintMessage("[VP] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Create shared memory canvas
+    cw = VPState.canvas_w
+    ch = VPState.canvas_h
+    wid = VPState.win_id
+    buf = ShmCanvas_Create(wid, cw, ch)
+    IfCondition EqualTo(buf, 0) ThenBlock: {
+        PrintMessage("[VP] ShmCanvas_Create failed\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    ShmCanvas_Attach(sock, wid, cw, ch)
+    PrintMessage("[VP] Canvas attached\n")
+
+    ShmCanvas_Clear(4278190080)
+    ShmCanvas_Present(sock, wid)
+
+    // Initialize audio engine
+    ar = Audio_Init()
+    IfCondition GreaterEqual(ar, 0) ThenBlock: {
+        VPState.audio_ok = 1
+        PrintMessage("[VP] Audio engine ready\n")
+    } ElseBlock: {
+        VPState.audio_ok = 0
+        PrintMessage("[VP] Audio unavailable\n")
+    }
+
+    // Allocate audio read buffer
+    VPState.audio_buf = Allocate(16384)
+
+    // Set socket non-blocking
+    Socket.SetNonBlock(sock)
+
+    // Tick timers
+    ts_tick = Allocate(16)
+    StoreValue(ts_tick, 0)
+    StoreValue(Add(ts_tick, 8), 2000000)
+
+    ts_idle = Allocate(16)
+    StoreValue(ts_idle, 0)
+    StoreValue(Add(ts_idle, 8), 50000000)
+
+    PrintMessage("[VP] Keys: Space=play/pause S=stop Left/Right=seek M=mute Up/Down=vol\n")
+
+    // Auto-play
+    IfCondition NotEqual(VPState.file_path, 0) ThenBlock: {
+        PrintMessage("[VP] Auto-playing: ")
+        PrintString(VPState.file_path)
+        PrintMessage("\n")
+        VP_LaunchPipeline(VPState.file_path)
+    }
+
+    PrintMessage("[VP] Entering main loop\n\n")
+
+    // ===== MAIN LOOP — CLOCK-DRIVEN FRAME SYNC =====
+    WhileLoop EqualTo(VPState.running, 1) {
+
+        IfCondition And(EqualTo(VPState.playing, 1), EqualTo(VPState.paused, 0)) ThenBlock: {
+            // ===== PLAYING =====
+            clock = VPClock.ptr
+
+            // STEP 1: Drain decoded audio into ALSA
+            VP_DrainDecodedAudio()
+
+            // STEP 2: Update clock with audio position
+            IfCondition NotEqual(clock, 0) ThenBlock: {
+                PlaybackClock_SetAudioHWPos(clock, Mixer_GetSamplesWritten())
+            }
+
+            // STEP 3: Get current media time
+            media_now = PlaybackClock_MediaTime(clock)
+
+            // STEP 4: Check for EOF on all active rings
+            audio_eof = 0
+            video_eof = 0
+
+            // If no audio track, treat as EOF
+            IfCondition EqualTo(VPState.have_audio, 0) ThenBlock: {
+                audio_eof = 1
+            }
+            IfCondition EqualTo(VPState.have_video, 0) ThenBlock: {
+                video_eof = 1
+            }
+
+            dec_a = VPRing.dec_audio
+            IfCondition NotEqual(dec_a, 0) ThenBlock: {
+                IfCondition EqualTo(PacketRing_IsEOF(dec_a), 1) ThenBlock: {
+                    avail = PacketRing_Available(dec_a)
+                    IfCondition EqualTo(avail, 0) ThenBlock: {
+                        audio_eof = 1
+                    }
+                }
+            }
+
+            dec_v = VPRing.dec_video
+            IfCondition NotEqual(dec_v, 0) ThenBlock: {
+                IfCondition EqualTo(PacketRing_IsEOF(dec_v), 1) ThenBlock: {
+                    avail = PacketRing_Available(dec_v)
+                    IfCondition EqualTo(avail, 0) ThenBlock: {
+                        video_eof = 1
+                    }
+                }
+            }
+
+            // Both streams finished
+            IfCondition And(EqualTo(audio_eof, 1), EqualTo(video_eof, 1)) ThenBlock: {
+                VP_StopPipeline()
+                VP_SetLabel(sock, "status", "Finished")
+                PrintMessage("[VP] Playback finished\n")
+            }
+
+            // STEP 5: Video frame presentation
+            IfCondition EqualTo(VPState.have_video, 1) ThenBlock: {
+                VP_PresentVideoFrame(sock, media_now)
+            }
+
+            // Update position display every ~500ms (250 ticks at 2ms)
+            fp = VPState.frames_presented
+            VPState.frames_presented = Add(fp, 1)
+            IfCondition EqualTo(Modulo(fp, 250), 0) ThenBlock: {
+                secs = Divide(media_now, 1000000)
+                tbuf = Allocate(8)
+                VP_FormatTime(secs, tbuf)
+                VP_SetLabel(sock, "pos", tbuf)
+                Deallocate(tbuf, 8)
+            }
+
+            SystemCall(VPSys.SYS_NANOSLEEP, ts_tick, 0)
+
+        } ElseBlock: {
+            // ===== IDLE or PAUSED =====
+            IfCondition EqualTo(VPState.audio_ok, 1) ThenBlock: {
+                Mixer_DrainTick()
+            }
+            SystemCall(VPSys.SYS_NANOSLEEP, ts_idle, 0)
+        }
+
+        VP_PollMessages(sock)
+    }
+
+    // Cleanup
+    VP_StopPipeline()
+    ShmCanvas_Destroy(wid)
+    IfCondition EqualTo(VPState.audio_ok, 1) ThenBlock: {
+        Audio_Shutdown()
+    }
+    Deallocate(VPState.audio_buf, 16384)
+    Deallocate(ts_tick, 16)
+    Deallocate(ts_idle, 16)
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  Media Presenter finished\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)

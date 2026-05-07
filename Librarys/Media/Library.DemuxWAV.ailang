@@ -1,0 +1,355 @@
+// Library.DemuxWAV.ailang
+// Standalone WAV/RIFF demuxer process.
+//
+// Reads a WAV file, parses the RIFF/fmt/data headers, and writes
+// raw PCM packets to an audio PacketRing. No video output.
+//
+// This is the simplest possible demuxer — WAV is uncompressed PCM
+// with a fixed-size header. Used to prove the pipeline end-to-end.
+//
+// Usage:
+//   ./demux_wav.x --file /path/to.wav --ring audio_ring --clock clk0
+//
+// Orthogonal: speaks only PacketRing + PlaybackClock. No other deps.
+//
+// WAV format:
+//   RIFF header: "RIFF" [4-byte LE size] "WAVE"
+//   fmt chunk:   "fmt " [4-byte LE size] [2-byte audio_fmt] [2-byte channels]
+//                [4-byte sample_rate] [4-byte byte_rate] [2-byte block_align]
+//                [2-byte bits_per_sample]
+//   data chunk:  "data" [4-byte LE size] [raw PCM bytes...]
+//
+// Build: ./ailang.x Librarys/Media/Library.DemuxWAV.ailang demux_wav.x
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.PacketRing
+LibraryImport.PlaybackClock
+LibraryImport.UtilArgs
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.DWSys {
+    "SYS_READ":      Initialize=0
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_EXIT":      Initialize=60
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_OPENAT":    Initialize=257
+    "O_RDONLY":      Initialize=0
+    "AT_FDCWD":      Initialize=-100
+}
+
+// WAV format constants
+FixedPool.DWConst {
+    "PKT_CHUNK_SIZE":  Initialize=4096
+    "RING_CAPACITY":   Initialize=4194304
+}
+
+// =============================================================================
+// ARGUMENT SCHEMA
+// =============================================================================
+Function.DW_BuildSchema {
+    Output: Address
+    Body: {
+        s = UtilArgs_NewSchema("demux_wav", "WAV/RIFF demuxer — extract PCM to PacketRing")
+        UtilArgs_AddField(s, "file",  "path",   1, "WAV file path",       "file")
+        UtilArgs_AddField(s, "ring",  "string", 1, "Audio PacketRing name","ring")
+        UtilArgs_AddField(s, "clock", "string", 1, "PlaybackClock name",  "clock")
+        UtilArgs_SetShort(s, "file",  "f")
+        UtilArgs_SetShort(s, "ring",  "r")
+        UtilArgs_SetShort(s, "clock", "c")
+        ReturnValue(s)
+    }
+}
+
+// =============================================================================
+// READ LE16 — read 16-bit little-endian from buffer
+// =============================================================================
+Function.DW_ReadLE16 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        lo = GetByte(buf, off)
+        hi = GetByte(buf, Add(off, 1))
+        ReturnValue(Add(lo, ShiftLeft(hi, 8)))
+    }
+}
+
+// =============================================================================
+// READ LE32 — read 32-bit little-endian from buffer
+// =============================================================================
+Function.DW_ReadLE32 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        b3 = GetByte(buf, Add(off, 3))
+        ReturnValue(Add(Add(b0, ShiftLeft(b1, 8)), Add(ShiftLeft(b2, 16), ShiftLeft(b3, 24))))
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    PrintMessage("[DemuxWAV] starting\n")
+
+    // Parse args via UtilArgs schema
+    schema = DW_BuildSchema()
+    args = UtilArgs_ParseCLI(schema)
+    IfCondition EqualTo(args, 0) ThenBlock: {
+        PrintMessage("[DemuxWAV] argument error\n")
+        SystemCall(DWSys.SYS_EXIT, 1)
+    }
+
+    filepath   = UtilArgs_GetString(args, "file")
+    ring_name  = UtilArgs_GetString(args, "ring")
+    clock_name = UtilArgs_GetString(args, "clock")
+
+    PrintMessage("[DemuxWAV] file: ")
+    PrintString(filepath)
+    PrintMessage("\n[DemuxWAV] ring: ")
+    PrintString(ring_name)
+    PrintMessage("\n[DemuxWAV] clock: ")
+    PrintString(clock_name)
+    PrintMessage("\n")
+
+    // Open the WAV file
+    wav_fd = SystemCall(DWSys.SYS_OPEN, filepath, DWSys.O_RDONLY, 0)
+    IfCondition LessThan(wav_fd, 0) ThenBlock: {
+        PrintMessage("[DemuxWAV] cannot open file\n")
+        SystemCall(DWSys.SYS_EXIT, 1)
+    }
+
+    // Read the header (first 44 bytes minimum for standard WAV)
+    hdr = Allocate(128)
+    hdr_bytes = SystemCall(DWSys.SYS_READ, wav_fd, hdr, 128, 0, 0, 0)
+    IfCondition LessThan(hdr_bytes, 44) ThenBlock: {
+        PrintMessage("[DemuxWAV] header too short\n")
+        SystemCall(DWSys.SYS_EXIT, 1)
+    }
+
+    // Verify RIFF header: bytes 0-3 = "RIFF", bytes 8-11 = "WAVE"
+    r0 = GetByte(hdr, 0)
+    r1 = GetByte(hdr, 1)
+    r2 = GetByte(hdr, 2)
+    r3 = GetByte(hdr, 3)
+    IfCondition Not(And(And(EqualTo(r0, 82), EqualTo(r1, 73)), And(EqualTo(r2, 70), EqualTo(r3, 70)))) ThenBlock: {
+        PrintMessage("[DemuxWAV] not a RIFF file\n")
+        SystemCall(DWSys.SYS_EXIT, 1)
+    }
+    w0 = GetByte(hdr, 8)
+    w1 = GetByte(hdr, 9)
+    w2 = GetByte(hdr, 10)
+    w3 = GetByte(hdr, 11)
+    IfCondition Not(And(And(EqualTo(w0, 87), EqualTo(w1, 65)), And(EqualTo(w2, 86), EqualTo(w3, 69)))) ThenBlock: {
+        PrintMessage("[DemuxWAV] not a WAVE file\n")
+        SystemCall(DWSys.SYS_EXIT, 1)
+    }
+
+    // Find fmt chunk — scan from offset 12
+    scan_pos = 12
+    audio_fmt = 0
+    channels = 0
+    sample_rate = 0
+    bits_per_sample = 0
+    block_align = 0
+    data_start = 0
+    data_size = 0
+
+    // Scan chunks
+    WhileLoop LessThan(scan_pos, hdr_bytes) {
+        c0 = GetByte(hdr, scan_pos)
+        c1 = GetByte(hdr, Add(scan_pos, 1))
+        c2 = GetByte(hdr, Add(scan_pos, 2))
+        c3 = GetByte(hdr, Add(scan_pos, 3))
+        chunk_size = DW_ReadLE32(hdr, Add(scan_pos, 4))
+
+        // "fmt " = 0x66 0x6D 0x74 0x20
+        IfCondition And(And(EqualTo(c0, 102), EqualTo(c1, 109)), And(EqualTo(c2, 116), EqualTo(c3, 32))) ThenBlock: {
+            audio_fmt       = DW_ReadLE16(hdr, Add(scan_pos, 8))
+            channels        = DW_ReadLE16(hdr, Add(scan_pos, 10))
+            sample_rate     = DW_ReadLE32(hdr, Add(scan_pos, 12))
+            block_align     = DW_ReadLE16(hdr, Add(scan_pos, 20))
+            bits_per_sample = DW_ReadLE16(hdr, Add(scan_pos, 22))
+
+            PrintMessage("[DemuxWAV] fmt: ")
+            PrintNumber(audio_fmt)
+            PrintMessage(" ch=")
+            PrintNumber(channels)
+            PrintMessage(" rate=")
+            PrintNumber(sample_rate)
+            PrintMessage(" bps=")
+            PrintNumber(bits_per_sample)
+            PrintMessage("\n")
+        }
+
+        // "data" = 0x64 0x61 0x74 0x61
+        IfCondition And(And(EqualTo(c0, 100), EqualTo(c1, 97)), And(EqualTo(c2, 116), EqualTo(c3, 97))) ThenBlock: {
+            data_start = Add(scan_pos, 8)
+            data_size = chunk_size
+            PrintMessage("[DemuxWAV] data: offset=")
+            PrintNumber(data_start)
+            PrintMessage(" size=")
+            PrintNumber(data_size)
+            PrintMessage("\n")
+        }
+
+        // Advance to next chunk (8 bytes header + chunk_size, word-aligned)
+        scan_pos = Add(scan_pos, Add(8, chunk_size))
+        // Word-align
+        IfCondition EqualTo(BitwiseAnd(scan_pos, 1), 1) ThenBlock: {
+            scan_pos = Add(scan_pos, 1)
+        }
+    }
+
+    IfCondition EqualTo(data_size, 0) ThenBlock: {
+        PrintMessage("[DemuxWAV] no data chunk found\n")
+        SystemCall(DWSys.SYS_EXIT, 1)
+    }
+
+    // Open (create) the audio PacketRing
+    ring = PacketRing_Create(ring_name, DWConst.RING_CAPACITY)
+    IfCondition EqualTo(ring, 0) ThenBlock: {
+        PrintMessage("[DemuxWAV] failed to create ring\n")
+        SystemCall(DWSys.SYS_EXIT, 1)
+    }
+
+    // Open the PlaybackClock
+    clock = PlaybackClock_Open(clock_name)
+    IfCondition EqualTo(clock, 0) ThenBlock: {
+        PrintMessage("[DemuxWAV] failed to open clock\n")
+        SystemCall(DWSys.SYS_EXIT, 1)
+    }
+
+    // Write stream info to stdout for presenter to read
+    // Format: "audio <codec_id> <sample_rate> <channels> <bits_per_sample> <duration_usec>"
+    // For WAV, codec_id = 1 (PCM)
+    // Duration = data_size / (sample_rate * channels * bits_per_sample/8) * 1000000
+    bytes_per_sample = Divide(bits_per_sample, 8)
+    frame_size = Multiply(channels, bytes_per_sample)
+    total_frames = Divide(data_size, frame_size)
+    duration_usec = Divide(Multiply(total_frames, 1000000), sample_rate)
+
+    PrintMessage("[DemuxWAV] duration: ")
+    PrintNumber(Divide(duration_usec, 1000000))
+    PrintMessage("s total_frames=")
+    PrintNumber(total_frames)
+    PrintMessage("\n")
+
+    // Seek to data start if needed (we already read 128 bytes of header)
+    // The data chunk may start at various offsets
+    // We have already consumed `hdr_bytes` from the file
+    // data_start is the offset within those bytes where data begins
+    // If data_start < hdr_bytes, some data is already in hdr buf
+    // For simplicity, re-read from data start with lseek
+    // SYS_LSEEK = 8
+    SystemCall(8, wav_fd, data_start, 0, 0, 0, 0)
+
+    // Main demux loop: read chunks of PCM, compute PTS, write to ring
+    read_buf = Allocate(DWConst.PKT_CHUNK_SIZE)
+    bytes_sent = 0
+    ts_wait = Allocate(16)
+    StoreValue(ts_wait, 0)
+    StoreValue(Add(ts_wait, 8), 1000000)
+
+    WhileLoop LessThan(bytes_sent, data_size) {
+        // Check clock state
+        state = PlaybackClock_GetState(clock)
+
+        IfCondition EqualTo(state, PCState.STOPPED) ThenBlock: {
+            PrintMessage("[DemuxWAV] clock STOPPED, exiting\n")
+            // break out — jump to cleanup
+            bytes_sent = data_size
+        }
+
+        IfCondition EqualTo(state, PCState.PAUSED) ThenBlock: {
+            // Wait 1ms and check again
+            SystemCall(DWSys.SYS_NANOSLEEP, ts_wait, 0)
+        }
+
+        IfCondition EqualTo(state, PCState.SEEKING) ThenBlock: {
+            // Seek to target
+            target = PlaybackClock_GetSeekTarget(clock)
+            // Convert target_usec to byte offset
+            target_frame = Divide(Multiply(target, sample_rate), 1000000)
+            target_byte = Multiply(target_frame, frame_size)
+            // Clamp
+            IfCondition GreaterThan(target_byte, data_size) ThenBlock: {
+                target_byte = data_size
+            }
+            // Align to frame boundary
+            target_byte = Multiply(Divide(target_byte, frame_size), frame_size)
+            // Seek in file
+            SystemCall(8, wav_fd, Add(data_start, target_byte), 0, 0, 0, 0)
+            bytes_sent = target_byte
+            // Flush the ring
+            PacketRing_Reset(ring)
+            // Signal seek done
+            PlaybackClock_SeekDone(clock)
+            PrintMessage("[DemuxWAV] seeked to ")
+            PrintNumber(Divide(target, 1000000))
+            PrintMessage("s\n")
+        }
+
+        IfCondition Or(EqualTo(state, PCState.PLAYING), EqualTo(state, PCState.SEEKING)) ThenBlock: {
+            // Only feed when PLAYING
+            IfCondition EqualTo(state, PCState.PLAYING) ThenBlock: {
+                // Calculate how much to read
+                remaining = Subtract(data_size, bytes_sent)
+                chunk = DWConst.PKT_CHUNK_SIZE
+                IfCondition GreaterThan(chunk, remaining) ThenBlock: {
+                    chunk = remaining
+                }
+
+                IfCondition GreaterThan(chunk, 0) ThenBlock: {
+                    n = SystemCall(DWSys.SYS_READ, wav_fd, read_buf, chunk, 0, 0, 0)
+                    IfCondition LessEqual(n, 0) ThenBlock: {
+                        // EOF or error
+                        bytes_sent = data_size
+                    }
+                    IfCondition GreaterThan(n, 0) ThenBlock: {
+                        // Compute PTS for this chunk
+                        frames_so_far = Divide(bytes_sent, frame_size)
+                        pts_usec = Divide(Multiply(frames_so_far, 1000000), sample_rate)
+
+                        // Try to write to ring
+                        wrote = PacketRing_Write(ring, read_buf, n, pts_usec, PRPktFlag.NONE)
+                        IfCondition EqualTo(wrote, 0) ThenBlock: {
+                            // Ring full — backpressure, wait 1ms and retry
+                            SystemCall(DWSys.SYS_NANOSLEEP, ts_wait, 0)
+                        }
+                        IfCondition EqualTo(wrote, 1) ThenBlock: {
+                            bytes_sent = Add(bytes_sent, n)
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Signal EOF
+    PacketRing_SignalEOF(ring)
+    PrintMessage("[DemuxWAV] finished, sent ")
+    PrintNumber(bytes_sent)
+    PrintMessage(" bytes\n")
+
+    // Cleanup
+    Deallocate(read_buf, DWConst.PKT_CHUNK_SIZE)
+    Deallocate(ts_wait, 16)
+    Deallocate(hdr, 128)
+    SystemCall(DWSys.SYS_CLOSE, wav_fd, 0, 0, 0, 0, 0)
+    PlaybackClock_Close(clock)
+    // Don't destroy the ring — presenter owns cleanup
+
+    SystemCall(DWSys.SYS_EXIT, 0)
+}
+
+RunTask(Main)
