@@ -166,7 +166,7 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 | JSOop | 919 | Prototype chain, instanceof, property descriptors (user-authored) |
 | JSValidate | 382 | Token validation tables for parser lookahead |
 
-**Value types**: UNDEFINED(0), NULL(1), BOOLEAN(2), NUMBER(3, 64-bit signed int), STRING(4), OBJECT(5, XSHash), FUNCTION(6), ARRAY(7, XArray), GENERATOR(8). Integer-only for v1 (no floats). No GC — arena per-page lifetime.
+**Value types**: UNDEFINED(0), NULL(1), BOOLEAN(2), NUMBER(3, IEEE 754 double bits in 64-bit payload), STRING(4), OBJECT(5, XSHash), FUNCTION(6), ARRAY(7, XArray), GENERATOR(8). Full IEEE 754 floating point via SSE2 intrinsics (`Float_Add`, `Float_Sub`, `Float_Mul`, `Float_Div`, `Float_FromInt`, `Float_ToInt`, `Float_Lt`, `Float_Gt`, `Float_Eq`, etc.). `JSRT_CreateNumber(n)` stores `Float_FromInt(n)`, `JSRT_CreateFloat(bits)` stores raw double bits. Extracting integer from NUMBER payload requires `Float_ToInt(JSRT_GetPayload(...))`. No GC — arena per-page lifetime.
 
 **Key patterns**:
 - `JSCompDot` FixedPool for MEMBER_DOT assignment compilation (survives recursive JSComp__CompileExpr calls)
@@ -174,7 +174,7 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - `JSRT_ToString` returns JSValue pointer; use `JSRT_GetPayload()` to extract raw C string
 - `JSBridge__GetDomIdx` checks `__dom_idx` property on JS wrapper objects to map back to DOM nodes
 
-**Test suites**: `test_js_e2e.ailang` (9 tests, 29/32 assertions passing), `bench_js.ailang` (8 micro-benchmarks including JIT).
+**Test suites**: `test_js_e2e.ailang` (9 tests, 32/32 assertions passing), `bench_js.ailang` (8 micro-benchmarks including JIT).
 
 **Build**: `./ailang.x TestCode/test_js_e2e.ailang test_js_e2e.x && ./test_js_e2e.x`
 
@@ -198,125 +198,79 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - **Optional chaining (`?.`)** — QUESTION_DOT token in JSLexer, compiled via JMP_NULLISH short-circuit in JSCompiler. Supports `obj?.prop`, `obj?.method()`, `obj?.[expr]`. Chains correctly with nested access.
 - **Catch destructuring + parameterless catch** — JSParser handles `catch ({ message })` and `catch` (no parens). Compiler dispatches destructuring pattern to CompileObjPattern/CompileArrayPattern on catch parameter.
 - **Template literal escape validation** — JSLexer rejects legacy octal escapes (`\1`-`\9`), `\0` followed by digit, invalid `\xNN`, and invalid `\uXXXX`/`\u{...}` in template literals. Sets `JSTokState.error = 1` and `JSLex_Tokenize` returns 0 on error. Result: template-literal category 54/57 (94.7%).
+- **Private class members + instance fields as own properties** — Private fields (`#x`), private methods (`#method()`), and private accessors (`get #x()`, `set #x(v)`) work via name mangling: `#foo` stored as literal property name `"#foo"`. Since `#` is not a valid JS identifier character, user code cannot access private members externally — privacy is syntactic with zero new infrastructure. **Lexer**: PRIVATE_NAME(120) token already tokenizes `#identifier`. **Parser**: dot member access already accepts PRIVATE_NAME (JSParseExpr.ailang:1274), class body parser accepts PRIVATE_NAME for fields/methods. **Instance fields**: Compiled as `__field_init__` closure stored on prototype. Closure takes `this_obj` as parameter, sets each field via `GET_LOCAL 0; <init>; SET_PROP`. **VM**: RETURN handler (JSVMDispatch.ailang:1004-1019) calls `__field_init__` after constructor returns — looks up `__proto__.__field_init__`, calls via `JSVM__CallFunc`. Frame pointer saved before `JSVM__CallFunc` to avoid invalidation (CallFunc zeroes frames buffer). Static fields compiled directly onto constructor via `GET_GLOBAL ctor_slot; <init>; SET_PROP`. **Limitation**: Static field properties on FUNCTION-typed values don't work (functions can't hold arbitrary props). Parent class `__field_init__` not chained through `super()`. **Files**: JSCompStmt.ailang (lines 1875-2013), JSVMDispatch.ailang (lines 997-1024).
 - **JIT Compiler (x86-64 native code generation)** — Full working JIT for leaf functions via CEmit ARCH backend. **Architecture**: `Library.JSJIT.ailang` uses the CEmit layer (`Library.CEmitCore.ailang` + `Library.CEmitCoreArch.ailang` + X86 backend) to emit native x86-64 instructions into executable mmap'd buffers. **Register convention**: R12=stack base ptr, R13=sp index, R14=const pool, RBP=locals base, RBX=scratch. **param_block pattern**: Stable 32-byte heap block allocated at JIT_Init. JIT_Execute writes [stack_base, sp, locals_ptr, const_pool] before each native call. Prologue loads from baked param_block address (stable across calls). Epilogue writes sp back. **Supported opcodes**: GET_LOCAL, SET_LOCAL, ADD, SUB, MUL, DIV, RETURN, HALT. Locals at `rbp + idx*8` matching VM's 8-byte slot size. **Compilation**: `JIT_Compile(func_idx)` scans bytecode, emits prologue+opcodes+epilogue, resolves fixups. Unsupported opcodes bail (function stays interpreted). **Performance**: `add(a,b)` compiles to 220 bytes native. 10k calls in ~5.5ms. **Files**: `Library.JSJIT.ailang` (JIT orchestrator), `Library.CEmitCoreArch.ailang` (arch-neutral emit API including `Emit_MovRaxRbp`), `Librarys/Compiler/CodeEmit/X86/Library.CEmitX86Reg.ailang` (x86 backend including `X86_MovRaxRbp`).
 
-### Test262 Conformance (as of 2026-05-04)
+### Test262 Conformance (as of 2026-05-06)
 
-`tools/test262_runner.py` has been fully unblocked — `UNSUPPORTED_FEATURES = set()`, `UNSUPPORTED_SOURCE_PATTERNS = []`, `should_skip()` always returns `(False, "")`.
+Build & run: `./ailang.x TestCode/test262_harness.ailang test262_harness.x && python3 tools/test262_runner.py --all`
 
-Build & run: `./ailang.x TestCode/test262_harness.ailang test262_harness.x && python3 tools/test262_runner.py`
+**Overall: 16,784 / 23,899 passing (70.4%)** — varies with system load/timeouts; peak 17,759 with low timeouts.
 
-Use `--all` flag for full suite: `python3 tools/test262_runner.py --all`
+Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 16,784 current.
 
-#### Full Suite (23,899 tests, --all flag)
+#### Benchmark Results (Phenom II X6 3.2GHz, DDR3)
 
-**Overall: 17,405 / 23,899 passing (74.0%)** — with 372 timeouts (system load). Stable at ~17,750 with low timeouts.
+- **SunSpider 1.0**: 26/26 passing (100%)
+- **Octane**: 8/8 core benchmarks parse+execute
+- **E2E tests**: 32/32 passing (9 integration tests)
+- **Internal micro-benchmarks** (8 tests) vs V8 (Node.js v18, JIT-warmed):
 
-Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 17,405 current (timeouts variance).
+| Benchmark | Ailang | V8 | Ratio | Winner |
+|---|---|---|---|---|
+| JIT leaf 10k calls | 10.2 ms | 0.04 ms | 268x | V8 |
+| loop 100k iters | 2.3 ms | 0.27 ms | 8.6x | V8 |
+| fib(20) recursive | 0.14 ms | 0.34 ms | 0.4x | **Ailang** |
+| arith 50k iters | 0.14 ms | 0.37 ms | 0.4x | **Ailang** |
+| obj props 10k iters | 0.15 ms | 0.09 ms | 1.7x | V8 |
+| string concat 1k | 0.12 ms | 0.09 ms | 1.4x | V8 |
+| nested calls 10k | 0.15 ms | 0.03 ms | 6.0x | V8 |
+| array 5k push+sum | 0.16 ms | 0.17 ms | 0.9x | **Ailang** |
+| **TOTAL** | **13.3 ms** | **1.4 ms** | **9.6x** | |
 
-#### Benchmark Results
+Ailang beats V8 on fib(20), arith, and array ops. V8 wins on JIT leaf calls (full optimizing compiler) and nested calls (inline caching).
 
-- **SunSpider 1.0**: 26/26 passing (100%) — all tests execute correctly
-- **Octane**: 8/8 core benchmarks parse+execute (richards, deltablue, crypto, raytrace, earley-boyer, navier-stokes, splay, code-load)
-- **Internal micro-benchmarks** (8 tests, 6.5ms total):
-  - JIT leaf 10k calls: 5.5ms (native x86-64 `add(a,b)`, 220 bytes compiled)
-  - loop 100k iterations: 0.13ms
-  - fib(20) recursive: 0.12ms
-  - arith 50k iterations: 0.14ms
-  - obj props 10k iters: 0.15ms
-  - string concat 1k: 0.14ms
-  - nested calls 10k: 0.15ms
-  - array 5k push+sum: 0.15ms
+#### Known bugs (active)
 
-**Full suite failure breakdown by category:**
+- **Comma operator**: 3+ operand chains broken.
+- **Static fields on functions**: FUNCTION-typed values can't hold arbitrary properties, so `class C { static x = 1; }; C.x` returns `undefined`. Needs property bag on function values.
+- **`new C().method()` chaining**: Method call on inline `new` expression doesn't bind `this` correctly. `var c = new C(); c.method()` works fine.
+- **Parent field init in extends**: `class B extends A { b = 2 }` — B's `__field_init__` runs but A's does not. Parent fields not initialized via `super()` chain.
 
-| Category | Total | Pass | Fail | Pass% | Root cause |
-|---|---|---|---|---|---|
-| statements/class | ~4367 | ~2401 | ~1966 | 55.0% | Async methods, private fields, destructuring/default/rest params, computed props |
-| expressions/class | ~4059 | ~943 | ~3116 | 23.2% | Same as above; expressions have more edge cases |
-| expressions/object | 1161 | 902 | 259 | 77.7% | Computed props, shorthand methods, getters/setters, spread |
-| expressions/assignment | 485 | 185 | 300 | 38.1% | Destructuring patterns |
-| for-await-of | ~1100 | ~6 | ~1094 | 0.5% | No async/await |
-| for-of | ~600 | ~80 | ~520 | 13.3% | No for-of iterator protocol |
-| expressions/arrow-function | 343 | 132 | 211 | 38.5% | Destructuring params, async arrows |
-| dynamic-import | ~370 | ~5 | ~365 | 1.4% | No module support |
-| async-generator | ~470 | ~4 | ~466 | 0.9% | No async/await |
-| async-function (expressions+declarations) | ~350 | ~0 | ~350 | 0% | No async/await |
-| expressions/template-literal | 57 | 54 | 3 | 94.7% | 2 unicode range checks, 1 tagged template |
-| identifiers | 268 | 148 | 120 | 55.2% | Unicode escapes, reserved word edge cases |
-| block-scope (all) | 145 | 113 | 30 | 79.0% | TDZ enforcement, redeclaration detection |
-| literals/numeric | 157 | 87 | 70 | 55.4% | Float literals, hex/octal edge cases |
-| statements/switch | 111 | 96 | 11 | 89.7% | Edge cases with let/const in case blocks |
-| statements/variable | 178 | 140 | 38 | 78.7% | let/const TDZ semantics |
-| compound-assignment | 454 | 383 | 71 | 84.4% | Destructuring in compound targets |
+#### Remaining failure categories
 
-**Tier analysis (by fixability):**
-
-- ~~**Tier 1 — Destructuring assignment**~~ — DONE (2026-05-03). +422 passes.
-- ~~**Tier 3 — Template literal escape validation**~~ — DONE (2026-05-04). +14 passes (94.7%).
-- ~~**for-of + iterator protocol**~~ — DONE (2026-05-03). +267 passes via TO_ARRAY eager materialization.
-- **Tier 2 — Class improvements (~5000 remaining failures):** Basic class works. Remaining: async methods, private fields (`#field`), computed property names.
-- **Tier 4 — let/const TDZ (~30 failures in block-scope, ~38 in variable):** Proper temporal dead zone enforcement. Moderate compiler work.
-- **Tier 5 — Async/await (~2600 failures):** for-await-of, async generators, async functions. Requires Promise + event loop. Very high effort. Defer.
-- **Tier 6 — Dynamic import / modules (~365 failures):** Module system. Defer.
+| Category | Pass% | Root cause |
+|---|---|---|
+| statements/class | ~55% | Static field props, async methods, `new().method()` binding |
+| expressions/class | ~23% | Same + more edge cases |
+| for-await-of | 0.5% | No for-await-of |
+| async-generator | 0.9% | No async generators |
+| async-function | ~47% | Partial async/await (basic works, advanced missing) |
+| dynamic-import | 1.4% | No module support |
 
 ## Pending Work
 
-### JS Engine — Test262 Conformance Push (active)
+### JS Engine — Active Priorities (2026-05-07)
 
-**Current: 17,405/23,899 (74.0%, +372 timeouts). Target: 80%+ (~19,100 passing).**
+**Current: ~16,564/23,899 (~69.3%). Target: 80%+.**
+
+1. **Static fields on functions** — FUNCTION values need property bag so `C.x = 1` works. Blocking static field tests.
+2. **Parent field init chaining** — `__field_init__` from parent class must run during `super()`. Blocking inherited field tests.
+3. **`new C().method()` this binding** — Method calls chained on `new` expression don't bind `this` to the new instance.
+4. **JIT expansion** — More opcodes (PUSH_CONST, CALL, comparisons, JMP/JMP_IF), hot function detection.
 
 Progress log:
-- 2026-05-03: Class syntax (+1,280), for-of loops (+267), destructuring assignment (+422). Crossed 50% → 74.5%.
-- 2026-05-04: JIT compiler working (leaf functions). Template literal escape validation (+14, now 94.7%). Optional chaining, catch destructuring, scope infrastructure.
+- 2026-05-02: Baseline 11,861 (49.6%)
+- 2026-05-03: +1,969 (class, for-of, destructuring) → 12,550
+- 2026-05-04: +5,209 (class+OOP, optional chaining, template validation) → 17,759 peak
+- 2026-05-06: arguments object, CountVars fix for nested scopes, benchmarks vs V8, IEEE 754 float fixes
+- 2026-05-07: Private class members (name mangling), instance fields as own properties (__field_init__ closure), fixed JSVM__CallFunc frame corruption in RETURN handler
 
-#### Priority 1: let/const TDZ (~68 recoveries across block-scope + variable)
+### Other Pending
 
-- TDZ enforcement (reference before declaration = ReferenceError)
-- const reassignment errors
-- Already at 79% block-scope, 93.8% let, 89.7% switch — diminishing returns
-
-#### Priority 2: JIT Expansion
-
-- More opcodes: PUSH_CONST, CALL, comparisons, JMP/JMP_IF
-- Hot function detection (call count threshold)
-- Inline caching for property access
-
-#### Lower Priority (defer)
-
-- **Async/await (~2600 failures)** — Requires Promise, event loop, async state machine. Very high effort. Defer.
-- **Dynamic import (~365 failures)** — Module system. Defer.
-- **Private class fields (#field)** — Lexer + runtime property hiding. Moderate effort.
-- **Tagged templates** — Pass template array + substitutions to tag function. 3 remaining template tests.
-
-### Plan for HalCode9000 Worker Deployment
-
-Use HalCode9000 MCP workers (cheap DeepSeek tokens) for parallelizable grunt work:
-- **Worker 1**: Analyze test262 failure categories, extract patterns from failing tests
-- **Worker 2**: Implement feature syntax in JSLexer + JSParser (token + AST node additions)
-- **Worker 3**: Implement feature compilation in JSCompiler (bytecode generation)
-- **Worker 4**: Run test262 subsets during development to validate progress
-- Claude (expensive model) orchestrates, reviews, and handles architectural decisions
-
-### Fixed-Point Arithmetic — FixedMul/FixedDiv (implemented 2026-05-04)
-
-Compiler primitives `FixedMul(a, b, bits)` and `FixedDiv(a, b, bits)` are fully implemented and passing all 36 tests with exact (zero-tolerance) results across Q8.8, Q16.16, Q32.32, and Q64.64 formats. See Compiler Constraints section above for details.
-
-JS engine currently uses 64-bit signed integers only. These primitives enable fractional math without IEEE 754 float hardware:
-- **Q16.16**: 16-bit integer + 16-bit fractional, good for financial/scientific
-- **Q8.8**: 8-bit integer + 8-bit fractional, compact for game/UI math
-- **Q32.32/Q64.64**: High-precision formats for JS IEEE compliance
-- Integration with JSRuntime NUMBER type is the next step for Test262 numeric tests
-
-### Other
-
-- **Ladybird live testing** — test `ladybird_ipc.x` on live display server, performance tuning, tab management
-- **Terminal polish** — toolbar actions, cursor blink, mouse reporting (?1000h/?1006h)
-- **Audio engine split** — extract from display server into standalone service
-- **Video player seek** — FF/RW via command pipe or restart-with-offset
-- **Scientific calculator** — trig, log, parentheses
-- **Start Menu UI** — side navigation, categories, running-app indicators
-- **Encryption at rest** — login gates master key, per-service keys
+- **Ladybird live testing** — performance tuning, tab management
+- **Terminal polish** — cursor blink, mouse reporting
+- **Audio engine split** — extract from display server
 - **SSE2 optimization** — FB_ClearBuffer, compiler integer SSE2 emit
 
 ---

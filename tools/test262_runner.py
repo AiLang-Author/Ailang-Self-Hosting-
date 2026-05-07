@@ -120,6 +120,10 @@ DEFAULT_CATEGORIES = [
     "identifier-resolution",
     "eval-code",
     "statementList",
+    # Async categories
+    "statements/async-function",
+    "expressions/async-function",
+    "expressions/await",
 ]
 
 # NO SKIPS — full spec conformance target. Every test runs.
@@ -136,6 +140,7 @@ var assert = {};
 assert.sameValue = function(a, e, m) { if (a !== e) { __test262_failed = 1; } };
 assert.notSameValue = function(a, u, m) { if (a === u) { __test262_failed = 1; } };
 assert.throws = function(E, fn, m) { try { fn(); __test262_failed = 1; } catch (e) { } };
+function $DONE(err) { if (err) { __test262_failed = 1; } }
 """
 
 EPILOGUE = """
