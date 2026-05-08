@@ -312,8 +312,20 @@ def preprocess(source):
 # RUNNER
 # =============================================================================
 
-def discover_tests(test262_dir, categories, discover_all=False):
-    """Yield .js test file paths for the given categories (or all if discover_all)."""
+def discover_tests(test262_dir, categories, discover_all=False, discover_full=False):
+    """Yield .js test file paths for the given categories, all language, or full suite."""
+    if discover_full:
+        # Full suite: language + built-ins + annexB + staging (skip intl402)
+        test_root = Path(test262_dir) / "test"
+        for subdir in ["language", "built-ins", "annexB", "staging"]:
+            sub_path = test_root / subdir
+            if not sub_path.exists():
+                continue
+            for js_file in sorted(sub_path.rglob("*.js")):
+                if js_file.name.startswith("_"):
+                    continue
+                yield str(js_file)
+        return
     test_root = Path(test262_dir) / "test" / "language"
     if discover_all:
         for js_file in sorted(test_root.rglob("*.js")):
@@ -417,9 +429,16 @@ def run_test(harness, test_path, timeout, verbose=False):
 # =============================================================================
 
 def categorize_path(test_path, test262_dir):
-    """Extract category from test path (e.g. 'statements/if')."""
-    rel = os.path.relpath(test_path, os.path.join(test262_dir, "test", "language"))
+    """Extract category from test path (e.g. 'language/statements/if')."""
+    rel = os.path.relpath(test_path, os.path.join(test262_dir, "test"))
     parts = rel.split(os.sep)
+    # For language tests: language/statements/if -> statements/if
+    if parts[0] == "language" and len(parts) >= 3:
+        return f"{parts[1]}/{parts[2]}"
+    # For built-ins: built-ins/Array/prototype -> built-ins/Array
+    if parts[0] == "built-ins" and len(parts) >= 3:
+        return f"built-ins/{parts[1]}"
+    # For annexB, staging, etc: annexB/subdir -> annexB/subdir
     if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
     return parts[0]
@@ -524,6 +543,8 @@ def main():
                         help="In verbose mode, only show failures")
     parser.add_argument("--all", action="store_true",
                         help="Run ALL tests under test/language/ (not just default categories)")
+    parser.add_argument("--full", action="store_true",
+                        help="Run FULL suite: language + built-ins + annexB + staging (~50K tests)")
     parser.add_argument("--jobs", "-j", type=int, default=0,
                         help="Parallel workers (0=auto, 1=sequential)")
     args = parser.parse_args()
@@ -543,7 +564,7 @@ def main():
     njobs = args.jobs if args.jobs > 0 else os.cpu_count() or 4
 
     # Discover tests
-    test_files = list(discover_tests(args.test262, categories, discover_all=args.all))
+    test_files = list(discover_tests(args.test262, categories, discover_all=args.all, discover_full=args.full))
     if not test_files:
         print("No test files found for specified categories.", file=sys.stderr)
         sys.exit(1)
