@@ -43,7 +43,7 @@ FixedPool.JSRTConst {
     "MAX_TIMERS":    Initialize=32
     "TIMER_SIZE":    Initialize=32
     "NATIVE_SIZE":   Initialize=24
-    "FUNC_DESC_SZ":  Initialize=72
+    "FUNC_DESC_SZ":  Initialize=64
     "STR_BUF_CAP":   Initialize=65536
 }
 
@@ -64,70 +64,6 @@ FixedPool.JSRTState {
     "next_timer_id": Initialize=1
     "str_buf":       Initialize=0
     "str_pos":       Initialize=0
-    "val_free_list": Initialize=0
-    "val_recycled":  Initialize=0
-}
-
-// =============================================================================
-// GC SCOPE LOG — tracks allocations per call frame for deferred free
-//
-// Design ("ping-pong mailbox"):
-//   - scope_log: flat array of JSValue ptrs allocated in current scope
-//   - scope_mark: stack of watermarks (one per call frame depth)
-//   - On function entry: push current log position as watermark
-//   - On function return: everything in log above the watermark is candidate
-//     for freeing (except the return value). Free the JSValue slot + backing
-//     storage (XSHash/XArray). Pop the watermark.
-//   - mailbox: ring buffer of deferred-free batches. Each batch holds for
-//     MAILBOX_HOLD turns before actual free. This lets return values survive
-//     one frame up without explicit escape tracking.
-// =============================================================================
-FixedPool.JSGCConst {
-    "LOG_CAP":       Initialize=16384
-    "MARK_CAP":      Initialize=256
-    "MAILBOX_SLOTS": Initialize=4
-    "MAILBOX_CAP":   Initialize=4096
-    "MAILBOX_HOLD":  Initialize=2
-}
-
-FixedPool.JSGC {
-    "scope_log":     Initialize=0
-    "scope_pos":     Initialize=0
-    "mark_stack":    Initialize=0
-    "mark_sp":       Initialize=0
-    "mb_ring":       Initialize=0
-    "mb_counts":     Initialize=0
-    "mb_ages":       Initialize=0
-    "mb_widx":       Initialize=0
-    "mb_enabled":    Initialize=0
-    "total_freed":   Initialize=0
-    "total_swept":   Initialize=0
-    "loop_idx":      Initialize=0
-    "loop_max":      Initialize=0
-    "collecting":    Initialize=0
-}
-
-// =============================================================================
-// NUMBER SLAB — ring buffer for transient arithmetic JSValues
-//
-// Design ("push-down slot mailbox"):
-//   - A dedicated fixed buffer for NUMBER-typed JSValues (16 bytes each)
-//   - No alloc/free — just bump cursor modulo capacity (wraps around)
-//   - Arithmetic results are consumed within 1-2 stack ops, so a ring of
-//     NUM_SLAB_CAP slots will never wrap onto a live value
-//   - Lives outside val_pool, so GC mark/sweep ignores it entirely
-//   - JSRT__FreeValue range-checks to no-op on slab addresses
-//   - FixedPool at R15 = single-instruction access to cursor/base
-// =============================================================================
-FixedPool.JSNumSlab {
-    "base":      Initialize=0
-    "cursor":    Initialize=0
-    "capacity":  Initialize=0
-    "end":       Initialize=0
-}
-
-FixedPool.JSNumSlabConst {
-    "NUM_SLAB_CAP":  Initialize=4096
 }
 
 // =============================================================================
@@ -190,94 +126,21 @@ Function.JSRT__Pop {
 
 // =============================================================================
 // VALUE POOL ALLOCATION — allocate a new 16-byte JSValue from pool
-// Returns pointer to the new JSValue, or 0 on overflow.
-// Checks free list first (recycled slots), then bump-allocates.
+// Returns pointer to the new JSValue, or 0 on overflow
 // =============================================================================
 Function.JSRT__AllocValue {
     Output: Address
     Body: {
-        // Try free list first (recycled slots from GC)
-        IfCondition NotEqual(JSRTState.val_free_list, 0) ThenBlock: {
-            addr = JSRTState.val_free_list
-            JSRTState.val_free_list = Dereference(addr)
-            StoreValue(addr, 0)
-            StoreValue(Add(addr, 8), 0)
-            JSRTState.val_recycled = Add(JSRTState.val_recycled, 1)
-            ReturnValue(addr)
-        }
-        // Bump allocate from pool
-        IfCondition GreaterEqual(JSRTState.val_count, JSRTConst.MAX_VALUES) ThenBlock: {
-            // Pool exhausted — emergency GC
-            JSRT_GC_Collect()
-            IfCondition NotEqual(JSRTState.val_free_list, 0) ThenBlock: {
-                addr = JSRTState.val_free_list
-                JSRTState.val_free_list = Dereference(addr)
-                StoreValue(addr, 0)
-                StoreValue(Add(addr, 8), 0)
-                JSRTState.val_recycled = Add(JSRTState.val_recycled, 1)
-                ReturnValue(addr)
-            }
-            ReturnValue(0)
-        }
         offset = Multiply(JSRTState.val_count, JSRTConst.VAL_SIZE)
         addr = Add(JSRTState.val_pool, offset)
         JSRTState.val_count = Add(JSRTState.val_count, 1)
+        IfCondition GreaterEqual(JSRTState.val_count, JSRTConst.MAX_VALUES) ThenBlock: {
+            JSRTState.val_count = 4
+        }
         ReturnValue(addr)
     }
 }
 
-// =============================================================================
-// VALUE FREE — recycle a 16-byte JSValue slot back to the free list.
-// Also frees backing storage (XSHash for objects, XArray for arrays).
-// Does NOT free singletons (undef, null, true, false).
-// =============================================================================
-Function.JSRT__FreeValue {
-    Input: val: Address
-    Body: {
-        save_val = val
-        IfCondition EqualTo(save_val, 0) ThenBlock: { ReturnValue(0) }
-        // Never free singletons
-        IfCondition EqualTo(save_val, JSRTState.undef_val) ThenBlock: { ReturnValue(0) }
-        IfCondition EqualTo(save_val, JSRTState.null_val) ThenBlock: { ReturnValue(0) }
-        IfCondition EqualTo(save_val, JSRTState.true_val) ThenBlock: { ReturnValue(0) }
-        IfCondition EqualTo(save_val, JSRTState.false_val) ThenBlock: { ReturnValue(0) }
-        // Never free slab values — they live in the ring buffer, not val_pool
-        IfCondition GreaterEqual(save_val, JSNumSlab.base) ThenBlock: {
-            IfCondition LessThan(save_val, JSNumSlab.end) ThenBlock: {
-                ReturnValue(0)
-            }
-        }
-
-        vtype = Dereference(save_val)
-
-        // Free backing storage based on type
-        IfCondition EqualTo(vtype, JSType.OBJECT) ThenBlock: {
-            hash = Dereference(Add(save_val, 8))
-            IfCondition NotEqual(hash, 0) ThenBlock: {
-                XSHash.XDestroy(hash)
-            }
-        }
-        IfCondition EqualTo(vtype, JSType.ARRAY) ThenBlock: {
-            arr = Dereference(Add(save_val, 8))
-            IfCondition NotEqual(arr, 0) ThenBlock: {
-                XArray.XDestroy(arr)
-            }
-        }
-        IfCondition EqualTo(vtype, JSType.STRING) ThenBlock: {
-            sptr = Dereference(Add(save_val, 8))
-            IfCondition NotEqual(sptr, 0) ThenBlock: {
-                slen = StringLength(sptr)
-                Deallocate(sptr, Add(slen, 1))
-            }
-        }
-
-        // Clear the slot and push onto free list
-        StoreValue(save_val, JSRTState.val_free_list)
-        StoreValue(Add(save_val, 8), 0)
-        JSRTState.val_free_list = save_val
-        JSGC.total_freed = Add(JSGC.total_freed, 1)
-    }
-}
 
 // =============================================================================
 // INIT — create singletons, native table, timer queue, stacks
@@ -339,376 +202,45 @@ Function.JSRT_Init {
         StoreValue(Add(fv, 8), 0)
         JSRTState.false_val = fv
 
-        // ─── Number slab ring buffer ───
-        // 4096 slots × 16 bytes = 65536 bytes
-        slab_sz = Multiply(JSNumSlabConst.NUM_SLAB_CAP, JSRTConst.VAL_SIZE)
-        JSNumSlab.base = Allocate(slab_sz)
-        MemorySet(JSNumSlab.base, 0, slab_sz)
-        JSNumSlab.capacity = JSNumSlabConst.NUM_SLAB_CAP
-        JSNumSlab.cursor = 0
-        JSNumSlab.end = Add(JSNumSlab.base, slab_sz)
-
-        // Initialize GC scope tracking
-        JSRT_GC_Init()
-
         ReturnValue(1)
     }
 }
 
-// =============================================================================
-// GC SCOPE TRACKING — ping-pong mailbox deferred free
-// =============================================================================
-
-// Initialize GC data structures
-Function.JSRT_GC_Init {
-    Body: {
-        // Scope log: flat array of JSValue pointers (16384 entries x 8 bytes)
-        log_sz = Multiply(JSGCConst.LOG_CAP, 8)
-        JSGC.scope_log = Allocate(log_sz)
-        MemorySet(JSGC.scope_log, 0, log_sz)
-        JSGC.scope_pos = 0
-
-        // Mark stack: watermarks per call depth (256 entries x 8 bytes)
-        mark_sz = Multiply(JSGCConst.MARK_CAP, 8)
-        JSGC.mark_stack = Allocate(mark_sz)
-        MemorySet(JSGC.mark_stack, 0, mark_sz)
-        JSGC.mark_sp = 0
-
-        // Mailbox ring: 4 slots x 4096 entries x 8 bytes each
-        mb_sz = Multiply(Multiply(JSGCConst.MAILBOX_SLOTS, JSGCConst.MAILBOX_CAP), 8)
-        JSGC.mb_ring = Allocate(mb_sz)
-        MemorySet(JSGC.mb_ring, 0, mb_sz)
-
-        // Per-slot counts and ages (4 entries x 8 bytes each)
-        JSGC.mb_counts = Allocate(32)
-        MemorySet(JSGC.mb_counts, 0, 32)
-        JSGC.mb_ages = Allocate(32)
-        MemorySet(JSGC.mb_ages, 0, 32)
-
-        JSGC.mb_widx = 0
-        JSGC.mb_enabled = 1
-        JSGC.total_freed = 0
-        JSGC.total_swept = 0
-    }
-}
-
-// Log a newly allocated JSValue for GC scope tracking.
-// Called from JSRT__AllocValue on every allocation.
-Function.JSRT_GC_LogAlloc {
-    Input: val: Address
-    Body: {
-        IfCondition EqualTo(JSGC.mb_enabled, 0) ThenBlock: { ReturnValue(0) }
-        IfCondition GreaterEqual(JSGC.scope_pos, JSGCConst.LOG_CAP) ThenBlock: {
-            // Log full — skip tracking (values won't be freed this cycle)
-            ReturnValue(0)
-        }
-        addr = Add(JSGC.scope_log, Multiply(JSGC.scope_pos, 8))
-        StoreValue(addr, val)
-        JSGC.scope_pos = Add(JSGC.scope_pos, 1)
-    }
-}
-
-// Push a scope watermark — called when entering a JS function (CALL handler).
-Function.JSRT_GC_ScopeBegin {
-    Body: {
-        IfCondition EqualTo(JSGC.mb_enabled, 0) ThenBlock: { ReturnValue(0) }
-        IfCondition GreaterEqual(JSGC.mark_sp, JSGCConst.MARK_CAP) ThenBlock: {
-            ReturnValue(0)
-        }
-        addr = Add(JSGC.mark_stack, Multiply(JSGC.mark_sp, 8))
-        StoreValue(addr, JSGC.scope_pos)
-        JSGC.mark_sp = Add(JSGC.mark_sp, 1)
-    }
-}
-
-// Pop a scope watermark — called on function RETURN.
-// exempt = the return value pointer (protected from future GC).
-// Rewinds the scope log but does NOT immediately free anything.
-// Actual freeing happens in JSRT_GC_Collect (triggered by pool pressure).
-Function.JSRT_GC_ScopeEnd {
-    Input: exempt: Address
-    Body: {
-        IfCondition EqualTo(JSGC.mb_enabled, 0) ThenBlock: { ReturnValue(0) }
-        IfCondition LessEqual(JSGC.mark_sp, 0) ThenBlock: { ReturnValue(0) }
-
-        // Pop watermark
-        JSGC.mark_sp = Subtract(JSGC.mark_sp, 1)
-        wm_addr = Add(JSGC.mark_stack, Multiply(JSGC.mark_sp, 8))
-        watermark = Dereference(wm_addr)
-
-        // Rewind scope log to watermark (drop tracking for this scope)
-        JSGC.scope_pos = watermark
-    }
-}
-
-// =============================================================================
-// MARK-SWEEP GC — triggered when value pool approaches capacity.
-// Walks VM stack + globals to find live values, frees everything else.
-// =============================================================================
-
-// Mark a single JSValue as live (set high bit of type tag).
-// Also recursively marks values reachable from objects and arrays.
-// CLOBBER SAFETY: Uses JSRTTmp.ptr to save val across recursive calls.
-Function.JSRT_GC_Mark {
-    Input: val: Address
-    Body: {
-        save_val = val
-        IfCondition EqualTo(save_val, 0) ThenBlock: { ReturnValue(0) }
-        // Check if within our value pool range
-        IfCondition LessThan(save_val, JSRTState.val_pool) ThenBlock: { ReturnValue(0) }
-        pool_end = Add(JSRTState.val_pool, Multiply(JSRTState.val_count, JSRTConst.VAL_SIZE))
-        IfCondition GreaterEqual(save_val, pool_end) ThenBlock: { ReturnValue(0) }
-
-        // Read type tag
-        tag = Dereference(save_val)
-        // Already marked? (high bit set = marked)
-        IfCondition GreaterEqual(tag, 256) ThenBlock: { ReturnValue(0) }
-        // Mark it (set bit 8)
-        StoreValue(save_val, Add(tag, 256))
-
-        // Recursively mark values inside objects (XSHash entries)
-        IfCondition EqualTo(tag, JSType.OBJECT) ThenBlock: {
-            hash = Dereference(Add(save_val, 8))
-            IfCondition NotEqual(hash, 0) ThenBlock: {
-                JSRT_GC_MarkHash(hash)
-            }
-            ReturnValue(0)
-        }
-
-        // Recursively mark values inside arrays (XArray entries)
-        IfCondition EqualTo(tag, JSType.ARRAY) ThenBlock: {
-            arr = Dereference(Add(save_val, 8))
-            IfCondition NotEqual(arr, 0) ThenBlock: {
-                JSRT_GC_MarkArray(arr)
-            }
-            ReturnValue(0)
-        }
-
-        // Mark function descriptor's prototype and props
-        IfCondition EqualTo(tag, JSType.FUNCTION) ThenBlock: {
-            fdesc = Dereference(Add(save_val, 8))
-            IfCondition NotEqual(fdesc, 0) ThenBlock: {
-                // Save fdesc in JSRT stack across recursive calls
-                JSRT__Push(fdesc)
-                // prototype at offset 48
-                proto = Dereference(Add(fdesc, 48))
-                IfCondition NotEqual(proto, 0) ThenBlock: {
-                    JSRT_GC_Mark(proto)
-                }
-                fdesc = JSRT__Pop()
-                JSRT__Push(fdesc)
-                // props hash at offset 64
-                phash = Dereference(Add(fdesc, 64))
-                IfCondition NotEqual(phash, 0) ThenBlock: {
-                    JSRT_GC_MarkHash(phash)
-                }
-                fdesc = JSRT__Pop()
-                // closure env at offset 40 — it's a JSValue or env ptr
-                cenv = Dereference(Add(fdesc, 40))
-                IfCondition NotEqual(cenv, 0) ThenBlock: {
-                    JSRT_GC_Mark(cenv)
-                }
-            }
-            ReturnValue(0)
-        }
-    }
-}
-
-// Mark all values stored in an XSHash (object property table).
-// CLOBBER SAFETY: Uses JSRT stack to save loop state across Mark calls.
-Function.JSRT_GC_MarkHash {
-    Input: hash: Address
-    Body: {
-        save_hash = hash
-        IfCondition EqualTo(save_hash, 0) ThenBlock: { ReturnValue(0) }
-        bucket_count = Dereference(save_hash)
-        buckets = Dereference(Add(save_hash, 16))
-        IfCondition EqualTo(buckets, 0) ThenBlock: { ReturnValue(0) }
-        bi = 0
-        WhileLoop LessThan(bi, bucket_count) {
-            node = ArrayGet(buckets, bi)
-            WhileLoop NotEqual(node, 0) {
-                // XSHash node: [key:8][value:8][next:8] = 24 bytes
-                val_in_hash = Dereference(Add(node, 8))
-                next_node = Dereference(Add(node, 16))
-                IfCondition NotEqual(val_in_hash, 0) ThenBlock: {
-                    // Save loop state across Mark call
-                    JSRT__Push(bi)
-                    JSRT__Push(bucket_count)
-                    JSRT__Push(buckets)
-                    JSRT__Push(next_node)
-                    JSRT_GC_Mark(val_in_hash)
-                    next_node = JSRT__Pop()
-                    buckets = JSRT__Pop()
-                    bucket_count = JSRT__Pop()
-                    bi = JSRT__Pop()
-                }
-                node = next_node
-            }
-            bi = Add(bi, 1)
-        }
-    }
-}
-
-// Mark all values stored in an XArray (array elements).
-// CLOBBER SAFETY: Uses JSRT stack to save loop state across Mark calls.
-Function.JSRT_GC_MarkArray {
-    Input: arr: Address
-    Body: {
-        save_arr = arr
-        IfCondition EqualTo(save_arr, 0) ThenBlock: { ReturnValue(0) }
-        size = Dereference(Add(save_arr, 8))
-        data = Dereference(Add(save_arr, 16))
-        IfCondition EqualTo(data, 0) ThenBlock: { ReturnValue(0) }
-        ai = 0
-        WhileLoop LessThan(ai, size) {
-            elem = ArrayGet(data, ai)
-            IfCondition NotEqual(elem, 0) ThenBlock: {
-                // Save loop state across Mark call
-                JSRT__Push(ai)
-                JSRT__Push(size)
-                JSRT__Push(data)
-                JSRT_GC_Mark(elem)
-                data = JSRT__Pop()
-                size = JSRT__Pop()
-                ai = JSRT__Pop()
-            }
-            ai = Add(ai, 1)
-        }
-    }
-}
-
-// Full mark-sweep collection. Called when value pool is under pressure.
-// 1. Mark phase: walk all roots (stack, globals, singletons)
-// 2. Sweep phase: free all unmarked values, recycle to free list
-// 3. Clear marks on surviving values
-// CLOBBER SAFETY: Uses JSGC.loop_idx/loop_max for loop state across Mark calls.
-Function.JSRT_GC_Collect {
-    Body: {
-        IfCondition EqualTo(JSGC.mb_enabled, 0) ThenBlock: { ReturnValue(0) }
-        // Re-entrancy guard
-        IfCondition EqualTo(JSGC.collecting, 1) ThenBlock: { ReturnValue(0) }
-        JSGC.collecting = 1
-
-        // ─── MARK PHASE ───
-
-        // Mark singletons (these must never be freed)
-        JSRT_GC_Mark(JSRTState.undef_val)
-        JSRT_GC_Mark(JSRTState.null_val)
-        JSRT_GC_Mark(JSRTState.true_val)
-        JSRT_GC_Mark(JSRTState.false_val)
-
-        // Mark VM stack (all values currently on the execution stack)
-        JSGC.loop_idx = 0
-        JSGC.loop_max = JSVMState.sp
-        WhileLoop LessThan(JSGC.loop_idx, JSGC.loop_max) {
-            sval = Dereference(Add(JSVMState.stack, Multiply(JSGC.loop_idx, 8)))
-            JSRT_GC_Mark(sval)
-            JSGC.loop_idx = Add(JSGC.loop_idx, 1)
-        }
-
-        // Mark globals (XSHash — walk all buckets)
-        IfCondition NotEqual(JSVMState.globals, 0) ThenBlock: {
-            JSRT_GC_MarkHash(JSVMState.globals)
-        }
-
-        // Mark global value slots (gvals array)
-        IfCondition NotEqual(JSVMState.gvals, 0) ThenBlock: {
-            JSGC.loop_idx = 0
-            JSGC.loop_max = JSVMState.gvar_count
-            WhileLoop LessThan(JSGC.loop_idx, JSGC.loop_max) {
-                gval = Dereference(Add(JSVMState.gvals, Multiply(JSGC.loop_idx, 8)))
-                IfCondition NotEqual(gval, 0) ThenBlock: {
-                    JSRT_GC_Mark(gval)
-                }
-                JSGC.loop_idx = Add(JSGC.loop_idx, 1)
-            }
-        }
-
-        // ─── SWEEP PHASE ───
-        JSGC.loop_idx = 0
-        JSGC.loop_max = JSRTState.val_count
-        WhileLoop LessThan(JSGC.loop_idx, JSGC.loop_max) {
-            vaddr = Add(JSRTState.val_pool, Multiply(JSGC.loop_idx, JSRTConst.VAL_SIZE))
-            tag = Dereference(vaddr)
-
-            IfCondition GreaterEqual(tag, 256) ThenBlock: {
-                // Marked — unmark (clear bit 8)
-                StoreValue(vaddr, Subtract(tag, 256))
-            } ElseBlock: {
-                // Not marked — check if it's a valid type (0-8) vs. free-list node (pointer)
-                IfCondition LessEqual(tag, 8) ThenBlock: {
-                    // Skip singletons (they should be marked, but double-check)
-                    IfCondition NotEqual(vaddr, JSRTState.undef_val) ThenBlock: {
-                    IfCondition NotEqual(vaddr, JSRTState.null_val) ThenBlock: {
-                    IfCondition NotEqual(vaddr, JSRTState.true_val) ThenBlock: {
-                    IfCondition NotEqual(vaddr, JSRTState.false_val) ThenBlock: {
-                        // Unmarked, valid type — free it
-                        JSRT__FreeValue(vaddr)
-                        JSGC.total_freed = Add(JSGC.total_freed, 1)
-                    } } } }
-                }
-            }
-            JSGC.loop_idx = Add(JSGC.loop_idx, 1)
-        }
-
-        JSGC.total_swept = Add(JSGC.total_swept, 1)
-        JSGC.collecting = 0
-    }
-}
-
-// Emergency flush — trigger full GC collection.
-// Called when value pool is exhausted and we need slots back.
-Function.JSRT_GC_FlushMailbox {
-    Body: {
-        JSRT_GC_Collect()
-    }
-}
 
 // =============================================================================
 // VALUE CREATION
 // =============================================================================
 
 // Create a NUMBER JSValue from an integer. Converts to IEEE 754 double bits.
-// Uses slab ring buffer — zero alloc, zero GC involvement.
 Function.JSRT_CreateNumber {
     Input: n: Integer
     Output: Address
     Body: {
         save_n = n
-        // Compute slab slot address: base + cursor * 16
-        addr = Add(JSNumSlab.base, Multiply(JSNumSlab.cursor, 16))
-        // Bump cursor, wrap modulo capacity
-        JSNumSlab.cursor = Add(JSNumSlab.cursor, 1)
-        IfCondition GreaterEqual(JSNumSlab.cursor, JSNumSlab.capacity) ThenBlock: {
-            JSNumSlab.cursor = 0
+        val = JSRT__AllocValue()
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            ReturnValue(0)
         }
-        // Write NUMBER tag + float bits
-        StoreValue(addr, JSType.NUMBER)
+        StoreValue(val, JSType.NUMBER)
         fbits = Float_FromInt(save_n)
-        StoreValue(Add(addr, 8), fbits)
-        ReturnValue(addr)
+        StoreValue(Add(val, 8), fbits)
+        ReturnValue(val)
     }
 }
 
 // Create a NUMBER JSValue from raw IEEE 754 double bits (no conversion).
-// Uses slab ring buffer — zero alloc, zero GC involvement.
 Function.JSRT_CreateFloat {
     Input: bits: Integer
     Output: Address
     Body: {
         save_bits = bits
-        // Compute slab slot address: base + cursor * 16
-        addr = Add(JSNumSlab.base, Multiply(JSNumSlab.cursor, 16))
-        // Bump cursor, wrap modulo capacity
-        JSNumSlab.cursor = Add(JSNumSlab.cursor, 1)
-        IfCondition GreaterEqual(JSNumSlab.cursor, JSNumSlab.capacity) ThenBlock: {
-            JSNumSlab.cursor = 0
+        val = JSRT__AllocValue()
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            ReturnValue(0)
         }
-        // Write NUMBER tag + float bits
-        StoreValue(addr, JSType.NUMBER)
-        StoreValue(Add(addr, 8), save_bits)
-        ReturnValue(addr)
+        StoreValue(val, JSType.NUMBER)
+        StoreValue(Add(val, 8), save_bits)
+        ReturnValue(val)
     }
 }
 
@@ -836,9 +368,7 @@ Function.JSRT_CreateFunc {
         }
         // Offset 40: closure_env (0 for now)
         StoreValue(Add(desc, 40), 0)
-        // Offset 48: prototype JSValue ptr (0 = none)
-        // NOTE: Default prototype is created lazily in JSRT_FuncPropGet
-        // when "prototype" is first accessed, to avoid cost for non-constructors.
+        // Offset 48: prototype JSValue ptr (0 = none) — used by class/constructor
 
         val = JSRT__AllocValue()
         IfCondition EqualTo(val, 0) ThenBlock: { ReturnValue(0) }
