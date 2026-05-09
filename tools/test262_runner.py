@@ -141,10 +141,82 @@ assert.sameValue = function(a, e, m) { if (a !== e) { __test262_failed = 1; } };
 assert.notSameValue = function(a, u, m) { if (a === u) { __test262_failed = 1; } };
 assert.throws = function(E, fn, m) { try { fn(); __test262_failed = 1; } catch (e) { } };
 function $DONE(err) { if (err) { __test262_failed = 1; } }
+function verifyProperty(obj, name, desc) {
+  if (desc === undefined) return;
+  var actual = obj[name];
+  if (desc.value !== undefined) { if (actual !== desc.value) { __test262_failed = 1; } }
+  if (desc.writable !== undefined) {
+    var old = obj[name]; obj[name] = "___test262_probe___";
+    var changed = (obj[name] !== old);
+    if (desc.writable && !changed) { __test262_failed = 1; }
+    if (!desc.writable && changed) { __test262_failed = 1; }
+    obj[name] = old;
+  }
+  if (desc.enumerable !== undefined) {
+    var found = false;
+    for (var k in obj) { if (k === name) { found = true; } }
+    if (desc.enumerable && !found) { __test262_failed = 1; }
+    if (!desc.enumerable && found) { __test262_failed = 1; }
+  }
+  if (desc.configurable !== undefined) {
+    var d2 = obj[name]; delete obj[name];
+    var deleted = (obj[name] === undefined && d2 !== undefined);
+    if (desc.configurable && !deleted) { __test262_failed = 1; }
+    if (!desc.configurable && deleted) { __test262_failed = 1; }
+    if (!desc.configurable) { obj[name] = d2; }
+  }
+}
+function verifyNotEnumerable(obj, name) {
+  for (var k in obj) { if (k === name) { __test262_failed = 1; } }
+}
+function verifyEnumerable(obj, name) {
+  var found = false;
+  for (var k in obj) { if (k === name) { found = true; } }
+  if (!found) { __test262_failed = 1; }
+}
+function verifyWritable(obj, name) {
+  var old = obj[name]; obj[name] = "___test262_w___";
+  if (obj[name] === old) { __test262_failed = 1; }
+  obj[name] = old;
+}
+function verifyNotWritable(obj, name) {
+  var old = obj[name]; obj[name] = "___test262_w___";
+  if (obj[name] !== old) { __test262_failed = 1; }
+}
+function verifyConfigurable(obj, name) {
+  var old = obj[name]; delete obj[name];
+  if (obj[name] !== undefined) { __test262_failed = 1; }
+  obj[name] = old;
+}
+function verifyNotConfigurable(obj, name) {
+  var old = obj[name]; delete obj[name];
+  if (obj[name] === undefined && old !== undefined) { __test262_failed = 1; }
+}
+function isConstructor(f) { try { new f(); return true; } catch(e) { return false; } }
+function compareArray(a, b) {
+  if (a.length !== b.length) return false;
+  for (var i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+  return true;
+}
+assert.compareArray = function(a, b, m) { if (!compareArray(a, b)) { __test262_failed = 1; } };
+if (typeof Object === "undefined") { var Object = {}; }
+if (typeof Object.hasOwn !== "function") {
+  Object.hasOwn = function(obj, key) {
+    for (var k in obj) { if (k === key) return true; }
+    return false;
+  };
+}
+if (typeof Object.prototype === "undefined") { Object.prototype = {}; }
+if (typeof Object.prototype.hasOwnProperty !== "function") {
+  Object.prototype.hasOwnProperty = function(k) {
+    for (var p in this) { if (p === k) return true; }
+    return false;
+  };
+}
 """
 
 EPILOGUE = """
-if (__test262_failed) { __force_fail__(); }
+if (__test262_failed) { throw new Error("test262 assertion failed"); }
 """
 
 TMP_FILE = "/tmp/test262_current.js"  # legacy single-thread path
