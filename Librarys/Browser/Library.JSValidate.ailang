@@ -69,6 +69,16 @@ FixedPool.JSValidDup {
     "len":      Initialize=0    // temp: current param name len
 }
 
+// Private names validation state — AllPrivateNamesValid per ES spec
+// Supports nested classes: stack of name sets (up to 8 levels)
+// Each level has up to 32 entries × 16 bytes (ptr:8 + len:8) = 512 bytes
+// Total buffer: 8 levels × 512 bytes = 4096 bytes
+FixedPool.JSValidPriv {
+    "names":    Initialize=0    // pointer to buffer: 8 levels × 32 entries × 16 bytes
+    "counts":   Initialize=0    // pointer to 8-entry array of counts (8 bytes each = 64 bytes)
+    "depth":    Initialize=0    // current nesting depth (0 = not in any class)
+}
+
 // AST walker state — iterative DFS for static semantic checks
 // Uses its own stack (not ASTStack) to avoid interference with parser
 FixedPool.JSValidWalk {
@@ -214,6 +224,14 @@ Function.JSValidate_Init {
         JSValidDup.names = Arena_Alloc(512)
         MemorySet(JSValidDup.names, 0, 512)
         JSValidDup.count = 0
+
+        // --- Private names buffer: 8 levels × 32 entries × 16 bytes = 4096 bytes ---
+        JSValidPriv.names = Arena_Alloc(4096)
+        MemorySet(JSValidPriv.names, 0, 4096)
+        // Counts array: 8 × 8 bytes = 64 bytes
+        JSValidPriv.counts = Arena_Alloc(64)
+        MemorySet(JSValidPriv.counts, 0, 64)
+        JSValidPriv.depth = 0
 
         JSValidState.initialized = 1
         ReturnValue(1)
@@ -718,5 +736,163 @@ Function.JSValidate_CheckDupParams {
         }
 
         ReturnValue(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private names scope stack — push/pop for nested classes
+// ---------------------------------------------------------------------------
+
+// Push a new private name scope (entering a class body)
+Function.JSValidate_PrivPush {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(JSValidPriv.depth, 8) ThenBlock: { ReturnValue(0) }
+        // Zero the count for this new level
+        StoreValue(Add(JSValidPriv.counts, Multiply(JSValidPriv.depth, 8)), 0)
+        JSValidPriv.depth = Add(JSValidPriv.depth, 1)
+        ReturnValue(1)
+    }
+}
+
+// Pop a private name scope (leaving a class body)
+Function.JSValidate_PrivPop {
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(JSValidPriv.depth, 0) ThenBlock: {
+            JSValidPriv.depth = Subtract(JSValidPriv.depth, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Add a declared private name to the current scope level
+// Called during class body parsing when a #name element is encountered
+Function.JSValidate_PrivAdd {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(JSValidPriv.depth, 0) ThenBlock: { ReturnValue(0) }
+        pv_level = Subtract(JSValidPriv.depth, 1)
+        pv_cnt = Dereference(Add(JSValidPriv.counts, Multiply(pv_level, 8)))
+        IfCondition GreaterEqual(pv_cnt, 32) ThenBlock: { ReturnValue(0) }
+
+        // Check not already recorded at this level (get/set pairs)
+        pv_base = Add(JSValidPriv.names, Multiply(pv_level, 512))
+        pv_ai = 0
+        pv_dup = 0
+        WhileLoop And(LessThan(pv_ai, pv_cnt), EqualTo(pv_dup, 0)) {
+            pv_slot = Add(pv_base, Multiply(pv_ai, 16))
+            IfCondition EqualTo(JSValidate__StrEq(name_ptr, name_len, Dereference(pv_slot), Dereference(Add(pv_slot, 8))), 1) ThenBlock: {
+                pv_dup = 1
+            }
+            pv_ai = Add(pv_ai, 1)
+        }
+        IfCondition EqualTo(pv_dup, 1) ThenBlock: { ReturnValue(1) }
+
+        // Store the name
+        pv_slot = Add(pv_base, Multiply(pv_cnt, 16))
+        StoreValue(pv_slot, name_ptr)
+        StoreValue(Add(pv_slot, 8), name_len)
+        StoreValue(Add(JSValidPriv.counts, Multiply(pv_level, 8)), Add(pv_cnt, 1))
+        ReturnValue(1)
+    }
+}
+
+// Check if a #name reference is declared in ANY enclosing class scope
+// Returns: 1 if found (valid), 0 if not found (error)
+Function.JSValidate_PrivLookup {
+    Input: ref_ptr: Address
+    Input: ref_len: Integer
+    Output: Integer
+    Body: {
+        pv_li = 0
+        WhileLoop LessThan(pv_li, JSValidPriv.depth) {
+            pv_cnt = Dereference(Add(JSValidPriv.counts, Multiply(pv_li, 8)))
+            pv_base = Add(JSValidPriv.names, Multiply(pv_li, 512))
+            pv_si = 0
+            WhileLoop LessThan(pv_si, pv_cnt) {
+                pv_slot = Add(pv_base, Multiply(pv_si, 16))
+                IfCondition EqualTo(JSValidate__StrEq(ref_ptr, ref_len, Dereference(pv_slot), Dereference(Add(pv_slot, 8))), 1) ThenBlock: {
+                    ReturnValue(1)
+                }
+                pv_si = Add(pv_si, 1)
+            }
+            pv_li = Add(pv_li, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSValidate_AllPrivateNamesValid — ES spec 15.7.1 Static Semantics
+// Validates that every #name reference in the class body refers to a name
+// declared in this class OR any enclosing class. Names are already collected
+// via JSValidate_PrivAdd during parsing. This function only does the walk.
+// Input: first_element — head of class body linked list (methods/fields via N_NEXT)
+// Returns: 0 if valid, 1 if invalid (undeclared #name reference found)
+// ---------------------------------------------------------------------------
+Function.JSValidate_AllPrivateNamesValid {
+    Input: first_element: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(first_element, 0) ThenBlock: { ReturnValue(0) }
+
+        // DFS walk all elements (method bodies, field initializers)
+        // Stop at: CLASS_DECL(51), CLASS_EXPR(52) — inner classes validate themselves
+        // Check: MEMBER_DOT(16), OPT_MEMBER(56) with name starting with '#'
+        JSValidWalk.sp = 0
+        JSValidWalk.result = 0
+
+        // Push all elements onto the walk stack
+        pv_cur = first_element
+        WhileLoop GreaterThan(pv_cur, 0) {
+            // Push the method body (N_BODY)
+            JSValidWalk.child = JSParse_GetBody(pv_cur)
+            JSValidWalk__Push(JSValidWalk.child)
+            // Push the field initializer (N_LEFT for CLASS_FIELD)
+            JSValidWalk.child = JSParse_GetLeft(pv_cur)
+            JSValidWalk__Push(JSValidWalk.child)
+            // Push params (N_RIGHT)
+            JSValidWalk.child = JSParse_GetRight(pv_cur)
+            JSValidWalk__Push(JSValidWalk.child)
+            pv_cur = JSParse_GetNext(pv_cur)
+        }
+
+        // DFS walk
+        WhileLoop And(GreaterThan(JSValidWalk.sp, 0), EqualTo(JSValidWalk.result, 0)) {
+            JSValidWalk.cur = JSValidWalk__Pop()
+
+            IfCondition GreaterThan(JSValidWalk.cur, 0) ThenBlock: {
+                JSValidWalk.ntype = JSParse_GetType(JSValidWalk.cur)
+
+                // Stop at class boundaries (inner classes validate themselves)
+                IfCondition And(NotEqual(JSValidWalk.ntype, 51), NotEqual(JSValidWalk.ntype, 52)) ThenBlock: {
+
+                    // Check MEMBER_DOT(16) or OPT_MEMBER(56) with private name
+                    IfCondition Or(EqualTo(JSValidWalk.ntype, 16), EqualTo(JSValidWalk.ntype, 56)) ThenBlock: {
+                        pv_ref_ptr = JSParse_GetNamePtr(JSValidWalk.cur)
+                        pv_ref_len = JSParse_GetNameLen(JSValidWalk.cur)
+                        IfCondition And(GreaterThan(pv_ref_ptr, 0), GreaterThan(pv_ref_len, 0)) ThenBlock: {
+                            IfCondition EqualTo(GetByte(pv_ref_ptr, 0), 35) ThenBlock: {
+                                // Verify declared in any enclosing class scope
+                                IfCondition EqualTo(JSValidate_PrivLookup(pv_ref_ptr, pv_ref_len), 0) ThenBlock: {
+                                    JSValidWalk.result = 1
+                                }
+                            }
+                        }
+                    }
+
+                    // Push children for further traversal
+                    IfCondition EqualTo(JSValidWalk.result, 0) ThenBlock: {
+                        JSValidWalk__PushChildren(JSValidWalk.cur)
+                    }
+                }
+            }
+        }
+
+        JSValidWalk.sp = 0
+        ReturnValue(JSValidWalk.result)
     }
 }
