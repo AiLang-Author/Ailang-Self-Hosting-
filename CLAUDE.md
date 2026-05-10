@@ -213,18 +213,18 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - **Private class members + instance fields as own properties** — Private fields (`#x`), private methods (`#method()`), and private accessors (`get #x()`, `set #x(v)`) work via name mangling: `#foo` stored as literal property name `"#foo"`. Since `#` is not a valid JS identifier character, user code cannot access private members externally — privacy is syntactic with zero new infrastructure. **Lexer**: PRIVATE_NAME(120) token already tokenizes `#identifier`. **Parser**: dot member access already accepts PRIVATE_NAME (JSParseExpr.ailang:1274), class body parser accepts PRIVATE_NAME for fields/methods. **Instance fields**: Compiled as `__field_init__` closure stored on prototype. Closure takes `this_obj` as parameter, sets each field via `GET_LOCAL 0; <init>; SET_PROP`. **VM**: RETURN handler (JSVMDispatch.ailang:1004-1019) calls `__field_init__` after constructor returns — looks up `__proto__.__field_init__`, calls via `JSVM__CallFunc`. Frame pointer saved before `JSVM__CallFunc` to avoid invalidation (CallFunc zeroes frames buffer). Static fields compiled directly onto constructor via `GET_GLOBAL ctor_slot; <init>; SET_PROP`. **Limitation**: Parent class `__field_init__` not chained through `super()`. **Files**: JSCompStmt.ailang (lines 1875-2013), JSVMDispatch.ailang (lines 997-1024).
 - **Array named properties (ArrSide)** — Arrays can now hold named properties (`a.foo = 42`). Since ARRAY JSValues store an XArray pointer at offset +8 (no room for a PropTable), a side table (`ArrSide`) maps array JSValue pointers to PropTable handles. 256-entry linear scan, 16 bytes per entry `[arr_ptr(8) | proptable_ptr(8)]`. `ArrSide_Lookup` for reads, `ArrSide_GetOrCreate` for writes (lazy PropTable allocation). Integrated into `JSRT_ObjGet` and `JSRT_ObjSet` with ARRAY type checks before the OBJECT-only rejection. Reset in `GlobalHash_Reset`. **Files**: `Library.PropTable.ailang` (ArrSide functions + state), `Library.JSRTObject.ailang` (ObjGet/ObjSet ARRAY handlers).
 - **SWAP opcode + property increment** — New SWAP opcode (value 8) swaps top two stack elements. Required for correct postfix property increment (`o.x++`) which must return the old value. **Postfix `o.x++`**: `compile(o), DUP, GET_PROP, SWAP, DUP, GET_PROP, PUSH_CONST 1, ADD, SET_PROP` → old value on stack. **Prefix `++o.x`**: `compile(o), DUP, GET_PROP, PUSH_CONST 1, ADD, SET_PROP, re-compile(o), GET_PROP` → new value. Also handles MEMBER_BRACKET via re-eval approach. **Files**: `Library.JSCompiler.ailang` (SWAP=8 in JSOp), `Library.JSVMDispatch.ailang` (Case 8 handler), `Library.JSCompExpr.ailang` (UPDATE_EXPR MEMBER_DOT/MEMBER_BRACKET handlers).
+- **Getter key stability (str_slab)** — DEF_GETTER/DEF_SETTER (opcodes 64, 65, 76, 77) now copy `__get_`/`__set_` key strings from transient `JSVMCallBuf.getter_buf` to stable `str_slab` memory via `JSRT__StrSlabAlloc` + `MemoryCopy` before passing to `JSRT_ObjSet`. Previously, PropTable stored the pointer to the shared 128-byte `getter_buf`, causing pointer-equality false matches when GET_PROP's getter check overwrote the buffer with a different key — resulting in infinite recursion on any `this.<prop>` access inside getter bodies. The JSBridge `Object.defineProperty` path was unaffected (uses per-call buffer from `JSBridgeStack.pool`). **Files**: `Library.JSVMDispatch.ailang` (cases 64, 65, 76, 77). Result: +892 tests (44,648 → 45,540).
 - **JIT Compiler (x86-64 native code generation)** — Full working JIT for leaf functions via CEmit ARCH backend. **Architecture**: `Library.JSJIT.ailang` uses the CEmit layer (`Library.CEmitCore.ailang` + `Library.CEmitCoreArch.ailang` + X86 backend) to emit native x86-64 instructions into executable mmap'd buffers. **Register convention**: R12=stack base ptr, R13=sp index, R14=const pool, RBP=locals base, RBX=scratch. **param_block pattern**: Stable 32-byte heap block allocated at JIT_Init. JIT_Execute writes [stack_base, sp, locals_ptr, const_pool] before each native call. Prologue loads from baked param_block address (stable across calls). Epilogue writes sp back. **Supported opcodes**: GET_LOCAL, SET_LOCAL, ADD, SUB, MUL, DIV, RETURN, HALT. Locals at `rbp + idx*8` matching VM's 8-byte slot size. **Compilation**: `JIT_Compile(func_idx)` scans bytecode, emits prologue+opcodes+epilogue, resolves fixups. Unsupported opcodes bail (function stays interpreted). **Performance**: `add(a,b)` compiles to 220 bytes native. 10k calls in ~5.5ms. **Files**: `Library.JSJIT.ailang` (JIT orchestrator), `Library.CEmitCoreArch.ailang` (arch-neutral emit API including `Emit_MovRaxRbp`), `Librarys/Compiler/CodeEmit/X86/Library.CEmitX86Reg.ailang` (x86 backend including `X86_MovRaxRbp`).
 
-### Test262 Conformance (as of 2026-05-09)
+### Test262 Conformance (as of 2026-05-10)
 
 Build & run: `./ailang.x TestCode/test262_harness.ailang test262_harness.x && python3 tools/test262_runner.py --all` (language only, ~24K tests) or `--full` (language + built-ins + annexB + staging, ~50K tests).
 
 **Batch harness** (fast): `./ailang.x TestCode/test262_harness_batch.ailang test262_harness_batch.x` — streams tests via stdin (4-byte LE length prefix + source), writes 1-byte results to fd 4 (original stdout saved via dup2). Runner auto-detects batch binary and uses it by default; `--no-batch` for legacy per-process mode.
 
-**Overall (language): 18,000 / 23,899 passing (75.6%)**
-**Overall (full):     43,034 / 49,998 passing (86.8%)** — 6,571 failures, 226 timeouts
+**Overall (full): 45,540 / 49,998 passing (91.8%)** — 4,068 failures, 263 timeouts
 
-Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 16,421 (stable after zero-alloc refactor) → 16,884 (statement validation + async params + static blocks) → 18,000 (TDZ scope fix, 2026-05-09).
+Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 16,421 (stable after zero-alloc refactor) → 16,884 (statement validation + async params + static blocks) → 18,000/43,034 (TDZ scope fix) → 44,648 (conservative ScanString validation, 2026-05-09) → 45,540 (getter key stability fix, 2026-05-10).
 
 #### Benchmark Results (Phenom II X6 3.2GHz, DDR3)
 
@@ -253,29 +253,33 @@ Ailang beats V8 on fib(20), arith, and array ops. V8 wins on JIT leaf calls (ful
 - **Comma operator**: 3+ operand chains broken.
 - **`new C().method()` chaining**: Method call on inline `new` expression doesn't bind `this` correctly. `var c = new C(); c.method()` works fine.
 - **Parent field init in extends**: `class B extends A { b = 2 }` — B's `__field_init__` runs but A's does not. Parent fields not initialized via `super()` chain.
-- **3d-cube hang at large CubeSize**: Full SunSpider 3d-cube (CubeSize 20→160) times out. CubeSize=20 works. Likely float arithmetic or DrawLine loop issue at larger coordinates. Under investigation.
 
-#### Remaining failure categories
+#### Remaining failure categories (4,068 failures as of 2026-05-10)
 
-| Category | Pass% | Root cause |
+| Category | Failures | Root cause |
 |---|---|---|
-| statements/class | ~65.7% | Static field props, async methods, `new().method()` binding |
-| expressions/class | ~23% | Same + more edge cases |
-| async-function | ~58.8% | Partial async/await (basic works, advanced missing) |
-| dynamic-import | ~1.4% | No module support |
-
-*Note: for-await-of and async-generator crash issues resolved by TDZ scope fix (2026-05-09). Need fresh category breakdown.*
+| class/elements | ~300 | Missing early error checks (static semantics), async generator yield*, unicode private names |
+| class/dstr | ~100 | Rest-into-object `[...{props}]` (48), computed key eval in destructuring (24), misc |
+| dynamic-import | ~335 | No module support |
+| async-generator | ~240 | yield* delegation, edge cases |
+| regexp | ~388 | Literal validation, named groups, misc |
+| expressions/object | ~154 | Edge cases |
+| Other | ~2,551 | Spread across many categories |
 
 ## Pending Work
 
-### JS Engine — Active Priorities (2026-05-09)
+### JS Engine — Active Priorities (2026-05-10)
 
-**Current: 18,000/23,899 (75.6%) language, 43,034/49,998 (86.8%) full. Target: 90%+ language.**
+**Current: 45,540/49,998 (91.8%) full. Next target: 93%+.**
 
-1. **Static fields on functions** — FUNCTION values need property bag so `C.x = 1` works. Blocking static field tests.
-2. **Parent field init chaining** — `__field_init__` from parent class must run during `super()`. Blocking inherited field tests.
-3. **`new C().method()` this binding** — Method calls chained on `new` expression don't bind `this` to the new instance.
-4. **JIT expansion** — More opcodes (PUSH_CONST, CALL, comparisons, JMP/JMP_IF), hot function detection.
+Ordered fix list (high ROI first, modules last):
+1. ~~**Fix getter key stability**~~ (~892 tests) — **DONE 2026-05-10.** DEF_GETTER/DEF_SETTER stored `__get_`/`__set_` keys in shared transient `JSVMCallBuf.getter_buf`. PropTable pointer-equality fast path matched wrong getter when buffer was overwritten by nested GET_PROP, causing infinite recursion on any `this.<prop>` access inside getter bodies. Fix: copy key to `str_slab` via `JSRT__StrSlabAlloc` + `MemoryCopy`. All 4 opcodes fixed (64, 65, 76, 77). **Files**: JSVMDispatch.ailang cases 64/65/76/77.
+2. **Static semantic checks for class elements** (~300 tests) — ContainsArguments, ContainsSuperCall in field initializers (116), AllPrivateNamesValid (76), HasDirectSuper (40), `#` whitespace/escape validation (62), field-named-constructor (8), yield-as-identifier (16), ASI (4). Implementation in JSValidate library.
+3. **Rest-into-object + computed key eval in destructuring** (~110 tests) — `[...{props}]` in CompileArrayPattern, computed property eval in CompileObjPattern.
+4. **AllPrivateNamesValid** (~56 tests) — Early error for `#name` used outside class that declares it.
+5. **Async generator fixes** (~281 tests) — yield* delegation, edge cases.
+6. **RegExp literal validation** (~174 tests) — Named groups, character class ranges, misc.
+7. **Module support** (last) — dynamic-import (~335 tests).
 
 Progress log:
 - 2026-05-02: Baseline 11,861 (49.6%)
@@ -284,7 +288,8 @@ Progress log:
 - 2026-05-06: arguments object, CountVars fix for nested scopes, benchmarks vs V8, IEEE 754 float fixes
 - 2026-05-07: Private class members (name mangling), instance fields as own properties (__field_init__ closure), fixed JSVM__CallFunc frame corruption in RETURN handler
 - 2026-05-08: Zero-alloc hot path complete — str_slab, func_slab, gen_slab, PropTable ring buffer, static backup buffers, const_val_pool cache. XSHash fully replaced by PropTable/GlobalHash. SunSpider 26/26, Kraken 14/14, Octane 15/15 all passing.
-- 2026-05-09: Array named properties (ArrSide side table), SWAP opcode + property increment (o.x++/++o.x for MEMBER_DOT/MEMBER_BRACKET), String() global fix (was overwritten by plain object), String.fromCharCode Float_ToInt fix, new Object() constructor fix, Math methods (cos/sin/sqrt/log/exp/random/PI/E/LN2). E2E 32/32, benchmarks 8/8. Statement position validation (CheckNotDecl for class/async-func/async-gen in if-body), async function default params + trailing comma, static blocks (`static { }`). Batch test harness (test262_harness_batch.ailang) eliminates per-test fork+exec. **TDZ scope fix**: `JSCompState.tdz_map` was not saved/restored in `CompileFunc`, causing outer `let`/`const` TDZ marks to leak into nested function scopes — parameter slot 0 got spurious THROW_TDZ opcodes, causing SIGSEGV on any program combining `let`/`const` + method calls. Fix: save/clear tdz_map on CompileFunc entry, restore on exit. Eliminated ~2,986 crashes. Language: 16,884→18,000 (+1,116). Full: 39,455→43,034 (+3,579).
+- 2026-05-09: Conservative ScanString validation (PeekAt-only `\u`/`\x` validation, line terminator rejection, unterminated string detection — +1,614 tests). Getter `this` binding fix (`JSVM__SetGlobal("this", obj)` in GET_PROP inline getter). GET_GLOBAL experiment reverted (caused 24k regression — GlobalHash stores JSValue pointers that go stale in ring buffer). Full: 43,034→44,648 (+1,614). Commit 1caa865.
+- 2026-05-10: Getter key stability fix — DEF_GETTER/DEF_SETTER `__get_`/`__set_` keys copied from transient getter_buf to stable str_slab. Root cause: PropTable pointer-equality matched wrong getter via shared buffer address, causing infinite recursion on `this.<prop>` in getter bodies. +892 tests. Full: 44,648→45,540 (91.8%).
 
 ### Other Pending
 
