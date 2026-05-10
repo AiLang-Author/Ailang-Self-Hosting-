@@ -215,13 +215,16 @@ Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (r
 - **SWAP opcode + property increment** — New SWAP opcode (value 8) swaps top two stack elements. Required for correct postfix property increment (`o.x++`) which must return the old value. **Postfix `o.x++`**: `compile(o), DUP, GET_PROP, SWAP, DUP, GET_PROP, PUSH_CONST 1, ADD, SET_PROP` → old value on stack. **Prefix `++o.x`**: `compile(o), DUP, GET_PROP, PUSH_CONST 1, ADD, SET_PROP, re-compile(o), GET_PROP` → new value. Also handles MEMBER_BRACKET via re-eval approach. **Files**: `Library.JSCompiler.ailang` (SWAP=8 in JSOp), `Library.JSVMDispatch.ailang` (Case 8 handler), `Library.JSCompExpr.ailang` (UPDATE_EXPR MEMBER_DOT/MEMBER_BRACKET handlers).
 - **JIT Compiler (x86-64 native code generation)** — Full working JIT for leaf functions via CEmit ARCH backend. **Architecture**: `Library.JSJIT.ailang` uses the CEmit layer (`Library.CEmitCore.ailang` + `Library.CEmitCoreArch.ailang` + X86 backend) to emit native x86-64 instructions into executable mmap'd buffers. **Register convention**: R12=stack base ptr, R13=sp index, R14=const pool, RBP=locals base, RBX=scratch. **param_block pattern**: Stable 32-byte heap block allocated at JIT_Init. JIT_Execute writes [stack_base, sp, locals_ptr, const_pool] before each native call. Prologue loads from baked param_block address (stable across calls). Epilogue writes sp back. **Supported opcodes**: GET_LOCAL, SET_LOCAL, ADD, SUB, MUL, DIV, RETURN, HALT. Locals at `rbp + idx*8` matching VM's 8-byte slot size. **Compilation**: `JIT_Compile(func_idx)` scans bytecode, emits prologue+opcodes+epilogue, resolves fixups. Unsupported opcodes bail (function stays interpreted). **Performance**: `add(a,b)` compiles to 220 bytes native. 10k calls in ~5.5ms. **Files**: `Library.JSJIT.ailang` (JIT orchestrator), `Library.CEmitCoreArch.ailang` (arch-neutral emit API including `Emit_MovRaxRbp`), `Librarys/Compiler/CodeEmit/X86/Library.CEmitX86Reg.ailang` (x86 backend including `X86_MovRaxRbp`).
 
-### Test262 Conformance (as of 2026-05-08)
+### Test262 Conformance (as of 2026-05-09)
 
-Build & run: `./ailang.x TestCode/test262_harness.ailang test262_harness.x && python3 tools/test262_runner.py --all` (language only, ~24K tests) or `--full` (language + built-ins + annexB + staging, ~49K tests).
+Build & run: `./ailang.x TestCode/test262_harness.ailang test262_harness.x && python3 tools/test262_runner.py --all` (language only, ~24K tests) or `--full` (language + built-ins + annexB + staging, ~50K tests).
 
-**Overall (language): ~16,421 / 23,899 passing (~69.1%)** — stable after zero-alloc refactor; no regressions from allocation elimination.
+**Batch harness** (fast): `./ailang.x TestCode/test262_harness_batch.ailang test262_harness_batch.x` — streams tests via stdin (4-byte LE length prefix + source), writes 1-byte results to fd 4 (original stdout saved via dup2). Runner auto-detects batch binary and uses it by default; `--no-batch` for legacy per-process mode.
 
-Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 16,421 (stable after zero-alloc refactor).
+**Overall (language): 18,000 / 23,899 passing (75.6%)**
+**Overall (full):     43,034 / 49,998 passing (86.8%)** — 6,571 failures, 226 timeouts
+
+Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 16,421 (stable after zero-alloc refactor) → 16,884 (statement validation + async params + static blocks) → 18,000 (TDZ scope fix, 2026-05-09).
 
 #### Benchmark Results (Phenom II X6 3.2GHz, DDR3)
 
@@ -256,18 +259,18 @@ Ailang beats V8 on fib(20), arith, and array ops. V8 wins on JIT leaf calls (ful
 
 | Category | Pass% | Root cause |
 |---|---|---|
-| statements/class | ~55% | Static field props, async methods, `new().method()` binding |
+| statements/class | ~65.7% | Static field props, async methods, `new().method()` binding |
 | expressions/class | ~23% | Same + more edge cases |
-| for-await-of | 0.5% | No for-await-of |
-| async-generator | 0.9% | No async generators |
-| async-function | ~47% | Partial async/await (basic works, advanced missing) |
-| dynamic-import | 1.4% | No module support |
+| async-function | ~58.8% | Partial async/await (basic works, advanced missing) |
+| dynamic-import | ~1.4% | No module support |
+
+*Note: for-await-of and async-generator crash issues resolved by TDZ scope fix (2026-05-09). Need fresh category breakdown.*
 
 ## Pending Work
 
-### JS Engine — Active Priorities (2026-05-08)
+### JS Engine — Active Priorities (2026-05-09)
 
-**Current: ~16,421/23,899 (~69.1%). Target: 80%+.**
+**Current: 18,000/23,899 (75.6%) language, 43,034/49,998 (86.8%) full. Target: 90%+ language.**
 
 1. **Static fields on functions** — FUNCTION values need property bag so `C.x = 1` works. Blocking static field tests.
 2. **Parent field init chaining** — `__field_init__` from parent class must run during `super()`. Blocking inherited field tests.
@@ -281,7 +284,7 @@ Progress log:
 - 2026-05-06: arguments object, CountVars fix for nested scopes, benchmarks vs V8, IEEE 754 float fixes
 - 2026-05-07: Private class members (name mangling), instance fields as own properties (__field_init__ closure), fixed JSVM__CallFunc frame corruption in RETURN handler
 - 2026-05-08: Zero-alloc hot path complete — str_slab, func_slab, gen_slab, PropTable ring buffer, static backup buffers, const_val_pool cache. XSHash fully replaced by PropTable/GlobalHash. SunSpider 26/26, Kraken 14/14, Octane 15/15 all passing.
-- 2026-05-09: Array named properties (ArrSide side table), SWAP opcode + property increment (o.x++/++o.x for MEMBER_DOT/MEMBER_BRACKET), String() global fix (was overwritten by plain object), String.fromCharCode Float_ToInt fix, new Object() constructor fix, Math methods (cos/sin/sqrt/log/exp/random/PI/E/LN2). E2E 32/32, benchmarks 8/8.
+- 2026-05-09: Array named properties (ArrSide side table), SWAP opcode + property increment (o.x++/++o.x for MEMBER_DOT/MEMBER_BRACKET), String() global fix (was overwritten by plain object), String.fromCharCode Float_ToInt fix, new Object() constructor fix, Math methods (cos/sin/sqrt/log/exp/random/PI/E/LN2). E2E 32/32, benchmarks 8/8. Statement position validation (CheckNotDecl for class/async-func/async-gen in if-body), async function default params + trailing comma, static blocks (`static { }`). Batch test harness (test262_harness_batch.ailang) eliminates per-test fork+exec. **TDZ scope fix**: `JSCompState.tdz_map` was not saved/restored in `CompileFunc`, causing outer `let`/`const` TDZ marks to leak into nested function scopes — parameter slot 0 got spurious THROW_TDZ opcodes, causing SIGSEGV on any program combining `let`/`const` + method calls. Fix: save/clear tdz_map on CompileFunc entry, restore on exit. Eliminated ~2,986 crashes. Language: 16,884→18,000 (+1,116). Full: 39,455→43,034 (+3,579).
 
 ### Other Pending
 
