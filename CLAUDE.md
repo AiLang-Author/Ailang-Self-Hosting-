@@ -223,9 +223,9 @@ Build & run: `./ailang.x TestCode/test262_harness.ailang test262_harness.x && py
 
 **Batch harness** (fast): `./ailang.x TestCode/test262_harness_batch.ailang test262_harness_batch.x` — streams tests via stdin (4-byte LE length prefix + source), writes 1-byte results to fd 4 (original stdout saved via dup2). Runner auto-detects batch binary and uses it by default; `--no-batch` for legacy per-process mode.
 
-**Overall (full): 45,707 / 49,998 passing (92.1%)** — 3,901 failures, 263 timeouts
+**Overall (full): 45,848 / 49,998 passing (92.4%)** — 3,765 failures, 264 timeouts
 
-Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 16,421 (stable after zero-alloc refactor) → 16,884 (statement validation + async params + static blocks) → 18,000/43,034 (TDZ scope fix) → 44,648 (conservative ScanString validation, 2026-05-09) → 45,540 (getter key stability fix, 2026-05-10) → 45,707 (static semantic checks, 2026-05-10).
+Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 16,421 (stable after zero-alloc refactor) → 16,884 (statement validation + async params + static blocks) → 18,000/43,034 (TDZ scope fix) → 44,648 (conservative ScanString validation, 2026-05-09) → 45,540 (getter key stability fix, 2026-05-10) → 45,707 (static semantic checks, 2026-05-10) → 45,848 (AllPrivateNamesValid + param early errors, 2026-05-10).
 
 #### Benchmark Results (Phenom II X6 3.2GHz, DDR3)
 
@@ -269,18 +269,21 @@ Ailang beats V8 on fib(20), arith, and array ops. V8 wins on JIT leaf calls (ful
 
 ## Pending Work
 
-### JS Engine — Active Priorities (2026-05-10)
+### JS Engine — Status (2026-05-10)
 
-**Current: 45,540/49,998 (91.8%) full. Next target: 93%+.**
+**Current: 45,848/49,998 (92.4%) full. Paused — shifting focus to native browser.**
 
-Ordered fix list (high ROI first, modules last):
-1. ~~**Fix getter key stability**~~ (~892 tests) — **DONE 2026-05-10.** DEF_GETTER/DEF_SETTER stored `__get_`/`__set_` keys in shared transient `JSVMCallBuf.getter_buf`. PropTable pointer-equality fast path matched wrong getter when buffer was overwritten by nested GET_PROP, causing infinite recursion on any `this.<prop>` access inside getter bodies. Fix: copy key to `str_slab` via `JSRT__StrSlabAlloc` + `MemoryCopy`. All 4 opcodes fixed (64, 65, 76, 77). **Files**: JSVMDispatch.ailang cases 64/65/76/77.
-2. **Static semantic checks for class elements** (~300 tests) — ContainsArguments, ContainsSuperCall in field initializers (116), AllPrivateNamesValid (76), HasDirectSuper (40), `#` whitespace/escape validation (62), field-named-constructor (8), yield-as-identifier (16), ASI (4). Implementation in JSValidate library.
-3. **Rest-into-object + computed key eval in destructuring** (~110 tests) — `[...{props}]` in CompileArrayPattern, computed property eval in CompileObjPattern.
-4. **AllPrivateNamesValid** (~56 tests) — Early error for `#name` used outside class that declares it.
-5. **Async generator fixes** (~281 tests) — yield* delegation, edge cases.
-6. **RegExp literal validation** (~174 tests) — Named groups, character class ranges, misc.
-7. **Module support** (last) — dynamic-import (~335 tests).
+Completed fix list:
+1. ~~**Fix getter key stability**~~ (+892 tests) — DONE.
+2. ~~**Static semantic checks**~~ (+167 tests) — DONE. ContainsArguments, ContainsSuperCall, HasDirectSuper, field-named-constructor.
+3. ~~**Function parameter early errors**~~ (+126 tests) — DONE. Trailing comma after rest, use-strict + non-simple params, duplicate params.
+4. ~~**AllPrivateNamesValid**~~ (+15 tests) — DONE. Stack-based scope, DFS walker, in_class_depth gate.
+
+Remaining (low priority, diminishing returns):
+- Rest-into-object + computed key eval in destructuring (~110 tests)
+- Async generator yield* delegation (~281 tests)
+- RegExp named groups/character class ranges (~174 tests)
+- Module/dynamic-import (~335 tests) — needs entirely new subsystem
 
 Progress log:
 - 2026-05-02: Baseline 11,861 (49.6%)
@@ -290,7 +293,7 @@ Progress log:
 - 2026-05-07: Private class members (name mangling), instance fields as own properties (__field_init__ closure), fixed JSVM__CallFunc frame corruption in RETURN handler
 - 2026-05-08: Zero-alloc hot path complete — str_slab, func_slab, gen_slab, PropTable ring buffer, static backup buffers, const_val_pool cache. XSHash fully replaced by PropTable/GlobalHash. SunSpider 26/26, Kraken 14/14, Octane 15/15 all passing.
 - 2026-05-09: Conservative ScanString validation (PeekAt-only `\u`/`\x` validation, line terminator rejection, unterminated string detection — +1,614 tests). Getter `this` binding fix (`JSVM__SetGlobal("this", obj)` in GET_PROP inline getter). GET_GLOBAL experiment reverted (caused 24k regression — GlobalHash stores JSValue pointers that go stale in ring buffer). Full: 43,034→44,648 (+1,614). Commit 1caa865.
-- 2026-05-10: Getter key stability fix — DEF_GETTER/DEF_SETTER `__get_`/`__set_` keys copied from transient getter_buf to stable str_slab. Root cause: PropTable pointer-equality matched wrong getter via shared buffer address, causing infinite recursion on `this.<prop>` in getter bodies. +892 tests. Full: 44,648→45,540 (91.8%). Static semantic checks — iterative DFS walker (JSValidWalk FixedPool) for ContainsArguments, ContainsSuperCall in field initializers, HasDirectSuper in non-constructor methods and constructors without extends, field-named-constructor early error. +167 tests. Full: 45,540→45,707 (92.1%).
+- 2026-05-10: Getter key stability fix — DEF_GETTER/DEF_SETTER `__get_`/`__set_` keys copied from transient getter_buf to stable str_slab. Root cause: PropTable pointer-equality matched wrong getter via shared buffer address, causing infinite recursion on `this.<prop>` in getter bodies. +892 tests. Full: 44,648→45,540 (91.8%). Static semantic checks — iterative DFS walker (JSValidWalk FixedPool) for ContainsArguments, ContainsSuperCall in field initializers, HasDirectSuper in non-constructor methods and constructors without extends, field-named-constructor early error. +167 tests. Full: 45,540→45,707 (92.1%). Function parameter early errors (trailing comma after rest, use-strict + non-simple params, duplicate params) +126 tests. AllPrivateNamesValid — stack-based private name scope (8 levels), DFS walker validates #name references, in_class_depth gate for #name outside class. +15 tests. Full: 45,707→45,848 (92.4%).
 
 ### Other Pending
 
