@@ -8,6 +8,9 @@ LibraryImport.StringUtils
 LibraryImport.Socket
 LibraryImport.Browser.URL
 LibraryImport.Browser.DNS
+LibraryImport.Browser.HTTPChunked
+LibraryImport.Browser.HTTPGzip
+LibraryImport.Browser.HTTPCookie
 
 FixedPool.HTTPSys {
     "SYS_READ":     Initialize=0
@@ -45,6 +48,7 @@ Function.HTTP_Init {
         MemorySet(HTTPState.pool, 0, total)
         HTTPState.recv_buf = Allocate(HTTPConst.RECV_BUF)
         HTTPState.next = 0
+        Cookie_Init()
         ReturnValue(0)
     }
 }
@@ -122,6 +126,21 @@ Function.HTTP__DoGet {
         path = URL_GetPath(url_h)
         is_https = URL_IsHTTPS(url_h)
 
+        // Append query string to path if present (for request line)
+        qstr = URL_GetQuery(url_h)
+        IfCondition NotEqual(qstr, 0) ThenBlock: {
+            qlen = StringLength(qstr)
+            IfCondition GreaterThan(qlen, 0) ThenBlock: {
+                plen = StringLength(path)
+                full_path = Allocate(Add(plen, Add(qlen, 2)))
+                MemoryCopy(full_path, path, plen)
+                SetByte(full_path, plen, 63)
+                MemoryCopy(Add(full_path, Add(plen, 1)), qstr, qlen)
+                SetByte(full_path, Add(plen, Add(qlen, 1)), 0)
+                path = full_path
+            }
+        }
+
         // Resolve hostname
         host_len = StringLength(host)
         ip4 = DNS_Resolve(host, host_len)
@@ -164,7 +183,7 @@ Function.HTTP__DoGet {
             ReturnValue(-1)
         }
 
-        // Build request
+        // Build request (includes Cookie header if any)
         req = HTTP__BuildRequest("GET", path, host)
         req_len = StringLength(req)
 
@@ -178,6 +197,17 @@ Function.HTTP__DoGet {
         // Receive response
         resp_h = HTTP__RecvResponse(sock)
         SystemCall(HTTPSys.SYS_CLOSE, sock, 0, 0)
+
+        // Process Set-Cookie from response headers
+        IfCondition GreaterEqual(resp_h, 0) ThenBlock: {
+            rbase = HTTP__RespBase(resp_h)
+            rhdrs = Dereference(Add(rbase, HTTPConst.R_HDRS_PTR))
+            rhlen = Dereference(Add(rbase, HTTPConst.R_HDRS_LEN))
+            IfCondition GreaterThan(rhlen, 0) ThenBlock: {
+                Cookie_ProcessHeaders(rhdrs, rhlen, host, path)
+            }
+        }
+
         ReturnValue(resp_h)
     }
 }
@@ -212,9 +242,12 @@ Function.HTTP__DoGetTLS {
         pid = SystemCall(57, 0, 0, 0, 0, 0)   // SYS_FORK
         IfCondition EqualTo(pid, 0) ThenBlock: {
             // Child: wire pipes, exec openssl
-            SystemCall(33, read_in, 0, 0, 0, 0)    // dup2(read_in, 0)
-            SystemCall(33, write_out, 1, 0, 0, 0)  // dup2(write_out, 1)
-            SystemCall(33, write_out, 2, 0, 0, 0)  // dup2(write_out, 2)
+            SystemCall(33, read_in, 0, 0, 0, 0)    // dup2(read_in, 0)  — stdin
+            SystemCall(33, write_out, 1, 0, 0, 0)  // dup2(write_out, 1) — stdout
+            // Redirect stderr to /dev/null (cert chain messages corrupt response)
+            devnull = SystemCall(2, "/dev/null", 1, 0)  // open("/dev/null", O_WRONLY)
+            SystemCall(33, devnull, 2, 0, 0, 0)    // dup2(devnull, 2) — stderr
+            SystemCall(HTTPSys.SYS_CLOSE, devnull, 0, 0)
             SystemCall(HTTPSys.SYS_CLOSE, write_in, 0, 0)
             SystemCall(HTTPSys.SYS_CLOSE, read_out, 0, 0)
 
@@ -257,28 +290,45 @@ Function.HTTP__DoGetTLS {
         SystemCall(HTTPSys.SYS_CLOSE, read_in, 0, 0)
         SystemCall(HTTPSys.SYS_CLOSE, write_out, 0, 0)
 
-        // Wait a moment for TLS handshake (sleep 1 sec)
-        // Use nanosleep: 1 second
-        ts = Allocate(16)
-        StoreValue(Add(ts, 0), 1)
-        StoreValue(Add(ts, 8), 0)
-        SystemCall(35, ts, 0, 0, 0, 0)   // SYS_NANOSLEEP
-
-        // Send HTTP request through the TLS tunnel
+        // Write HTTP request to pipe immediately — kernel pipe buffer (64KB)
+        // holds it until openssl finishes TLS handshake and reads from stdin.
+        // No sleep needed: pipe buffering handles the timing naturally.
         req = HTTP__BuildRequest("GET", path, host)
         req_len = StringLength(req)
-        SystemCall(HTTPSys.SYS_WRITE, write_in, req, req_len)
+        wr = SystemCall(HTTPSys.SYS_WRITE, write_in, req, req_len)
 
-        // Read response
+        // If write failed (child died immediately), bail
+        IfCondition LessEqual(wr, 0) ThenBlock: {
+            PrintMessage("[HTTP] TLS pipe write failed\n")
+            SystemCall(HTTPSys.SYS_CLOSE, write_in, 0, 0)
+            SystemCall(HTTPSys.SYS_CLOSE, read_out, 0, 0)
+            SystemCall(62, pid, 9, 0, 0, 0)    // SIGKILL
+            SystemCall(61, pid, 0, 0, 0, 0)    // wait4
+            ReturnValue(-1)
+        }
+
+        // Close write end — signals EOF to openssl stdin after it reads request
+        SystemCall(HTTPSys.SYS_CLOSE, write_in, 0, 0)
+
+        // Read response (blocks until openssl connects + sends + receives)
         resp_h = HTTP__RecvResponse(read_out)
 
-        // Cleanup
-        SystemCall(HTTPSys.SYS_CLOSE, write_in, 0, 0)
+        // Cleanup (write_in already closed above)
         SystemCall(HTTPSys.SYS_CLOSE, read_out, 0, 0)
         // Kill child
         SystemCall(62, pid, 9, 0, 0, 0)    // SYS_KILL SIGKILL
         // Reap
         SystemCall(61, pid, 0, 0, 0, 0)    // SYS_WAIT4
+
+        // Process Set-Cookie from response headers
+        IfCondition GreaterEqual(resp_h, 0) ThenBlock: {
+            rbase = HTTP__RespBase(resp_h)
+            rhdrs = Dereference(Add(rbase, HTTPConst.R_HDRS_PTR))
+            rhlen = Dereference(Add(rbase, HTTPConst.R_HDRS_LEN))
+            IfCondition GreaterThan(rhlen, 0) ThenBlock: {
+                Cookie_ProcessHeaders(rhdrs, rhlen, host, path)
+            }
+        }
 
         ReturnValue(resp_h)
     }
@@ -291,7 +341,13 @@ Function.HTTP__BuildRequest {
     Input: host: Address
     Output: Address
     Body: {
-        buf = Allocate(2048)
+        // Calculate buffer size: method + path + host + headers + cookies + slack
+        ml = StringLength(method)
+        pl = StringLength(path)
+        hl2 = StringLength(host)
+        buf_sz = Add(ml, Add(pl, Add(hl2, 1024)))
+        IfCondition LessThan(buf_sz, 2048) ThenBlock: { buf_sz = 2048 }
+        buf = Allocate(buf_sz)
         pos = 0
 
         // "METHOD /path HTTP/1.1\r\n"
@@ -329,11 +385,31 @@ Function.HTTP__BuildRequest {
         pos = Add(pos, 1)
 
         // Standard headers
-        std_hdrs = "User-Agent: AilangBrowser/1.0\r\nAccept: text/html,*/*\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n"
+        std_hdrs = "User-Agent: Mozilla/5.0 (X11; Linux x86_64; rv:120.0) Gecko/20100101 Firefox/120.0\r\nAccept: text/html,application/xhtml+xml,*/*\r\nAccept-Encoding: identity\r\nConnection: close\r\n"
         sl = StringLength(std_hdrs)
         MemoryCopy(Add(buf, pos), std_hdrs, sl)
         pos = Add(pos, sl)
 
+        // Append Cookie header if we have matching cookies
+        cookie_hdr = Cookie_BuildHeader(host, path)
+        IfCondition NotEqual(cookie_hdr, 0) ThenBlock: {
+            // cookie_hdr starts with "Cookie: ..." — append it + CRLF
+            cl = StringLength(cookie_hdr)
+            IfCondition GreaterThan(cl, 0) ThenBlock: {
+                MemoryCopy(Add(buf, pos), cookie_hdr, cl)
+                pos = Add(pos, cl)
+                SetByte(buf, pos, 13)
+                pos = Add(pos, 1)
+                SetByte(buf, pos, 10)
+                pos = Add(pos, 1)
+            }
+        }
+
+        // Final CRLF (end of headers)
+        SetByte(buf, pos, 13)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 10)
+        pos = Add(pos, 1)
         SetByte(buf, pos, 0)
         ReturnValue(buf)
     }
@@ -344,11 +420,14 @@ Function.HTTP__RecvResponse {
     Input: sock: Integer
     Output: Integer
     Body: {
-        // Set recv timeout: 10 seconds
+        // Set recv timeout: 10 seconds (works on sockets, not pipes)
         tval = Allocate(16)
         StoreValue(Add(tval, 0), 10)
         StoreValue(Add(tval, 8), 0)
         SystemCall(54, sock, 1, 20, tval, 16)
+
+        // Allocate pollfd struct for pipe timeout (8 bytes: fd(4) + events(2) + revents(2))
+        pfd = Allocate(8)
 
         // Read all data into a buffer
         body_buf = Allocate(HTTPConst.MAX_BODY)
@@ -359,15 +438,30 @@ Function.HTTP__RecvResponse {
             IfCondition LessEqual(remain, 0) ThenBlock: {
                 done = 1
             } ElseBlock: {
-                rsize = remain
-                IfCondition GreaterThan(rsize, HTTPConst.RECV_BUF) ThenBlock: {
-                    rsize = HTTPConst.RECV_BUF
-                }
-                n = SystemCall(HTTPSys.SYS_READ, sock, Add(body_buf, recv_total), rsize)
-                IfCondition LessEqual(n, 0) ThenBlock: {
+                // poll() with timeout — works on both sockets AND pipes
+                // Use 10s for initial data, 2s after first data arrives
+                poll_ms = 10000
+                IfCondition GreaterThan(recv_total, 0) ThenBlock: { poll_ms = 2000 }
+                StoreValue(pfd, sock, "dword")
+                SetByte(pfd, 4, 1)     // events = POLLIN
+                SetByte(pfd, 5, 0)
+                SetByte(pfd, 6, 0)     // revents = 0
+                SetByte(pfd, 7, 0)
+                pr = SystemCall(7, pfd, 1, poll_ms)   // poll(pfd, 1, timeout_ms)
+                IfCondition LessEqual(pr, 0) ThenBlock: {
+                    // Timeout or error — stop reading
                     done = 1
                 } ElseBlock: {
-                    recv_total = Add(recv_total, n)
+                    rsize = remain
+                    IfCondition GreaterThan(rsize, HTTPConst.RECV_BUF) ThenBlock: {
+                        rsize = HTTPConst.RECV_BUF
+                    }
+                    n = SystemCall(HTTPSys.SYS_READ, sock, Add(body_buf, recv_total), rsize)
+                    IfCondition LessEqual(n, 0) ThenBlock: {
+                        done = 1
+                    } ElseBlock: {
+                        recv_total = Add(recv_total, n)
+                    }
                 }
             }
         }
@@ -424,9 +518,41 @@ Function.HTTP__RecvResponse {
         body_len = Subtract(recv_total, body_start)
         IfCondition LessThan(body_len, 0) ThenBlock: { body_len = 0 }
 
-        StoreValue(Add(base, HTTPConst.R_BODY_PTR), Add(body_buf, body_start))
+        body_ptr = Add(body_buf, body_start)
+
+        // Decode chunked transfer-encoding if present
+        IfCondition GreaterThan(body_len, 0) ThenBlock: {
+            is_chunked = HTTPChunked_IsChunked(body_buf, hdr_end)
+            IfCondition EqualTo(is_chunked, 1) ThenBlock: {
+                decoded_len = HTTPChunked_Decode(body_ptr, body_len)
+                IfCondition GreaterThan(decoded_len, 0) ThenBlock: {
+                    body_len = decoded_len
+                }
+            }
+        }
+
+        // Decompress gzip/deflate if present
+        IfCondition GreaterThan(body_len, 0) ThenBlock: {
+            gz_type = HTTPGzip_IsGzip(body_buf, hdr_end)
+            IfCondition GreaterThan(gz_type, 0) ThenBlock: {
+                decomp_len_buf = Allocate(8)
+                StoreValue(decomp_len_buf, 0)
+                decomp_ptr = HTTPGzip_Decompress(body_ptr, body_len, decomp_len_buf)
+                IfCondition NotEqual(decomp_ptr, 0) ThenBlock: {
+                    decomp_len = Dereference(decomp_len_buf)
+                    IfCondition GreaterThan(decomp_len, 0) ThenBlock: {
+                        body_ptr = decomp_ptr
+                        body_len = decomp_len
+                    }
+                }
+            }
+        }
+
+        StoreValue(Add(base, HTTPConst.R_BODY_PTR), body_ptr)
         StoreValue(Add(base, HTTPConst.R_BODY_LEN), body_len)
         StoreValue(Add(base, HTTPConst.R_VALID), 1)
+
+        // Note: Set-Cookie processed by caller who knows the domain
 
         ReturnValue(resp_h)
     }
@@ -438,16 +564,28 @@ Function.HTTP__ParseStatus {
     Input: len: Integer
     Output: Integer
     Body: {
-        // Find first space, then parse 3 digits
+        // Find "HTTP/" marker first, then scan for space + 3 digits
         i = 0
-        WhileLoop LessThan(i, len) {
-            ch = GetByte(buf, i)
-            IfCondition EqualTo(ch, 32) ThenBlock: {
-                // Parse NNN
-                d1 = Subtract(GetByte(buf, Add(i, 1)), 48)
-                d2 = Subtract(GetByte(buf, Add(i, 2)), 48)
-                d3 = Subtract(GetByte(buf, Add(i, 3)), 48)
-                ReturnValue(Add(Add(Multiply(d1, 100), Multiply(d2, 10)), d3))
+        limit = Subtract(len, 12)
+        WhileLoop LessThan(i, limit) {
+            // Look for 'H','T','T','P','/' (72,84,84,80,47)
+            IfCondition And(EqualTo(GetByte(buf, i), 72),
+                           And(EqualTo(GetByte(buf, Add(i, 1)), 84),
+                               And(EqualTo(GetByte(buf, Add(i, 2)), 84),
+                                   And(EqualTo(GetByte(buf, Add(i, 3)), 80),
+                                       EqualTo(GetByte(buf, Add(i, 4)), 47))))) ThenBlock: {
+                // Found "HTTP/", now find space after version (e.g. "HTTP/1.1 ")
+                j = Add(i, 5)
+                WhileLoop LessThan(j, len) {
+                    IfCondition EqualTo(GetByte(buf, j), 32) ThenBlock: {
+                        // Parse 3 digits after space
+                        d1 = Subtract(GetByte(buf, Add(j, 1)), 48)
+                        d2 = Subtract(GetByte(buf, Add(j, 2)), 48)
+                        d3 = Subtract(GetByte(buf, Add(j, 3)), 48)
+                        ReturnValue(Add(Add(Multiply(d1, 100), Multiply(d2, 10)), d3))
+                    }
+                    j = Add(j, 1)
+                }
             }
             i = Add(i, 1)
         }

@@ -251,7 +251,7 @@ Ailang beats V8 on fib(20), arith, and array ops. V8 wins on JIT leaf calls (ful
 
 #### Known bugs (active)
 
-- **Comma operator**: 3+ operand chains broken.
+- ~~**Comma operator**: 3+ operand chains broken.~~ FIXED (ASTTmp.done clobber in JSParse__Expr + for-loop init used Assign instead of Expr)
 - **`new C().method()` chaining**: Method call on inline `new` expression doesn't bind `this` correctly. `var c = new C(); c.method()` works fine.
 - **Parent field init in extends**: `class B extends A { b = 2 }` — B's `__field_init__` runs but A's does not. Parent fields not initialized via `super()` chain.
 
@@ -301,6 +301,103 @@ Progress log:
 - **Terminal polish** — cursor blink, mouse reporting
 - **Audio engine split** — extract from display server
 - **SSE2 optimization** — FB_ClearBuffer, compiler integer SSE2 emit
+
+### Native Browser — Battle Plan (2026-05-10)
+
+**Baseline test results:**
+- Render visual regression: **10/10 (100%)** — all pixel-perfect
+- html5lib tokenizer: **1624/1625 (99.9%)** — 1 fail, 221 skipped (entities)
+- WPT DOM: **0%** — needs DOM API bindings in JSBridge
+- test_browser.x: **193/193 (100%)** — unit + integration tests
+
+**Architecture:** HTMLTokenizer → HTMLDom → CSSParse → HTMLLayout → HTMLRender → ShmCanvas
+
+**Fixed (2026-05-10):**
+- CSS rule pool overflow — `CSS_ParseSheet` infinite loop on pseudo-selectors (`:link`, `:visited`). Scan-forward to `{` for unrecognized selector syntax + loop guard.
+- CSS rule pool capacity increased from 1024→4096, string intern table from 64KB→256KB (Google homepage has 32 `<style>` blocks totalling 800+ rules).
+- `<script type="application/json">` filtering — JSEngine__FindScripts now checks the `type` attribute and skips `application/json`, `application/ld+json`, `text/template` (Next.js `__NEXT_DATA__` caused parse failures).
+- External `<script src>` loading — 3-step API: `JSEngine_PrepareScripts` (find), browser fetches via HTTP_Get + `JSEngine_ResolveExternal`, then `JSEngine_ExecuteScripts`. Script pool expanded to 64 entries × 32 bytes.
+- CSS `vw`/`vh`/`%` units — `LY__ParsePx` now converts viewport-relative and percentage units. Example Domain body renders at 614px (was 60px).
+
+#### Phase 1: Core Rendering Pipeline (highest impact)
+
+| # | Task | File(s) | Impact | Notes |
+|---|------|---------|--------|-------|
+| 1 | **CSS property inheritance** | HTMLLayout | HIGH | `color`, `font-size`, `font-family` don't cascade to children. Every child needs its own rule match. |
+| 2 | **CSS shorthand expansion** | CSSParse | HIGH | `margin: 10px 20px` → individual `margin-top/right/bottom/left`. Same for padding, border, background, font. |
+| 3 | **Border rendering** | HTMLRender + HTMLLayout | MED | Parsed but not drawn. Need DRAW_BORDER command or 4x FILL_RECT. |
+| 4 | **Image rendering** | HTMLRender + HTTPClient | MED | DRAW_IMAGE opcode exists but unimplemented. Need HTTP fetch for `<img src>` + decode + blit. |
+| 5 | **CSS `position: absolute/fixed`** | HTMLLayout | MED | No positioned elements. Modals, overlays, sticky headers all broken. |
+| 6 | **CSS `float: left/right`** | HTMLLayout | MED | No floating layout. Inline images/text wrap broken. |
+| 7 | **Pseudo-selector `:hover/:focus`** | CSSParse + HTMLLayout | LOW | Need runtime selector re-evaluation on mouse/focus events. |
+| 8 | **Named HTML entities** | HTMLTokenizer | LOW | Only ~10 entities. HTML5 spec has 2000+. Sites using `&mdash;`, `&nbsp;` etc. render literal. |
+
+#### Phase 2: Browser Chrome & Navigation
+
+| # | Task | File(s) | Impact | Notes |
+|---|------|---------|--------|-------|
+| 9 | **Scroll support** | browser_ipc | HIGH | No vertical scrolling. Pages taller than 700px are clipped. Need mouse wheel + scroll offset in layout. |
+| 10 | **External CSS `<link>` loading** | browser_ipc + HTTPClient | HIGH | Only inline `<style>` parsed. `<link rel="stylesheet" href="...">` ignored. Google/DDG serve CSS via `<link>`. |
+| 11 | ~~**External `<script src>` loading**~~ | browser_ipc + JSEngine | HIGH | ✅ DONE — 3-step API: PrepareScripts (find), browser fetches externals via HTTP_Get, ResolveExternal, ExecuteScripts. Script type filtering skips application/json, application/ld+json, text/template. |
+| 12 | **User-Agent header** | HTTPClient | MED | No UA sent. Some sites serve different HTML based on UA (Google does this). Send basic UA to get simpler HTML. |
+| 13 | **Content-Encoding: gzip** | HTTPClient | MED | Compressed responses not decompressed. Many servers send gzip by default. |
+| 14 | **Cookie jar** | browser_ipc + HTTPClient | MED | No cookies = no sessions, no login, no state. Need Set-Cookie parsing + Cookie header on requests. |
+| 15 | **POST method** | HTTPClient + browser_ipc | MED | Only GET. Forms with `method="POST"` silently degrade to GET or fail. |
+| 16 | **Multiple `<input>` fields in form** | browser_ipc | MED | `Br_SubmitForm` only sends focused input. Need to gather ALL inputs within `<form>` and build multi-param query. |
+
+#### Phase 3: JavaScript DOM Integration
+
+| # | Task | File(s) | Impact | Notes |
+|---|------|---------|--------|-------|
+| 17 | ~~**`document.querySelector/querySelectorAll`**~~ | JSBridge + HTMLDom | HIGH | ✅ DONE — handlers 10, 114. |
+| 18 | ~~**`element.innerHTML/textContent` setter**~~ | JSBridge + HTMLDom | HIGH | ✅ DONE — handlers 16, 113. |
+| 19 | ~~**`setTimeout/setInterval`**~~ | JSBridge + JSVM | HIGH | ✅ DONE — handlers 21-23. |
+| 20 | ~~**`addEventListener` + Event object**~~ | JSBridge + HTMLDom | HIGH | ✅ DONE — handler 14. Full Event object (type, target, preventDefault, stopPropagation). FireEvent invokes callbacks via JSVM__CallFunc. |
+| 21 | **`window.location`** | JSBridge + browser_ipc | MED | JS navigation (`location.href = "..."`) doesn't work. |
+| 22 | ~~**`fetch()` / `XMLHttpRequest`**~~ | JSBridge + HTTPClient | MED | ✅ STUB — handler 140. Returns resolved Promise with stub Response (status=0, text()→"", json()→{}). Real HTTP backend TODO. |
+| 23 | **`document.createElement` + `appendChild` re-render** | JSBridge + HTMLLayout | MED | DOM mutations don't trigger layout re-calculation. |
+| 24 | ~~**Layout metrics (offsetWidth/Height, getBoundingClientRect)**~~ | JSBridge + HTMLLayout | MED | ✅ DONE — handlers 133-139. Queries hit-test pool for DOM node boxes. |
+
+#### Phase 4: CSS Layout Maturity
+
+| # | Task | File(s) | Impact | Notes |
+|---|------|---------|--------|-------|
+| 24 | **Margin collapsing** | HTMLLayout | MED | Adjacent block margins should collapse per CSS spec. |
+| 25 | **Box-sizing: border-box** | HTMLLayout | MED | Width calculation doesn't account for padding/border. |
+| 26 | **CSS Grid** | HTMLLayout | LOW | Missing entirely. Needed for modern layouts. |
+| 27 | **Media queries `@media`** | CSSParse + HTMLLayout | LOW | Parsed but ignored. No responsive design. |
+| 28 | **CSS variables `var()`** | CSSParse | LOW | Modern sites use CSS custom properties extensively. |
+| 29 | **`calc()` expressions** | CSSParse + HTMLLayout | LOW | `width: calc(100% - 20px)` not evaluated. |
+
+#### Recommended Attack Order (maximize real-site impact)
+
+**Sprint 1 — Make Google search render:**
+1. Send User-Agent header (Google sends simpler HTML to basic browsers)
+2. External CSS `<link>` loading
+3. Scroll support
+4. Multiple form inputs in submit
+5. CSS property inheritance
+
+**Sprint 2 — Make basic sites usable:**
+6. ~~External `<script src>` loading~~ ✅ DONE
+7. Image rendering (`<img>`)
+8. Border rendering
+9. CSS shorthand expansion
+10. Content-Encoding: gzip
+
+**Sprint 3 — JavaScript interactivity:**
+11. `setTimeout`/`setInterval`
+12. `addEventListener`
+13. `document.querySelector`
+14. `element.innerHTML` setter
+15. DOM mutation re-render
+
+**Sprint 4 — Full browsing:**
+16. Cookie jar
+17. POST method
+18. `position: absolute/fixed`
+19. `float: left/right`
+20. `fetch()` API
 
 ---
 
