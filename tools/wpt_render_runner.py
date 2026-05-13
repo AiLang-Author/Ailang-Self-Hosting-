@@ -53,6 +53,14 @@ SUITES = {
     "css-color":        WPT_DIR / "css" / "css-color",
     "css-display":      WPT_DIR / "css" / "css-display",
     "html-rendering":   WPT_DIR / "html" / "rendering",
+    # Phase 2: Layout model suites (float, position, inline-block)
+    "css2-floats-clear": WPT_DIR / "css" / "CSS2" / "floats-clear",
+    "css-position":     WPT_DIR / "css" / "css-position",
+    "css2-positioning": WPT_DIR / "css" / "CSS2" / "positioning",
+    "css2-abspos":      WPT_DIR / "css" / "CSS2" / "abspos",
+    "css2-zindex":      WPT_DIR / "css" / "CSS2" / "zindex",
+    "css2-linebox":     WPT_DIR / "css" / "CSS2" / "linebox",
+    "css2-visuren":     WPT_DIR / "css" / "CSS2" / "visuren",
     "render-tests":     PROJECT_DIR / "TestCode" / "render_tests",
 }
 

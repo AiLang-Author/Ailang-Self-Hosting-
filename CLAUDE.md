@@ -302,13 +302,65 @@ Progress log:
 - **Audio engine split** — extract from display server
 - **SSE2 optimization** — FB_ClearBuffer, compiler integer SSE2 emit
 
-### Native Browser — Battle Plan (2026-05-10)
+### Native Browser — Status & Roadmap (2026-05-12)
 
-**Baseline test results:**
+**Current test results:**
+- **WPT render: 1752/1950 (89%), 0 crashes, 0 timeouts** — pixel-comparison ref tests
 - Render visual regression: **10/10 (100%)** — all pixel-perfect
 - html5lib tokenizer: **1624/1625 (99.9%)** — 1 fail, 221 skipped (entities)
-- WPT DOM: **0%** — needs DOM API bindings in JSBridge
 - test_browser.x: **193/193 (100%)** — unit + integration tests
+- test_js_e2e.x: **32/32 (100%)** — JS engine integration tests
+
+**WPT suite breakdown (v6, 2026-05-12):**
+
+| Suite | Score | Notes |
+|-------|-------|-------|
+| css2-backgrounds | 200/200 (100%) | Perfect |
+| css2-box-display | 109/109 (100%) | Perfect |
+| css2-cascade | 101/101 (100%) | Perfect |
+| css2-colors | 22/22 (100%) | Perfect |
+| css2-fonts | 200/200 (100%) | Perfect |
+| css2-borders | 199/200 (99%) | 1 PARTIAL (border-width accuracy) |
+| css-text | 188/200 (94%) | 2 PARTIAL (hanging punctuation) |
+| css-display | 176/200 (88%) | 3 PARTIAL (fieldset, display-contents) |
+| css2-floats | 123/147 (83%) | Float layout not implemented |
+| css-color | 163/200 (81%) | Advanced color functions (color-mix, contrast-color) |
+| html-rendering | 149/200 (74%) | Fieldset/legend, tables |
+| css-box | 101/150 (67%) | Margin-trim, box model edge cases |
+| css2-box | 11/11 (100%) | Perfect |
+| render-tests | 10/10 (100%) | Internal regression suite |
+
+**Fixed (2026-05-11/12):**
+- Border shorthand infinite loop — named color scanner used `Add(var, slen)` break pattern; word ending at exact string boundary wrapped wpos to 0, looping forever. Fixed with done-flag variables.
+- Default border width — `border: dashed` (style only) now defaults to medium (3px) per CSS spec.
+- Ahem test font support — font-family CSS resolution detects "Ahem", sets variable font_w_px. Renderer draws Ahem glyphs as filled squares (font_size_px x font_size_px). Verified: "XX" at 25px = 50x25 green region.
+- Variable-width font infrastructure — LY__EmitText uses LYState.font_w_px instead of hardcoded FONT_W=8. DRAW_TEXT C_H field carries font_w to renderer.
+
+**Roadmap to 90%+ WPT (immediate):**
+- Only need 3 more tests to cross 95% threshold (currently 40 PARTIALs at 50-94%)
+- Low-hanging: tighten border width accuracy (border-001.xht at 92.9%), margin collapsing, box-model fixes
+- Medium: display-contents, fieldset/legend rendering edge cases
+
+**Roadmap: Next 9 features (post-90% WPT):**
+
+| Priority | Feature | Est. Lines | WPT Test Suite | Test Count | Test Format |
+|----------|---------|-----------|----------------|------------|-------------|
+| 1 | Image rendering (`<img>`) | ~200 | `html/semantics/embedded-content/the-img-element/` + PngSuite | ~190 + ~166 images | testharness.js + decoder tests |
+| 2 | CSS float (left/right/clear) | ~300 | `css/CSS2/floats/` + `css/CSS2/floats-clear/` (already in runner) | ~300 reftests | Pixel comparison |
+| 3 | CSS position absolute/fixed | ~200 | `css/css-position/` + `css/CSS2/positioning/` + `css/CSS2/zindex/` | ~800 reftests | Pixel comparison |
+| 4 | Real fetch() API | ~150 | `fetch/` + `xhr/` | ~800 | testharness.js (needs WPT server) |
+| 5 | Keyboard input in forms | ~100 | `uievents/keyboard/` + `input-events/` | ~50 | Manual/WebDriver (hard to automate) |
+| 6 | DOM mutation re-render | ~200 | `dom/nodes/` + `domparsing/` | ~175 | testharness.js |
+| 7 | CSS inline-block | ~100 | `css/CSS2/linebox/` + `css/CSS2/visuren/` | ~400 reftests | Pixel comparison |
+| 8 | Form POST submission | ~100 | `html/semantics/forms/form-submission-0/` | ~20 | testharness.js (needs WPT server) |
+| 9 | External script hardening | ~50 | `html/semantics/scripting-1/the-script-element/` | ~70 | testharness.js (needs WPT server) |
+
+**New WPT suites added to runner** (available via `--suite <name>`):
+- `css2-floats-clear` (365 tests), `css-position` (166), `css2-positioning` (721), `css2-abspos` (39), `css2-zindex` (53), `css2-linebox` (311), `css2-visuren` (89)
+
+**External test resources to download:**
+- PngSuite: `https://github.com/lunapaint/pngsuite` — 166 PNG decoder conformance images
+- Acid2: Already at `/home/bob/wpt/acid/acid2/` — covers float, position, images in one page
 
 **Architecture:** HTMLTokenizer → HTMLDom → CSSParse → HTMLLayout → HTMLRender → ShmCanvas
 
