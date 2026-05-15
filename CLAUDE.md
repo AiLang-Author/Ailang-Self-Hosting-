@@ -25,6 +25,7 @@
 - **MemoryCopy/MemorySet**: Emit `CLD` + `REP MOVSB/STOSB` with register save/restore.
 - **FixedMul/FixedDiv**: Compiler primitives for fixed-point arithmetic. `FixedMul(a, b, bits)` = `(a * b) >> bits`, `FixedDiv(a, b, bits)` = `(a << bits) / b` (direct IDIV, exact, signed). `bits` must be a compile-time constant: 8 (Q8.8), 16 (Q16.16), 32 (Q32.32), or 64 (Q64.64). FixedDiv guards division-by-zero (returns 0). All widths handle negative values correctly via signed IMUL/IDIV. Implementation: `Librarys/Compiler/Compile/FPU/X86/Library.FPUCompileX86FixedPoint.ailang` (compile layer, Branch/Case dispatch) + `Library.FPUEmitX86FixedPoint.ailang` (x86-64 byte emission). Tests: `TestCode/TestFixedPointPrimitives.ailang` (36/36 passing, zero tolerance).
 - **Top-level code restriction**: AILang does not allow executable code (variable assignment, function calls that store results) at the top level outside of `SubRoutine`/`Function` bodies. Top-level has RBP=0 (no stack frame), so local variable stores crash. Use `SubRoutine.Main { ... }` + `RunTask(Main)` for entry points. FixedPool declarations are fine at top level (they're globals via R15).
+- **Local variables survive function calls**: Local variables are stored at RBP-relative stack offsets (not registers), and RBP is callee-saved. This means locals assigned before a function call retain their value after the call returns. Compiler intrinsics (StringLength, MemoryCopy, GetByte, SetByte, etc.) also do NOT clobber locals. **However**, FixedPool fields are global state — recursive functions that read/write the same FixedPool fields across recursion levels will see the child's writes. Use local variables (not FixedPool) for per-call state in recursive functions.
 
 ### Headless Testing
 
@@ -302,33 +303,40 @@ Progress log:
 - **Audio engine split** — extract from display server
 - **SSE2 optimization** — FB_ClearBuffer, compiler integer SSE2 emit
 
-### Native Browser — Status & Roadmap (2026-05-12)
+### Native Browser — Status & Roadmap (2026-05-14)
 
-**Current test results:**
-- **WPT render: 1752/1950 (89%), 0 crashes, 0 timeouts** — pixel-comparison ref tests
-- Render visual regression: **10/10 (100%)** — all pixel-perfect
+**Current test results (2026-05-14):**
+- **WPT render (full 21 suites): 6307/6855 (92%), 2 crashes, 0 timeouts**
 - html5lib tokenizer: **1624/1625 (99.9%)** — 1 fail, 221 skipped (entities)
-- test_browser.x: **193/193 (100%)** — unit + integration tests
+- test_browser.x: **209/209 (100%)** — unit + integration tests
 - test_js_e2e.x: **32/32 (100%)** — JS engine integration tests
+- Test262 (full): **45,865/49,998 (92.5%)**
 
-**WPT suite breakdown (v6, 2026-05-12):**
+**WPT suite breakdown (v7, 2026-05-14, full --all run):**
 
 | Suite | Score | Notes |
 |-------|-------|-------|
-| css2-backgrounds | 200/200 (100%) | Perfect |
+| css2-backgrounds | 625/625 (100%) | Perfect |
+| css2-box | 11/11 (100%) | Perfect |
 | css2-box-display | 109/109 (100%) | Perfect |
 | css2-cascade | 101/101 (100%) | Perfect |
 | css2-colors | 22/22 (100%) | Perfect |
-| css2-fonts | 200/200 (100%) | Perfect |
-| css2-borders | 199/200 (99%) | 1 PARTIAL (border-width accuracy) |
-| css-text | 188/200 (94%) | 2 PARTIAL (hanging punctuation) |
-| css-display | 176/200 (88%) | 3 PARTIAL (fieldset, display-contents) |
-| css2-floats | 123/147 (83%) | Float layout not implemented |
-| css-color | 163/200 (81%) | Advanced color functions (color-mix, contrast-color) |
-| html-rendering | 149/200 (74%) | Fieldset/legend, tables |
-| css-box | 101/150 (67%) | Margin-trim, box model edge cases |
-| css2-box | 11/11 (100%) | Perfect |
+| css2-fonts | 324/324 (100%) | Perfect |
+| css2-visuren | 57/57 (100%) | Perfect |
 | render-tests | 10/10 (100%) | Internal regression suite |
+| css2-floats-clear | 248/249 (99%) | Near-perfect |
+| css2-borders | 762/763 (99%) | 1 partial |
+| css2-positioning | 577/578 (99%) | Near-perfect |
+| css2-linebox | 243/249 (97%) | Near-perfect |
+| css2-zindex | 50/52 (96%) | Near-perfect |
+| css-display | 319/341 (93%) | fieldset, display-contents |
+| css-text | 1730/1878 (92%) | 2 crashes (hanging punctuation) |
+| css2-abspos | 27/31 (87%) | Absolute positioning edge cases |
+| css-color | 309/365 (84%) | Advanced color functions |
+| css-position | 270/354 (76%) | position:absolute/fixed gaps |
+| html-rendering | 338/439 (76%) | Fieldset/legend, tables |
+| css2-floats | 98/147 (66%) | Float clearing/wrapping |
+| css-box | 77/150 (51%) | Margin-trim, box model edge cases |
 
 **Fixed (2026-05-11/12):**
 - Border shorthand infinite loop — named color scanner used `Add(var, slen)` break pattern; word ending at exact string boundary wrapped wpos to 0, looping forever. Fixed with done-flag variables.
@@ -336,10 +344,8 @@ Progress log:
 - Ahem test font support — font-family CSS resolution detects "Ahem", sets variable font_w_px. Renderer draws Ahem glyphs as filled squares (font_size_px x font_size_px). Verified: "XX" at 25px = 50x25 green region.
 - Variable-width font infrastructure — LY__EmitText uses LYState.font_w_px instead of hardcoded FONT_W=8. DRAW_TEXT C_H field carries font_w to renderer.
 
-**Roadmap to 90%+ WPT (immediate):**
-- Only need 3 more tests to cross 95% threshold (currently 40 PARTIALs at 50-94%)
-- Low-hanging: tighten border width accuracy (border-001.xht at 92.9%), margin collapsing, box-model fixes
-- Medium: display-contents, fieldset/legend rendering edge cases
+**Fixed (2026-05-14):**
+- HTMLLayout modularization — split 5159-line monolith into 5 focused modules (Colors, CSS, Flex, Engine, Core). Zero regression. Same binary size.
 
 **Roadmap: Next 9 features (post-90% WPT):**
 
@@ -450,6 +456,44 @@ Progress log:
 18. `position: absolute/fixed`
 19. `float: left/right`
 20. `fetch()` API
+
+---
+
+### AILANG Browser — Rendering Fix Sprint (May 2026)
+
+**Current status:** ~1.2 MB self-hosted browser engine. JS engine mature (92.5% Test262, upper 80s-90s WPT). Browser rendering pipeline functional but produces broken output on modern sites.
+
+**The problem:** Loading https://www.w3schools.com produces only a vertical unstyled list of blue nav links on white background. Hero section, search bar, backgrounds, modern layout all missing.
+
+**Root cause analysis (2026-05-14):**
+1. **No external CSS `<link>` loading** — W3Schools (and all modern sites) load visual design via external stylesheets. Without them, zero CSS rules exist → everything falls back to tag defaults → vertical block stacking.
+2. **CSS Grid not implemented** — W3Schools nav uses `display:grid`. Grid maps to BLOCK with no grid algorithm → children stack vertically.
+3. **No `<img>` rendering** — only alt-text placeholders shown.
+4. **No `position:absolute/fixed`** — overlays, sticky headers all ignored.
+5. **No `@media` query evaluation** — responsive layout logic never fires.
+
+**HTMLLayout modularization (completed 2026-05-14):**
+
+| Module | File | Lines | Purpose |
+|--------|------|-------|---------|
+| Core | HTMLLayout.ailang | 598 | FixedPools, init, cmd helpers, hit-test API, GetDisplay |
+| Colors | HTMLLayoutColors.ailang | 1267 | Color parsing (named, hex, rgb, hsl, hwb, px/em/vw/vh) |
+| CSS | HTMLLayoutCSS.ailang | 1140 | Selector matching, property resolution, margin/padding/border |
+| Flex | HTMLLayoutFlex.ailang | 668 | Float state, FlexLayout, text emission/word-wrap |
+| Engine | HTMLLayoutEngine.ailang | 1529 | LY__LayoutNode recursive DFS, block/inline/flex dispatch |
+
+**Immediate next steps (priority order):**
+1. External CSS `<link>` loading (unlocks ALL visual styling for real sites)
+2. CSS Grid layout (basic `grid-template-columns` for nav layouts)
+3. `<img>` decode + render (PNG/JPEG via existing ImageDecode/JPEGDecode libs)
+4. `position: absolute/fixed` (sticky headers, overlays)
+5. `@media` query parsing + viewport-based evaluation
+
+**Latest test results (2026-05-14):**
+- test_browser.x: 209/209 (100%)
+- html5lib: 1624/1625 (99.9%)
+- WPT render: 6307/6855 (92%), 2 crashes
+- Test262: 45,865/49,998 (92.5%)
 
 ---
 
