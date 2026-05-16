@@ -2,617 +2,232 @@
 
 ## Hard Rules
 
-- **ALWAYS use `master` branch** — never `main`. The `main` branch is a dead orphan with no common ancestor; delete it if it appears.
-- **NEVER read image files** (PNG, JPG, JPEG, BMP, GIF, ICO, SVG, WebP, TIFF, TGA, TVG, etc.) with the Read tool. This causes crashes. No exceptions.
+- **ALWAYS use `master` branch** — never `main`. The `main` branch is a dead orphan with no common ancestor.
+- **NEVER read image files** (PNG, JPG, JPEG, BMP, GIF, ICO, SVG, WebP, TIFF, TGA, TVG, etc.) with the Read tool. Causes crashes.
+- **ONE browser binary**: `browser_ipc.x` — live IPC browser AND headless test harness. No other browser binaries.
+- **No code changes without test baseline** — run WPT suite before and after fixes to verify improvement.
 
-## Architecture Notes
+## Build & Run
 
-- **AKContext system:** Explicit `LinkagePool.AKContext` handles. Each context (main window, toolbar, deskbar, menu, dialog) owns its own node buffer, extra table, and event state. `AK_CreateContext()` allocates, all AK_* functions take `ctx` as first param.
-- Toolbar actions fire on UP (not DOWN). Action string -> EventRouter queue -> `EventRouter_Drain` in main loop dispatches.
-- `Menu_Show` creates its own AKContext, builds tree, renders to surface, destroys context. Surface stored in MenuState. `Menu_Blit` called from `Win_BlitAll`.
-- Main loop: Evdev_Poll -> DrainInput -> Win_RenderDirty -> EventRouter_Drain -> IPCBroker_Poll -> Deskbar_Refresh -> DebugLog_Render -> Win_BlitAll -> sleep(16ms).
-- Deskbar has its own AKContext stored in `DeskbarState.ak_ctx`. No global swap needed.
-- Each window toolbar has its own AKContext stored via `WinMgr_SetToolbarCtx(idx, ctx)`.
-- **IPC Broker** (`Display/IPC/Library.IPCBroker.ailang`): Embedded in display server. Unix socket at `/tmp/ailang_display.sock`. Non-blocking `poll(0)` once per frame. 8-client max. Protocol: 4-byte BE length prefix + JSON. Methods: `register`, `window.create`, `window.update` (app->server); `window.created`, `window.closed`, `input.action`, `input.key`, `input.mouse` (server->app).
-- **Start Menu** (`Display/Menu/Library.StartMenu.ailang`): Windows XP/7-style popup panel above deskbar. Own AKContext, own surface, positioned overlay. Lists services from PostgreSQL cache + system items.
-- **EventRouter action routing**: System actions (`win.`, `app.`, `menu:`, `sys.`, `fd.` prefixes) always handled locally. Non-system actions from IPC-owned windows forwarded to app via `IPCBroker_RouteAction`.
-- **Init sequence**: `SysDisplay_Init -> EventRouter_Init -> Dialog_Init -> Menu_Init -> Deskbar_Init -> IPCBroker_Init -> StartMenu_Init -> HTML_Init -> PageSurface_Init -> Doc_Init`
+```bash
+# Compiler
+./ailang.x <source>.ailang <output>.x
+
+# Browser (the ONE browser)
+./ailang.x Applications/browser_ipc.ailang browser_ipc.x
+
+# Headless test mode
+./browser_ipc.x --headless input.html output.ppm
+
+# Display server
+./ailang.x Main.ailang SysDisplay.x
+./SysDisplay.x  # run on TTY (Ctrl+Alt+F2)
+
+# Test runners
+python3 tools/wpt_render_runner.py --all              # Full WPT (24k tests)
+python3 tools/wpt_render_runner.py --suite css-color  # Single suite
+python3 tools/render_test_runner.py                   # Internal regression tests
+python3 tools/html5lib_runner.py                      # HTML tokenizer tests
+python3 tools/test262_runner.py --full                # JS engine tests
+
+# Headless display server tests
+./ailang.x TestCode/test_main.ailang test_main.x && ./test_main.x
+
+# JS engine E2E
+./ailang.x TestCode/test_js_e2e.ailang test_js_e2e.x && ./test_js_e2e.x
+
+# Other apps
+./ailang.x Applications/calc_ipc.ailang calc_ipc.x
+./ailang.x Applications/terminal_ipc.ailang terminal_ipc.x
+./ailang.x Applications/claude_ipc.ailang claude_ipc.x
+./ailang.x dnd_game.ailang dnd.x
+```
+
+## Test Results Baseline (2026-05-16, strict 99.9% pixel threshold)
+
+**WPT Render: 19,970 / 24,021 good (83%), 18 crashes**
+
+| Suite | Score | % |
+|-------|-------|---|
+| css2-box | 11/11 | 100 |
+| css2-colors | 22/22 | 100 |
+| css2-ui | 239/239 | 100 |
+| css2-values | 28/28 | 100 |
+| render-tests | 10/10 | 100 |
+| css2-selectors | 612/615 | 99 |
+| css2-cascade | 100/101 | 99 |
+| css2-box-display | 108/109 | 99 |
+| css2-lists | 291/293 | 99 |
+| css2-generated-content | 313/316 | 99 |
+| css2-borders | 750/763 | 98 |
+| css2-fonts | 320/324 | 98 |
+| css2-zindex | 51/52 | 98 |
+| css2-visuren | 56/57 | 98 |
+| css2-backgrounds | 607/625 | 97 |
+| css2-margin-padding-clear | 717/739 | 97 |
+| css2-tables | 1105/1139 | 97 |
+| css2-text | 558/570 | 97 |
+| css2-linebox | 239/249 | 95 |
+| css-display | 314/341 | 92 |
+| css-text | 1737/1878 | 92 |
+| css-images | 460/508 | 90 |
+| css2-positioning | 525/578 | 90 |
+| css2-floats-clear | 222/249 | 89 |
+| css-flexbox | 1111/1274 | 87 |
+| css-break | 1020/1170 | 87 |
+| css2-abspos | 27/31 | 87 |
+| css-color | 307/365 | 84 |
+| css-pseudo | 297/353 | 84 |
+| css-lists | 183/218 | 83 |
+| html-rendering | 363/439 | 82 |
+| css-contain | 475/580 | 81 |
+| css2-normal-flow | 675/850 | 79 |
+| css-overflow | 586/737 | 79 |
+| css-backgrounds | 642/859 | 74 |
+| css-position | 263/354 | 74 |
+| css2-floats | 110/147 | 74 |
+| selectors | 383/511 | 74 |
+| css-sizing | 540/725 | 74 |
+| css-fonts | 432/589 | 73 |
+| css-grid | 1370/1879 | 72 |
+| css-box | 102/150 | 68 |
+| cssom-view | 148/220 | 67 |
+| css-animations | 152/230 | 66 |
+| css-transitions | 126/189 | 66 |
+| css-multicol | 461/709 | 65 |
+| css-cascade | 79/136 | 58 |
+| css-nesting | 25/43 | 58 |
+| css-values | 239/465 | 51 |
+| css-conditional | 146/318 | 45 |
+| css-inline | 94/215 | 43 |
+| cssom | 71/208 | 34 |
+| css-logical | 20/92 | 21 |
+
+**Other test suites:**
+- html5lib tokenizer: 1624/1625 (99.9%)
+- Test262 JS (full): 45,865/49,998 (92.5%)
+- test_js_e2e: 32/32 (100%)
+
+## Architecture
 
 ### Compiler Constraints
 
-- **6-arg limit**: SysV AMD64's 6 register args (RDI, RSI, RDX, RCX, R8, R9) with no spill. `analyzer.x` arity checker enforces this.
-- **StoreValue**: Defaults to 8-byte (qword) writes. Use `StoreValue(addr, val, "dword")` for 4-byte writes.
-- **MemoryCopy/MemorySet**: Emit `CLD` + `REP MOVSB/STOSB` with register save/restore.
-- **FixedMul/FixedDiv**: Compiler primitives for fixed-point arithmetic. `FixedMul(a, b, bits)` = `(a * b) >> bits`, `FixedDiv(a, b, bits)` = `(a << bits) / b` (direct IDIV, exact, signed). `bits` must be a compile-time constant: 8 (Q8.8), 16 (Q16.16), 32 (Q32.32), or 64 (Q64.64). FixedDiv guards division-by-zero (returns 0). All widths handle negative values correctly via signed IMUL/IDIV. Implementation: `Librarys/Compiler/Compile/FPU/X86/Library.FPUCompileX86FixedPoint.ailang` (compile layer, Branch/Case dispatch) + `Library.FPUEmitX86FixedPoint.ailang` (x86-64 byte emission). Tests: `TestCode/TestFixedPointPrimitives.ailang` (36/36 passing, zero tolerance).
-- **Top-level code restriction**: AILang does not allow executable code (variable assignment, function calls that store results) at the top level outside of `SubRoutine`/`Function` bodies. Top-level has RBP=0 (no stack frame), so local variable stores crash. Use `SubRoutine.Main { ... }` + `RunTask(Main)` for entry points. FixedPool declarations are fine at top level (they're globals via R15).
-- **Local variables survive function calls**: Local variables are stored at RBP-relative stack offsets (not registers), and RBP is callee-saved. This means locals assigned before a function call retain their value after the call returns. Compiler intrinsics (StringLength, MemoryCopy, GetByte, SetByte, etc.) also do NOT clobber locals. **However**, FixedPool fields are global state — recursive functions that read/write the same FixedPool fields across recursion levels will see the child's writes. Use local variables (not FixedPool) for per-call state in recursive functions.
+- **6-arg limit**: SysV AMD64's 6 register args (RDI, RSI, RDX, RCX, R8, R9) with no spill.
+- **StoreValue**: Defaults to 8-byte (qword). Use `StoreValue(addr, val, "dword")` for 4-byte.
+- **MemoryCopy/MemorySet**: `CLD` + `REP MOVSB/STOSB` with register save/restore.
+- **FixedMul/FixedDiv**: Fixed-point arithmetic. `FixedMul(a, b, bits)` = `(a * b) >> bits`, `FixedDiv(a, b, bits)` = `(a << bits) / b`. Bits: 8, 16, 32, or 64.
+- **Top-level code restriction**: No executable code at top level. Use `SubRoutine.Main { ... }` + `RunTask(Main)`.
+- **Local variables survive function calls**: Stored at RBP-relative. But FixedPool fields are global — recursive functions clobber each other's FixedPool state. Use locals for per-call state.
+- **No stack arrays**: Use FixedPool or if-chains for indexed access.
 
-### Headless Testing
+### Browser Pipeline
 
-`FB_InitHeadless(w, h)` allocates anonymous mmap buffer instead of `/dev/fb0`. Test binaries override `RenderFB_InitDouble` to call `FB_InitHeadless(1920, 1080)`.
+```
+HTML source -> HTMLTokenizer -> HTMLDom -> CSSParse -> HTMLLayout -> HTMLRender -> Canvas (PPM)
+```
 
-### HTML Toolbar System
+**Layout modules** (in `Librarys/Browser/`):
+- `HTMLLayout.ailang` — Core: FixedPools, init, cmd helpers, hit-test, GetDisplay
+- `HTMLLayoutColors.ailang` — Color parsing (named, hex, rgb, hsl, hwb, px/em/vw/vh)
+- `HTMLLayoutCSS.ailang` — Selector matching, property resolution, margin/padding/border
+- `HTMLLayoutFlex.ailang` — Float state, FlexLayout, text emission/word-wrap
+- `HTMLLayoutEngine.ailang` — LY__LayoutNode recursive DFS, block/inline/flex dispatch
+- `HTMLLayoutTraversal.ailang` — Display detection, grid/flex/block dispatch
 
-`toolbar=` attribute on `<window>` tag: `"none"` (0), `"about"` (1, default), `"file"` (2), `"full"` (3). `Win_BuildAppToolbar(ctx, mode, app_title)` builds the tree.
+**Headless mode** (`browser_ipc.ailang`):
+- Reads `/proc/self/cmdline` for `--headless` flag
+- `./browser_ipc.x --headless input.html output.ppm`
+- Always renders 1024x700 canvas
+- Full pipeline: tokenize -> DOM -> CSS -> JS -> layout -> render -> PPM
 
-## Key Subsystems (Condensed)
+### JavaScript Engine
 
-### Shared Memory Canvas
+Bytecode VM: JSLexer -> JSParser -> JSCompiler -> JSVM -> JSRuntime -> JSBridge
 
-Zero-copy pixel streaming via `/dev/shm/ailang_canvas_<win_id>` (`MAP_SHARED`, BGRA). IPC messages: `canvas.attach`, `canvas.present`, `canvas.detach`. Per-window `CanvasState` (48-byte entries): ACTIVE, SHM_PTR, SHM_SIZE, SURF, MOUSE_CAPTURE, DIRTY fields.
+- 11 libraries, ~23,300 LOC
+- Test262: 92.5% (45,865/49,998)
+- Zero-alloc hot path (ring buffers, slabs, PropTable)
+- JIT for leaf functions (x86-64 native)
 
-### Xvfb Sandboxed Apps (Chrome, VS Code, Ladybird)
+### Display Server (SysDisplay.x)
 
-3-process stack: Xvfb (virtual X, `-fbdir` for mmap framebuffer) -> app (`--display=:N`) -> xdotool (persistent stdin pipe for input). Direct mmap of Xvfb framebuffer file (xwd format, 3232-byte header offset). Row-by-row viewport copy to ShmCanvas each tick.
+- Framebuffer compositor (`/dev/fb0`)
+- Auckland widget toolkit (AKContext per window/toolbar/menu)
+- IPC broker (Unix socket `/tmp/ailang_display.sock`, JSON protocol)
+- Evdev input, multi-window, deskbar, start menu
 
-- Chrome: Xvfb :99, fbdir `/tmp/chrome_fb/`, profile `/tmp/chrome_ailang_profile`, `--start-maximized`. Do NOT use `--disable-software-rasterizer`.
-- VS Code: Xvfb :98, fbdir `/tmp/vscode_fb/`, profile `/tmp/vscode_ailang_profile`, `--maximize`, `--new-window`.
-- Ladybird: Native IPC client (no Xvfb needed) — uses Ailang's ShmCanvas directly via C++ integration in `~/ladybird/UI/Ailang/`.
-- PID file system for cleanup (`/tmp/*_ailang_{xvfb,browser,xdotool}.pid`). `DropPriv()` before execve (stat `/home/bob` for uid/gid).
-- MOUSE_CAPTURE flag for VM-style mouse forwarding. Mouse move coalescing (one xdotool per tick).
-- Persistent Xvfb on resize — no process restart, just ShmCanvas recreate + `xdotool windowsize`.
+### IPC Protocol
 
-### Audio Engine
-
-Direct ALSA (`/dev/snd/pcmC0D0p`), S16LE 48kHz stereo. 3-bus mixer (app/system/master). Audio-driven frame sync for video. Volume 0-1024 (256=unity). Replay: must call `Audio_Prepare()` after `Audio_Drop()`.
-
-### Terminal Emulator
-
-PTY + VT100 state machine (NORMAL/ESC/CSI/OSC). 8x16 bitmap font (`Library.TermFont.ailang`). Grid: 4-byte codepoints + BGRA fg/bg per cell. Truecolor (256-color + 24-bit RGB). DEC private modes (?1049/?25/?7/?1). Scrollback ring buffer (1000 lines). UTF-8 multi-byte decoder. Dynamic resize via `TIOCSWINSZ`.
+4-byte BE length prefix + JSON. Methods: `register`, `window.create`, `window.update` (app->server); `window.created`, `window.closed`, `input.action`, `input.key`, `input.mouse` (server->app).
 
 ## Library Directory Structure
 
-Import paths use dots: `LibraryImport.Display.Window.WinManager` -> `Librarys/Display/Window/Library.WinManager.ailang`.
+Import paths use dots: `LibraryImport.Browser.HTMLLayoutGrid` -> `Librarys/Browser/Library.HTMLLayoutGrid.ailang`
 
 ```
 Librarys/
 ├── Library.{Arena,XArrays,StringUtils,JSON,HashMap,Socket,ShmCanvas,KeyMap,TextBuffer,TermFont,TUI,Math}.ailang
-├── Compiler/                       # Compiler subsystem
-├── AIMacro/                        # Macro subsystem
-├── Display/                        # Display server
-│   ├── System/    # SysDisplay, EventRouter, Screenshot
-│   ├── Window/    # WinManager, WinToolbar, WinInput, WinStack, WinRender
-│   ├── Input/     # DInputTypes, DInputEvdev, DInputDiscover, Cursor, CursorBitmap
-│   ├── UI/        # Auckland, AucklandEvent, AucklandBind, TextRegion, PaneDecorator, Dialog, AboutDialog, FileDialog, NotepadApp
-│   ├── Menu/      # Menu, StartMenu, CascadeMenu, Deskbar
-│   ├── Render/    # Framebuffer, DRenderFB, DSurface*, DCompose*, DRing*, DZone*, Fonts, VIF, VIcon, AudioEngine
-│   ├── Content/   # Document, PageSurface, HTMLParse, Editor
-│   ├── Theme/     # UIConfig, UIScale, UITheme
-│   └── IPC/       # IPCBroker, InputRouter
-├── Browser/                        # JS engine + HTML browser
-│   # JSLexer, JSParser, JSCompiler, JSRuntime, JSVM, JSBridge, JSEngine, JSJIT
-│   # JSRegex, JSOop, JSValidate
-│   # HTMLTokenizer, HTMLDom, CSSParse, HTMLLayout, HTMLRender
-└── DnD/                            # D&D RPG game
-    ├── Engine/    # DND, GameConfig, World, Portal, Encounter, DICE
-    ├── Character/ # Character, Item, EquipScreen
-    ├── Battle/    # BattleScreen
-    ├── Commerce/  # Shop, Inn
-    ├── Save/      # Save, SaveScreen
-    └── Web/       # HTMLBroadcast, DND_HTML_Output_engine
+├── Compiler/        # Self-hosting compiler
+├── Display/         # Display server (windows, input, rendering, IPC)
+├── Browser/         # JS engine + HTML browser rendering
+└── DnD/             # D&D RPG game engine
 ```
 
-IPC apps only import generic root libs — no Display/ imports.
+## Key Files
 
-## PostgreSQL Services
+| Purpose | Path |
+|---------|------|
+| Browser app | `Applications/browser_ipc.ailang` |
+| Layout engine | `Librarys/Browser/Library.HTMLLayoutEngine.ailang` |
+| Layout traversal | `Librarys/Browser/Library.HTMLLayoutTraversal.ailang` |
+| Layout core | `Librarys/Browser/Library.HTMLLayout.ailang` |
+| CSS parser | `Librarys/Browser/Library.CSSParse.ailang` |
+| HTML tokenizer | `Librarys/Browser/Library.HTMLTokenizer.ailang` |
+| HTML DOM | `Librarys/Browser/Library.HTMLDom.ailang` |
+| HTML renderer | `Librarys/Browser/Library.HTMLRender.ailang` |
+| JS engine entry | `Librarys/Browser/Library.JSEngine.ailang` |
+| WPT test runner | `tools/wpt_render_runner.py` |
+| Render test runner | `tools/render_test_runner.py` |
+| Display server | `Main.ailang` |
 
-```sql
-CREATE TABLE IF NOT EXISTS services (
-    id SERIAL PRIMARY KEY, name TEXT NOT NULL UNIQUE,
-    binary_path TEXT, args TEXT, autostart BOOLEAN DEFAULT false,
-    restart_policy TEXT DEFAULT 'never', depends_on TEXT,
-    run_as TEXT DEFAULT 'nobody', priority INTEGER DEFAULT 50,
-    enabled BOOLEAN DEFAULT true, encryption_key_id INTEGER,
-    display_name TEXT
-)
+## WPT Test Runner Usage
+
+```bash
+# Full suite (all 56 suites, ~24k tests, ~35 min)
+python3 tools/wpt_render_runner.py --all
+
+# Single suite
+python3 tools/wpt_render_runner.py --suite css-grid
+
+# Focused test
+python3 tools/wpt_render_runner.py --suite css-grid --test grid-lanes
+
+# Results location
+/tmp/wpt_real_results.txt  # Full run output
+
+# Test thresholds:
+#   PASS: >= 99.9% pixel match
+#   PARTIAL: 90-99.9% pixel match
+#   FAIL: < 50% pixel match
 ```
 
-Seeded: notepad, files, calculator, grep, canvas_demo, videoplayer, terminal, claude, chrome, ladybird.
+## Known Rendering Bugs (from WPT failures)
 
-## Build & Run
+1. **CSS Grid** — `display:grid` falls back to block stacking (no grid algorithm)
+2. **CSS Logical Properties** — `margin-inline`, `padding-block` etc. not implemented
+3. **Container Queries** — `@container` not parsed/evaluated
+4. **CSSOM** — computed style API incomplete
+5. **CSS Inline** — inline-block vertical alignment issues
+6. **Float wrapping** — float clearing/wrapping edge cases in css2-floats
+7. **display:contents** — still renders box (borders/backgrounds) when it shouldn't
+8. **Root background propagation** — body bg doesn't propagate to canvas root
 
-```
-./ailang.x Main.ailang SysDisplay.x                        # display server
-./ailang.x Applications/calc_ipc.ailang calc_ipc.x         # calculator
-./ailang.x Applications/grep_ipc.ailang grep_ipc.x         # grep
-./ailang.x Testcode/canvas_demo.ailang canvas_demo.x       # canvas demo
-./ailang.x Applications/videoplayer.ailang videoplayer.x   # video player
-./ailang.x Applications/terminal_ipc.ailang terminal_ipc.x # terminal
-./ailang.x Applications/claude_ipc.ailang claude_ipc.x     # claude code
-./ailang.x Applications/chrome_ipc.ailang chrome_ipc.x     # chrome browser
-./ailang.x Applications/vscode_ipc.ailang vscode_ipc.x    # VS Code
-./ailang.x Applications/ladybird_ipc.ailang ladybird_ipc.x # Ladybird browser (native IPC)
-./ailang.x dnd_game.ailang dnd.x                           # DnD game
-./ailang.x Calc.ailang Calc.x                              # calc unit tests
-./ailang.x TestCode/test_main.ailang test_main.x           # headless tests (125 steps)
-./ailang.x TestCode/test_js_e2e.ailang test_js_e2e.x       # JS engine E2E tests
-./ailang.x TestCode/bench_js.ailang bench_js.x             # JS benchmark (fib)
-./ailang.x Applications/browser_ipc.ailang browser_ipc.x   # Ailang native browser
-./SysDisplay.x                                              # run on TTY (Ctrl+Alt+F2)
-```
+## Headless Testing Pattern
 
-### Kernel Module Path (`-kmod`)
+`FB_InitHeadless(w, h)` allocates anonymous mmap buffer instead of `/dev/fb0`. Test binaries override `RenderFB_InitDouble` to call `FB_InitHeadless(1920, 1080)`.
 
-`./ailang.x -kmod source.ailang ail_payload.o` produces ET_REL. Drop into `kernel_module/shim/`, `make`, `sudo insmod ail_combined.ko`. Steps 1-5 done, step 6 (insmod test) pending dedicated Linux box.
+## HalCode9000 — MCP Server
 
-## Ladybird Browser Integration
+`Applications/HalCode9000/` — MCP server for cheap LLM workers (DeepSeek). Terminal TUI with streaming, multi-provider support, tool dispatch over IPC.
 
-Native IPC client (no Xvfb sandboxing needed). C++ integration in `~/ladybird/UI/Ailang/` (10 files, ~1100 lines):
-- `AilangIPC.h/cpp` — socket client, JSON protocol, ShmCanvas management
-- `Application.h/cpp` — extends `WebView::Application`, IPC message dispatch, toolbar actions (`lb.back`/`lb.fwd`/`lb.reload`)
-- `WebContentView.h/cpp` — `ViewImplementation` for Ailang backend, BGRx8888->BGRA paint, keyboard/mouse mapping
-- `Events.cpp` — evdev scancode -> `Web::UIEvents::KeyCode` (95 mappings)
-- `main.cpp` + `CMakeLists.txt`
-
-Window config: `config/ladybird.html` (1024x700, `toolbar="about"`).
-Build: `~/ladybird/Build/release/bin/Ladybird` (compiled, 2.4MB).
-
-## JavaScript Engine (Phase 6)
-
-Bytecode VM architecture: `<script>` source -> JSLexer (tokenize) -> JSParser (recursive descent AST) -> JSCompiler (AST -> bytecode + constant pool) -> JSVM (fetch-decode-execute) -> JSRuntime (values, coercion, built-ins) -> JSBridge (DOM bindings) -> JSEngine (orchestrator).
-
-11 libraries in `Librarys/Browser/` (~23,300 LOC total):
-
-| Library | LOC | Role |
-|---------|-----|------|
-| JSLexer | 1798 | Tokenizer, ~49 token types (KW_VAR=70 through KW_STATIC=105), template escape validation |
-| JSParser | 5116 | Recursive descent, Pratt precedence, ~55 AST node types, class/destructuring/for-of |
-| JSCompiler | 4135 | AST -> bytecode (~75 opcodes), constant pool, local resolution, class compilation |
-| JSRuntime | 3370 | JSValue (16-byte tagged: type+payload), coercion, object/array/generator ops |
-| JSVM | 2361 | Branch-dispatch loop, 4096-deep value stack, generator coroutines, eval() |
-| JSBridge | 2073 | DOM bindings + Object/Array/Error globals (56 native handlers) |
-| JSEngine | 902 | Orchestrator: extract `<script>` tags, lex->parse->compile->run pipeline |
-| JSJIT | 1032 | x86-64 JIT compiler via CEmit ARCH backend, param_block calling convention |
-| JSRegex | 1216 | Thompson NFA regex engine (user-authored) |
-| JSOop | 919 | Prototype chain, instanceof, property descriptors (user-authored) |
-| JSValidate | 382 | Token validation tables for parser lookahead |
-| PropTable | ~420 | FixedPool property tables (replaced XSHash) — linear-scan object props + open-addressed global hash |
-
-**Value types**: UNDEFINED(0), NULL(1), BOOLEAN(2), NUMBER(3, IEEE 754 double bits in 64-bit payload), STRING(4), OBJECT(5, PropTable), FUNCTION(6), ARRAY(7, XArray), GENERATOR(8). Full IEEE 754 floating point via SSE2 intrinsics (`Float_Add`, `Float_Sub`, `Float_Mul`, `Float_Div`, `Float_FromInt`, `Float_ToInt`, `Float_Lt`, `Float_Gt`, `Float_Eq`, etc.). `JSRT_CreateNumber(n)` stores `Float_FromInt(n)`, `JSRT_CreateFloat(bits)` stores raw double bits. Extracting integer from NUMBER payload requires `Float_ToInt(JSRT_GetPayload(...))`. No GC — zero-alloc hot path via fixed pools, ring buffers, and slab allocators.
-
-**Memory architecture (zero-alloc hot path)**:
-- `val_pool` — 65536-entry ring buffer for JSValue slots (16 bytes each, ~1 MB). `JSRT__AllocValue()` bumps cursor, wraps at capacity.
-- `str_slab` — 512 KB bump allocator for string data. `JSRT__StrSlabAlloc(sz)` bumps cursor, wraps at capacity. Used by `JSRT_CreateString`, `JSRT_CreateStringLen`, `JSRT__StrConcat`.
-- `func_slab` — 64 KB bump allocator for function descriptors (64 bytes each, 1024 slots). `JSRT__FuncSlabAlloc()`.
-- `gen_slab` — 512 KB bump allocator for generator state (stack + frames). `JSRT__GenSlabAlloc(sz)`.
-- `PropTable` — 4096-entry × 264-byte ring buffer slab (~1.03 MB) for object property tables. Linear scan array (16 entries per object, 16 bytes per entry: key_ptr + value). `PropTable_Alloc()` bumps cursor. Replaced XSHash entirely.
-- `GlobalHash` — 512-slot open-addressed hash table (8 KB, fixed lifetime) for global variables. DJB2 hash, linear probing. `GlobalHash_Lookup` / `GlobalHash_Insert`.
-- `const_val_pool` — Static 32 KB + 64 KB buffers for bytecode constant value cache (used when ≤4096 constants; Allocate fallback for oversized programs only).
-- Static backup buffers for `JSVM__CallFunc` (re-entrant calls) and `JSVM__GenNext` (generator resume): pre-allocated at init, no per-call allocation.
-- All runtime Allocate() calls eliminated. Only init-time (~100 calls), compiler scope save (recursive/cold), and peripheral I/O subsystems use Arena.
-
-**Key patterns**:
-- `JSCompDot` FixedPool for MEMBER_DOT assignment compilation (survives recursive JSComp__CompileExpr calls)
-- `JSBridgeTmp` / `JSVMTmp` FixedPools for clobber-safe temporaries across function calls
-- `JSRT_ToString` returns JSValue pointer; use `JSRT_GetPayload()` to extract raw C string
-- `JSBridge__GetDomIdx` checks `__dom_idx` property on JS wrapper objects to map back to DOM nodes
-
-**Test suites**: `test_js_e2e.ailang` (9 tests, 32/32 assertions passing), `bench_js.ailang` (8 micro-benchmarks including JIT).
-
-**Build**: `./ailang.x TestCode/test_js_e2e.ailang test_js_e2e.x && ./test_js_e2e.x`
-
-### Implemented Features (completed across sessions)
-
-- **Arrow functions** — ARROW token in JSLexer, ARROW_EXPR(47) AST node in JSParser (`IsArrowHead` lookahead + `ArrowFunc` parser), compiled via `JSComp__CompileFunc` reuse in JSCompiler. Supports `x => expr`, `(x, y) => expr`, `(x, y) => { stmts }`. Concise body auto-wrapped in RETURN_STMT→BLOCK.
-- **Error constructors** — Handlers 15-21 in JSRT_CallNative for Error/TypeError/RangeError/ReferenceError/SyntaxError/URIError/EvalError. Each creates object with `name`, `message`, `__class__` properties. Registered as globals in JSVM_InstallBuiltins via `JSBridge__CreateNativeFunc`. `JSRT_Instanceof` checks `__class__` property against function name.
-- **Native handler dispatch** — VM threshold at 22: handlers 0-21 go to JSRT_CallNative (0-14 math/type, 15-21 Error ctors), handlers 22+ go to JSBridge_Dispatch. All JSBridge native IDs bumped by +6 (CONSOLE_LOG=22 through MATH_FLOOR=42).
-- **Generators** — Full `function*`/`yield`/`.next()`/`.return()`/`.throw()` implementation across all layers. KW_YIELD(101) token in JSLexer, YIELD_EXPR(48)/GEN_FUNC_DECL(49)/GEN_FUNC_EXPR(50) AST nodes in JSParser, GEN_CLOSURE(74)/YIELD(73) opcodes in JSCompiler, GENERATOR(8) value type in JSRuntime with 104-byte state block (private stack + frames), coroutine-style VM state swapping in JSVM (save/restore pc/sp/fp/stack/frames). Generator object created on CALL to generator function, `.next()` resumes via `JSVM__GenNext` with full state isolation. Supports `function*`, `*method()`, `function*()` expressions, `yield`, `yield*` (delegate), `yield` as expression with `.next(value)` pass-through.
-- **Regex** — Added by user externally (Library.JSRegex.ailang, Thompson NFA, 1217 lines)
-- **OOP** — Added by user externally (Library.JSOop.ailang, 920 lines)
-- **Exponentiation (`**`)** — STAR_STAR/STAR_STAR_ASSIGN tokens in JSLexer, precedence 11 (right-associative) in JSParser Pratt table, EXP opcode (26) in compiler/VM, `JSRT_Exp` iterative squaring in runtime.
-- **Numeric separators (`1_000`)** — JSLexer skips `_` (95) in decimal digit scanning, JSParser `ParseInt` skips `_` during value computation.
-- **Nullish coalescing (`??`)** — NULLISH token in JSLexer, precedence 1 in parser, short-circuit compilation via `JMP_NULLISH` opcode (53) — jumps if top-of-stack is NOT null/undefined.
-- **Logical assignment (`&&=`, `||=`, `??=`)** — AND_ASSIGN, OR_ASSIGN, NULLISH_ASSIGN tokens, wired through parser `IsAssignOp` and compiler compound-assignment dispatch. Simplified semantics (always evaluates RHS); proper short-circuit TODO.
-- **Class syntax** — Full basic class support across all layers. **JSLexer**: KW_CLASS(102), KW_EXTENDS(103), KW_SUPER(104), KW_STATIC(105) tokens. **JSParser**: CLASS_DECL(51), CLASS_EXPR(52), SUPER_EXPR(53) AST nodes; `JSParse__ClassDecl`, `JSParse__ClassExpr`, `JSParse__ClassBody` parse class declarations/expressions with constructor, methods, static methods, get/set accessors, extends clause. **JSCompiler**: `JSComp__CompileClass` (~450 lines) compiles classes to constructor function + prototype object using existing opcodes (CLOSURE, NEW_OBJECT, SET_PROP, GET_PROP) — no new VM opcodes needed. Extends sets up `__proto__` chain. `__super__` local holds parent constructor for super() calls. Methods compiled as closures and set on prototype. Statics set on constructor. **JSValidate**: KW_CLASS added to stmt_start and expr_start tables, KW_SUPER added to expr_start. **Parser keyword range**: Extended from 70-100 to 70-105 in 4 locations (object literal property keys, get/set accessor detection, dot member access) to accept `class`/`extends`/`super`/`static` as property names per ES spec. Class-only test262 results: statements/class 2401/4367 (55.0%), expressions/class 943/4059 (23.2%), total 3344/8426 (39.7%).
-- **For-of loops** — Eager-materialization approach using TO_ARRAY opcode. **JSParser**: FOR_OF_STMT(54) AST node, contextual `of` keyword detection (IDENT with bytes 111,102) in both var-decl and expression-init branches of `JSParse__ForStmt`. Reuses `for_is_in` flag to skip condition/update clauses. **JSCompiler**: TO_ARRAY(75) opcode, FOR_OF_STMT compilation (~200 lines) mirrors FOR_IN_STMT pattern — `compile(rhs) → TO_ARRAY → __vals__ local, __idx__=0, loop: if idx>=vals.length break, lhs=vals[idx], body, idx++, goto loop`. **JSVM**: Case 75 (TO_ARRAY) — arrays pass through unchanged, strings split into single-character arrays via `JSRT_CreateStringLen(ptr, 1)`, fallback returns empty array. Design trade-off: eager materialization loses lazy generator iteration but covers the vast majority of test262 for-of tests. Result: +267 net passes (11,861 → 12,128).
-- **Object.defineProperty / Object.keys / Object.create / Array.isArray** — Full Object and Array global implementation. 14 native handler IDs (43-56). Object.defineProperty stores getter as `__get_<prop>`, setter as `__set_<prop>`, value directly. Object.keys wraps `JSRT_ObjKeys()`. Object.create sets `__proto__`. Object.assign copies own enumerable props. Object.freeze sets `__frozen__` flag. Array.isArray checks JSType.ARRAY. Array.from copies arrays/splits strings. Object.getOwnPropertyDescriptor builds descriptor object. Object.is does SameValue comparison. Registered in JSVM_InstallBuiltins using JSRT__Push/Pop (not JSBridge__Push/Pop) since JSBridge may not be initialized. Result: ~+500 passes.
-- **Class method destructuring parameters** — Class body parameter parser was only accepting simple IDENT tokens. Replaced with full destructuring-aware parsing matching the FuncExpr path: supports `{ x, y }` object patterns, `[ a, b ]` array patterns, `...rest` parameters, and `= default` values. All patterns use AST__Push/Pop to protect 8 local variables (ASTTmp.first, ASTTmp.last, ASTTmp.done, mflags, method, param_first, param_last, p_done) across recursive JSParse__ParseBindTarget/JSParse__Assign calls. Result: ~+2,000 passes.
-- **Destructuring assignment + for-of destructuring** — Two-part fix. **(1) For-of with patterns**: JSParser `JSParse__VarDeclSingle` now skips `=` requirement when next token is `in` or `of` (contextual detection, skip_semi=1 for-loop context). JSCompiler FOR_OF_STMT handler checks `forof_dstr_pat = JSParse_GetRight(lhs_n)` — when pattern exists, stores element in `__dt__` temp local and dispatches to `JSComp__CompileArrayPattern`/`JSComp__CompileObjPattern`. **(2) Assignment destructuring**: Cover grammar conversion via `JSParse__CoverToPattern` — recursive walker converts ARRAY_LIT(25)→ARRAY_PATTERN(42), OBJECT_LIT(24)→OBJECT_PATTERN(43), UNDEF_LIT→NULL_LIT (holes), SPREAD_ELEMENT→REST_ELEMENT, nested patterns recursed. Called from `JSParse__Assign` when `=` follows ARRAY_LIT/OBJECT_LIT. JSValidate assign_target table extended with types 24,25,42,43. Compiler ASSIGN handler detects ARRAY_PATTERN/OBJECT_PATTERN LHS → compile RHS, DUP (return value), store in `__dt__` temp, dispatch to pattern compilers. Result: +422 net passes (12,128 → 12,550).
-- **Optional chaining (`?.`)** — QUESTION_DOT token in JSLexer, compiled via JMP_NULLISH short-circuit in JSCompiler. Supports `obj?.prop`, `obj?.method()`, `obj?.[expr]`. Chains correctly with nested access.
-- **Catch destructuring + parameterless catch** — JSParser handles `catch ({ message })` and `catch` (no parens). Compiler dispatches destructuring pattern to CompileObjPattern/CompileArrayPattern on catch parameter.
-- **Template literal escape validation** — JSLexer rejects legacy octal escapes (`\1`-`\9`), `\0` followed by digit, invalid `\xNN`, and invalid `\uXXXX`/`\u{...}` in template literals. Sets `JSTokState.error = 1` and `JSLex_Tokenize` returns 0 on error. Result: template-literal category 54/57 (94.7%).
-- **Private class members + instance fields as own properties** — Private fields (`#x`), private methods (`#method()`), and private accessors (`get #x()`, `set #x(v)`) work via name mangling: `#foo` stored as literal property name `"#foo"`. Since `#` is not a valid JS identifier character, user code cannot access private members externally — privacy is syntactic with zero new infrastructure. **Lexer**: PRIVATE_NAME(120) token already tokenizes `#identifier`. **Parser**: dot member access already accepts PRIVATE_NAME (JSParseExpr.ailang:1274), class body parser accepts PRIVATE_NAME for fields/methods. **Instance fields**: Compiled as `__field_init__` closure stored on prototype. Closure takes `this_obj` as parameter, sets each field via `GET_LOCAL 0; <init>; SET_PROP`. **VM**: RETURN handler (JSVMDispatch.ailang:1004-1019) calls `__field_init__` after constructor returns — looks up `__proto__.__field_init__`, calls via `JSVM__CallFunc`. Frame pointer saved before `JSVM__CallFunc` to avoid invalidation (CallFunc zeroes frames buffer). Static fields compiled directly onto constructor via `GET_GLOBAL ctor_slot; <init>; SET_PROP`. **Limitation**: Parent class `__field_init__` not chained through `super()`. **Files**: JSCompStmt.ailang (lines 1875-2013), JSVMDispatch.ailang (lines 997-1024).
-- **Array named properties (ArrSide)** — Arrays can now hold named properties (`a.foo = 42`). Since ARRAY JSValues store an XArray pointer at offset +8 (no room for a PropTable), a side table (`ArrSide`) maps array JSValue pointers to PropTable handles. 256-entry linear scan, 16 bytes per entry `[arr_ptr(8) | proptable_ptr(8)]`. `ArrSide_Lookup` for reads, `ArrSide_GetOrCreate` for writes (lazy PropTable allocation). Integrated into `JSRT_ObjGet` and `JSRT_ObjSet` with ARRAY type checks before the OBJECT-only rejection. Reset in `GlobalHash_Reset`. **Files**: `Library.PropTable.ailang` (ArrSide functions + state), `Library.JSRTObject.ailang` (ObjGet/ObjSet ARRAY handlers).
-- **SWAP opcode + property increment** — New SWAP opcode (value 8) swaps top two stack elements. Required for correct postfix property increment (`o.x++`) which must return the old value. **Postfix `o.x++`**: `compile(o), DUP, GET_PROP, SWAP, DUP, GET_PROP, PUSH_CONST 1, ADD, SET_PROP` → old value on stack. **Prefix `++o.x`**: `compile(o), DUP, GET_PROP, PUSH_CONST 1, ADD, SET_PROP, re-compile(o), GET_PROP` → new value. Also handles MEMBER_BRACKET via re-eval approach. **Files**: `Library.JSCompiler.ailang` (SWAP=8 in JSOp), `Library.JSVMDispatch.ailang` (Case 8 handler), `Library.JSCompExpr.ailang` (UPDATE_EXPR MEMBER_DOT/MEMBER_BRACKET handlers).
-- **Getter key stability (str_slab)** — DEF_GETTER/DEF_SETTER (opcodes 64, 65, 76, 77) now copy `__get_`/`__set_` key strings from transient `JSVMCallBuf.getter_buf` to stable `str_slab` memory via `JSRT__StrSlabAlloc` + `MemoryCopy` before passing to `JSRT_ObjSet`. Previously, PropTable stored the pointer to the shared 128-byte `getter_buf`, causing pointer-equality false matches when GET_PROP's getter check overwrote the buffer with a different key — resulting in infinite recursion on any `this.<prop>` access inside getter bodies. The JSBridge `Object.defineProperty` path was unaffected (uses per-call buffer from `JSBridgeStack.pool`). **Files**: `Library.JSVMDispatch.ailang` (cases 64, 65, 76, 77). Result: +892 tests (44,648 → 45,540).
-- **Static semantic checks for class elements** — Iterative DFS AST walker in JSValidate (`JSValidWalk` FixedPool + 256-entry stack) checks class field initializers and method bodies for early errors per ES spec 15.7.1 / 15.4.1. **JSValidate_CheckFieldInit(node)**: walks field initializer subtree, returns 1 if contains `arguments` identifier, 2 if contains `super()` call. Stops at function boundaries (FUNC_EXPR/DECL, GEN_FUNC_*, ASYNC_FUNC_*) but NOT arrow functions (arrows inherit arguments/super). **JSValidate_HasDirectSuper(node)**: walks method body for direct `super()` calls. Used for non-constructor methods and constructors without extends. **Parser wiring**: `ASTState.has_extends` flag set before `JSParse__ClassBody` by both `JSParse__ClassDecl` and `JSParse__ClassExpr`. Field-named-constructor check catches both static and non-static fields. All checks use AST__Push/Pop to preserve parser state across validation calls. **Files**: `Library.JSValidate.ailang` (walker infrastructure + CheckFieldInit + HasDirectSuper), `Library.JSParser.ailang` (has_extends field), `Library.JSParseStmt.ailang` (3 check call sites in ClassBody). Result: +167 tests (45,540 → 45,707).
-- **JIT Compiler (x86-64 native code generation)** — Full working JIT for leaf functions via CEmit ARCH backend. **Architecture**: `Library.JSJIT.ailang` uses the CEmit layer (`Library.CEmitCore.ailang` + `Library.CEmitCoreArch.ailang` + X86 backend) to emit native x86-64 instructions into executable mmap'd buffers. **Register convention**: R12=stack base ptr, R13=sp index, R14=const pool, RBP=locals base, RBX=scratch. **param_block pattern**: Stable 32-byte heap block allocated at JIT_Init. JIT_Execute writes [stack_base, sp, locals_ptr, const_pool] before each native call. Prologue loads from baked param_block address (stable across calls). Epilogue writes sp back. **Supported opcodes**: GET_LOCAL, SET_LOCAL, ADD, SUB, MUL, DIV, RETURN, HALT. Locals at `rbp + idx*8` matching VM's 8-byte slot size. **Compilation**: `JIT_Compile(func_idx)` scans bytecode, emits prologue+opcodes+epilogue, resolves fixups. Unsupported opcodes bail (function stays interpreted). **Performance**: `add(a,b)` compiles to 220 bytes native. 10k calls in ~5.5ms. **Files**: `Library.JSJIT.ailang` (JIT orchestrator), `Library.CEmitCoreArch.ailang` (arch-neutral emit API including `Emit_MovRaxRbp`), `Librarys/Compiler/CodeEmit/X86/Library.CEmitX86Reg.ailang` (x86 backend including `X86_MovRaxRbp`).
-
-### Test262 Conformance (as of 2026-05-10)
-
-Build & run: `./ailang.x TestCode/test262_harness.ailang test262_harness.x && python3 tools/test262_runner.py --all` (language only, ~24K tests) or `--full` (language + built-ins + annexB + staging, ~50K tests).
-
-**Batch harness** (fast): `./ailang.x TestCode/test262_harness_batch.ailang test262_harness_batch.x` — streams tests via stdin (4-byte LE length prefix + source), writes 1-byte results to fd 4 (original stdout saved via dup2). Runner auto-detects batch binary and uses it by default; `--no-batch` for legacy per-process mode.
-
-**Overall (full): 45,848 / 49,998 passing (92.4%)** — 3,765 failures, 264 timeouts
-
-Milestones: 11,861 (2026-05-02) → 12,550 (destructuring) → 17,488 (class+OOP) → 17,759 (optional chaining) → 16,421 (stable after zero-alloc refactor) → 16,884 (statement validation + async params + static blocks) → 18,000/43,034 (TDZ scope fix) → 44,648 (conservative ScanString validation, 2026-05-09) → 45,540 (getter key stability fix, 2026-05-10) → 45,707 (static semantic checks, 2026-05-10) → 45,848 (AllPrivateNamesValid + param early errors, 2026-05-10).
-
-#### Benchmark Results (Phenom II X6 3.2GHz, DDR3)
-
-- **SunSpider 1.0**: 26/26 passing (100%)
-- **Kraken 1.1**: 14/14 passing (100%)
-- **Octane**: 15/15 benchmarks parse+execute (100%), including multi-part (gbemu, typescript, zlib)
-- **E2E tests**: 32/32 passing (9 integration tests)
-- **Internal micro-benchmarks** (8 tests) vs V8 (Node.js v18, JIT-warmed):
-
-| Benchmark | Ailang | V8 | Ratio | Winner |
-|---|---|---|---|---|
-| JIT leaf 10k calls | 10.2 ms | 0.04 ms | 268x | V8 |
-| loop 100k iters | 2.3 ms | 0.27 ms | 8.6x | V8 |
-| fib(20) recursive | 0.14 ms | 0.34 ms | 0.4x | **Ailang** |
-| arith 50k iters | 0.14 ms | 0.37 ms | 0.4x | **Ailang** |
-| obj props 10k iters | 0.15 ms | 0.09 ms | 1.7x | V8 |
-| string concat 1k | 0.12 ms | 0.09 ms | 1.4x | V8 |
-| nested calls 10k | 0.15 ms | 0.03 ms | 6.0x | V8 |
-| array 5k push+sum | 0.16 ms | 0.17 ms | 0.9x | **Ailang** |
-| **TOTAL** | **13.3 ms** | **1.4 ms** | **9.6x** | |
-
-Ailang beats V8 on fib(20), arith, and array ops. V8 wins on JIT leaf calls (full optimizing compiler) and nested calls (inline caching).
-
-#### Known bugs (active)
-
-- ~~**Comma operator**: 3+ operand chains broken.~~ FIXED (ASTTmp.done clobber in JSParse__Expr + for-loop init used Assign instead of Expr)
-- **`new C().method()` chaining**: Method call on inline `new` expression doesn't bind `this` correctly. `var c = new C(); c.method()` works fine.
-- **Parent field init in extends**: `class B extends A { b = 2 }` — B's `__field_init__` runs but A's does not. Parent fields not initialized via `super()` chain.
-
-#### Remaining failure categories (4,068 failures as of 2026-05-10)
-
-| Category | Failures | Root cause |
-|---|---|---|
-| class/elements | ~300 | Missing early error checks (static semantics), async generator yield*, unicode private names |
-| class/dstr | ~100 | Rest-into-object `[...{props}]` (48), computed key eval in destructuring (24), misc |
-| dynamic-import | ~335 | No module support |
-| async-generator | ~240 | yield* delegation, edge cases |
-| regexp | ~388 | Literal validation, named groups, misc |
-| expressions/object | ~154 | Edge cases |
-| Other | ~2,551 | Spread across many categories |
-
-## Pending Work
-
-### JS Engine — Status (2026-05-10)
-
-**Current: 45,848/49,998 (92.4%) full. Paused — shifting focus to native browser.**
-
-Completed fix list:
-1. ~~**Fix getter key stability**~~ (+892 tests) — DONE.
-2. ~~**Static semantic checks**~~ (+167 tests) — DONE. ContainsArguments, ContainsSuperCall, HasDirectSuper, field-named-constructor.
-3. ~~**Function parameter early errors**~~ (+126 tests) — DONE. Trailing comma after rest, use-strict + non-simple params, duplicate params.
-4. ~~**AllPrivateNamesValid**~~ (+15 tests) — DONE. Stack-based scope, DFS walker, in_class_depth gate.
-
-Remaining (low priority, diminishing returns):
-- Rest-into-object + computed key eval in destructuring (~110 tests)
-- Async generator yield* delegation (~281 tests)
-- RegExp named groups/character class ranges (~174 tests)
-- Module/dynamic-import (~335 tests) — needs entirely new subsystem
-
-Progress log:
-- 2026-05-02: Baseline 11,861 (49.6%)
-- 2026-05-03: +1,969 (class, for-of, destructuring) → 12,550
-- 2026-05-04: +5,209 (class+OOP, optional chaining, template validation) → 17,759 peak
-- 2026-05-06: arguments object, CountVars fix for nested scopes, benchmarks vs V8, IEEE 754 float fixes
-- 2026-05-07: Private class members (name mangling), instance fields as own properties (__field_init__ closure), fixed JSVM__CallFunc frame corruption in RETURN handler
-- 2026-05-08: Zero-alloc hot path complete — str_slab, func_slab, gen_slab, PropTable ring buffer, static backup buffers, const_val_pool cache. XSHash fully replaced by PropTable/GlobalHash. SunSpider 26/26, Kraken 14/14, Octane 15/15 all passing.
-- 2026-05-09: Conservative ScanString validation (PeekAt-only `\u`/`\x` validation, line terminator rejection, unterminated string detection — +1,614 tests). Getter `this` binding fix (`JSVM__SetGlobal("this", obj)` in GET_PROP inline getter). GET_GLOBAL experiment reverted (caused 24k regression — GlobalHash stores JSValue pointers that go stale in ring buffer). Full: 43,034→44,648 (+1,614). Commit 1caa865.
-- 2026-05-10: Getter key stability fix — DEF_GETTER/DEF_SETTER `__get_`/`__set_` keys copied from transient getter_buf to stable str_slab. Root cause: PropTable pointer-equality matched wrong getter via shared buffer address, causing infinite recursion on `this.<prop>` in getter bodies. +892 tests. Full: 44,648→45,540 (91.8%). Static semantic checks — iterative DFS walker (JSValidWalk FixedPool) for ContainsArguments, ContainsSuperCall in field initializers, HasDirectSuper in non-constructor methods and constructors without extends, field-named-constructor early error. +167 tests. Full: 45,540→45,707 (92.1%). Function parameter early errors (trailing comma after rest, use-strict + non-simple params, duplicate params) +126 tests. AllPrivateNamesValid — stack-based private name scope (8 levels), DFS walker validates #name references, in_class_depth gate for #name outside class. +15 tests. Full: 45,707→45,848 (92.4%).
-
-### Other Pending
-
-- **Ladybird live testing** — performance tuning, tab management
-- **Terminal polish** — cursor blink, mouse reporting
-- **Audio engine split** — extract from display server
-- **SSE2 optimization** — FB_ClearBuffer, compiler integer SSE2 emit
-
-### Native Browser — Status & Roadmap (2026-05-14)
-
-**Current test results (2026-05-14):**
-- **WPT render (full 21 suites): 6307/6855 (92%), 2 crashes, 0 timeouts**
-- html5lib tokenizer: **1624/1625 (99.9%)** — 1 fail, 221 skipped (entities)
-- test_browser.x: **209/209 (100%)** — unit + integration tests
-- test_js_e2e.x: **32/32 (100%)** — JS engine integration tests
-- Test262 (full): **45,865/49,998 (92.5%)**
-
-**WPT suite breakdown (v7, 2026-05-14, full --all run):**
-
-| Suite | Score | Notes |
-|-------|-------|-------|
-| css2-backgrounds | 625/625 (100%) | Perfect |
-| css2-box | 11/11 (100%) | Perfect |
-| css2-box-display | 109/109 (100%) | Perfect |
-| css2-cascade | 101/101 (100%) | Perfect |
-| css2-colors | 22/22 (100%) | Perfect |
-| css2-fonts | 324/324 (100%) | Perfect |
-| css2-visuren | 57/57 (100%) | Perfect |
-| render-tests | 10/10 (100%) | Internal regression suite |
-| css2-floats-clear | 248/249 (99%) | Near-perfect |
-| css2-borders | 762/763 (99%) | 1 partial |
-| css2-positioning | 577/578 (99%) | Near-perfect |
-| css2-linebox | 243/249 (97%) | Near-perfect |
-| css2-zindex | 50/52 (96%) | Near-perfect |
-| css-display | 319/341 (93%) | fieldset, display-contents |
-| css-text | 1730/1878 (92%) | 2 crashes (hanging punctuation) |
-| css2-abspos | 27/31 (87%) | Absolute positioning edge cases |
-| css-color | 309/365 (84%) | Advanced color functions |
-| css-position | 270/354 (76%) | position:absolute/fixed gaps |
-| html-rendering | 338/439 (76%) | Fieldset/legend, tables |
-| css2-floats | 98/147 (66%) | Float clearing/wrapping |
-| css-box | 77/150 (51%) | Margin-trim, box model edge cases |
-
-**Fixed (2026-05-11/12):**
-- Border shorthand infinite loop — named color scanner used `Add(var, slen)` break pattern; word ending at exact string boundary wrapped wpos to 0, looping forever. Fixed with done-flag variables.
-- Default border width — `border: dashed` (style only) now defaults to medium (3px) per CSS spec.
-- Ahem test font support — font-family CSS resolution detects "Ahem", sets variable font_w_px. Renderer draws Ahem glyphs as filled squares (font_size_px x font_size_px). Verified: "XX" at 25px = 50x25 green region.
-- Variable-width font infrastructure — LY__EmitText uses LYState.font_w_px instead of hardcoded FONT_W=8. DRAW_TEXT C_H field carries font_w to renderer.
-
-**Fixed (2026-05-14):**
-- HTMLLayout modularization — split 5159-line monolith into 5 focused modules (Colors, CSS, Flex, Engine, Core). Zero regression. Same binary size.
-
-**Roadmap: Next 9 features (post-90% WPT):**
-
-| Priority | Feature | Est. Lines | WPT Test Suite | Test Count | Test Format |
-|----------|---------|-----------|----------------|------------|-------------|
-| 1 | Image rendering (`<img>`) | ~200 | `html/semantics/embedded-content/the-img-element/` + PngSuite | ~190 + ~166 images | testharness.js + decoder tests |
-| 2 | CSS float (left/right/clear) | ~300 | `css/CSS2/floats/` + `css/CSS2/floats-clear/` (already in runner) | ~300 reftests | Pixel comparison |
-| 3 | CSS position absolute/fixed | ~200 | `css/css-position/` + `css/CSS2/positioning/` + `css/CSS2/zindex/` | ~800 reftests | Pixel comparison |
-| 4 | Real fetch() API | ~150 | `fetch/` + `xhr/` | ~800 | testharness.js (needs WPT server) |
-| 5 | Keyboard input in forms | ~100 | `uievents/keyboard/` + `input-events/` | ~50 | Manual/WebDriver (hard to automate) |
-| 6 | DOM mutation re-render | ~200 | `dom/nodes/` + `domparsing/` | ~175 | testharness.js |
-| 7 | CSS inline-block | ~100 | `css/CSS2/linebox/` + `css/CSS2/visuren/` | ~400 reftests | Pixel comparison |
-| 8 | Form POST submission | ~100 | `html/semantics/forms/form-submission-0/` | ~20 | testharness.js (needs WPT server) |
-| 9 | External script hardening | ~50 | `html/semantics/scripting-1/the-script-element/` | ~70 | testharness.js (needs WPT server) |
-
-**New WPT suites added to runner** (available via `--suite <name>`):
-- `css2-floats-clear` (365 tests), `css-position` (166), `css2-positioning` (721), `css2-abspos` (39), `css2-zindex` (53), `css2-linebox` (311), `css2-visuren` (89)
-
-**External test resources to download:**
-- PngSuite: `https://github.com/lunapaint/pngsuite` — 166 PNG decoder conformance images
-- Acid2: Already at `/home/bob/wpt/acid/acid2/` — covers float, position, images in one page
-
-**Architecture:** HTMLTokenizer → HTMLDom → CSSParse → HTMLLayout → HTMLRender → ShmCanvas
-
-**Fixed (2026-05-10):**
-- CSS rule pool overflow — `CSS_ParseSheet` infinite loop on pseudo-selectors (`:link`, `:visited`). Scan-forward to `{` for unrecognized selector syntax + loop guard.
-- CSS rule pool capacity increased from 1024→4096, string intern table from 64KB→256KB (Google homepage has 32 `<style>` blocks totalling 800+ rules).
-- `<script type="application/json">` filtering — JSEngine__FindScripts now checks the `type` attribute and skips `application/json`, `application/ld+json`, `text/template` (Next.js `__NEXT_DATA__` caused parse failures).
-- External `<script src>` loading — 3-step API: `JSEngine_PrepareScripts` (find), browser fetches via HTTP_Get + `JSEngine_ResolveExternal`, then `JSEngine_ExecuteScripts`. Script pool expanded to 64 entries × 32 bytes.
-- CSS `vw`/`vh`/`%` units — `LY__ParsePx` now converts viewport-relative and percentage units. Example Domain body renders at 614px (was 60px).
-
-#### Phase 1: Core Rendering Pipeline (highest impact)
-
-| # | Task | File(s) | Impact | Notes |
-|---|------|---------|--------|-------|
-| 1 | **CSS property inheritance** | HTMLLayout | HIGH | `color`, `font-size`, `font-family` don't cascade to children. Every child needs its own rule match. |
-| 2 | **CSS shorthand expansion** | CSSParse | HIGH | `margin: 10px 20px` → individual `margin-top/right/bottom/left`. Same for padding, border, background, font. |
-| 3 | **Border rendering** | HTMLRender + HTMLLayout | MED | Parsed but not drawn. Need DRAW_BORDER command or 4x FILL_RECT. |
-| 4 | **Image rendering** | HTMLRender + HTTPClient | MED | DRAW_IMAGE opcode exists but unimplemented. Need HTTP fetch for `<img src>` + decode + blit. |
-| 5 | **CSS `position: absolute/fixed`** | HTMLLayout | MED | No positioned elements. Modals, overlays, sticky headers all broken. |
-| 6 | **CSS `float: left/right`** | HTMLLayout | MED | No floating layout. Inline images/text wrap broken. |
-| 7 | **Pseudo-selector `:hover/:focus`** | CSSParse + HTMLLayout | LOW | Need runtime selector re-evaluation on mouse/focus events. |
-| 8 | **Named HTML entities** | HTMLTokenizer | LOW | Only ~10 entities. HTML5 spec has 2000+. Sites using `&mdash;`, `&nbsp;` etc. render literal. |
-
-#### Phase 2: Browser Chrome & Navigation
-
-| # | Task | File(s) | Impact | Notes |
-|---|------|---------|--------|-------|
-| 9 | **Scroll support** | browser_ipc | HIGH | No vertical scrolling. Pages taller than 700px are clipped. Need mouse wheel + scroll offset in layout. |
-| 10 | **External CSS `<link>` loading** | browser_ipc + HTTPClient | HIGH | Only inline `<style>` parsed. `<link rel="stylesheet" href="...">` ignored. Google/DDG serve CSS via `<link>`. |
-| 11 | ~~**External `<script src>` loading**~~ | browser_ipc + JSEngine | HIGH | ✅ DONE — 3-step API: PrepareScripts (find), browser fetches externals via HTTP_Get, ResolveExternal, ExecuteScripts. Script type filtering skips application/json, application/ld+json, text/template. |
-| 12 | **User-Agent header** | HTTPClient | MED | No UA sent. Some sites serve different HTML based on UA (Google does this). Send basic UA to get simpler HTML. |
-| 13 | **Content-Encoding: gzip** | HTTPClient | MED | Compressed responses not decompressed. Many servers send gzip by default. |
-| 14 | **Cookie jar** | browser_ipc + HTTPClient | MED | No cookies = no sessions, no login, no state. Need Set-Cookie parsing + Cookie header on requests. |
-| 15 | **POST method** | HTTPClient + browser_ipc | MED | Only GET. Forms with `method="POST"` silently degrade to GET or fail. |
-| 16 | **Multiple `<input>` fields in form** | browser_ipc | MED | `Br_SubmitForm` only sends focused input. Need to gather ALL inputs within `<form>` and build multi-param query. |
-
-#### Phase 3: JavaScript DOM Integration
-
-| # | Task | File(s) | Impact | Notes |
-|---|------|---------|--------|-------|
-| 17 | ~~**`document.querySelector/querySelectorAll`**~~ | JSBridge + HTMLDom | HIGH | ✅ DONE — handlers 10, 114. |
-| 18 | ~~**`element.innerHTML/textContent` setter**~~ | JSBridge + HTMLDom | HIGH | ✅ DONE — handlers 16, 113. |
-| 19 | ~~**`setTimeout/setInterval`**~~ | JSBridge + JSVM | HIGH | ✅ DONE — handlers 21-23. |
-| 20 | ~~**`addEventListener` + Event object**~~ | JSBridge + HTMLDom | HIGH | ✅ DONE — handler 14. Full Event object (type, target, preventDefault, stopPropagation). FireEvent invokes callbacks via JSVM__CallFunc. |
-| 21 | **`window.location`** | JSBridge + browser_ipc | MED | JS navigation (`location.href = "..."`) doesn't work. |
-| 22 | ~~**`fetch()` / `XMLHttpRequest`**~~ | JSBridge + HTTPClient | MED | ✅ STUB — handler 140. Returns resolved Promise with stub Response (status=0, text()→"", json()→{}). Real HTTP backend TODO. |
-| 23 | **`document.createElement` + `appendChild` re-render** | JSBridge + HTMLLayout | MED | DOM mutations don't trigger layout re-calculation. |
-| 24 | ~~**Layout metrics (offsetWidth/Height, getBoundingClientRect)**~~ | JSBridge + HTMLLayout | MED | ✅ DONE — handlers 133-139. Queries hit-test pool for DOM node boxes. |
-
-#### Phase 4: CSS Layout Maturity
-
-| # | Task | File(s) | Impact | Notes |
-|---|------|---------|--------|-------|
-| 24 | **Margin collapsing** | HTMLLayout | MED | Adjacent block margins should collapse per CSS spec. |
-| 25 | **Box-sizing: border-box** | HTMLLayout | MED | Width calculation doesn't account for padding/border. |
-| 26 | **CSS Grid** | HTMLLayout | LOW | Missing entirely. Needed for modern layouts. |
-| 27 | **Media queries `@media`** | CSSParse + HTMLLayout | LOW | Parsed but ignored. No responsive design. |
-| 28 | **CSS variables `var()`** | CSSParse | LOW | Modern sites use CSS custom properties extensively. |
-| 29 | **`calc()` expressions** | CSSParse + HTMLLayout | LOW | `width: calc(100% - 20px)` not evaluated. |
-
-#### Recommended Attack Order (maximize real-site impact)
-
-**Sprint 1 — Make Google search render:**
-1. Send User-Agent header (Google sends simpler HTML to basic browsers)
-2. External CSS `<link>` loading
-3. Scroll support
-4. Multiple form inputs in submit
-5. CSS property inheritance
-
-**Sprint 2 — Make basic sites usable:**
-6. ~~External `<script src>` loading~~ ✅ DONE
-7. Image rendering (`<img>`)
-8. Border rendering
-9. CSS shorthand expansion
-10. Content-Encoding: gzip
-
-**Sprint 3 — JavaScript interactivity:**
-11. `setTimeout`/`setInterval`
-12. `addEventListener`
-13. `document.querySelector`
-14. `element.innerHTML` setter
-15. DOM mutation re-render
-
-**Sprint 4 — Full browsing:**
-16. Cookie jar
-17. POST method
-18. `position: absolute/fixed`
-19. `float: left/right`
-20. `fetch()` API
-
----
-
-### AILANG Browser — Rendering Fix Sprint (May 2026)
-
-**Current status:** ~1.2 MB self-hosted browser engine. JS engine mature (92.5% Test262, upper 80s-90s WPT). Browser rendering pipeline functional but produces broken output on modern sites.
-
-**The problem:** Loading https://www.w3schools.com produces only a vertical unstyled list of blue nav links on white background. Hero section, search bar, backgrounds, modern layout all missing.
-
-**Root cause analysis (2026-05-14):**
-1. **No external CSS `<link>` loading** — W3Schools (and all modern sites) load visual design via external stylesheets. Without them, zero CSS rules exist → everything falls back to tag defaults → vertical block stacking.
-2. **CSS Grid not implemented** — W3Schools nav uses `display:grid`. Grid maps to BLOCK with no grid algorithm → children stack vertically.
-3. **No `<img>` rendering** — only alt-text placeholders shown.
-4. **No `position:absolute/fixed`** — overlays, sticky headers all ignored.
-5. **No `@media` query evaluation** — responsive layout logic never fires.
-
-**HTMLLayout modularization (completed 2026-05-14):**
-
-| Module | File | Lines | Purpose |
-|--------|------|-------|---------|
-| Core | HTMLLayout.ailang | 598 | FixedPools, init, cmd helpers, hit-test API, GetDisplay |
-| Colors | HTMLLayoutColors.ailang | 1267 | Color parsing (named, hex, rgb, hsl, hwb, px/em/vw/vh) |
-| CSS | HTMLLayoutCSS.ailang | 1140 | Selector matching, property resolution, margin/padding/border |
-| Flex | HTMLLayoutFlex.ailang | 668 | Float state, FlexLayout, text emission/word-wrap |
-| Engine | HTMLLayoutEngine.ailang | 1529 | LY__LayoutNode recursive DFS, block/inline/flex dispatch |
-
-**Immediate next steps (priority order):**
-1. External CSS `<link>` loading (unlocks ALL visual styling for real sites)
-2. CSS Grid layout (basic `grid-template-columns` for nav layouts)
-3. `<img>` decode + render (PNG/JPEG via existing ImageDecode/JPEGDecode libs)
-4. `position: absolute/fixed` (sticky headers, overlays)
-5. `@media` query parsing + viewport-based evaluation
-
-**Latest test results (2026-05-14):**
-- test_browser.x: 209/209 (100%)
-- html5lib: 1624/1625 (99.9%)
-- WPT render: 6307/6855 (92%), 2 crashes
-- Test262: 45,865/49,998 (92.5%)
-
----
-
-## HalCode9000 — MCP Server for Cheap LLM Workers
-
-`Applications/HalCode9000/` — MCP server written in native AILang. Fire it up to run cheap DeepSeek (or other LLM) workers with full tool access. Terminal-mode TUI with streaming, multi-provider support, and agentic tool dispatch over IPC.
-
-### MCP Tools (cc_tools/)
-
-Each tool is a standalone IPC subprocess spawned by HalCode9000. The server dispatches tool calls from the model to these workers over abstract Unix sockets:
-
-| Tool | Source | Socket | Description |
-|------|--------|--------|-------------|
-| Bash | `cc_bash_ipc.ailang` | `@halcode/Bash` | Shell execution, 30s default / 55s max timeout |
-| Read | `cc_read_ipc.ailang` | `@halcode/Read` | File read |
-| Write | `cc_write_ipc.ailang` | `@halcode/Write` | File write |
-| Ls | `cc_ls_ipc.ailang` | `@halcode/Ls` | Directory listing |
-| Head | `cc_head_ipc.ailang` | `@halcode/Head` | File head (first N lines) |
-| WebFetch | `cc_webfetch_ipc.ailang` | `@halcode/WebFetch` | URL fetch |
-| PgMem | `cc_pgmem_ipc.ailang` | `@halcode/PgMem` | PostgreSQL memory/context store |
-| Relmem | `cc_relmem_ipc.ailang` | `@halcode/Relmem` | Relational memory — codebase symbol index |
-
-All tools share the 60-second `IPCDispatch` hard timeout. Protocol: abstract Unix sockets, JSON over length-prefixed frames.
-
-**Key value prop:** DeepSeek flash tokens are dirt cheap. Spin up HalCode9000 instances as disposable workers for grunt work — bulk file processing, code search, test runs, refactoring passes — while the expensive model (Claude) focuses on architecture and decision-making. Each worker gets the full tool suite above, so it can read/write/execute autonomously.
-
-### Build commands
-
-```
-cd /mnt/c/Users/Sean/Documents/AILangSH
-./ailang.x Applications/HalCode9000/HalCode9000.ailang Applications/HalCode9000/HalCode9000.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_bash_ipc.ailang     Applications/HalCode9000/cc_bash_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_read_ipc.ailang     Applications/HalCode9000/cc_read_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_write_ipc.ailang    Applications/HalCode9000/cc_write_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_ls_ipc.ailang       Applications/HalCode9000/cc_ls_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_head_ipc.ailang     Applications/HalCode9000/cc_head_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_webfetch_ipc.ailang Applications/HalCode9000/cc_webfetch_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_pgmem_ipc.ailang    Applications/HalCode9000/cc_pgmem_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_relmem_ipc.ailang   Applications/HalCode9000/cc_relmem_ipc.x
-cd Applications/HalCode9000 && ./HalCode9000.x
-```
-
-HalCode9000.ailang imports backends/ and UI.ailang transitively — a single compile of HalCode9000.ailang rebuilds everything except the cc_tools.
-
-### Provider menu (startup)
-
-```
-1. Anthropic  (claude-sonnet-4-6)
-2. OpenAI     (gpt-4o)
-3. Grok       (xAI) — grok-3-mini-fast  ← NOTE: Grok/xAI, NOT Groq (different company)
-4. Gemini     (gemini-2.0-flash)
-5. Local      (localhost:11434, ollama)
-6. DeepSeek   (deepseek-v4-flash)
-```
-
-Option 3 is **Grok by xAI** (`api.x.ai`). The HalCode9000.ailang currently labels it "Groq" — needs renaming to "Grok / xAI".
-
-### UI layout (5-row prompt, as of 2026-04-30)
-
-```
-[chat scrollback region]
- ─────────────────────────  ← top rule (straight ─, no ╭/╰)
- > input here               ← body row (1 row)
- ─────────────────────────  ← bottom rule
-   ↑1234 ↓567   /help · /clear · /quit   ← hint row (tok_in/tok_out left, commands right-aligned)
-```
-
-- `UILayout.prompt_h = 5` (quote + top_rule + body + bot_rule + hint)
-- `UI.SetTokens(in, out)` — stores to UILayout.tok_in/tok_out, repaints hint row
-- `UI.SetQuote(text)` — paints a dim status/quote line above the prompt box
-- `UI.AnimTick()` — ticks mascot animation during model TTFT wait (call from idle poll loop)
-- `UI.ChatPrintDim(s)` — dim+italic print for DeepSeek reasoning_content stream
-
-### Known UI.ailang issue to never repeat
-
-The Write tool wrote a literal `\n` (backslash-n, 0x5c 0x6e) at the end of UI.ailang as part of a test marker comment. The AILang lexer saw `\` at column 1 as "Unknown character" and refused to compile. Fixed by trimming the trailing garbage bytes. **Never append `\n` as literal text to .ailang files** — it must be an actual newline byte.
-
-### DeepSeek tool_calls fix (backends/OpenAI.ailang)
-
-Library.JSON's XSHash dropped `tool_calls` when `reasoning_content` was also present in the same object (root cause unclear — bucket collision or ordering). Fix: `OpenAI_BuildAssistantMsgStr()` builds the entire assistant message as raw JSON via `StringConcat` + `JSON.EscapeString`, then `ParseJSON` back. Bypasses XSHash for that object entirely.
-
-**Critical**: OpenAI `arguments` field must be a JSON-encoded STRING (not inline object): `"arguments": "{\"path\":\"/etc/hostname\"}"`. Use `JSON.EscapeString(args_ptr)` before inserting.
-
-### Token display
-
-Both Anthropic and OpenAI backends now call `UI.SetTokens(in, out)` after each turn instead of printing dim text to chat. Anthropic reads `message.usage.input_tokens` from `message_start` event, `usage.output_tokens` from `message_delta` event.
-
-### Relmem (cc_relmem_ipc) — current state and pending redesign
-
-**Current state (2026-04-30):**
-- Index at `~/.claude/relmem/index.json` (~4MB, already built)
-- Socket: `@halcode/Relmem` (abstract Unix socket, bypasses WSL2 tmpfs)
-- Path guard added to `Op_Index`: rejects `/`, `/mnt`, `/mnt/c*`, `/home` — returns error instead of hanging
-
-**Pending redesign (user-specified):**
-`Op_Index` must be redesigned to **require model interaction** rather than walking the filesystem itself:
-1. **Clear** — drop existing index entries for the project path
-2. **Stash** — model uses Bash to enumerate files (e.g. `find <path> -name "*.ailang" | head -500`); op=index without a `files` param should return instructions for this step
-3. **Grep into results** — op=index with `files=<newline-separated-paths>` processes each listed file using grep-style symbol extraction (not the full AILang AST Walker)
-
-This replaces the recursive `Walker_Walk` entirely. The bespoke `Walker_RecurseDir` / `Walker_ProcessFile` / `Parser_Dispatch` chain stays for now but `Op_Index` should no longer call it. Until redesign is done, the path guard prevents hangs.
-
-### WSL2 Hard Rules (system prompt rules 1-5)
-
-Encoded in `CCConst.SYSTEM_PROMPT` in `HalCode9000.ailang`:
-1. NEVER `find /`, `/mnt`, `/mnt/c` — unbounded, hangs permanently
-2. Use `Relmem op=symbols` to locate files in the indexed codebase
-3. If using `find`, scope to a specific known subdirectory
-4. Never produce unbounded output — always pipe through `head`/`grep`/`tail`
-5. NEVER `Relmem op=index` with broad paths — index already built, use `op=symbols`
-
-### Known crash: ~1700 output tokens causes death
-
-Observed consistently: model responses that reach approximately 1700 tokens cause a crash/hang. Not a one-time event — reproducible. Likely a history buffer overflow or a per-turn output buffer cap in the streaming path. **Not yet diagnosed or fixed.** Check `CCHistory`, `AgentLoop.ailang` turn buffer, and `TUI_BufferWriteStr` overflow.
-
-### Bash tool timeout
-
-`cc_bash_ipc.ailang`: `DEFAULT_TIMEOUT = 30` seconds. `timeout_secs=0` from the model maps to 30s, capped at 55s (so IPCDispatch's 60s fence always fires last). Already implemented.
-
-### IPCDispatch
-
-60-second hard timeout on all tool calls via `Socket.SetRecvTimeout(fd, 60000)`. After timeout: returns `"tool TIMED OUT (60s): <name>"` to model. `IPCDispatch_Reconnect` called to flush stale socket state.
+Build: `./ailang.x Applications/HalCode9000/HalCode9000.ailang Applications/HalCode9000/HalCode9000.x`

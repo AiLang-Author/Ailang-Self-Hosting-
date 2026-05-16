@@ -35,7 +35,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent
-HEADLESS_BIN = PROJECT_DIR / "browser_main.x"
+HEADLESS_BIN = PROJECT_DIR / "browser_ipc.x"
 WPT_DIR = Path("/home/bob/wpt")
 SHIM_PATH = SCRIPT_DIR / "testharness_shim.js"
 
@@ -55,6 +55,31 @@ def _get_shim_content():
 
 
 import re
+
+# Pattern to match <link rel="match" href="..."> for WPT reftests
+_RE_REF_MATCH = re.compile(
+    rb'<link\s[^>]*rel\s*=\s*["\']?match["\']?[^>]*href\s*=\s*["\']([^"\']+)["\']',
+    re.IGNORECASE
+)
+_RE_REF_MATCH2 = re.compile(
+    rb'<link\s[^>]*href\s*=\s*["\']([^"\']+)["\'][^>]*rel\s*=\s*["\']?match["\']?',
+    re.IGNORECASE
+)
+
+
+def _find_ref_from_html(html_data, test_path):
+    """Parse <link rel="match" href="..."> from test HTML to find reference file.
+    Returns resolved Path or None."""
+    for pat in (_RE_REF_MATCH, _RE_REF_MATCH2):
+        m = pat.search(html_data)
+        if m:
+            href = m.group(1).decode('utf-8', errors='replace')
+            # Resolve relative to test file's directory
+            ref = (test_path.parent / href).resolve()
+            if ref.exists():
+                return ref
+    return None
+
 
 # Patterns to match testharness.js and testharnessreport.js script tags
 _RE_HARNESS = re.compile(
@@ -117,6 +142,48 @@ SUITES = {
     "css2-linebox":     WPT_DIR / "css" / "CSS2" / "linebox",
     "css2-visuren":     WPT_DIR / "css" / "CSS2" / "visuren",
     "render-tests":     PROJECT_DIR / "TestCode" / "render_tests",
+    # CSS selectors
+    "selectors":        WPT_DIR / "css" / "selectors",
+    "css2-selectors":   WPT_DIR / "css" / "CSS2" / "selectors",
+    # CSS cascade
+    "css-cascade":      WPT_DIR / "css" / "css-cascade",
+    "css2-cascade":     WPT_DIR / "css" / "CSS2" / "cascade",
+    # CSS layout
+    "css-flexbox":      WPT_DIR / "css" / "css-flexbox",
+    "css-grid":         WPT_DIR / "css" / "css-grid",
+    "css-sizing":       WPT_DIR / "css" / "css-sizing",
+    "css-inline":       WPT_DIR / "css" / "css-inline",
+    "css-overflow":     WPT_DIR / "css" / "css-overflow",
+    "css-multicol":     WPT_DIR / "css" / "css-multicol",
+    # CSS values + fonts + images
+    "css-values":       WPT_DIR / "css" / "css-values",
+    "css-fonts":        WPT_DIR / "css" / "css-fonts",
+    "css-images":       WPT_DIR / "css" / "css-images",
+    "css-backgrounds":  WPT_DIR / "css" / "css-backgrounds",
+    # CSS misc
+    "css-logical":      WPT_DIR / "css" / "css-logical",
+    "css-conditional":  WPT_DIR / "css" / "css-conditional",
+    "css-nesting":      WPT_DIR / "css" / "css-nesting",
+    "css-pseudo":       WPT_DIR / "css" / "css-pseudo",
+    "css-contain":      WPT_DIR / "css" / "css-contain",
+    "css-lists":        WPT_DIR / "css" / "css-lists",
+    "css-animations":   WPT_DIR / "css" / "css-animations",
+    "css-transitions":  WPT_DIR / "css" / "css-transitions",
+    "css-break":        WPT_DIR / "css" / "css-break",
+    "cssom":            WPT_DIR / "css" / "cssom",
+    "cssom-view":       WPT_DIR / "css" / "cssom-view",
+    # CSS2 extras
+    "css2-normal-flow": WPT_DIR / "css" / "CSS2" / "normal-flow",
+    "css2-visudet":     WPT_DIR / "css" / "CSS2" / "visudet",
+    "css2-visufx":      WPT_DIR / "css" / "CSS2" / "visufx",
+    "css2-text":        WPT_DIR / "css" / "CSS2" / "text",
+    "css2-values":      WPT_DIR / "css" / "CSS2" / "values",
+    "css2-tables":      WPT_DIR / "css" / "CSS2" / "tables",
+    "css2-margin-padding-clear": WPT_DIR / "css" / "CSS2" / "margin-padding-clear",
+    "css2-generated-content": WPT_DIR / "css" / "CSS2" / "generated-content",
+    "css2-lists":       WPT_DIR / "css" / "CSS2" / "lists",
+    "css2-ui":          WPT_DIR / "css" / "CSS2" / "ui",
+    "css2-stacking":    WPT_DIR / "css" / "CSS2" / "stacking-context",
 }
 
 DEFAULT_SUITES = ["css2-box", "css2-colors", "css2-backgrounds", "render-tests"]
@@ -181,7 +248,7 @@ def render_html(html_path, input_file, output_file, timeout=10):
 
     try:
         result = subprocess.run(
-            [str(HEADLESS_BIN)],
+            [str(HEADLESS_BIN), "--headless"],
             input=stdin_data,
             capture_output=True,
             timeout=timeout,
@@ -291,6 +358,13 @@ def _worker_run_test(args_tuple):
     output_file = f"{wdir}/render_out.ppm"
     ref_ppm_file = f"{wdir}/render_ref.ppm"
 
+    # Read raw HTML for reference detection
+    try:
+        with open(test_path, 'rb') as f:
+            raw_html = f.read()
+    except Exception:
+        raw_html = b''
+
     success, stdout, cmd_count, dom_nodes = render_html(test_path, input_file, output_file, timeout)
 
     if not success:
@@ -311,26 +385,32 @@ def _worker_run_test(args_tuple):
         except Exception:
             pass
 
-    # Check for ref-test
-    ref_path = test_path.parent / (test_path.stem + "-ref" + test_path.suffix)
-    if not ref_path.exists():
-        ref_path = test_path.parent / "reference" / (test_path.stem + "-ref" + test_path.suffix)
+    # Find reference file: first try <link rel="match" href="...">, then -ref filename
+    ref_path = _find_ref_from_html(raw_html, test_path)
+    if ref_path is None:
+        candidate = test_path.parent / (test_path.stem + "-ref" + test_path.suffix)
+        if candidate.exists():
+            ref_path = candidate
+        else:
+            candidate = test_path.parent / "reference" / (test_path.stem + "-ref" + test_path.suffix)
+            if candidate.exists():
+                ref_path = candidate
 
-    if ref_path.exists():
-        ref_success, _, _, _ = render_html(ref_path, input_file, output_file, timeout)
-        if ref_success and os.path.exists(output_file):
-            shutil.copy(output_file, ref_ppm_file)
-            # Re-render the test
+    if ref_path is not None:
+        # Render reference, then re-render test, compare
+        ref_success, _, _, _ = render_html(ref_path, input_file, ref_ppm_file, timeout)
+        if ref_success and os.path.exists(ref_ppm_file):
+            # Re-render the test to output_file
             render_html(test_path, input_file, output_file, timeout)
             match_pct = compare_ppms(ref_ppm_file, output_file)
-            if match_pct >= 95.0:
+            if match_pct >= 99.9:
                 return (test_path_str, "PASS", {"cmd": cmd_count, "dom": dom_nodes, "match": f"{match_pct:.1f}%"})
-            elif match_pct >= 50.0:
+            elif match_pct >= 90.0:
                 return (test_path_str, "PARTIAL", {"cmd": cmd_count, "dom": dom_nodes, "match": f"{match_pct:.1f}%"})
             else:
                 return (test_path_str, "FAIL", {"cmd": cmd_count, "dom": dom_nodes, "match": f"{match_pct:.1f}%"})
 
-    # No ref-test
+    # No ref-test found
     if cmd_count > 0 and has_content:
         return (test_path_str, "RENDERED", {"cmd": cmd_count, "dom": dom_nodes})
     elif cmd_count > 0:
@@ -412,8 +492,8 @@ def run_suite(name, directory, max_files=0, dump_dir=None, num_workers=8, timeou
     # Summary
     good = results["PASS"] + results["RENDERED"] + results["PARTIAL"]
     print(f"\n  Results for {name}:")
-    print(f"    PASS (ref match >=95%):  {results['PASS']}")
-    print(f"    PARTIAL (ref 50-95%):    {results['PARTIAL']}")
+    print(f"    PASS (ref match >=99.9%): {results['PASS']}")
+    print(f"    PARTIAL (ref 90-99.9%):  {results['PARTIAL']}")
     print(f"    RENDERED (pixels drawn): {results['RENDERED']}")
     print(f"    CMDS_ONLY (no pixels):   {results['CMDS_ONLY']}")
     print(f"    PARSED (DOM only):       {results['PARSED']}")

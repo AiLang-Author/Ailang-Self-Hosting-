@@ -30,7 +30,7 @@ from pathlib import Path
 # Paths
 SCRIPT_DIR = Path(__file__).parent
 PROJECT_DIR = SCRIPT_DIR.parent
-HEADLESS_BIN = PROJECT_DIR / "browser_main.x"
+HEADLESS_BIN = PROJECT_DIR / "browser_ipc.x"
 TEST_DIR = PROJECT_DIR / "TestCode" / "render_tests"
 INPUT_FILE = Path("/tmp/render_test.html")
 OUTPUT_FILE = Path("/tmp/render_out.ppm")
@@ -112,7 +112,7 @@ def render_html(html_path):
 
     # Run headless renderer
     result = subprocess.run(
-        [str(HEADLESS_BIN)],
+        [str(HEADLESS_BIN), "--headless", str(INPUT_FILE), str(OUTPUT_FILE)],
         capture_output=True,
         timeout=10,
         cwd=str(PROJECT_DIR)
