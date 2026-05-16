@@ -286,13 +286,26 @@ Each tool is a standalone IPC subprocess spawned by HalCode9000. The server disp
 | Tool | Source | Socket | Description |
 |------|--------|--------|-------------|
 | Bash | `cc_bash_ipc.ailang` | `@halcode/Bash` | Shell execution, 30s default / 55s max timeout |
-| Read | `cc_read_ipc.ailang` | `@halcode/Read` | File read |
-| Write | `cc_write_ipc.ailang` | `@halcode/Write` | File write |
-| Ls | `cc_ls_ipc.ailang` | `@halcode/Ls` | Directory listing |
-| Head | `cc_head_ipc.ailang` | `@halcode/Head` | File head (first N lines) |
+| Read | `cc_read_ipc.ailang` | `@halcode/Read` | File read with offset |
+| Head | `cc_head_ipc.ailang` | `@halcode/Head` | First N lines of a file |
+| Write | `cc_write_ipc.ailang` | `@halcode/Write` | File write/append, 40KB guard |
+| Edit | `cc_edit_ipc.ailang` | `@halcode/Edit` | Exact string replacement in file |
+| LS | `cc_ls_ipc.ailang` | `@halcode/LS` | Directory listing |
+| Find | `cc_find_ipc.ailang` | `@halcode/Find` | File search by name/type |
+| Grep | `cc_grep_ipc.ailang` | `@halcode/Grep` | BM/NFA/DFA pattern search |
+| Stat | `cc_stat_ipc.ailang` | `@halcode/Stat` | File metadata |
+| Wc | `cc_wc_ipc.ailang` | `@halcode/Wc` | Word/line/byte count |
+| Du | `cc_du_ipc.ailang` | `@halcode/Du` | Disk usage |
+| Diff | `cc_diff_ipc.ailang` | `@halcode/Diff` | File diff |
+| Git | `cc_git_ipc.ailang` | `@halcode/Git` | Git subcommands |
+| Olympus | `cc_olympus_ipc.ailang` | `@halcode/Olympus` | VCS workflow: snapshot, review, log, info, init |
 | WebFetch | `cc_webfetch_ipc.ailang` | `@halcode/WebFetch` | URL fetch |
-| PgMem | `cc_pgmem_ipc.ailang` | `@halcode/PgMem` | PostgreSQL memory/context store |
-| Relmem | `cc_relmem_ipc.ailang` | `@halcode/Relmem` | Relational memory — codebase symbol index |
+| Sleep | `cc_sleep_ipc.ailang` | `@halcode/Sleep` | Safe wait (use instead of Bash sleep) |
+| Skills | `cc_skills_ipc.ailang` | `@halcode/Skills` | List/read skill sheets from ~/.halcode/skills/ |
+| MCP | `cc_mcp_ipc.ailang` | `@halcode/MCP` | MCP server passthrough |
+| Pgmem | `cc_pgmem_ipc.x` | `@halcode/Pgmem` | PostgreSQL memory/context store |
+| Relmem | `cc_relmem_ipc.x` | `@halcode/Relmem` | Codebase symbol index |
+| Agent | `cc_agent_ipc.ailang` | `@halcode/Agent` | Spawn DeepSeek sub-agents asynchronously |
 
 All tools share the 60-second `IPCDispatch` hard timeout. Protocol: abstract Unix sockets, JSON over length-prefixed frames.
 
@@ -300,21 +313,28 @@ All tools share the 60-second `IPCDispatch` hard timeout. Protocol: abstract Uni
 
 ### Build commands
 
-```
+```bash
+# From /mnt/c/Users/Sean/Documents/AILangSH
 cd /mnt/c/Users/Sean/Documents/AILangSH
+
+# Main binary (imports backends/ + UI transitively)
 ./ailang.x Applications/HalCode9000/HalCode9000.ailang Applications/HalCode9000/HalCode9000.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_bash_ipc.ailang     Applications/HalCode9000/cc_bash_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_read_ipc.ailang     Applications/HalCode9000/cc_read_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_write_ipc.ailang    Applications/HalCode9000/cc_write_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_ls_ipc.ailang       Applications/HalCode9000/cc_ls_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_head_ipc.ailang     Applications/HalCode9000/cc_head_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_webfetch_ipc.ailang Applications/HalCode9000/cc_webfetch_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_pgmem_ipc.ailang    Applications/HalCode9000/cc_pgmem_ipc.x
-./ailang.x Applications/HalCode9000/cc_tools/cc_relmem_ipc.ailang   Applications/HalCode9000/cc_relmem_ipc.x
+
+# Build all cc_tools individually, or use build.sh:
+#   ./build.sh                # all
+#   ./build.sh --no-tools     # main binary only
+#   ./build.sh --tools-only   # cc_tools only
+
+# Individual tool builds (HAL dir = Applications/HalCode9000)
+HAL=Applications/HalCode9000
+for tool in bash read head write edit ls find grep stat wc du diff git olympus webfetch sleep skills mcp agent; do
+    ./ailang.x $HAL/cc_tools/cc_${tool}_ipc.ailang $HAL/cc_${tool}_ipc.x
+done
+
 cd Applications/HalCode9000 && ./HalCode9000.x
 ```
 
-HalCode9000.ailang imports backends/ and UI.ailang transitively — a single compile of HalCode9000.ailang rebuilds everything except the cc_tools.
+HalCode9000.ailang imports backends/ and UI.ailang transitively — a single compile rebuilds everything except cc_tools. Pgmem and Relmem are prebuilt binaries (no .ailang source in cc_tools/).
 
 ### Provider menu (startup)
 
@@ -359,20 +379,12 @@ Library.JSON's XSHash dropped `tool_calls` when `reasoning_content` was also pre
 
 Both Anthropic and OpenAI backends now call `UI.SetTokens(in, out)` after each turn instead of printing dim text to chat. Anthropic reads `message.usage.input_tokens` from `message_start` event, `usage.output_tokens` from `message_delta` event.
 
-### Relmem (cc_relmem_ipc) — current state and pending redesign
+### Relmem (cc_relmem_ipc)
 
-**Current state (2026-04-30):**
 - Index at `~/.claude/relmem/index.json` (~4MB, already built)
 - Socket: `@halcode/Relmem` (abstract Unix socket, bypasses WSL2 tmpfs)
-- Path guard added to `Op_Index`: rejects `/`, `/mnt`, `/mnt/c*`, `/home` — returns error instead of hanging
-
-**Pending redesign (user-specified):**
-`Op_Index` must be redesigned to **require model interaction** rather than walking the filesystem itself:
-1. **Clear** — drop existing index entries for the project path
-2. **Stash** — model uses Bash to enumerate files (e.g. `find <path> -name "*.ailang" | head -500`); op=index without a `files` param should return instructions for this step
-3. **Grep into results** — op=index with `files=<newline-separated-paths>` processes each listed file using grep-style symbol extraction (not the full AILang AST Walker)
-
-This replaces the recursive `Walker_Walk` entirely. The bespoke `Walker_RecurseDir` / `Walker_ProcessFile` / `Parser_Dispatch` chain stays for now but `Op_Index` should no longer call it. Until redesign is done, the path guard prevents hangs.
+- `Op_Index` uses model-interaction pattern: model enumerates files via Bash `find`, passes `files=<newline-separated-paths>` to op=index for grep-style symbol extraction. Broad-path guard in place (rejects `/`, `/mnt`, `/mnt/c*`, `/home`).
+- Use `op=symbols` to query — never `op=index` with broad paths.
 
 ### WSL2 Hard Rules (system prompt rules 1-5)
 
@@ -382,10 +394,6 @@ Encoded in `CCConst.SYSTEM_PROMPT` in `HalCode9000.ailang`:
 3. If using `find`, scope to a specific known subdirectory
 4. Never produce unbounded output — always pipe through `head`/`grep`/`tail`
 5. NEVER `Relmem op=index` with broad paths — index already built, use `op=symbols`
-
-### Known crash: ~1700 output tokens causes death
-
-Observed consistently: model responses that reach approximately 1700 tokens cause a crash/hang. Not a one-time event — reproducible. Likely a history buffer overflow or a per-turn output buffer cap in the streaming path. **Not yet diagnosed or fixed.** Check `CCHistory`, `AgentLoop.ailang` turn buffer, and `TUI_BufferWriteStr` overflow.
 
 ### Bash tool timeout
 
