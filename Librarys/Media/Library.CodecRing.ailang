@@ -1,0 +1,468 @@
+// Library.CodecRing.ailang
+// Shared memory ring buffers — the binary interface between MediaCenter
+// and codec worker processes.
+//
+// Two rings per session, in /dev/shm:
+//   ailang_codec_<id>_pkt   — MediaCenter writes packets IN to codec worker
+//   ailang_codec_<id>_frm   — codec worker writes frames OUT to MediaCenter
+//
+// Ring layout (mmap'd shared memory):
+//   [0]   magic    8 bytes  'AILRNG\0\0'
+//   [8]   capacity 8 bytes  data region size in bytes
+//   [16]  write_pos 8 bytes  producer advances this
+//   [24]  read_pos  8 bytes  consumer advances this
+//   [32]  data[capacity]
+//
+// Record layout (variable length, written into data region):
+//   [0]  len       4 bytes  byte count of payload (not including this header)
+//   [4]  type      2 bytes  RTYPE_PACKET or RTYPE_FRAME
+//   [6]  flags     2 bytes  keyframe, flush, eof
+//   [8]  pts_ns    8 bytes  absolute nanoseconds (MediaClock_PTStoNS output)
+//   [16] payload   len bytes
+//   [+]  pad to 8-byte alignment
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.StringUtils
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.CRSys {
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_FTRUNCATE": Initialize=77
+    "SYS_MMAP":      Initialize=9
+    "SYS_MUNMAP":    Initialize=11
+    "SYS_UNLINK":    Initialize=87
+    "O_RDWR":        Initialize=2
+    "O_CREAT":       Initialize=64
+    "O_TRUNC":       Initialize=512
+    "PROT_RW":       Initialize=3
+    "MAP_SHARED":    Initialize=1
+}
+
+FixedPool.CRConst {
+    "MAGIC":          Initialize=5134804483358539776
+    "HEADER_SIZE":    Initialize=32
+    "RECORD_HDR":     Initialize=16
+    "RTYPE_PACKET":   Initialize=1
+    "RTYPE_FRAME":    Initialize=2
+    "FLAG_KEYFRAME":  Initialize=1
+    "FLAG_EOF":       Initialize=2
+    "FLAG_FLUSH":     Initialize=4
+    "DEFAULT_RING_SIZE": Initialize=4194304
+}
+
+// Ring offsets
+FixedPool.CROff {
+    "MAGIC":     Initialize=0
+    "CAPACITY":  Initialize=8
+    "WRITE_POS": Initialize=16
+    "READ_POS":  Initialize=24
+    "DATA":      Initialize=32
+}
+
+// Record header offsets
+FixedPool.CRRec {
+    "LEN":    Initialize=0
+    "TYPE":   Initialize=4
+    "FLAGS":  Initialize=6
+    "PTS_NS": Initialize=8
+    "PAYLOAD": Initialize=16
+}
+
+// =============================================================================
+// SESSION RING TABLE — up to 32 sessions, each with a pkt ring and frm ring
+// 32 entries × 24 bytes = 768 bytes
+//   [0]  pkt_ptr  8 bytes  mmap address of packet ring
+//   [8]  frm_ptr  8 bytes  mmap address of frame ring
+//   [16] pkt_fd   4 bytes  shm fd for packet ring
+//   [20] frm_fd   4 bytes  shm fd for frame ring
+// =============================================================================
+FixedPool.CRTable {
+    "max_sessions": Initialize=32
+    "entry_size":   Initialize=24
+    "table_ptr":    Initialize=0
+}
+
+Function.CodecRing_TableInit {
+    Body: {
+        sz = Multiply(CRTable.max_sessions, CRTable.entry_size)
+        tbl = Allocate(sz)
+        MemorySet(tbl, 0, sz)
+        CRTable.table_ptr = tbl
+    }
+}
+
+Function.CodecRing_EntryPtr {
+    Input: session_id: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(CRTable.table_ptr, Multiply(session_id, CRTable.entry_size)))
+    }
+}
+
+// =============================================================================
+// BUILD SHM PATH — "/dev/shm/ailang_codec_<id>_pkt" or "_frm"
+// suffix: 0=pkt, 1=frm
+// =============================================================================
+Function.CodecRing_BuildPath {
+    Input: session_id: Integer
+    Input: suffix:     Integer
+    Output: Integer
+    Body: {
+        buf = Allocate(64)
+        MemoryCopy(buf, "/dev/shm/ailang_codec_", 22)
+        // Write decimal session_id
+        tmp = Allocate(12)
+        n = 0
+        v = session_id
+        IfCondition EqualTo(v, 0) ThenBlock: {
+            SetByte(tmp, 0, 48)
+            n = 1
+        } ElseBlock: {
+            WhileLoop GreaterThan(v, 0) {
+                SetByte(tmp, n, Add(48, Modulo(v, 10)))
+                v = Divide(v, 10)
+                n = Add(n, 1)
+            }
+            // Reverse digits
+            i = 0
+            WhileLoop LessThan(i, Divide(n, 2)) {
+                a = GetByte(tmp, i)
+                b = GetByte(tmp, Subtract(Subtract(n, 1), i))
+                SetByte(tmp, i, b)
+                SetByte(tmp, Subtract(Subtract(n, 1), i), a)
+                i = Add(i, 1)
+            }
+        }
+        MemoryCopy(Add(buf, 22), tmp, n)
+        Deallocate(tmp, 12)
+        off = Add(22, n)
+        IfCondition EqualTo(suffix, 0) ThenBlock: {
+            MemoryCopy(Add(buf, off), "_pkt", 5)
+        } ElseBlock: {
+            MemoryCopy(Add(buf, off), "_frm", 5)
+        }
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// OPEN ONE RING — create + mmap a shm ring file
+// Returns mmap pointer, stores fd into fd_out (4-byte dword ptr)
+// =============================================================================
+Function.CodecRing_OpenRing {
+    Input: path:    Address
+    Input: ring_sz: Integer
+    Input: fd_out:  Address
+    Output: Integer
+    Body: {
+        flags = Add(CRSys.O_RDWR, Add(CRSys.O_CREAT, CRSys.O_TRUNC))
+        fd = SystemCall(CRSys.SYS_OPEN, path, flags, 438)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[CodecRing] shm open failed: ")
+            PrintString(path)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+        total = Add(CRConst.HEADER_SIZE, ring_sz)
+        SystemCall(CRSys.SYS_FTRUNCATE, fd, total)
+        // mmap(0, total, PROT_RW, MAP_SHARED, fd, 0)
+        ptr = SystemCall(CRSys.SYS_MMAP, 0, total, CRSys.PROT_RW, CRSys.MAP_SHARED, fd, 0)
+        IfCondition LessEqual(ptr, 0) ThenBlock: {
+            PrintMessage("[CodecRing] mmap failed\n")
+            SystemCall(CRSys.SYS_CLOSE, fd)
+            ReturnValue(0)
+        }
+        // Initialize ring header
+        StoreValue(Add(ptr, CROff.MAGIC),     CRConst.MAGIC)
+        StoreValue(Add(ptr, CROff.CAPACITY),  ring_sz)
+        StoreValue(Add(ptr, CROff.WRITE_POS), 0)
+        StoreValue(Add(ptr, CROff.READ_POS),  0)
+        StoreValue(fd_out, fd, "dword")
+        ReturnValue(ptr)
+    }
+}
+
+// =============================================================================
+// CREATE — open both rings for a session
+// =============================================================================
+Function.CodecRing_Create {
+    Input: session_id: Integer
+    Output: Integer
+    Body: {
+        entry = CodecRing_EntryPtr(session_id)
+
+        pkt_path = CodecRing_BuildPath(session_id, 0)
+        frm_path = CodecRing_BuildPath(session_id, 1)
+
+        pkt_fd_slot = Add(entry, 16)
+        frm_fd_slot = Add(entry, 20)
+
+        pkt_ptr = CodecRing_OpenRing(pkt_path, CRConst.DEFAULT_RING_SIZE, pkt_fd_slot)
+        frm_ptr = CodecRing_OpenRing(frm_path, CRConst.DEFAULT_RING_SIZE, frm_fd_slot)
+
+        Deallocate(pkt_path, 64)
+        Deallocate(frm_path, 64)
+
+        IfCondition Or(EqualTo(pkt_ptr, 0), EqualTo(frm_ptr, 0)) ThenBlock: {
+            PrintMessage("[CodecRing] Create failed for session ")
+            PrintNumber(session_id)
+            PrintMessage("\n")
+            ReturnValue(-1)
+        }
+
+        StoreValue(Add(entry, 0), pkt_ptr)
+        StoreValue(Add(entry, 8), frm_ptr)
+
+        PrintMessage("[CodecRing] Session ")
+        PrintNumber(session_id)
+        PrintMessage(" rings ready\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// AVAILABLE BYTES in ring (for producer to write or consumer to read)
+// =============================================================================
+Function.CodecRing_WriteAvail {
+    Input: ring: Address
+    Output: Integer
+    Body: {
+        cap = Dereference(Add(ring, CROff.CAPACITY))
+        wp  = Dereference(Add(ring, CROff.WRITE_POS))
+        rp  = Dereference(Add(ring, CROff.READ_POS))
+        used = Modulo(Add(Subtract(wp, rp), cap), cap)
+        ReturnValue(Subtract(cap, Add(used, 1)))
+    }
+}
+
+Function.CodecRing_ReadAvail {
+    Input: ring: Address
+    Output: Integer
+    Body: {
+        cap = Dereference(Add(ring, CROff.CAPACITY))
+        wp  = Dereference(Add(ring, CROff.WRITE_POS))
+        rp  = Dereference(Add(ring, CROff.READ_POS))
+        ReturnValue(Modulo(Add(Subtract(wp, rp), cap), cap))
+    }
+}
+
+// =============================================================================
+// WRITE BYTE to ring data region (wrapping)
+// =============================================================================
+Function.CodecRing_WriteByte {
+    Input: ring: Address
+    Input: pos:  Integer
+    Input: val:  Integer
+    Body: {
+        cap  = Dereference(Add(ring, CROff.CAPACITY))
+        data = Add(ring, CROff.DATA)
+        SetByte(data, Modulo(pos, cap), val)
+    }
+}
+
+Function.CodecRing_ReadByte {
+    Input: ring: Address
+    Input: pos:  Integer
+    Output: Integer
+    Body: {
+        cap  = Dereference(Add(ring, CROff.CAPACITY))
+        data = Add(ring, CROff.DATA)
+        ReturnValue(GetByte(data, Modulo(pos, cap)))
+    }
+}
+
+// =============================================================================
+// WRITE RECORD — write a packet or frame into a ring
+// Returns 0 on success, -1 if ring full
+// =============================================================================
+Function.CodecRing_WriteRecord {
+    Input: ring:    Address
+    Input: payload: Address
+    Input: len:     Integer
+    Input: rtype:   Integer
+    Input: flags:   Integer
+    Input: pts_ns:  Integer
+    Output: Integer
+    Body: {
+        // Align total record size to 8 bytes
+        pad     = Modulo(Add(len, CRConst.RECORD_HDR), 8)
+        IfCondition GreaterThan(pad, 0) ThenBlock: {
+            pad = Subtract(8, pad)
+        }
+        total = Add(Add(len, CRConst.RECORD_HDR), pad)
+
+        avail = CodecRing_WriteAvail(ring)
+        IfCondition LessThan(avail, total) ThenBlock: {
+            ReturnValue(-1)
+        }
+
+        wp = Dereference(Add(ring, CROff.WRITE_POS))
+
+        // Write record header: len(4) type(2) flags(2) pts_ns(8)
+        CodecRing_WriteByte(ring, wp,            BitwiseAnd(len, 255))
+        CodecRing_WriteByte(ring, Add(wp, 1),    BitwiseAnd(ShiftRight(len, 8), 255))
+        CodecRing_WriteByte(ring, Add(wp, 2),    BitwiseAnd(ShiftRight(len, 16), 255))
+        CodecRing_WriteByte(ring, Add(wp, 3),    BitwiseAnd(ShiftRight(len, 24), 255))
+        CodecRing_WriteByte(ring, Add(wp, 4),    BitwiseAnd(rtype, 255))
+        CodecRing_WriteByte(ring, Add(wp, 5),    BitwiseAnd(ShiftRight(rtype, 8), 255))
+        CodecRing_WriteByte(ring, Add(wp, 6),    BitwiseAnd(flags, 255))
+        CodecRing_WriteByte(ring, Add(wp, 7),    BitwiseAnd(ShiftRight(flags, 8), 255))
+        // pts_ns: 8 bytes little-endian
+        i = 0
+        WhileLoop LessThan(i, 8) {
+            CodecRing_WriteByte(ring, Add(Add(wp, 8), i), BitwiseAnd(ShiftRight(pts_ns, Multiply(i, 8)), 255))
+            i = Add(i, 1)
+        }
+        // Payload
+        i = 0
+        WhileLoop LessThan(i, len) {
+            CodecRing_WriteByte(ring, Add(Add(wp, CRConst.RECORD_HDR), i), GetByte(payload, i))
+            i = Add(i, 1)
+        }
+
+        cap = Dereference(Add(ring, CROff.CAPACITY))
+        StoreValue(Add(ring, CROff.WRITE_POS), Modulo(Add(wp, total), cap))
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// READ RECORD HEADER — peek at next record without consuming payload
+// Fills: out_len(4 bytes), out_type(2), out_flags(2), out_pts_ns(8)
+// Returns total record size (header + payload + padding), 0 if empty
+// =============================================================================
+Function.CodecRing_PeekHeader {
+    Input: ring:        Address
+    Input: out_len:     Address
+    Input: out_type:    Address
+    Input: out_flags:   Address
+    Input: out_pts_ns:  Address
+    Output: Integer
+    Body: {
+        avail = CodecRing_ReadAvail(ring)
+        IfCondition LessThan(avail, CRConst.RECORD_HDR) ThenBlock: {
+            ReturnValue(0)
+        }
+        rp = Dereference(Add(ring, CROff.READ_POS))
+
+        // len: 4 bytes little-endian
+        b0  = CodecRing_ReadByte(ring, rp)
+        b1  = CodecRing_ReadByte(ring, Add(rp, 1))
+        b2  = CodecRing_ReadByte(ring, Add(rp, 2))
+        b3  = CodecRing_ReadByte(ring, Add(rp, 3))
+        len = BitwiseOr(b0, BitwiseOr(ShiftLeft(b1, 8), BitwiseOr(ShiftLeft(b2, 16), ShiftLeft(b3, 24))))
+
+        // type: 2 bytes little-endian
+        bt0   = CodecRing_ReadByte(ring, Add(rp, 4))
+        bt1   = CodecRing_ReadByte(ring, Add(rp, 5))
+        rtype = BitwiseOr(bt0, ShiftLeft(bt1, 8))
+
+        // flags: 2 bytes little-endian
+        bf0   = CodecRing_ReadByte(ring, Add(rp, 6))
+        bf1   = CodecRing_ReadByte(ring, Add(rp, 7))
+        flags = BitwiseOr(bf0, ShiftLeft(bf1, 8))
+
+        // pts_ns: 8 bytes little-endian — count UP to avoid unsigned wrap bug
+        pts = 0
+        i = 0
+        WhileLoop LessThan(i, 8) {
+            bv  = CodecRing_ReadByte(ring, Add(Add(rp, 8), i))
+            pts = BitwiseOr(pts, ShiftLeft(bv, Multiply(i, 8)))
+            i   = Add(i, 1)
+        }
+
+        StoreValue(out_len,    len, "dword")
+        StoreValue(out_type,   rtype, "dword")
+        StoreValue(out_flags,  flags, "dword")
+        StoreValue(out_pts_ns, pts)
+
+        pad = Modulo(Add(len, CRConst.RECORD_HDR), 8)
+        IfCondition GreaterThan(pad, 0) ThenBlock: { pad = Subtract(8, pad) }
+        ReturnValue(Add(Add(len, CRConst.RECORD_HDR), pad))
+    }
+}
+
+// =============================================================================
+// CONSUME RECORD — copy payload into out_buf, advance read_pos
+// Call after PeekHeader. out_buf must be at least out_len bytes.
+// =============================================================================
+Function.CodecRing_Consume {
+    Input: ring:    Address
+    Input: out_buf: Address
+    Input: len:     Integer
+    Input: total:   Integer
+    Body: {
+        rp  = Dereference(Add(ring, CROff.READ_POS))
+        cap = Dereference(Add(ring, CROff.CAPACITY))
+        payload_start = Add(rp, CRConst.RECORD_HDR)
+        i = 0
+        WhileLoop LessThan(i, len) {
+            SetByte(out_buf, i, CodecRing_ReadByte(ring, Add(payload_start, i)))
+            i = Add(i, 1)
+        }
+        StoreValue(Add(ring, CROff.READ_POS), Modulo(Add(rp, total), cap))
+    }
+}
+
+// =============================================================================
+// HELPERS — get packet/frame ring ptr for a session
+// =============================================================================
+Function.CodecRing_PktRing {
+    Input: session_id: Integer
+    Output: Integer
+    Body: {
+        entry = CodecRing_EntryPtr(session_id)
+        ReturnValue(Dereference(Add(entry, 0)))
+    }
+}
+
+Function.CodecRing_FrmRing {
+    Input: session_id: Integer
+    Output: Integer
+    Body: {
+        entry = CodecRing_EntryPtr(session_id)
+        ReturnValue(Dereference(Add(entry, 8)))
+    }
+}
+
+// =============================================================================
+// DESTROY — unmap and unlink shm for a session
+// =============================================================================
+Function.CodecRing_Destroy {
+    Input: session_id: Integer
+    Body: {
+        entry = CodecRing_EntryPtr(session_id)
+
+        pkt_ptr = Dereference(Add(entry, 0))
+        frm_ptr = Dereference(Add(entry, 8))
+        pkt_fd  = Dereference(Add(entry, 16), "dword")
+        frm_fd  = Dereference(Add(entry, 20), "dword")
+        cap     = CRConst.DEFAULT_RING_SIZE
+        total   = Add(CRConst.HEADER_SIZE, cap)
+
+        IfCondition NotEqual(pkt_ptr, 0) ThenBlock: {
+            SystemCall(CRSys.SYS_MUNMAP, pkt_ptr, total)
+            SystemCall(CRSys.SYS_CLOSE, pkt_fd)
+        }
+        IfCondition NotEqual(frm_ptr, 0) ThenBlock: {
+            SystemCall(CRSys.SYS_MUNMAP, frm_ptr, total)
+            SystemCall(CRSys.SYS_CLOSE, frm_fd)
+        }
+
+        pkt_path = CodecRing_BuildPath(session_id, 0)
+        frm_path = CodecRing_BuildPath(session_id, 1)
+        SystemCall(CRSys.SYS_UNLINK, pkt_path)
+        SystemCall(CRSys.SYS_UNLINK, frm_path)
+        Deallocate(pkt_path, 64)
+        Deallocate(frm_path, 64)
+
+        MemorySet(entry, 0, CRTable.entry_size)
+        PrintMessage("[CodecRing] Session ")
+        PrintNumber(session_id)
+        PrintMessage(" destroyed\n")
+    }
+}

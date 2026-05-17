@@ -1,0 +1,435 @@
+// Library.MediaSession.ailang
+// Session table — tracks active codec worker instances.
+// Each session owns a codec worker process + two CodecRings + a canvas tag.
+//
+// Session states:
+//   IDLE    (0) — slot free
+//   ACTIVE  (1) — codec worker running, rings open
+//   PAUSED  (2) — worker SIGSTOP'd
+//   EOF     (3) — worker finished, pending cleanup
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Media.MediaClock
+LibraryImport.Media.CodecRing
+LibraryImport.StringUtils
+
+// =============================================================================
+// SESSION ENTRY — 128 bytes each, 32 sessions = 4096 bytes
+//   [0]   state          8  IDLE/ACTIVE/PAUSED/EOF
+//   [8]   worker_pid     8  codec worker process pid
+//   [16]  session_id     8  index into this table
+//   [24]  start_ns       8  MediaClock_NowNS() at play start
+//   [32]  codec_type     8  CODEC_MP3 / CODEC_AAC / CODEC_H264 etc.
+//   [40]  stream_type    8  STREAM_AUDIO / STREAM_VIDEO
+//   [48]  canvas_tag     8  ptr to tag string (for video sessions)
+//   [56]  mixer_bus      8  0=app 1=sys (for audio sessions)
+//   [64]  last_pts_ns    8  last frame pts we presented
+//   [72]  frames_out     8  total frames/periods sent downstream
+//   [80]  reserved[48]      future use
+// =============================================================================
+FixedPool.MSConst {
+    "MAX_SESSIONS":   Initialize=32
+    "ENTRY_SIZE":     Initialize=128
+    "STATE_IDLE":     Initialize=0
+    "STATE_ACTIVE":   Initialize=1
+    "STATE_PAUSED":   Initialize=2
+    "STATE_EOF":      Initialize=3
+    "CODEC_MP3":      Initialize=1
+    "CODEC_AAC":      Initialize=2
+    "CODEC_H264":     Initialize=3
+    "CODEC_H265":     Initialize=4
+    "CODEC_VP9":      Initialize=5
+    "CODEC_AV1":      Initialize=6
+    "CODEC_WAV":      Initialize=7
+    "STREAM_AUDIO":   Initialize=1
+    "STREAM_VIDEO":   Initialize=2
+}
+
+FixedPool.MSOff {
+    "STATE":       Initialize=0
+    "WORKER_PID":  Initialize=8
+    "SESSION_ID":  Initialize=16
+    "START_NS":    Initialize=24
+    "CODEC_TYPE":  Initialize=32
+    "STREAM_TYPE": Initialize=40
+    "CANVAS_TAG":  Initialize=48
+    "MIXER_BUS":   Initialize=56
+    "LAST_PTS_NS": Initialize=64
+    "FRAMES_OUT":  Initialize=72
+}
+
+FixedPool.MSState {
+    "table":       Initialize=0
+    "initialized": Initialize=0
+}
+
+FixedPool.MSSys {
+    "SYS_FORK":    Initialize=57
+    "SYS_EXECVE":  Initialize=59
+    "SYS_KILL":    Initialize=62
+    "SYS_WAIT4":   Initialize=61
+    "SIGTERM":     Initialize=15
+    "SIGSTOP":     Initialize=19
+    "SIGCONT":     Initialize=18
+    "WNOHANG":     Initialize=1
+}
+
+// =============================================================================
+// INIT
+// =============================================================================
+Function.MediaSession_Init {
+    Body: {
+        sz  = Multiply(MSConst.MAX_SESSIONS, MSConst.ENTRY_SIZE)
+        tbl = Allocate(sz)
+        MemorySet(tbl, 0, sz)
+        MSState.table       = tbl
+        MSState.initialized = 1
+        CodecRing_TableInit()
+        PrintMessage("[MediaSession] Init: 32 slots ready\n")
+    }
+}
+
+// =============================================================================
+// ENTRY POINTER
+// =============================================================================
+Function.MediaSession_EntryPtr {
+    Input: session_id: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(MSState.table, Multiply(session_id, MSConst.ENTRY_SIZE)))
+    }
+}
+
+// =============================================================================
+// FIND FREE SLOT
+// =============================================================================
+Function.MediaSession_AllocSlot {
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, MSConst.MAX_SESSIONS) {
+            entry = MediaSession_EntryPtr(i)
+            state = Dereference(Add(entry, MSOff.STATE))
+            IfCondition EqualTo(state, MSConst.STATE_IDLE) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// CODEC WORKER PATH — build path string for worker binary
+// =============================================================================
+Function.MediaSession_WorkerPath {
+    Input: codec_type: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(codec_type, MSConst.CODEC_MP3) ThenBlock: {
+            ReturnValue("MediaCenter/Codec/mp3_worker")
+        }
+        IfCondition EqualTo(codec_type, MSConst.CODEC_AAC) ThenBlock: {
+            ReturnValue("MediaCenter/Codec/aac_worker")
+        }
+        IfCondition EqualTo(codec_type, MSConst.CODEC_H264) ThenBlock: {
+            ReturnValue("MediaCenter/Codec/h264_worker")
+        }
+        IfCondition EqualTo(codec_type, MSConst.CODEC_H265) ThenBlock: {
+            ReturnValue("MediaCenter/Codec/h265_worker")
+        }
+        IfCondition EqualTo(codec_type, MSConst.CODEC_VP9) ThenBlock: {
+            ReturnValue("MediaCenter/Codec/vp9_worker")
+        }
+        IfCondition EqualTo(codec_type, MSConst.CODEC_AV1) ThenBlock: {
+            ReturnValue("MediaCenter/Codec/av1_worker")
+        }
+        IfCondition EqualTo(codec_type, MSConst.CODEC_WAV) ThenBlock: {
+            ReturnValue("MediaCenter/Codec/wav_worker")
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// INT TO STRING — for passing session_id to worker argv
+// =============================================================================
+Function.MediaSession_IntToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// CREATE — allocate slot, open rings, fork+exec codec worker
+// Returns session_id on success, -1 on failure
+// =============================================================================
+Function.MediaSession_Create {
+    Input: codec_type:   Integer
+    Input: stream_type:  Integer
+    Input: canvas_tag:   Address
+    Input: mixer_bus:    Integer
+    Output: Integer
+    Body: {
+        sid = MediaSession_AllocSlot()
+        IfCondition LessThan(sid, 0) ThenBlock: {
+            PrintMessage("[MediaSession] No free slots\n")
+            ReturnValue(-1)
+        }
+
+        // Open codec rings for this session
+        r = CodecRing_Create(sid)
+        IfCondition LessThan(r, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+
+        // Locate worker binary
+        worker_path = MediaSession_WorkerPath(codec_type)
+        IfCondition EqualTo(worker_path, 0) ThenBlock: {
+            PrintMessage("[MediaSession] Unknown codec type ")
+            PrintNumber(codec_type)
+            PrintMessage("\n")
+            CodecRing_Destroy(sid)
+            ReturnValue(-1)
+        }
+
+        // Build argv: { worker_path, "<session_id>", NULL }
+        id_str = Allocate(16)
+        MediaSession_IntToStr(sid, id_str)
+        argv = Allocate(24)
+        StoreValue(Add(argv, 0),  worker_path)
+        StoreValue(Add(argv, 8),  id_str)
+        StoreValue(Add(argv, 16), 0)
+
+        // Fork + exec worker
+        pid = SystemCall(MSSys.SYS_FORK)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child: exec worker
+            SystemCall(MSSys.SYS_EXECVE, worker_path, argv, 0)
+            // execve returned — fatal
+            SystemCall(60, 1)
+        }
+
+        Deallocate(argv, 24)
+        Deallocate(id_str, 16)
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[MediaSession] fork failed\n")
+            CodecRing_Destroy(sid)
+            ReturnValue(-1)
+        }
+
+        // Fill session entry
+        entry    = MediaSession_EntryPtr(sid)
+        start_ns = MediaClock_NowNS()
+        StoreValue(Add(entry, MSOff.STATE),       MSConst.STATE_ACTIVE)
+        StoreValue(Add(entry, MSOff.WORKER_PID),  pid)
+        StoreValue(Add(entry, MSOff.SESSION_ID),  sid)
+        StoreValue(Add(entry, MSOff.START_NS),    start_ns)
+        StoreValue(Add(entry, MSOff.CODEC_TYPE),  codec_type)
+        StoreValue(Add(entry, MSOff.STREAM_TYPE), stream_type)
+        StoreValue(Add(entry, MSOff.CANVAS_TAG),  canvas_tag)
+        StoreValue(Add(entry, MSOff.MIXER_BUS),   mixer_bus)
+        StoreValue(Add(entry, MSOff.LAST_PTS_NS), 0)
+        StoreValue(Add(entry, MSOff.FRAMES_OUT),  0)
+
+        PrintMessage("[MediaSession] Created session ")
+        PrintNumber(sid)
+        PrintMessage(" pid=")
+        PrintNumber(pid)
+        PrintMessage(" codec=")
+        PrintNumber(codec_type)
+        PrintMessage("\n")
+        ReturnValue(sid)
+    }
+}
+
+// =============================================================================
+// PAUSE / RESUME / STOP
+// =============================================================================
+Function.MediaSession_Pause {
+    Input: session_id: Integer
+    Body: {
+        entry = MediaSession_EntryPtr(session_id)
+        state = Dereference(Add(entry, MSOff.STATE))
+        IfCondition NotEqual(state, MSConst.STATE_ACTIVE) ThenBlock: { ReturnValue(0) }
+        pid = Dereference(Add(entry, MSOff.WORKER_PID))
+        SystemCall(MSSys.SYS_KILL, pid, MSSys.SIGSTOP)
+        StoreValue(Add(entry, MSOff.STATE), MSConst.STATE_PAUSED)
+    }
+}
+
+Function.MediaSession_Resume {
+    Input: session_id: Integer
+    Body: {
+        entry = MediaSession_EntryPtr(session_id)
+        state = Dereference(Add(entry, MSOff.STATE))
+        IfCondition NotEqual(state, MSConst.STATE_PAUSED) ThenBlock: { ReturnValue(0) }
+        pid = Dereference(Add(entry, MSOff.WORKER_PID))
+        // Re-anchor start_ns so PTS math stays correct after pause
+        StoreValue(Add(entry, MSOff.START_NS), MediaClock_NowNS())
+        SystemCall(MSSys.SYS_KILL, pid, MSSys.SIGCONT)
+        StoreValue(Add(entry, MSOff.STATE), MSConst.STATE_ACTIVE)
+    }
+}
+
+Function.MediaSession_Stop {
+    Input: session_id: Integer
+    Body: {
+        entry = MediaSession_EntryPtr(session_id)
+        state = Dereference(Add(entry, MSOff.STATE))
+        IfCondition EqualTo(state, MSConst.STATE_IDLE) ThenBlock: { ReturnValue(0) }
+        pid = Dereference(Add(entry, MSOff.WORKER_PID))
+        IfCondition GreaterThan(pid, 0) ThenBlock: {
+            IfCondition EqualTo(state, MSConst.STATE_PAUSED) ThenBlock: {
+                SystemCall(MSSys.SYS_KILL, pid, MSSys.SIGCONT)
+            }
+            SystemCall(MSSys.SYS_KILL, pid, MSSys.SIGTERM)
+            status = Allocate(8)
+            SystemCall(MSSys.SYS_WAIT4, pid, status, MSSys.WNOHANG)
+            Deallocate(status, 8)
+        }
+        CodecRing_Destroy(session_id)
+        MemorySet(entry, 0, MSConst.ENTRY_SIZE)
+        PrintMessage("[MediaSession] Stopped session ")
+        PrintNumber(session_id)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// TICK — drain ready frames from a session's frame ring
+// Called every MediaCenter tick for each ACTIVE session.
+// Routes audio to mixer bus, video to canvas tag.
+// Returns number of frames consumed.
+// =============================================================================
+Function.MediaSession_Tick {
+    Input: session_id: Integer
+    Input: now_ns:     Integer
+    Output: Integer
+    Body: {
+        entry = MediaSession_EntryPtr(session_id)
+        state = Dereference(Add(entry, MSOff.STATE))
+        IfCondition NotEqual(state, MSConst.STATE_ACTIVE) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        frm_ring    = CodecRing_FrmRing(session_id)
+        stream_type = Dereference(Add(entry, MSOff.STREAM_TYPE))
+        consumed    = 0
+
+        // Peek-drain loop: consume all frames whose pts_ns <= now_ns
+        done = 0
+        WhileLoop EqualTo(done, 0) {
+            out_len   = Allocate(4)
+            out_type  = Allocate(4)
+            out_flags = Allocate(4)
+            out_pts   = Allocate(8)
+
+            total = CodecRing_PeekHeader(frm_ring, out_len, out_type, out_flags, out_pts)
+
+            IfCondition EqualTo(total, 0) ThenBlock: {
+                // Ring empty
+                Deallocate(out_len, 4)
+                Deallocate(out_type, 4)
+                Deallocate(out_flags, 4)
+                Deallocate(out_pts, 8)
+                done = 1
+            } ElseBlock: {
+                pts_ns = Dereference(out_pts)
+                len    = Dereference(out_len, "dword")
+                flags  = Dereference(out_flags, "dword")
+
+                Deallocate(out_len, 4)
+                Deallocate(out_type, 4)
+                Deallocate(out_flags, 4)
+                Deallocate(out_pts, 8)
+
+                // EOF flag — mark session done
+                IfCondition And(NotEqual(flags, 0), EqualTo(BitwiseAnd(flags, 2), 2)) ThenBlock: {
+                    StoreValue(Add(entry, MSOff.STATE), MSConst.STATE_EOF)
+                    done = 1
+                } ElseBlock: {
+                    // Not yet time for this frame — hold
+                    IfCondition GreaterThan(pts_ns, now_ns) ThenBlock: {
+                        done = 1
+                    } ElseBlock: {
+                        // Time to consume — allocate frame buffer
+                        frame_buf = Allocate(len)
+                        CodecRing_Consume(frm_ring, frame_buf, len, total)
+
+                        IfCondition EqualTo(stream_type, MSConst.STREAM_AUDIO) ThenBlock: {
+                            // Audio: first 32 bytes are CRFrameDesc, rest is PCM
+                            pcm_ptr    = Add(frame_buf, 32)
+                            // sample_count at offset 12, 4 bytes
+                            scount     = Dereference(Add(frame_buf, 12), "dword")
+                            pcm_bytes  = Multiply(scount, 4)
+                            // Route to mixer via bus
+                            bus = Dereference(Add(entry, MSOff.MIXER_BUS))
+                            IfCondition EqualTo(bus, 0) ThenBlock: {
+                                Mixer_AppWrite(pcm_ptr, pcm_bytes)
+                            } ElseBlock: {
+                                Mixer_SysWrite(pcm_ptr, pcm_bytes)
+                            }
+                        }
+                        // Video routing will call ShmCanvas_Present with canvas_tag
+                        // when the video session tick impl is added
+
+                        Deallocate(frame_buf, len)
+                        StoreValue(Add(entry, MSOff.LAST_PTS_NS), pts_ns)
+                        fout = Dereference(Add(entry, MSOff.FRAMES_OUT))
+                        StoreValue(Add(entry, MSOff.FRAMES_OUT), Add(fout, 1))
+                        consumed = Add(consumed, 1)
+                    }
+                }
+            }
+        }
+        ReturnValue(consumed)
+    }
+}
+
+// =============================================================================
+// SHUTDOWN — stop all active sessions
+// =============================================================================
+Function.MediaSession_Shutdown {
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, MSConst.MAX_SESSIONS) {
+            entry = MediaSession_EntryPtr(i)
+            state = Dereference(Add(entry, MSOff.STATE))
+            IfCondition NotEqual(state, MSConst.STATE_IDLE) ThenBlock: {
+                MediaSession_Stop(i)
+            }
+            i = Add(i, 1)
+        }
+        sz = Multiply(MSConst.MAX_SESSIONS, MSConst.ENTRY_SIZE)
+        Deallocate(MSState.table, sz)
+        MSState.table       = 0
+        MSState.initialized = 0
+        PrintMessage("[MediaSession] Shutdown complete\n")
+    }
+}
