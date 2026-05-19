@@ -3,8 +3,9 @@
 test262_runner.py — ECMAScript conformance test runner for the Ailang JS engine.
 
 Discovers tests from tc39/test262, filters for supported features, prepends a
-polyfill preamble, preprocesses throw statements, executes via test262_harness.x,
-and prints a per-category conformance report.
+polyfill preamble, preprocesses throw statements, executes via test262_harness.x
+(or test262_harness_batch.x for batch mode), and prints a per-category
+conformance report.
 
 Usage:
     python3 tools/test262_runner.py [options]
@@ -14,8 +15,10 @@ Usage:
     --verbose                    Print each test result
     --output-json FILE           Write JSON results to FILE
     --harness PATH               Path to harness binary (default: ./test262_harness.x)
+    --batch-harness PATH         Path to batch harness binary (default: ./test262_harness_batch.x)
     --test262 PATH               Path to test262 repo (default: ./test262)
     --timeout SECS               Per-test timeout (default: 5)
+    --no-batch                   Force legacy mode (one process per test)
 
 Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
 """
@@ -24,11 +27,13 @@ import argparse
 import json
 import os
 import re
+import select
+import signal
+import struct
 import subprocess
 import sys
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # =============================================================================
@@ -141,15 +146,91 @@ assert.sameValue = function(a, e, m) { if (a !== e) { __test262_failed = 1; } };
 assert.notSameValue = function(a, u, m) { if (a === u) { __test262_failed = 1; } };
 assert.throws = function(E, fn, m) { try { fn(); __test262_failed = 1; } catch (e) { } };
 function $DONE(err) { if (err) { __test262_failed = 1; } }
+function verifyProperty(obj, name, desc) {
+  if (desc === undefined) return;
+  var actual = obj[name];
+  if (desc.value !== undefined) { if (actual !== desc.value) { __test262_failed = 1; } }
+  if (desc.writable !== undefined) {
+    var old = obj[name]; obj[name] = "___test262_probe___";
+    var changed = (obj[name] !== old);
+    if (desc.writable && !changed) { __test262_failed = 1; }
+    if (!desc.writable && changed) { __test262_failed = 1; }
+    obj[name] = old;
+  }
+  if (desc.enumerable !== undefined) {
+    var found = false;
+    for (var k in obj) { if (k === name) { found = true; } }
+    if (desc.enumerable && !found) { __test262_failed = 1; }
+    if (!desc.enumerable && found) { __test262_failed = 1; }
+  }
+  if (desc.configurable !== undefined) {
+    var d2 = obj[name]; delete obj[name];
+    var deleted = (obj[name] === undefined && d2 !== undefined);
+    if (desc.configurable && !deleted) { __test262_failed = 1; }
+    if (!desc.configurable && deleted) { __test262_failed = 1; }
+    if (!desc.configurable) { obj[name] = d2; }
+  }
+}
+function verifyNotEnumerable(obj, name) {
+  for (var k in obj) { if (k === name) { __test262_failed = 1; } }
+}
+function verifyEnumerable(obj, name) {
+  var found = false;
+  for (var k in obj) { if (k === name) { found = true; } }
+  if (!found) { __test262_failed = 1; }
+}
+function verifyWritable(obj, name) {
+  var old = obj[name]; obj[name] = "___test262_w___";
+  if (obj[name] === old) { __test262_failed = 1; }
+  obj[name] = old;
+}
+function verifyNotWritable(obj, name) {
+  var old = obj[name]; obj[name] = "___test262_w___";
+  if (obj[name] !== old) { __test262_failed = 1; }
+}
+function verifyConfigurable(obj, name) {
+  var old = obj[name]; delete obj[name];
+  if (obj[name] !== undefined) { __test262_failed = 1; }
+  obj[name] = old;
+}
+function verifyNotConfigurable(obj, name) {
+  var old = obj[name]; delete obj[name];
+  if (obj[name] === undefined && old !== undefined) { __test262_failed = 1; }
+}
+function isConstructor(f) { try { new f(); return true; } catch(e) { return false; } }
+function compareArray(a, b) {
+  if (a.length !== b.length) return false;
+  for (var i = 0; i < a.length; i++) { if (a[i] !== b[i]) return false; }
+  return true;
+}
+assert.compareArray = function(a, b, m) { if (!compareArray(a, b)) { __test262_failed = 1; } };
+if (typeof Object === "undefined") { var Object = {}; }
+if (typeof Object.hasOwn !== "function") {
+  Object.hasOwn = function(obj, key) {
+    for (var k in obj) { if (k === key) return true; }
+    return false;
+  };
+}
+if (typeof Object.prototype === "undefined") { Object.prototype = {}; }
+if (typeof Object.prototype.hasOwnProperty !== "function") {
+  Object.prototype.hasOwnProperty = function(k) {
+    for (var p in this) { if (p === k) return true; }
+    return false;
+  };
+}
 """
 
 EPILOGUE = """
-if (__test262_failed) { __force_fail__(); }
+if (__test262_failed) { throw new Error("test262 assertion failed"); }
 """
 
 TMP_FILE = "/tmp/test262_current.js"  # legacy single-thread path
 _thread_local = threading.local()
 _ORIG_PATH = b"/tmp/test262_current.js"  # 23 bytes — must match harness binary
+
+# Pre-encode polyfill and epilogue
+_POLYFILL_BYTES = POLYFILL.encode("utf-8", errors="replace")
+_EPILOGUE_BYTES = EPILOGUE.encode("utf-8", errors="replace")
 
 # =============================================================================
 # FRONTMATTER PARSER
@@ -157,49 +238,6 @@ _ORIG_PATH = b"/tmp/test262_current.js"  # 23 bytes — must match harness binar
 
 _FRONTMATTER_RE = re.compile(r'/\*---\s*\n(.*?)\n\s*---\*/', re.DOTALL)
 
-
-def strip_comments(source):
-    """Remove single-line (//) and multi-line (/* */) comments from JS source.
-
-    Preserves string contents (won't strip // inside "..." or '...')."""
-    result = []
-    i = 0
-    n = len(source)
-    while i < n:
-        # String literals — skip over them
-        if source[i] in ('"', "'"):
-            q = source[i]
-            result.append(q)
-            i += 1
-            while i < n and source[i] != q:
-                if source[i] == '\\' and i + 1 < n:
-                    result.append(source[i])
-                    result.append(source[i + 1])
-                    i += 2
-                else:
-                    result.append(source[i])
-                    i += 1
-            if i < n:
-                result.append(source[i])
-                i += 1
-        # Multi-line comment
-        elif source[i] == '/' and i + 1 < n and source[i + 1] == '*':
-            end = source.find('*/', i + 2)
-            if end == -1:
-                i = n
-            else:
-                i = end + 2
-        # Single-line comment
-        elif source[i] == '/' and i + 1 < n and source[i + 1] == '/':
-            end = source.find('\n', i)
-            if end == -1:
-                i = n
-            else:
-                i = end  # keep the newline
-        else:
-            result.append(source[i])
-            i += 1
-    return "".join(result)
 
 def parse_frontmatter(source):
     """Extract YAML-ish frontmatter from test262 test file."""
@@ -250,11 +288,6 @@ def parse_frontmatter(source):
         if flag_lines:
             meta["flags"] = flag_lines
 
-    # Parse includes
-    inc_match = re.search(r'^includes:\s*\[([^\]]*)\]', raw, re.MULTILINE)
-    if inc_match:
-        meta["includes"] = [f.strip().strip("'\"") for f in inc_match.group(1).split(",") if f.strip()]
-
     # Parse negative
     neg_match = re.search(r'^negative:', raw, re.MULTILINE)
     if neg_match:
@@ -266,56 +299,46 @@ def parse_frontmatter(source):
         if type_match:
             meta["negative_type"] = type_match.group(1)
 
-    # Parse description
-    desc_match = re.search(r'^description:\s*[>|]?\s*\n?\s*(.*)', raw, re.MULTILINE)
-    if desc_match:
-        meta["description"] = desc_match.group(1).strip()
-
     return meta
-
-
-# =============================================================================
-# FILTER
-# =============================================================================
-
-def should_skip(source, meta):
-    """No skips — every test runs."""
-    return False, ""
 
 
 # =============================================================================
 # PREPROCESSOR
 # =============================================================================
 
+_THROW_TEST262_RE = re.compile(r'throw\s+new\s+Test262Error\(([^)]*)\)')
+_THROW_ANY_RE = re.compile(r'throw\s+new\s+\w+Error\(([^)]*)\)')
+
+
 def preprocess(source):
     """Clean up test source for the Ailang JS engine."""
-    # Strip the frontmatter block itself
     source = _FRONTMATTER_RE.sub("", source)
-
-    # Replace throw statements with $ERROR calls
-    source = re.sub(
-        r'throw\s+new\s+Test262Error\(([^)]*)\)',
-        r'$ERROR(\1)',
-        source,
-    )
-    source = re.sub(
-        r'throw\s+new\s+\w+Error\(([^)]*)\)',
-        r'$ERROR(\1)',
-        source,
-    )
-    # Plain throw "string" is now handled natively (no conversion needed)
-
+    source = _THROW_TEST262_RE.sub(r'$ERROR(\1)', source)
+    source = _THROW_ANY_RE.sub(r'$ERROR(\1)', source)
     return source
 
 
 # =============================================================================
-# RUNNER
+# TEST DISCOVERY
 # =============================================================================
 
-def discover_tests(test262_dir, categories, discover_all=False, discover_full=False):
+def discover_tests(test262_dir, categories, discover_all=False, discover_full=False, paths=None):
     """Yield .js test file paths for the given categories, all language, or full suite."""
+    if paths:
+        test_root = Path(test262_dir) / "test"
+        for p in paths:
+            target = test_root / p
+            if not target.exists():
+                continue
+            if target.is_file():
+                yield str(target)
+            else:
+                for js_file in sorted(target.rglob("*.js")):
+                    if js_file.name.startswith("_"):
+                        continue
+                    yield str(js_file)
+        return
     if discover_full:
-        # Full suite: language + built-ins + annexB + staging (skip intl402)
         test_root = Path(test262_dir) / "test"
         for subdir in ["language", "built-ins", "annexB", "staging"]:
             sub_path = test_root / subdir
@@ -338,35 +361,26 @@ def discover_tests(test262_dir, categories, discover_all=False, discover_full=Fa
         if not cat_dir.exists():
             continue
         for js_file in sorted(cat_dir.rglob("*.js")):
-            # Skip _FIXTURE files
             if js_file.name.startswith("_"):
                 continue
             yield str(js_file)
 
 
-def run_test(harness, test_path, timeout, verbose=False):
-    """
-    Run a single test262 test.
+# =============================================================================
+# LEGACY RUNNER (one process per test)
+# =============================================================================
 
-    Returns dict: {path, status, reason, time_ms}
-    status is one of: 'pass', 'fail', 'skip', 'timeout', 'error'
-    """
+def run_test(harness, test_path, timeout, verbose=False):
+    """Run a single test262 test via subprocess."""
     try:
         source = open(test_path, "r", errors="replace").read()
     except Exception as e:
         return {"path": test_path, "status": "error", "reason": str(e), "time_ms": 0}
 
     meta = parse_frontmatter(source)
-
-    skip, reason = should_skip(source, meta)
-    if skip:
-        return {"path": test_path, "status": "skip", "reason": reason, "time_ms": 0}
-
-    # Build test source
     processed = preprocess(source)
     full_source = POLYFILL + processed + EPILOGUE
 
-    # Write to per-worker temp file
     tmp_path = getattr(_thread_local, 'tmp_path', TMP_FILE)
     try:
         with open(tmp_path, "w") as f:
@@ -376,45 +390,22 @@ def run_test(harness, test_path, timeout, verbose=False):
 
     harness_bin = getattr(_thread_local, 'harness', harness)
     is_negative = meta.get("negative", False)
-    neg_phase = meta.get("negative_phase", "runtime")
 
     t0 = time.monotonic()
     try:
-        result = subprocess.run(
-            [harness_bin],
-            timeout=timeout,
-            capture_output=True,
-        )
+        result = subprocess.run([harness_bin], timeout=timeout, capture_output=True)
         elapsed = (time.monotonic() - t0) * 1000
         exit_code = result.returncode
     except subprocess.TimeoutExpired:
-        elapsed = timeout * 1000
-        return {"path": test_path, "status": "timeout", "reason": "timeout", "time_ms": elapsed}
+        return {"path": test_path, "status": "timeout", "reason": "timeout", "time_ms": timeout * 1000}
     except Exception as e:
         elapsed = (time.monotonic() - t0) * 1000
         return {"path": test_path, "status": "error", "reason": str(e), "time_ms": elapsed}
 
-    # Interpret result
     if is_negative:
-        # Negative test: SHOULD fail (exit != 0)
-        if neg_phase == "parse":
-            # Parse-phase negative: engine should reject during parse
-            if exit_code != 0:
-                status = "pass"
-            else:
-                status = "fail"
-        else:
-            # Runtime negative
-            if exit_code != 0:
-                status = "pass"
-            else:
-                status = "fail"
+        status = "pass" if exit_code != 0 else "fail"
     else:
-        # Positive test: should succeed (exit == 0)
-        if exit_code == 0:
-            status = "pass"
-        else:
-            status = "fail"
+        status = "pass" if exit_code == 0 else "fail"
 
     return {
         "path": test_path,
@@ -425,20 +416,162 @@ def run_test(harness, test_path, timeout, verbose=False):
 
 
 # =============================================================================
+# BATCH RUNNER (single long-running harness process per worker)
+# =============================================================================
+
+def _prepare_test(test_path):
+    """Read, parse frontmatter, preprocess a test file. Returns (path, meta, source_bytes) or None on error."""
+    try:
+        source = open(test_path, "r", errors="replace").read()
+    except Exception:
+        return (test_path, {}, None)
+    meta = parse_frontmatter(source)
+    processed = preprocess(source)
+    full = POLYFILL + processed + EPILOGUE
+    return (test_path, meta, full.encode("utf-8", errors="replace"))
+
+
+def _batch_worker(wid, batch_harness, work_items, results, done_count, done_lock, timeout):
+    """Worker thread: spawns batch harness, feeds tests via stdin, reads results from stdout."""
+    proc = subprocess.Popen(
+        [batch_harness],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+    )
+
+    try:
+        for idx, path, meta, src_bytes in work_items:
+            if src_bytes is None:
+                results[idx] = {"path": path, "status": "error", "reason": "read_error", "time_ms": 0}
+                with done_lock:
+                    done_count[0] += 1
+                continue
+
+            is_negative = meta.get("negative", False)
+
+            # Send length-prefixed source
+            header = struct.pack("<I", len(src_bytes))
+            try:
+                proc.stdin.write(header)
+                proc.stdin.write(src_bytes)
+                proc.stdin.flush()
+            except (BrokenPipeError, OSError):
+                # Harness crashed — mark remaining as error and restart
+                results[idx] = {"path": path, "status": "error", "reason": "harness_crash", "time_ms": 0}
+                with done_lock:
+                    done_count[0] += 1
+                # Restart harness
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+                proc = subprocess.Popen(
+                    [batch_harness],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                continue
+
+            # Read 1-byte result with timeout
+            t0 = time.monotonic()
+            result_byte = None
+            try:
+                # Use select for timeout on stdout
+                rlist, _, _ = select.select([proc.stdout], [], [], timeout)
+                if rlist:
+                    result_byte = proc.stdout.read(1)
+                    elapsed = (time.monotonic() - t0) * 1000
+                else:
+                    # Timeout — kill and restart harness
+                    elapsed = timeout * 1000
+                    try:
+                        proc.kill()
+                        proc.wait()
+                    except Exception:
+                        pass
+                    results[idx] = {"path": path, "status": "timeout", "reason": "timeout", "time_ms": elapsed}
+                    with done_lock:
+                        done_count[0] += 1
+                    proc = subprocess.Popen(
+                        [batch_harness],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,
+                    )
+                    continue
+            except Exception as e:
+                results[idx] = {"path": path, "status": "error", "reason": str(e), "time_ms": 0}
+                with done_lock:
+                    done_count[0] += 1
+                continue
+
+            if not result_byte or len(result_byte) == 0:
+                # Harness exited unexpectedly
+                results[idx] = {"path": path, "status": "error", "reason": "harness_eof", "time_ms": 0}
+                with done_lock:
+                    done_count[0] += 1
+                # Restart
+                try:
+                    proc.kill()
+                    proc.wait()
+                except Exception:
+                    pass
+                proc = subprocess.Popen(
+                    [batch_harness],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.DEVNULL,
+                )
+                continue
+
+            # Interpret: '0' = engine pass, '1' = engine fail, '2' = error
+            engine_ok = (result_byte == b'0')
+            engine_fail = (result_byte == b'1')
+
+            if is_negative:
+                status = "pass" if engine_fail else "fail"
+            else:
+                status = "pass" if engine_ok else "fail"
+
+            results[idx] = {
+                "path": path,
+                "status": status,
+                "reason": f"exit={result_byte!r}" if status == "fail" else "",
+                "time_ms": round(elapsed, 1),
+            }
+            with done_lock:
+                done_count[0] += 1
+
+    finally:
+        # Send termination signal (length=0)
+        try:
+            proc.stdin.write(struct.pack("<I", 0))
+            proc.stdin.flush()
+            proc.stdin.close()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            proc.kill()
+            proc.wait()
+
+
+# =============================================================================
 # REPORTING
 # =============================================================================
 
 def categorize_path(test_path, test262_dir):
-    """Extract category from test path (e.g. 'language/statements/if')."""
+    """Extract category from test path."""
     rel = os.path.relpath(test_path, os.path.join(test262_dir, "test"))
     parts = rel.split(os.sep)
-    # For language tests: language/statements/if -> statements/if
     if parts[0] == "language" and len(parts) >= 3:
         return f"{parts[1]}/{parts[2]}"
-    # For built-ins: built-ins/Array/prototype -> built-ins/Array
     if parts[0] == "built-ins" and len(parts) >= 3:
         return f"built-ins/{parts[1]}"
-    # For annexB, staging, etc: annexB/subdir -> annexB/subdir
     if len(parts) >= 2:
         return f"{parts[0]}/{parts[1]}"
     return parts[0]
@@ -477,23 +610,15 @@ def print_report(results, test262_dir):
 
 
 # =============================================================================
-# MAIN
+# LEGACY PARALLEL (kept for --no-batch)
 # =============================================================================
 
 def _make_worker_harness(base_harness, worker_id):
-    """Create a per-worker harness binary with a unique temp file path.
-
-    Binary-patches the hardcoded '/tmp/test262_current.js' string in the ELF
-    to '/tmp/test262_wNNNNNNN.js' (same 24-byte length, null-terminated).
-    Returns (harness_path, tmp_js_path)."""
-    new_name = f"test262_w{worker_id:06d}"           # 14 chars
-    new_path = f"/tmp/{new_name}.js"                 # 23 chars — same as original
+    new_name = f"test262_w{worker_id:06d}"
+    new_path = f"/tmp/{new_name}.js"
     new_path_b = new_path.encode("ascii")
 
     harness_data = open(base_harness, "rb").read()
-    # Replace ALL occurrences of the original path (both the ReadTextFile arg
-    # and the error message contain the same string).  Since both paths are the
-    # same byte-length, the ELF layout is preserved.
     assert len(new_path_b) == len(_ORIG_PATH), \
         f"path length mismatch: {len(new_path_b)} vs {len(_ORIG_PATH)}"
     patched = harness_data.replace(_ORIG_PATH, new_path_b)
@@ -505,79 +630,135 @@ def _make_worker_harness(base_harness, worker_id):
     return worker_bin, new_path
 
 
-def _worker_init(harness_path, tmp_path):
-    """Called once per thread to set thread-local state."""
-    _thread_local.harness = harness_path
-    _thread_local.tmp_path = tmp_path
-
-
-_progress_lock = threading.Lock()
-_progress_count = 0
-
-
-def _run_test_parallel(args_tuple):
-    """Wrapper for ThreadPoolExecutor — unpacks args and tracks progress."""
-    global _progress_count
-    harness, test_path, timeout = args_tuple
-    r = run_test(harness, test_path, timeout)
-    with _progress_lock:
-        _progress_count += 1
-    return r
-
+# =============================================================================
+# MAIN
+# =============================================================================
 
 def main():
     parser = argparse.ArgumentParser(description="Test262 conformance runner for Ailang JS engine")
-    parser.add_argument("--categories", type=str, default=None,
-                        help="Comma-separated categories (e.g. statements/if,statements/while)")
-    parser.add_argument("--verbose", "-v", action="store_true",
-                        help="Print each test result")
-    parser.add_argument("--output-json", type=str, default=None,
-                        help="Write JSON results to file")
-    parser.add_argument("--harness", type=str, default="./test262_harness.x",
-                        help="Path to harness binary")
-    parser.add_argument("--test262", type=str, default="./test262",
-                        help="Path to test262 repo")
-    parser.add_argument("--timeout", type=float, default=5.0,
-                        help="Per-test timeout in seconds")
-    parser.add_argument("--fail-only", action="store_true",
-                        help="In verbose mode, only show failures")
-    parser.add_argument("--all", action="store_true",
-                        help="Run ALL tests under test/language/ (not just default categories)")
-    parser.add_argument("--full", action="store_true",
-                        help="Run FULL suite: language + built-ins + annexB + staging (~50K tests)")
-    parser.add_argument("--jobs", "-j", type=int, default=0,
-                        help="Parallel workers (0=auto, 1=sequential)")
+    parser.add_argument("--categories", type=str, default=None)
+    parser.add_argument("--verbose", "-v", action="store_true")
+    parser.add_argument("--output-json", type=str, default=None)
+    parser.add_argument("--harness", type=str, default="./test262_harness.x")
+    parser.add_argument("--batch-harness", type=str, default="./test262_harness_batch.x")
+    parser.add_argument("--test262", type=str, default="./test262")
+    parser.add_argument("--timeout", type=float, default=5.0)
+    parser.add_argument("--fail-only", action="store_true")
+    parser.add_argument("--all", action="store_true")
+    parser.add_argument("--full", action="store_true")
+    parser.add_argument("--paths", type=str, default=None)
+    parser.add_argument("--jobs", "-j", type=int, default=0)
+    parser.add_argument("--no-batch", action="store_true",
+                        help="Force legacy mode (one process per test)")
     args = parser.parse_args()
 
-    # Validate
-    if not os.path.isfile(args.harness):
-        print(f"ERROR: harness binary not found: {args.harness}", file=sys.stderr)
-        print("Build it with: ./ailang.x TestCode/test262_harness.ailang test262_harness.x", file=sys.stderr)
-        sys.exit(1)
+    # Determine batch mode
+    use_batch = not args.no_batch and os.path.isfile(args.batch_harness)
+    harness_path = args.batch_harness if use_batch else args.harness
+
+    if not use_batch:
+        if not os.path.isfile(args.harness):
+            print(f"ERROR: harness binary not found: {args.harness}", file=sys.stderr)
+            print("Build with: ./ailang.x TestCode/test262_harness.ailang test262_harness.x", file=sys.stderr)
+            sys.exit(1)
+    else:
+        if not os.path.isfile(args.batch_harness):
+            print(f"ERROR: batch harness not found: {args.batch_harness}", file=sys.stderr)
+            sys.exit(1)
 
     if not os.path.isdir(args.test262):
         print(f"ERROR: test262 directory not found: {args.test262}", file=sys.stderr)
-        print("Clone it with: git clone --depth 1 https://github.com/tc39/test262.git test262", file=sys.stderr)
         sys.exit(1)
 
     categories = args.categories.split(",") if args.categories else DEFAULT_CATEGORIES
+    test_paths = args.paths.split(",") if args.paths else None
     njobs = args.jobs if args.jobs > 0 else os.cpu_count() or 4
 
     # Discover tests
-    test_files = list(discover_tests(args.test262, categories, discover_all=args.all, discover_full=args.full))
+    test_files = list(discover_tests(args.test262, categories,
+                                     discover_all=args.all,
+                                     discover_full=args.full,
+                                     paths=test_paths))
     if not test_files:
-        print("No test files found for specified categories.", file=sys.stderr)
+        print("No test files found.", file=sys.stderr)
         sys.exit(1)
 
+    mode_str = "batch" if use_batch else "legacy"
     print(f"Test262 Conformance — Ailang JS Engine")
     print(f"Tests discovered: {len(test_files)}")
-    print(f"Workers: {njobs}")
+    print(f"Workers: {njobs}  Mode: {mode_str}")
     print()
 
     t_start = time.monotonic()
 
-    if njobs == 1 or args.verbose:
-        # Sequential mode (also used for verbose since output ordering matters)
+    if use_batch:
+        # =====================================================================
+        # BATCH MODE — pre-read all files, then feed to worker harness procs
+        # =====================================================================
+        print("  Preprocessing tests...", flush=True)
+        t_prep = time.monotonic()
+
+        # Pre-read and preprocess all tests
+        prepared = []
+        for tf in test_files:
+            prepared.append(_prepare_test(tf))
+
+        prep_time = time.monotonic() - t_prep
+        print(f"  Preprocessed {len(prepared)} tests in {prep_time:.1f}s", flush=True)
+
+        # Partition tests across workers
+        results = [None] * len(test_files)
+        done_count = [0]
+        done_lock = threading.Lock()
+        total = len(test_files)
+
+        # Build work items: (global_idx, path, meta, src_bytes)
+        all_work = []
+        for i, (path, meta, src_bytes) in enumerate(prepared):
+            all_work.append((i, path, meta, src_bytes))
+
+        # Round-robin partition into per-worker lists
+        worker_items = [[] for _ in range(njobs)]
+        for i, item in enumerate(all_work):
+            worker_items[i % njobs].append(item)
+
+        # Progress reporter
+        stop_progress = threading.Event()
+        def _progress_reporter():
+            while not stop_progress.is_set():
+                with done_lock:
+                    d = done_count[0]
+                print(f"  ... {d}/{total} tests completed", flush=True)
+                stop_progress.wait(3.0)
+
+        pt = threading.Thread(target=_progress_reporter, daemon=True)
+        pt.start()
+
+        # Launch worker threads
+        threads = []
+        for wid in range(njobs):
+            t = threading.Thread(
+                target=_batch_worker,
+                args=(wid, args.batch_harness, worker_items[wid],
+                      results, done_count, done_lock, args.timeout),
+            )
+            t.start()
+            threads.append(t)
+
+        for t in threads:
+            t.join()
+
+        stop_progress.set()
+        pt.join(timeout=1)
+
+        # Fill any None results (shouldn't happen)
+        for i in range(len(results)):
+            if results[i] is None:
+                results[i] = {"path": test_files[i], "status": "error",
+                              "reason": "not_run", "time_ms": 0}
+
+    elif njobs == 1 or args.verbose:
+        # Sequential legacy mode
         results = []
         for i, tf in enumerate(test_files):
             r = run_test(args.harness, tf, args.timeout, args.verbose)
@@ -594,10 +775,9 @@ def main():
                     print(f"  [{sym}] {short}{extra}")
             if not args.verbose and (i + 1) % 100 == 0:
                 print(f"  ... {i + 1}/{len(test_files)} tests completed", flush=True)
+
     else:
-        # Parallel mode — each worker thread owns a dedicated harness binary
-        # with a unique temp file path binary-patched in. Workers pull tests
-        # from a shared queue so there are no race conditions on temp files.
+        # Legacy parallel mode
         import queue
 
         worker_assets = []
@@ -628,7 +808,6 @@ def main():
                 with done_lock:
                     done_count[0] += 1
 
-        # Progress reporter thread
         stop_progress = threading.Event()
         def _progress_reporter():
             while not stop_progress.is_set():
@@ -651,7 +830,6 @@ def main():
         stop_progress.set()
         pt.join(timeout=1)
 
-        # Cleanup worker binaries
         for h_path, t_path in worker_assets:
             try: os.unlink(h_path)
             except: pass

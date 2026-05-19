@@ -127,6 +127,9 @@ FixedPool.JSTokType {
     "TMPL_MID":     Initialize=127
     "TMPL_TAIL":    Initialize=128
 
+    // Regex literal
+    "REGEX_LIT":    Initialize=130
+
     // Arrow
     "ARROW":        Initialize=67
 
@@ -137,13 +140,13 @@ FixedPool.JSTokType {
 // TOKEN STRUCTURE — 32 bytes per token
 // =============================================================================
 FixedPool.JSTokConst {
-    "MAX_TOKENS":  Initialize=16384
+    "MAX_TOKENS":  Initialize=262144
     "TOKEN_SIZE":  Initialize=32
     "T_TYPE":      Initialize=0
     "T_PTR":       Initialize=8
     "T_LEN":       Initialize=16
     "T_LINE":      Initialize=24
-    "STR_CAP":     Initialize=262144
+    "STR_CAP":     Initialize=1048576
 }
 
 // =============================================================================
@@ -160,6 +163,7 @@ FixedPool.JSTokState {
     "line":       Initialize=1
     "col":        Initialize=1
     "error":      Initialize=0
+    "last_type":  Initialize=0
 }
 
 // Clobber-safe temporaries for scan loops
@@ -252,6 +256,7 @@ Function.JSLex__AddToken {
         StoreValue(Add(base, JSTokConst.T_PTR), save_ptr)
         StoreValue(Add(base, JSTokConst.T_LEN), save_len)
         StoreValue(Add(base, JSTokConst.T_LINE), JSTokState.line)
+        JSTokState.last_type = save_type
         ReturnValue(idx)
     }
 }
@@ -394,7 +399,7 @@ Function.JSLex__IsDigit {
     }
 }
 
-// Check if char is valid identifier start: [a-zA-Z_$]
+// Check if char is valid identifier start: [a-zA-Z_$] or non-ASCII (>= 128) or backslash (92)
 Function.JSLex__IsIdentStart {
     Input: ch: Integer
     Output: Integer
@@ -403,11 +408,13 @@ Function.JSLex__IsIdentStart {
         IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ReturnValue(1) }
         IfCondition EqualTo(ch, 95) ThenBlock: { ReturnValue(1) }   // underscore
         IfCondition EqualTo(ch, 36) ThenBlock: { ReturnValue(1) }   // dollar sign
+        IfCondition EqualTo(ch, 92) ThenBlock: { ReturnValue(1) }   // backslash (unicode escape)
+        IfCondition GreaterEqual(ch, 128) ThenBlock: { ReturnValue(1) } // non-ASCII UTF-8
         ReturnValue(0)
     }
 }
 
-// Check if char is valid identifier continuation: [a-zA-Z0-9_$]
+// Check if char is valid identifier continuation: [a-zA-Z0-9_$] or non-ASCII (>= 128) or backslash (92)
 Function.JSLex__IsIdentCont {
     Input: ch: Integer
     Output: Integer
@@ -417,7 +424,53 @@ Function.JSLex__IsIdentCont {
         IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: { ReturnValue(1) }
         IfCondition EqualTo(ch, 95) ThenBlock: { ReturnValue(1) }   // underscore
         IfCondition EqualTo(ch, 36) ThenBlock: { ReturnValue(1) }   // dollar sign
+        IfCondition EqualTo(ch, 92) ThenBlock: { ReturnValue(1) }   // backslash (unicode escape)
+        IfCondition GreaterEqual(ch, 128) ThenBlock: { ReturnValue(1) } // non-ASCII UTF-8
         ReturnValue(0)
+    }
+}
+
+// Decode a single hex digit to its numeric value (0-15), or -1 if invalid
+Function.JSLex__HexVal {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: { ReturnValue(Subtract(ch, 48)) }
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 102)) ThenBlock: { ReturnValue(Add(Subtract(ch, 97), 10)) }
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 70)) ThenBlock: { ReturnValue(Add(Subtract(ch, 65), 10)) }
+        ReturnValue(-1)
+    }
+}
+
+// Encode a Unicode codepoint into UTF-8 bytes in a buffer.
+// Returns number of bytes written (1-4).
+Function.JSLex__EncodeUTF8 {
+    Input: buf: Address
+    Input: offset: Integer
+    Input: cp: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(cp, 128) ThenBlock: {
+            SetByte(buf, offset, cp)
+            ReturnValue(1)
+        }
+        IfCondition LessThan(cp, 2048) ThenBlock: {
+            SetByte(buf, offset, Or(192, ShiftRight(cp, 6)))
+            SetByte(buf, Add(offset, 1), Or(128, And(cp, 63)))
+            ReturnValue(2)
+        }
+        IfCondition LessThan(cp, 65536) ThenBlock: {
+            SetByte(buf, offset, Or(224, ShiftRight(cp, 12)))
+            SetByte(buf, Add(offset, 1), Or(128, And(ShiftRight(cp, 6), 63)))
+            SetByte(buf, Add(offset, 2), Or(128, And(cp, 63)))
+            ReturnValue(3)
+        }
+        // 4-byte (codepoints above U+FFFF)
+        SetByte(buf, offset, Or(240, ShiftRight(cp, 18)))
+        SetByte(buf, Add(offset, 1), Or(128, And(ShiftRight(cp, 12), 63)))
+        SetByte(buf, Add(offset, 2), Or(128, And(ShiftRight(cp, 6), 63)))
+        SetByte(buf, Add(offset, 3), Or(128, And(cp, 63)))
+        ReturnValue(4)
     }
 }
 
@@ -765,25 +818,117 @@ Function.JSLex__MatchKeyword {
 }
 
 // =============================================================================
-// SCAN IDENTIFIER — [a-zA-Z_$][a-zA-Z0-9_$]*
-// Then check if it is a keyword. Emits IDENT or KW_* token.
+// SCAN IDENTIFIER — [a-zA-Z_$\u...][a-zA-Z0-9_$\u...]*
+// Handles \uXXXX and \u{XXXX} unicode escapes in identifier names.
+// Decoded identifier is built in the intern buffer. Emits IDENT or KW_*.
 // =============================================================================
 Function.JSLex__ScanIdent {
     Output: Integer
     Body: {
         JSTokTmp.start = JSTokState.pos
-        JSTokTmp.ch = JSLex__Peek()
-        JSTokTmp.done = JSLex__IsIdentCont(JSTokTmp.ch)
-        WhileLoop EqualTo(JSTokTmp.done, 1) {
+        // Quick scan: check if there are any backslashes or non-ASCII bytes
+        has_escape = 0
+        scan_pos = JSTokState.pos
+        scan_ch = JSLex__Peek()
+        WhileLoop EqualTo(JSLex__IsIdentCont(scan_ch), 1) {
+            IfCondition Or(EqualTo(scan_ch, 92), GreaterEqual(scan_ch, 128)) ThenBlock: {
+                has_escape = 1
+            }
             JSLex__Advance()
-            JSTokTmp.ch = JSLex__Peek()
-            JSTokTmp.done = JSLex__IsIdentCont(JSTokTmp.ch)
+            scan_ch = JSLex__Peek()
         }
-        JSTokTmp.len = Subtract(JSTokState.pos, JSTokTmp.start)
-        IfCondition EqualTo(JSTokTmp.len, 0) ThenBlock: {
-            ReturnValue(0)
+
+        IfCondition EqualTo(has_escape, 0) ThenBlock: {
+            // Fast path — no escapes, no non-ASCII, just intern raw bytes
+            JSTokTmp.len = Subtract(JSTokState.pos, JSTokTmp.start)
+            IfCondition EqualTo(JSTokTmp.len, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            JSTokTmp.interned = JSLex__Intern(Add(JSTokState.source, JSTokTmp.start), JSTokTmp.len)
+            kw_type = JSLex__MatchKeyword(JSTokTmp.interned, JSTokTmp.len)
+            JSLex__AddToken(kw_type, JSTokTmp.interned, JSTokTmp.len)
+            ReturnValue(1)
         }
-        JSTokTmp.interned = JSLex__Intern(Add(JSTokState.source, JSTokTmp.start), JSTokTmp.len)
+
+        // Slow path — decode escapes into intern buffer
+        // Reset pos to re-scan with decoding
+        JSTokState.pos = JSTokTmp.start
+        dest = Add(JSTokState.str_buf, JSTokState.str_pos)
+        di = 0
+        id_ch = GetByte(JSTokState.source, JSTokState.pos)
+
+        WhileLoop EqualTo(JSLex__IsIdentCont(id_ch), 1) {
+            IfCondition EqualTo(id_ch, 92) ThenBlock: {
+                // Backslash — expect \uXXXX or \u{XXXX}
+                JSTokState.pos = Add(JSTokState.pos, 1)
+                u_ch = GetByte(JSTokState.source, JSTokState.pos)
+                IfCondition EqualTo(u_ch, 117) ThenBlock: {
+                    // 'u' — unicode escape
+                    JSTokState.pos = Add(JSTokState.pos, 1)
+                    brace_ch = GetByte(JSTokState.source, JSTokState.pos)
+                    IfCondition EqualTo(brace_ch, 123) ThenBlock: {
+                        // \u{XXXX} — braced form, 1-6 hex digits
+                        JSTokState.pos = Add(JSTokState.pos, 1)
+                        cp = 0
+                        hex_ch = GetByte(JSTokState.source, JSTokState.pos)
+                        WhileLoop And(NotEqual(hex_ch, 125), NotEqual(hex_ch, 0)) {
+                            hv = JSLex__HexVal(hex_ch)
+                            IfCondition EqualTo(hv, -1) ThenBlock: {
+                                JSTokState.error = 1
+                                ReturnValue(0)
+                            }
+                            cp = Add(Multiply(cp, 16), hv)
+                            JSTokState.pos = Add(JSTokState.pos, 1)
+                            hex_ch = GetByte(JSTokState.source, JSTokState.pos)
+                        }
+                        // Skip closing }
+                        IfCondition EqualTo(hex_ch, 125) ThenBlock: {
+                            JSTokState.pos = Add(JSTokState.pos, 1)
+                        }
+                        // Encode codepoint as UTF-8 into dest
+                        n_bytes = JSLex__EncodeUTF8(dest, di, cp)
+                        di = Add(di, n_bytes)
+                    } ElseBlock: {
+                        // \uXXXX — exactly 4 hex digits
+                        cp = 0
+                        esc_i = 0
+                        WhileLoop LessThan(esc_i, 4) {
+                            hex_ch = GetByte(JSTokState.source, JSTokState.pos)
+                            hv = JSLex__HexVal(hex_ch)
+                            IfCondition EqualTo(hv, -1) ThenBlock: {
+                                JSTokState.error = 1
+                                ReturnValue(0)
+                            }
+                            cp = Add(Multiply(cp, 16), hv)
+                            JSTokState.pos = Add(JSTokState.pos, 1)
+                            esc_i = Add(esc_i, 1)
+                        }
+                        n_bytes = JSLex__EncodeUTF8(dest, di, cp)
+                        di = Add(di, n_bytes)
+                    }
+                } ElseBlock: {
+                    // Invalid escape in identifier — just emit the backslash
+                    SetByte(dest, di, 92)
+                    di = Add(di, 1)
+                }
+            } ElseBlock: {
+                // Regular character (ASCII or non-ASCII) — copy byte
+                SetByte(dest, di, id_ch)
+                di = Add(di, 1)
+                JSTokState.pos = Add(JSTokState.pos, 1)
+            }
+            IfCondition GreaterEqual(JSTokState.pos, JSTokState.src_len) ThenBlock: {
+                id_ch = 0
+            } ElseBlock: {
+                id_ch = GetByte(JSTokState.source, JSTokState.pos)
+            }
+        }
+
+        // Null-terminate and update str_pos
+        SetByte(dest, di, 0)
+        JSTokTmp.interned = dest
+        JSTokTmp.len = di
+        JSTokState.str_pos = Add(JSTokState.str_pos, Add(di, 1))
         // Check if it is a keyword
         kw_type = JSLex__MatchKeyword(JSTokTmp.interned, JSTokTmp.len)
         JSLex__AddToken(kw_type, JSTokTmp.interned, JSTokTmp.len)
@@ -821,11 +966,32 @@ Function.JSLex__ScanNumber {
                 JSLex__Advance()
                 JSLex__Advance()
                 JSTokTmp.ch = JSLex__Peek()
-                JSTokTmp.done = JSLex__IsHexDigit(JSTokTmp.ch)
+                // Reject _ immediately after 0x prefix
+                IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
+                }
+                ns_prev_us = 0
+                JSTokTmp.done = Or(JSLex__IsHexDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
                 WhileLoop EqualTo(JSTokTmp.done, 1) {
+                    IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                        // Reject double underscore
+                        IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                            JSTokState.error = 1
+                            ReturnValue(0)
+                        }
+                        ns_prev_us = 1
+                    } ElseBlock: {
+                        ns_prev_us = 0
+                    }
                     JSLex__Advance()
                     JSTokTmp.ch = JSLex__Peek()
-                    JSTokTmp.done = JSLex__IsHexDigit(JSTokTmp.ch)
+                    JSTokTmp.done = Or(JSLex__IsHexDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
+                }
+                // Reject trailing underscore
+                IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
                 }
                 JSTokTmp.len = Subtract(JSTokState.pos, JSTokTmp.start)
                 JSTokTmp.interned = JSLex__Intern(Add(JSTokState.source, JSTokTmp.start), JSTokTmp.len)
@@ -838,9 +1004,29 @@ Function.JSLex__ScanNumber {
                 JSLex__Advance()
                 JSLex__Advance()
                 JSTokTmp.ch = JSLex__Peek()
-                WhileLoop And(GreaterEqual(JSTokTmp.ch, 48), LessEqual(JSTokTmp.ch, 55)) {
+                // Reject _ immediately after 0o prefix
+                IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
+                }
+                ns_prev_us = 0
+                WhileLoop Or(And(GreaterEqual(JSTokTmp.ch, 48), LessEqual(JSTokTmp.ch, 55)), EqualTo(JSTokTmp.ch, 95)) {
+                    IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                        IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                            JSTokState.error = 1
+                            ReturnValue(0)
+                        }
+                        ns_prev_us = 1
+                    } ElseBlock: {
+                        ns_prev_us = 0
+                    }
                     JSLex__Advance()
                     JSTokTmp.ch = JSLex__Peek()
+                }
+                // Reject trailing underscore
+                IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
                 }
                 JSTokTmp.len = Subtract(JSTokState.pos, JSTokTmp.start)
                 JSTokTmp.interned = JSLex__Intern(Add(JSTokState.source, JSTokTmp.start), JSTokTmp.len)
@@ -853,9 +1039,81 @@ Function.JSLex__ScanNumber {
                 JSLex__Advance()
                 JSLex__Advance()
                 JSTokTmp.ch = JSLex__Peek()
-                WhileLoop Or(EqualTo(JSTokTmp.ch, 48), EqualTo(JSTokTmp.ch, 49)) {
+                // Reject _ immediately after 0b prefix
+                IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
+                }
+                ns_prev_us = 0
+                WhileLoop Or(Or(EqualTo(JSTokTmp.ch, 48), EqualTo(JSTokTmp.ch, 49)), EqualTo(JSTokTmp.ch, 95)) {
+                    IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                        IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                            JSTokState.error = 1
+                            ReturnValue(0)
+                        }
+                        ns_prev_us = 1
+                    } ElseBlock: {
+                        ns_prev_us = 0
+                    }
                     JSLex__Advance()
                     JSTokTmp.ch = JSLex__Peek()
+                }
+                // Reject trailing underscore
+                IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
+                }
+                JSTokTmp.len = Subtract(JSTokState.pos, JSTokTmp.start)
+                JSTokTmp.interned = JSLex__Intern(Add(JSTokState.source, JSTokTmp.start), JSTokTmp.len)
+                JSLex__AddToken(JSTokType.NUMBER, JSTokTmp.interned, JSTokTmp.len)
+                ReturnValue(1)
+            }
+
+            // --- Legacy octal or 0_ — reject _ in these contexts ---
+            // If next char after 0 is _ → SyntaxError (0_N not allowed)
+            IfCondition EqualTo(JSTokTmp.ch2, 95) ThenBlock: {
+                JSTokState.error = 1
+                ReturnValue(0)
+            }
+            // If next char after 0 is a digit (legacy octal 00, 01, ..., 09)
+            // consume digits but reject any _ in the literal
+            IfCondition And(GreaterEqual(JSTokTmp.ch2, 48), LessEqual(JSTokTmp.ch2, 57)) ThenBlock: {
+                // Advance past the leading 0
+                JSLex__Advance()
+                JSTokTmp.ch = JSLex__Peek()
+                WhileLoop Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95)) {
+                    IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                        // _ not allowed in legacy octal / implicit octal
+                        JSTokState.error = 1
+                        ReturnValue(0)
+                    }
+                    JSLex__Advance()
+                    JSTokTmp.ch = JSLex__Peek()
+                }
+                // Legacy octals can have decimal point (e.g. 09.5)
+                IfCondition EqualTo(JSTokTmp.ch, 46) ThenBlock: {
+                    JSTokTmp.ch2 = JSLex__PeekAt(1)
+                    IfCondition And(GreaterEqual(JSTokTmp.ch2, 48), LessEqual(JSTokTmp.ch2, 57)) ThenBlock: {
+                        JSLex__Advance()
+                        JSTokTmp.ch = JSLex__Peek()
+                        WhileLoop JSLex__IsDigit(JSTokTmp.ch) {
+                            JSLex__Advance()
+                            JSTokTmp.ch = JSLex__Peek()
+                        }
+                    }
+                }
+                // Legacy octals can have exponent
+                IfCondition Or(EqualTo(JSTokTmp.ch, 101), EqualTo(JSTokTmp.ch, 69)) ThenBlock: {
+                    JSLex__Advance()
+                    JSTokTmp.ch = JSLex__Peek()
+                    IfCondition Or(EqualTo(JSTokTmp.ch, 43), EqualTo(JSTokTmp.ch, 45)) ThenBlock: {
+                        JSLex__Advance()
+                    }
+                    JSTokTmp.ch = JSLex__Peek()
+                    WhileLoop JSLex__IsDigit(JSTokTmp.ch) {
+                        JSLex__Advance()
+                        JSTokTmp.ch = JSLex__Peek()
+                    }
                 }
                 JSTokTmp.len = Subtract(JSTokState.pos, JSTokTmp.start)
                 JSTokTmp.interned = JSLex__Intern(Add(JSTokState.source, JSTokTmp.start), JSTokTmp.len)
@@ -866,11 +1124,26 @@ Function.JSLex__ScanNumber {
 
         // --- Decimal integer part (with numeric separator _) ---
         JSTokTmp.ch = JSLex__Peek()
+        ns_prev_us = 0
         JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
         WhileLoop EqualTo(JSTokTmp.done, 1) {
+            IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
+                }
+                ns_prev_us = 1
+            } ElseBlock: {
+                ns_prev_us = 0
+            }
             JSLex__Advance()
             JSTokTmp.ch = JSLex__Peek()
             JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
+        }
+        // Reject trailing underscore before . or end
+        IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+            JSTokState.error = 1
+            ReturnValue(0)
         }
 
         // --- Float: consume decimal point + fractional digits ---
@@ -881,11 +1154,26 @@ Function.JSLex__ScanNumber {
             IfCondition And(GreaterEqual(JSTokTmp.ch2, 48), LessEqual(JSTokTmp.ch2, 57)) ThenBlock: {
                 JSLex__Advance()
                 JSTokTmp.ch = JSLex__Peek()
-                JSTokTmp.done = JSLex__IsDigit(JSTokTmp.ch)
+                ns_prev_us = 0
+                JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
                 WhileLoop EqualTo(JSTokTmp.done, 1) {
+                    IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                        IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                            JSTokState.error = 1
+                            ReturnValue(0)
+                        }
+                        ns_prev_us = 1
+                    } ElseBlock: {
+                        ns_prev_us = 0
+                    }
                     JSLex__Advance()
                     JSTokTmp.ch = JSLex__Peek()
-                    JSTokTmp.done = JSLex__IsDigit(JSTokTmp.ch)
+                    JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
+                }
+                // Reject trailing underscore in fractional part
+                IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
                 }
             }
         }
@@ -899,11 +1187,31 @@ Function.JSLex__ScanNumber {
                 JSLex__Advance()
             }
             JSTokTmp.ch = JSLex__Peek()
-            JSTokTmp.done = JSLex__IsDigit(JSTokTmp.ch)
+            // Reject _ immediately after e/E or +/-
+            IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                JSTokState.error = 1
+                ReturnValue(0)
+            }
+            ns_prev_us = 0
+            JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
             WhileLoop EqualTo(JSTokTmp.done, 1) {
+                IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                    IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                        JSTokState.error = 1
+                        ReturnValue(0)
+                    }
+                    ns_prev_us = 1
+                } ElseBlock: {
+                    ns_prev_us = 0
+                }
                 JSLex__Advance()
                 JSTokTmp.ch = JSLex__Peek()
-                JSTokTmp.done = JSLex__IsDigit(JSTokTmp.ch)
+                JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
+            }
+            // Reject trailing underscore in exponent
+            IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                JSTokState.error = 1
+                ReturnValue(0)
             }
         }
 
@@ -923,16 +1231,78 @@ Function.JSLex__ScanString {
     Body: {
         // Consume opening quote
         JSLex__Advance()
-        buf = Allocate(4096)
+        buf = JSRTState.str_lex_buf
         di = 0
         JSTokTmp.ch = JSLex__Peek()
 
         WhileLoop And(NotEqual(JSTokTmp.ch, JSTokTmp.quote), NotEqual(JSTokTmp.ch, 0)) {
+            // Reject raw line terminators (LF=10, CR=13) in string literals
+            IfCondition Or(EqualTo(JSTokTmp.ch, 10), EqualTo(JSTokTmp.ch, 13)) ThenBlock: {
+                JSTokState.error = 1
+                ReturnValue(0)
+            }
+
             // Check for backslash escapes
             IfCondition EqualTo(JSTokTmp.ch, 92) ThenBlock: {
                 // Consume backslash
                 JSLex__Advance()
                 JSTokTmp.ch2 = JSLex__Peek()
+
+                // EOF after backslash → unterminated string
+                IfCondition EqualTo(JSTokTmp.ch2, 0) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
+                }
+
+                // \u — validate unicode escape (but emit chars same as before)
+                IfCondition EqualTo(JSTokTmp.ch2, 117) ThenBlock: {
+                    // Peek ahead to validate without consuming
+                    ufirst = JSLex__PeekAt(1)
+                    IfCondition EqualTo(ufirst, 123) ThenBlock: {
+                        // \u{...} form — validate hex digits, reject non-hex
+                        uoff = 2
+                        uhex_count = 0
+                        uch = JSLex__PeekAt(uoff)
+                        WhileLoop And(NotEqual(uch, 125), NotEqual(uch, 0)) {
+                            IfCondition EqualTo(JSLex__IsHexDigit(uch), 0) ThenBlock: {
+                                JSTokState.error = 1
+                                ReturnValue(0)
+                            }
+                            uhex_count = Add(uhex_count, 1)
+                            uoff = Add(uoff, 1)
+                            uch = JSLex__PeekAt(uoff)
+                        }
+                        IfCondition Or(EqualTo(uch, 0), EqualTo(uhex_count, 0)) ThenBlock: {
+                            JSTokState.error = 1
+                            ReturnValue(0)
+                        }
+                    } ElseBlock: {
+                        // \uHHHH form — require exactly 4 hex digits
+                        uh_i = 0
+                        WhileLoop LessThan(uh_i, 4) {
+                            uch2 = JSLex__PeekAt(Add(1, uh_i))
+                            IfCondition EqualTo(JSLex__IsHexDigit(uch2), 0) ThenBlock: {
+                                JSTokState.error = 1
+                                ReturnValue(0)
+                            }
+                            uh_i = Add(uh_i, 1)
+                        }
+                    }
+                    // Validation passed — fall through to emit char literally
+                }
+
+                // \x — validate hex escape (require 2 hex digits after x)
+                IfCondition EqualTo(JSTokTmp.ch2, 120) ThenBlock: {
+                    xh1 = JSLex__PeekAt(1)
+                    xh2 = JSLex__PeekAt(2)
+                    IfCondition Or(EqualTo(JSLex__IsHexDigit(xh1), 0),
+                                   EqualTo(JSLex__IsHexDigit(xh2), 0)) ThenBlock: {
+                        JSTokState.error = 1
+                        ReturnValue(0)
+                    }
+                    // Validation passed — fall through to emit char literally
+                }
+
                 // \n -> newline (10)
                 IfCondition EqualTo(JSTokTmp.ch2, 110) ThenBlock: {
                     SetByte(buf, di, 10)
@@ -975,7 +1345,7 @@ Function.JSLex__ScanString {
                     di = Add(di, 1)
                     JSLex__Advance()
                 }
-                // Unknown escape — emit the char literally
+                // Unknown escape — emit the char literally (same as original behavior)
                 IfCondition And(And(NotEqual(JSTokTmp.ch2, 110), NotEqual(JSTokTmp.ch2, 116)),
                                And(And(NotEqual(JSTokTmp.ch2, 92), NotEqual(JSTokTmp.ch2, 34)),
                                    And(NotEqual(JSTokTmp.ch2, 39), And(NotEqual(JSTokTmp.ch2, 114),
@@ -993,10 +1363,14 @@ Function.JSLex__ScanString {
             JSTokTmp.ch = JSLex__Peek()
         }
 
-        // Consume closing quote if present
-        IfCondition EqualTo(JSTokTmp.ch, JSTokTmp.quote) ThenBlock: {
-            JSLex__Advance()
+        // Unterminated string (EOF without closing quote)
+        IfCondition EqualTo(JSTokTmp.ch, 0) ThenBlock: {
+            JSTokState.error = 1
+            ReturnValue(0)
         }
+
+        // Consume closing quote
+        JSLex__Advance()
 
         JSTokTmp.interned = JSLex__Intern(buf, di)
         JSTokTmp.len = di
@@ -1016,7 +1390,7 @@ Function.JSLex__ScanTemplate {
     Input: is_cont: Integer
     Output: Integer
     Body: {
-        buf = Allocate(4096)
+        buf = JSRTState.str_lex_buf
         di = 0
         JSTokTmp.ch = JSLex__Peek()
 
@@ -1256,6 +1630,134 @@ Function.JSLex__ScanTemplate {
 // Handles ==, ===, !=, !==, <=, >=, &&, ||, <<, >>, +=, -=, *=, /=, ++, --
 // and single-char punctuation/operators
 // =============================================================================
+// =============================================================================
+// REGEX LITERAL SCANNER — scan /pattern/flags
+// Stores: pattern\0flags\0 in string buffer
+// Token: T_PTR = pattern start, T_LEN = pattern length
+// Flags accessible at: T_PTR + T_LEN + 1
+// =============================================================================
+Function.JSLex__ScanRegexLit {
+    Output: Integer
+    Body: {
+        // Opening / already confirmed by caller. Advance past it.
+        JSLex__Advance()
+
+        // Record pattern start in string buffer
+        pat_start = Add(JSTokState.str_buf, JSTokState.str_pos)
+        pat_len = 0
+        in_class = 0
+
+        // Scan pattern body until unescaped / outside character class
+        scan_done = 0
+        WhileLoop EqualTo(scan_done, 0) {
+            IfCondition GreaterEqual(JSTokState.pos, JSTokState.src_len) ThenBlock: {
+                // Unterminated regex — error
+                JSTokState.error = 1
+                ReturnValue(0)
+            }
+            rc = JSLex__Peek()
+
+            // Newline inside regex is an error
+            IfCondition Or(EqualTo(rc, 10), EqualTo(rc, 13)) ThenBlock: {
+                JSTokState.error = 1
+                ReturnValue(0)
+            }
+
+            // Backslash escape — copy both chars
+            IfCondition EqualTo(rc, 92) ThenBlock: {
+                SetByte(JSTokState.str_buf, JSTokState.str_pos, rc)
+                JSTokState.str_pos = Add(JSTokState.str_pos, 1)
+                pat_len = Add(pat_len, 1)
+                JSLex__Advance()
+                // Copy the escaped char
+                IfCondition LessThan(JSTokState.pos, JSTokState.src_len) ThenBlock: {
+                    rc2 = JSLex__Peek()
+                    SetByte(JSTokState.str_buf, JSTokState.str_pos, rc2)
+                    JSTokState.str_pos = Add(JSTokState.str_pos, 1)
+                    pat_len = Add(pat_len, 1)
+                    JSLex__Advance()
+                }
+            }
+
+            // Character class [ ... ]
+            IfCondition And(NotEqual(rc, 92), EqualTo(rc, 91)) ThenBlock: {
+                in_class = 1
+                SetByte(JSTokState.str_buf, JSTokState.str_pos, rc)
+                JSTokState.str_pos = Add(JSTokState.str_pos, 1)
+                pat_len = Add(pat_len, 1)
+                JSLex__Advance()
+            }
+            IfCondition And(NotEqual(rc, 92), EqualTo(rc, 93)) ThenBlock: {
+                in_class = 0
+                SetByte(JSTokState.str_buf, JSTokState.str_pos, rc)
+                JSTokState.str_pos = Add(JSTokState.str_pos, 1)
+                pat_len = Add(pat_len, 1)
+                JSLex__Advance()
+            }
+
+            // Closing / (only if not in character class and not backslash)
+            IfCondition And(And(NotEqual(rc, 92), NotEqual(rc, 91)), NotEqual(rc, 93)) ThenBlock: {
+                IfCondition And(EqualTo(rc, 47), EqualTo(in_class, 0)) ThenBlock: {
+                    // End of pattern
+                    JSLex__Advance()
+                    scan_done = 1
+                }
+                IfCondition Or(NotEqual(rc, 47), NotEqual(in_class, 0)) ThenBlock: {
+                    // Regular pattern character — copy
+                    SetByte(JSTokState.str_buf, JSTokState.str_pos, rc)
+                    JSTokState.str_pos = Add(JSTokState.str_pos, 1)
+                    pat_len = Add(pat_len, 1)
+                    JSLex__Advance()
+                }
+            }
+        }
+
+        // Null-terminate pattern
+        SetByte(JSTokState.str_buf, JSTokState.str_pos, 0)
+        JSTokState.str_pos = Add(JSTokState.str_pos, 1)
+
+        // Scan flags: [gimsuy]*
+        flg_start = Add(JSTokState.str_buf, JSTokState.str_pos)
+        flg_len = 0
+        flg_done = 0
+        WhileLoop EqualTo(flg_done, 0) {
+            IfCondition GreaterEqual(JSTokState.pos, JSTokState.src_len) ThenBlock: {
+                flg_done = 1
+            }
+            IfCondition LessThan(JSTokState.pos, JSTokState.src_len) ThenBlock: {
+                fc = JSLex__Peek()
+                // g=103, i=105, m=109, s=115, u=117, y=121, v=118, d=100
+                is_flag = 0
+                IfCondition EqualTo(fc, 103) ThenBlock: { is_flag = 1 }
+                IfCondition EqualTo(fc, 105) ThenBlock: { is_flag = 1 }
+                IfCondition EqualTo(fc, 109) ThenBlock: { is_flag = 1 }
+                IfCondition EqualTo(fc, 115) ThenBlock: { is_flag = 1 }
+                IfCondition EqualTo(fc, 117) ThenBlock: { is_flag = 1 }
+                IfCondition EqualTo(fc, 121) ThenBlock: { is_flag = 1 }
+                IfCondition EqualTo(fc, 118) ThenBlock: { is_flag = 1 }
+                IfCondition EqualTo(fc, 100) ThenBlock: { is_flag = 1 }
+                IfCondition EqualTo(is_flag, 1) ThenBlock: {
+                    SetByte(JSTokState.str_buf, JSTokState.str_pos, fc)
+                    JSTokState.str_pos = Add(JSTokState.str_pos, 1)
+                    flg_len = Add(flg_len, 1)
+                    JSLex__Advance()
+                }
+                IfCondition EqualTo(is_flag, 0) ThenBlock: {
+                    flg_done = 1
+                }
+            }
+        }
+        // Null-terminate flags
+        SetByte(JSTokState.str_buf, JSTokState.str_pos, 0)
+        JSTokState.str_pos = Add(JSTokState.str_pos, 1)
+
+        // Emit REGEX_LIT token: ptr=pattern, len=pat_len
+        // Flags at pat_start + pat_len + 1
+        JSLex__AddToken(JSTokType.REGEX_LIT, pat_start, pat_len)
+        ReturnValue(1)
+    }
+}
+
 Function.JSLex__ScanOp {
     Output: Integer
     Body: {
@@ -1326,8 +1828,74 @@ Function.JSLex__ScanOp {
             JSLex__AddToken(JSTokType.COMMA, 0, 0)
             ReturnValue(1)
         }
-        // --- DOT . or DOT3 ... ---
+        // --- DOT . or DOT3 ... or .NNN numeric literal ---
         IfCondition EqualTo(JSTokTmp.ch, 46) ThenBlock: {
+            // Check if next char is a digit → .NNN numeric literal
+            JSTokTmp.ch2 = JSLex__PeekAt(1)
+            IfCondition And(GreaterEqual(JSTokTmp.ch2, 48), LessEqual(JSTokTmp.ch2, 57)) ThenBlock: {
+                // Scan .NNN as a numeric literal
+                JSTokTmp.start = JSTokState.pos
+                JSLex__Advance()
+                JSTokTmp.ch = JSLex__Peek()
+                ns_prev_us = 0
+                JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
+                WhileLoop EqualTo(JSTokTmp.done, 1) {
+                    IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                        IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                            JSTokState.error = 1
+                            ReturnValue(0)
+                        }
+                        ns_prev_us = 1
+                    } ElseBlock: {
+                        ns_prev_us = 0
+                    }
+                    JSLex__Advance()
+                    JSTokTmp.ch = JSLex__Peek()
+                    JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
+                }
+                // Reject trailing underscore in fractional part
+                IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                    JSTokState.error = 1
+                    ReturnValue(0)
+                }
+                // Exponent part
+                IfCondition Or(EqualTo(JSTokTmp.ch, 101), EqualTo(JSTokTmp.ch, 69)) ThenBlock: {
+                    JSLex__Advance()
+                    JSTokTmp.ch = JSLex__Peek()
+                    IfCondition Or(EqualTo(JSTokTmp.ch, 43), EqualTo(JSTokTmp.ch, 45)) ThenBlock: {
+                        JSLex__Advance()
+                    }
+                    JSTokTmp.ch = JSLex__Peek()
+                    IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                        JSTokState.error = 1
+                        ReturnValue(0)
+                    }
+                    ns_prev_us = 0
+                    JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
+                    WhileLoop EqualTo(JSTokTmp.done, 1) {
+                        IfCondition EqualTo(JSTokTmp.ch, 95) ThenBlock: {
+                            IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                                JSTokState.error = 1
+                                ReturnValue(0)
+                            }
+                            ns_prev_us = 1
+                        } ElseBlock: {
+                            ns_prev_us = 0
+                        }
+                        JSLex__Advance()
+                        JSTokTmp.ch = JSLex__Peek()
+                        JSTokTmp.done = Or(JSLex__IsDigit(JSTokTmp.ch), EqualTo(JSTokTmp.ch, 95))
+                    }
+                    IfCondition EqualTo(ns_prev_us, 1) ThenBlock: {
+                        JSTokState.error = 1
+                        ReturnValue(0)
+                    }
+                }
+                JSTokTmp.len = Subtract(JSTokState.pos, JSTokTmp.start)
+                JSTokTmp.interned = JSLex__Intern(Add(JSTokState.source, JSTokTmp.start), JSTokTmp.len)
+                JSLex__AddToken(JSTokType.NUMBER, JSTokTmp.interned, JSTokTmp.len)
+                ReturnValue(1)
+            }
             JSLex__Advance()
             // Check for .. then .
             IfCondition EqualTo(JSLex__Peek(), 46) ThenBlock: {
@@ -1639,23 +2207,86 @@ Function.JSLex__ScanOp {
             ReturnValue(1)
         }
 
-        // --- HASH # --- private name (#identifier)
+        // --- HASH # --- private name (#identifier with unicode escapes)
         IfCondition EqualTo(JSTokTmp.ch, 35) ThenBlock: {
-            // Record start position (points to #)
-            pn_start = Add(JSTokState.source, JSTokState.pos)
+            pn_raw_start = JSTokState.pos
             JSLex__Advance()
             // Scan identifier part after #
             JSTokTmp.ch = JSLex__Peek()
             IfCondition EqualTo(JSLex__IsIdentStart(JSTokTmp.ch), 1) ThenBlock: {
-                JSLex__Advance()
-                JSTokTmp.ch = JSLex__Peek()
+                // Check if the identifier part has escapes/non-ASCII
+                pn_id_start = JSTokState.pos
+                pn_has_esc = 0
                 WhileLoop EqualTo(JSLex__IsIdentCont(JSTokTmp.ch), 1) {
+                    IfCondition Or(EqualTo(JSTokTmp.ch, 92), GreaterEqual(JSTokTmp.ch, 128)) ThenBlock: {
+                        pn_has_esc = 1
+                    }
                     JSLex__Advance()
                     JSTokTmp.ch = JSLex__Peek()
                 }
-                pn_end = Add(JSTokState.source, JSTokState.pos)
-                pn_len = Subtract(pn_end, pn_start)
-                JSLex__AddToken(JSTokType.PRIVATE_NAME, pn_start, pn_len)
+                IfCondition EqualTo(pn_has_esc, 0) ThenBlock: {
+                    // Fast path — use raw source (#ident)
+                    pn_start = Add(JSTokState.source, pn_raw_start)
+                    pn_len = Subtract(JSTokState.pos, pn_raw_start)
+                    JSLex__AddToken(JSTokType.PRIVATE_NAME, pn_start, pn_len)
+                } ElseBlock: {
+                    // Slow path — decode escapes, build #decoded in intern buffer
+                    JSTokState.pos = pn_id_start
+                    pn_dest = Add(JSTokState.str_buf, JSTokState.str_pos)
+                    SetByte(pn_dest, 0, 35) // '#' prefix
+                    pn_di = 1
+                    pn_ch = GetByte(JSTokState.source, JSTokState.pos)
+                    WhileLoop EqualTo(JSLex__IsIdentCont(pn_ch), 1) {
+                        IfCondition EqualTo(pn_ch, 92) ThenBlock: {
+                            JSTokState.pos = Add(JSTokState.pos, 1)
+                            pn_u = GetByte(JSTokState.source, JSTokState.pos)
+                            IfCondition EqualTo(pn_u, 117) ThenBlock: {
+                                JSTokState.pos = Add(JSTokState.pos, 1)
+                                pn_br = GetByte(JSTokState.source, JSTokState.pos)
+                                IfCondition EqualTo(pn_br, 123) ThenBlock: {
+                                    // \u{XXXX}
+                                    JSTokState.pos = Add(JSTokState.pos, 1)
+                                    pn_cp = 0
+                                    pn_hc = GetByte(JSTokState.source, JSTokState.pos)
+                                    WhileLoop And(NotEqual(pn_hc, 125), NotEqual(pn_hc, 0)) {
+                                        pn_hv = JSLex__HexVal(pn_hc)
+                                        pn_cp = Add(Multiply(pn_cp, 16), pn_hv)
+                                        JSTokState.pos = Add(JSTokState.pos, 1)
+                                        pn_hc = GetByte(JSTokState.source, JSTokState.pos)
+                                    }
+                                    IfCondition EqualTo(pn_hc, 125) ThenBlock: { JSTokState.pos = Add(JSTokState.pos, 1) }
+                                    pn_nb = JSLex__EncodeUTF8(pn_dest, pn_di, pn_cp)
+                                    pn_di = Add(pn_di, pn_nb)
+                                } ElseBlock: {
+                                    // \uXXXX
+                                    pn_cp = 0
+                                    pn_ei = 0
+                                    WhileLoop LessThan(pn_ei, 4) {
+                                        pn_hc = GetByte(JSTokState.source, JSTokState.pos)
+                                        pn_hv = JSLex__HexVal(pn_hc)
+                                        pn_cp = Add(Multiply(pn_cp, 16), pn_hv)
+                                        JSTokState.pos = Add(JSTokState.pos, 1)
+                                        pn_ei = Add(pn_ei, 1)
+                                    }
+                                    pn_nb = JSLex__EncodeUTF8(pn_dest, pn_di, pn_cp)
+                                    pn_di = Add(pn_di, pn_nb)
+                                }
+                            }
+                        } ElseBlock: {
+                            SetByte(pn_dest, pn_di, pn_ch)
+                            pn_di = Add(pn_di, 1)
+                            JSTokState.pos = Add(JSTokState.pos, 1)
+                        }
+                        IfCondition GreaterEqual(JSTokState.pos, JSTokState.src_len) ThenBlock: {
+                            pn_ch = 0
+                        } ElseBlock: {
+                            pn_ch = GetByte(JSTokState.source, JSTokState.pos)
+                        }
+                    }
+                    SetByte(pn_dest, pn_di, 0)
+                    JSTokState.str_pos = Add(JSTokState.str_pos, Add(pn_di, 1))
+                    JSLex__AddToken(JSTokType.PRIVATE_NAME, pn_dest, pn_di)
+                }
             }
             ReturnValue(1)
         }
@@ -1694,7 +2325,7 @@ Function.JSLex_Tokenize {
                 JSLex__SkipWS()
             }
 
-            // ─── COMMENTS: // and /* ───
+            // ─── SLASH: // comment, /* comment, /regex/, / division, /= ───
             IfCondition EqualTo(JSTokTmp.ch, 47) ThenBlock: {
                 JSTokTmp.ch2 = JSLex__PeekAt(1)
                 IfCondition EqualTo(JSTokTmp.ch2, 47) ThenBlock: {
@@ -1705,10 +2336,41 @@ Function.JSLex_Tokenize {
                     // Block comment
                     JSLex__SkipBlockComment()
                 }
-                // If neither // nor /*, fall through to operator scan below
+                // If neither // nor /*, determine regex vs division by context
                 IfCondition And(NotEqual(JSTokTmp.ch2, 47), NotEqual(JSTokTmp.ch2, 42)) ThenBlock: {
-                    // It's a / operator or /=
-                    JSLex__ScanOp()
+                    // Regex context: / starts a regex literal when the previous token
+                    // cannot end an expression. Division tokens that preclude regex:
+                    // IDENT(1), NUMBER(2), STRING(3), RPAREN(11), RBRACKET(15),
+                    // RBRACE(13), PLUS_PLUS(57), MINUS_MINUS(58), KW_THIS(86),
+                    // KW_TRUE(81), KW_FALSE(82), KW_NULL(83), KW_UNDEFINED(84),
+                    // REGEX_LIT(130), TMPL_FULL(125), TMPL_TAIL(128)
+                    lt = JSTokState.last_type
+                    is_div = 0
+                    IfCondition EqualTo(lt, 1) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 2) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 3) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 11) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 13) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 15) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 57) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 58) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 81) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 82) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 83) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 84) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 86) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 130) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 125) ThenBlock: { is_div = 1 }
+                    IfCondition EqualTo(lt, 128) ThenBlock: { is_div = 1 }
+
+                    IfCondition EqualTo(is_div, 1) ThenBlock: {
+                        // Division operator or /=
+                        JSLex__ScanOp()
+                    }
+                    IfCondition EqualTo(is_div, 0) ThenBlock: {
+                        // Regex literal
+                        JSLex__ScanRegexLit()
+                    }
                 }
             }
 

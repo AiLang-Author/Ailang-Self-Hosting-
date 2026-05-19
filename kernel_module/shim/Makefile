@@ -9,7 +9,7 @@ obj-m += ail_combined.o
 # ail_combined.o is built from the shim and the payload.
 # kbuild will compile ail_shim.c to ail_shim.o and expects ail_payload.o
 # to be present in the same directory.
-ail_combined-objs := ail_shim.o ail_payload.o
+ail_combined-objs := ail_shim.o ail_shim_pcie.o ail_payload.o
 
 # Standard targets for building external modules.
 # We add a dependency on 'check_payload' to provide a user-friendly error

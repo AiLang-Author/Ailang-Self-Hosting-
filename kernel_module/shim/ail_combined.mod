@@ -1,2 +1,3 @@
-/mnt/c/Users/Sean/Documents/AiLangSH/kernel_module/shim/ail_shim.o
-/mnt/c/Users/Sean/Documents/AiLangSH/kernel_module/shim/ail_payload.o
+./ail_shim.o
+./ail_shim_pcie.o
+./ail_payload.o

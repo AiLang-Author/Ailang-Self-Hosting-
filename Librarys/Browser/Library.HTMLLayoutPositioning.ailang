@@ -1,0 +1,1677 @@
+// Library.HTMLLayoutPositioning.ailang — Inline element rendering and positioning
+// Handles form controls (input/select/textarea/button), img, links, and inline children.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.StringUtils
+LibraryImport.Browser.HTMLDom
+LibraryImport.Browser.CSSParse
+LibraryImport.Browser.HTMLLayoutColors
+LibraryImport.Browser.HTMLLayoutCSS
+LibraryImport.Browser.ImageDecode
+LibraryImport.Browser.JPEGDecode
+LibraryImport.Browser.URL
+LibraryImport.Browser.HTTPClient
+LibraryImport.SVG
+LibraryImport.Display.Render.Fonts
+
+// =============================================================================
+// IMAGE CACHE — avoid re-decoding the same URL
+// =============================================================================
+FixedPool.LYImgCache {
+    "pool":       Initialize=0    // buffer: 64 entries x 24 bytes (url_hash, handle, valid)
+    "max":        Initialize=64
+    "ENTRY_SIZE": Initialize=24
+    "E_HASH":     Initialize=0
+    "E_HANDLE":   Initialize=8
+    "E_VALID":    Initialize=16
+}
+
+// Base directory for resolving relative image paths (set by browser_ipc)
+FixedPool.LYImgState {
+    "base_dir":   Initialize=0    // Address of base directory string
+    "base_len":   Initialize=0    // length of base_dir
+    "inited":     Initialize=0    // 1 if IMG_Init has been called
+    "page_url":   Initialize=0    // Current page URL (for resolving relative img src)
+    "page_url_len": Initialize=0  // Length of page URL
+    "url_buf":    Initialize=0    // 2048-byte buffer for resolved URLs
+}
+
+// Clobber-safe temporaries for image HTTP fetching
+FixedPool.LYImgFetch {
+    "resp":       Initialize=0
+    "body":       Initialize=0
+    "body_len":   Initialize=0
+    "url_h":      Initialize=0
+    "src_ptr":    Initialize=0
+    "src_len":    Initialize=0
+}
+
+Function.LY__ImgCacheInit {
+    Body: {
+        IfCondition EqualTo(LYImgCache.pool, 0) ThenBlock: {
+            csz = Multiply(LYImgCache.max, LYImgCache.ENTRY_SIZE)
+            LYImgCache.pool = Allocate(csz)
+            MemorySet(LYImgCache.pool, 0, csz)
+        }
+        IfCondition EqualTo(LYImgState.inited, 0) ThenBlock: {
+            IMG_Init()
+            LYImgState.inited = 1
+        }
+    }
+}
+
+// Simple hash for URL string
+Function.LY__ImgHashURL {
+    Input: url: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(url, 0) ThenBlock: { ReturnValue(0) }
+        h = 5381
+        hi = 0
+        hlen = StringLength(url)
+        WhileLoop LessThan(hi, hlen) {
+            ch = GetByte(url, hi)
+            // h = h * 33 + ch
+            h = Add(Multiply(h, 33), ch)
+            hi = Add(hi, 1)
+        }
+        // Ensure positive
+        IfCondition LessThan(h, 0) ThenBlock: { h = Subtract(0, h) }
+        ReturnValue(h)
+    }
+}
+
+// Look up cached image handle by URL hash, returns handle or -1
+Function.LY__ImgCacheLookup {
+    Input: hash: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(LYImgCache.pool, 0) ThenBlock: { ReturnValue(-1) }
+        ci = 0
+        WhileLoop LessThan(ci, LYImgCache.max) {
+            base = Add(LYImgCache.pool, Multiply(ci, LYImgCache.ENTRY_SIZE))
+            valid = Dereference(Add(base, LYImgCache.E_VALID))
+            IfCondition EqualTo(valid, 1) ThenBlock: {
+                IfCondition EqualTo(Dereference(Add(base, LYImgCache.E_HASH)), hash) ThenBlock: {
+                    ReturnValue(Dereference(Add(base, LYImgCache.E_HANDLE)))
+                }
+            }
+            ci = Add(ci, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// Store image handle in cache
+Function.LY__ImgCacheStore {
+    Input: hash: Integer
+    Input: handle: Integer
+    Body: {
+        IfCondition EqualTo(LYImgCache.pool, 0) ThenBlock: { ReturnValue(0) }
+        // Find first empty slot
+        ci = 0
+        WhileLoop LessThan(ci, LYImgCache.max) {
+            base = Add(LYImgCache.pool, Multiply(ci, LYImgCache.ENTRY_SIZE))
+            valid = Dereference(Add(base, LYImgCache.E_VALID))
+            IfCondition EqualTo(valid, 0) ThenBlock: {
+                StoreValue(Add(base, LYImgCache.E_HASH), hash)
+                StoreValue(Add(base, LYImgCache.E_HANDLE), handle)
+                StoreValue(Add(base, LYImgCache.E_VALID), 1)
+                ReturnValue(0)
+            }
+            ci = Add(ci, 1)
+        }
+    }
+}
+
+// Load image from local file path, returns image handle or -1
+Function.LY__LoadImageFile {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(-1) }
+        LY__ImgCacheInit()
+
+        // Check cache first
+        url_hash = LY__ImgHashURL(path)
+        cached = LY__ImgCacheLookup(url_hash)
+        IfCondition GreaterEqual(cached, 0) ThenBlock: { ReturnValue(cached) }
+
+        // Open file: syscall 2 = open(path, O_RDONLY=0)
+        fd = SystemCall(2, path, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[IMG] Cannot open: ")
+            PrintMessage(path)
+            PrintMessage("\n")
+            ReturnValue(-1)
+        }
+
+        // Read entire file into buffer (max 4MB)
+        img_max = 4194304
+        img_buf = Allocate(img_max)
+        img_total = 0
+        img_reading = 1
+        WhileLoop EqualTo(img_reading, 1) {
+            img_remain = Subtract(img_max, img_total)
+            IfCondition LessEqual(img_remain, 0) ThenBlock: { img_reading = 0 }
+            IfCondition EqualTo(img_reading, 1) ThenBlock: {
+                img_n = SystemCall(0, fd, Add(img_buf, img_total), img_remain)
+                IfCondition LessEqual(img_n, 0) ThenBlock: { img_reading = 0 }
+                IfCondition GreaterThan(img_n, 0) ThenBlock: {
+                    img_total = Add(img_total, img_n)
+                }
+            }
+        }
+        SystemCall(3, fd)
+
+        IfCondition LessEqual(img_total, 8) ThenBlock: {
+            Deallocate(img_buf, img_max)
+            ReturnValue(-1)
+        }
+
+        // Detect format by magic bytes
+        b0 = GetByte(img_buf, 0)
+        b1 = GetByte(img_buf, 1)
+        handle = -1
+
+        // PNG: starts with 137 80 78 71 (0x89 P N G)
+        IfCondition EqualTo(b0, 137) ThenBlock: {
+            IfCondition EqualTo(b1, 80) ThenBlock: {
+                PrintMessage("[IMG] Decoding PNG: ")
+                PrintMessage(path)
+                PrintMessage(" (")
+                PrintNumber(img_total)
+                PrintMessage(" bytes)\n")
+                handle = IMG_DecodePNG(img_buf, img_total)
+            }
+        }
+
+        // JPEG: starts with 0xFF 0xD8
+        IfCondition EqualTo(handle, -1) ThenBlock: {
+            IfCondition EqualTo(b0, 255) ThenBlock: {
+                IfCondition EqualTo(b1, 216) ThenBlock: {
+                    PrintMessage("[IMG] Decoding JPEG: ")
+                    PrintMessage(path)
+                    PrintMessage(" (")
+                    PrintNumber(img_total)
+                    PrintMessage(" bytes)\n")
+                    handle = IMG_DecodeJPEG(img_buf, img_total)
+                }
+            }
+        }
+
+        // Don't deallocate img_buf — PNG/JPEG decoder references it
+        // (decoder copies pixel data to its own buffer)
+
+        IfCondition GreaterEqual(handle, 0) ThenBlock: {
+            PrintMessage("[IMG] Decoded: ")
+            PrintNumber(IMG_GetWidth(handle))
+            PrintMessage("x")
+            PrintNumber(IMG_GetHeight(handle))
+            PrintMessage("\n")
+            LY__ImgCacheStore(url_hash, handle)
+        }
+
+        ReturnValue(handle)
+    }
+}
+
+// Build full path from base_dir + relative src
+Function.LY__BuildImagePath {
+    Input: src: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        src_len = StringLength(src)
+        IfCondition EqualTo(src_len, 0) ThenBlock: { ReturnValue(0) }
+
+        // If src starts with '/' it's absolute, use directly
+        IfCondition EqualTo(GetByte(src, 0), 47) ThenBlock: { ReturnValue(src) }
+
+        // If no base_dir, just use src as-is
+        IfCondition EqualTo(LYImgState.base_dir, 0) ThenBlock: { ReturnValue(src) }
+
+        // Build: base_dir + "/" + src
+        full_len = Add(Add(LYImgState.base_len, 1), src_len)
+        full = Allocate(Add(full_len, 1))
+        MemoryCopy(full, LYImgState.base_dir, LYImgState.base_len)
+        SetByte(full, LYImgState.base_len, 47)
+        MemoryCopy(Add(full, Add(LYImgState.base_len, 1)), src, src_len)
+        SetByte(full, full_len, 0)
+        ReturnValue(full)
+    }
+}
+
+// Set base directory for relative image paths
+Function.LY__SetImageBaseDir {
+    Input: dir: Address
+    Body: {
+        LYImgState.base_dir = dir
+        IfCondition NotEqual(dir, 0) ThenBlock: {
+            LYImgState.base_len = StringLength(dir)
+        } ElseBlock: {
+            LYImgState.base_len = 0
+        }
+    }
+}
+
+// Set current page URL for resolving relative image URLs
+Function.LY__SetPageURL {
+    Input: url: Address
+    Input: url_len: Integer
+    Body: {
+        LYImgState.page_url = url
+        LYImgState.page_url_len = url_len
+        IfCondition EqualTo(LYImgState.url_buf, 0) ThenBlock: {
+            LYImgState.url_buf = Allocate(2048)
+        }
+    }
+}
+
+// Resolve a relative image src against the current page URL
+// Returns pointer to absolute URL or the original src if already absolute
+Function.LY__ResolveImageURL {
+    Input: src: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        LYImgFetch.src_ptr = src
+        LYImgFetch.src_len = StringLength(src)
+
+        // If src starts with "http" (104,116,116,112) — already absolute
+        IfCondition GreaterThan(LYImgFetch.src_len, 4) ThenBlock: {
+            IfCondition EqualTo(GetByte(LYImgFetch.src_ptr, 0), 104) ThenBlock: {
+                IfCondition EqualTo(GetByte(LYImgFetch.src_ptr, 1), 116) ThenBlock: {
+                    IfCondition EqualTo(GetByte(LYImgFetch.src_ptr, 2), 116) ThenBlock: {
+                        IfCondition EqualTo(GetByte(LYImgFetch.src_ptr, 3), 112) ThenBlock: {
+                            ReturnValue(LYImgFetch.src_ptr)
+                        }
+                    }
+                }
+            }
+        }
+
+        // If no page URL set, can't resolve
+        IfCondition EqualTo(LYImgState.page_url, 0) ThenBlock: { ReturnValue(src) }
+        IfCondition EqualTo(LYImgState.url_buf, 0) ThenBlock: { ReturnValue(src) }
+
+        // Protocol-relative: "//..."
+        IfCondition GreaterThan(LYImgFetch.src_len, 2) ThenBlock: {
+            IfCondition EqualTo(GetByte(LYImgFetch.src_ptr, 0), 47) ThenBlock: {
+                IfCondition EqualTo(GetByte(LYImgFetch.src_ptr, 1), 47) ThenBlock: {
+                    // Prepend "https:" (most common for protocol-relative)
+                    MemoryCopy(LYImgState.url_buf, "https:", 6)
+                    MemoryCopy(Add(LYImgState.url_buf, 6), LYImgFetch.src_ptr, LYImgFetch.src_len)
+                    SetByte(LYImgState.url_buf, Add(6, LYImgFetch.src_len), 0)
+                    ReturnValue(LYImgState.url_buf)
+                }
+            }
+        }
+
+        // Parse base URL to get scheme + host
+        LYImgFetch.url_h = URL_Parse(LYImgState.page_url, LYImgState.page_url_len)
+        IfCondition LessThan(LYImgFetch.url_h, 0) ThenBlock: { ReturnValue(src) }
+
+        pos = 0
+        // scheme://
+        b_scheme = URL_GetScheme(LYImgFetch.url_h)
+        s_len = StringLength(b_scheme)
+        MemoryCopy(Add(LYImgState.url_buf, pos), b_scheme, s_len)
+        pos = Add(pos, s_len)
+        SetByte(LYImgState.url_buf, pos, 58)  // ':'
+        pos = Add(pos, 1)
+        SetByte(LYImgState.url_buf, pos, 47)  // '/'
+        pos = Add(pos, 1)
+        SetByte(LYImgState.url_buf, pos, 47)  // '/'
+        pos = Add(pos, 1)
+
+        // host
+        b_host = URL_GetHost(LYImgFetch.url_h)
+        h_len = StringLength(b_host)
+        MemoryCopy(Add(LYImgState.url_buf, pos), b_host, h_len)
+        pos = Add(pos, h_len)
+
+        // If src starts with '/' — absolute path on same host
+        IfCondition EqualTo(GetByte(LYImgFetch.src_ptr, 0), 47) ThenBlock: {
+            MemoryCopy(Add(LYImgState.url_buf, pos), LYImgFetch.src_ptr, LYImgFetch.src_len)
+            pos = Add(pos, LYImgFetch.src_len)
+            SetByte(LYImgState.url_buf, pos, 0)
+            ReturnValue(LYImgState.url_buf)
+        }
+
+        // Relative path — find last '/' in base path, append after it
+        b_path = URL_GetPath(LYImgFetch.url_h)
+        bp_len = StringLength(b_path)
+        last_sl = 0
+        si = 0
+        WhileLoop LessThan(si, bp_len) {
+            IfCondition EqualTo(GetByte(b_path, si), 47) ThenBlock: {
+                last_sl = si
+            }
+            si = Add(si, 1)
+        }
+        copy_len = Add(last_sl, 1)
+        MemoryCopy(Add(LYImgState.url_buf, pos), b_path, copy_len)
+        pos = Add(pos, copy_len)
+        MemoryCopy(Add(LYImgState.url_buf, pos), LYImgFetch.src_ptr, LYImgFetch.src_len)
+        pos = Add(pos, LYImgFetch.src_len)
+        SetByte(LYImgState.url_buf, pos, 0)
+        ReturnValue(LYImgState.url_buf)
+    }
+}
+
+// Load image from HTTP URL, returns image handle or -1
+Function.LY__LoadImageURL {
+    Input: url: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(url, 0) ThenBlock: { ReturnValue(-1) }
+        LY__ImgCacheInit()
+
+        // Check cache first
+        url_hash = LY__ImgHashURL(url)
+        cached = LY__ImgCacheLookup(url_hash)
+        IfCondition GreaterEqual(cached, 0) ThenBlock: { ReturnValue(cached) }
+
+        PrintMessage("[IMG] Fetching: ")
+        PrintMessage(url)
+        PrintMessage("\n")
+
+        // Parse URL
+        LYImgFetch.src_ptr = url
+        LYImgFetch.src_len = StringLength(url)
+        LYImgFetch.url_h = URL_Parse(LYImgFetch.src_ptr, LYImgFetch.src_len)
+        IfCondition LessThan(LYImgFetch.url_h, 0) ThenBlock: {
+            PrintMessage("[IMG] URL parse failed\n")
+            ReturnValue(-1)
+        }
+
+        // HTTP GET
+        LYImgFetch.resp = HTTP_Get(LYImgFetch.url_h)
+        IfCondition LessThan(LYImgFetch.resp, 0) ThenBlock: {
+            PrintMessage("[IMG] HTTP fetch failed\n")
+            ReturnValue(-1)
+        }
+
+        LYImgFetch.body = HTTP_GetBody(LYImgFetch.resp)
+        LYImgFetch.body_len = HTTP_GetBodyLen(LYImgFetch.resp)
+
+        IfCondition LessEqual(LYImgFetch.body_len, 8) ThenBlock: {
+            PrintMessage("[IMG] Response too small: ")
+            PrintNumber(LYImgFetch.body_len)
+            PrintMessage(" bytes\n")
+            ReturnValue(-1)
+        }
+
+        PrintMessage("[IMG] Downloaded: ")
+        PrintNumber(LYImgFetch.body_len)
+        PrintMessage(" bytes\n")
+
+        // Detect format by magic bytes
+        b0 = GetByte(LYImgFetch.body, 0)
+        b1 = GetByte(LYImgFetch.body, 1)
+        handle = -1
+
+        // PNG: 137 80 (0x89 P)
+        IfCondition EqualTo(b0, 137) ThenBlock: {
+            IfCondition EqualTo(b1, 80) ThenBlock: {
+                PrintMessage("[IMG] Decoding PNG\n")
+                handle = IMG_DecodePNG(LYImgFetch.body, LYImgFetch.body_len)
+            }
+        }
+
+        // JPEG: 255 216 (0xFF 0xD8)
+        IfCondition EqualTo(handle, -1) ThenBlock: {
+            IfCondition EqualTo(b0, 255) ThenBlock: {
+                IfCondition EqualTo(b1, 216) ThenBlock: {
+                    PrintMessage("[IMG] Decoding JPEG\n")
+                    handle = IMG_DecodeJPEG(LYImgFetch.body, LYImgFetch.body_len)
+                }
+            }
+        }
+
+        IfCondition GreaterEqual(handle, 0) ThenBlock: {
+            PrintMessage("[IMG] Decoded: ")
+            PrintNumber(IMG_GetWidth(handle))
+            PrintMessage("x")
+            PrintNumber(IMG_GetHeight(handle))
+            PrintMessage("\n")
+            LY__ImgCacheStore(url_hash, handle)
+        } ElseBlock: {
+            PrintMessage("[IMG] Unknown format (b0=")
+            PrintNumber(b0)
+            PrintMessage(" b1=")
+            PrintNumber(b1)
+            PrintMessage(")\n")
+        }
+
+        ReturnValue(handle)
+    }
+}
+
+// =============================================================================
+// BASE64 DECODER — for data: URI images
+// =============================================================================
+FixedPool.LYB64 {
+    "buf":      Initialize=0    // output buffer
+    "buf_len":  Initialize=0    // decoded length
+}
+
+// Decode a single base64 character to 6-bit value (0-63), or -1 for invalid
+Function.LY__B64Val {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        // A-Z: 65-90 → 0-25
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+            ReturnValue(Subtract(ch, 65))
+        }
+        // a-z: 97-122 → 26-51
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: {
+            ReturnValue(Subtract(ch, 71))
+        }
+        // 0-9: 48-57 → 52-61
+        IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: {
+            ReturnValue(Add(ch, 4))
+        }
+        // +: 43 → 62
+        IfCondition EqualTo(ch, 43) ThenBlock: { ReturnValue(62) }
+        // /: 47 → 63
+        IfCondition EqualTo(ch, 47) ThenBlock: { ReturnValue(63) }
+        ReturnValue(-1)
+    }
+}
+
+// Decode base64 data to binary. Returns number of bytes written.
+Function.LY__B64Decode {
+    Input: src: Address
+    Input: src_len: Integer
+    Input: dst: Address
+    Input: dst_max: Integer
+    Output: Integer
+    Body: {
+        si = 0
+        di = 0
+        WhileLoop LessThan(si, src_len) {
+            // Collect 4 valid base64 chars
+            v0 = -1
+            v1 = -1
+            v2 = -1
+            v3 = -1
+            // First char
+            WhileLoop And(LessThan(si, src_len), EqualTo(v0, -1)) {
+                c = GetByte(src, si)
+                si = Add(si, 1)
+                IfCondition EqualTo(c, 61) ThenBlock: { si = src_len }
+                IfCondition NotEqual(c, 61) ThenBlock: { v0 = LY__B64Val(c) }
+            }
+            // Second char
+            WhileLoop And(LessThan(si, src_len), EqualTo(v1, -1)) {
+                c = GetByte(src, si)
+                si = Add(si, 1)
+                IfCondition EqualTo(c, 61) ThenBlock: { si = src_len }
+                IfCondition NotEqual(c, 61) ThenBlock: { v1 = LY__B64Val(c) }
+            }
+            IfCondition Or(LessThan(v0, 0), LessThan(v1, 0)) ThenBlock: { BreakLoop }
+            // Byte 1: (v0 << 2) | (v1 >> 4)
+            IfCondition LessThan(di, dst_max) ThenBlock: {
+                SetByte(dst, di, BitwiseOr(ShiftLeft(v0, 2), ShiftRight(v1, 4)))
+                di = Add(di, 1)
+            }
+            // Third char
+            WhileLoop And(LessThan(si, src_len), EqualTo(v2, -1)) {
+                c = GetByte(src, si)
+                si = Add(si, 1)
+                IfCondition EqualTo(c, 61) ThenBlock: { v2 = -2 }
+                IfCondition NotEqual(c, 61) ThenBlock: { v2 = LY__B64Val(c) }
+            }
+            IfCondition EqualTo(v2, -2) ThenBlock: { BreakLoop }
+            IfCondition LessThan(v2, 0) ThenBlock: { BreakLoop }
+            // Byte 2: ((v1 << 4) | (v2 >> 2)) & 0xFF
+            IfCondition LessThan(di, dst_max) ThenBlock: {
+                SetByte(dst, di, BitwiseAnd(BitwiseOr(ShiftLeft(v1, 4), ShiftRight(v2, 2)), 255))
+                di = Add(di, 1)
+            }
+            // Fourth char
+            WhileLoop And(LessThan(si, src_len), EqualTo(v3, -1)) {
+                c = GetByte(src, si)
+                si = Add(si, 1)
+                IfCondition EqualTo(c, 61) ThenBlock: { v3 = -2 }
+                IfCondition NotEqual(c, 61) ThenBlock: { v3 = LY__B64Val(c) }
+            }
+            IfCondition EqualTo(v3, -2) ThenBlock: { BreakLoop }
+            IfCondition LessThan(v3, 0) ThenBlock: { BreakLoop }
+            // Byte 3: ((v2 << 6) | v3) & 0xFF
+            IfCondition LessThan(di, dst_max) ThenBlock: {
+                SetByte(dst, di, BitwiseAnd(BitwiseOr(ShiftLeft(v2, 6), v3), 255))
+                di = Add(di, 1)
+            }
+        }
+        ReturnValue(di)
+    }
+}
+
+// Load image from data: URI (base64 encoded PNG/JPEG)
+// Returns image handle or -1
+Function.LY__LoadImageDataURI {
+    Input: src: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(-1) }
+        // Ensure image subsystem is initialized
+        LY__ImgCacheInit()
+        // Find the base64 marker ";base64,"
+        src_len = StringLength(src)
+        b64_start = -1
+        di = 0
+        WhileLoop LessThan(di, Subtract(src_len, 8)) {
+            // Look for ";base64," = 59,98,97,115,101,54,52,44
+            IfCondition EqualTo(GetByte(src, di), 59) ThenBlock: {
+                IfCondition EqualTo(GetByte(src, Add(di, 1)), 98) ThenBlock: {
+                    IfCondition EqualTo(GetByte(src, Add(di, 2)), 97) ThenBlock: {
+                        IfCondition EqualTo(GetByte(src, Add(di, 3)), 115) ThenBlock: {
+                            IfCondition EqualTo(GetByte(src, Add(di, 4)), 101) ThenBlock: {
+                                IfCondition EqualTo(GetByte(src, Add(di, 5)), 54) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(src, Add(di, 6)), 52) ThenBlock: {
+                                        IfCondition EqualTo(GetByte(src, Add(di, 7)), 44) ThenBlock: {
+                                            b64_start = Add(di, 8)
+                                            di = src_len
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            di = Add(di, 1)
+        }
+        IfCondition LessThan(b64_start, 0) ThenBlock: { ReturnValue(-1) }
+
+        b64_len = Subtract(src_len, b64_start)
+        IfCondition LessEqual(b64_len, 0) ThenBlock: { ReturnValue(-1) }
+
+        // Allocate decode buffer (3/4 of base64 length + padding)
+        dec_max = Add(Divide(Multiply(b64_len, 3), 4), 16)
+        IfCondition GreaterThan(dec_max, 4194304) ThenBlock: { ReturnValue(-1) }
+        dec_buf = Allocate(dec_max)
+        IfCondition EqualTo(dec_buf, 0) ThenBlock: { ReturnValue(-1) }
+
+        dec_len = LY__B64Decode(Add(src, b64_start), b64_len, dec_buf, dec_max)
+        IfCondition LessEqual(dec_len, 8) ThenBlock: {
+            Deallocate(dec_buf, dec_max)
+            ReturnValue(-1)
+        }
+
+        // Detect format and decode
+        b0 = GetByte(dec_buf, 0)
+        b1 = GetByte(dec_buf, 1)
+        handle = -1
+
+        // PNG: 137 80
+        IfCondition EqualTo(b0, 137) ThenBlock: {
+            IfCondition EqualTo(b1, 80) ThenBlock: {
+                handle = IMG_DecodePNG(dec_buf, dec_len)
+            }
+        }
+        // JPEG: 255 216
+        IfCondition EqualTo(handle, -1) ThenBlock: {
+            IfCondition EqualTo(b0, 255) ThenBlock: {
+                IfCondition EqualTo(b1, 216) ThenBlock: {
+                    handle = IMG_DecodeJPEG(dec_buf, dec_len)
+                }
+            }
+        }
+
+        // Don't deallocate - image decoder may reference the buffer
+        // Deallocate(dec_buf, dec_max)
+        ReturnValue(handle)
+    }
+}
+
+// =============================================================================
+// SVG SERIALIZER — Convert DOM <svg> subtree back to SVG XML text
+// =============================================================================
+FixedPool.LYSvg {
+    "buf":     Initialize=0    // output buffer
+    "pos":     Initialize=0    // current write position
+    "max":     Initialize=0    // buffer size limit
+    "inited":  Initialize=0    // SVG_Init called?
+}
+
+// Append a string to the SVG serialization buffer
+Function.LY__SvgAppend {
+    Input: str: Address
+    Input: len: Integer
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(len, 0) ThenBlock: { ReturnValue(0) }
+        remain = Subtract(LYSvg.max, LYSvg.pos)
+        IfCondition GreaterThan(len, remain) ThenBlock: { len = remain }
+        IfCondition GreaterThan(len, 0) ThenBlock: {
+            MemoryCopy(Add(LYSvg.buf, LYSvg.pos), str, len)
+            LYSvg.pos = Add(LYSvg.pos, len)
+        }
+    }
+}
+
+// Append a byte to the SVG buffer
+Function.LY__SvgAppendByte {
+    Input: b: Integer
+    Body: {
+        IfCondition LessThan(LYSvg.pos, LYSvg.max) ThenBlock: {
+            SetByte(LYSvg.buf, LYSvg.pos, b)
+            LYSvg.pos = Add(LYSvg.pos, 1)
+        }
+    }
+}
+
+// Serialize a DOM node and its children to SVG XML text (recursive)
+Function.LY__SvgSerializeNode {
+    Input: node: Integer
+    Body: {
+        IfCondition LessThan(node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(LYSvg.pos, Subtract(LYSvg.max, 10)) ThenBlock: { ReturnValue(0) }
+
+        nd_type = DOM_GetType(node)
+
+        // Text node: output the text content
+        IfCondition EqualTo(nd_type, 2) ThenBlock: {
+            t_ptr = DOM_GetText(node)
+            IfCondition NotEqual(t_ptr, 0) ThenBlock: {
+                t_len = DOM_GetTextLen(node)
+                LY__SvgAppend(t_ptr, t_len)
+            }
+            ReturnValue(0)
+        }
+
+        // Element node: output <tag attrs>children</tag>
+        IfCondition EqualTo(nd_type, 1) ThenBlock: {
+            nd_tag = DOM_GetTag(node)
+            IfCondition EqualTo(nd_tag, 0) ThenBlock: { ReturnValue(0) }
+            nd_tl = StringLength(nd_tag)
+
+            // <tagname
+            LY__SvgAppendByte(60)
+            LY__SvgAppend(nd_tag, nd_tl)
+
+            // Attributes
+            nd_ac = DOM_GetAttrCount(node)
+            nd_ai = 0
+            WhileLoop LessThan(nd_ai, nd_ac) {
+                ak = DOM_GetAttrNameByIdx(node, nd_ai)
+                av = DOM_GetAttrValByIdx(node, nd_ai)
+                IfCondition NotEqual(ak, 0) ThenBlock: {
+                    LY__SvgAppendByte(32)
+                    LY__SvgAppend(ak, StringLength(ak))
+                    IfCondition NotEqual(av, 0) ThenBlock: {
+                        LY__SvgAppendByte(61)  // =
+                        LY__SvgAppendByte(34)  // "
+                        LY__SvgAppend(av, StringLength(av))
+                        LY__SvgAppendByte(34)  // "
+                    }
+                }
+                nd_ai = Add(nd_ai, 1)
+            }
+            LY__SvgAppendByte(62)  // >
+
+            // Children
+            ch = DOM_GetFirstChild(node)
+            WhileLoop GreaterEqual(ch, 0) {
+                LY__SvgSerializeNode(ch)
+                ch = DOM_GetNextSib(ch)
+            }
+
+            // </tagname>
+            LY__SvgAppendByte(60)  // <
+            LY__SvgAppendByte(47)  // /
+            LY__SvgAppend(nd_tag, nd_tl)
+            LY__SvgAppendByte(62)  // >
+        }
+    }
+}
+
+// Render an SVG DOM node to pixels. Returns img handle or -1.
+Function.LY__RenderSVGNode {
+    Input: node: Integer
+    Input: w: Integer
+    Input: h: Integer
+    Output: Integer
+    Body: {
+        // Defaults
+        IfCondition LessEqual(w, 0) ThenBlock: { w = 100 }
+        IfCondition LessEqual(h, 0) ThenBlock: { h = 100 }
+        // Clamp size to avoid huge allocations
+        IfCondition GreaterThan(w, 1024) ThenBlock: { w = 1024 }
+        IfCondition GreaterThan(h, 1024) ThenBlock: { h = 1024 }
+
+        // Init SVG subsystem once
+        IfCondition EqualTo(LYSvg.inited, 0) ThenBlock: {
+            SVG_Init()
+            LYSvg.inited = 1
+        }
+
+        // Allocate serialization buffer (64KB)
+        svg_max = 65536
+        LYSvg.buf = Allocate(svg_max)
+        IfCondition EqualTo(LYSvg.buf, 0) ThenBlock: { ReturnValue(-1) }
+        LYSvg.pos = 0
+        LYSvg.max = Subtract(svg_max, 1)
+
+        // Serialize the <svg> DOM node to XML text
+        LY__SvgSerializeNode(node)
+        SetByte(LYSvg.buf, LYSvg.pos, 0)
+
+        IfCondition LessEqual(LYSvg.pos, 0) ThenBlock: {
+            Deallocate(LYSvg.buf, svg_max)
+            ReturnValue(-1)
+        }
+
+        // Create a proper DSurface for the rasterizer
+        svg_pitch = Multiply(w, 4)
+        svg_pix_sz = Multiply(svg_pitch, h)
+        svg_pix = Allocate(svg_pix_sz)
+        IfCondition EqualTo(svg_pix, 0) ThenBlock: {
+            Deallocate(LYSvg.buf, svg_max)
+            ReturnValue(-1)
+        }
+        // Clear to transparent
+        MemorySet(svg_pix, 0, svg_pix_sz)
+
+        // Build DSurface header (48 bytes) wrapping the pixel buffer
+        svg_hdr = Allocate(48)
+        IfCondition EqualTo(svg_hdr, 0) ThenBlock: {
+            Deallocate(svg_pix, svg_pix_sz)
+            Deallocate(LYSvg.buf, svg_max)
+            ReturnValue(-1)
+        }
+        StoreValue(Add(svg_hdr, 0), 1)            // FORMAT = PIXEL_32
+        StoreValue(Add(svg_hdr, 8), w)             // WIDTH
+        StoreValue(Add(svg_hdr, 16), h)            // HEIGHT
+        StoreValue(Add(svg_hdr, 24), svg_pitch)    // PITCH
+        StoreValue(Add(svg_hdr, 32), svg_pix)      // DATA
+        StoreValue(Add(svg_hdr, 40), svg_pix_sz)   // DATA_SIZE
+
+        // Render SVG to pixel buffer via DSurface
+        svg_ok = SVG_Render(LYSvg.buf, LYSvg.pos, svg_hdr, w, h)
+
+        Deallocate(LYSvg.buf, svg_max)
+
+        IfCondition EqualTo(svg_ok, 0) ThenBlock: {
+            Deallocate(svg_pix, svg_pix_sz)
+            Deallocate(svg_hdr, 48)
+            ReturnValue(-1)
+        }
+
+        // Free header (no longer needed — rasterizer is done)
+        Deallocate(svg_hdr, 48)
+
+        // Store in image cache: create a synthetic IMG handle
+        // Use IMG_CreateFromPixels if available, or just store the pixel pointer
+        // For now, emit draw directly rather than going through image cache
+        // Store pixels in LYTmp.ptr for LY__EmitDrawImage
+        LYTmp.ptr = svg_pix
+        ReturnValue(1)
+    }
+}
+
+Function.LY__LayoutInline {
+    Input: node: Integer
+    Input: tag: Address
+    Input: is_visible: Integer
+    Body: {
+        LYState.dbg_nodes = Add(LYState.dbg_nodes, 1)
+        LYState.dbg_inlines = Add(LYState.dbg_inlines, 1)
+        sv_fg2 = LYState.fg_color
+        sv_vis2 = LYState.visible
+
+        // Apply visibility:hidden for inline elements
+        IfCondition EqualTo(is_visible, 0) ThenBlock: {
+            LYState.visible = 0
+        }
+
+        fg2 = LY__ResolveFgColor(node)
+        LYState.fg_color = fg2
+
+        // Resolve inline padding (horizontal only — CSS inline elements)
+        inl_pad_l = LY__ResolvePaddingSide(node, tag, 3)
+        inl_pad_r = LY__ResolvePaddingSide(node, tag, 1)
+        // Resolve inline margin (horizontal only)
+        inl_mar_l = LY__ResolveMarginSide(node, tag, 3)
+        inl_mar_r = LY__ResolveMarginSide(node, tag, 1)
+
+        // Apply left margin
+        IfCondition GreaterThan(inl_mar_l, 0) ThenBlock: {
+            LYState.cursor_x = Add(LYState.cursor_x, inl_mar_l)
+        }
+
+        // Resolve background color for inline elements (e.g. <span class="normal">)
+        // Reserve a FILL_RECT command slot BEFORE children so it paints behind text
+        inl_bg = LY__ResolveBgColor(node)
+        inl_bg_slot = -1
+        inl_bg_x = LYState.cursor_x
+        inl_bg_y = LYState.cursor_y
+        IfCondition NotEqual(inl_bg, LYConst.COLOR_TRANSP) ThenBlock: {
+            inl_bg_slot = LYState.cmd_count
+            IfCondition LessThan(inl_bg_slot, LYConst.MAX_CMDS) ThenBlock: {
+                LYState.cmd_count = Add(inl_bg_slot, 1)
+                LY__CmdSet(inl_bg_slot, LYConst.C_TYPE, LYCmd.FILL_RECT)
+                LY__CmdSet(inl_bg_slot, LYConst.C_X, inl_bg_x)
+                LY__CmdSet(inl_bg_slot, LYConst.C_Y, inl_bg_y)
+                LY__CmdSet(inl_bg_slot, LYConst.C_W, 0)
+                LY__CmdSet(inl_bg_slot, LYConst.C_H, 0)
+                LY__CmdSet(inl_bg_slot, LYConst.C_COLOR, inl_bg)
+            } ElseBlock: {
+                inl_bg_slot = -1
+            }
+        }
+
+        // Apply left padding (offset text start)
+        IfCondition GreaterThan(inl_pad_l, 0) ThenBlock: {
+            LYState.cursor_x = Add(LYState.cursor_x, inl_pad_l)
+        }
+
+        // Special: <br> — line break
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "br"), 0) ThenBlock: {
+                font_h = LY__LineHeight()
+                LYState.cursor_y = Add(LYState.cursor_y, font_h)
+                LYState.cursor_x = LYState.indent
+            }
+        }
+
+        // Special: <input> — render as visible text box
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "input"), 0) ThenBlock: {
+                in_type = DOM_GetAttr(node, "type")
+                in_hidden = 0
+                IfCondition NotEqual(in_type, 0) ThenBlock: {
+                    IfCondition EqualTo(StringCompare(in_type, "hidden"), 0) ThenBlock: {
+                        in_hidden = 1
+                    }
+                }
+                IfCondition EqualTo(in_hidden, 0) ThenBlock: {
+                    // Determine if button-style or text-style
+                    in_is_btn = 0
+                    IfCondition NotEqual(in_type, 0) ThenBlock: {
+                        IfCondition EqualTo(StringCompare(in_type, "submit"), 0) ThenBlock: { in_is_btn = 1 }
+                        IfCondition EqualTo(StringCompare(in_type, "button"), 0) ThenBlock: { in_is_btn = 1 }
+                        IfCondition EqualTo(StringCompare(in_type, "reset"), 0) ThenBlock: { in_is_btn = 1 }
+                    }
+                    IfCondition EqualTo(in_is_btn, 1) ThenBlock: {
+                        // Button: draw filled rect with label text
+                        in_val = DOM_GetAttr(node, "value")
+                        IfCondition EqualTo(in_val, 0) ThenBlock: { in_val = "Submit" }
+                        in_tlen = StringLength(in_val)
+                        in_bw = Add(Multiply(in_tlen, 8), 16)
+                        // Position at cursor_x (inline flow)
+                        in_x = LYState.cursor_x
+                        // Wrap if doesn't fit
+                        in_re = Add(LYState.indent, LYState.avail_w)
+                        IfCondition GreaterThan(Add(in_x, in_bw), in_re) ThenBlock: {
+                            IfCondition GreaterThan(in_x, LYState.indent) ThenBlock: {
+                                LYState.cursor_y = Add(LYState.cursor_y, 28)
+                                in_x = LYState.indent
+                            }
+                        }
+                        // Center button if text-align: center
+                        IfCondition EqualTo(LYState.text_align, 1) ThenBlock: {
+                            IfCondition EqualTo(in_x, LYState.indent) ThenBlock: {
+                                IfCondition LessThan(in_bw, LYState.avail_w) ThenBlock: {
+                                    in_x = Add(LYState.indent, Divide(Subtract(LYState.avail_w, in_bw), 2))
+                                }
+                            }
+                        }
+                        // Button background (light gray)
+                        LY__EmitFillRect(in_x, LYState.cursor_y, in_bw, 24, 4293388263)
+                        // Border (dark gray)
+                        LY__EmitDrawLine(in_x, LYState.cursor_y, in_bw, LYConst.COLOR_GRAY)
+                        LY__EmitDrawLine(in_x, Add(LYState.cursor_y, 23), in_bw, LYConst.COLOR_GRAY)
+                        // Record hit-region for click
+                        LY__AddHitRegion(in_x, LYState.cursor_y, in_bw, 24, node, LYHitType.BUTTON)
+                        // Text
+                        LYTmp.ptr = in_val
+                        LY__EmitDrawText(Add(in_x, 8), Add(LYState.cursor_y, 4), in_tlen, LYConst.COLOR_BLACK)
+                        // Advance cursor_x past button (inline flow)
+                        LYState.cursor_x = Add(in_x, Add(in_bw, 4))
+                    } ElseBlock: {
+                        // Text input: draw bordered rect with placeholder
+                        in_ph = DOM_GetAttr(node, "placeholder")
+                        in_val = DOM_GetAttr(node, "value")
+                        in_w = 240
+                        // Parse inline style once for width/padding
+                        in_wrule = -1
+                        in_wstr = DOM_GetAttr(node, "style")
+                        IfCondition NotEqual(in_wstr, 0) ThenBlock: {
+                            in_wslen = StringLength(in_wstr)
+                            IfCondition GreaterThan(in_wslen, 0) ThenBlock: {
+                                in_wrule = CSS_ParseInline(in_wstr, in_wslen)
+                            }
+                        }
+                        // Check size attribute
+                        in_sz = DOM_GetAttr(node, "size")
+                        IfCondition NotEqual(in_sz, 0) ThenBlock: {
+                            in_szv = LY__ParsePx(in_sz)
+                            IfCondition GreaterThan(in_szv, 0) ThenBlock: {
+                                in_w = Multiply(in_szv, 8)
+                            }
+                        }
+                        // CSS width from inline style overrides size attr
+                        IfCondition GreaterEqual(in_wrule, 0) ThenBlock: {
+                            in_wcss = CSS_GetPropVal(in_wrule, "width")
+                            IfCondition NotEqual(in_wcss, 0) ThenBlock: {
+                                in_wpx = LY__ParsePx(in_wcss)
+                                IfCondition GreaterThan(in_wpx, 0) ThenBlock: {
+                                    in_w = in_wpx
+                                }
+                            }
+                        }
+                        // Position at cursor_x (inline flow)
+                        in_x = LYState.cursor_x
+                        // Wrap if doesn't fit
+                        in_re = Add(LYState.indent, LYState.avail_w)
+                        IfCondition GreaterThan(Add(in_x, in_w), in_re) ThenBlock: {
+                            IfCondition GreaterThan(in_x, LYState.indent) ThenBlock: {
+                                LYState.cursor_y = Add(LYState.cursor_y, 28)
+                                in_x = LYState.indent
+                            }
+                        }
+                        // Clamp width to available space
+                        IfCondition GreaterThan(in_w, LYState.avail_w) ThenBlock: {
+                            in_w = LYState.avail_w
+                        }
+                        // Center input if text-align: center
+                        IfCondition EqualTo(LYState.text_align, 1) ThenBlock: {
+                            IfCondition EqualTo(in_x, LYState.indent) ThenBlock: {
+                                IfCondition LessThan(in_w, LYState.avail_w) ThenBlock: {
+                                    in_x = Add(LYState.indent, Divide(Subtract(LYState.avail_w, in_w), 2))
+                                }
+                            }
+                        }
+                        // Resolve padding from inline style
+                        in_hpad = 8
+                        in_vpad = 5
+                        IfCondition GreaterEqual(in_wrule, 0) ThenBlock: {
+                            in_pad_v = CSS_GetPropVal(in_wrule, "padding")
+                            IfCondition NotEqual(in_pad_v, 0) ThenBlock: {
+                                in_ppx = LY__ParsePx(in_pad_v)
+                                IfCondition GreaterThan(in_ppx, 0) ThenBlock: {
+                                    in_hpad = in_ppx
+                                    in_vpad = in_ppx
+                                }
+                            }
+                        }
+                        in_ih = Add(LYState.font_size_px, Multiply(in_vpad, 2))
+                        // White background
+                        LY__EmitFillRect(in_x, LYState.cursor_y, in_w, in_ih, LYConst.COLOR_WHITE)
+                        // Border: all 4 sides (1px gray)
+                        LY__EmitFillRect(in_x, LYState.cursor_y, in_w, 1, LYConst.COLOR_GRAY)
+                        LY__EmitFillRect(in_x, Add(LYState.cursor_y, Subtract(in_ih, 1)), in_w, 1, LYConst.COLOR_GRAY)
+                        LY__EmitFillRect(in_x, LYState.cursor_y, 1, in_ih, LYConst.COLOR_GRAY)
+                        LY__EmitFillRect(Add(in_x, Subtract(in_w, 1)), LYState.cursor_y, 1, in_ih, LYConst.COLOR_GRAY)
+                        // Record hit-region for click focus
+                        LY__AddHitRegion(in_x, LYState.cursor_y, in_w, in_ih, node, LYHitType.INPUT)
+                        // Placeholder or value text
+                        in_txt = in_val
+                        in_clr = LYConst.COLOR_BLACK
+                        IfCondition EqualTo(in_txt, 0) ThenBlock: {
+                            in_txt = in_ph
+                            in_clr = LYConst.COLOR_GRAY
+                        }
+                        IfCondition NotEqual(in_txt, 0) ThenBlock: {
+                            in_tl = StringLength(in_txt)
+                            IfCondition GreaterThan(in_tl, 0) ThenBlock: {
+                                LYTmp.ptr = in_txt
+                                LY__EmitDrawText(Add(in_x, in_hpad), Add(LYState.cursor_y, in_vpad), in_tl, in_clr)
+                            }
+                        }
+                        // Advance cursor_x past input (inline flow)
+                        LYState.cursor_x = Add(in_x, Add(in_w, 4))
+                    }
+                }
+            }
+        }
+
+        // Special: <select> — render as dropdown box
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "select"), 0) ThenBlock: {
+                // Draw a compact dropdown-like box
+                sel_w = 160
+                LY__EmitFillRect(LYState.indent, LYState.cursor_y, sel_w, 24, LYConst.COLOR_WHITE)
+                LY__EmitDrawLine(LYState.indent, LYState.cursor_y, sel_w, LYConst.COLOR_GRAY)
+                LY__EmitDrawLine(LYState.indent, Add(LYState.cursor_y, 23), sel_w, LYConst.COLOR_GRAY)
+                // Draw dropdown arrow indicator
+                LYTmp.ptr = "v"
+                LY__EmitDrawText(Add(LYState.indent, Subtract(sel_w, 12)), Add(LYState.cursor_y, 4), 1, LYConst.COLOR_GRAY)
+                LYState.cursor_y = Add(LYState.cursor_y, 28)
+                // Skip children (option elements)
+                LYState.fg_color = sv_fg2
+                LYState.visible = sv_vis2
+                ReturnValue(0)
+            }
+        }
+
+        // Special: <textarea> — render as multi-line text box with input support
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "textarea"), 0) ThenBlock: {
+                ta_w = 400
+                ta_h = 24
+                // Google uses textarea with rows="1" — treat as single-line input
+                ta_rows = DOM_GetAttr(node, "rows")
+                IfCondition NotEqual(ta_rows, 0) ThenBlock: {
+                    ta_rv = LY__ParsePx(ta_rows)
+                    IfCondition GreaterThan(ta_rv, 1) ThenBlock: {
+                        ta_h = Multiply(ta_rv, 16)
+                    }
+                }
+                // Center if text-align: center
+                ta_x = LYState.indent
+                IfCondition EqualTo(LYState.text_align, 1) ThenBlock: {
+                    IfCondition LessThan(ta_w, LYState.avail_w) ThenBlock: {
+                        ta_x = Add(LYState.indent, Divide(Subtract(LYState.avail_w, ta_w), 2))
+                    }
+                }
+                // White background
+                LY__EmitFillRect(ta_x, LYState.cursor_y, ta_w, ta_h, LYConst.COLOR_WHITE)
+                // Border
+                LY__EmitDrawLine(ta_x, LYState.cursor_y, ta_w, LYConst.COLOR_GRAY)
+                LY__EmitDrawLine(ta_x, Add(LYState.cursor_y, Subtract(ta_h, 1)), ta_w, LYConst.COLOR_GRAY)
+                // Record hit-region for click focus (same as text input)
+                LY__AddHitRegion(ta_x, LYState.cursor_y, ta_w, ta_h, node, LYHitType.INPUT)
+                // Show placeholder or value text
+                ta_ph = DOM_GetAttr(node, "placeholder")
+                ta_val = DOM_GetAttr(node, "value")
+                ta_txt = ta_val
+                ta_clr = LYConst.COLOR_BLACK
+                IfCondition EqualTo(ta_txt, 0) ThenBlock: {
+                    ta_txt = ta_ph
+                    ta_clr = LYConst.COLOR_GRAY
+                }
+                IfCondition NotEqual(ta_txt, 0) ThenBlock: {
+                    ta_tl = StringLength(ta_txt)
+                    IfCondition GreaterThan(ta_tl, 0) ThenBlock: {
+                        LYTmp.ptr = ta_txt
+                        LY__EmitDrawText(Add(ta_x, 4), Add(LYState.cursor_y, 4), ta_tl, ta_clr)
+                    }
+                }
+                LYState.cursor_y = Add(LYState.cursor_y, Add(ta_h, 4))
+                // Skip children — textarea content is the value, not child nodes
+                LYState.fg_color = sv_fg2
+                LYState.visible = sv_vis2
+                ReturnValue(0)
+            }
+        }
+
+        // Special: <button> — render as button
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "button"), 0) ThenBlock: {
+                // Save cursor, process children to get text, then wrap in button box
+                btn_y = LYState.cursor_y
+                // Button background
+                LY__EmitFillRect(LYState.indent, btn_y, 120, 24, 4293388263)
+                LY__EmitDrawLine(LYState.indent, btn_y, 120, LYConst.COLOR_GRAY)
+                LY__EmitDrawLine(LYState.indent, Add(btn_y, 23), 120, LYConst.COLOR_GRAY)
+                // Record hit-region for click
+                LY__AddHitRegion(LYState.indent, btn_y, 120, 24, node, LYHitType.BUTTON)
+                // Offset text inside button
+                LYState.indent = Add(LYState.indent, 8)
+                LYState.cursor_y = Add(LYState.cursor_y, 4)
+
+                ic = DOM_GetFirstChild(node)
+                WhileLoop GreaterEqual(ic, 0) {
+                    next_ic = DOM_GetNextSib(ic)
+                    LY__LayoutNode(ic)
+                    ic = next_ic
+                }
+
+                LYState.indent = Subtract(LYState.indent, 8)
+                LYState.cursor_y = Add(btn_y, 28)
+                LYState.fg_color = sv_fg2
+                LYState.visible = sv_vis2
+                ReturnValue(0)
+            }
+        }
+
+        // Special: <svg> — render inline SVG to pixels
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "svg"), 0) ThenBlock: {
+                // Get width/height from attributes or CSS
+                svg_w = 0
+                svg_h = 0
+                svg_ws = DOM_GetAttr(node, "width")
+                IfCondition NotEqual(svg_ws, 0) ThenBlock: {
+                    svg_wv = LY__ParsePx(svg_ws)
+                    IfCondition GreaterThan(svg_wv, 0) ThenBlock: { svg_w = svg_wv }
+                }
+                svg_hs = DOM_GetAttr(node, "height")
+                IfCondition NotEqual(svg_hs, 0) ThenBlock: {
+                    svg_hv = LY__ParsePx(svg_hs)
+                    IfCondition GreaterThan(svg_hv, 0) ThenBlock: { svg_h = svg_hv }
+                }
+                // Also try CSS width/height
+                IfCondition EqualTo(svg_w, 0) ThenBlock: {
+                    svg_cw = LY__CSSLookupProp(node, "width")
+                    IfCondition NotEqual(svg_cw, 0) ThenBlock: {
+                        svg_cwv = LY__ParsePx(svg_cw)
+                        IfCondition GreaterThan(svg_cwv, 0) ThenBlock: { svg_w = svg_cwv }
+                    }
+                }
+                IfCondition EqualTo(svg_h, 0) ThenBlock: {
+                    svg_ch = LY__CSSLookupProp(node, "height")
+                    IfCondition NotEqual(svg_ch, 0) ThenBlock: {
+                        svg_chv = LY__ParsePx(svg_ch)
+                        IfCondition GreaterThan(svg_chv, 0) ThenBlock: { svg_h = svg_chv }
+                    }
+                }
+                // Default size if none specified
+                IfCondition EqualTo(svg_w, 0) ThenBlock: { svg_w = 100 }
+                IfCondition EqualTo(svg_h, 0) ThenBlock: { svg_h = 100 }
+                // Clamp to available width
+                IfCondition GreaterThan(svg_w, LYState.avail_w) ThenBlock: {
+                    svg_old_w = svg_w
+                    svg_w = LYState.avail_w
+                    IfCondition GreaterThan(svg_old_w, 0) ThenBlock: {
+                        svg_h = Divide(Multiply(svg_h, svg_w), svg_old_w)
+                    }
+                }
+                // Render SVG to pixel buffer
+                svg_result = LY__RenderSVGNode(node, svg_w, svg_h)
+                IfCondition GreaterThan(svg_result, 0) ThenBlock: {
+                    // LYTmp.ptr already set by LY__RenderSVGNode
+                    LY__EmitDrawImage(LYState.cursor_x, LYState.cursor_y, svg_w, svg_h, svg_w, svg_h)
+                    LYState.cursor_y = Add(LYState.cursor_y, svg_h)
+                    LYState.cursor_x = LYState.indent
+                }
+                ReturnValue(0)
+            }
+        }
+
+        // Special: <img> — load and render image, fallback to alt text
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "img"), 0) ThenBlock: {
+                img_alt = DOM_GetAttr(node, "alt")
+                img_src = DOM_GetAttr(node, "src")
+                img_w = 0
+                img_h = 0
+                img_loaded = 0
+
+                // Try to get explicit dimensions from HTML attributes
+                img_attr_w = 0
+                img_attr_h = 0
+                img_ws = DOM_GetAttr(node, "width")
+                IfCondition NotEqual(img_ws, 0) ThenBlock: {
+                    img_wv = LY__ParsePx(img_ws)
+                    IfCondition GreaterThan(img_wv, 0) ThenBlock: { img_attr_w = img_wv }
+                }
+                img_hs = DOM_GetAttr(node, "height")
+                IfCondition NotEqual(img_hs, 0) ThenBlock: {
+                    img_hv = LY__ParsePx(img_hs)
+                    IfCondition GreaterThan(img_hv, 0) ThenBlock: { img_attr_h = img_hv }
+                }
+
+                // Also check CSS width/height from inline style
+                img_style = DOM_GetAttr(node, "style")
+                IfCondition NotEqual(img_style, 0) ThenBlock: {
+                    img_slen = StringLength(img_style)
+                    img_srule = CSS_ParseInline(img_style, img_slen)
+                    IfCondition GreaterEqual(img_srule, 0) ThenBlock: {
+                        img_cw = CSS_GetPropVal(img_srule, "width")
+                        IfCondition NotEqual(img_cw, 0) ThenBlock: {
+                            img_cwv = LY__ParsePx(img_cw)
+                            IfCondition GreaterThan(img_cwv, 0) ThenBlock: { img_attr_w = img_cwv }
+                        }
+                        img_ch = CSS_GetPropVal(img_srule, "height")
+                        IfCondition NotEqual(img_ch, 0) ThenBlock: {
+                            img_chv = LY__ParsePx(img_ch)
+                            IfCondition GreaterThan(img_chv, 0) ThenBlock: { img_attr_h = img_chv }
+                        }
+                    }
+                }
+
+                // Try to load the image from src
+                IfCondition NotEqual(img_src, 0) ThenBlock: {
+                    img_handle = -1
+                    // Skip data: URIs (can't HTTP fetch, not yet supported)
+                    img_is_data = 0
+                    IfCondition GreaterThan(StringLength(img_src), 5) ThenBlock: {
+                        // "data:" = 100,97,116,97,58
+                        IfCondition EqualTo(GetByte(img_src, 0), 100) ThenBlock: {
+                            IfCondition EqualTo(GetByte(img_src, 1), 97) ThenBlock: {
+                                IfCondition EqualTo(GetByte(img_src, 2), 116) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(img_src, 3), 97) ThenBlock: {
+                                        IfCondition EqualTo(GetByte(img_src, 4), 58) ThenBlock: {
+                                            img_is_data = 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Try to decode data: URI (base64 PNG/JPEG)
+                    IfCondition EqualTo(img_is_data, 1) ThenBlock: {
+                        img_handle = LY__LoadImageDataURI(img_src)
+                    }
+
+                    // Check if src is a URL (starts with "http" or "//")
+                    img_is_url = 0
+                    IfCondition EqualTo(img_is_data, 0) ThenBlock: {
+                        IfCondition GreaterThan(StringLength(img_src), 4) ThenBlock: {
+                            IfCondition EqualTo(GetByte(img_src, 0), 104) ThenBlock: {
+                                IfCondition EqualTo(GetByte(img_src, 1), 116) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(img_src, 2), 116) ThenBlock: {
+                                        IfCondition EqualTo(GetByte(img_src, 3), 112) ThenBlock: {
+                                            img_is_url = 1
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // Protocol-relative "//..."
+                        IfCondition EqualTo(img_is_url, 0) ThenBlock: {
+                            IfCondition GreaterThan(StringLength(img_src), 2) ThenBlock: {
+                                IfCondition EqualTo(GetByte(img_src, 0), 47) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(img_src, 1), 47) ThenBlock: {
+                                        img_is_url = 1
+                                    }
+                                }
+                            }
+                        }
+                        // Relative URL: if page_url is set, treat as web page
+                        IfCondition EqualTo(img_is_url, 0) ThenBlock: {
+                            IfCondition NotEqual(LYImgState.page_url, 0) ThenBlock: {
+                                img_is_url = 1
+                            }
+                        }
+                    }
+
+                    // Fetch via HTTP if URL
+                    IfCondition EqualTo(img_is_url, 1) ThenBlock: {
+                        img_abs_url = LY__ResolveImageURL(img_src)
+                        IfCondition NotEqual(img_abs_url, 0) ThenBlock: {
+                            img_handle = LY__LoadImageURL(img_abs_url)
+                        }
+                    }
+
+                    // Fall back to local file if not a URL and not a data: URI
+                    IfCondition LessThan(img_handle, 0) ThenBlock: {
+                        IfCondition EqualTo(img_is_url, 0) ThenBlock: {
+                            IfCondition EqualTo(img_is_data, 0) ThenBlock: {
+                                img_path = LY__BuildImagePath(img_src)
+                                IfCondition NotEqual(img_path, 0) ThenBlock: {
+                                    img_handle = LY__LoadImageFile(img_path)
+                                }
+                            }
+                        }
+                    }
+
+                    IfCondition GreaterEqual(img_handle, 0) ThenBlock: {
+                        img_loaded = 1
+                        img_src_w = IMG_GetWidth(img_handle)
+                        img_src_h = IMG_GetHeight(img_handle)
+                        img_pixels = IMG_GetPixels(img_handle)
+
+                        // Use decoded dimensions, override with explicit attrs
+                        img_w = img_src_w
+                        img_h = img_src_h
+                        IfCondition GreaterThan(img_attr_w, 0) ThenBlock: {
+                            img_w = img_attr_w
+                            // If only width set, scale height proportionally
+                            IfCondition EqualTo(img_attr_h, 0) ThenBlock: {
+                                IfCondition GreaterThan(img_src_w, 0) ThenBlock: {
+                                    img_h = Divide(Multiply(img_src_h, img_w), img_src_w)
+                                }
+                            }
+                        }
+                        IfCondition GreaterThan(img_attr_h, 0) ThenBlock: {
+                            img_h = img_attr_h
+                            // If only height set, scale width proportionally
+                            IfCondition EqualTo(img_attr_w, 0) ThenBlock: {
+                                IfCondition GreaterThan(img_src_h, 0) ThenBlock: {
+                                    img_w = Divide(Multiply(img_src_w, img_h), img_src_h)
+                                }
+                            }
+                        }
+
+                        // Clamp to available width
+                        IfCondition GreaterThan(img_w, LYState.avail_w) ThenBlock: {
+                            old_w = img_w
+                            img_w = LYState.avail_w
+                            IfCondition GreaterThan(old_w, 0) ThenBlock: {
+                                img_h = Divide(Multiply(img_h, img_w), old_w)
+                            }
+                        }
+
+                        // Position image at cursor
+                        img_x = LYState.cursor_x
+                        // Wrap to next line if doesn't fit
+                        img_re = Add(LYState.indent, LYState.avail_w)
+                        IfCondition GreaterThan(Add(img_x, img_w), img_re) ThenBlock: {
+                            IfCondition GreaterThan(img_x, LYState.indent) ThenBlock: {
+                                LYState.cursor_y = Add(LYState.cursor_y, LY__LineHeight())
+                                img_x = LYState.indent
+                            }
+                        }
+                        // Center image if text-align: center
+                        IfCondition EqualTo(LYState.text_align, 1) ThenBlock: {
+                            IfCondition LessThan(img_w, LYState.avail_w) ThenBlock: {
+                                img_x = Add(LYState.indent, Divide(Subtract(LYState.avail_w, img_w), 2))
+                            }
+                        }
+                        // Right-align image if text-align: right
+                        IfCondition EqualTo(LYState.text_align, 2) ThenBlock: {
+                            IfCondition LessThan(img_w, LYState.avail_w) ThenBlock: {
+                                img_x = Add(LYState.indent, Subtract(LYState.avail_w, img_w))
+                            }
+                        }
+
+                        // Emit DRAW_IMAGE command
+                        IfCondition NotEqual(img_pixels, 0) ThenBlock: {
+                            LYTmp.ptr = img_pixels
+                            LY__EmitDrawImage(img_x, LYState.cursor_y, img_w, img_h, img_src_w, img_src_h)
+                        }
+
+                        // Advance cursor past image
+                        LYState.cursor_y = Add(LYState.cursor_y, img_h)
+                        LYState.cursor_x = LYState.indent
+                    }
+                }
+
+                // Fallback: show alt text if image didn't load
+                IfCondition EqualTo(img_loaded, 0) ThenBlock: {
+                    // Use explicit dimensions or defaults
+                    IfCondition EqualTo(img_attr_w, 0) ThenBlock: { img_attr_w = 64 }
+                    IfCondition EqualTo(img_attr_h, 0) ThenBlock: { img_attr_h = 20 }
+                    IfCondition NotEqual(img_alt, 0) ThenBlock: {
+                        alt_len = StringLength(img_alt)
+                        IfCondition GreaterThan(alt_len, 0) ThenBlock: {
+                            // Draw placeholder box using explicit img dimensions
+                            alt_x = LYState.indent
+                            // Center placeholder if text-align: center
+                            IfCondition EqualTo(LYState.text_align, 1) ThenBlock: {
+                                IfCondition LessThan(img_attr_w, LYState.avail_w) ThenBlock: {
+                                    alt_x = Add(LYState.indent, Divide(Subtract(LYState.avail_w, img_attr_w), 2))
+                                }
+                            }
+                            // Draw light gray placeholder box with border
+                            LY__EmitFillRect(alt_x, LYState.cursor_y, img_attr_w, img_attr_h, 4293388263)
+                            LY__EmitDrawLine(alt_x, LYState.cursor_y, img_attr_w, LYConst.COLOR_GRAY)
+                            LY__EmitDrawLine(alt_x, Add(LYState.cursor_y, Subtract(img_attr_h, 1)), img_attr_w, LYConst.COLOR_GRAY)
+                            // Draw alt text centered in the placeholder
+                            LYTmp.ptr = img_alt
+                            alt_text_x = Add(alt_x, 4)
+                            alt_text_y = Add(LYState.cursor_y, Divide(Subtract(img_attr_h, 16), 2))
+                            LY__EmitDrawText(alt_text_x, alt_text_y, alt_len, LYConst.COLOR_GRAY)
+                            LYState.cursor_y = Add(LYState.cursor_y, Add(img_attr_h, 4))
+                        }
+                    } ElseBlock: {
+                        // No alt, no image — draw placeholder box
+                        alt_px = LYState.cursor_x
+                        // Center if text-align: center
+                        IfCondition EqualTo(LYState.text_align, 1) ThenBlock: {
+                            IfCondition LessThan(img_attr_w, LYState.avail_w) ThenBlock: {
+                                alt_px = Add(LYState.indent, Divide(Subtract(LYState.avail_w, img_attr_w), 2))
+                            }
+                        }
+                        LY__EmitFillRect(alt_px, LYState.cursor_y, img_attr_w, img_attr_h, 4293388263)
+                        LY__EmitDrawLine(alt_px, LYState.cursor_y, img_attr_w, LYConst.COLOR_GRAY)
+                        LYState.cursor_y = Add(LYState.cursor_y, Add(img_attr_h, 2))
+                    }
+                }
+            }
+        }
+
+        // Table cell padding: emit a space separator between <td>/<th> cells
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            td_sep = 0
+            IfCondition EqualTo(StringCompare(tag, "td"), 0) ThenBlock: { td_sep = 1 }
+            IfCondition EqualTo(StringCompare(tag, "th"), 0) ThenBlock: { td_sep = 1 }
+            IfCondition EqualTo(td_sep, 1) ThenBlock: {
+                LYTmp.ptr = "  "
+                LY__EmitText(LYTmp.ptr, 2, LYState.fg_color)
+            }
+        }
+
+        // Record hit-region for <a> links before processing children
+        IfCondition NotEqual(tag, 0) ThenBlock: {
+            IfCondition EqualTo(StringCompare(tag, "a"), 0) ThenBlock: {
+                // Measure link text width using VIF font metrics
+                link_w = 80
+                link_fc = DOM_GetFirstChild(node)
+                IfCondition GreaterEqual(link_fc, 0) ThenBlock: {
+                    link_tp = DOM_GetText(link_fc)
+                    link_tl = DOM_GetTextLen(link_fc)
+                    IfCondition And(GreaterThan(link_tl, 0), NotEqual(link_tp, 0)) ThenBlock: {
+                        // Use VIF measurement for real pixel width
+                        link_fsz = LYState.font_size_px
+                        IfCondition LessEqual(link_fsz, 0) ThenBlock: { link_fsz = 16 }
+                        link_inst = VFont_CreateInstance(FontState.default_face, link_fsz)
+                        IfCondition GreaterEqual(link_inst, 0) ThenBlock: {
+                            link_w = VInst_MeasureWidth(link_inst, link_tp, link_tl)
+                            IfCondition LessEqual(link_w, 0) ThenBlock: {
+                                link_w = Multiply(link_tl, LYState.font_w_px)
+                            }
+                        } ElseBlock: {
+                            link_w = Multiply(link_tl, LYState.font_w_px)
+                        }
+                    }
+                }
+                LY__AddHitRegion(LYState.cursor_x, LYState.cursor_y, link_w, 16, node, LYHitType.LINK)
+            }
+        }
+
+        // Process children — get next sibling BEFORE recursing
+        ic = DOM_GetFirstChild(node)
+        WhileLoop GreaterEqual(ic, 0) {
+            next_ic = DOM_GetNextSib(ic)
+            LY__LayoutNode(ic)
+            ic = next_ic
+        }
+
+        // Apply right padding after children
+        IfCondition GreaterThan(inl_pad_r, 0) ThenBlock: {
+            LYState.cursor_x = Add(LYState.cursor_x, inl_pad_r)
+        }
+
+        // Patch the reserved inline background FILL_RECT with actual dimensions
+        IfCondition GreaterEqual(inl_bg_slot, 0) ThenBlock: {
+            // Width = how far cursor_x advanced from bg start (includes padding)
+            inl_bg_w = Subtract(LYState.cursor_x, inl_bg_x)
+            IfCondition LessEqual(inl_bg_w, 0) ThenBlock: {
+                // If cursor_x didn't advance, content may have wrapped to new line
+                // Use available width as fallback
+                inl_bg_w = LYState.avail_w
+            }
+            // Height = cursor_y delta for multi-line, or rendered font height for single-line
+            // Use actual glyph height (FONT_H) since text rendering doesn't scale glyphs
+            inl_bg_h = Subtract(LYState.cursor_y, inl_bg_y)
+            IfCondition LessEqual(inl_bg_h, 0) ThenBlock: {
+                inl_bg_h = LYConst.FONT_H
+            }
+            LY__CmdSet(inl_bg_slot, LYConst.C_W, inl_bg_w)
+            LY__CmdSet(inl_bg_slot, LYConst.C_H, inl_bg_h)
+        }
+
+        // Apply right margin after background
+        IfCondition GreaterThan(inl_mar_r, 0) ThenBlock: {
+            LYState.cursor_x = Add(LYState.cursor_x, inl_mar_r)
+        }
+
+        LYState.fg_color = sv_fg2
+        LYState.visible = sv_vis2
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// TABLE ROW LAYOUT — lay out <td>/<th> children horizontally
+// =============================================================================
+Function.LY__TableRowLayout {
+    Input: node: Integer
+    Body: {
+        // Pass 1: Count cells and compute widths
+        tr_total_w = LYState.avail_w
+        tr_x_start = LYState.indent
+        tr_y_start = LYState.cursor_y
+        cell_count = 0
+        fixed_w = 0
+        auto_count = 0
+
+        // Allocate arrays for cell widths (max 32 cells)
+        cell_widths = Allocate(256)
+        MemorySet(cell_widths, 0, 256)
+
+        // Pass 1: Scan children, determine cell widths
+        ch = DOM_GetFirstChild(node)
+        WhileLoop GreaterEqual(ch, 0) {
+            ch_tag = DOM_GetTag(ch)
+            is_cell = 0
+            IfCondition NotEqual(ch_tag, 0) ThenBlock: {
+                IfCondition EqualTo(StringCompare(ch_tag, "td"), 0) ThenBlock: { is_cell = 1 }
+                IfCondition EqualTo(StringCompare(ch_tag, "th"), 0) ThenBlock: { is_cell = 1 }
+            }
+            IfCondition EqualTo(is_cell, 1) ThenBlock: {
+                IfCondition LessThan(cell_count, 32) ThenBlock: {
+                    cw = 0
+                    // Check width attribute
+                    w_attr = DOM_GetAttr(ch, "width")
+                    IfCondition NotEqual(w_attr, 0) ThenBlock: {
+                        w_len = StringLength(w_attr)
+                        IfCondition GreaterThan(w_len, 0) ThenBlock: {
+                            last_ch = GetByte(w_attr, Subtract(w_len, 1))
+                            IfCondition EqualTo(last_ch, 37) ThenBlock: {
+                                // Percentage: manually compute from table width
+                                // Don't use LY__ParsePx which uses avail_w
+                                pct_val = 0
+                                pct_i = 0
+                                WhileLoop LessThan(pct_i, w_len) {
+                                    pct_c = GetByte(w_attr, pct_i)
+                                    IfCondition And(GreaterEqual(pct_c, 48), LessEqual(pct_c, 57)) ThenBlock: {
+                                        pct_val = Add(Multiply(pct_val, 10), Subtract(pct_c, 48))
+                                    } ElseBlock: {
+                                        BreakLoop
+                                    }
+                                    pct_i = Add(pct_i, 1)
+                                }
+                                IfCondition GreaterThan(pct_val, 0) ThenBlock: {
+                                    cw = Divide(Multiply(tr_total_w, pct_val), 100)
+                                }
+                            }
+                            IfCondition NotEqual(last_ch, 37) ThenBlock: {
+                                // Plain number (pixels)
+                                cw = LY__ParsePx(w_attr)
+                                IfCondition Not(GreaterThan(cw, 0)) ThenBlock: { cw = 0 }
+                            }
+                        }
+                    }
+                    // Also check CSS width from inline style
+                    IfCondition EqualTo(cw, 0) ThenBlock: {
+                        cw_style = DOM_GetAttr(ch, "style")
+                        IfCondition NotEqual(cw_style, 0) ThenBlock: {
+                            IfCondition GreaterEqual(StringIndexOf(cw_style, "width"), 0) ThenBlock: {
+                                cw_slen = StringLength(cw_style)
+                                cw_rule = CSS_ParseInline(cw_style, cw_slen)
+                                IfCondition GreaterEqual(cw_rule, 0) ThenBlock: {
+                                    cw_v = CSS_GetPropVal(cw_rule, "width")
+                                    IfCondition NotEqual(cw_v, 0) ThenBlock: {
+                                        cw_px = LY__ParsePx(cw_v)
+                                        IfCondition GreaterThan(cw_px, 0) ThenBlock: {
+                                            cw = cw_px
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // Store cell width
+                    StoreValue(Add(cell_widths, Multiply(cell_count, 8)), cw)
+                    IfCondition GreaterThan(cw, 0) ThenBlock: {
+                        fixed_w = Add(fixed_w, cw)
+                    } ElseBlock: {
+                        auto_count = Add(auto_count, 1)
+                    }
+                    cell_count = Add(cell_count, 1)
+                }
+            }
+            ch = DOM_GetNextSib(ch)
+        }
+
+        // Distribute remaining width to auto cells
+        remaining = Subtract(tr_total_w, fixed_w)
+        IfCondition LessThan(remaining, 0) ThenBlock: { remaining = 0 }
+        auto_w = 0
+        IfCondition GreaterThan(auto_count, 0) ThenBlock: {
+            auto_w = Divide(remaining, auto_count)
+        }
+        // Fill in auto widths
+        ci = 0
+        WhileLoop LessThan(ci, cell_count) {
+            cw_off = Add(cell_widths, Multiply(ci, 8))
+            cw_stored = Dereference(cw_off)
+            IfCondition EqualTo(cw_stored, 0) ThenBlock: {
+                StoreValue(cw_off, auto_w)
+            }
+            ci = Add(ci, 1)
+        }
+
+        // Pass 2: Layout each cell at its horizontal position
+        cell_x = tr_x_start
+        max_cell_h = 0
+        ci = 0
+        ch = DOM_GetFirstChild(node)
+        WhileLoop GreaterEqual(ch, 0) {
+            ch_tag = DOM_GetTag(ch)
+            is_cell = 0
+            IfCondition NotEqual(ch_tag, 0) ThenBlock: {
+                IfCondition EqualTo(StringCompare(ch_tag, "td"), 0) ThenBlock: { is_cell = 1 }
+                IfCondition EqualTo(StringCompare(ch_tag, "th"), 0) ThenBlock: { is_cell = 1 }
+            }
+            IfCondition EqualTo(is_cell, 1) ThenBlock: {
+                IfCondition LessThan(ci, cell_count) ThenBlock: {
+                    cell_w = Dereference(Add(cell_widths, Multiply(ci, 8)))
+                    // Save layout state
+                    sv_ind_tr = LYState.indent
+                    sv_aw_tr = LYState.avail_w
+                    sv_cx_tr = LYState.cursor_x
+                    sv_cy_tr = LYState.cursor_y
+
+                    // Set cell layout bounds
+                    LYState.indent = cell_x
+                    LYState.avail_w = cell_w
+                    LYState.cursor_x = cell_x
+                    LYState.cursor_y = tr_y_start
+
+                    // Layout the cell content (as a block)
+                    LY__LayoutBlock(ch, ch_tag, LYDisp.BLOCK, 1)
+
+                    // Track tallest cell for row height
+                    cell_h = Subtract(LYState.cursor_y, tr_y_start)
+                    IfCondition GreaterThan(cell_h, max_cell_h) ThenBlock: {
+                        max_cell_h = cell_h
+                    }
+
+                    // Advance to next cell position
+                    cell_x = Add(cell_x, cell_w)
+
+                    // Restore layout state (except cursor_y which we track)
+                    LYState.indent = sv_ind_tr
+                    LYState.avail_w = sv_aw_tr
+                    LYState.cursor_x = sv_cx_tr
+                    LYState.cursor_y = sv_cy_tr
+
+                    ci = Add(ci, 1)
+                }
+            } ElseBlock: {
+                // Non-cell children (text nodes, other elements) — skip in table row
+                nop = 0
+            }
+            ch = DOM_GetNextSib(ch)
+        }
+
+        // Set cursor_y to bottom of tallest cell
+        LYState.cursor_y = Add(tr_y_start, max_cell_h)
+
+        Deallocate(cell_widths, 256)
+        ReturnValue(0)
+    }
+}

@@ -1,0 +1,486 @@
+// Library.PropTable.ailang — FixedPool property tables replacing XSHash
+// Object properties: 264-byte linear-scan tables from ring buffer slab
+// Global variables: 8KB open-addressed hash with linear probing
+// No Arena. No linked lists. No dynamic allocation.
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.PropConst {
+    "ENTRY_SIZE":      Initialize=16
+    "MAX_ENTRIES":     Initialize=32
+    "TABLE_SIZE":      Initialize=520
+    "MAX_TABLES":      Initialize=32768
+    "TOMBSTONE":       Initialize=-2
+    "GLOBAL_SLOTS":    Initialize=2048
+    "GLOBAL_SIZE":     Initialize=32768
+    "ARR_SIDE_MAX":    Initialize=2048
+    "ARR_SIDE_ENTRY":  Initialize=16
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.PropState {
+    "slab":          Initialize=0
+    "next_slot":     Initialize=0
+    "global_hash":   Initialize=0
+    "arr_side":      Initialize=0
+    "arr_side_count": Initialize=0
+}
+
+// =============================================================================
+// TEMPORARIES
+// =============================================================================
+FixedPool.PropTmp {
+    "idx":       Initialize=0
+    "key":       Initialize=0
+    "val":       Initialize=0
+    "slot":      Initialize=0
+    "addr":      Initialize=0
+    "count":     Initialize=0
+    "ekey":      Initialize=0
+}
+
+// =============================================================================
+// INIT — allocate slab + global hash at startup
+// =============================================================================
+Function.PropTable_Init {
+    Output: Integer
+    Body: {
+        // Object property slab: 32768 x 264 = 8,650,752 bytes
+        slab_sz = Multiply(PropConst.MAX_TABLES, PropConst.TABLE_SIZE)
+        PropState.slab = Allocate(slab_sz)
+        MemorySet(PropState.slab, 0, slab_sz)
+        PropState.next_slot = 0
+
+        // Global hash: 2048 x 16 = 32768 bytes
+        PropState.global_hash = Allocate(PropConst.GLOBAL_SIZE)
+        MemorySet(PropState.global_hash, 0, PropConst.GLOBAL_SIZE)
+
+        // Array named-property side table: 2048 x 16 = 32768 bytes
+        // Each entry: [array_jsval_ptr(8) | proptable_ptr(8)]
+        arr_side_sz = Multiply(PropConst.ARR_SIDE_MAX, PropConst.ARR_SIDE_ENTRY)
+        PropState.arr_side = Allocate(arr_side_sz)
+        MemorySet(PropState.arr_side, 0, arr_side_sz)
+        PropState.arr_side_count = 0
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// OBJECT PROPERTY TABLE — ring buffer allocation
+// =============================================================================
+
+// Allocate a 264-byte property table for an object.
+// Returns address to the table (zeroed). Ring buffer wraps.
+Function.PropTable_Alloc {
+    Output: Address
+    Body: {
+        idx = PropState.next_slot
+        addr = Add(PropState.slab, Multiply(idx, PropConst.TABLE_SIZE))
+        MemorySet(addr, 0, PropConst.TABLE_SIZE)
+        PropState.next_slot = Add(idx, 1)
+        IfCondition GreaterEqual(PropState.next_slot, PropConst.MAX_TABLES) ThenBlock: {
+            PropState.next_slot = 0
+        }
+        ReturnValue(addr)
+    }
+}
+
+// =============================================================================
+// OBJECT PROPERTY TABLE — lookup
+// Linear scan entries[0..count-1]. Pointer compare first, string fallback.
+// Returns value or -1 (XNULL) if not found.
+// =============================================================================
+Function.PropTable_Lookup {
+    Input: table: Address
+    Input: key: Address
+    Output: Integer
+    Body: {
+        save_table = table
+        save_key = key
+        IfCondition EqualTo(save_table, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        count = Dereference(save_table)
+        IfCondition EqualTo(count, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        // Clamp count to MAX_ENTRIES
+        IfCondition GreaterThan(count, PropConst.MAX_ENTRIES) ThenBlock: {
+            count = PropConst.MAX_ENTRIES
+        }
+        PropTmp.idx = 0
+        WhileLoop LessThan(PropTmp.idx, count) {
+            // Entry at offset 8 + idx*16
+            PropTmp.addr = Add(save_table, Add(8, Multiply(PropTmp.idx, PropConst.ENTRY_SIZE)))
+            PropTmp.ekey = Dereference(PropTmp.addr)
+            // Skip empty (0) and tombstone (-2)
+            IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
+                PropTmp.idx = Add(PropTmp.idx, 1)
+            } ElseBlock: {
+                IfCondition EqualTo(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
+                    PropTmp.idx = Add(PropTmp.idx, 1)
+                } ElseBlock: {
+                    // Pointer compare first (fast path)
+                    IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
+                        ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+                    }
+                    // String compare fallback
+                    cmp = StringCompare(PropTmp.ekey, save_key)
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+                    }
+                    PropTmp.idx = Add(PropTmp.idx, 1)
+                }
+            }
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// OBJECT PROPERTY TABLE — insert/update
+// Scan for existing key → update value. Else append at count position.
+// Returns 1 (new insert), 0 (update), -1 (table full).
+// =============================================================================
+Function.PropTable_Insert {
+    Input: table: Address
+    Input: key: Address
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        save_table = table
+        save_key = key
+        save_val = val
+        IfCondition EqualTo(save_table, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        count = Dereference(save_table)
+        // Clamp count to MAX_ENTRIES
+        IfCondition GreaterThan(count, PropConst.MAX_ENTRIES) ThenBlock: {
+            count = PropConst.MAX_ENTRIES
+        }
+        // First pass: check if key already exists
+        first_tombstone = -1
+        PropTmp.idx = 0
+        WhileLoop LessThan(PropTmp.idx, count) {
+            PropTmp.addr = Add(save_table, Add(8, Multiply(PropTmp.idx, PropConst.ENTRY_SIZE)))
+            PropTmp.ekey = Dereference(PropTmp.addr)
+            // Track first tombstone for reuse
+            IfCondition EqualTo(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
+                IfCondition EqualTo(first_tombstone, -1) ThenBlock: {
+                    first_tombstone = PropTmp.idx
+                }
+            } ElseBlock: {
+                IfCondition NotEqual(PropTmp.ekey, 0) ThenBlock: {
+                    // Pointer compare
+                    IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
+                        StoreValue(Add(PropTmp.addr, 8), save_val)
+                        ReturnValue(0)
+                    }
+                    // String compare
+                    cmp = StringCompare(PropTmp.ekey, save_key)
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        StoreValue(Add(PropTmp.addr, 8), save_val)
+                        ReturnValue(0)
+                    }
+                }
+            }
+            PropTmp.idx = Add(PropTmp.idx, 1)
+        }
+        // Not found — insert new entry
+        // Reuse tombstone if available
+        IfCondition NotEqual(first_tombstone, -1) ThenBlock: {
+            PropTmp.addr = Add(save_table, Add(8, Multiply(first_tombstone, PropConst.ENTRY_SIZE)))
+            StoreValue(PropTmp.addr, save_key)
+            StoreValue(Add(PropTmp.addr, 8), save_val)
+            ReturnValue(1)
+        }
+        // Append at end if room
+        IfCondition GreaterEqual(count, PropConst.MAX_ENTRIES) ThenBlock: {
+            ReturnValue(-1)
+        }
+        PropTmp.addr = Add(save_table, Add(8, Multiply(count, PropConst.ENTRY_SIZE)))
+        StoreValue(PropTmp.addr, save_key)
+        StoreValue(Add(PropTmp.addr, 8), save_val)
+        // Increment count
+        StoreValue(save_table, Add(count, 1))
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// OBJECT PROPERTY TABLE — exists
+// Returns 1 if key found, 0 if not.
+// =============================================================================
+Function.PropTable_Exists {
+    Input: table: Address
+    Input: key: Address
+    Output: Integer
+    Body: {
+        save_table = table
+        save_key = key
+        result = PropTable_Lookup(save_table, save_key)
+        IfCondition NotEqual(result, -1) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// OBJECT PROPERTY TABLE — delete (tombstone)
+// Returns old value or -1 if not found.
+// =============================================================================
+Function.PropTable_Delete {
+    Input: table: Address
+    Input: key: Address
+    Output: Integer
+    Body: {
+        save_table = table
+        save_key = key
+        IfCondition EqualTo(save_table, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        count = Dereference(save_table)
+        IfCondition GreaterThan(count, PropConst.MAX_ENTRIES) ThenBlock: {
+            count = PropConst.MAX_ENTRIES
+        }
+        PropTmp.idx = 0
+        WhileLoop LessThan(PropTmp.idx, count) {
+            PropTmp.addr = Add(save_table, Add(8, Multiply(PropTmp.idx, PropConst.ENTRY_SIZE)))
+            PropTmp.ekey = Dereference(PropTmp.addr)
+            IfCondition NotEqual(PropTmp.ekey, 0) ThenBlock: {
+                IfCondition NotEqual(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
+                    found = 0
+                    IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
+                        found = 1
+                    }
+                    IfCondition EqualTo(found, 0) ThenBlock: {
+                        cmp = StringCompare(PropTmp.ekey, save_key)
+                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                            found = 1
+                        }
+                    }
+                    IfCondition EqualTo(found, 1) ThenBlock: {
+                        old_val = Dereference(Add(PropTmp.addr, 8))
+                        StoreValue(PropTmp.addr, PropConst.TOMBSTONE)
+                        StoreValue(Add(PropTmp.addr, 8), 0)
+                        ReturnValue(old_val)
+                    }
+                }
+            }
+            PropTmp.idx = Add(PropTmp.idx, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// OBJECT PROPERTY TABLE — keys enumeration
+// Returns XArray of key pointers (not copies — direct const pool pointers).
+// =============================================================================
+Function.PropTable_Keys {
+    Input: table: Address
+    Output: Address
+    Body: {
+        save_table = table
+        keys = XArray.XCreate(16)
+        IfCondition EqualTo(save_table, 0) ThenBlock: {
+            ReturnValue(keys)
+        }
+        count = Dereference(save_table)
+        IfCondition GreaterThan(count, PropConst.MAX_ENTRIES) ThenBlock: {
+            count = PropConst.MAX_ENTRIES
+        }
+        PropTmp.idx = 0
+        WhileLoop LessThan(PropTmp.idx, count) {
+            PropTmp.addr = Add(save_table, Add(8, Multiply(PropTmp.idx, PropConst.ENTRY_SIZE)))
+            PropTmp.ekey = Dereference(PropTmp.addr)
+            // Only collect live entries (not empty, not tombstone)
+            IfCondition NotEqual(PropTmp.ekey, 0) ThenBlock: {
+                IfCondition NotEqual(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
+                    XArray.XPush(keys, PropTmp.ekey)
+                }
+            }
+            PropTmp.idx = Add(PropTmp.idx, 1)
+        }
+        ReturnValue(keys)
+    }
+}
+
+// =============================================================================
+// GLOBAL VARIABLE HASH — open-addressed, linear probing, 2048 slots
+// =============================================================================
+
+// DJB2 hash variant (h = h*31 + byte), mod 2048
+Function.GlobalHash__Hash {
+    Input: key: Address
+    Output: Integer
+    Body: {
+        save_key = key
+        h = 0
+        PropTmp.idx = 0
+        ch = GetByte(save_key, PropTmp.idx)
+        WhileLoop NotEqual(ch, 0) {
+            h = Add(Multiply(h, 31), ch)
+            PropTmp.idx = Add(PropTmp.idx, 1)
+            ch = GetByte(save_key, PropTmp.idx)
+        }
+        // Make positive
+        IfCondition LessThan(h, 0) ThenBlock: {
+            h = Subtract(0, h)
+        }
+        // Mod 2048 using bitwise AND (2048 = power of 2)
+        h = BitwiseAnd(h, 2047)
+        ReturnValue(h)
+    }
+}
+
+// Lookup a global by name. Returns value or -1 if not found.
+Function.GlobalHash_Lookup {
+    Input: key: Address
+    Output: Integer
+    Body: {
+        save_key = key
+        IfCondition EqualTo(PropState.global_hash, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        bucket = GlobalHash__Hash(save_key)
+        // Linear probe up to 2048 slots
+        PropTmp.idx = 0
+        WhileLoop LessThan(PropTmp.idx, PropConst.GLOBAL_SLOTS) {
+            slot_idx = BitwiseAnd(Add(bucket, PropTmp.idx), 2047)
+            PropTmp.addr = Add(PropState.global_hash, Multiply(slot_idx, PropConst.ENTRY_SIZE))
+            PropTmp.ekey = Dereference(PropTmp.addr)
+            // Empty slot = not found
+            IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
+                ReturnValue(-1)
+            }
+            // Pointer compare
+            IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
+                ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+            }
+            // String compare
+            cmp = StringCompare(PropTmp.ekey, save_key)
+            IfCondition EqualTo(cmp, 0) ThenBlock: {
+                ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+            }
+            PropTmp.idx = Add(PropTmp.idx, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// Insert or update a global. Returns 1 (new) or 0 (update).
+Function.GlobalHash_Insert {
+    Input: key: Address
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        save_key = key
+        save_val = val
+        IfCondition EqualTo(PropState.global_hash, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+        bucket = GlobalHash__Hash(save_key)
+        // Linear probe
+        PropTmp.idx = 0
+        WhileLoop LessThan(PropTmp.idx, PropConst.GLOBAL_SLOTS) {
+            slot_idx = BitwiseAnd(Add(bucket, PropTmp.idx), 2047)
+            PropTmp.addr = Add(PropState.global_hash, Multiply(slot_idx, PropConst.ENTRY_SIZE))
+            PropTmp.ekey = Dereference(PropTmp.addr)
+            // Empty slot — insert here
+            IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
+                StoreValue(PropTmp.addr, save_key)
+                StoreValue(Add(PropTmp.addr, 8), save_val)
+                ReturnValue(1)
+            }
+            // Existing key — update value
+            IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
+                StoreValue(Add(PropTmp.addr, 8), save_val)
+                ReturnValue(0)
+            }
+            cmp = StringCompare(PropTmp.ekey, save_key)
+            IfCondition EqualTo(cmp, 0) ThenBlock: {
+                StoreValue(Add(PropTmp.addr, 8), save_val)
+                ReturnValue(0)
+            }
+            PropTmp.idx = Add(PropTmp.idx, 1)
+        }
+        // Table full
+        ReturnValue(-1)
+    }
+}
+
+// Reset global hash (clear all slots)
+Function.GlobalHash_Reset {
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(PropState.global_hash, 0) ThenBlock: {
+            MemorySet(PropState.global_hash, 0, PropConst.GLOBAL_SIZE)
+        }
+        // Also reset array side table
+        IfCondition NotEqual(PropState.arr_side, 0) ThenBlock: {
+            as_sz = Multiply(PropConst.ARR_SIDE_MAX, PropConst.ARR_SIDE_ENTRY)
+            MemorySet(PropState.arr_side, 0, as_sz)
+            PropState.arr_side_count = 0
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// ARRAY NAMED-PROPERTY SIDE TABLE
+// Maps array JSValue pointers to PropTable handles for named properties.
+// Linear scan — 256 entries max. Each: [arr_ptr(8) | ptable_ptr(8)]
+// =============================================================================
+
+// Look up the PropTable for an array. Returns PropTable address or 0 if none.
+Function.ArrSide_Lookup {
+    Input: arr_ptr: Address
+    Output: Address
+    Body: {
+        save_arr = arr_ptr
+        as_i = 0
+        WhileLoop LessThan(as_i, PropState.arr_side_count) {
+            as_addr = Add(PropState.arr_side, Multiply(as_i, PropConst.ARR_SIDE_ENTRY))
+            as_key = Dereference(as_addr)
+            IfCondition EqualTo(as_key, save_arr) ThenBlock: {
+                ReturnValue(Dereference(Add(as_addr, 8)))
+            }
+            as_i = Add(as_i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Get or create a PropTable for an array. Returns PropTable address.
+Function.ArrSide_GetOrCreate {
+    Input: arr_ptr: Address
+    Output: Address
+    Body: {
+        save_arr = arr_ptr
+        // Check if already exists
+        existing = ArrSide_Lookup(save_arr)
+        IfCondition NotEqual(existing, 0) ThenBlock: {
+            ReturnValue(existing)
+        }
+        // Allocate new PropTable and insert into side table
+        pt = PropTable_Alloc()
+        IfCondition GreaterEqual(PropState.arr_side_count, PropConst.ARR_SIDE_MAX) ThenBlock: {
+            // Wrap around — overwrite oldest entry
+            PropState.arr_side_count = 0
+        }
+        as_addr = Add(PropState.arr_side, Multiply(PropState.arr_side_count, PropConst.ARR_SIDE_ENTRY))
+        StoreValue(as_addr, save_arr)
+        StoreValue(Add(as_addr, 8), pt)
+        PropState.arr_side_count = Add(PropState.arr_side_count, 1)
+        ReturnValue(pt)
+    }
+}

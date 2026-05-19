@@ -61,6 +61,35 @@ FixedPool.JSValidTmp {
     "base":       Initialize=0
 }
 
+// Duplicate params checker state
+FixedPool.JSValidDup {
+    "names":    Initialize=0    // pointer to buffer: 32 entries × 16 bytes (ptr:8 + len:8)
+    "count":    Initialize=0    // number of names stored
+    "ptr":      Initialize=0    // temp: current param name ptr
+    "len":      Initialize=0    // temp: current param name len
+}
+
+// Private names validation state — AllPrivateNamesValid per ES spec
+// Supports nested classes: stack of name sets (up to 8 levels)
+// Each level has up to 32 entries × 16 bytes (ptr:8 + len:8) = 512 bytes
+// Total buffer: 8 levels × 512 bytes = 4096 bytes
+FixedPool.JSValidPriv {
+    "names":    Initialize=0    // pointer to buffer: 8 levels × 32 entries × 16 bytes
+    "counts":   Initialize=0    // pointer to 8-entry array of counts (8 bytes each = 64 bytes)
+    "depth":    Initialize=0    // current nesting depth (0 = not in any class)
+}
+
+// AST walker state — iterative DFS for static semantic checks
+// Uses its own stack (not ASTStack) to avoid interference with parser
+FixedPool.JSValidWalk {
+    "stack":   Initialize=0    // pointer to 256-entry × 8-byte stack buffer
+    "sp":      Initialize=0    // stack pointer (entry count)
+    "cur":     Initialize=0    // current node index
+    "ntype":   Initialize=0    // type of current node
+    "child":   Initialize=0    // temp child node index
+    "result":  Initialize=0    // walk result (0=ok, nonzero=error)
+}
+
 // =============================================================================
 // INIT — allocate and populate all truth tables
 // =============================================================================
@@ -175,6 +204,7 @@ Function.JSValidate_Init {
         SetByte(JSValidState.expr_start, 126, 1)    // TMPL_HEAD
         SetByte(JSValidState.expr_start, 106, 1)    // KW_ASYNC
         SetByte(JSValidState.expr_start, 107, 1)    // KW_AWAIT
+        SetByte(JSValidState.expr_start, 130, 1)    // REGEX_LIT
 
         // --- Scope tracking tables for redeclaration detection ---
         // scope_counts: array of 16 integers (8 bytes each) = 128 bytes
@@ -184,6 +214,24 @@ Function.JSValidate_Init {
         JSValidState.scope_names = Arena_Alloc(24576)
         MemorySet(JSValidState.scope_names, 0, 24576)
         JSValidState.scope_depth = 0
+
+        // --- AST walker stack for static semantic checks ---
+        JSValidWalk.stack = Arena_Alloc(2048)
+        MemorySet(JSValidWalk.stack, 0, 2048)
+        JSValidWalk.sp = 0
+
+        // --- Duplicate params buffer: 32 entries × 16 bytes = 512 bytes ---
+        JSValidDup.names = Arena_Alloc(512)
+        MemorySet(JSValidDup.names, 0, 512)
+        JSValidDup.count = 0
+
+        // --- Private names buffer: 8 levels × 32 entries × 16 bytes = 4096 bytes ---
+        JSValidPriv.names = Arena_Alloc(4096)
+        MemorySet(JSValidPriv.names, 0, 4096)
+        // Counts array: 8 × 8 bytes = 64 bytes
+        JSValidPriv.counts = Arena_Alloc(64)
+        MemorySet(JSValidPriv.counts, 0, 64)
+        JSValidPriv.depth = 0
 
         JSValidState.initialized = 1
         ReturnValue(1)
@@ -381,5 +429,470 @@ Function.JSValidate_DeclareBinding {
         StoreValue(Add(JSValidState.scope_counts, Multiply(JSValidTmp.base, 8)), Add(JSValidTmp.i, 1))
 
         ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// AST WALKER — iterative DFS for class element static semantic checks
+// =============================================================================
+
+// Internal: push a node onto the walk stack (skip if <= 0 or stack full)
+Function.JSValidWalk__Push {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterThan(node, 0), LessThan(JSValidWalk.sp, 256)) ThenBlock: {
+            StoreValue(Add(JSValidWalk.stack, Multiply(JSValidWalk.sp, 8)), node)
+            JSValidWalk.sp = Add(JSValidWalk.sp, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Internal: pop a node from the walk stack (returns 0 if empty)
+Function.JSValidWalk__Pop {
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(JSValidWalk.sp, 0) ThenBlock: { ReturnValue(0) }
+        JSValidWalk.sp = Subtract(JSValidWalk.sp, 1)
+        ReturnValue(Dereference(Add(JSValidWalk.stack, Multiply(JSValidWalk.sp, 8))))
+    }
+}
+
+// Internal: push all children of a node (LEFT, RIGHT, BODY, COND, NEXT)
+// Uses JSValidWalk.cur to preserve node across calls
+Function.JSValidWalk__PushChildren {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        JSValidWalk.cur = node
+        JSValidWalk.child = JSParse_GetNext(JSValidWalk.cur)
+        JSValidWalk__Push(JSValidWalk.child)
+        JSValidWalk.child = JSParse_GetCond(JSValidWalk.cur)
+        JSValidWalk__Push(JSValidWalk.child)
+        JSValidWalk.child = JSParse_GetBody(JSValidWalk.cur)
+        JSValidWalk__Push(JSValidWalk.child)
+        JSValidWalk.child = JSParse_GetRight(JSValidWalk.cur)
+        JSValidWalk__Push(JSValidWalk.child)
+        JSValidWalk.child = JSParse_GetLeft(JSValidWalk.cur)
+        JSValidWalk__Push(JSValidWalk.child)
+        ReturnValue(0)
+    }
+}
+
+// Check whether a node type is a function boundary (creates own arguments/super)
+// FUNC_EXPR=27, FUNC_DECL=4, GEN_FUNC_EXPR=50, GEN_FUNC_DECL=49,
+// ASYNC_FUNC_EXPR=60, ASYNC_FUNC_DECL=59
+// Does NOT include ARROW_EXPR=47 (arrows inherit outer arguments/super)
+Function.JSValidWalk__IsFuncBoundary {
+    Input: ntype: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ntype, 27) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ntype, 4) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ntype, 50) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ntype, 49) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ntype, 60) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ntype, 59) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// Check if a field initializer AST subtree contains 'arguments' or super().
+// Per ES spec 15.7.1 Static Semantics: Early Errors
+//   - ContainsArguments of Initializer → SyntaxError
+//   - Initializer Contains SuperCall → SyntaxError
+// Stops at function boundaries but NOT arrow functions.
+// Returns: 0=OK, 1=contains 'arguments', 2=contains super() call
+Function.JSValidate_CheckFieldInit {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(node, 0) ThenBlock: { ReturnValue(0) }
+
+        JSValidWalk.sp = 0
+        JSValidWalk__Push(node)
+        JSValidWalk.result = 0
+
+        WhileLoop And(GreaterThan(JSValidWalk.sp, 0), EqualTo(JSValidWalk.result, 0)) {
+            JSValidWalk.cur = JSValidWalk__Pop()
+
+            IfCondition GreaterThan(JSValidWalk.cur, 0) ThenBlock: {
+                JSValidWalk.ntype = JSParse_GetType(JSValidWalk.cur)
+
+                // Skip function boundaries (they create own arguments/super)
+                IfCondition EqualTo(JSValidWalk__IsFuncBoundary(JSValidWalk.ntype), 0) ThenBlock: {
+
+                    // Check for IDENT(18) named "arguments"
+                    // "arguments" = 97 114 103 117 109 101 110 116 115 (9 bytes)
+                    IfCondition EqualTo(JSValidWalk.ntype, 18) ThenBlock: {
+                        JSValidWalk.child = JSParse_GetNameLen(JSValidWalk.cur)
+                        IfCondition EqualTo(JSValidWalk.child, 9) ThenBlock: {
+                            JSValidWalk.child = JSParse_GetNamePtr(JSValidWalk.cur)
+                            IfCondition And(EqualTo(GetByte(JSValidWalk.child, 0), 97), EqualTo(GetByte(JSValidWalk.child, 1), 114)) ThenBlock: {
+                                IfCondition And(EqualTo(GetByte(JSValidWalk.child, 2), 103), EqualTo(GetByte(JSValidWalk.child, 3), 117)) ThenBlock: {
+                                    IfCondition And(EqualTo(GetByte(JSValidWalk.child, 4), 109), EqualTo(GetByte(JSValidWalk.child, 5), 101)) ThenBlock: {
+                                        IfCondition And(EqualTo(GetByte(JSValidWalk.child, 6), 110), EqualTo(GetByte(JSValidWalk.child, 7), 116)) ThenBlock: {
+                                            IfCondition EqualTo(GetByte(JSValidWalk.child, 8), 115) ThenBlock: {
+                                                JSValidWalk.result = 1
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Check for super() call: CALL(15) with LEFT = SUPER_EXPR(53)
+                    IfCondition And(EqualTo(JSValidWalk.ntype, 15), EqualTo(JSValidWalk.result, 0)) ThenBlock: {
+                        JSValidWalk.child = JSParse_GetLeft(JSValidWalk.cur)
+                        IfCondition GreaterThan(JSValidWalk.child, 0) ThenBlock: {
+                            IfCondition EqualTo(JSParse_GetType(JSValidWalk.child), 53) ThenBlock: {
+                                JSValidWalk.result = 2
+                            }
+                        }
+                    }
+
+                    // Push children for further traversal
+                    IfCondition EqualTo(JSValidWalk.result, 0) ThenBlock: {
+                        JSValidWalk__PushChildren(JSValidWalk.cur)
+                    }
+                }
+            }
+        }
+
+        JSValidWalk.sp = 0
+        ReturnValue(JSValidWalk.result)
+    }
+}
+
+// Check if a method body AST subtree contains a direct super() call.
+// Used for: non-constructor methods where super() is illegal.
+// Per ES spec 15.4.1: HasDirectSuper of MethodDefinition.
+// Stops at function boundaries but NOT arrow functions.
+// Returns: 1 if super() found, 0 otherwise
+Function.JSValidate_HasDirectSuper {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(node, 0) ThenBlock: { ReturnValue(0) }
+
+        JSValidWalk.sp = 0
+        JSValidWalk__Push(node)
+        JSValidWalk.result = 0
+
+        WhileLoop And(GreaterThan(JSValidWalk.sp, 0), EqualTo(JSValidWalk.result, 0)) {
+            JSValidWalk.cur = JSValidWalk__Pop()
+
+            IfCondition GreaterThan(JSValidWalk.cur, 0) ThenBlock: {
+                JSValidWalk.ntype = JSParse_GetType(JSValidWalk.cur)
+
+                // Skip function boundaries
+                IfCondition EqualTo(JSValidWalk__IsFuncBoundary(JSValidWalk.ntype), 0) ThenBlock: {
+
+                    // Check for CALL(15) with SUPER_EXPR(53) callee
+                    IfCondition EqualTo(JSValidWalk.ntype, 15) ThenBlock: {
+                        JSValidWalk.child = JSParse_GetLeft(JSValidWalk.cur)
+                        IfCondition GreaterThan(JSValidWalk.child, 0) ThenBlock: {
+                            IfCondition EqualTo(JSParse_GetType(JSValidWalk.child), 53) ThenBlock: {
+                                JSValidWalk.result = 1
+                            }
+                        }
+                    }
+
+                    IfCondition EqualTo(JSValidWalk.result, 0) ThenBlock: {
+                        JSValidWalk__PushChildren(JSValidWalk.cur)
+                    }
+                }
+            }
+        }
+
+        JSValidWalk.sp = 0
+        ReturnValue(JSValidWalk.result)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSValidate_BodyHasUseStrict — check if a BLOCK node's first statement
+// is an expression statement containing string literal "use strict"
+// Returns: 1 if "use strict" directive found, 0 otherwise
+// ---------------------------------------------------------------------------
+Function.JSValidate_BodyHasUseStrict {
+    Input: block_node: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(block_node, 0) ThenBlock: { ReturnValue(0) }
+
+        // Get first statement in block (N_BODY)
+        first_stmt = JSParse_GetBody(block_node)
+        IfCondition LessThan(first_stmt, 0) ThenBlock: { ReturnValue(0) }
+
+        // Must be EXPR_STMT (type 11)
+        IfCondition NotEqual(JSParse_GetType(first_stmt), 11) ThenBlock: { ReturnValue(0) }
+
+        // Get the expression (N_LEFT)
+        expr = JSParse_GetLeft(first_stmt)
+        IfCondition LessThan(expr, 0) ThenBlock: { ReturnValue(0) }
+
+        // Must be STRING_LIT (type 20)
+        IfCondition NotEqual(JSParse_GetType(expr), 20) ThenBlock: { ReturnValue(0) }
+
+        // Check string content: must be exactly "use strict" (10 bytes)
+        us_ptr = JSParse_GetNamePtr(expr)
+        us_len = JSParse_GetNameLen(expr)
+        IfCondition NotEqual(us_len, 10) ThenBlock: { ReturnValue(0) }
+
+        // Compare bytes: u=117 s=115 e=101 ' '=32 s=115 t=116 r=114 i=105 c=99 t=116
+        IfCondition NotEqual(GetByte(us_ptr, 0), 117) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 1), 115) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 2), 101) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 3), 32) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 4), 115) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 5), 116) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 6), 114) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 7), 105) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 8), 99) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(us_ptr, 9), 116) ThenBlock: { ReturnValue(0) }
+
+        ReturnValue(1)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSValidate_CheckDupParams — check for duplicate parameter names
+// Walks param linked list (N_NEXT chain), extracts name from each param
+// using Branch on node type, compares against previously seen names.
+// Returns: 1 if duplicate found (error), 0 if all unique
+// ---------------------------------------------------------------------------
+Function.JSValidate_CheckDupParams {
+    Input: first_param: Integer
+    Output: Integer
+    Body: {
+        JSValidDup.count = 0
+        dup_cur = first_param
+
+        WhileLoop GreaterEqual(dup_cur, 0) {
+            JSValidDup.ptr = 0
+            JSValidDup.len = 0
+
+            // Extract name based on param node type
+            dup_type = JSParse_GetType(dup_cur)
+            Branch dup_type {
+                // IDENT (18) — name directly on node
+                Case 18: {
+                    JSValidDup.ptr = JSParse_GetNamePtr(dup_cur)
+                    JSValidDup.len = JSParse_GetNameLen(dup_cur)
+                }
+                // ASSIGN (12) — default param; name on node (FuncDecl path) or in N_RIGHT child
+                Case 12: {
+                    JSValidDup.ptr = JSParse_GetNamePtr(dup_cur)
+                    JSValidDup.len = JSParse_GetNameLen(dup_cur)
+                    // If name not on wrapper, check N_RIGHT child (IDENT)
+                    IfCondition EqualTo(JSValidDup.len, 0) ThenBlock: {
+                        dup_right = JSParse_GetRight(dup_cur)
+                        IfCondition GreaterEqual(dup_right, 0) ThenBlock: {
+                            IfCondition EqualTo(JSParse_GetType(dup_right), 18) ThenBlock: {
+                                JSValidDup.ptr = JSParse_GetNamePtr(dup_right)
+                                JSValidDup.len = JSParse_GetNameLen(dup_right)
+                            }
+                        }
+                    }
+                }
+                // REST_ELEMENT (44) — binding in N_LEFT child
+                Case 44: {
+                    dup_left = JSParse_GetLeft(dup_cur)
+                    IfCondition GreaterEqual(dup_left, 0) ThenBlock: {
+                        IfCondition EqualTo(JSParse_GetType(dup_left), 18) ThenBlock: {
+                            JSValidDup.ptr = JSParse_GetNamePtr(dup_left)
+                            JSValidDup.len = JSParse_GetNameLen(dup_left)
+                        }
+                    }
+                }
+            }
+
+            // If we extracted a name, check against all previous names
+            IfCondition GreaterThan(JSValidDup.len, 0) ThenBlock: {
+                dup_i = 0
+                WhileLoop LessThan(dup_i, JSValidDup.count) {
+                    dup_base = Add(JSValidDup.names, Multiply(dup_i, 16))
+                    dup_prev_ptr = Dereference(dup_base)
+                    dup_prev_len = Dereference(Add(dup_base, 8))
+                    IfCondition EqualTo(JSValidate__StrEq(JSValidDup.ptr, JSValidDup.len, dup_prev_ptr, dup_prev_len), 1) ThenBlock: {
+                        ReturnValue(1)
+                    }
+                    dup_i = Add(dup_i, 1)
+                }
+
+                // Store this name (if room)
+                IfCondition LessThan(JSValidDup.count, 32) ThenBlock: {
+                    dup_slot = Add(JSValidDup.names, Multiply(JSValidDup.count, 16))
+                    StoreValue(dup_slot, JSValidDup.ptr)
+                    StoreValue(Add(dup_slot, 8), JSValidDup.len)
+                    JSValidDup.count = Add(JSValidDup.count, 1)
+                }
+            }
+
+            dup_cur = JSParse_GetNext(dup_cur)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Private names scope stack — push/pop for nested classes
+// ---------------------------------------------------------------------------
+
+// Push a new private name scope (entering a class body)
+Function.JSValidate_PrivPush {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(JSValidPriv.depth, 8) ThenBlock: { ReturnValue(0) }
+        // Zero the count for this new level
+        StoreValue(Add(JSValidPriv.counts, Multiply(JSValidPriv.depth, 8)), 0)
+        JSValidPriv.depth = Add(JSValidPriv.depth, 1)
+        ReturnValue(1)
+    }
+}
+
+// Pop a private name scope (leaving a class body)
+Function.JSValidate_PrivPop {
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(JSValidPriv.depth, 0) ThenBlock: {
+            JSValidPriv.depth = Subtract(JSValidPriv.depth, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Add a declared private name to the current scope level
+// Called during class body parsing when a #name element is encountered
+Function.JSValidate_PrivAdd {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(JSValidPriv.depth, 0) ThenBlock: { ReturnValue(0) }
+        pv_level = Subtract(JSValidPriv.depth, 1)
+        pv_cnt = Dereference(Add(JSValidPriv.counts, Multiply(pv_level, 8)))
+        IfCondition GreaterEqual(pv_cnt, 32) ThenBlock: { ReturnValue(0) }
+
+        // Check not already recorded at this level (get/set pairs)
+        pv_base = Add(JSValidPriv.names, Multiply(pv_level, 512))
+        pv_ai = 0
+        pv_dup = 0
+        WhileLoop And(LessThan(pv_ai, pv_cnt), EqualTo(pv_dup, 0)) {
+            pv_slot = Add(pv_base, Multiply(pv_ai, 16))
+            IfCondition EqualTo(JSValidate__StrEq(name_ptr, name_len, Dereference(pv_slot), Dereference(Add(pv_slot, 8))), 1) ThenBlock: {
+                pv_dup = 1
+            }
+            pv_ai = Add(pv_ai, 1)
+        }
+        IfCondition EqualTo(pv_dup, 1) ThenBlock: { ReturnValue(1) }
+
+        // Store the name
+        pv_slot = Add(pv_base, Multiply(pv_cnt, 16))
+        StoreValue(pv_slot, name_ptr)
+        StoreValue(Add(pv_slot, 8), name_len)
+        StoreValue(Add(JSValidPriv.counts, Multiply(pv_level, 8)), Add(pv_cnt, 1))
+        ReturnValue(1)
+    }
+}
+
+// Check if a #name reference is declared in ANY enclosing class scope
+// Returns: 1 if found (valid), 0 if not found (error)
+Function.JSValidate_PrivLookup {
+    Input: ref_ptr: Address
+    Input: ref_len: Integer
+    Output: Integer
+    Body: {
+        pv_li = 0
+        WhileLoop LessThan(pv_li, JSValidPriv.depth) {
+            pv_cnt = Dereference(Add(JSValidPriv.counts, Multiply(pv_li, 8)))
+            pv_base = Add(JSValidPriv.names, Multiply(pv_li, 512))
+            pv_si = 0
+            WhileLoop LessThan(pv_si, pv_cnt) {
+                pv_slot = Add(pv_base, Multiply(pv_si, 16))
+                IfCondition EqualTo(JSValidate__StrEq(ref_ptr, ref_len, Dereference(pv_slot), Dereference(Add(pv_slot, 8))), 1) ThenBlock: {
+                    ReturnValue(1)
+                }
+                pv_si = Add(pv_si, 1)
+            }
+            pv_li = Add(pv_li, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// JSValidate_AllPrivateNamesValid — ES spec 15.7.1 Static Semantics
+// Validates that every #name reference in the class body refers to a name
+// declared in this class OR any enclosing class. Names are already collected
+// via JSValidate_PrivAdd during parsing. This function only does the walk.
+// Input: first_element — head of class body linked list (methods/fields via N_NEXT)
+// Returns: 0 if valid, 1 if invalid (undeclared #name reference found)
+// ---------------------------------------------------------------------------
+Function.JSValidate_AllPrivateNamesValid {
+    Input: first_element: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(first_element, 0) ThenBlock: { ReturnValue(0) }
+
+        // DFS walk all elements (method bodies, field initializers)
+        // Stop at: CLASS_DECL(51), CLASS_EXPR(52) — inner classes validate themselves
+        // Check: MEMBER_DOT(16), OPT_MEMBER(56) with name starting with '#'
+        JSValidWalk.sp = 0
+        JSValidWalk.result = 0
+
+        // Push all elements onto the walk stack
+        pv_cur = first_element
+        WhileLoop GreaterThan(pv_cur, 0) {
+            // Push the method body (N_BODY)
+            JSValidWalk.child = JSParse_GetBody(pv_cur)
+            JSValidWalk__Push(JSValidWalk.child)
+            // Push the field initializer (N_LEFT for CLASS_FIELD)
+            JSValidWalk.child = JSParse_GetLeft(pv_cur)
+            JSValidWalk__Push(JSValidWalk.child)
+            // Push params (N_RIGHT)
+            JSValidWalk.child = JSParse_GetRight(pv_cur)
+            JSValidWalk__Push(JSValidWalk.child)
+            pv_cur = JSParse_GetNext(pv_cur)
+        }
+
+        // DFS walk
+        WhileLoop And(GreaterThan(JSValidWalk.sp, 0), EqualTo(JSValidWalk.result, 0)) {
+            JSValidWalk.cur = JSValidWalk__Pop()
+
+            IfCondition GreaterThan(JSValidWalk.cur, 0) ThenBlock: {
+                JSValidWalk.ntype = JSParse_GetType(JSValidWalk.cur)
+
+                // Stop at class boundaries (inner classes validate themselves)
+                IfCondition And(NotEqual(JSValidWalk.ntype, 51), NotEqual(JSValidWalk.ntype, 52)) ThenBlock: {
+
+                    // Check MEMBER_DOT(16) or OPT_MEMBER(56) with private name
+                    IfCondition Or(EqualTo(JSValidWalk.ntype, 16), EqualTo(JSValidWalk.ntype, 56)) ThenBlock: {
+                        pv_ref_ptr = JSParse_GetNamePtr(JSValidWalk.cur)
+                        pv_ref_len = JSParse_GetNameLen(JSValidWalk.cur)
+                        IfCondition And(GreaterThan(pv_ref_ptr, 0), GreaterThan(pv_ref_len, 0)) ThenBlock: {
+                            IfCondition EqualTo(GetByte(pv_ref_ptr, 0), 35) ThenBlock: {
+                                // Verify declared in any enclosing class scope
+                                IfCondition EqualTo(JSValidate_PrivLookup(pv_ref_ptr, pv_ref_len), 0) ThenBlock: {
+                                    JSValidWalk.result = 1
+                                }
+                            }
+                        }
+                    }
+
+                    // Push children for further traversal
+                    IfCondition EqualTo(JSValidWalk.result, 0) ThenBlock: {
+                        JSValidWalk__PushChildren(JSValidWalk.cur)
+                    }
+                }
+            }
+        }
+
+        JSValidWalk.sp = 0
+        ReturnValue(JSValidWalk.result)
     }
 }

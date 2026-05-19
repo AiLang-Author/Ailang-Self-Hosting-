@@ -1,1 +1,1 @@
-savedcmd_/mnt/c/Users/Sean/Documents/AiLangSH/kernel_module/shim/modules.order := {   echo /mnt/c/Users/Sean/Documents/AiLangSH/kernel_module/shim/ail_combined.o; :; } > /mnt/c/Users/Sean/Documents/AiLangSH/kernel_module/shim/modules.order
+savedcmd_modules.order := {   echo ail_combined.o; :; } > modules.order

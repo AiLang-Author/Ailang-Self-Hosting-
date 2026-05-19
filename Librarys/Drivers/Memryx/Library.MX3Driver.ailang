@@ -1,0 +1,561 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.MX3Driver.ailang
+//
+// Main MemryX MX3 PCIe AI accelerator driver.
+// Implements module init/exit, PCI probe/remove, and char device fops.
+//
+// BUILD
+//   ./ailang.x -kmod Librarys/Drivers/Memryx/Library.MX3Driver.ailang ail_payload.o
+//   cp ail_payload.o kernel_module/shim/
+//   cd kernel_module/shim && make
+//   sudo insmod ail_combined.ko
+//
+// DEVICE
+//   /dev/memx0 — char device for data streaming and ioctl control
+
+LibraryImport.KernelShim
+LibraryImport.KernelShimPCIe
+LibraryImport.Drivers.Memryx.MX3Constants
+LibraryImport.Drivers.Memryx.MX3State
+LibraryImport.Drivers.Memryx.MX3XFLOW
+LibraryImport.Drivers.Memryx.MX3Firmware
+LibraryImport.Drivers.Memryx.MX3DMA
+
+// =============================================================================
+// MODULE INIT / EXIT
+// Called by the existing ail_shim.c module_init/module_exit handlers.
+// =============================================================================
+
+Function.ail_main {
+    Output: Integer
+    Body: {
+        ail_printk("mx3: Ailang MX3 PCIe driver loading\n")
+
+        rc = ail_pci_register_driver()
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            ail_printk("mx3: pci_register_driver failed\n")
+        } ElseBlock: {
+            ail_printk("mx3: PCI driver registered, waiting for device\n")
+        }
+
+        ReturnValue(rc)
+    }
+}
+
+Function.ail_exit {
+    Body: {
+        ail_pci_unregister_driver()
+        ail_printk("mx3: Ailang MX3 PCIe driver unloaded\n")
+    }
+}
+
+// =============================================================================
+// PCI PROBE
+// Called by C shim when a device matching vendor=0x1FE9 device=0x0100 is found.
+// =============================================================================
+
+Function.ail_mx3_probe {
+    Input: pdev: Address
+    Output: Integer
+    Body: {
+        ail_printk("mx3: probe starting\n")
+        MX3Dev.pdev = pdev
+
+        // --- Enable PCI device ---
+        rc = ail_pci_enable_device(pdev)
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            ail_printk("mx3: pci_enable_device failed\n")
+            ReturnValue(rc)
+        }
+
+        // --- Set bus master for DMA ---
+        ail_pci_set_master(pdev)
+
+        // --- Request BAR regions ---
+        rc = ail_pci_request_regions(pdev, "memx_ailang")
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            ail_printk("mx3: pci_request_regions failed\n")
+            ail_pci_disable_device(pdev)
+            ReturnValue(rc)
+        }
+
+        // --- Get struct device* for DMA ---
+        MX3Dev.dev = ail_pci_get_dev(pdev)
+
+        // --- Detect BAR mode ---
+        bar_mode = MX3.DetectBarMode(pdev)
+        MX3Dev.bar_mode = bar_mode
+
+        IfCondition EqualTo(bar_mode, MX3_BARMODE.NOT_VALID) ThenBlock: {
+            ail_printk("mx3: unrecognized BAR configuration\n")
+            ail_pci_release_regions(pdev)
+            ail_pci_disable_device(pdev)
+            ReturnValue(-19)
+        }
+
+        ail_printk("mx3: BAR mode detected\n")
+
+        // --- Map BARs based on detected mode ---
+
+        // Map XFLOW BAR (BAR0 in most modes)
+        xflow_bar_idx = MX3Dev.xflow_conf_bar
+        xflow_len = ail_pci_resource_len(pdev, xflow_bar_idx)
+        bar0_io = ail_pci_iomap(pdev, xflow_bar_idx, xflow_len)
+        IfCondition EqualTo(bar0_io, 0) ThenBlock: {
+            ail_printk("mx3: XFLOW BAR iomap failed\n")
+            ail_pci_release_regions(pdev)
+            ail_pci_disable_device(pdev)
+            ReturnValue(-12)
+        }
+        MX3Dev.bar0 = bar0_io
+
+        // Map SRAM BAR
+        sram_idx = MX3Dev.sram_bar_idx
+        sram_len = ail_pci_resource_len(pdev, sram_idx)
+        IfCondition GreaterThan(sram_len, 0) ThenBlock: {
+            sram_io = ail_pci_iomap(pdev, sram_idx, sram_len)
+            IfCondition EqualTo(sram_io, 0) ThenBlock: {
+                ail_printk("mx3: SRAM BAR iomap failed\n")
+                ail_pci_iounmap(pdev, bar0_io)
+                ail_pci_release_regions(pdev)
+                ail_pci_disable_device(pdev)
+                ReturnValue(-12)
+            }
+            MX3Dev.sram_bar = sram_io
+        } ElseBlock: {
+            // Single-BAR mode: SRAM is within BAR0
+            MX3Dev.sram_bar = bar0_io
+        }
+
+        ail_printk("mx3: BARs mapped\n")
+
+        // --- Set DMA mask (try 64-bit, fallback to 32-bit) ---
+        rc = ail_dma_set_mask_and_coherent(MX3Dev.dev, -1)
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            rc = ail_dma_set_mask_and_coherent(MX3Dev.dev, 4294967295)
+            IfCondition NotEqual(rc, 0) ThenBlock: {
+                ail_printk("mx3: DMA mask set failed\n")
+            }
+        }
+
+        // --- Allocate synchronization primitives ---
+        MX3Dev.completion_rx = ail_completion_alloc()
+        MX3Dev.completion_tx = ail_completion_alloc()
+        MX3Dev.completion_fw = ail_completion_alloc()
+        MX3Dev.sema = ail_sema_alloc(1)
+        MX3Dev.spinlock = ail_spinlock_alloc()
+        MX3Dev.rx_fifo = ail_kfifo_alloc(64)
+
+        // --- Allocate MSI-X vectors ---
+        // Try MSI-X first (up to 33 vectors), then MSI, then legacy
+        num_irqs = ail_pci_alloc_irq_vectors(pdev, 1, MX3_IRQ.MAX_MSIX_VECTORS, MX3_IRQ.PCI_IRQ_MSIX)
+        IfCondition LessThan(num_irqs, 1) ThenBlock: {
+            // Fallback to MSI
+            num_irqs = ail_pci_alloc_irq_vectors(pdev, 1, 32, MX3_IRQ.PCI_IRQ_MSI)
+        }
+        IfCondition LessThan(num_irqs, 1) ThenBlock: {
+            // Fallback to legacy
+            num_irqs = ail_pci_alloc_irq_vectors(pdev, 1, 1, MX3_IRQ.PCI_IRQ_LEGACY)
+        }
+
+        IfCondition GreaterThan(num_irqs, 0) ThenBlock: {
+            MX3Dev.num_irqs = num_irqs
+            ail_printk("mx3: IRQ vectors allocated\n")
+
+            // Register ISR stubs for each vector
+            i = 0
+            WhileLoop LessThan(i, num_irqs) {
+                irq_num = ail_pci_irq_vector(pdev, i)
+                rc = ail_request_irq_stub(irq_num, i, MX3Dev.completion_fw)
+                IfCondition NotEqual(rc, 0) ThenBlock: {
+                    ail_printk("mx3: request_irq failed for vector\n")
+                }
+                i = Add(i, 1)
+            }
+        } ElseBlock: {
+            ail_printk("mx3: no IRQ vectors available\n")
+            MX3Dev.num_irqs = 0
+        }
+
+        // --- Allocate DMA buffer ---
+        rc = MX3.DMAInit()
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            ail_printk("mx3: DMA init failed (non-fatal)\n")
+        }
+
+        // --- Map FW command buffer ---
+        // FW command buffer is in SRAM at offset (FW_CMD_BASE - SRAM_BASE)
+        fw_cmd_offset = Subtract(MX3_ADDR.FW_CMD_BASE, MX3_ADDR.SRAM_BASE)
+        MX3Dev.fw_cmd_buf = Add(MX3Dev.sram_bar, fw_cmd_offset)
+
+        // --- Firmware initialization ---
+        rc = MX3.FirmwareInit("cascade_4chips_flash.bin")
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            ail_printk("mx3: firmware init failed (non-fatal, device may work with pre-loaded FW)\n")
+        }
+
+        // --- Register char device /dev/memx0 ---
+        MX3Dev.chardev_ctx = ail_chardev_register("memx", 1)
+        IfCondition EqualTo(MX3Dev.chardev_ctx, 0) ThenBlock: {
+            ail_printk("mx3: chardev registration failed\n")
+        } ElseBlock: {
+            // Store device state pointer so fops callbacks can access it
+            ail_chardev_set_drvdata(MX3Dev.chardev_ctx, MX3Dev.sram_bar)
+            ail_printk("mx3: /dev/memx0 registered\n")
+        }
+
+        ail_printk("mx3: probe complete\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PCI REMOVE
+// Cleanup in reverse order of probe.
+// =============================================================================
+
+Function.ail_mx3_remove {
+    Input: pdev: Address
+    Body: {
+        ail_printk("mx3: remove starting\n")
+
+        // Unregister char device
+        IfCondition NotEqual(MX3Dev.chardev_ctx, 0) ThenBlock: {
+            ail_chardev_unregister(MX3Dev.chardev_ctx)
+            MX3Dev.chardev_ctx = 0
+        }
+
+        // Free DMA buffer
+        MX3.DMAFree()
+
+        // Free IRQs
+        IfCondition GreaterThan(MX3Dev.num_irqs, 0) ThenBlock: {
+            i = 0
+            WhileLoop LessThan(i, MX3Dev.num_irqs) {
+                irq_num = ail_pci_irq_vector(pdev, i)
+                ail_free_irq(irq_num, MX3Dev.completion_fw)
+                i = Add(i, 1)
+            }
+            ail_pci_free_irq_vectors(pdev)
+            MX3Dev.num_irqs = 0
+        }
+
+        // Free synchronization primitives
+        IfCondition NotEqual(MX3Dev.rx_fifo, 0) ThenBlock: {
+            ail_kfifo_free(MX3Dev.rx_fifo)
+            MX3Dev.rx_fifo = 0
+        }
+        IfCondition NotEqual(MX3Dev.spinlock, 0) ThenBlock: {
+            ail_spinlock_free(MX3Dev.spinlock)
+            MX3Dev.spinlock = 0
+        }
+        IfCondition NotEqual(MX3Dev.sema, 0) ThenBlock: {
+            ail_sema_free(MX3Dev.sema)
+            MX3Dev.sema = 0
+        }
+        IfCondition NotEqual(MX3Dev.completion_fw, 0) ThenBlock: {
+            ail_completion_free(MX3Dev.completion_fw)
+            MX3Dev.completion_fw = 0
+        }
+        IfCondition NotEqual(MX3Dev.completion_tx, 0) ThenBlock: {
+            ail_completion_free(MX3Dev.completion_tx)
+            MX3Dev.completion_tx = 0
+        }
+        IfCondition NotEqual(MX3Dev.completion_rx, 0) ThenBlock: {
+            ail_completion_free(MX3Dev.completion_rx)
+            MX3Dev.completion_rx = 0
+        }
+
+        // Unmap BARs
+        IfCondition NotEqual(MX3Dev.sram_bar, MX3Dev.bar0) ThenBlock: {
+            IfCondition NotEqual(MX3Dev.sram_bar, 0) ThenBlock: {
+                ail_pci_iounmap(pdev, MX3Dev.sram_bar)
+            }
+        }
+        MX3Dev.sram_bar = 0
+
+        IfCondition NotEqual(MX3Dev.bar0, 0) ThenBlock: {
+            ail_pci_iounmap(pdev, MX3Dev.bar0)
+            MX3Dev.bar0 = 0
+        }
+
+        ail_pci_release_regions(pdev)
+        ail_pci_disable_device(pdev)
+
+        MX3Dev.pdev = 0
+        MX3Dev.dev = 0
+        MX3Dev.fw_loaded = 0
+
+        ail_printk("mx3: remove complete\n")
+    }
+}
+
+// =============================================================================
+// CHAR DEVICE: OPEN
+// =============================================================================
+
+Function.ail_mx3_open {
+    Input: ctx: Address
+    Input: minor: Integer
+    Output: Integer
+    Body: {
+        ail_down(MX3Dev.sema)
+        MX3Dev.open_count = Add(MX3Dev.open_count, 1)
+
+        // On first open, reset abort flags
+        IfCondition EqualTo(MX3Dev.open_count, 1) ThenBlock: {
+            MX3Dev.is_abort = 0
+        }
+
+        ail_up(MX3Dev.sema)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CHAR DEVICE: RELEASE
+// =============================================================================
+
+Function.ail_mx3_release {
+    Input: ctx: Address
+    Input: minor: Integer
+    Output: Integer
+    Body: {
+        ail_down(MX3Dev.sema)
+        MX3Dev.open_count = Subtract(MX3Dev.open_count, 1)
+        ail_up(MX3Dev.sema)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CHAR DEVICE: WRITE (ingress — host to device)
+// User writes input feature map data. Copied to TX DMA buffer, then DMA'd.
+// =============================================================================
+
+Function.ail_mx3_write {
+    Input: ctx: Address
+    Input: ubuf: Address
+    Input: count: Integer
+    Output: Integer
+    Body: {
+        // Check abort flag
+        IfCondition NotEqual(MX3Dev.is_abort, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Clamp to TX buffer size
+        IfCondition GreaterThan(count, MX3_DMA.TX_SIZE_512KB) ThenBlock: {
+            count = MX3_DMA.TX_SIZE_512KB
+        }
+
+        // Check if DMA buffer is available
+        IfCondition EqualTo(MX3Dev.dma_buf_virt, 0) ThenBlock: {
+            ail_printk("mx3: write: no DMA buffer\n")
+            ReturnValue(-5)
+        }
+
+        // Get TX buffer virtual address (at DMA buffer + 512KB offset)
+        tx_buf = MX3.GetTxBuf()
+
+        // Acquire semaphore
+        ail_down(MX3Dev.sema)
+
+        // Copy user data into TX DMA buffer
+        not_copied = ail_copy_from_user(tx_buf, ubuf, count)
+        IfCondition NotEqual(not_copied, 0) ThenBlock: {
+            ail_up(MX3Dev.sema)
+            ReturnValue(-14)
+        }
+
+        // Sync TX buffer for device
+        MX3.DMASyncTxForDevice()
+
+        // Extract target chip_id from TX buffer header (offset +8)
+        target_chip = Dereference(Add(tx_buf, 8))
+        IfCondition GreaterEqual(target_chip, MX3_CASCADE.MAX_CHIPS) ThenBlock: {
+            target_chip = 0
+        }
+
+        // Trigger data transfer to device via software IRQ
+        ail_completion_reinit(MX3Dev.completion_tx)
+        MX3.TriggerDeviceIRQ(target_chip, MX3_SW_IRQ.MOVE_SRAM_TO_DI)
+
+        // Wait for TX completion
+        rc = ail_wait_for_completion_timeout(MX3Dev.completion_tx, 250)
+
+        ail_up(MX3Dev.sema)
+
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            // Timeout
+            IfCondition NotEqual(MX3Dev.is_abort, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            ail_printk("mx3: write timeout\n")
+            ReturnValue(-5)
+        }
+
+        ReturnValue(count)
+    }
+}
+
+// =============================================================================
+// CHAR DEVICE: READ (egress — device to host)
+// Blocks until output data is available, then copies from RX DMA buffer.
+// =============================================================================
+
+Function.ail_mx3_read {
+    Input: ctx: Address
+    Input: ubuf: Address
+    Input: count: Integer
+    Output: Integer
+    Body: {
+        // Check abort flag
+        IfCondition NotEqual(MX3Dev.is_abort, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Clamp to RX buffer size
+        IfCondition GreaterThan(count, MX3_DMA.RX_SIZE_512KB) ThenBlock: {
+            count = MX3_DMA.RX_SIZE_512KB
+        }
+
+        IfCondition EqualTo(MX3Dev.dma_buf_virt, 0) ThenBlock: {
+            ail_printk("mx3: read: no DMA buffer\n")
+            ReturnValue(-5)
+        }
+
+        // Wait for RX data (egress done interrupt)
+        rc = ail_wait_for_completion_timeout(MX3Dev.completion_rx, 2500)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            IfCondition NotEqual(MX3Dev.is_abort, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            ReturnValue(-11)
+        }
+
+        // Sync RX buffer for CPU
+        MX3.DMASyncRxForCPU()
+
+        // Get RX buffer virtual address
+        rx_buf = MX3.GetRxBuf()
+
+        // Read actual data length from RX buffer header (offset +12)
+        data_len = Dereference(Add(rx_buf, 12))
+        IfCondition GreaterThan(data_len, count) ThenBlock: {
+            data_len = count
+        }
+
+        // Copy to user
+        not_copied = ail_copy_to_user(ubuf, rx_buf, data_len)
+        IfCondition NotEqual(not_copied, 0) ThenBlock: {
+            ReturnValue(-14)
+        }
+
+        ReturnValue(data_len)
+    }
+}
+
+// =============================================================================
+// CHAR DEVICE: IOCTL
+// Dispatches device control commands.
+// =============================================================================
+
+Function.ail_mx3_ioctl {
+    Input: ctx: Address
+    Input: cmd: Integer
+    Input: arg: Integer
+    Output: Integer
+    Body: {
+        // Extract ioctl command number (strip direction/size encoding)
+        // Linux ioctl: bits [7:0] = nr, bits [15:8] = type
+        cmd_nr = BitwiseAnd(cmd, 255)
+
+        // GET_HW_INFO (nr=15): return hw_info struct to userspace
+        IfCondition EqualTo(cmd_nr, MX3_IOCTL.GET_HW_INFO) ThenBlock: {
+            // Allocate a temporary buffer for hw_info
+            info_size = 256
+            info_buf = ail_kmalloc(info_size)
+            IfCondition EqualTo(info_buf, 0) ThenBlock: {
+                ReturnValue(-12)
+            }
+            ail_memset(info_buf, 0, info_size)
+
+            // Fill chip info
+            StoreValue(info_buf, MX3Dev.chip_generation)
+            StoreValue(Add(info_buf, 4), MX3Dev.num_chips)
+
+            // Copy to userspace
+            not_copied = ail_copy_to_user(arg, info_buf, info_size)
+            ail_kfree(info_buf)
+            IfCondition NotEqual(not_copied, 0) ThenBlock: {
+                ReturnValue(-14)
+            }
+            ReturnValue(0)
+        }
+
+        // DOWNLOAD_FIRMWARE (nr=4)
+        IfCondition EqualTo(cmd_nr, MX3_IOCTL.DOWNLOAD_FIRMWARE) ThenBlock: {
+            rc = MX3.FirmwareInit("cascade_4chips_flash.bin")
+            ReturnValue(rc)
+        }
+
+        // ABORT_TRANSFER (nr=10)
+        IfCondition EqualTo(cmd_nr, MX3_IOCTL.ABORT_TRANSFER) ThenBlock: {
+            MX3Dev.is_abort = 1
+            // Wake up any waiting completions
+            ail_complete(MX3Dev.completion_rx)
+            ail_complete(MX3Dev.completion_tx)
+            ReturnValue(0)
+        }
+
+        // RESET_DEVICE (nr=18)
+        IfCondition EqualTo(cmd_nr, MX3_IOCTL.RESET_DEVICE) ThenBlock: {
+            i = 0
+            WhileLoop LessThan(i, MX3Dev.num_chips) {
+                MX3.TriggerDeviceIRQ(i, MX3_SW_IRQ.RESET_DEVICE)
+                i = Add(i, 1)
+            }
+            ail_msleep(100)
+            MX3Dev.fw_loaded = 0
+            MX3Dev.is_abort = 0
+            ail_printk("mx3: device reset\n")
+            ReturnValue(0)
+        }
+
+        // WAIT_FW_MSIX_ACK (nr=14)
+        IfCondition EqualTo(cmd_nr, MX3_IOCTL.WAIT_FW_MSIX_ACK) ThenBlock: {
+            rc = MX3.WaitFirmwareAck()
+            ReturnValue(rc)
+        }
+
+        // SET_ABORT_READ (nr=24)
+        IfCondition EqualTo(cmd_nr, MX3_IOCTL.SET_ABORT_READ) ThenBlock: {
+            MX3Dev.is_abort = 1
+            ail_complete(MX3Dev.completion_rx)
+            ReturnValue(0)
+        }
+
+        // DUMMY_READ (nr=23)
+        IfCondition EqualTo(cmd_nr, MX3_IOCTL.DUMMY_READ) ThenBlock: {
+            // Check if there's pending data in RX kfifo
+            fifo_len = ail_kfifo_len(MX3Dev.rx_fifo)
+            IfCondition GreaterThan(fifo_len, 0) ThenBlock: {
+                // Read chip_idx from fifo
+                chip_buf = ail_kmalloc(4)
+                IfCondition NotEqual(chip_buf, 0) ThenBlock: {
+                    ail_kfifo_out(MX3Dev.rx_fifo, chip_buf, 4)
+                    chip_idx = Dereference(chip_buf)
+                    ail_kfree(chip_buf)
+                    ReturnValue(chip_idx)
+                }
+            }
+            ReturnValue(-1)
+        }
+
+        // Unknown ioctl
+        ReturnValue(-25)
+    }
+}
