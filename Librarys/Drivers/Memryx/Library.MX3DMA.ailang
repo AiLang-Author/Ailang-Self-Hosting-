@@ -1,0 +1,173 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.MX3DMA.ailang
+//
+// DMA buffer management and transfer operations for the MX3 PCIe driver.
+// The MX3 uses a 2MB DMA coherent buffer split into:
+//   - RX (egress) buffer:  512KB at offset 0x00000
+//   - TX (ingress) buffer: 512KB at offset 0x80000
+//   - FW log buffer:       1MB   at offset 0x100000
+//
+// USAGE
+//   LibraryImport.Drivers.Memryx.MX3DMA
+
+LibraryImport.KernelShim
+LibraryImport.KernelShimPCIe
+LibraryImport.Drivers.Memryx.MX3Constants
+LibraryImport.Drivers.Memryx.MX3State
+LibraryImport.Drivers.Memryx.MX3XFLOW
+
+// =============================================================================
+// DMA BUFFER ALLOCATION
+// =============================================================================
+
+// Allocate the 2MB coherent DMA buffer.
+// Called once during probe. Returns 0 on success, negative on failure.
+Function.MX3.DMAInit {
+    Output: Integer
+    Body: {
+        // Allocate 8 bytes to receive the DMA physical address
+        dma_handle_buf = ail_kmalloc(8)
+        IfCondition EqualTo(dma_handle_buf, 0) ThenBlock: {
+            ail_printk("mx3: kmalloc failed for DMA handle\n")
+            ReturnValue(-12)
+        }
+
+        // Zero the handle buffer
+        StoreValue(dma_handle_buf, 0)
+
+        dma_size = MX3_DMA.COHERENT_SIZE_2MB
+
+        // Allocate DMA coherent buffer
+        vaddr = ail_dma_alloc_coherent(MX3Dev.dev, dma_size, dma_handle_buf, MX3_GFP.KERNEL)
+        IfCondition EqualTo(vaddr, 0) ThenBlock: {
+            ail_printk("mx3: dma_alloc_coherent failed\n")
+            ail_kfree(dma_handle_buf)
+            ReturnValue(-12)
+        }
+
+        // Store buffer info in device state
+        MX3Dev.dma_buf_virt = vaddr
+        MX3Dev.dma_buf_phys = Dereference(dma_handle_buf)
+        MX3Dev.dma_buf_size = dma_size
+
+        ail_kfree(dma_handle_buf)
+
+        // Zero the entire DMA buffer
+        ail_memset(vaddr, 0, dma_size)
+
+        ail_printk("mx3: DMA buffer allocated (2MB)\n")
+        ReturnValue(0)
+    }
+}
+
+// Free the DMA coherent buffer. Called during remove.
+Function.MX3.DMAFree {
+    Body: {
+        IfCondition NotEqual(MX3Dev.dma_buf_virt, 0) ThenBlock: {
+            ail_dma_free_coherent(MX3Dev.dev, MX3Dev.dma_buf_size, MX3Dev.dma_buf_virt, MX3Dev.dma_buf_phys)
+            MX3Dev.dma_buf_virt = 0
+            MX3Dev.dma_buf_phys = 0
+            MX3Dev.dma_buf_size = 0
+            ail_printk("mx3: DMA buffer freed\n")
+        }
+    }
+}
+
+// =============================================================================
+// DMA SYNC HELPERS
+// =============================================================================
+
+// Sync RX (egress) portion of DMA buffer for CPU access (after device writes).
+Function.MX3.DMASyncRxForCPU {
+    Body: {
+        ail_dma_sync_for_cpu(MX3Dev.dev, MX3Dev.dma_buf_phys, MX3_DMA.RX_SIZE_512KB, MX3_DMA_DIR.BIDIRECTIONAL)
+    }
+}
+
+// Sync TX (ingress) portion of DMA buffer for device access (before device reads).
+Function.MX3.DMASyncTxForDevice {
+    Body: {
+        tx_phys = Add(MX3Dev.dma_buf_phys, MX3_DMA.TX_SIZE_512KB)
+        ail_dma_sync_for_device(MX3Dev.dev, tx_phys, MX3_DMA.TX_SIZE_512KB, MX3_DMA_DIR.BIDIRECTIONAL)
+    }
+}
+
+// =============================================================================
+// DMA TRANSFER
+// Uses the ARM DMAC on the device to move data between host and chip SRAM.
+// The DMA controller is accessed via XFLOW register writes.
+// =============================================================================
+
+// Get virtual address of the TX (ingress) buffer portion.
+Function.MX3.GetTxBuf {
+    Output: Address
+    Body: {
+        ReturnValue(Add(MX3Dev.dma_buf_virt, MX3_DMA.TX_SIZE_512KB))
+    }
+}
+
+// Get virtual address of the RX (egress) buffer portion.
+Function.MX3.GetRxBuf {
+    Output: Address
+    Body: {
+        ReturnValue(MX3Dev.dma_buf_virt)
+    }
+}
+
+// Initiate a DMA transfer using the ARM DMAC.
+// chip_id: target chip
+// channel: DMA channel (0-7)
+// src_addr: source address (device-space for D2H, host-space for H2D)
+// dst_addr: destination address
+// size_bytes: transfer size
+// Returns 0 on success, negative on failure.
+Function.MX3.DMATransfer {
+    Input: chip_id: Integer
+    Input: src_addr: Integer
+    Input: dst_addr: Integer
+    Input: size_bytes: Integer
+    Output: Integer
+    Body: {
+        // ARM DMAC registers are at DMA_BASE (0x20040000) on the device
+        // Accessed via XFLOW writes to chip_id
+
+        // Channel 0 register offsets within DMAC
+        // CHx_SAR (source addr) = 0x00
+        // CHx_DAR (dest addr)   = 0x08
+        // CHx_BLOCK_TS          = 0x10
+        // CHx_CTL               = 0x18
+        // DMAC_CHEN0            = 0x18 (channel enable register)
+
+        dma_base = MX3_DMA.BASE
+
+        // Write source address (64-bit: low word, high word)
+        MX3.XflowWrite(chip_id, dma_base, 0, BitwiseAnd(src_addr, 4294967295))
+        MX3.XflowWrite(chip_id, dma_base, 4, ShiftRight(src_addr, 32))
+
+        // Write destination address
+        MX3.XflowWrite(chip_id, dma_base, 8, BitwiseAnd(dst_addr, 4294967295))
+        MX3.XflowWrite(chip_id, dma_base, 12, ShiftRight(dst_addr, 32))
+
+        // Write block transfer size (in 32-bit words, minus 1)
+        block_ts = Subtract(ShiftRight(size_bytes, 2), 1)
+        MX3.XflowWrite(chip_id, dma_base, 16, block_ts)
+
+        // Reinit completion before starting transfer
+        ail_completion_reinit(MX3Dev.completion_tx)
+
+        // Enable DMA channel 0: write 0x101 to DMAC_CHEN0
+        // Bit 0 = enable CH0, Bit 8 = write-enable for bit 0
+        MX3.XflowWrite(chip_id, dma_base, 24, 257)
+
+        // Wait for transfer completion (ISR fires complete())
+        rc = ail_wait_for_completion_timeout(MX3Dev.completion_tx, 500)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            ail_printk("mx3: DMA transfer timeout\n")
+            ReturnValue(-5)
+        }
+
+        ReturnValue(0)
+    }
+}

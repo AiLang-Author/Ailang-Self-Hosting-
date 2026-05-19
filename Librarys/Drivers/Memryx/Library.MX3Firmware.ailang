@@ -1,0 +1,268 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.MX3Firmware.ailang
+//
+// Firmware loading and command interface for the MX3 PCIe driver.
+// Handles firmware download to SRAM, boot wait, and FW command protocol.
+//
+// USAGE
+//   LibraryImport.Drivers.Memryx.MX3Firmware
+
+LibraryImport.KernelShim
+LibraryImport.KernelShimPCIe
+LibraryImport.Drivers.Memryx.MX3Constants
+LibraryImport.Drivers.Memryx.MX3State
+LibraryImport.Drivers.Memryx.MX3XFLOW
+
+// =============================================================================
+// FIRMWARE DOWNLOAD
+// Downloads firmware binary to chip SRAM via MMIO writes.
+// =============================================================================
+
+// Download firmware from /lib/firmware/<fw_name> to chip 0 SRAM.
+// Returns 0 on success, negative on failure.
+Function.MX3.DownloadFirmware {
+    Input: fw_name: Address
+    Output: Integer
+    Body: {
+        ail_printk("mx3: requesting firmware\n")
+
+        // Check if firmware already loaded (ZSBL marker cleared)
+        zsbl_val = MX3.SramRead(MX3_ADDR.FW_DL_BASE)
+        IfCondition NotEqual(zsbl_val, MX3_ADDR.FW_ZSBL_INITVAL) ThenBlock: {
+            ail_printk("mx3: firmware already present in SRAM\n")
+            ReturnValue(1)
+        }
+
+        // Allocate 8 bytes for firmware size output
+        size_buf = ail_kmalloc(8)
+        IfCondition EqualTo(size_buf, 0) ThenBlock: {
+            ail_printk("mx3: kmalloc failed for size buffer\n")
+            ReturnValue(-12)
+        }
+
+        // Request firmware from kernel firmware subsystem
+        fw_data = ail_request_firmware_buf(fw_name, MX3Dev.dev, size_buf)
+        IfCondition EqualTo(fw_data, 0) ThenBlock: {
+            ail_printk("mx3: request_firmware failed\n")
+            ail_kfree(size_buf)
+            ReturnValue(-2)
+        }
+
+        fw_size = Dereference(size_buf)
+        ail_kfree(size_buf)
+
+        ail_printk("mx3: firmware loaded, writing to SRAM\n")
+
+        // Write firmware size to FW_DL_BASE (tells bootloader how much to expect)
+        MX3.SramWrite(MX3_ADDR.FW_DL_BASE, fw_size)
+
+        // Wait for bootloader to consume the size word (clears it to 0)
+        wait_count = 0
+        WhileLoop LessThan(wait_count, 500) {
+            check = MX3.SramRead(MX3_ADDR.FW_DL_BASE)
+            IfCondition EqualTo(check, 0) ThenBlock: {
+                wait_count = 500
+            } ElseBlock: {
+                ail_msleep(10)
+                wait_count = Add(wait_count, 1)
+            }
+        }
+
+        // Clear local interrupt
+        MX3.SramWrite(MX3_ADDR.PCIE_LOCINTR, 0)
+
+        // Write firmware data as 32-bit words to SRAM
+        // Skip first 4 bytes (header), write remainder
+        offset = 4
+        WhileLoop LessThan(offset, fw_size) {
+            word = Dereference(Add(fw_data, offset))
+            sram_addr = Add(MX3_ADDR.FW_DL_BASE, offset)
+            MX3.SramWrite(sram_addr, word)
+            offset = Add(offset, 4)
+        }
+
+        ail_release_firmware_handle(fw_data)
+        ail_printk("mx3: firmware written to SRAM\n")
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// FIRMWARE BOOT WAIT
+// Waits for firmware to signal readiness via MSI-X ACK.
+// =============================================================================
+
+// Wait for firmware ACK via completion (MSI-X vector 0).
+// Returns 0 on success, -1 on timeout.
+Function.MX3.WaitFirmwareAck {
+    Output: Integer
+    Body: {
+        retries = 0
+        WhileLoop LessThan(retries, 5) {
+            // Wait up to 1 second per attempt (HZ jiffies = 1 second)
+            rc = ail_wait_for_completion_timeout(MX3Dev.completion_fw, 250)
+            IfCondition GreaterThan(rc, 0) ThenBlock: {
+                ail_printk("mx3: firmware ACK received\n")
+                ReturnValue(0)
+            }
+            retries = Add(retries, 1)
+        }
+
+        ail_printk("mx3: firmware ACK timeout\n")
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// FIRMWARE COMMAND PROTOCOL
+// Sends a command to firmware via the SRAM command buffer and waits for ACK.
+// =============================================================================
+
+// Send a firmware command and wait for result.
+// opcode: PCIE_FW_CMD_ID enum value
+// chip_id: target chip
+// Returns 0 on success, negative on failure.
+Function.MX3.SendFWCommand {
+    Input: opcode: Integer
+    Input: chip_id: Integer
+    Output: Integer
+    Body: {
+        // FW command buffer is at FW_CMD_BASE in SRAM
+        // Format: u16 opcode, u16 expected_length, u32 data[63]
+
+        // Write opcode (as 32-bit with opcode in low 16 bits)
+        MX3.SramWrite(MX3_ADDR.FW_CMD_BASE, opcode)
+
+        // Reinit completion before triggering
+        ail_completion_reinit(MX3Dev.completion_fw)
+
+        // Trigger FW command IRQ (software IRQ 4)
+        MX3.TriggerDeviceIRQ(chip_id, MX3_SW_IRQ.FW_CMD)
+
+        // Wait for ACK
+        rc = MX3.WaitFirmwareAck()
+        ReturnValue(rc)
+    }
+}
+
+// =============================================================================
+// INIT HOST BUFFER MAPPING
+// Tells firmware about the DMA coherent buffer physical address.
+// =============================================================================
+
+Function.MX3.InitHostBufferMapping {
+    Output: Integer
+    Body: {
+        // Write DMA buffer physical address to FW command data area
+        // data[0] = low 32 bits of DMA physical address
+        // data[1] = high 32 bits
+        dma_phys = MX3Dev.dma_buf_phys
+
+        // Low 32 bits
+        low32 = BitwiseAnd(dma_phys, 4294967295)
+        MX3.SramWrite(Add(MX3_ADDR.FW_CMD_BASE, 8), low32)
+
+        // High 32 bits (shift right by 32)
+        high32 = ShiftRight(dma_phys, 32)
+        MX3.SramWrite(Add(MX3_ADDR.FW_CMD_BASE, 12), high32)
+
+        // Send INIT_HOST_BUF_MAPPING command
+        rc = MX3.SendFWCommand(MX3_FW_CMD.INIT_HOST_BUF_MAPPING, 0)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            ail_printk("mx3: host buffer mapping initialized\n")
+        } ElseBlock: {
+            ail_printk("mx3: host buffer mapping failed\n")
+        }
+
+        ReturnValue(rc)
+    }
+}
+
+// =============================================================================
+// GET HARDWARE INFO
+// Queries firmware for chip count, roles, SRAM addresses.
+// =============================================================================
+
+Function.MX3.GetHWInfo {
+    Output: Integer
+    Body: {
+        rc = MX3.SendFWCommand(MX3_FW_CMD.GET_HW_INFO, 0)
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            ail_printk("mx3: GET_HW_INFO failed\n")
+            ReturnValue(rc)
+        }
+
+        // Parse response from FW command buffer
+        // Response is a fw_hw_info_pkt at FW_CMD_BASE + 4
+
+        // Total chip count is at offset 64 (16 u32 chip_role[] + total_chip_cnt)
+        total_chips = MX3.SramRead(Add(MX3_ADDR.FW_CMD_BASE, 68))
+        MX3Dev.num_chips = total_chips
+
+        // Chip generation
+        chip_gen = MX3.SramRead(Add(MX3_ADDR.FW_CMD_BASE, 136))
+        MX3Dev.chip_generation = chip_gen
+
+        ail_printk("mx3: HW info received\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// FULL FIRMWARE INIT SEQUENCE
+// Complete boot sequence: download → wait ACK → init buffers → get HW info.
+// =============================================================================
+
+Function.MX3.FirmwareInit {
+    Input: fw_name: Address
+    Output: Integer
+    Body: {
+        // Step 1: Download firmware to SRAM
+        rc = MX3.DownloadFirmware(fw_name)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            ReturnValue(rc)
+        }
+
+        // Step 2: Wait for firmware boot ACK (if we actually downloaded)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            rc = MX3.WaitFirmwareAck()
+            IfCondition NotEqual(rc, 0) ThenBlock: {
+                ReturnValue(rc)
+            }
+        } ElseBlock: {
+            // Firmware was already present (rc=1), poll sys tick instead
+            poll_count = 0
+            WhileLoop LessThan(poll_count, 100) {
+                tick = MX3.SramRead(MX3_ADDR.FW_SYS_TICK)
+                IfCondition GreaterThan(tick, 30) ThenBlock: {
+                    poll_count = 100
+                } ElseBlock: {
+                    ail_msleep(100)
+                    poll_count = Add(poll_count, 1)
+                }
+            }
+        }
+
+        // Step 3: Initialize host buffer mapping (if DMA buffer allocated)
+        IfCondition NotEqual(MX3Dev.dma_buf_virt, 0) ThenBlock: {
+            rc = MX3.InitHostBufferMapping()
+            IfCondition NotEqual(rc, 0) ThenBlock: {
+                ail_printk("mx3: host buffer mapping failed, continuing\n")
+            }
+        }
+
+        // Step 4: Get hardware info (chip count, roles)
+        rc = MX3.GetHWInfo()
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            ail_printk("mx3: get HW info failed, using defaults\n")
+            MX3Dev.num_chips = MX3_CASCADE.DEFAULT_CHIPS
+        }
+
+        MX3Dev.fw_loaded = 1
+        ail_printk("mx3: firmware initialization complete\n")
+        ReturnValue(0)
+    }
+}
