@@ -124,7 +124,7 @@ build_app() {
                   "${tmp_prefix}_cc_mcp_ipc"
         local_tools+=(mcp)
     fi
-    for _opt in stat wc du diff olympus sleep skills ailang; do
+    for _opt in stat wc du diff olympus sleep skills ailang ailang_lsp; do
         if [[ -f "${tools_dir}/cc_${_opt}_ipc.ailang" ]]; then
             build_one "${tools_dir}/cc_${_opt}_ipc.ailang" \
                       "/tmp/${tmp_prefix}_cc_${_opt}_ipc.x" \

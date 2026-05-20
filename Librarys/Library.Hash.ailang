@@ -1,0 +1,712 @@
+// Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+//
+// Licensed under the Sean Collins Software License (SCSL). See the LICENSE file in the root directory of this project
+// for the full terms and conditions, including restrictions on forking, corporate use, and permissions for private/teaching purposes.
+
+// Library.Hash.ailang
+// High-performance unified hash table — v2
+//
+// =============================================================================
+// ARCHITECTURE
+// =============================================================================
+//
+// Single API prefix: Hash.*
+//
+// Memory layout — Header (32 bytes):
+//   [magic:8][capacity:8][size:8][entries_ptr:8]
+//
+// Memory layout — Entry slot (32 bytes, open-addressed flat array):
+//   [hash:8][key_ptr:8][value:8][_pad:8]
+//   hash=0  -> empty slot
+//   hash=-1 -> tombstone (deleted)
+//
+// Collision strategy: linear probing
+//   - Cache-friendly: entries are contiguous, no pointer chasing
+//   - Auto-resize at 70% load factor (capacity always power-of-2)
+//   - Modulo replaced with bitwise AND: slot & (capacity-1)
+//   - Tombstone reuse in Set: first dead slot claimed on insert
+//
+// Hash function: hardware CRC32 (SSE4.2) via InlineAsm
+//
+// Keys/Values/Items return Array objects (Library.Array)
+//
+// =============================================================================
+
+LibraryImport.Array
+
+// =============================================================================
+// MAGIC NUMBER
+// =============================================================================
+FixedPool.HashMagic {
+    "MAGIC": Initialize=8244561397
+}
+
+// =============================================================================
+// CRC32 HARDWARE STEP — one byte at a time
+// System V AMD64: crc -> RDI (EDI), byte_val -> RSI (ESI/CL via ECX)
+// =============================================================================
+Function.Hash.CRC32Step {
+    Input: crc:      Integer
+    Input: byte_val: Integer
+    Output: Integer
+    Body: {
+        InlineAsm["MOV eax, edi"]
+        InlineAsm["MOV ecx, esi"]
+        result = InlineAsm["CRC32 eax, cl"]
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// HASH FUNCTION — hardware CRC32 per byte, guaranteed non-zero result
+// =============================================================================
+Function.Hash.HashString {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(str, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        len = StringLength(str)
+        crc = 0
+        i   = 0
+
+        WhileLoop LessThan(i, len) {
+            b   = GetByte(str, i)
+            crc = Hash.CRC32Step(crc, b)
+            i   = Add(i, 1)
+        }
+
+        IfCondition EqualTo(crc, 0) ThenBlock: {
+            crc = 1
+        }
+        ReturnValue(crc)
+    }
+}
+
+// =============================================================================
+// CREATE
+// =============================================================================
+Function.Hash.Create {
+    Input: capacity: Integer
+    Output: Address
+    Body: {
+        IfCondition LessThan(capacity, 8) ThenBlock: {
+            capacity = 8
+        }
+
+        p = 8
+        WhileLoop LessThan(p, capacity) {
+            p = Multiply(p, 2)
+        }
+        capacity = p
+
+        header = Allocate(32)
+        StoreValue(header, HashMagic.MAGIC)
+        StoreValue(Add(header, 8),  capacity)
+        StoreValue(Add(header, 16), 0)
+
+        // 32 bytes per slot: [hash:8][key_ptr:8][value:8][_pad:8]
+        entries = Allocate(Multiply(capacity, 32))
+        i = 0
+        WhileLoop LessThan(i, capacity) {
+            off = Multiply(i, 32)
+            StoreValue(Add(entries, off),        0)
+            StoreValue(Add(entries, Add(off, 8)),  0)
+            StoreValue(Add(entries, Add(off, 16)), 0)
+            StoreValue(Add(entries, Add(off, 24)), 0)
+            i = Add(i, 1)
+        }
+
+        StoreValue(Add(header, 24), entries)
+        ReturnValue(header)
+    }
+}
+
+// Convenience: create with default capacity 16
+Function.Hash.New {
+    Output: Address
+    Body: {
+        ReturnValue(Hash.Create(16))
+    }
+}
+
+// =============================================================================
+// ISHASHTABLE — runtime type check via magic number
+// =============================================================================
+Function.Hash.IsHash {
+    Input: addr: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(addr, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition LessThan(addr, 1000000) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(Dereference(addr), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// FINDSLOT — internal: linear probe returning slot index of matching key
+// Returns -1 if not found. Stops on empty, skips tombstones.
+// =============================================================================
+Function.Hash.FindSlot {
+    Input: ents: Address
+    Input: cap:  Integer
+    Input: h:    Integer
+    Input: key:  Address
+    Output: Integer
+    Body: {
+        mask = Subtract(cap, 1)
+        slot = BitwiseAnd(h, mask)
+        i = 0
+        WhileLoop LessThan(i, cap) {
+            off = Multiply(slot, 32)
+            sh  = Dereference(Add(ents, off))
+
+            // Empty — key definitely not present
+            IfCondition EqualTo(sh, 0) ThenBlock: {
+                ReturnValue(-1)
+            }
+
+            // Tombstone — skip (sh == -1 never equals a valid CRC32 hash)
+            IfCondition NotEqual(sh, -1) ThenBlock: {
+                IfCondition EqualTo(sh, h) ThenBlock: {
+                    sk = Dereference(Add(ents, Add(off, 8)))
+                    IfCondition EqualTo(StringCompare(sk, key), 0) ThenBlock: {
+                        ReturnValue(slot)
+                    }
+                }
+            }
+
+            slot = BitwiseAnd(Add(slot, 1), mask)
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// RESIZE — double capacity and rehash all live entries
+// =============================================================================
+Function.Hash.Resize {
+    Input: table: Address
+    Body: {
+        old_cap     = Dereference(Add(table, 8))
+        old_entries = Dereference(Add(table, 24))
+        new_cap     = Multiply(old_cap, 2)
+
+        new_entries = Allocate(Multiply(new_cap, 32))
+        mask = Subtract(new_cap, 1)
+
+        // Zero new entries
+        i = 0
+        WhileLoop LessThan(i, new_cap) {
+            off = Multiply(i, 32)
+            StoreValue(Add(new_entries, off),        0)
+            StoreValue(Add(new_entries, Add(off, 8)),  0)
+            StoreValue(Add(new_entries, Add(off, 16)), 0)
+            StoreValue(Add(new_entries, Add(off, 24)), 0)
+            i = Add(i, 1)
+        }
+
+        // Rehash live entries (skip empty and tombstones)
+        i = 0
+        WhileLoop LessThan(i, old_cap) {
+            off = Multiply(i, 32)
+            h   = Dereference(Add(old_entries, off))
+
+            IfCondition GreaterThan(h, 0) ThenBlock: {
+                k = Dereference(Add(old_entries, Add(off, 8)))
+                v = Dereference(Add(old_entries, Add(off, 16)))
+
+                slot = BitwiseAnd(h, mask)
+                WhileLoop EqualTo(0, 0) {
+                    noff = Multiply(slot, 32)
+                    IfCondition EqualTo(Dereference(Add(new_entries, noff)), 0) ThenBlock: {
+                        StoreValue(Add(new_entries, noff),        h)
+                        StoreValue(Add(new_entries, Add(noff, 8)),  k)
+                        StoreValue(Add(new_entries, Add(noff, 16)), v)
+                        BreakLoop
+                    }
+                    slot = BitwiseAnd(Add(slot, 1), mask)
+                }
+            }
+
+            i = Add(i, 1)
+        }
+
+        Deallocate(old_entries, Multiply(old_cap, 32))
+        StoreValue(Add(table, 8),  new_cap)
+        StoreValue(Add(table, 24), new_entries)
+    }
+}
+
+// =============================================================================
+// SET — insert or update key/value pair
+// Reuses first tombstone slot encountered during probe.
+// Returns 1 if new key inserted, 0 if existing key updated.
+// =============================================================================
+Function.Hash.Set {
+    Input: table: Address
+    Input: key:   Address
+    Input: value: Integer
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        cap  = Dereference(Add(table, 8))
+        size = Dereference(Add(table, 16))
+        ents = Dereference(Add(table, 24))
+
+        // Resize at 70% load
+        IfCondition GreaterThan(size, Divide(Multiply(cap, 7), 10)) ThenBlock: {
+            Hash.Resize(table)
+            cap  = Dereference(Add(table, 8))
+            ents = Dereference(Add(table, 24))
+        }
+
+        h    = Hash.HashString(key)
+        mask = Subtract(cap, 1)
+        slot = BitwiseAnd(h, mask)
+        tomb = -1
+
+        i = 0
+        WhileLoop LessThan(i, cap) {
+            off = Multiply(slot, 32)
+            sh  = Dereference(Add(ents, off))
+            sk  = Dereference(Add(ents, Add(off, 8)))
+
+            // Empty slot — insert here, or at first tombstone if one was seen
+            IfCondition EqualTo(sh, 0) ThenBlock: {
+                ins = slot
+                IfCondition NotEqual(tomb, -1) ThenBlock: {
+                    ins = tomb
+                }
+                ioff  = Multiply(ins, 32)
+                klen  = StringLength(key)
+                kcopy = Allocate(Add(klen, 1))
+                j = 0
+                WhileLoop LessThan(j, klen) {
+                    SetByte(kcopy, j, GetByte(key, j))
+                    j = Add(j, 1)
+                }
+                SetByte(kcopy, klen, 0)
+                StoreValue(Add(ents, ioff),        h)
+                StoreValue(Add(ents, Add(ioff, 8)),  kcopy)
+                StoreValue(Add(ents, Add(ioff, 16)), value)
+                StoreValue(Add(table, 16), Add(size, 1))
+                ReturnValue(1)
+            }
+
+            // Tombstone — record first one, keep probing
+            IfCondition EqualTo(sh, -1) ThenBlock: {
+                IfCondition EqualTo(tomb, -1) ThenBlock: {
+                    tomb = slot
+                }
+            }
+
+            // Live slot — update if key matches
+            IfCondition EqualTo(sh, h) ThenBlock: {
+                IfCondition EqualTo(StringCompare(sk, key), 0) ThenBlock: {
+                    StoreValue(Add(ents, Add(off, 16)), value)
+                    ReturnValue(0)
+                }
+            }
+
+            slot = BitwiseAnd(Add(slot, 1), mask)
+            i = Add(i, 1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// GET — retrieve value by key, returns 0 if not found
+// =============================================================================
+Function.Hash.Get {
+    Input: table: Address
+    Input: key:   Address
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        cap  = Dereference(Add(table, 8))
+        ents = Dereference(Add(table, 24))
+        h    = Hash.HashString(key)
+        slot = Hash.FindSlot(ents, cap, h, key)
+        IfCondition EqualTo(slot, -1) ThenBlock: {
+            ReturnValue(0)
+        }
+        off = Multiply(slot, 32)
+        ReturnValue(Dereference(Add(ents, Add(off, 16))))
+    }
+}
+
+// =============================================================================
+// CONTAINS — check if key exists, returns 1/0
+// =============================================================================
+Function.Hash.Contains {
+    Input: table: Address
+    Input: key:   Address
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        cap  = Dereference(Add(table, 8))
+        ents = Dereference(Add(table, 24))
+        h    = Hash.HashString(key)
+        slot = Hash.FindSlot(ents, cap, h, key)
+        IfCondition EqualTo(slot, -1) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DELETE — remove key, marks slot as tombstone (-1)
+// Returns 1 if deleted, 0 if not found
+// =============================================================================
+Function.Hash.Delete {
+    Input: table: Address
+    Input: key:   Address
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        cap  = Dereference(Add(table, 8))
+        size = Dereference(Add(table, 16))
+        ents = Dereference(Add(table, 24))
+        h    = Hash.HashString(key)
+        slot = Hash.FindSlot(ents, cap, h, key)
+        IfCondition EqualTo(slot, -1) ThenBlock: {
+            ReturnValue(0)
+        }
+        off = Multiply(slot, 32)
+        sk  = Dereference(Add(ents, Add(off, 8)))
+        Deallocate(sk, 0)
+        StoreValue(Add(ents, off),        -1)
+        StoreValue(Add(ents, Add(off, 8)),  0)
+        StoreValue(Add(ents, Add(off, 16)), 0)
+        StoreValue(Add(table, 16), Subtract(size, 1))
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SIZE
+// =============================================================================
+Function.Hash.Size {
+    Input: table: Address
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Dereference(Add(table, 16)))
+    }
+}
+
+// =============================================================================
+// CLEAR — remove all entries without freeing the table itself
+// =============================================================================
+Function.Hash.Clear {
+    Input: table: Address
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        cap  = Dereference(Add(table, 8))
+        ents = Dereference(Add(table, 24))
+
+        i = 0
+        WhileLoop LessThan(i, cap) {
+            off = Multiply(i, 32)
+            sh  = Dereference(Add(ents, off))
+            IfCondition GreaterThan(sh, 0) ThenBlock: {
+                sk = Dereference(Add(ents, Add(off, 8)))
+                IfCondition NotEqual(sk, 0) ThenBlock: {
+                    Deallocate(sk, 0)
+                }
+            }
+            StoreValue(Add(ents, off),        0)
+            StoreValue(Add(ents, Add(off, 8)),  0)
+            StoreValue(Add(ents, Add(off, 16)), 0)
+            StoreValue(Add(ents, Add(off, 24)), 0)
+            i = Add(i, 1)
+        }
+
+        StoreValue(Add(table, 16), 0)
+    }
+}
+
+// =============================================================================
+// KEYS — returns Array of key strings (pointers into table — do not free)
+// =============================================================================
+Function.Hash.Keys {
+    Input: table: Address
+    Output: Address
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(Array.Create(0))
+        }
+
+        cap    = Dereference(Add(table, 8))
+        size   = Dereference(Add(table, 16))
+        ents   = Dereference(Add(table, 24))
+        result = Array.Create(size)
+
+        i = 0
+        WhileLoop LessThan(i, cap) {
+            off = Multiply(i, 32)
+            sh  = Dereference(Add(ents, off))
+            IfCondition GreaterThan(sh, 0) ThenBlock: {
+                Array.Push(result, Dereference(Add(ents, Add(off, 8))))
+            }
+            i = Add(i, 1)
+        }
+
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// VALUES — returns Array of values
+// =============================================================================
+Function.Hash.Values {
+    Input: table: Address
+    Output: Address
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(Array.Create(0))
+        }
+
+        cap    = Dereference(Add(table, 8))
+        size   = Dereference(Add(table, 16))
+        ents   = Dereference(Add(table, 24))
+        result = Array.Create(size)
+
+        i = 0
+        WhileLoop LessThan(i, cap) {
+            off = Multiply(i, 32)
+            sh  = Dereference(Add(ents, off))
+            IfCondition GreaterThan(sh, 0) ThenBlock: {
+                Array.Push(result, Dereference(Add(ents, Add(off, 16))))
+            }
+            i = Add(i, 1)
+        }
+
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// ITEMS — returns Array of 2-element Arrays: [[key, value], ...]
+// =============================================================================
+Function.Hash.Items {
+    Input: table: Address
+    Output: Address
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(Array.Create(0))
+        }
+
+        cap    = Dereference(Add(table, 8))
+        size   = Dereference(Add(table, 16))
+        ents   = Dereference(Add(table, 24))
+        result = Array.Create(size)
+
+        i = 0
+        WhileLoop LessThan(i, cap) {
+            off = Multiply(i, 32)
+            sh  = Dereference(Add(ents, off))
+
+            IfCondition GreaterThan(sh, 0) ThenBlock: {
+                sk   = Dereference(Add(ents, Add(off, 8)))
+                sv   = Dereference(Add(ents, Add(off, 16)))
+                pair = Array.Create(2)
+                Array.Push(pair, sk)
+                Array.Push(pair, sv)
+                Array.Push(result, pair)
+            }
+
+            i = Add(i, 1)
+        }
+
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// DESTROY — free all keys and the table itself
+// =============================================================================
+Function.Hash.Destroy {
+    Input: table: Address
+    Body: {
+        IfCondition NotEqual(Dereference(table), HashMagic.MAGIC) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        cap  = Dereference(Add(table, 8))
+        ents = Dereference(Add(table, 24))
+
+        i = 0
+        WhileLoop LessThan(i, cap) {
+            off = Multiply(i, 32)
+            sh  = Dereference(Add(ents, off))
+            IfCondition GreaterThan(sh, 0) ThenBlock: {
+                sk = Dereference(Add(ents, Add(off, 8)))
+                IfCondition NotEqual(sk, 0) ThenBlock: {
+                    Deallocate(sk, 0)
+                }
+            }
+            i = Add(i, 1)
+        }
+
+        Deallocate(ents, Multiply(cap, 32))
+        Deallocate(table, 32)
+    }
+}
+
+// =============================================================================
+// INCRBY — increment a numeric value stored at key by amount
+// Key is created with value 0 if it doesn't exist yet. Returns new value.
+// =============================================================================
+Function.Hash.IncrBy {
+    Input: table:  Address
+    Input: key:    Address
+    Input: amount: Integer
+    Output: Integer
+    Body: {
+        current = Hash.Get(table, key)
+        new_val = Add(current, amount)
+        Hash.Set(table, key, new_val)
+        ReturnValue(new_val)
+    }
+}
+
+// =============================================================================
+// MSET — set multiple keys from parallel Arrays of keys and values
+// =============================================================================
+Function.Hash.MSet {
+    Input: table:  Address
+    Input: keys:   Address
+    Input: values: Address
+    Body: {
+        count = Array.Size(keys)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            k = Array.Get(keys, i)
+            v = Array.Get(values, i)
+            Hash.Set(table, k, v)
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// MGET — get multiple values from an Array of keys
+// Returns Array of values (0 for missing keys)
+// =============================================================================
+Function.Hash.MGet {
+    Input: table: Address
+    Input: keys:  Address
+    Output: Address
+    Body: {
+        count  = Array.Size(keys)
+        result = Array.Create(count)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            k = Array.Get(keys, i)
+            Array.Push(result, Hash.Get(table, k))
+            i = Add(i, 1)
+        }
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// SIMPLE WRAPPERS — thin aliases with default capacity for casual use
+// =============================================================================
+Function.Hash.NewSimple {
+    Output: Address
+    Body: {
+        ReturnValue(Hash.Create(16))
+    }
+}
+
+Function.Hash.SetSimple {
+    Input: table: Address
+    Input: key:   Address
+    Input: value: Integer
+    Body: {
+        Hash.Set(table, key, value)
+    }
+}
+
+Function.Hash.GetSimple {
+    Input: table: Address
+    Input: key:   Address
+    Output: Integer
+    Body: {
+        ReturnValue(Hash.Get(table, key))
+    }
+}
+
+Function.Hash.DeleteSimple {
+    Input: table: Address
+    Input: key:   Address
+    Output: Integer
+    Body: {
+        ReturnValue(Hash.Delete(table, key))
+    }
+}
+
+Function.Hash.ContainsSimple {
+    Input: table: Address
+    Input: key:   Address
+    Output: Integer
+    Body: {
+        ReturnValue(Hash.Contains(table, key))
+    }
+}
+
+Function.Hash.SizeSimple {
+    Input: table: Address
+    Output: Integer
+    Body: {
+        ReturnValue(Hash.Size(table))
+    }
+}
+
+Function.Hash.KeysSimple {
+    Input: table: Address
+    Output: Address
+    Body: {
+        ReturnValue(Hash.Keys(table))
+    }
+}
+
+Function.Hash.DestroySimple {
+    Input: table: Address
+    Body: {
+        Hash.Destroy(table)
+    }
+}

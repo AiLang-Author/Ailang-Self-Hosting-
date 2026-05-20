@@ -181,10 +181,20 @@ Function.CompileFunc_Function {
         IfCondition NotEqual(body_node, 0) ThenBlock: {
             local_count = Compile_CountLocals(body_node, param_names)
         }
-        
+
         // Cleanup param list (don't free strings - they belong to AST)
         XArray.XDestroy(param_names)
-        
+
+        // Leaf detection: skip callee-saves + sub rsp if body has no calls.
+        // Leaf functions use the System V red zone (128 bytes below RSP) for
+        // locals and spilled params — no explicit stack allocation needed.
+        is_leaf = 0
+        IfCondition NotEqual(body_node, 0) ThenBlock: {
+            IfCondition EqualTo(CompileFunc_HasCalls(body_node), 0) ThenBlock: {
+                is_leaf = 1
+            }
+        }
+
         // Calculate stack space
         // - Base 64 bytes for scratch/temporaries/RSP save slot
         // - 16 bytes per local variable (alignment safe)
@@ -193,19 +203,23 @@ Function.CompileFunc_Function {
         local_space = Multiply(local_count, 16)
         param_space = Multiply(param_count, 8)
         total_space = Add(base_space, Add(local_space, param_space))
-        
+
         // Align to 16 bytes
         stack_space = BitwiseAnd(Add(total_space, 15), -16)
-        
-        // Allocate stack space FIRST
-        IfCondition GreaterThan(stack_space, 0) ThenBlock: {
-            Emit_SubRspImm32(stack_space)
+
+        // Allocate stack space FIRST (leaf functions skip — use red zone)
+        IfCondition EqualTo(is_leaf, 0) ThenBlock: {
+            IfCondition GreaterThan(stack_space, 0) ThenBlock: {
+                Emit_SubRspImm32(stack_space)
+            }
         }
         Compile.stack_size = stack_space
-        
-        // THEN save callee-saved registers
-        Emit_PushRbx()
-        Emit_PushR12()
+
+        // Save callee-saved registers (leaf functions skip — never use rbx/r12)
+        IfCondition EqualTo(is_leaf, 0) ThenBlock: {
+            Emit_PushRbx()
+            Emit_PushR12()
+        }
         
         
         // === SPILL ARGUMENT REGISTERS TO STACK ===
@@ -263,12 +277,14 @@ Function.CompileFunc_Function {
         Emit_MarkLabel(return_label)
         
         // === FUNCTION EPILOGUE ===
-        
-        Emit_PopR12()
-        Emit_PopRbx()
-        
+
+        IfCondition EqualTo(is_leaf, 0) ThenBlock: {
+            Emit_PopR12()
+            Emit_PopRbx()
+        }
+
         Emit_MovRspRbp()
-        
+
         Emit_PopRbp()
         Emit_Ret()
         
@@ -561,6 +577,13 @@ Function.CompileFunc_UserCall {
             PrintMessage("' is only valid when compiling with -kmod\n")
             Compile.error = 1
             ReturnValue(0)
+        }
+
+        // Inline expansion: if the callee is in the inline registry, expand its
+        // body at this call site instead of emitting a CALL instruction.
+        inline_entry = Compile_FindInline(func_name)
+        IfCondition NotEqual(inline_entry, 0) ThenBlock: {
+            ReturnValue(CompileFunc_ExpandInline(node, inline_entry))
         }
 
         // Look up the function label
@@ -1196,5 +1219,194 @@ Function.CompileFunc_ExternCall {
 
         Compile.nodes_compiled = Add(Compile.nodes_compiled, 1)
         ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// INLINE FUNCTION REGISTRY LOOKUP
+// Returns the 24-byte entry [name, body_node, params_xarray] or 0 if absent.
+// =============================================================================
+Function.Compile_FindInline {
+    Input: name: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(Compile.inline_bodies, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        count = XArray.XSize(Compile.inline_bodies)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            entry = XArray.XGet(Compile.inline_bodies, i)
+            IfCondition NotEqual(entry, 0) ThenBlock: {
+                entry_name = Dereference(entry)
+                IfCondition EqualTo(StringCompare(name, entry_name), 0) ThenBlock: {
+                    ReturnValue(entry)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// INLINE CALL-SITE EXPANSION
+// Evaluates args, binds them as locals, compiles body inline, cleans up.
+// V1 constraint: inline param names must not collide with outer scope names.
+// =============================================================================
+Function.CompileFunc_ExpandInline {
+    Input: call_node: Address
+    Input: inline_entry: Address
+    Output: Integer
+    Body: {
+        body_node     = Dereference(Add(inline_entry, 8))
+        params_xarray = Dereference(Add(inline_entry, 16))
+        param_count   = XArray.XSize(params_xarray)
+        arg_count     = AST_GetChildCount(call_node)
+
+        // Snapshot state for cleanup after expansion
+        saved_var_count    = XArray.XSize(Compile.variables)
+        saved_stack_offset = Compile.stack_offset
+
+        // Evaluate every arg before registering param names to prevent scope
+        // collision: if outer scope has a variable with the same name as a param,
+        // we want to use the outer value while evaluating, not the (not-yet-bound)
+        // inline param slot.
+        i = 0
+        WhileLoop LessThan(i, arg_count) {
+            arg = AST_GetChild(call_node, i)
+            Compile_Expression(arg)
+            Emit_PushRax()
+            i = Add(i, 1)
+        }
+
+        // Pop args in reverse order so param[i] gets arg[i].
+        // Push order: arg[0] deepest → arg[N-1] at top (lowest RSP).
+        // Pop order:  arg[N-1] first (i = N-1 down to 0).
+        i = Subtract(param_count, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            param_name = XArray.XGet(params_xarray, i)
+            Compile.stack_offset = Add(Compile.stack_offset, 8)
+            offset = Subtract(0, Compile.stack_offset)
+            Compile_RegisterLocal(param_name, offset)
+            Emit_PopRax()
+            Emit_MovRbpOffsetRax(offset)
+            i = Subtract(i, 1)
+        }
+
+        // Wire return label: any ReturnValue() in the body jumps here instead
+        // of leaving the caller's function.
+        inline_return_label = Emit_CreateLabel()
+        prev_return_label   = Compile.current_return_label
+        Compile.current_return_label = inline_return_label
+        Compile.inline_return_label  = inline_return_label
+
+        // Compile body statements inline
+        IfCondition NotEqual(body_node, 0) ThenBlock: {
+            CompileFunc_CompileBody(body_node)
+        }
+
+        // Fall-through: if body has no ReturnValue, result is 0 in RAX
+        Emit_XorRaxRax()
+
+        // All ReturnValue() calls in the body jump here; RAX holds the result
+        Emit_MarkLabel(inline_return_label)
+
+        // Restore caller's return context
+        Compile.current_return_label = prev_return_label
+        Compile.inline_return_label  = 0
+
+        // Remove variables registered during expansion (params + body locals)
+        vars_to_remove = Subtract(XArray.XSize(Compile.variables), saved_var_count)
+        WhileLoop GreaterThan(vars_to_remove, 0) {
+            XArray.XPop(Compile.variables)
+            vars_to_remove = Subtract(vars_to_remove, 1)
+        }
+
+        // Restore stack bookkeeping (expanded slots are now dead but harmless)
+        Compile.stack_offset = saved_stack_offset
+
+        Compile.nodes_compiled = Add(Compile.nodes_compiled, 1)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// INLINE FUNCTION DEFINITION
+// Compiles a real callable version (fallback/recursion) and also registers
+// the body + param names for call-site expansion.
+// =============================================================================
+Function.CompileFunc_InlineFunction {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Compile a normal callable version using the existing Function path.
+        // CompileFunc_Function looks up the label by name — works for INLINE_FUNCTION
+        // nodes too because pass 1 registered the name regardless of node type.
+        result = CompileFunc_Function(node)
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Collect param names and body node from AST children
+        func_name     = AST_GetData1(node)
+        child_count   = AST_GetChildCount(node)
+        params_xarray = XArray.XCreate(8)
+        body_node     = 0
+
+        i = 0
+        WhileLoop LessThan(i, child_count) {
+            child      = AST_GetChild(node, i)
+            child_type = AST_GetType(child)
+            IfCondition EqualTo(child_type, AST.PARAMETER) ThenBlock: {
+                pname = AST_GetData1(child)
+                XArray.XPush(params_xarray, pname)
+            }
+            IfCondition EqualTo(child_type, AST.BLOCK) ThenBlock: {
+                body_node = child
+            }
+            i = Add(i, 1)
+        }
+
+        // Register entry: [func_name, body_node, params_xarray]
+        entry = Allocate(24)
+        StoreValue(entry, func_name)
+        StoreValue(Add(entry, 8), body_node)
+        StoreValue(Add(entry, 16), params_xarray)
+        XArray.XPush(Compile.inline_bodies, entry)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// LEAF FUNCTION DETECTION
+// Returns 1 if the AST subtree contains any CALL node, 0 if none.
+// Used to skip callee-save push/pop and sub rsp for leaf functions.
+// =============================================================================
+Function.CompileFunc_HasCalls {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+
+        node_type = AST_GetType(node)
+        IfCondition EqualTo(node_type, AST.CALL) ThenBlock: { ReturnValue(1) }
+
+        child_count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, child_count) {
+            child = AST_GetChild(node, i)
+            IfCondition EqualTo(CompileFunc_HasCalls(child), 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+
+        ReturnValue(0)
     }
 }
