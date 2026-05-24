@@ -1,0 +1,644 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.ComputeIR_GCN.ailang
+//
+// GCN 1.0 lowering pass for CIR (Compute IR).
+// Translates abstract CIR ops → GCN machine code via Library.GCNEnc.
+//
+// This is ONE backend. Future backends (RDNA, SPIR-V, PTX) slot in the same way.
+// The CIR layer never calls this directly — it goes through CIR_Lower(backend_id).
+//
+// Register allocation strategy (simple linear):
+//   CIR vregs 0..N → GCN VGPRs v0..vN  (1:1 for now, optimize later)
+//   CIR sregs 0..M → GCN SGPRs s8..s(8+M)  (s0-3=V#, s4-6=TGID, s7=rsvd)
+//   Thread ID → v0 is pre-loaded by hardware (VGPR0 = thread_id_x on SI)
+//   Group ID  → s4 is pre-loaded by hardware (after 4 USER_DATA SGPRs)
+//
+// Buffer access model (SI):
+//   s[0:3] = buffer resource descriptor (128-bit V#) loaded from USER_DATA_0..3
+//   BUFFER_LOAD_DWORD v_dst, v_index, s[0:3], 0 offen
+//
+// USAGE
+//   LibraryImport.Accel.ComputeIR_GCN
+
+LibraryImport.Drivers.AMDGPU.GCNEnc
+
+// =============================================================================
+// GCN LOWERING STATE
+// =============================================================================
+FixedPool.CIRGcn {
+    // Physical register mapping
+    "vreg_base":    Initialize=0,   CanChange=True  // first available VGPR
+    "sreg_base":    Initialize=8,   CanChange=True  // first available SGPR (0-3=V#, 4-6=TGID, 7=scratch)
+    "num_vgprs":    Initialize=0,   CanChange=True  // total VGPRs used
+    "num_sgprs":    Initialize=0,   CanChange=True  // total SGPRs used
+
+    // Machine code write position
+    "mc_pos":       Initialize=0,   CanChange=True  // byte offset in mc_buf
+
+    // Reserved register assignments (SI hardware conventions)
+    // SGPR0-3 = buffer resource V# (USER_DATA_0..3, 128-bit descriptor)
+    // SGPR4   = workgroup_id_x (set by HW at dispatch, after user_sgpr=4)
+    // SGPR5   = workgroup_id_y (if 2D+ dispatch)
+    // SGPR6   = workgroup_id_z (if 3D dispatch)
+    // VGPR0   = thread_id_x (set by HW, always present on SI)
+    "s_buf_base":   Initialize=0,   CanChange=False // s[0:3] buffer resource V#
+    "s_group_id_x": Initialize=4,   CanChange=False // s4 = workgroup_id_x
+    "s_group_id_y": Initialize=5,   CanChange=False // s5 = workgroup_id_y
+    "v_thread_id":  Initialize=0,   CanChange=False // v0 = thread_id_x (HW)
+}
+
+// =============================================================================
+// CIRGcn_McEmit32 — write one 32-bit word to machine code buffer
+// =============================================================================
+Function.CIRGcn_McEmit32 {
+    Input: word: Integer
+    Output: Integer
+    Body: {
+        pos = CIRGcn.mc_pos
+        ptr = Add(CIRProg.mc_buf, pos)
+        // Write 32-bit word as 4 bytes (little-endian)
+        SetByte(ptr, 0, BitwiseAnd(word, 255))
+        SetByte(ptr, 1, BitwiseAnd(RightShift(word, 8), 255))
+        SetByte(ptr, 2, BitwiseAnd(RightShift(word, 16), 255))
+        SetByte(ptr, 3, BitwiseAnd(RightShift(word, 24), 255))
+        CIRGcn.mc_pos = Add(pos, 4)
+        ReturnValue(4)
+    }
+}
+
+// =============================================================================
+// CIRGcn_McEmit64 — write two 32-bit words (64-bit instruction)
+// =============================================================================
+Function.CIRGcn_McEmit64 {
+    Input: w0: Integer
+    Input: w1: Integer
+    Output: Integer
+    Body: {
+        discard_lo = CIRGcn_McEmit32(w0)
+        discard_hi = CIRGcn_McEmit32(w1)
+        ReturnValue(8)
+    }
+}
+
+// =============================================================================
+// CIRGcn_VReg — map CIR virtual vreg to GCN physical VGPR number
+// CIR vregs are 0-based. Physical = vreg + vreg_base.
+// For GCN src encoding: physical_vgpr + 256 (VGPRs start at 256 in src field).
+// =============================================================================
+Function.CIRGcn_VReg {
+    Input: cir_vreg: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(cir_vreg, CIRGcn.vreg_base))
+    }
+}
+
+// VGPR as src0 encoding (256 + physical_vgpr)
+Function.CIRGcn_VSrc {
+    Input: cir_vreg: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(256, Add(cir_vreg, CIRGcn.vreg_base)))
+    }
+}
+
+// =============================================================================
+// CIRGcn_SReg — map CIR virtual sreg to GCN physical SGPR number
+// CIR sregs are 65536-based (0x10000+N). Strip prefix, add sreg_base.
+// =============================================================================
+Function.CIRGcn_SReg {
+    Input: cir_sreg: Integer
+    Output: Integer
+    Body: {
+        raw = BitwiseAnd(cir_sreg, 65535)
+        ReturnValue(Add(raw, CIRGcn.sreg_base))
+    }
+}
+
+// =============================================================================
+// CIRGcn_IsSReg — check if a register number is a scalar register
+// SRegs have bit 16 set (>= 65536).
+// =============================================================================
+Function.CIRGcn_IsSReg {
+    Input: reg: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(reg, 65535) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CIRGcn_LowerOne — lower a single CIR instruction to GCN machine code
+// Reads from CIRScratch (populated by CIR_ReadInsn).
+// =============================================================================
+Function.CIRGcn_LowerOne {
+    Output: Integer
+    Body: {
+        op   = CIRScratch.op
+        dst  = CIRScratch.dst
+        src0 = CIRScratch.src0
+        src1 = CIRScratch.src1
+        src2 = CIRScratch.src2
+
+        // ----- Memory: LOAD_BUF -----
+        // dst_vreg = buffer[slot][index_vreg]
+        // src0 = buffer slot, src1 = element index vreg
+        // GCN MUBUF offen mode: address = V#_base + VADDR + inst_offset
+        //   VADDR = element_index * 4 + slot_byte_offset (full 32-bit)
+        //   inst_offset = 0 (12-bit field limited to 0-4095, too small for
+        //                     multi-buffer layouts where slot offsets exceed 4KB)
+        IfCondition EqualTo(op, 1) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            vidx = CIRGcn_VReg(src1)
+            // Look up CIR buffer slot to get byte offset within data area
+            lb_bd = Add(CIRBufs.base, Multiply(src0, 32))
+            lb_off = Dereference(Add(lb_bd, 0))
+            // Scale element index to byte offset: v_scratch = vidx << 2
+            v_scratch = CIRProg.next_vreg   // first unused VGPR
+            // V_LSHLREV_B32 v_scratch, 2, v_index  (byte_offset = index * 4)
+            // SI VOP2 opcode: V_LSHLREV_B32 = 26 (0x1A)
+            GCNEnc_Emit_VOP2(26, v_scratch, 130, vidx)  // 130 = inline constant 2
+            discard_shl = CIRGcn_McEmit32(GCNEncState.word0)
+            // Add slot byte offset to VADDR (handles offsets > 4095 correctly)
+            // V_ADD_I32 v_scratch, v_scratch, lb_off  (literal constant)
+            GCNEnc_Emit_VOP2(37, v_scratch, 255, v_scratch)
+            discard_add = CIRGcn_McEmit32(GCNEncState.word0)
+            discard_lit = CIRGcn_McEmit32(lb_off)
+            // BUFFER_LOAD_DWORD v_dst, v_scratch, s[0:3], off offen offset=0
+            // soffset=128 = inline constant 0 (not SGPR s0 which holds V# data!)
+            GCNEnc_Emit_MUBUF(12, vdst, v_scratch, 0, 128, 4096)
+            discard_e64 = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+            ReturnValue(0)
+        }
+
+        // ----- Memory: STORE_BUF -----
+        // src0 = buffer slot, src1 = element index vreg
+        IfCondition EqualTo(op, 2) ThenBlock: {
+            vdata = CIRGcn_VReg(dst)
+            vidx = CIRGcn_VReg(src1)
+            // Look up CIR buffer slot to get byte offset within data area
+            sb_bd = Add(CIRBufs.base, Multiply(src0, 32))
+            sb_off = Dereference(Add(sb_bd, 0))
+            // Scale element index to byte offset: v_scratch = vidx << 2
+            v_scratch = CIRProg.next_vreg
+            // V_LSHLREV_B32 v_scratch, 2, v_index
+            // SI VOP2 opcode: V_LSHLREV_B32 = 26 (0x1A)
+            GCNEnc_Emit_VOP2(26, v_scratch, 130, vidx)
+            discard_shl = CIRGcn_McEmit32(GCNEncState.word0)
+            // Add slot byte offset to VADDR (handles offsets > 4095 correctly)
+            // V_ADD_I32 v_scratch, v_scratch, sb_off  (literal constant)
+            GCNEnc_Emit_VOP2(37, v_scratch, 255, v_scratch)
+            discard_add = CIRGcn_McEmit32(GCNEncState.word0)
+            discard_lit = CIRGcn_McEmit32(sb_off)
+            // BUFFER_STORE_DWORD v_data, v_scratch, s[0:3], off offen offset=0
+            // soffset=128 = inline constant 0
+            GCNEnc_Emit_MUBUF(28, vdata, v_scratch, 0, 128, 4096)
+            discard_e64 = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+            ReturnValue(0)
+        }
+
+        // ----- Memory: LOAD_CONST -----
+        // dst_vreg = immediate value
+        // → V_MOV_B32 v_dst, literal ; followed by 32-bit literal
+        IfCondition EqualTo(op, 3) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            // Src encoding 255 = literal constant, next DWORD is the value
+            GCNEnc_Emit_VOP1(1, vdst, 255)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            discard_lit = CIRGcn_McEmit32(src0)
+            ReturnValue(0)
+        }
+
+        // ----- Memory: LOAD_PARAM -----
+        // dst_sreg = kernel USER_DATA parameter
+        // → S_MOV_B32 s_dst, s(user_data_base + param_idx)
+        IfCondition EqualTo(op, 4) ThenBlock: {
+            sdst = CIRGcn_SReg(dst)
+            // USER_DATA SGPRs start at physical s0 (param 0 = s0, param 1 = s1, etc.)
+            GCNEnc_Emit_SOP1(3, sdst, src0)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: ADD_U32 -----
+        // → V_ADD_I32 v_dst, v_src0, v_src1  (VOP2 op=37 on SI: V_ADD_I32)
+        // Actually SI uses V_ADD_I32 (VOP2 op=0x25=37) which sets VCC
+        IfCondition EqualTo(op, 10) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(37, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: SUB_U32 -----
+        // → V_SUB_I32 (VOP2 op=0x26=38)
+        IfCondition EqualTo(op, 11) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(38, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: MUL_LO_U32 -----
+        // → V_MUL_LO_U32 (VOP3 op=0x169=361) — always 64-bit encoding
+        IfCondition EqualTo(op, 12) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VSrc(src1)
+            GCNEnc_Emit_VOP3(361, vdst, va, vb, 0, 0)
+            discard_e64 = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: MUL_HI_U32 -----
+        // → V_MUL_HI_U32 (VOP3 op=0x16A=362)
+        IfCondition EqualTo(op, 13) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VSrc(src1)
+            GCNEnc_Emit_VOP3(362, vdst, va, vb, 0, 0)
+            discard_e64 = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: AND_B32 -----
+        // → V_AND_B32 (VOP2 op=0x1B=27)
+        IfCondition EqualTo(op, 14) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(27, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: OR_B32 -----
+        // → V_OR_B32 (VOP2 op=0x1C=28)
+        IfCondition EqualTo(op, 15) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(28, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: XOR_B32 -----
+        // → V_XOR_B32 (VOP2 op=0x1D=29)
+        IfCondition EqualTo(op, 16) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(29, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: SHL_B32 -----
+        // → V_LSHLREV_B32 (SI VOP2 op=0x1A=26) — note: reversed operands (shift, src)
+        IfCondition EqualTo(op, 17) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            vshift = CIRGcn_VSrc(src1)
+            vsrc = CIRGcn_VReg(src0)
+            GCNEnc_Emit_VOP2(26, vdst, vshift, vsrc)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: SHR_U32 -----
+        // → V_LSHRREV_B32 (SI VOP2 op=0x16=22) — reversed operands
+        IfCondition EqualTo(op, 18) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            vshift = CIRGcn_VSrc(src1)
+            vsrc = CIRGcn_VReg(src0)
+            GCNEnc_Emit_VOP2(22, vdst, vshift, vsrc)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Integer ALU: SHR_I32 (arithmetic) -----
+        // → V_ASHRREV_I32 (SI VOP2 op=0x18=24) — reversed operands
+        IfCondition EqualTo(op, 19) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            vshift = CIRGcn_VSrc(src1)
+            vsrc = CIRGcn_VReg(src0)
+            GCNEnc_Emit_VOP2(24, vdst, vshift, vsrc)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Float ALU: ADD_F32 -----
+        // → V_ADD_F32 (VOP2 op=3)
+        IfCondition EqualTo(op, 30) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(3, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Float ALU: SUB_F32 -----
+        // → V_SUB_F32 (VOP2 op=4)
+        IfCondition EqualTo(op, 31) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(4, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Float ALU: MUL_F32 -----
+        // → V_MUL_F32 (VOP2 op=8)
+        IfCondition EqualTo(op, 32) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(8, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Float ALU: FMA_F32 -----
+        // → V_FMA_F32 (VOP3 op=0x14B=331)
+        IfCondition EqualTo(op, 33) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VSrc(src1)
+            vc = CIRGcn_VSrc(src2)
+            GCNEnc_Emit_VOP3(331, vdst, va, vb, vc, 0)
+            discard_e64 = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+            ReturnValue(0)
+        }
+
+        // ----- Float ALU: RCP_F32 -----
+        // → V_RCP_F32 (VOP1 op=0x2A=42)
+        IfCondition EqualTo(op, 34) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            vsrc = CIRGcn_VSrc(src0)
+            GCNEnc_Emit_VOP1(42, vdst, vsrc)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Float ALU: SQRT_F32 -----
+        // → V_SQRT_F32 (VOP1 op=0x33=51)
+        IfCondition EqualTo(op, 35) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            vsrc = CIRGcn_VSrc(src0)
+            GCNEnc_Emit_VOP1(51, vdst, vsrc)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Float ALU: MIN_F32 -----
+        // → V_MIN_F32 (VOP2 op=0x0F=15)
+        IfCondition EqualTo(op, 36) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(15, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Float ALU: MAX_F32 -----
+        // → V_MAX_F32 (VOP2 op=0x10=16)
+        IfCondition EqualTo(op, 37) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(16, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Conversions: CVT_F32_U32 -----
+        // → V_CVT_F32_U32 (VOP1 op=6)
+        IfCondition EqualTo(op, 38) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            vsrc = CIRGcn_VSrc(src0)
+            GCNEnc_Emit_VOP1(6, vdst, vsrc)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Conversions: CVT_U32_F32 -----
+        // → V_CVT_U32_F32 (VOP1 op=7)
+        IfCondition EqualTo(op, 39) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            vsrc = CIRGcn_VSrc(src0)
+            GCNEnc_Emit_VOP1(7, vdst, vsrc)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Scalar: S_ADD_U32 -----
+        // → S_ADD_U32 (SOP2 op=0)
+        IfCondition EqualTo(op, 50) ThenBlock: {
+            sdst = CIRGcn_SReg(dst)
+            sa = CIRGcn_SReg(src0)
+            sb = CIRGcn_SReg(src1)
+            GCNEnc_Emit_SOP2(0, sdst, sa, sb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Scalar: S_MUL_I32 -----
+        // → S_MUL_I32 (SOP2 op=0x26=38)
+        IfCondition EqualTo(op, 51) ThenBlock: {
+            sdst = CIRGcn_SReg(dst)
+            sa = CIRGcn_SReg(src0)
+            sb = CIRGcn_SReg(src1)
+            GCNEnc_Emit_SOP2(38, sdst, sa, sb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Scalar: S_MOV -----
+        // → S_MOV_B32 (SOP1 op=3)
+        IfCondition EqualTo(op, 52) ThenBlock: {
+            sdst = CIRGcn_SReg(dst)
+            ssrc = CIRGcn_SReg(src0)
+            GCNEnc_Emit_SOP1(3, sdst, ssrc)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Thread identity: THREAD_ID_X -----
+        // Hardware pre-loads thread_id_x into VGPR0.
+        // → V_MOV_B32 v_dst, v0  (if dst != v0)
+        IfCondition EqualTo(op, 100) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            IfCondition EqualTo(vdst, 0) ThenBlock: { ReturnValue(0) }
+            GCNEnc_Emit_VOP1(1, vdst, 256)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Thread identity: GROUP_ID_X -----
+        // Hardware pre-loads group_id_x into s4 (after 4 USER_DATA SGPRs).
+        // → V_MOV_B32 v_dst, s4  (copy scalar to vector)
+        IfCondition EqualTo(op, 103) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            GCNEnc_Emit_VOP1(1, vdst, CIRGcn.s_group_id_x)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Thread identity: GROUP_ID_Y -----
+        // → V_MOV_B32 v_dst, s5
+        IfCondition EqualTo(op, 104) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            GCNEnc_Emit_VOP1(1, vdst, CIRGcn.s_group_id_y)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Thread identity: GLOBAL_ID_X -----
+        // global_id_x = group_id_x * group_size_x + thread_id_x
+        // → S_MUL_I32 s_scratch, s_group_id_x, group_size_literal
+        // → V_ADD_I32 v_dst, s_scratch, v0
+        // group_id_x is in s4 (after 4 USER_DATA SGPRs)
+        // scratch SGPR at s8 (first available after reserved)
+        IfCondition EqualTo(op, 106) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            grp_sz = CIRProg.group_size_x
+            s_gid = CIRGcn.s_group_id_x         // s4
+            s_scratch = CIRGcn.sreg_base         // s8
+            // S_MUL_I32 s8, s4, literal(group_size)
+            GCNEnc_Emit_SOP2(38, s_scratch, s_gid, 255)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            discard_lit = CIRGcn_McEmit32(grp_sz)
+            // V_ADD_I32 v_dst, s8, v0
+            GCNEnc_Emit_VOP2(37, vdst, s_scratch, 0)
+            discard_e32b = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Thread identity: GROUP_SIZE_X -----
+        // → V_MOV_B32 v_dst, literal(group_size)
+        IfCondition EqualTo(op, 109) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            GCNEnc_Emit_VOP1(1, vdst, 255)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            discard_lit = CIRGcn_McEmit32(CIRProg.group_size_x)
+            ReturnValue(0)
+        }
+
+        // ----- Composite: MAC_F32 (dst += a * b) -----
+        // → V_MAC_F32 (VOP2 op=0x1F=31): dst = dst * 1.0 + a*b... no wait
+        // V_MAC_F32 does: dst = src0 * src1 + dst — accumulate into dst
+        IfCondition EqualTo(op, 121) ThenBlock: {
+            vdst = CIRGcn_VReg(dst)
+            va = CIRGcn_VSrc(src0)
+            vb = CIRGcn_VReg(src1)
+            GCNEnc_Emit_VOP2(31, vdst, va, vb)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Synchronization: BARRIER -----
+        // → S_BARRIER
+        IfCondition EqualTo(op, 80) ThenBlock: {
+            GCNEnc_Emit_S_BARRIER()
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Synchronization: WAITCNT -----
+        // src0=vmcnt, src1=expcnt, src2=lgkmcnt
+        IfCondition EqualTo(op, 81) ThenBlock: {
+            GCNEnc_Emit_S_WAITCNT(src0, src1, src2)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Flow: END_PGM -----
+        // → S_ENDPGM
+        IfCondition EqualTo(op, 90) ThenBlock: {
+            GCNEnc_Emit_S_ENDPGM()
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // ----- Flow: NOP -----
+        // → S_NOP 0
+        IfCondition EqualTo(op, 91) ThenBlock: {
+            GCNEnc_Emit_S_NOP(0)
+            discard_e32 = CIRGcn_McEmit32(GCNEncState.word0)
+            ReturnValue(0)
+        }
+
+        // Unknown op — skip
+        PrintMessage("[CIR:GCN] unknown op=")
+        PrintNumber(op)
+        PrintMessage("\n")
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// CIR_Lower_GCN — lower entire CIR program to GCN machine code
+// Iterates all IR instructions and calls CIRGcn_LowerOne for each.
+// Returns total machine code bytes emitted.
+// =============================================================================
+Function.CIR_Lower_GCN {
+    Output: Integer
+    Body: {
+        n = CIRProg.num_insns
+        IfCondition EqualTo(n, 0) ThenBlock: {
+            PrintMessage("[CIR:GCN] empty program\n")
+            ReturnValue(0)
+        }
+
+        // Set up register allocation
+        // s[0:3] = V# descriptor, s[4:6] = TGID, s[7] = reserved, s[8+] = user
+        CIRGcn.vreg_base = 0
+        CIRGcn.sreg_base = 8
+        // +1 VGPR for scratch (byte offset calc in LOAD/STORE_BUF)
+        // +1 SGPR for scratch (GLOBAL_ID_X scratch at sreg_base)
+        CIRGcn.num_vgprs = Add(CIRProg.next_vreg, 1)
+        CIRGcn.num_sgprs = Add(CIRProg.next_sreg, 9)
+        CIRGcn.mc_pos = 0
+
+        PrintMessage("[CIR:GCN] lowering ")
+        PrintNumber(n)
+        PrintMessage(" ops, ")
+        PrintNumber(CIRProg.next_vreg)
+        PrintMessage(" vregs → VGPRs, ")
+        PrintNumber(CIRProg.next_sreg)
+        PrintMessage(" sregs → SGPRs\n")
+
+        // Lower each instruction
+        i = 0
+        errs = 0
+        WhileLoop LessThan(i, n) {
+            discard_read = CIR_ReadInsn(i)
+            rc = CIRGcn_LowerOne()
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                errs = Add(errs, 1)
+            }
+            i = Add(i, 1)
+        }
+
+        mc_bytes = CIRGcn.mc_pos
+        CIRProg.mc_size = mc_bytes
+        CIRProg.lowered = 1
+
+        PrintMessage("[CIR:GCN] ")
+        PrintNumber(mc_bytes)
+        PrintMessage(" bytes machine code, ")
+        PrintNumber(errs)
+        PrintMessage(" errors\n")
+        ReturnValue(mc_bytes)
+    }
+}

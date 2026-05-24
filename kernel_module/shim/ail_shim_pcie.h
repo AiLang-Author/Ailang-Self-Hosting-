@@ -8,10 +8,11 @@
  * PCIe device drivers in AiLang. All functions take ≤6 parameters
  * (System V AMD64 ABI register limit).
  *
- * The MX3 PCI device table and struct pci_driver live in the C shim.
- * Ailang calls ail_pci_register_driver() (zero-arg) to activate.
- * Probe/remove dispatch to ail_mx3_probe/ail_mx3_remove (Ailang).
- * Char device fops dispatch to ail_mx3_open/read/write/ioctl/release.
+ * The PCI device table is populated at load time from module params
+ * (pci_vendor, pci_device). Ailang calls ail_pci_register_driver()
+ * (zero-arg) to activate.
+ * Probe/remove dispatch to ail_pci_dev_probe/ail_pci_dev_remove (Ailang).
+ * Char device fops dispatch to ail_pci_dev_open/read/write/ioctl/release.
  * ISR handlers stay in C — they call complete() and return.
  */
 
@@ -25,18 +26,18 @@
  * The shim calls these; the payload defines them.
  * ===================================================================== */
 
-extern int  ail_mx3_probe(void *pdev);
-extern void ail_mx3_remove(void *pdev);
-extern int  ail_mx3_open(void *ctx, unsigned int minor);
-extern int  ail_mx3_release(void *ctx, unsigned int minor);
-extern long ail_mx3_write(void *ctx, const void *ubuf, unsigned long count);
-extern long ail_mx3_read(void *ctx, void *ubuf, unsigned long count);
-extern long ail_mx3_ioctl(void *ctx, unsigned int cmd, unsigned long arg);
+extern int  ail_pci_dev_probe(void *pdev);
+extern void ail_pci_dev_remove(void *pdev);
+extern int  ail_pci_dev_open(void *ctx, unsigned int minor);
+extern int  ail_pci_dev_release(void *ctx, unsigned int minor);
+extern long ail_pci_dev_write(void *ctx, const void *ubuf, unsigned long count);
+extern long ail_pci_dev_read(void *ctx, void *ubuf, unsigned long count);
+extern long ail_pci_dev_ioctl(void *ctx, unsigned int cmd, unsigned long arg);
 
 /* =====================================================================
  * PCI Driver Registration
- * Zero-arg: the struct pci_driver with MX3 vendor/device table
- * lives entirely in the C shim.
+ * Zero-arg: the struct pci_driver with dynamically-populated device
+ * table lives entirely in the C shim.
  * ===================================================================== */
 
 int  ail_pci_register_driver(void);
@@ -155,7 +156,7 @@ void  ail_up(void *sem);
 /* =====================================================================
  * Char Device fops bridge
  * The shim creates a struct file_operations that dispatches to
- * ail_mx3_open/read/write/ioctl/release. Ailang calls
+ * ail_pci_dev_open/read/write/ioctl/release. Ailang calls
  * ail_chardev_register() once during probe.
  * ===================================================================== */
 

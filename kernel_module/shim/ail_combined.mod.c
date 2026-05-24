@@ -22,11 +22,14 @@ __used __section("__versions") = {
 	{ 0x9f222e1e, "alloc_chrdev_region" },
 	{ 0xa61fd7aa, "__check_object_size" },
 	{ 0xa96d32ba, "__udelay" },
+	{ 0x52e9e210, "pci_request_region" },
 	{ 0x1abc7887, "release_firmware" },
+	{ 0x1c9578f7, "param_ops_uint" },
 	{ 0x092a35a2, "_copy_from_user" },
 	{ 0x57860fb4, "wait_for_completion_timeout" },
 	{ 0xdf9d1cc9, "pci_enable_device" },
 	{ 0xd710adbf, "__kmalloc_noprof" },
+	{ 0x5331a25d, "pci_iomap" },
 	{ 0x64905a6c, "pci_alloc_irq_vectors" },
 	{ 0x40a621c5, "snprintf" },
 	{ 0x65026e43, "complete" },
@@ -52,6 +55,7 @@ __used __section("__versions") = {
 	{ 0xd272d446, "__put_user_4" },
 	{ 0x90a48d82, "__ubsan_handle_out_of_bounds" },
 	{ 0xfaadbd72, "cdev_add" },
+	{ 0x871567f6, "pci_clear_master" },
 	{ 0x3f7ce9b9, "__dma_sync_single_for_cpu" },
 	{ 0x9126ce86, "request_threaded_irq" },
 	{ 0x01f403fc, "device_create" },
@@ -65,6 +69,7 @@ __used __section("__versions") = {
 	{ 0x402db74e, "memcmp" },
 	{ 0xc1e6c71e, "__mutex_init" },
 	{ 0x81a1a811, "_raw_spin_unlock_irqrestore" },
+	{ 0x00a532c1, "pci_iounmap" },
 	{ 0x27683a56, "memset" },
 	{ 0x871567f6, "pci_set_master" },
 	{ 0xd272d446, "__x86_return_thunk" },
@@ -74,6 +79,7 @@ __used __section("__versions") = {
 	{ 0x0bc5fb0d, "unregister_chrdev_region" },
 	{ 0xf46d5bf3, "mutex_unlock" },
 	{ 0x341fa0ae, "pci_release_regions" },
+	{ 0xcbae5412, "__const_udelay" },
 	{ 0x3f7ce9b9, "__dma_sync_single_for_device" },
 	{ 0x7851be11, "__get_user_4" },
 	{ 0x3124a198, "device_destroy" },
@@ -84,6 +90,8 @@ __used __section("__versions") = {
 	{ 0x871567f6, "pci_disable_device" },
 	{ 0x927f50df, "dma_set_mask" },
 	{ 0xb3d1d601, "__kfifo_alloc" },
+	{ 0x97dd6ca9, "ioremap_wc" },
+	{ 0x8d8136d1, "pci_release_region" },
 	{ 0x1336016d, "pci_free_irq_vectors" },
 	{ 0xd1ea1c88, "__kfifo_out" },
 	{ 0x67628f51, "msleep" },
@@ -99,11 +107,14 @@ __used __section("__version_ext_crcs") = {
 	0x9f222e1e,
 	0xa61fd7aa,
 	0xa96d32ba,
+	0x52e9e210,
 	0x1abc7887,
+	0x1c9578f7,
 	0x092a35a2,
 	0x57860fb4,
 	0xdf9d1cc9,
 	0xd710adbf,
+	0x5331a25d,
 	0x64905a6c,
 	0x40a621c5,
 	0x65026e43,
@@ -129,6 +140,7 @@ __used __section("__version_ext_crcs") = {
 	0xd272d446,
 	0x90a48d82,
 	0xfaadbd72,
+	0x871567f6,
 	0x3f7ce9b9,
 	0x9126ce86,
 	0x01f403fc,
@@ -142,6 +154,7 @@ __used __section("__version_ext_crcs") = {
 	0x402db74e,
 	0xc1e6c71e,
 	0x81a1a811,
+	0x00a532c1,
 	0x27683a56,
 	0x871567f6,
 	0xd272d446,
@@ -151,6 +164,7 @@ __used __section("__version_ext_crcs") = {
 	0x0bc5fb0d,
 	0xf46d5bf3,
 	0x341fa0ae,
+	0xcbae5412,
 	0x3f7ce9b9,
 	0x7851be11,
 	0x3124a198,
@@ -161,6 +175,8 @@ __used __section("__version_ext_crcs") = {
 	0x871567f6,
 	0x927f50df,
 	0xb3d1d601,
+	0x97dd6ca9,
+	0x8d8136d1,
 	0x1336016d,
 	0xd1ea1c88,
 	0x67628f51,
@@ -175,11 +191,14 @@ __used __section("__version_ext_names") =
 	"alloc_chrdev_region\0"
 	"__check_object_size\0"
 	"__udelay\0"
+	"pci_request_region\0"
 	"release_firmware\0"
+	"param_ops_uint\0"
 	"_copy_from_user\0"
 	"wait_for_completion_timeout\0"
 	"pci_enable_device\0"
 	"__kmalloc_noprof\0"
+	"pci_iomap\0"
 	"pci_alloc_irq_vectors\0"
 	"snprintf\0"
 	"complete\0"
@@ -205,6 +224,7 @@ __used __section("__version_ext_names") =
 	"__put_user_4\0"
 	"__ubsan_handle_out_of_bounds\0"
 	"cdev_add\0"
+	"pci_clear_master\0"
 	"__dma_sync_single_for_cpu\0"
 	"request_threaded_irq\0"
 	"device_create\0"
@@ -218,6 +238,7 @@ __used __section("__version_ext_names") =
 	"memcmp\0"
 	"__mutex_init\0"
 	"_raw_spin_unlock_irqrestore\0"
+	"pci_iounmap\0"
 	"memset\0"
 	"pci_set_master\0"
 	"__x86_return_thunk\0"
@@ -227,6 +248,7 @@ __used __section("__version_ext_names") =
 	"unregister_chrdev_region\0"
 	"mutex_unlock\0"
 	"pci_release_regions\0"
+	"__const_udelay\0"
 	"__dma_sync_single_for_device\0"
 	"__get_user_4\0"
 	"device_destroy\0"
@@ -237,6 +259,8 @@ __used __section("__version_ext_names") =
 	"pci_disable_device\0"
 	"dma_set_mask\0"
 	"__kfifo_alloc\0"
+	"ioremap_wc\0"
+	"pci_release_region\0"
 	"pci_free_irq_vectors\0"
 	"__kfifo_out\0"
 	"msleep\0"
@@ -248,6 +272,5 @@ __used __section("__version_ext_names") =
 
 MODULE_INFO(depends, "");
 
-MODULE_ALIAS("pci:v00001FE9d00000100sv*sd*bc*sc*i*");
 
-MODULE_INFO(srcversion, "90925515EEE3CEB304CB75C");
+MODULE_INFO(srcversion, "518D46EF93003166D2F84E4");

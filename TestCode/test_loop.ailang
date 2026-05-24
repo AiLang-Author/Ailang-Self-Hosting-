@@ -1,0 +1,165 @@
+// test_loop.ailang — continuous dispatch loop stress test
+// Runs the simple kernel (dst[gid] = src[gid] + 42) repeatedly
+// to reveal first-run vs steady-state behavior.
+// Build: ./ailang.x TestCode/test_loop.ailang -o test_loop.x
+// Run:   sudo ./test_loop.x 2>&1 | tee loop_log.txt
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.GCNEnc
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+LibraryImport.Accel.HAL
+LibraryImport.Accel.AccelGCN
+
+SubRoutine.Main {
+    PrintMessage("=== Loop Stress Test: dst[gid] = src[gid] + 42 ===\n")
+    PrintMessage("64 threads, 100 iterations, single init\n\n")
+
+    num_elems = 64
+    buf_bytes = 256
+    src_off = 0
+    dst_off = 256
+    max_iters = 100
+
+    // --- Init once ---
+    rc = AccelGCN_Init()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("FATAL: init failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("Init OK\n\n")
+
+    // --- Build kernel once: dst[gid] = src[gid] + 42 ---
+    rc = CIR_Begin()
+    rc = CIR_SetGroupSize(64, 1, 1)
+    rc = CIR_SetGrid(1, 1, 1)
+    rc = CIR_BindBuffer(0, src_off, buf_bytes, 4, 1)
+    rc = CIR_BindBuffer(1, dst_off, buf_bytes, 4, 2)
+
+    v_gid = CIR_AllocVReg()
+    v_val = CIR_AllocVReg()
+    v_42  = CIR_AllocVReg()
+    v_sum = CIR_AllocVReg()
+
+    rc = CIR_Op_GlobalIdX(v_gid)
+    rc = CIR_Op_LoadBuf(v_val, 0, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_LoadConst(v_42, 42)
+    rc = CIR_Op_AddU32(v_sum, v_val, v_42)
+    rc = CIR_Op_StoreBuf(v_sum, 1, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_EndPgm()
+
+    n_insns = CIR_End()
+    mc_bytes = CIR_Lower_GCN()
+    PrintMessage("Kernel: ")
+    PrintNumber(n_insns)
+    PrintMessage(" insns, ")
+    PrintNumber(mc_bytes)
+    PrintMessage(" bytes GCN\n\n")
+
+    // Allocate host buffers once
+    host_src = Allocate(buf_bytes)
+    host_dst = Allocate(buf_bytes)
+
+    total_pass = 0
+    total_fail = 0
+
+    iter = 0
+    WhileLoop LessThan(iter, max_iters) {
+        // --- Fill src with iter-dependent data: src[i] = iter*64 + i ---
+        i = 0
+        WhileLoop LessThan(i, num_elems) {
+            off = Multiply(i, 4)
+            val = Add(Multiply(iter, 64), i)
+            SetByte(host_src, off, BitwiseAnd(val, 255))
+            SetByte(host_src, Add(off, 1), BitwiseAnd(RightShift(val, 8), 255))
+            SetByte(host_src, Add(off, 2), BitwiseAnd(RightShift(val, 16), 255))
+            SetByte(host_src, Add(off, 3), BitwiseAnd(RightShift(val, 24), 255))
+            i = Add(i, 1)
+        }
+        discard = AccelGCN_VramWrite(src_off, host_src, buf_bytes)
+
+        // Zero dst
+        MemorySet(host_dst, 0, buf_bytes)
+        discard = AccelGCN_VramWrite(dst_off, host_dst, buf_bytes)
+
+        // --- Dispatch ---
+        rc = AccelGCN_Dispatch()
+
+        // --- Read back ---
+        discard = AccelGCN_VramRead(dst_off, host_dst, buf_bytes)
+
+        // --- Verify ---
+        errors = 0
+        first_bad_idx = 0
+        first_bad_got = 0
+        first_bad_exp = 0
+        i = 0
+        WhileLoop LessThan(i, num_elems) {
+            off = Multiply(i, 4)
+            b0 = GetByte(host_dst, off)
+            b1 = GetByte(host_dst, Add(off, 1))
+            b2 = GetByte(host_dst, Add(off, 2))
+            b3 = GetByte(host_dst, Add(off, 3))
+            got = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+            expected = Add(Add(Multiply(iter, 64), i), 42)
+            IfCondition NotEqual(got, expected) ThenBlock: {
+                IfCondition EqualTo(errors, 0) ThenBlock: {
+                    first_bad_idx = i
+                    first_bad_got = got
+                    first_bad_exp = expected
+                }
+                errors = Add(errors, 1)
+            }
+            i = Add(i, 1)
+        }
+
+        // Print one line per iteration
+        PrintMessage("iter ")
+        PrintNumber(iter)
+        PrintMessage(": ")
+        IfCondition EqualTo(errors, 0) ThenBlock: {
+            PrintMessage("PASS 64/64")
+            total_pass = Add(total_pass, 1)
+        }
+        IfCondition GreaterThan(errors, 0) ThenBlock: {
+            PrintMessage("FAIL ")
+            PrintNumber(Subtract(64, errors))
+            PrintMessage("/64  first_bad=[")
+            PrintNumber(first_bad_idx)
+            PrintMessage("] got=")
+            PrintNumber(first_bad_got)
+            PrintMessage(" exp=")
+            PrintNumber(first_bad_exp)
+            total_fail = Add(total_fail, 1)
+        }
+        PrintMessage("\n")
+
+        iter = Add(iter, 1)
+    }
+
+    PrintMessage("\n=== Summary ===\n")
+    PrintMessage("Iterations: ")
+    PrintNumber(max_iters)
+    PrintMessage("  PASS: ")
+    PrintNumber(total_pass)
+    PrintMessage("  FAIL: ")
+    PrintNumber(total_fail)
+    PrintMessage("\n")
+
+    IfCondition EqualTo(total_fail, 0) ThenBlock: { PrintMessage("*** ALL PASS ***\n") }
+    IfCondition GreaterThan(total_fail, 0) ThenBlock: { PrintMessage("*** FAILURES DETECTED ***\n") }
+
+    Deallocate(host_src, buf_bytes)
+    Deallocate(host_dst, buf_bytes)
+    discard = AccelGCN_Shutdown()
+    PrintMessage("=== Done ===\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)

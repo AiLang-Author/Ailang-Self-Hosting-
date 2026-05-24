@@ -1,0 +1,287 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AccelMX3FW.ailang
+//
+// Userspace firmware loading for the Memryx MX3.
+// Reads firmware binary from filesystem, writes to SRAM via mmap'd BAR.
+// Polls device registers for boot completion — no kernel IRQs needed.
+//
+// Protocol matches reference driver (memx_fw_init.c):
+//   1. Read ZSBL marker at FW_DL_BASE — if != 0x4D4D4D4D, assume already loaded
+//   2. Write first 4 bytes of firmware (size header) to FW_DL_BASE
+//   3. Poll until bootloader clears FW_DL_BASE to 0 (re-write if ZSBL re-appears)
+//   4. Write firmware data (32-bit words) to FW_DL_BASE+0 .. FW_DL_BASE+size
+//   5. Poll sys_tick until firmware boot confirmed
+//
+// USAGE
+//   LibraryImport.Accel.AccelMX3FW
+
+LibraryImport.Accel.AccelMX3BAR
+LibraryImport.Drivers.Memryx.MX3Constants
+LibraryImport.ThreadTrampoline
+
+// =============================================================================
+// FIRMWARE CONFIG
+// =============================================================================
+FixedPool.MX3FWCfg {
+    "path":          Initialize="/tmp/mx3_driver_pub/firmware/cascade_4chips_flash.bin"
+    "poll_max":      Initialize=500        // max poll iterations for bootloader ACK
+    "poll_ms":       Initialize=10         // ms between polls during FW write
+    "boot_poll_max": Initialize=100        // max poll iterations for boot
+    "boot_poll_ms":  Initialize=100        // ms between polls during boot
+    "boot_tick_min": Initialize=30         // sys_tick threshold for "booted"
+}
+
+// =============================================================================
+// AccelMX3FW_SramTest — write/read round-trip to verify SRAM is accessible
+// Uses a scratch region well past control registers.
+// Returns 0 on success, -1 on failure.
+// =============================================================================
+Function.AccelMX3FW_SramTest {
+    Output: Integer
+    Body: {
+        // Test address: DATA_SRAM_OFFS (0x40000) into SRAM = 0x40080000 MPU
+        // This is the data region, safe to write.
+        st_addr = MX3_SRAM.DATASRAM_BASE
+        st_pattern = 305419896     // 0x12345678
+
+        // Write pattern
+        MX3BAR_SramWrite32(st_addr, st_pattern)
+
+        // Read back
+        st_readback = MX3BAR_SramRead32(st_addr)
+
+        PrintMessage("[SRAM TEST] wrote 0x12345678, read back ")
+        PrintNumber(st_readback)
+
+        IfCondition EqualTo(st_readback, st_pattern) ThenBlock: {
+            PrintMessage(" — PASS\n")
+            // Clean up
+            MX3BAR_SramWrite32(st_addr, 0)
+            ReturnValue(0)
+        }
+
+        PrintMessage(" — FAIL\n")
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// AccelMX3FW_Load — load firmware if not already present
+// Returns 0 on success, negative on failure.
+// =============================================================================
+Function.AccelMX3FW_Load {
+    Output: Integer
+    Body: {
+        // Step 0: Verify SRAM is accessible
+        st_rc = AccelMX3FW_SramTest()
+        IfCondition NotEqual(st_rc, 0) ThenBlock: {
+            PrintMessage("[AccelMX3FW] SRAM not accessible — check PCI command register\n")
+            PrintMessage("[AccelMX3FW] Run: sudo setpci -s 02:00.0 COMMAND=0x06\n")
+            ReturnValue(-90)
+        }
+
+        // Step 1: Check ZSBL marker
+        fw_zsbl = MX3BAR_SramRead32(MX3_ADDR.FW_DL_BASE)
+        PrintMessage("[AccelMX3FW] ZSBL marker = 0x")
+        // Print as hex-ish: just print decimal for now
+        PrintNumber(fw_zsbl)
+        PrintMessage(" (expect 0x4D4D4D4D = ")
+        PrintNumber(MX3_ADDR.FW_ZSBL_INITVAL)
+        PrintMessage(")\n")
+
+        IfCondition NotEqual(fw_zsbl, MX3_ADDR.FW_ZSBL_INITVAL) ThenBlock: {
+            // Marker is not "MMMM" — firmware may already be loaded.
+            // Check sys_tick to confirm it's running.
+            fw_tick = MX3BAR_SramRead32(MX3_ADDR.FW_SYS_TICK)
+            PrintMessage("[AccelMX3FW] sys_tick = ")
+            PrintNumber(fw_tick)
+            PrintMessage("\n")
+            IfCondition GreaterThan(fw_tick, MX3FWCfg.boot_tick_min) ThenBlock: {
+                PrintMessage("[AccelMX3FW] firmware already running\n")
+                MX3User.fw_loaded = 1
+                ReturnValue(0)
+            }
+            // sys_tick low — device not booted.
+            // If ZSBL marker is 0xFFFFFFFF, SRAM might be uninitialized (fresh chip).
+            // Try loading anyway — the bootloader ROM may still accept data.
+            PrintMessage("[AccelMX3FW] ZSBL not found, tick not advancing — attempting PCIe boot\n")
+        }
+
+        // Step 2: Open firmware file
+        fw_fd = SystemCall(2, MX3FWCfg.path, 0, 0)
+        IfCondition LessThan(fw_fd, 0) ThenBlock: {
+            PrintMessage("[AccelMX3FW] cannot open firmware: ")
+            PrintNumber(fw_fd)
+            PrintMessage("\n")
+            ReturnValue(-2)
+        }
+
+        // Get file size: lseek(fd, 0, SEEK_END) then lseek(fd, 0, SEEK_SET)
+        fw_size = SystemCall(8, fw_fd, 0, 2)
+        SystemCall(8, fw_fd, 0, 0)
+        PrintMessage("[AccelMX3FW] firmware size = ")
+        PrintNumber(fw_size)
+        PrintMessage(" bytes\n")
+
+        IfCondition LessThan(fw_size, 8) ThenBlock: {
+            PrintMessage("[AccelMX3FW] firmware file too small\n")
+            SystemCall(3, fw_fd)
+            ReturnValue(-3)
+        }
+
+        // Allocate buffer and read firmware
+        fw_buf = Allocate(fw_size)
+        IfCondition EqualTo(fw_buf, 0) ThenBlock: {
+            PrintMessage("[AccelMX3FW] alloc failed\n")
+            SystemCall(3, fw_fd)
+            ReturnValue(-12)
+        }
+
+        fw_read = SystemCall(0, fw_fd, fw_buf, fw_size)
+        SystemCall(3, fw_fd)
+
+        IfCondition NotEqual(fw_read, fw_size) ThenBlock: {
+            PrintMessage("[AccelMX3FW] read incomplete: got ")
+            PrintNumber(fw_read)
+            PrintMessage("\n")
+            Deallocate(fw_buf, fw_size)
+            ReturnValue(-5)
+        }
+
+        // Step 3: Write first 4 bytes (size/header word) to FW_DL_BASE
+        // Reference driver: memx_sram_write(dev, MXCNST_FW_START_BASE, *(u32*)buf)
+        // We read the first 8 bytes from buffer, mask to lower 32 bits.
+        fw_hdr_raw = Dereference(fw_buf)
+        fw_hdr = BitwiseAnd(fw_hdr_raw, 4294967295)
+        PrintMessage("[AccelMX3FW] writing header word: ")
+        PrintNumber(fw_hdr)
+        PrintMessage("\n")
+        MX3BAR_SramWrite32(MX3_ADDR.FW_DL_BASE, fw_hdr)
+
+        // Step 4: Poll until bootloader consumes header (clears to 0)
+        // Reference driver re-writes header if ZSBL marker reappears.
+        fw_wait = 0
+        fw_consumed = 0
+        WhileLoop LessThan(fw_wait, MX3FWCfg.poll_max) {
+            fw_check = MX3BAR_SramRead32(MX3_ADDR.FW_DL_BASE)
+
+            IfCondition EqualTo(fw_check, 0) ThenBlock: {
+                // Bootloader consumed the header — ready for data
+                fw_consumed = 1
+                fw_wait = MX3FWCfg.poll_max
+            } ElseBlock: {
+                // If ZSBL marker reappeared, re-write header
+                IfCondition EqualTo(fw_check, MX3_ADDR.FW_ZSBL_INITVAL) ThenBlock: {
+                    MX3BAR_SramWrite32(MX3_ADDR.FW_DL_BASE, fw_hdr)
+                }
+
+                // nanosleep poll_ms
+                fw_ts = Allocate(16)
+                StoreValue(fw_ts, 0)
+                StoreValue(Add(fw_ts, 8), Multiply(MX3FWCfg.poll_ms, 1000000))
+                SystemCall(SysNr.NANOSLEEP, fw_ts, 0, 0, 0, 0, 0)
+                Deallocate(fw_ts, 16)
+                fw_wait = Add(fw_wait, 1)
+            }
+        }
+
+        IfCondition EqualTo(fw_consumed, 0) ThenBlock: {
+            // Bootloader didn't ACK. Print what we read back for diagnosis.
+            fw_diag = MX3BAR_SramRead32(MX3_ADDR.FW_DL_BASE)
+            PrintMessage("[AccelMX3FW] bootloader no ACK (value=")
+            PrintNumber(fw_diag)
+            PrintMessage("), writing firmware data anyway\n")
+            // Don't give up — try writing data regardless.
+            // On fresh uninitialized chips the ZSBL might not be active
+            // but writing firmware to SRAM and triggering reset might work.
+        }
+
+        // Step 5: Write firmware data to SRAM
+        // Reference driver: skip first 4 bytes of buffer (header), write rest
+        // starting at FW_DL_BASE+0 (overwrites the header location).
+        // Each word is 32-bit, read from host buffer.
+        fw_data_words = Divide(fw_size, 4)
+        fw_written = 0
+        fw_ofs = 4
+        fw_sram_ofs = 0
+        WhileLoop LessThan(fw_ofs, fw_size) {
+            // Read 32-bit word from firmware buffer
+            // Dereference reads 8 bytes — mask to lower 32 bits
+            fw_word = BitwiseAnd(Dereference(Add(fw_buf, fw_ofs)), 4294967295)
+            fw_sram_addr = Add(MX3_ADDR.FW_DL_BASE, fw_sram_ofs)
+            MX3BAR_SramWrite32(fw_sram_addr, fw_word)
+            fw_ofs = Add(fw_ofs, 4)
+            fw_sram_ofs = Add(fw_sram_ofs, 4)
+            fw_written = Add(fw_written, 1)
+        }
+
+        Deallocate(fw_buf, fw_size)
+        PrintMessage("[AccelMX3FW] firmware written: ")
+        PrintNumber(fw_written)
+        PrintMessage(" words to SRAM\n")
+
+        // Step 6: Verify firmware data landed — read back first few words
+        fw_v0 = MX3BAR_SramRead32(MX3_ADDR.FW_DL_BASE)
+        fw_v1 = MX3BAR_SramRead32(Add(MX3_ADDR.FW_DL_BASE, 4))
+        fw_v2 = MX3BAR_SramRead32(Add(MX3_ADDR.FW_DL_BASE, 8))
+        PrintMessage("[AccelMX3FW] verify SRAM[0..2] = ")
+        PrintNumber(fw_v0)
+        PrintMessage(" ")
+        PrintNumber(fw_v1)
+        PrintMessage(" ")
+        PrintNumber(fw_v2)
+        PrintMessage("\n")
+
+        // Step 7: Wait for firmware boot — poll sys_tick
+        PrintMessage("[AccelMX3FW] waiting for boot (polling sys_tick)...\n")
+        fw_bpoll = 0
+        fw_booted = 0
+        fw_tick0 = MX3BAR_SramRead32(MX3_ADDR.FW_SYS_TICK)
+        WhileLoop LessThan(fw_bpoll, MX3FWCfg.boot_poll_max) {
+            fw_btick = MX3BAR_SramRead32(MX3_ADDR.FW_SYS_TICK)
+            IfCondition GreaterThan(fw_btick, MX3FWCfg.boot_tick_min) ThenBlock: {
+                // Also verify tick is advancing (not stuck)
+                IfCondition GreaterThan(fw_btick, fw_tick0) ThenBlock: {
+                    fw_booted = 1
+                    fw_bpoll = MX3FWCfg.boot_poll_max
+                }
+            }
+
+            IfCondition EqualTo(fw_booted, 0) ThenBlock: {
+                // Print progress every 10 polls
+                fw_bmod = Modulo(fw_bpoll, 10)
+                IfCondition EqualTo(fw_bmod, 0) ThenBlock: {
+                    PrintMessage("[AccelMX3FW]   tick=")
+                    PrintNumber(fw_btick)
+                    PrintMessage(" (poll ")
+                    PrintNumber(fw_bpoll)
+                    PrintMessage(")\n")
+                }
+
+                fw_bts = Allocate(16)
+                StoreValue(fw_bts, 0)
+                StoreValue(Add(fw_bts, 8), Multiply(MX3FWCfg.boot_poll_ms, 1000000))
+                SystemCall(SysNr.NANOSLEEP, fw_bts, 0, 0, 0, 0, 0)
+                Deallocate(fw_bts, 16)
+                fw_bpoll = Add(fw_bpoll, 1)
+            }
+        }
+
+        IfCondition EqualTo(fw_booted, 0) ThenBlock: {
+            fw_final_tick = MX3BAR_SramRead32(MX3_ADDR.FW_SYS_TICK)
+            PrintMessage("[AccelMX3FW] boot timeout — final sys_tick = ")
+            PrintNumber(fw_final_tick)
+            PrintMessage("\n")
+            ReturnValue(-62)
+        }
+
+        MX3User.fw_loaded = 1
+        fw_final = MX3BAR_SramRead32(MX3_ADDR.FW_SYS_TICK)
+        PrintMessage("[AccelMX3FW] firmware boot complete, sys_tick = ")
+        PrintNumber(fw_final)
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}

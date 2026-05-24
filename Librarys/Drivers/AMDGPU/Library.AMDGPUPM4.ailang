@@ -1,0 +1,2154 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUPM4.ailang
+//
+// PM4 Ring Buffer Manager for AMD GCN 1.0 (Southern Islands).
+// Manages the CP (Command Processor) ring buffer for GPU command submission.
+// Uses VRAM-backed ring buffer accessed through the VRAM BAR aperture.
+//
+// Architecture (mirrors ThreadPool head/tail mailbox):
+//   CPU owns WPTR (write pointer) — "tail" in ThreadPool terms
+//   GPU owns RPTR (read pointer)  — "head" in ThreadPool terms
+//   CPU writes commands, bumps WPTR → GPU starts consuming
+//   CPU polls RPTR (via writeback) to know GPU has caught up
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+//
+// DEPENDS
+//   LibraryImport.Arena
+//   LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+
+// =============================================================================
+// SOUTHERN ISLANDS CP RING BUFFER REGISTERS (byte offsets into MMIO BAR)
+// =============================================================================
+FixedPool.SIReg {
+    // GRBM
+    "GRBM_STATUS":          Initialize=32784      // 0x8010
+    "GRBM_SOFT_RESET":      Initialize=32800      // 0x8020
+    "GRBM_GFX_INDEX":       Initialize=32812      // 0x802C
+
+    // CP Ring 0 (GFX/Compute)
+    "CP_RB0_CNTL":          Initialize=49412      // 0xC104
+    "CP_RB0_BASE":          Initialize=49408      // 0xC100
+    "CP_RB0_BASE_HI":       Initialize=0          // not used on SI (32-bit GPU addr)
+    "CP_RB0_RPTR":          Initialize=34560      // 0x8700  (read from HW)
+    "CP_RB0_RPTR_ADDR":     Initialize=49420      // 0xC10C
+    "CP_RB0_RPTR_ADDR_HI":  Initialize=49424      // 0xC110
+    "CP_RB0_WPTR":          Initialize=49428      // 0xC114
+
+    // CP Ring 1 (Compute)
+    "CP_RB1_CNTL":          Initialize=49540      // 0xC184
+    "CP_RB1_BASE":          Initialize=49536      // 0xC180
+    "CP_RB1_RPTR":          Initialize=34556      // 0x86FC  (read from HW)
+    "CP_RB1_RPTR_ADDR":     Initialize=49544      // 0xC188
+    "CP_RB1_RPTR_ADDR_HI":  Initialize=49548      // 0xC18C
+    "CP_RB1_WPTR":          Initialize=49552      // 0xC190
+
+    // CP Control
+    "CP_ME_CNTL":           Initialize=34520      // 0x86D8
+    "CP_RB_WPTR_DELAY":     Initialize=34564      // 0x8704
+    "CP_INT_CNTL_RING0":    Initialize=49576      // 0xC1A8
+
+    // CP Misc (required for firmware startup)
+    "CP_SEM_WAIT_TIMER":    Initialize=34236      // 0x85BC
+    "CP_SEM_INCOMPLETE_TIMER": Initialize=34248   // 0x85C8
+    "CP_MAX_CONTEXT":       Initialize=34464      // 0x86A0
+    "CP_ENDIAN_SWAP":       Initialize=34512      // 0x86D0
+    "CP_DEVICE_ID":         Initialize=34516      // 0x86D4
+    "CP_DEBUG":             Initialize=49660      // 0xC1FC
+
+    // Scratch registers
+    "SCRATCH_REG0":         Initialize=34048      // 0x8500
+    "SCRATCH_REG1":         Initialize=34052      // 0x8504
+    "SCRATCH_REG2":         Initialize=34056      // 0x8508
+    "SCRATCH_REG3":         Initialize=34060      // 0x850C
+    "SCRATCH_REG4":         Initialize=34064      // 0x8510
+    "SCRATCH_REG5":         Initialize=34068      // 0x8514
+    "SCRATCH_REG6":         Initialize=34072      // 0x8518
+    "SCRATCH_REG7":         Initialize=34076      // 0x851C
+    "SCRATCH_UMSK":         Initialize=34112      // 0x8540
+    "SCRATCH_ADDR":         Initialize=34116      // 0x8544
+
+    // Memory Controller
+    "MC_VM_FB_LOCATION":    Initialize=8228       // 0x2024
+    "MC_VM_SYSTEM_APERTURE_LOW_ADDR":  Initialize=8244   // 0x2034
+    "MC_VM_SYSTEM_APERTURE_HIGH_ADDR": Initialize=8248   // 0x2038
+    "MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR": Initialize=8252 // 0x203C
+
+    // VM Context (VMID 0)
+    "VM_CONTEXT0_CNTL":               Initialize=5136    // 0x1410
+    "VM_CONTEXT0_PAGE_TABLE_BASE_ADDR": Initialize=5436  // 0x153C
+    "VM_CONTEXT0_PAGE_TABLE_START_ADDR": Initialize=5452 // 0x154C
+    "VM_CONTEXT0_PAGE_TABLE_END_ADDR":  Initialize=5468  // 0x155C
+    "VM_L2_CNTL":                     Initialize=5120    // 0x1400
+    "VM_L2_CNTL2":                    Initialize=5124    // 0x1404
+    "VM_L2_CNTL3":                    Initialize=5128    // 0x1408
+    "VM_INVALIDATE_REQUEST":          Initialize=5240    // 0x1478
+    "VM_INVALIDATE_RESPONSE":         Initialize=5244    // 0x147C
+
+    // MC VM L1 TLB — controls address routing (aperture check, PA mode, etc.)
+    "MC_VM_MX_L1_TLB_CNTL":          Initialize=8292    // 0x2064
+
+    // RLC (Run List Controller)
+    "RLC_CNTL":             Initialize=49920      // 0xC300
+
+    // Clock Gating — must be disabled for bare-metal compute without RLC firmware
+    "RLC_CGTT_MGCG_OVERRIDE": Initialize=50176    // 0xC400 — MGCG per-block override
+    "RLC_CGCG_CGLS_CTRL":     Initialize=50180    // 0xC404 — bit0=CGCG_EN bit1=CGLS_EN
+    "CGTS_SM_CTRL_REG":       Initialize=37200    // 0x9150 — CGTS state machine control
+
+    // SRBM (System Register Bus Manager)
+    "SRBM_STATUS":          Initialize=3664       // 0x0E50
+    "SRBM_SOFT_RESET":      Initialize=3680       // 0x0E60
+    "SRBM_STATUS2":         Initialize=3700       // 0x0E74
+
+    // MC / Display / Bus Interface (needed for safe GPU reset sequence)
+    // GPU reset REQUIRES MC blackout + BAR fence before writing GRBM/SRBM
+    // soft reset registers. Without this the bus deadlocks → system lockup.
+    "VGA_RENDER_CONTROL":      Initialize=768      // 0x0300
+    "BIF_FB_EN":               Initialize=21648    // 0x5490
+    "MC_SHARED_BLACKOUT_CNTL": Initialize=8364     // 0x20AC
+
+    // CP Microcode/Firmware
+    "CP_PFP_UCODE_ADDR":   Initialize=49488      // 0xC150
+    "CP_PFP_UCODE_DATA":   Initialize=49492      // 0xC154
+    "CP_ME_RAM_WADDR":      Initialize=49500      // 0xC15C
+    "CP_ME_RAM_DATA":       Initialize=49504      // 0xC160
+    "CP_CE_UCODE_ADDR":    Initialize=49512      // 0xC168
+    "CP_CE_UCODE_DATA":    Initialize=49516      // 0xC16C
+
+    // SPI (Shader Processor Input) — controls wavefront dispatch to CUs
+    // These are CONFIG registers that GRBM_SOFT_RESET clears.
+    // Must be reprogrammed after reset (kernel does si_init_golden_registers).
+    "SPI_CONFIG_CNTL":       Initialize=37120     // 0x9100
+    "SPI_CONFIG_CNTL_1":     Initialize=37180     // 0x913C
+
+    // SPI thread management -- per-SE/SH CU enable for wavefront dispatch
+    // Must be programmed via GRBM_GFX_INDEX targeting each (SE,SH) pair.
+    // If CUs are masked out here, no compute wavefronts will launch.
+    "SPI_STATIC_THREAD_MGMT_3": Initialize=37096  // 0x90E8
+
+    // GRBM_GFX_INDEX -- selects which SE/SH/instance gets MMIO register writes
+    "GRBM_GFX_INDEX":       Initialize=32812     // 0x802C
+
+    // CP queue thresholds -- partition ROQ and MEQ for dispatch processing
+    "CP_QUEUE_THRESHOLDS":   Initialize=34656     // 0x8760
+    "CP_MEQ_THRESHOLDS":     Initialize=34660     // 0x8764
+
+    // Shader queue and memory addressing
+    "SQ_CONFIG":             Initialize=35840     // 0x8C00
+    "GB_ADDR_CONFIG":        Initialize=39064     // 0x9898
+    "CP_PERFMON_CNTL":       Initialize=34812     // 0x87FC
+
+    // CU active mask -- read-only, used to detect disabled CUs
+    "CC_GC_SHADER_ARRAY_CONFIG": Initialize=37016 // 0x909C
+}
+
+// =============================================================================
+// CP_ME_CNTL BIT DEFINITIONS
+// =============================================================================
+FixedPool.CPMEBits {
+    "CE_HALT":              Initialize=16777216   // 1 << 24
+    "PFP_HALT":             Initialize=67108864   // 1 << 26
+    "ME_HALT":              Initialize=268435456  // 1 << 28
+}
+
+// =============================================================================
+// CP_RB_CNTL BIT DEFINITIONS
+// =============================================================================
+FixedPool.CntlBits {
+    // RB_BUFSZ: bits [5:0] — log2(ring_size_in_dwords)
+    // RB_BLKSZ: bits [13:8] — log2(page_size / 8)
+    "BUF_SWAP_32BIT":      Initialize=131072     // 2 << 16
+    "RB_NO_UPDATE":        Initialize=134217728   // 1 << 27
+    "RB_RPTR_WR_ENA":      Initialize=2147483648  // 1 << 31
+}
+
+// =============================================================================
+// GRBM_SOFT_RESET BITS  (from radeon/sid.h — Southern Islands)
+// =============================================================================
+FixedPool.GRBMResetBits {
+    "SOFT_RESET_CP":       Initialize=1           // 1 << 0
+    "SOFT_RESET_CB":       Initialize=2           // 1 << 1
+    "SOFT_RESET_RLC":      Initialize=4           // 1 << 2
+    "SOFT_RESET_DB":       Initialize=8           // 1 << 3
+    "SOFT_RESET_GDS":      Initialize=16          // 1 << 4
+    "SOFT_RESET_PA":       Initialize=32          // 1 << 5
+    "SOFT_RESET_SC":       Initialize=64          // 1 << 6
+    "SOFT_RESET_BCI":      Initialize=128         // 1 << 7
+    "SOFT_RESET_SPI":      Initialize=256         // 1 << 8
+    "SOFT_RESET_SX":       Initialize=1024        // 1 << 10
+    "SOFT_RESET_TC":       Initialize=2048        // 1 << 11
+    "SOFT_RESET_TA":       Initialize=4096        // 1 << 12
+    "SOFT_RESET_VGT":      Initialize=16384       // 1 << 14
+    "SOFT_RESET_IA":       Initialize=32768       // 1 << 15
+}
+
+// =============================================================================
+// SRBM_SOFT_RESET BITS  (from radeon/sid.h — Southern Islands)
+// =============================================================================
+FixedPool.SRBMResetBits {
+    "SOFT_RESET_BIF":      Initialize=2           // 1 << 1   Bus Interface
+    "SOFT_RESET_DC":       Initialize=32          // 1 << 5   Display Controller
+    "SOFT_RESET_DMA1":     Initialize=64          // 1 << 6   DMA Engine 1
+    "SOFT_RESET_GRBM":     Initialize=256         // 1 << 8   Graphics Reg Bus Manager
+    "SOFT_RESET_HDP":      Initialize=512         // 1 << 9   Host Data Path
+    "SOFT_RESET_IH":       Initialize=1024        // 1 << 10  Interrupt Handler
+    "SOFT_RESET_MC":       Initialize=2048        // 1 << 11  Memory Controller
+    "SOFT_RESET_ROM":      Initialize=16384       // 1 << 14  ROM
+    "SOFT_RESET_SEM":      Initialize=32768       // 1 << 15  Semaphore
+    "SOFT_RESET_VMC":      Initialize=131072      // 1 << 17  VM Controller
+    "SOFT_RESET_DMA":      Initialize=1048576     // 1 << 20  DMA Engine 0
+}
+
+// =============================================================================
+// COMPUTE DISPATCH REGISTERS (byte offsets)
+// These are in the SH (shader) register space: base 0xB000 (DWORD 0x2C00)
+// =============================================================================
+FixedPool.SICompute {
+    "DISPATCH_INITIATOR":   Initialize=47104      // 0xB800
+    "DIM_X":                Initialize=47108      // 0xB804
+    "DIM_Y":                Initialize=47112      // 0xB808
+    "DIM_Z":                Initialize=47116      // 0xB80C
+    "START_X":              Initialize=47120      // 0xB810
+    "START_Y":              Initialize=47124      // 0xB814
+    "START_Z":              Initialize=47128      // 0xB818
+    "NUM_THREAD_X":         Initialize=47132      // 0xB81C
+    "NUM_THREAD_Y":         Initialize=47136      // 0xB820
+    "NUM_THREAD_Z":         Initialize=47140      // 0xB824
+    "PGM_LO":               Initialize=47152      // 0xB830
+    "PGM_HI":               Initialize=47156      // 0xB834
+    "PGM_RSRC1":            Initialize=47176      // 0xB848
+    "PGM_RSRC2":            Initialize=47180      // 0xB84C
+    "VMID":                 Initialize=47184      // 0xB850
+    "RESOURCE_LIMITS":      Initialize=47188      // 0xB854
+    "STATIC_THREAD_MGMT_SE0": Initialize=47192    // 0xB858
+    "STATIC_THREAD_MGMT_SE1": Initialize=47196    // 0xB85C
+    "TMPRING_SIZE":         Initialize=47200      // 0xB860
+    "USER_DATA_0":          Initialize=47360      // 0xB900
+    "USER_DATA_1":          Initialize=47364      // 0xB904
+    "USER_DATA_2":          Initialize=47368      // 0xB908
+    "USER_DATA_3":          Initialize=47372      // 0xB90C
+}
+
+// =============================================================================
+// PM4 PACKET TYPES AND OPCODES
+// =============================================================================
+FixedPool.PM4 {
+    // Packet type identifiers (bits [31:30])
+    "TYPE0":                Initialize=0          // Register write (legacy)
+    "TYPE2":                Initialize=2          // NOP filler
+    "TYPE3":                Initialize=3          // Command packet
+
+    // Type 3 opcodes (bits [15:8] of header)
+    "OP_NOP":               Initialize=16         // 0x10
+    "OP_SET_BASE":          Initialize=17         // 0x11
+    "OP_CLEAR_STATE":       Initialize=18         // 0x12
+    "OP_DISPATCH_DIRECT":   Initialize=21         // 0x15
+    "OP_WRITE_DATA":        Initialize=55         // 0x37
+    "OP_ME_INITIALIZE":     Initialize=68         // 0x44
+    "OP_WAIT_REG_MEM":      Initialize=60         // 0x3C
+    "OP_INDIRECT_BUFFER":   Initialize=63         // 0x3F
+    "OP_EVENT_WRITE":       Initialize=70         // 0x46
+    "OP_EVENT_WRITE_EOP":   Initialize=71         // 0x47
+    "OP_RELEASE_MEM":       Initialize=73         // 0x49
+    "OP_ACQUIRE_MEM":       Initialize=88         // 0x58
+    "OP_SET_CONFIG_REG":    Initialize=104        // 0x68
+    "OP_SET_CONTEXT_REG":   Initialize=105        // 0x69
+    "OP_SURFACE_SYNC":      Initialize=67         // 0x43
+    "OP_SET_SH_REG":        Initialize=118        // 0x76
+
+    // SET_SH_REG base (DWORD offset subtracted from target register)
+    "SH_REG_BASE":          Initialize=11264      // 0x2C00 (DWORD base of SH regs)
+    // SET_CONFIG_REG base (DWORD offset subtracted from target register)
+    "CONFIG_REG_BASE":      Initialize=8192       // 0x2000 (DWORD base = 0x8000 / 4)
+
+    // SHADER_TYPE bit for compute (bit 1 of header)
+    "SHADER_TYPE_COMPUTE":  Initialize=2          // 1 << 1
+
+    // SURFACE_SYNC cache invalidation flags (coher_cntl bits)
+    "TCL1_ACTION_ENA":      Initialize=4194304    // 1 << 22
+    "TC_ACTION_ENA":        Initialize=8388608    // 1 << 23
+    "SH_KCACHE_ACTION_ENA": Initialize=134217728  // 1 << 27
+    "SH_ICACHE_ACTION_ENA": Initialize=536870912  // 1 << 29
+
+    // CP_COHER_CNTL2 register (used to set VMID for cache flush scope)
+    "CP_COHER_CNTL2":       Initialize=34280      // 0x85E8
+}
+
+// =============================================================================
+// RING BUFFER CONFIGURATION
+// =============================================================================
+FixedPool.RingConf {
+    "RING_SIZE_DWORDS":     Initialize=16384      // 64KB ring = 16K DWORDs
+    "RING_SIZE_BYTES":      Initialize=65536      // 64KB
+    "RING_LOG2":            Initialize=14         // log2(16384)
+    "RING_MASK":            Initialize=16383      // RING_SIZE_DWORDS - 1
+    "PAGE_LOG2":            Initialize=8          // log2(4096/8) = log2(512) ≈ 9, but AMD uses 8
+    "RPTR_WB_OFFSET":       Initialize=16842752   // Offset in VRAM for RPTR writeback (just after ring)
+    "VRAM_RING_OFFSET":     Initialize=16777216   // Ring starts at 16MB into VRAM (past framebuffer)
+    "VRAM_TOTAL_ALLOC":     Initialize=69632      // 64KB ring + 4KB writeback area
+    "MAX_RINGS":            Initialize=4          // We support up to 4 rings
+}
+
+// =============================================================================
+// PER-RING STATE — stored in a flat array
+// =============================================================================
+// Layout of each 128-byte ring state entry:
+//   +0:   gpu_index    (8 bytes) — which GPU this ring belongs to
+//   +8:   ring_id      (8 bytes) — 0=GFX, 1=Compute1, 2=Compute2
+//   +16:  vram_base    (8 bytes) — VRAM byte offset where ring buffer lives
+//   +24:  ring_size    (8 bytes) — size in DWORDs
+//   +32:  wptr         (8 bytes) — software write pointer (DWORDs, monotonic)
+//   +40:  rptr_wb_addr (8 bytes) — VRAM byte offset of RPTR writeback location
+//   +48:  initialized  (8 bytes) — 1 if ring is set up
+//   +56:  reserved     (8 bytes)
+//   +64:  pkt_buf      (8 bytes) — scratch buffer for building packets
+//   +72:  pkt_pos      (8 bytes) — current position in pkt_buf
+//   +80:  fence_val    (8 bytes) — monotonic fence counter
+//   +88:  fence_wb_off (8 bytes) — VRAM offset for fence writeback
+//   +96:  halted       (8 bytes) — 1 if CP is halted for this ring
+//   +104: reserved2    (8 bytes)
+//   +112: reserved3    (8 bytes)
+//   +120: reserved4    (8 bytes)
+
+FixedPool.RingField {
+    "GPU_INDEX":        Initialize=0
+    "RING_ID":          Initialize=8
+    "VRAM_BASE":        Initialize=16
+    "RING_SIZE":        Initialize=24
+    "WPTR":             Initialize=32
+    "RPTR_WB_ADDR":     Initialize=40
+    "INITIALIZED":      Initialize=48
+    "PKT_BUF":          Initialize=64
+    "PKT_POS":          Initialize=72
+    "FENCE_VAL":        Initialize=80
+    "FENCE_WB_OFF":     Initialize=88
+    "HALTED":           Initialize=96
+    "ENTRY_SIZE":       Initialize=128
+}
+
+FixedPool.PM4State {
+    "rings":            Initialize=0, CanChange=True   // ptr to ring state array
+    "initialized":      Initialize=0, CanChange=True
+    "mc_fb_base":       Initialize=0, CanChange=True   // GPU MC address of VRAM start
+}
+
+// =============================================================================
+// PM4_Init — allocate ring state array
+// =============================================================================
+Function.PM4_Init {
+    Body: {
+        IfCondition EqualTo(PM4State.initialized, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        total = Multiply(RingConf.MAX_RINGS, RingField.ENTRY_SIZE)
+        PM4State.rings = Allocate(total)
+        MemorySet(PM4State.rings, 0, total)
+        PM4State.initialized = 1
+    }
+}
+
+// =============================================================================
+// PM4_GetRing — return pointer to ring state for given ring index
+// =============================================================================
+Function.PM4_GetRing {
+    Input: ring_idx: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(ring_idx, RingConf.MAX_RINGS) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Add(PM4State.rings, Multiply(ring_idx, RingField.ENTRY_SIZE)))
+    }
+}
+
+// =============================================================================
+// PM4_HaltCP — halt the command processor (all three MEs)
+// Must be called before reprogramming ring registers.
+// =============================================================================
+Function.PM4_HaltCP {
+    Input: gpu: Integer
+    Body: {
+        // Halt CE + PFP + ME
+        halt = Add(CPMEBits.CE_HALT, Add(CPMEBits.PFP_HALT, CPMEBits.ME_HALT))
+        GPU_Wr32(gpu, SIReg.CP_ME_CNTL, halt)
+
+        // Brief spin to let CP drain
+        i = 0
+        WhileLoop LessThan(i, 1000) {
+            scratch = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            i = Add(i, 1)
+        }
+
+        PrintMessage("[PM4] CP halted\n")
+    }
+}
+
+// =============================================================================
+// PM4_UnhaltCP — release the command processor
+// =============================================================================
+Function.PM4_UnhaltCP {
+    Input: gpu: Integer
+    Body: {
+        GPU_Wr32(gpu, SIReg.CP_ME_CNTL, 0)
+        PrintMessage("[PM4] CP unhalted")
+        PrintMessage(" (ME_CNTL readback=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CP_ME_CNTL))
+        PrintMessage(" GRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_STATUS))
+        PrintMessage(")\n")
+    }
+}
+
+// =============================================================================
+// CP FIRMWARE PATHS (Southern Islands / Cape Verde)
+// The old-format radeon firmware files are arrays of big-endian 32-bit words.
+// PFP = Pre-Fetch Parser, ME = Micro Engine, CE = Constant Engine.
+// All three must be loaded while CP is halted, before ring setup.
+// =============================================================================
+FixedPool.CPFWPaths {
+    "pfp":    Initialize="/lib/firmware/radeon/VERDE_pfp.bin"
+    "me":     Initialize="/lib/firmware/radeon/VERDE_me.bin"
+    "ce":     Initialize="/lib/firmware/radeon/VERDE_ce.bin"
+}
+
+// =============================================================================
+// PM4_LoadUcodeFile — load one CP microcode firmware file into an engine
+//
+// Opens the firmware .bin file, reads it into a buffer, byte-swaps each
+// 32-bit word from big-endian to native (little-endian x86), and streams
+// to the engine's data register via MMIO.
+//
+// This mirrors the Linux kernel's si_cp_load_microcode() which does
+// be32_to_cpup() on each firmware word before WREG32 to the data register.
+//
+// gpu:       GPU index
+// addr_reg:  engine address register (e.g. SIReg.CP_PFP_UCODE_ADDR)
+// data_reg:  engine data register (e.g. SIReg.CP_PFP_UCODE_DATA)
+// fw_path:   address of firmware file path string
+//
+// Returns word count on success, negative on error.
+// =============================================================================
+Function.PM4_LoadUcodeFile {
+    Input: gpu: Integer
+    Input: addr_reg: Integer
+    Input: data_reg: Integer
+    Input: fw_path: Integer
+    Output: Integer
+    Body: {
+        // Open firmware file (syscall 2 = open, O_RDONLY = 0)
+        ufw_fd = SystemCall(2, fw_path, 0, 0)
+        IfCondition LessThan(ufw_fd, 0) ThenBlock: {
+            PrintMessage("[PM4] cannot open firmware file\n")
+            ReturnValue(-1)
+        }
+
+        // Get file size: lseek(fd, 0, SEEK_END) then lseek(fd, 0, SEEK_SET)
+        ufw_size = SystemCall(8, ufw_fd, 0, 2)
+        SystemCall(8, ufw_fd, 0, 0)
+
+        IfCondition LessThan(ufw_size, 4) ThenBlock: {
+            PrintMessage("[PM4] firmware file too small\n")
+            SystemCall(3, ufw_fd)
+            ReturnValue(-2)
+        }
+
+        // Allocate buffer and read entire file
+        ufw_buf = Allocate(ufw_size)
+        IfCondition EqualTo(ufw_buf, 0) ThenBlock: {
+            PrintMessage("[PM4] firmware alloc failed\n")
+            SystemCall(3, ufw_fd)
+            ReturnValue(-3)
+        }
+
+        ufw_read = SystemCall(0, ufw_fd, ufw_buf, ufw_size)
+        SystemCall(3, ufw_fd)
+
+        IfCondition NotEqual(ufw_read, ufw_size) ThenBlock: {
+            PrintMessage("[PM4] firmware read incomplete: got ")
+            PrintNumber(ufw_read)
+            PrintMessage(" expected ")
+            PrintNumber(ufw_size)
+            PrintMessage("\n")
+            Deallocate(ufw_buf, ufw_size)
+            ReturnValue(-4)
+        }
+
+        // Reset engine address counter to 0
+        GPU_Wr32(gpu, addr_reg, 0)
+
+        // Stream firmware words — big-endian to little-endian byte swap
+        // Big-endian layout: byte[0]=MSB, byte[1], byte[2], byte[3]=LSB
+        // Reconstruct native value: (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        ufw_words = Divide(ufw_size, 4)
+        ufw_i = 0
+        WhileLoop LessThan(ufw_i, ufw_words) {
+            ufw_off = Multiply(ufw_i, 4)
+            ufw_b0 = GetByte(ufw_buf, ufw_off)
+            ufw_b1 = GetByte(ufw_buf, Add(ufw_off, 1))
+            ufw_b2 = GetByte(ufw_buf, Add(ufw_off, 2))
+            ufw_b3 = GetByte(ufw_buf, Add(ufw_off, 3))
+            ufw_word = Add(LeftShift(ufw_b0, 24), Add(LeftShift(ufw_b1, 16), Add(LeftShift(ufw_b2, 8), ufw_b3)))
+            GPU_Wr32(gpu, data_reg, ufw_word)
+            ufw_i = Add(ufw_i, 1)
+        }
+
+        // Reset address counter back to 0 (kernel does this after each engine load)
+        GPU_Wr32(gpu, addr_reg, 0)
+
+        Deallocate(ufw_buf, ufw_size)
+        ReturnValue(ufw_words)
+    }
+}
+
+// =============================================================================
+// PM4_LoadCPFirmware — load PFP, ME, and CE microcode for the Command Processor
+//
+// Must be called while CP is halted (after PM4_HaltCP, before PM4_UnhaltCP).
+// Reads firmware from /lib/firmware/radeon/VERDE_{pfp,me,ce}.bin.
+// These are the same firmware files the radeon/amdgpu kernel driver uses.
+//
+// Without firmware, the CP engines have no microcode and cannot parse PM4
+// packets — the ring test NOP will hang forever waiting for RPTR to advance.
+//
+// Returns 0 on success, negative on error.
+// =============================================================================
+Function.PM4_LoadCPFirmware {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[PM4] Loading CP firmware...\n")
+
+        // Load PFP (Pre-Fetch Parser)
+        PrintMessage("[PM4]   PFP: ")
+        cpfw_rc = PM4_LoadUcodeFile(gpu, SIReg.CP_PFP_UCODE_ADDR, SIReg.CP_PFP_UCODE_DATA, CPFWPaths.pfp)
+        IfCondition LessThan(cpfw_rc, 0) ThenBlock: {
+            PrintMessage("FAILED\n")
+            ReturnValue(-1)
+        }
+        PrintNumber(cpfw_rc)
+        PrintMessage(" words\n")
+
+        // Load ME (Micro Engine)
+        PrintMessage("[PM4]   ME:  ")
+        cpfw_rc = PM4_LoadUcodeFile(gpu, SIReg.CP_ME_RAM_WADDR, SIReg.CP_ME_RAM_DATA, CPFWPaths.me)
+        IfCondition LessThan(cpfw_rc, 0) ThenBlock: {
+            PrintMessage("FAILED\n")
+            ReturnValue(-2)
+        }
+        PrintNumber(cpfw_rc)
+        PrintMessage(" words\n")
+
+        // Load CE (Constant Engine)
+        PrintMessage("[PM4]   CE:  ")
+        cpfw_rc = PM4_LoadUcodeFile(gpu, SIReg.CP_CE_UCODE_ADDR, SIReg.CP_CE_UCODE_DATA, CPFWPaths.ce)
+        IfCondition LessThan(cpfw_rc, 0) ThenBlock: {
+            PrintMessage("FAILED\n")
+            ReturnValue(-3)
+        }
+        PrintNumber(cpfw_rc)
+        PrintMessage(" words\n")
+
+        PrintMessage("[PM4] CP firmware loaded successfully\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_SoftResetCP — reset the Command Processor via GRBM
+//
+// Follows the Linux kernel radeon si_gpu_soft_reset() sequence:
+//   1. Halt RLC (do NOT reset it — halting is safe, resetting wipes state)
+//   2. MC stop: disable VGA render, fence BAR access, blackout MC
+//   3. GRBM_SOFT_RESET (CP + full shader pipeline, NO RLC)
+//   4. SRBM_SOFT_RESET (HDP + GRBM)
+//   5. MC resume: unblackout, re-enable BAR, restore VGA
+//   6. Restart RLC
+//
+// The MC MUST be blackouted before touching soft-reset registers.
+// Without this the reset deadlocks the PCIe bus → system lockup.
+// Must be called while CP is halted.
+// =============================================================================
+Function.PM4_SoftResetCP {
+    Input: gpu: Integer
+    Body: {
+        // --- Step 1: Halt RLC ---
+        // RLC manages DCE power gating.  We HALT it (RLC_CNTL=0), we do NOT
+        // RESET it (SOFT_RESET_RLC is never set).  Halting just stops new
+        // power-gating decisions during the reset window.
+        saved_rlc = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+
+        // --- Step 2: MC stop (evergreen_mc_stop equivalent) ---
+        // Save and disable VGA render
+        saved_vga = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+        GPU_Wr32(gpu, SIReg.VGA_RENDER_CONTROL, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+
+        // Fence CPU BAR access to VRAM
+        saved_bif = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+        GPU_Wr32(gpu, SIReg.BIF_FB_EN, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+
+        // Blackout the Memory Controller
+        saved_blackout = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+        GPU_Wr32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL, BitwiseOr(saved_blackout, 1))
+        rst_flush = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+
+        // Wait ~100us for MC to settle
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 500) {
+            rst_flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+
+        // --- Step 3: GRBM soft reset — CP + full shader pipeline ---
+        // Reset CP and the entire shader pipeline (SPI, TC, TA, VGT, etc.).
+        // A CP-only reset leaves the shader blocks wedged if a previous
+        // dispatch hung (SPI/TC/TA stuck with GUI_ACTIVE=1), causing the
+        // next DISPATCH_DIRECT to hang on fence indefinitely.
+        // The golden registers cleared by this reset (SPI_CONFIG_CNTL,
+        // clock gating, CU masks, queue thresholds) are reprogrammed in
+        // Step 7 below.  RLC is excluded (halted, not reset).
+        grbm_mask = Add(GRBMResetBits.SOFT_RESET_CP,
+                    Add(GRBMResetBits.SOFT_RESET_CB,
+                    Add(GRBMResetBits.SOFT_RESET_DB,
+                    Add(GRBMResetBits.SOFT_RESET_GDS,
+                    Add(GRBMResetBits.SOFT_RESET_PA,
+                    Add(GRBMResetBits.SOFT_RESET_SC,
+                    Add(GRBMResetBits.SOFT_RESET_BCI,
+                    Add(GRBMResetBits.SOFT_RESET_SPI,
+                    Add(GRBMResetBits.SOFT_RESET_SX,
+                    Add(GRBMResetBits.SOFT_RESET_TC,
+                    Add(GRBMResetBits.SOFT_RESET_TA,
+                    Add(GRBMResetBits.SOFT_RESET_VGT,
+                        GRBMResetBits.SOFT_RESET_IA))))))))))))
+        GPU_Wr32(gpu, SIReg.GRBM_SOFT_RESET, grbm_mask)
+        rst_flush = GPU_Rd32(gpu, SIReg.GRBM_SOFT_RESET)
+        // Hold assert ~50us
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 200) {
+            rst_flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+        GPU_Wr32(gpu, SIReg.GRBM_SOFT_RESET, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.GRBM_SOFT_RESET)
+
+        // --- Step 4: SRBM soft reset ---
+        // HDP + GRBM.  GRBM reset clears the register bus manager state,
+        // which recovers from any stuck GRBM-routed transactions left by
+        // a wedged shader pipeline.  GRBM comes back after deassert;
+        // registers are accessible again once the reset bit is cleared.
+        // Do NOT include SOFT_RESET_MC — kills the memory controller.
+        srbm_mask = Add(SRBMResetBits.SOFT_RESET_HDP, SRBMResetBits.SOFT_RESET_GRBM)
+        GPU_Wr32(gpu, SIReg.SRBM_SOFT_RESET, srbm_mask)
+        rst_flush = GPU_Rd32(gpu, SIReg.SRBM_SOFT_RESET)
+        // Hold assert ~50us
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 200) {
+            rst_flush = GPU_Rd32(gpu, SIReg.SRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+        GPU_Wr32(gpu, SIReg.SRBM_SOFT_RESET, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.SRBM_SOFT_RESET)
+
+        // Post-reset settle ~50us
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 200) {
+            rst_flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+
+        // --- Step 5: MC resume (evergreen_mc_resume equivalent) ---
+        // Unblackout MC
+        GPU_Wr32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL, saved_blackout)
+        rst_flush = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+
+        // Re-enable CPU BAR access
+        GPU_Wr32(gpu, SIReg.BIF_FB_EN, saved_bif)
+        rst_flush = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+
+        // Restore VGA render
+        GPU_Wr32(gpu, SIReg.VGA_RENDER_CONTROL, saved_vga)
+        rst_flush = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+
+        // Final settle ~50us
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 200) {
+            rst_flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+
+        // --- Step 6: Restart RLC ---
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, saved_rlc)
+        rst_flush = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+
+        // --- Step 7: Reprogram golden registers cleared by GRBM_SOFT_RESET ---
+        // GRBM_SOFT_RESET includes SOFT_RESET_SPI which resets SPI_CONFIG_CNTL
+        // to hardware defaults. Without reprogramming, the SPI won't dispatch
+        // wavefronts to shader engines and compute shaders silently fail.
+        //
+        // si_init_golden_registers() programs these via read-modify-write.
+        // Verde golden register: SPI_CONFIG_CNTL &= ~0x07ffffff; |= 0x03000000
+        //   bits [25:24] = GPR_WRITE_PRIORITY = 3 (critical for wave dispatch)
+        spi_cfg = GPU_Rd32(gpu, SIReg.SPI_CONFIG_CNTL)
+        spi_cfg = BitwiseAnd(spi_cfg, 4160749568)  // ~0x07FFFFFF = 0xF8000000
+        spi_cfg = BitwiseOr(spi_cfg, 50331648)     // 0x03000000
+        GPU_Wr32(gpu, SIReg.SPI_CONFIG_CNTL, spi_cfg)
+        PrintMessage("[PM4] SPI_CONFIG_CNTL = 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPI_CONFIG_CNTL))
+        PrintMessage("\n")
+
+        // SPI_CONFIG_CNTL_1: VTX_DONE_DELAY = 4 (bits [3:0])
+        // From si_gpu_init() in the kernel
+        GPU_Wr32(gpu, SIReg.SPI_CONFIG_CNTL_1, 4)
+
+        // SQ_CONFIG = 0 (shader queue defaults)
+        GPU_Wr32(gpu, SIReg.SQ_CONFIG, 0)
+
+        // CP_PERFMON_CNTL = 0 (disable performance monitors)
+        GPU_Wr32(gpu, SIReg.CP_PERFMON_CNTL, 0)
+
+        // --- Disable ALL clock gating (no RLC firmware loaded) ---
+        // Without the RLC managing clock gating dynamically, CUs may be
+        // clock-gated after reset, preventing compute wavefront dispatch.
+        // Force all clocks on by overriding CG controls.
+        //
+        // RLC_CGTT_MGCG_OVERRIDE = 0xFFFFFFFF: override (disable) all MGCG
+        GPU_Wr32(gpu, SIReg.RLC_CGTT_MGCG_OVERRIDE, 4294967295)
+        // RLC_CGCG_CGLS_CTRL = 0: clear CGCG_EN (bit 0) and CGLS_EN (bit 1)
+        GPU_Wr32(gpu, SIReg.RLC_CGCG_CGLS_CTRL, 0)
+        // CGTS_SM_CTRL_REG: set OVERRIDE (bit 21) and LS_OVERRIDE (bit 22)
+        // to disable CGTS per-block clock gating timing sequencer
+        cgts_val = GPU_Rd32(gpu, SIReg.CGTS_SM_CTRL_REG)
+        cgts_val = BitwiseOr(cgts_val, BitwiseOr(2097152, 4194304))  // (1<<21)|(1<<22)
+        GPU_Wr32(gpu, SIReg.CGTS_SM_CTRL_REG, cgts_val)
+        // RLC_CNTL = 0: keep RLC disabled (no firmware loaded)
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, 0)
+        PrintMessage("[PM4] Clock gating disabled (MGCG override=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_CGTT_MGCG_OVERRIDE))
+        PrintMessage(" CGCG_CGLS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_CGCG_CGLS_CTRL))
+        PrintMessage(" CGTS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CGTS_SM_CTRL_REG))
+        PrintMessage(" RLC=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_CNTL))
+        PrintMessage(")\n")
+
+        // --- CP queue thresholds (from si_gpu_init) ---
+        // ROQ_IB1_START=0x16, ROQ_IB2_START=0x2B → value = 0x2B16
+        GPU_Wr32(gpu, SIReg.CP_QUEUE_THRESHOLDS, Add(Multiply(43, 256), 22))
+        // MEQ1_START=0x30, MEQ2_START=0x60 → value = 0x6030
+        GPU_Wr32(gpu, SIReg.CP_MEQ_THRESHOLDS, Add(Multiply(96, 256), 48))
+
+        // --- SPI_STATIC_THREAD_MGMT_3: enable CUs for wavefront dispatch ---
+        // The kernel's si_setup_spi() loops over each (SE,SH) pair, reads the
+        // CU active mask, and ensures at least one CU is enabled per SH.
+        // Cape Verde: 1 SE, 2 SH per SE, 5 CUs per SH.
+        // We set GRBM_GFX_INDEX to target each (SE,SH), then write MGMT_3.
+        //
+        // The default after reset may have all bits set (all CUs masked = disabled).
+        // We need to CLEAR bits for active CUs to enable them for dispatch.
+        // Value 0x0 = no CUs masked = all CUs enabled for thread dispatch.
+        spi_se = 0
+        WhileLoop LessThan(spi_se, 1) {    // Cape Verde has 1 SE
+            spi_sh = 0
+            WhileLoop LessThan(spi_sh, 2) {  // 2 SH per SE
+                // Target this specific (SE,SH): INSTANCE_BROADCAST(1<<30) | SE | SH
+                gfx_idx = BitwiseOr(1073741824, BitwiseOr(LeftShift(spi_se, 16), LeftShift(spi_sh, 8)))
+                GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, gfx_idx)
+
+                // Read current THREAD_MGMT_3 and active CU mask
+                mgmt3 = GPU_Rd32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3)
+                cu_mask = GPU_Rd32(gpu, SIReg.CC_GC_SHADER_ARRAY_CONFIG)
+                // Bits SET = CUs ENABLED for wavefront dispatch (kernel si_setup_spi)
+                // 0xFFFF = enable all 16 possible CUs (hardware masks off fused CUs)
+                GPU_Wr32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3, 65535)
+
+                PrintMessage("[PM4] SPI_THREAD_MGMT_3 SE")
+                PrintNumber(spi_se)
+                PrintMessage("/SH")
+                PrintNumber(spi_sh)
+                PrintMessage(": was=0x")
+                PrintHex(mgmt3)
+                PrintMessage(" CU_mask=0x")
+                PrintHex(cu_mask)
+                PrintMessage(" -> 0xFFFF\n")
+
+                spi_sh = Add(spi_sh, 1)
+            }
+            spi_se = Add(spi_se, 1)
+        }
+
+        // Reset GRBM_GFX_INDEX to broadcast mode for all subsequent writes
+        // 0xE0000000 = SH_BROADCAST(1<<29) | INSTANCE_BROADCAST(1<<30) | SE_BROADCAST(1<<31)
+        bcast_val = BitwiseOr(LeftShift(1, 29), BitwiseOr(LeftShift(1, 30), LeftShift(1, 31)))
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, bcast_val)
+        PrintMessage("[PM4] GRBM_GFX_INDEX = 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_GFX_INDEX))
+        PrintMessage(" (broadcast)\n")
+
+        PrintMessage("[PM4] CP soft reset complete (MC blackout sequence)\n")
+    }
+}
+
+// =============================================================================
+// PM4_InitMCBase — read MC_VM_FB_LOCATION to find VRAM GPU base address
+//
+// The GPU sees VRAM at MC address (FB_BASE << 24), not at offset 0.
+// All GPU-side addresses (CP_RB_BASE, RPTR writeback, fence, shader, buffers)
+// must include this base. Host-side BAR mmap uses VRAM offsets directly.
+// =============================================================================
+Function.PM4_InitMCBase {
+    Input: gpu: Integer
+    Body: {
+        mc_raw = GPU_Rd32(gpu, SIReg.MC_VM_FB_LOCATION)
+        mc_base_units = BitwiseAnd(mc_raw, 65535)
+        mc_top_units = BitwiseAnd(RightShift(mc_raw, 16), 65535)
+        PM4State.mc_fb_base = LeftShift(mc_base_units, 24)
+        PrintMessage("[PM4] MC_VM_FB_LOCATION = 0x")
+        PrintHex(mc_raw)
+        PrintMessage("  VRAM GPU base = 0x")
+        PrintHex(PM4State.mc_fb_base)
+        PrintMessage("\n")
+
+        // --- VM setup: configure system aperture so compute shaders can access VRAM ---
+        // Without this, buffer loads/stores go through VM translation and fault.
+        // System aperture defines a GPU address range that bypasses VM page tables.
+        // Addresses are in 4KB pages (addr >> 12).
+        vram_start_page = RightShift(PM4State.mc_fb_base, 12)
+        vram_end_page = RightShift(LeftShift(mc_top_units, 24), 12)
+
+        // Debug: read current VM state
+        PrintMessage("[PM4] VM_CONTEXT0_CNTL = 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.VM_CONTEXT0_CNTL))
+        PrintMessage("\n")
+        PrintMessage("[PM4] SYSTEM_APERTURE: low=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR))
+        PrintMessage(" high=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR))
+        PrintMessage(" default=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR))
+        PrintMessage("\n")
+
+        // Disable VM page table for VMID 0 — use physical addressing
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_CNTL, 0)
+
+        // --- MC_VM_MX_L1_TLB_CNTL — CRITICAL for compute buffer access ---
+        // This register controls how the L1 TLB routes GPU memory requests.
+        // Without this, the inherited kernel config may have ENABLE_L1_TLB +
+        // ENABLE_ADVANCED_DRIVER_MODEL set, which routes addresses outside the
+        // system aperture through VM page tables — and with VM_CONTEXT0_CNTL=0
+        // (no page table), those accesses silently fault, killing the wavefront.
+        //
+        // si_pcie_gart_disable() pattern from Linux radeon si.c:
+        //   SYSTEM_ACCESS_MODE_NOT_IN_SYS (3 << 3 = 0x18)
+        //     + SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU (1 << 5 = 0x20)
+        //   = 0x38
+        // L1 TLB disabled, no advanced driver model, aperture routing only.
+        PrintMessage("[PM4] MC_VM_MX_L1_TLB_CNTL before=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL))
+        PrintMessage("\n")
+        // bits: [4:3]=3 (NOT_IN_SYS), [5]=1 (UNMAPPED_ACCESS_PASS_THRU) = 0x38
+        GPU_Wr32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL, 56)
+
+        // --- VM L2 cache — disable to avoid stale cached translations ---
+        // si_pcie_gart_disable() pattern: L2 cache OFF, PTE/PDE0 LRU update on,
+        // queue size 7, context1 identity access mode 1.
+        // = ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE (1<<9)    = 512
+        //   + ENABLE_L2_PDE0_CACHE_LRU_UPDATE_BY_WRITE (1<<10) = 1024
+        //   + EFFECTIVE_L2_QUEUE_SIZE(7) = (7<<15)              = 229376
+        //   + CONTEXT1_IDENTITY_ACCESS_MODE(1) = (1<<19)        = 524288
+        //   Total = 755200
+        GPU_Wr32(gpu, SIReg.VM_L2_CNTL, 755200)
+        // L2_CNTL2: clear invalidation bits (no ongoing invalidation)
+        GPU_Wr32(gpu, SIReg.VM_L2_CNTL2, 0)
+        // L2_CNTL3: BIGK associativity + fragment size 0
+        // = L2_CACHE_BIGK_ASSOCIATIVITY (1 << 20) = 1048576
+        GPU_Wr32(gpu, SIReg.VM_L2_CNTL3, 1048576)
+
+        // --- Invalidate all TLB entries to clear stale kernel translations ---
+        GPU_Wr32(gpu, SIReg.VM_INVALIDATE_REQUEST, 1)
+        // Poll for invalidation to complete (bit 0 of RESPONSE = VMID 0)
+        vm_inv_poll = 0
+        WhileLoop LessThan(vm_inv_poll, 1000) {
+            vm_inv_resp = GPU_Rd32(gpu, SIReg.VM_INVALIDATE_RESPONSE)
+            IfCondition NotEqual(BitwiseAnd(vm_inv_resp, 1), 0) ThenBlock: {
+                vm_inv_poll = 1000
+            }
+            vm_inv_poll = Add(vm_inv_poll, 1)
+        }
+
+        // Set system aperture to cover entire VRAM range
+        GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR, vram_start_page)
+        GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR, vram_end_page)
+        GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, vram_start_page)
+
+        // Readback verify all writes took effect
+        rb_ctx = GPU_Rd32(gpu, SIReg.VM_CONTEXT0_CNTL)
+        rb_l1  = GPU_Rd32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL)
+        rb_lo  = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR)
+        rb_hi  = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR)
+        rb_def = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR)
+        PrintMessage("[PM4] VM configured: aperture 0x")
+        PrintHex(PM4State.mc_fb_base)
+        PrintMessage(" - 0x")
+        PrintHex(LeftShift(mc_top_units, 24))
+        PrintMessage(", VM_CONTEXT0_CNTL=")
+        PrintNumber(rb_ctx)
+        PrintMessage("\n")
+        PrintMessage("[PM4] MC_VM_MX_L1_TLB_CNTL=0x")
+        PrintHex(rb_l1)
+        PrintMessage("\n")
+        PrintMessage("[PM4] APERTURE readback: low=0x")
+        PrintHex(rb_lo)
+        PrintMessage(" high=0x")
+        PrintHex(rb_hi)
+        PrintMessage(" default=0x")
+        PrintHex(rb_def)
+        PrintMessage("\n")
+        IfCondition EqualTo(rb_lo, 0) ThenBlock: {
+            PrintMessage("[PM4] WARNING: aperture LOW readback is 0 — MC register write may have failed!\n")
+        }
+    }
+}
+
+// =============================================================================
+// PM4_VramToGPU — convert a VRAM BAR offset to a GPU MC address
+//
+// The GPU sees VRAM at MC_VM_FB_LOCATION base, not at offset 0.
+// All GPU-side addresses (ring base, RPTR writeback, fence, shader, buffers)
+// must use MC addresses. Host-side BAR access uses VRAM offsets directly.
+//
+// Call PM4_InitMCBase first to populate PM4State.mc_fb_base.
+// =============================================================================
+Function.PM4_VramToGPU {
+    Input: vram_offset: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(PM4State.mc_fb_base, vram_offset))
+    }
+}
+
+// =============================================================================
+// PM4_SetupRing — configure a ring buffer in VRAM and program CP registers
+//
+// ring_idx: 0=GFX/Ring0, 1=Compute1/Ring1, 2=Compute2/Ring2
+// vram_offset: byte offset into VRAM aperture for ring placement
+//
+// This follows the exact sequence from si_cp_resume() in the Linux kernel:
+//   1. Halt CP
+//   2. Set WPTR delay to 0
+//   3. Write CP_RB_CNTL with size (+ RB_RPTR_WR_ENA)
+//   4. Zero WPTR
+//   5. Set RPTR writeback address
+//   6. Write CP_RB_CNTL without RB_RPTR_WR_ENA
+//   7. Set CP_RB_BASE (GPU addr >> 8)
+//   8. Read back RPTR
+//   9. Unhalt CP
+//
+// Returns 1 on success.
+// =============================================================================
+Function.PM4_SetupRing {
+    Input: gpu: Integer
+    Input: ring_idx: Integer
+    Input: vram_offset: Integer
+    Output: Integer
+    Body: {
+        PM4_Init()
+
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: {
+            PrintMessage("[PM4] Invalid ring index\n")
+            ReturnValue(0)
+        }
+
+        // Ensure MMIO and VRAM BARs are mapped
+        IfCondition EqualTo(GPU_BAR_MapMMIO(gpu), 0) ThenBlock: {
+            PrintMessage("[PM4] MMIO not available\n")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(GPU_BAR_MapVRAM(gpu), 0) ThenBlock: {
+            PrintMessage("[PM4] VRAM not available\n")
+            ReturnValue(0)
+        }
+
+        // Zero out the ring area in VRAM
+        vram_state = GPU_BAR_GetState(gpu)
+        vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
+        ring_host_ptr = Add(vram_ptr, vram_offset)
+        MemorySet(ring_host_ptr, 0, RingConf.VRAM_TOTAL_ALLOC)
+
+        // RPTR writeback location: just after the ring buffer in VRAM
+        rptr_wb = Add(vram_offset, RingConf.RPTR_WB_OFFSET)
+
+        // Determine which register set to use based on ring_idx
+        // Ring 0: CP_RB0_*
+        // Ring 1: CP_RB1_*
+        // Ring 2: CP_RB2_*
+
+        // Select registers
+        IfCondition EqualTo(ring_idx, 0) ThenBlock: {
+            reg_cntl = SIReg.CP_RB0_CNTL
+            reg_base = SIReg.CP_RB0_BASE
+            reg_wptr = SIReg.CP_RB0_WPTR
+            reg_rptr = SIReg.CP_RB0_RPTR
+            reg_rptr_addr = SIReg.CP_RB0_RPTR_ADDR
+            reg_rptr_addr_hi = SIReg.CP_RB0_RPTR_ADDR_HI
+        }
+        IfCondition EqualTo(ring_idx, 1) ThenBlock: {
+            reg_cntl = SIReg.CP_RB1_CNTL
+            reg_base = SIReg.CP_RB1_BASE
+            reg_wptr = SIReg.CP_RB1_WPTR
+            reg_rptr = SIReg.CP_RB1_RPTR
+            reg_rptr_addr = SIReg.CP_RB1_RPTR_ADDR
+            reg_rptr_addr_hi = SIReg.CP_RB1_RPTR_ADDR_HI
+        }
+
+        // --- Begin CP ring programming sequence ---
+
+        // 1. Clear WPTR delay
+        GPU_Wr32(gpu, SIReg.CP_RB_WPTR_DELAY, 0)
+
+        // 2. Build CNTL value: RB_BUFSZ = log2(size_in_dwords)
+        //    bits [5:0] = RingConf.RING_LOG2
+        //    bits [13:8] = PAGE_LOG2 (page_size / 8 in log2)
+        cntl_val = Add(RingConf.RING_LOG2, Multiply(RingConf.PAGE_LOG2, 256))
+
+        // 3. Write CNTL with RB_RPTR_WR_ENA set (enables RPTR write + writeback setup)
+        GPU_Wr32(gpu, reg_cntl, Add(cntl_val, CntlBits.RB_RPTR_WR_ENA))
+
+        // 4. Zero BOTH pointers — RPTR must be written while RB_RPTR_WR_ENA is set.
+        //    Without this, a wedged prior run leaves RPTR at a stale value and
+        //    the CP re-executes garbage from the old ring position on wrap.
+        GPU_Wr32(gpu, reg_rptr, 0)
+        GPU_Wr32(gpu, reg_wptr, 0)
+
+        // 5. Set RPTR writeback address (full byte address, DWORD-aligned)
+        //    Kernel: WREG32(RPTR_ADDR, gpu_addr & 0xFFFFFFFC)
+        //    Kernel: WREG32(RPTR_ADDR_HI, upper_32_bits(gpu_addr) & 0xFF)
+        //    NOTE: RPTR_ADDR is NOT shifted >> 8 (unlike CP_RB_BASE)
+        rptr_wb_full = PM4_VramToGPU(rptr_wb)
+        rptr_wb_lo = BitwiseAnd(rptr_wb_full, 4294967292)     // lower 32 bits, aligned
+        rptr_wb_hi = BitwiseAnd(RightShift(rptr_wb_full, 32), 255)  // upper 8 bits
+        GPU_Wr32(gpu, reg_rptr_addr, rptr_wb_lo)
+        GPU_Wr32(gpu, reg_rptr_addr_hi, rptr_wb_hi)
+
+        // 6. Write CNTL again WITHOUT RB_RPTR_WR_ENA (lock it in)
+        GPU_Wr32(gpu, reg_cntl, cntl_val)
+
+        // 7. Set ring base address (GPU MC address >> 8)
+        ring_base_gpu = Divide(PM4_VramToGPU(vram_offset), 256)   // >> 8
+        GPU_Wr32(gpu, reg_base, ring_base_gpu)
+
+        // 8. Read back initial RPTR
+        initial_rptr = GPU_Rd32(gpu, reg_rptr)
+
+        // --- Store ring state ---
+        StoreValue(Add(ring, RingField.GPU_INDEX), gpu)
+        StoreValue(Add(ring, RingField.RING_ID), ring_idx)
+        StoreValue(Add(ring, RingField.VRAM_BASE), vram_offset)
+        StoreValue(Add(ring, RingField.RING_SIZE), RingConf.RING_SIZE_DWORDS)
+        StoreValue(Add(ring, RingField.WPTR), 0)
+        StoreValue(Add(ring, RingField.RPTR_WB_ADDR), rptr_wb)
+        StoreValue(Add(ring, RingField.FENCE_VAL), 0)
+        // Fence offset must be at least 64 bytes from RPTR writeback —
+        // GPU DMA may write a full cache line for RPTR updates.
+        StoreValue(Add(ring, RingField.FENCE_WB_OFF), Add(rptr_wb, 64))
+        StoreValue(Add(ring, RingField.HALTED), 0)
+        StoreValue(Add(ring, RingField.INITIALIZED), 1)
+
+        // Allocate scratch packet buffer (1KB for building PM4 packets)
+        pkt_buf = Allocate(1024)
+        MemorySet(pkt_buf, 0, 1024)
+        StoreValue(Add(ring, RingField.PKT_BUF), pkt_buf)
+        StoreValue(Add(ring, RingField.PKT_POS), 0)
+
+        PrintMessage("[PM4] Ring ")
+        PrintNumber(ring_idx)
+        PrintMessage(" configured: ")
+        PrintNumber(RingConf.RING_SIZE_DWORDS)
+        PrintMessage(" DWORDs at VRAM+")
+        PrintHex(vram_offset)
+        PrintMessage(", initial RPTR=")
+        PrintNumber(initial_rptr)
+        PrintMessage("\n")
+
+        // Debug: readback critical ring registers after setup
+        PrintMessage("[PM4:DBG] readback: CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, reg_cntl))
+        PrintMessage(" BASE=0x")
+        PrintHex(GPU_Rd32(gpu, reg_base))
+        PrintMessage(" WPTR=")
+        PrintNumber(GPU_Rd32(gpu, reg_wptr))
+        PrintMessage(" RPTR=")
+        PrintNumber(GPU_Rd32(gpu, reg_rptr))
+        PrintMessage("\n")
+        PrintMessage("[PM4:DBG] RPTR_ADDR=0x")
+        PrintHex(GPU_Rd32(gpu, reg_rptr_addr))
+        PrintMessage(" HI=0x")
+        PrintHex(GPU_Rd32(gpu, reg_rptr_addr_hi))
+        PrintMessage(" (expect lo=0x")
+        PrintHex(rptr_wb_lo)
+        PrintMessage(" hi=0x")
+        PrintHex(rptr_wb_hi)
+        PrintMessage(")\n")
+        PrintMessage("[PM4:DBG] ring_base_gpu=0x")
+        PrintHex(ring_base_gpu)
+        PrintMessage(" cntl_val=0x")
+        PrintHex(cntl_val)
+        PrintMessage("\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PM4_ReadRPTR — read the current GPU read pointer for a ring
+// Reads from RPTR writeback location in VRAM (GPU writes this).
+// This is the "head" in the head/tail mailbox model.
+// =============================================================================
+Function.PM4_ReadRPTR {
+    Input: ring_idx: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        rptr_wb = Dereference(Add(ring, RingField.RPTR_WB_ADDR))
+
+        // Read RPTR from writeback location in VRAM
+        ReturnValue(GPU_VramRd32(gpu, rptr_wb))
+    }
+}
+
+// =============================================================================
+// PM4_ReadRPTR_MMIO — read RPTR directly from hardware register (slower)
+// =============================================================================
+Function.PM4_ReadRPTR_MMIO {
+    Input: ring_idx: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        rid = Dereference(Add(ring, RingField.RING_ID))
+
+        IfCondition EqualTo(rid, 0) ThenBlock: {
+            ReturnValue(GPU_Rd32(gpu, SIReg.CP_RB0_RPTR))
+        }
+        IfCondition EqualTo(rid, 1) ThenBlock: {
+            ReturnValue(GPU_Rd32(gpu, SIReg.CP_RB1_RPTR))
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_GetWPTR — return current software write pointer
+// =============================================================================
+Function.PM4_GetWPTR {
+    Input: ring_idx: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(ring, RingField.WPTR)))
+    }
+}
+
+// =============================================================================
+// PM4_RingSpace — calculate available DWORDs in the ring
+// Returns number of DWORDs that can be written before ring is full.
+// Mirrors ThreadPool's head/tail distance calculation.
+// =============================================================================
+Function.PM4_RingSpace {
+    Input: ring_idx: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        wptr = Dereference(Add(ring, RingField.WPTR))
+        rptr = PM4_ReadRPTR(ring_idx)
+        size = Dereference(Add(ring, RingField.RING_SIZE))
+
+        // Available = size - 1 - (wptr - rptr) mod size
+        // We keep 1 DWORD gap to distinguish full from empty
+        used = BitwiseAnd(Subtract(wptr, rptr), Subtract(size, 1))
+        ReturnValue(Subtract(Subtract(size, 1), used))
+    }
+}
+
+// =============================================================================
+// PM4_WaitForSpace — spin-poll until enough ring space is available
+// This mirrors the ThreadPool worker's spin-poll on tail.
+// =============================================================================
+Function.PM4_WaitForSpace {
+    Input: ring_idx: Integer
+    Input: ndwords: Integer
+    Output: Integer
+    Body: {
+        attempts = 0
+        max_attempts = 10000000   // ~10M spins before giving up
+
+        WhileLoop LessThan(attempts, max_attempts) {
+            space = PM4_RingSpace(ring_idx)
+            IfCondition GreaterEqual(space, ndwords) ThenBlock: {
+                ReturnValue(1)
+            }
+            // Spin — like ThreadPool's StoreValue-to-scratch barrier trick,
+            // reading from VRAM forces a fresh load each iteration
+            attempts = Add(attempts, 1)
+        }
+
+        PrintMessage("[PM4] Ring ")
+        PrintNumber(ring_idx)
+        PrintMessage(" timed out waiting for ")
+        PrintNumber(ndwords)
+        PrintMessage(" DWORDs\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_EmitDWord — write a single DWORD into the ring buffer
+// Does NOT update WPTR register — call PM4_Commit after building a packet.
+// =============================================================================
+Function.PM4_EmitDWord {
+    Input: ring_idx: Integer
+    Input: value: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        vram_base = Dereference(Add(ring, RingField.VRAM_BASE))
+        wptr = Dereference(Add(ring, RingField.WPTR))
+        size = Dereference(Add(ring, RingField.RING_SIZE))
+
+        // Wrap wptr within ring
+        slot = BitwiseAnd(wptr, Subtract(size, 1))
+
+        // Write to VRAM: vram_base + slot * 4
+        offset = Add(vram_base, Multiply(slot, 4))
+        GPU_VramWr32(gpu, offset, value)
+
+        // Advance software WPTR (monotonic, wraps via mask on read)
+        StoreValue(Add(ring, RingField.WPTR), Add(wptr, 1))
+    }
+}
+
+// =============================================================================
+// PM4_Commit — write the current WPTR to the hardware register
+// This is the "bump tail" signal — tells the GPU new commands are ready.
+// Mirrors ThreadPool's tail bump that wakes a worker.
+// =============================================================================
+Function.PM4_Commit {
+    Input: ring_idx: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        rid = Dereference(Add(ring, RingField.RING_ID))
+        wptr = Dereference(Add(ring, RingField.WPTR))
+
+        // Write WPTR to hardware — masked to ring size
+        wptr_masked = BitwiseAnd(wptr, Subtract(Dereference(Add(ring, RingField.RING_SIZE)), 1))
+
+        // CRITICAL: Flush WC (write-combining) store buffer before bumping WPTR.
+        // Ring buffer lives in VRAM mapped through a WC BAR — stores may be
+        // buffered in the CPU's WC buffer and NOT yet visible to the GPU.
+        // Without SFENCE, the GPU may read stale/zero data from the ring.
+        // The Linux kernel relies on writel() which includes a barrier.
+        InlineAsm["0f ae f8"]
+
+        IfCondition EqualTo(rid, 0) ThenBlock: {
+            GPU_Wr32(gpu, SIReg.CP_RB0_WPTR, wptr_masked)
+        }
+        IfCondition EqualTo(rid, 1) ThenBlock: {
+            GPU_Wr32(gpu, SIReg.CP_RB1_WPTR, wptr_masked)
+        }
+    }
+}
+
+// =============================================================================
+// PM4_WaitIdle — spin until GPU has consumed all commands (RPTR == WPTR)
+// This is "poll head until it matches tail" — same as ThreadPool dispatch.
+// =============================================================================
+Function.PM4_WaitIdle {
+    Input: ring_idx: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        wptr = Dereference(Add(ring, RingField.WPTR))
+        size = Dereference(Add(ring, RingField.RING_SIZE))
+        wptr_masked = BitwiseAnd(wptr, Subtract(size, 1))
+
+        attempts = 0
+        max_attempts = 5000000   // 5M spins
+
+        WhileLoop LessThan(attempts, max_attempts) {
+            // Try VRAM writeback first (fast path)
+            rptr = PM4_ReadRPTR(ring_idx)
+            IfCondition EqualTo(rptr, wptr_masked) ThenBlock: {
+                ReturnValue(1)
+            }
+            // Every 100K spins, try MMIO register (RPTR writeback may be broken)
+            wi_mod = Modulo(attempts, 100000)
+            IfCondition EqualTo(wi_mod, 0) ThenBlock: {
+                rptr = PM4_ReadRPTR_MMIO(ring_idx)
+                IfCondition EqualTo(rptr, wptr_masked) ThenBlock: {
+                    ReturnValue(1)
+                }
+            }
+            attempts = Add(attempts, 1)
+        }
+
+        // Final fallback: MMIO register read
+        rptr = PM4_ReadRPTR_MMIO(ring_idx)
+        IfCondition EqualTo(rptr, wptr_masked) ThenBlock: {
+            ReturnValue(1)
+        }
+        gpu_dbg = Dereference(Add(ring, RingField.GPU_INDEX))
+        PrintMessage("[PM4] WaitIdle timeout: RPTR=")
+        PrintNumber(rptr)
+        PrintMessage(" WPTR=")
+        PrintNumber(wptr_masked)
+        PrintMessage("\n")
+        PrintMessage("[PM4:DBG] GRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.GRBM_STATUS))
+        PrintMessage(" CP_ME_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.CP_ME_CNTL))
+        PrintMessage("\n")
+        PrintMessage("[PM4:DBG] CP_RB0_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.CP_RB0_CNTL))
+        PrintMessage(" CP_RB0_BASE=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.CP_RB0_BASE))
+        PrintMessage(" CP_RB0_RPTR=")
+        PrintNumber(GPU_Rd32(gpu_dbg, SIReg.CP_RB0_RPTR))
+        PrintMessage(" CP_RB0_WPTR=")
+        PrintNumber(GPU_Rd32(gpu_dbg, SIReg.CP_RB0_WPTR))
+        PrintMessage("\n")
+        PrintMessage("[PM4:DBG] SRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.SRBM_STATUS))
+        PrintMessage(" SRBM_STATUS2=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.SRBM_STATUS2))
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4 PACKET BUILDERS
+// =============================================================================
+
+// -----------------------------------------------------------------------------
+// PM4_BuildHeader — build a PM4 Type 3 packet header
+//   opcode: PM4 opcode (e.g. PM4.OP_SET_SH_REG)
+//   count:  number of DWORDs following the header (body count)
+//   shader_type: 0 for GFX, PM4.SHADER_TYPE_COMPUTE for compute
+// Returns the 32-bit header DWORD.
+// -----------------------------------------------------------------------------
+Function.PM4_BuildHeader {
+    Input: opcode: Integer
+    Input: count: Integer
+    Input: shader_type: Integer
+    Output: Integer
+    Body: {
+        // header = (3 << 30) | ((count - 1) << 16) | (opcode << 8) | shader_type
+        hdr = Add(Multiply(3, 1073741824), 0)   // 3 << 30 = 0xC0000000
+        hdr = Add(hdr, Multiply(Subtract(count, 1), 65536))   // (count-1) << 16
+        hdr = Add(hdr, Multiply(opcode, 256))                  // opcode << 8
+        hdr = Add(hdr, shader_type)
+        ReturnValue(hdr)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PM4_EmitNOP — emit a NOP packet (useful for padding/alignment)
+//   ndwords: number of NOP DWORDs (including header)
+// -----------------------------------------------------------------------------
+Function.PM4_EmitNOP {
+    Input: ring_idx: Integer
+    Input: ndwords: Integer
+    Body: {
+        IfCondition LessThan(ndwords, 2) ThenBlock: {
+            // Type 2 NOP: single DWORD, all zeros except type field
+            // Type 2 header: (2 << 30) = 0x80000000
+            PM4_EmitDWord(ring_idx, 2147483648)
+            ReturnValue(0)
+        }
+
+        // Type 3 NOP: header + (ndwords-1) padding DWORDs
+        hdr = PM4_BuildHeader(PM4.OP_NOP, Subtract(ndwords, 1), 0)
+        PM4_EmitDWord(ring_idx, hdr)
+
+        i = 1
+        WhileLoop LessThan(i, ndwords) {
+            PM4_EmitDWord(ring_idx, 0)
+            i = Add(i, 1)
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PM4_EmitSetSHReg — emit a SET_SH_REG packet to write shader registers
+//   reg_byte_offset: byte offset of the target register (e.g. SICompute.PGM_LO)
+//   value: 32-bit value to write
+//   shader_type: 0 or PM4.SHADER_TYPE_COMPUTE
+// -----------------------------------------------------------------------------
+Function.PM4_EmitSetSHReg {
+    Input: ring_idx: Integer
+    Input: reg_byte_offset: Integer
+    Input: value: Integer
+    Input: shader_type: Integer
+    Body: {
+        // Convert byte offset to DWORD offset, subtract SH_REG_BASE
+        reg_dword = Divide(reg_byte_offset, 4)
+        sh_offset = Subtract(reg_dword, PM4.SH_REG_BASE)
+
+        // SET_SH_REG packet: header + offset + value = 3 DWORDs total
+        hdr = PM4_BuildHeader(PM4.OP_SET_SH_REG, 2, shader_type)
+        PM4_EmitDWord(ring_idx, hdr)
+        PM4_EmitDWord(ring_idx, sh_offset)
+        PM4_EmitDWord(ring_idx, value)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PM4_EmitSetSHRegPair — write two consecutive SH registers
+//   reg_byte_offset: byte offset of the first register
+//   val_lo, val_hi: values for first and second register
+// -----------------------------------------------------------------------------
+Function.PM4_EmitSetSHRegPair {
+    Input: ring_idx: Integer
+    Input: reg_byte_offset: Integer
+    Input: val_lo: Integer
+    Input: val_hi: Integer
+    Input: shader_type: Integer
+    Body: {
+        reg_dword = Divide(reg_byte_offset, 4)
+        sh_offset = Subtract(reg_dword, PM4.SH_REG_BASE)
+
+        // SET_SH_REG packet: header + offset + val_lo + val_hi = 4 DWORDs
+        hdr = PM4_BuildHeader(PM4.OP_SET_SH_REG, 3, shader_type)
+        PM4_EmitDWord(ring_idx, hdr)
+        PM4_EmitDWord(ring_idx, sh_offset)
+        PM4_EmitDWord(ring_idx, val_lo)
+        PM4_EmitDWord(ring_idx, val_hi)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PM4_EmitSetConfigReg — emit a SET_CONFIG_REG packet
+//   reg_byte_offset: byte offset of the config register (e.g. 0x85E8)
+//   value: 32-bit value to write
+// -----------------------------------------------------------------------------
+Function.PM4_EmitSetConfigReg {
+    Input: ring_idx: Integer
+    Input: reg_byte_offset: Integer
+    Input: value: Integer
+    Body: {
+        reg_dword = Divide(reg_byte_offset, 4)
+        cfg_offset = Subtract(reg_dword, PM4.CONFIG_REG_BASE)
+
+        hdr = PM4_BuildHeader(PM4.OP_SET_CONFIG_REG, 2, 0)
+        PM4_EmitDWord(ring_idx, hdr)
+        PM4_EmitDWord(ring_idx, cfg_offset)
+        PM4_EmitDWord(ring_idx, value)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PM4_EmitSurfaceSync — emit a SURFACE_SYNC packet to invalidate caches
+//   coher_cntl: cache invalidation flags (e.g. PM4.SH_ICACHE_ACTION_ENA)
+//   size: address range size in 256-byte blocks (0xFFFFFFFF = all)
+//   base: base address in 256-byte blocks (0 = all)
+//   poll_interval: poll interval (10 typical)
+//
+// Must be emitted before compute dispatch so the shader fetches
+// fresh instructions and data from VRAM after CPU BAR writes.
+// The kernel (si.c) emits this before every IB with:
+//   TCL1_ACTION_ENA | TC_ACTION_ENA | SH_KCACHE_ACTION_ENA | SH_ICACHE_ACTION_ENA
+// -----------------------------------------------------------------------------
+Function.PM4_EmitSurfaceSync {
+    Input: ring_idx: Integer
+    Input: coher_cntl: Integer
+    Input: size: Integer
+    Input: base: Integer
+    Input: poll_interval: Integer
+    Body: {
+        // SURFACE_SYNC: header + coher_cntl + size + base + poll = 5 DWORDs
+        hdr = PM4_BuildHeader(PM4.OP_SURFACE_SYNC, 4, 0)
+        PM4_EmitDWord(ring_idx, hdr)
+        PM4_EmitDWord(ring_idx, coher_cntl)
+        PM4_EmitDWord(ring_idx, size)
+        PM4_EmitDWord(ring_idx, base)
+        PM4_EmitDWord(ring_idx, poll_interval)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PM4_EmitDispatchDirect — emit a DISPATCH_DIRECT packet
+//   dim_x, dim_y, dim_z: thread group counts
+//   initiator: dispatch initiator flags (1 = COMPUTE_SHADER_EN)
+//
+// GCN DISPATCH_DIRECT format (5 DWORDs total):
+//   header:    type3 | opcode=0x15 | count=3 (4 body DWORDs)
+//   DWORD 1:   dim_x
+//   DWORD 2:   dim_y
+//   DWORD 3:   dim_z
+//   DWORD 4:   dispatch_initiator
+// -----------------------------------------------------------------------------
+Function.PM4_EmitDispatchDirect {
+    Input: ring_idx: Integer
+    Input: dim_x: Integer
+    Input: dim_y: Integer
+    Input: dim_z: Integer
+    Input: initiator: Integer
+    Body: {
+        // DISPATCH_DIRECT: 4 body DWORDs — each dimension is a separate DWORD.
+        // Kernel: PACKET3(PACKET3_DISPATCH_DIRECT, 3) → count=4 body DWORDs
+        //   DIM_X, DIM_Y, DIM_Z, DISPATCH_INITIATOR
+        hdr = PM4_BuildHeader(PM4.OP_DISPATCH_DIRECT, 4, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitDWord(ring_idx, hdr)
+        PM4_EmitDWord(ring_idx, dim_x)
+        PM4_EmitDWord(ring_idx, dim_y)
+        PM4_EmitDWord(ring_idx, dim_z)
+        PM4_EmitDWord(ring_idx, initiator)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PM4_EmitEventWriteEOP — emit an EVENT_WRITE_EOP for fence/completion
+//   addr_lo, addr_hi: GPU address for fence writeback (VRAM offset)
+//   value: fence value to write
+// -----------------------------------------------------------------------------
+Function.PM4_EmitEventWriteEOP {
+    Input: ring_idx: Integer
+    Input: addr_lo: Integer
+    Input: addr_hi: Integer
+    Input: value: Integer
+    Body: {
+        // EVENT_WRITE_EOP: header + event_type + addr_lo + addr_hi + data_lo + data_hi
+        // data_sel: 1 = send 32-bit data, addr in bytes
+        // shader_type=0: the kernel sends EVENT_WRITE_EOP without SHADER_TYPE bit
+        hdr = PM4_BuildHeader(PM4.OP_EVENT_WRITE_EOP, 5, 0)
+        PM4_EmitDWord(ring_idx, hdr)
+
+        // Event type: CACHE_FLUSH_AND_INV_TS_EVENT = 0x14 (20)
+        // Flushes GPU L2 cache and invalidates, then signals fence.
+        // Must use this (not BOTTOM_OF_PIPE_TS=0x28) so CPU reads
+        // see compute shader writes that went through TC/L2.
+        // event_index = 5 (EOP timestamp/fence style)
+        event = Add(20, Multiply(5, 256))   // 0x14 | (5 << 8) = 0x514
+        PM4_EmitDWord(ring_idx, event)
+
+        // Address low (byte address)
+        PM4_EmitDWord(ring_idx, addr_lo)
+
+        // Address high + data_sel (DATA_SEL at bits [31:29], 1 = send 32-bit imm)
+        data_sel_bits = Multiply(1, 536870912)   // 1 << 29
+        PM4_EmitDWord(ring_idx, Add(addr_hi, data_sel_bits))
+
+        // Data value low
+        PM4_EmitDWord(ring_idx, value)
+
+        // Data value high (0 for 32-bit write)
+        PM4_EmitDWord(ring_idx, 0)
+    }
+}
+
+// -----------------------------------------------------------------------------
+// PM4_EmitWaitRegMem — emit WAIT_REG_MEM to poll a memory/register location
+//   mem_or_reg: 0 = register, 1 = memory
+//   addr: address to poll (byte offset for reg, GPU addr for mem)
+//   ref_val: reference value
+//   mask: mask applied before compare
+//   func: compare function (3 = equal, 5 = >=)
+// -----------------------------------------------------------------------------
+Function.PM4_EmitWaitRegMem {
+    Input: ring_idx: Integer
+    Input: mem_or_reg: Integer
+    Input: addr: Integer
+    Input: ref_val: Integer
+    Input: mask: Integer
+    Input: func: Integer
+    Body: {
+        // WAIT_REG_MEM: header + engine_sel|func|mem_space + addr_lo + addr_hi + ref + mask + poll_interval
+        hdr = PM4_BuildHeader(PM4.OP_WAIT_REG_MEM, 6, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitDWord(ring_idx, hdr)
+
+        // DWORD1: function(bits [2:0]) | mem_space(bit 4) | engine(bit 8, 0=ME)
+        dw1 = Add(func, Multiply(mem_or_reg, 16))
+        PM4_EmitDWord(ring_idx, dw1)
+
+        // Address lo/hi
+        PM4_EmitDWord(ring_idx, addr)
+        PM4_EmitDWord(ring_idx, 0)
+
+        // Reference value
+        PM4_EmitDWord(ring_idx, ref_val)
+
+        // Mask
+        PM4_EmitDWord(ring_idx, mask)
+
+        // Poll interval (in 16-clock units)
+        PM4_EmitDWord(ring_idx, 10)
+    }
+}
+
+// =============================================================================
+// HIGH-LEVEL COMPUTE DISPATCH
+// =============================================================================
+
+// Dispatch carrier — fill fields before calling PM4_SubmitCompute(ring_idx).
+// Uses FixedPool instead of >6 function args (SystemV ABI limit = 6 registers).
+FixedPool.PM4Dispatch {
+    "pgm_addr":     Initialize=0, CanChange=True   // GPU address of shader (256-byte aligned)
+    "num_vgprs":    Initialize=4, CanChange=True   // VGPRs used (actual count, granulated internally)
+    "num_sgprs":    Initialize=8, CanChange=True   // SGPRs used (actual count, granulated internally)
+    "tg_size_x":    Initialize=64, CanChange=True  // threads per group X
+    "tg_size_y":    Initialize=1, CanChange=True   // threads per group Y
+    "tg_size_z":    Initialize=1, CanChange=True   // threads per group Z
+    "grid_x":       Initialize=1, CanChange=True   // number of thread groups X
+    "grid_y":       Initialize=1, CanChange=True   // number of thread groups Y
+    "grid_z":       Initialize=1, CanChange=True   // number of thread groups Z
+}
+
+// -----------------------------------------------------------------------------
+// PM4_SubmitCompute — set up and dispatch a compute shader
+//
+// Reads dispatch parameters from FixedPool.PM4Dispatch.
+// Caller must fill PM4Dispatch fields before calling.
+//
+// Returns 1 on success, 0 on failure.
+// -----------------------------------------------------------------------------
+Function.PM4_SubmitCompute {
+    Input: ring_idx: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Dereference(Add(ring, RingField.INITIALIZED)), 0) ThenBlock: {
+            PrintMessage("[PM4] Ring not initialized\n")
+            ReturnValue(0)
+        }
+
+        // Read dispatch parameters from carrier
+        pgm_addr   = PM4Dispatch.pgm_addr
+        num_vgprs  = PM4Dispatch.num_vgprs
+        num_sgprs  = PM4Dispatch.num_sgprs
+        tg_size_x  = PM4Dispatch.tg_size_x
+        tg_size_y  = PM4Dispatch.tg_size_y
+        tg_size_z  = PM4Dispatch.tg_size_z
+        grid_x     = PM4Dispatch.grid_x
+        grid_y     = PM4Dispatch.grid_y
+        grid_z     = PM4Dispatch.grid_z
+
+        // Calculate total packet DWORDs needed:
+        //   SET_CONFIG_REG for CP_COHER_CNTL2 (3 DWORDs)
+        //   SURFACE_SYNC for cache invalidation (5 DWORDs)
+        //   SET_SH_REG for PGM_LO/HI (4 DWORDs)
+        //   SET_SH_REG for PGM_RSRC1 (3 DWORDs)
+        //   SET_SH_REG for PGM_RSRC2 (3 DWORDs)
+        //   SET_SH_REG for RESOURCE_LIMITS (3 DWORDs)
+        //   SET_SH_REG for NUM_THREAD_X (3 DWORDs)
+        //   SET_SH_REG for NUM_THREAD_Y (3 DWORDs)
+        //   SET_SH_REG for NUM_THREAD_Z (3 DWORDs)
+        //   DISPATCH_DIRECT (4 DWORDs)
+        //   EVENT_WRITE_EOP for fence (7 DWORDs)
+        //   SET_CONFIG_REG + SURFACE_SYNC before fence (8 DWORDs)
+        //   Total: ~78 DWORDs
+        needed = 84   // 2x(COHER_CNTL2+SURFACE_SYNC) + 4xUSER_DATA + PGM + RSRC1/2 + LIMITS + THREAD_MGMT(2) + TMPRING + 3xSTART + 3xTHREAD + DISPATCH(5) + CS_PARTIAL_FLUSH(2) + EOP
+
+        IfCondition EqualTo(PM4_WaitForSpace(ring_idx, needed), 0) ThenBlock: {
+            PrintMessage("[PM4] No ring space for compute dispatch\n")
+            ReturnValue(0)
+        }
+
+        // --- Cache invalidation (CRITICAL for correctness) ---
+        // The CPU writes shader code and data to VRAM via BAR, but the GPU
+        // caches (I$, K$, TC L1/L2) may hold stale data.  Without this
+        // invalidation the shader fetches garbage instructions and/or reads
+        // stale source data, producing silent wrong results (all zeros).
+        // The kernel (si.c line ~3430) emits this before every IB.
+        PM4_EmitSetConfigReg(ring_idx, PM4.CP_COHER_CNTL2, 0)
+        coher = Add(PM4.SH_ICACHE_ACTION_ENA,
+                Add(PM4.SH_KCACHE_ACTION_ENA,
+                Add(PM4.TC_ACTION_ENA,
+                    PM4.TCL1_ACTION_ENA)))
+        PM4_EmitSurfaceSync(ring_idx, coher, 4294967295, 0, 10)
+        PrintMessage("[DBG:PM4] SURFACE_SYNC: cache invalidate emitted\n")
+
+        // --- Build shader program address ---
+        // PGM_LO = bits [31:0] of (addr >> 8)
+        // PGM_HI = bits [39:32] of (addr >> 8)
+        pgm_shifted = Divide(pgm_addr, 256)
+        pgm_lo = BitwiseAnd(pgm_shifted, 4294967295)
+        pgm_hi = Divide(pgm_shifted, 4294967296)
+
+        PrintMessage("[DBG:PM4] PGM addr=0x")
+        PrintHex(pgm_addr)
+        PrintMessage(" >>8=0x")
+        PrintHex(pgm_shifted)
+        PrintMessage(" lo=0x")
+        PrintHex(pgm_lo)
+        PrintMessage(" hi=0x")
+        PrintHex(pgm_hi)
+        PrintMessage("\n")
+
+        PM4_EmitSetSHRegPair(ring_idx, SICompute.PGM_LO, pgm_lo, pgm_hi, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- Build PGM_RSRC1 ---
+        // bits [5:0] = (num_vgprs / 4) - 1  (granularity 4 for GCN1)
+        // bits [9:6] = (num_sgprs / 8) - 1  (granularity 8 for GCN1)
+        // For simplicity: float_mode = 0 (default), no DX10 clamp, no IEEE
+        vgpr_field = Subtract(Divide(num_vgprs, 4), 1)
+        IfCondition LessThan(vgpr_field, 0) ThenBlock: { vgpr_field = 0 }
+        sgpr_field = Subtract(Divide(num_sgprs, 8), 1)
+        IfCondition LessThan(sgpr_field, 0) ThenBlock: { sgpr_field = 0 }
+
+        rsrc1 = Add(vgpr_field, Multiply(sgpr_field, 64))   // sgpr at bits [9:6]
+        PrintMessage("[DBG:PM4] RSRC1=0x")
+        PrintHex(rsrc1)
+        PrintMessage(" (vgpr_field=")
+        PrintNumber(vgpr_field)
+        PrintMessage(" sgpr_field=")
+        PrintNumber(sgpr_field)
+        PrintMessage(")\n")
+        PM4_EmitSetSHReg(ring_idx, SICompute.PGM_RSRC1, rsrc1, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- Build PGM_RSRC2 ---
+        // bit 0:      SCRATCH_EN (0 = no scratch)
+        // bits [5:1]:  USER_SGPR count (number of USER_DATA SGPRs)
+        // bit 6:      TRAP_PRESENT (0 = no trap handler)
+        // bit 7:      TGID_X_EN (1 = load thread group ID X into SGPR)
+        // bit 8:      TGID_Y_EN
+        // bit 9:      TGID_Z_EN
+        // bit 10:     TG_SIZE_EN (1 = load total TG size into SGPR)
+        // bits[12:11]: TIDIG_COMP_CNT (0 = X only, 1 = X+Y, 2 = X+Y+Z)
+        // bits [17:12]: LDS_SIZE (in 256-byte units)
+        rsrc2 = 0
+        rsrc2 = Add(rsrc2, Multiply(4, 2))    // USER_SGPR = 4, at bits [5:1] (s[0:3] = V#)
+        // bit 6 = TRAP_PRESENT — leave 0 (no trap handler)
+        rsrc2 = Add(rsrc2, 128)                // TGID_X_EN (bit 7)
+        PrintMessage("[DBG:PM4] RSRC2=0x")
+        PrintHex(rsrc2)
+        PrintMessage("\n")
+        PM4_EmitSetSHReg(ring_idx, SICompute.PGM_RSRC2, rsrc2, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- COMPUTE_VMID — use VMID 0 (physical/system aperture addressing) ---
+        PM4_EmitSetSHReg(ring_idx, SICompute.VMID, 0, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- RESOURCE_LIMITS ---
+        // bits [21:16] = waves_per_sh (0 = no limit)
+        // Cape Verde: 1 SE, 2 SH/CU — use defaults
+        PM4_EmitSetSHReg(ring_idx, SICompute.RESOURCE_LIMITS, 0, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- STATIC_THREAD_MGMT — enable all CUs for compute ---
+        // 0xFFFFFFFF = all CU thread slots enabled on each shader engine
+        // Without these, no CUs are assigned to compute and the wavefront hangs.
+        PM4_EmitSetSHReg(ring_idx, SICompute.STATIC_THREAD_MGMT_SE0, 4294967295, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitSetSHReg(ring_idx, SICompute.STATIC_THREAD_MGMT_SE1, 4294967295, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- TMPRING_SIZE — scratch ring size (0 = no scratch) ---
+        PM4_EmitSetSHReg(ring_idx, SICompute.TMPRING_SIZE, 0, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- COMPUTE_START_X/Y/Z — must be zeroed (work-group grid origin) ---
+        PM4_EmitSetSHReg(ring_idx, SICompute.START_X, 0, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitSetSHReg(ring_idx, SICompute.START_Y, 0, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitSetSHReg(ring_idx, SICompute.START_Z, 0, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- Thread group dimensions ---
+        PrintMessage("[DBG:PM4] NUM_THREAD=")
+        PrintNumber(tg_size_x)
+        PrintMessage(",")
+        PrintNumber(tg_size_y)
+        PrintMessage(",")
+        PrintNumber(tg_size_z)
+        PrintMessage(" GRID=")
+        PrintNumber(grid_x)
+        PrintMessage(",")
+        PrintNumber(grid_y)
+        PrintMessage(",")
+        PrintNumber(grid_z)
+        PrintMessage("\n")
+        PM4_EmitSetSHReg(ring_idx, SICompute.NUM_THREAD_X, tg_size_x, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitSetSHReg(ring_idx, SICompute.NUM_THREAD_Y, tg_size_y, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitSetSHReg(ring_idx, SICompute.NUM_THREAD_Z, tg_size_z, PM4.SHADER_TYPE_COMPUTE)
+
+        // --- Dispatch ---
+        PrintMessage("[DBG:PM4] emitting DISPATCH_DIRECT...\n")
+        // DISPATCH_INITIATOR = 1: COMPUTE_SHADER_EN (bit 0)
+        PM4_EmitDispatchDirect(ring_idx, grid_x, grid_y, grid_z, 1)
+
+        // --- CS_PARTIAL_FLUSH — wait for all compute wavefronts to complete ---
+        // DISPATCH_DIRECT is asynchronous: the CP queues the dispatch and
+        // immediately processes the next PM4 packet.  Without this barrier
+        // the SURFACE_SYNC below fires before the shader's BUFFER_STORE_DWORD
+        // writes reach the L2 cache, so the L2 flush has nothing to flush.
+        // The Linux kernel (si_fence_ring_emit) emits EVENT_WRITE(CS_PARTIAL_FLUSH)
+        // on compute rings before any cache flush or EOP fence.
+        // CS_PARTIAL_FLUSH = event_type 7, event_index 4 → (7 | (4 << 8)) = 0x407
+        cs_flush_hdr = PM4_BuildHeader(PM4.OP_EVENT_WRITE, 1, 0)
+        PM4_EmitDWord(ring_idx, cs_flush_hdr)
+        PM4_EmitDWord(ring_idx, Add(7, Multiply(4, 256)))
+
+        // --- Flush caches before fence (kernel si_fence_ring_emit pattern) ---
+        // Now that CS_PARTIAL_FLUSH guarantees all shader stores are in L2,
+        // flush the L2 (TC) to VRAM so CPU BAR0 reads see the data.
+        PM4_EmitSetConfigReg(ring_idx, PM4.CP_COHER_CNTL2, 0)
+        coher2 = Add(PM4.SH_ICACHE_ACTION_ENA,
+                 Add(PM4.SH_KCACHE_ACTION_ENA,
+                 Add(PM4.TC_ACTION_ENA,
+                     PM4.TCL1_ACTION_ENA)))
+        PM4_EmitSurfaceSync(ring_idx, coher2, 4294967295, 0, 10)
+
+        // --- Fence via EVENT_WRITE_EOP ---
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        fence_val = Add(Dereference(Add(ring, RingField.FENCE_VAL)), 1)
+        StoreValue(Add(ring, RingField.FENCE_VAL), fence_val)
+        fence_off = Dereference(Add(ring, RingField.FENCE_WB_OFF))
+        // Zero the fence location in VRAM before dispatch so we don't see stale data
+        GPU_VramWr32(gpu, fence_off, 0)
+        fence_gpu_addr = PM4_VramToGPU(fence_off)
+        fence_addr_lo = BitwiseAnd(fence_gpu_addr, 4294967295)
+        fence_addr_hi = BitwiseAnd(RightShift(fence_gpu_addr, 32), 255)
+        PrintMessage("[DBG:PM4] fence: vram_off=0x")
+        PrintHex(fence_off)
+        PrintMessage(" gpu=0x")
+        PrintHex(fence_gpu_addr)
+        PrintMessage(" lo=0x")
+        PrintHex(fence_addr_lo)
+        PrintMessage(" hi=0x")
+        PrintHex(fence_addr_hi)
+        PrintMessage(" val=")
+        PrintNumber(fence_val)
+        PrintMessage("\n")
+        PM4_EmitEventWriteEOP(ring_idx, fence_addr_lo, fence_addr_hi, fence_val)
+
+        // --- Commit: bump WPTR hardware register ---
+        pre_wptr = Dereference(Add(ring, RingField.WPTR))
+        PrintMessage("[DBG:PM4] WPTR before commit=")
+        PrintNumber(pre_wptr)
+        PrintMessage("\n")
+
+        // --- RING DUMP: show raw DWORDs from position 2 (after NOP) to WPTR ---
+        PrintMessage("[DBG:RING] raw ring DWORDs [2..")
+        PrintNumber(pre_wptr)
+        PrintMessage("):\n")
+        dump_gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        dump_base = Dereference(Add(ring, RingField.VRAM_BASE))
+        dump_i = 2
+        WhileLoop LessThan(dump_i, pre_wptr) {
+            IfCondition EqualTo(BitwiseAnd(Subtract(dump_i, 2), 7), 0) ThenBlock: {
+                PrintMessage("  [")
+                PrintNumber(dump_i)
+                PrintMessage("] ")
+            }
+            PrintHex(GPU_VramRd32(dump_gpu, Add(dump_base, Multiply(dump_i, 4))))
+            PrintMessage(" ")
+            IfCondition EqualTo(BitwiseAnd(Subtract(dump_i, 2), 7), 7) ThenBlock: {
+                PrintMessage("\n")
+            }
+            dump_i = Add(dump_i, 1)
+        }
+        PrintMessage("\n")
+
+        PM4_Commit(ring_idx)
+
+        // Read back RPTR + GRBM_STATUS immediately after commit
+        gpu_chk = Dereference(Add(ring, RingField.GPU_INDEX))
+        PrintMessage("[DBG:PM4] after commit: RPTR(wb)=")
+        PrintNumber(PM4_ReadRPTR(ring_idx))
+        PrintMessage(" RPTR(mmio)=")
+        PrintNumber(PM4_ReadRPTR_MMIO(ring_idx))
+        PrintMessage("\n")
+        grbm_st = GPU_Rd32(gpu_chk, SIReg.GRBM_STATUS)
+        PrintMessage("[DBG:PM4] GRBM_STATUS=0x")
+        PrintHex(grbm_st)
+        PrintMessage("\n")
+
+        PrintMessage("[DBG:PM4] waiting for fence...\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PM4_WaitFence — wait for a specific fence value to appear
+// The GPU writes the fence value to the VRAM writeback location after
+// completing all commands up to the EVENT_WRITE_EOP.
+// =============================================================================
+Function.PM4_WaitFence {
+    Input: ring_idx: Integer
+    Input: expected: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        fence_off = Dereference(Add(ring, RingField.FENCE_WB_OFF))
+
+        attempts = 0
+        max = 50000000
+
+        WhileLoop LessThan(attempts, max) {
+            val = GPU_VramRd32(gpu, fence_off)
+            IfCondition GreaterEqual(val, expected) ThenBlock: {
+                PrintMessage("[DBG:FENCE] done, val=")
+                PrintNumber(val)
+                PrintMessage(" after ")
+                PrintNumber(attempts)
+                PrintMessage(" polls\n")
+                ReturnValue(1)
+            }
+            // Print progress every 10M polls
+            IfCondition EqualTo(Modulo(attempts, 10000000), 0) ThenBlock: {
+                IfCondition GreaterThan(attempts, 0) ThenBlock: {
+                    PrintMessage("[DBG:FENCE] poll ")
+                    PrintNumber(attempts)
+                    PrintMessage(": fence_val=")
+                    PrintNumber(val)
+                    PrintMessage(" RPTR(mmio)=")
+                    PrintNumber(PM4_ReadRPTR_MMIO(ring_idx))
+                    PrintMessage(" GRBM=0x")
+                    PrintHex(GPU_Rd32(gpu, SIReg.GRBM_STATUS))
+                    PrintMessage("\n")
+                }
+            }
+            attempts = Add(attempts, 1)
+        }
+
+        PrintMessage("[PM4] Fence timeout: expected=")
+        PrintNumber(expected)
+        PrintMessage(" got=")
+        PrintNumber(GPU_VramRd32(gpu, fence_off))
+        PrintMessage("\n")
+        // Print final diagnostic
+        PrintMessage("[DBG:FENCE] final RPTR(mmio)=")
+        PrintNumber(PM4_ReadRPTR_MMIO(ring_idx))
+        PrintMessage(" GRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_STATUS))
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_RingTest — basic ring test: submit a NOP and verify GPU consumes it
+// Returns 1 if the ring is working.
+// =============================================================================
+Function.PM4_RingTest {
+    Input: ring_idx: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        PrintMessage("[PM4] Ring test: submitting NOP... ")
+
+        // Wait for 8 DWORDs of space
+        IfCondition EqualTo(PM4_WaitForSpace(ring_idx, 8), 0) ThenBlock: {
+            PrintMessage("no space!\n")
+            ReturnValue(0)
+        }
+
+        // Emit a NOP packet (2 DWORDs)
+        PM4_EmitNOP(ring_idx, 2)
+
+        // Commit WPTR
+        PM4_Commit(ring_idx)
+
+        // Wait for GPU to consume
+        IfCondition EqualTo(PM4_WaitIdle(ring_idx), 1) ThenBlock: {
+            PrintMessage("OK\n")
+            ReturnValue(1)
+        }
+
+        PrintMessage("TIMEOUT\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_CPStart — initialize CP micro-engine and clear compute context
+//
+// Matches the Linux kernel si_cp_start() sequence:
+//   1. ME_INITIALIZE: set max_hw_contexts=7 (8-1), device_id=1
+//   2. SET_BASE: CE partition base (0xC000..0xE000)
+//   3. Commit + unhalt CP → CP processes ME_INITIALIZE
+//   4. CLEAR_STATE with SHADER_TYPE=compute → clears compute register state
+//   5. Commit → CP processes CLEAR_STATE
+//
+// Must be called AFTER PM4_SetupRing and BEFORE any compute dispatch.
+// The ring must be set up but CP must still be HALTED when this is called.
+// =============================================================================
+Function.PM4_CPStart {
+    Input: gpu: Integer
+    Input: ring_idx: Integer
+    Output: Integer
+    Body: {
+        // ---- Phase 1: ME_INITIALIZE (CP still halted) ----
+        // This packet MUST be consumed first — it initializes the ME's context
+        // management.  Without this, SET_SH_REG with SHADER_TYPE=compute may
+        // be silently dropped.
+        IfCondition EqualTo(PM4_WaitForSpace(ring_idx, 16), 0) ThenBlock: {
+            PrintMessage("[PM4] CPStart: no ring space\n")
+            ReturnValue(0)
+        }
+
+        // ME_INITIALIZE: header + 6 body DWORDs = 7 DWORDs total
+        // Kernel: PACKET3(ME_INITIALIZE, 5) → n=5 → 6 body DWORDs
+        // Our PM4_BuildHeader(op, count) puts (count-1) in header → count=6
+        hdr_me = PM4_BuildHeader(PM4.OP_ME_INITIALIZE, 6, 0)
+        PM4_EmitDWord(ring_idx, hdr_me)
+        PM4_EmitDWord(ring_idx, 1)           // ME_INITIALIZE.header = 1
+        PM4_EmitDWord(ring_idx, 0)           // reserved
+        PM4_EmitDWord(ring_idx, 7)           // max_hw_contexts - 1 = 8 - 1 = 7
+        PM4_EmitDWord(ring_idx, 65536)       // DEVICE_ID(1) = 1 << 16
+        PM4_EmitDWord(ring_idx, 0)           // reserved
+        PM4_EmitDWord(ring_idx, 0)           // reserved
+
+        // SET_BASE: CE partition — header + 3 body DWORDs = 4 DWORDs total
+        // Kernel: PACKET3(SET_BASE, 2) → n=2 → 3 body DWORDs
+        // Our PM4_BuildHeader: count=3
+        hdr_sb = PM4_BuildHeader(PM4.OP_SET_BASE, 3, 0)
+        PM4_EmitDWord(ring_idx, hdr_sb)
+        PM4_EmitDWord(ring_idx, 3)           // CE_PARTITION_BASE = 3
+        PM4_EmitDWord(ring_idx, 49152)       // 0xC000
+        // Note: kernel sends 0xE000 as a 4th DWORD but SET_BASE count=2 means only 2 body.
+        // Actually kernel uses count=2 → 3 DWORDs total: header, BASE_INDEX, addr.
+        // Hmm, let me re-check... PACKET3(PACKET3_SET_BASE, 2) = count=2 → 3 body DWORDs.
+        // kernel: radeon_ring_write(ring, PACKET3_BASE_INDEX(CE_PARTITION_BASE));
+        //         radeon_ring_write(ring, 0xc000);
+        //         radeon_ring_write(ring, 0xe000);
+        PM4_EmitDWord(ring_idx, 57344)       // 0xE000
+
+        // Commit WPTR — CP is still halted, so this just bumps the MMIO WPTR.
+        // The packets sit in the ring waiting.
+        PM4_Commit(ring_idx)
+
+        // ---- Unhalt CP — it starts processing ME_INITIALIZE ----
+        PM4_UnhaltCP(gpu)
+
+        // Brief delay to let ME_INITIALIZE be consumed
+        di = 0
+        WhileLoop LessThan(di, 2000) {
+            scratch = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            di = Add(di, 1)
+        }
+
+        // Wait for CP to consume ME_INITIALIZE
+        IfCondition EqualTo(PM4_WaitIdle(ring_idx), 0) ThenBlock: {
+            PrintMessage("[PM4] CPStart: ME_INITIALIZE not consumed\n")
+            ReturnValue(0)
+        }
+        PrintMessage("[PM4] ME_INITIALIZE consumed OK\n")
+
+        // ---- Phase 2: GFX + Compute CLEAR_STATE ----
+        IfCondition EqualTo(PM4_WaitForSpace(ring_idx, 8), 0) ThenBlock: {
+            PrintMessage("[PM4] CPStart: no ring space for CLEAR_STATE\n")
+            ReturnValue(0)
+        }
+
+        // GFX CLEAR_STATE (SHADER_TYPE=0, matching kernel's si_cp_start)
+        hdr_gfx = PM4_BuildHeader(PM4.OP_CLEAR_STATE, 1, 0)
+        PM4_EmitDWord(ring_idx, hdr_gfx)
+        PM4_EmitDWord(ring_idx, 0)
+
+        // Compute CLEAR_STATE (SHADER_TYPE=compute)
+        // kernel: PACKET3_COMPUTE(PACKET3_CLEAR_STATE, 0)
+        hdr_cs = PM4_BuildHeader(PM4.OP_CLEAR_STATE, 1, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitDWord(ring_idx, hdr_cs)
+        PM4_EmitDWord(ring_idx, 0)
+
+        PM4_Commit(ring_idx)
+
+        // Wait for both CLEAR_STATE packets to be consumed
+        IfCondition EqualTo(PM4_WaitIdle(ring_idx), 0) ThenBlock: {
+            PrintMessage("[PM4] CPStart: CLEAR_STATE not consumed\n")
+            ReturnValue(0)
+        }
+        PrintMessage("[PM4] GFX+Compute CLEAR_STATE consumed OK\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PM4_PrintStatus — print ring buffer status
+// =============================================================================
+Function.PM4_PrintStatus {
+    Input: ring_idx: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        rid = Dereference(Add(ring, RingField.RING_ID))
+
+        PrintMessage("Ring ")
+        PrintNumber(rid)
+        PrintMessage(" [GPU ")
+        PrintNumber(gpu)
+        PrintMessage("]\n")
+
+        PrintMessage("  WPTR (sw):  ")
+        PrintNumber(Dereference(Add(ring, RingField.WPTR)))
+        PrintMessage("\n")
+
+        PrintMessage("  RPTR (wb):  ")
+        PrintNumber(PM4_ReadRPTR(ring_idx))
+        PrintMessage("\n")
+
+        PrintMessage("  RPTR (hw):  ")
+        PrintNumber(PM4_ReadRPTR_MMIO(ring_idx))
+        PrintMessage("\n")
+
+        PrintMessage("  Space:      ")
+        PrintNumber(PM4_RingSpace(ring_idx))
+        PrintMessage(" DWORDs\n")
+
+        PrintMessage("  Fence:      ")
+        PrintNumber(Dereference(Add(ring, RingField.FENCE_VAL)))
+        PrintMessage("\n")
+
+        PrintMessage("  VRAM base:  ")
+        PrintHex(Dereference(Add(ring, RingField.VRAM_BASE)))
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// PM4_Destroy — free ring resources
+// =============================================================================
+Function.PM4_Destroy {
+    Input: ring_idx: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+
+        pkt_buf = Dereference(Add(ring, RingField.PKT_BUF))
+        IfCondition NotEqual(pkt_buf, 0) ThenBlock: {
+            Deallocate(pkt_buf, 1024)
+            StoreValue(Add(ring, RingField.PKT_BUF), 0)
+        }
+
+        StoreValue(Add(ring, RingField.INITIALIZED), 0)
+        PrintMessage("[PM4] Ring ")
+        PrintNumber(ring_idx)
+        PrintMessage(" destroyed\n")
+    }
+}

@@ -1,0 +1,497 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUDiscover.ailang
+//
+// PCI device discovery for AMD GPUs via sysfs.
+// Enumerates /sys/bus/pci/devices/*, reads vendor/device IDs,
+// identifies AMD GPUs, and populates GPUDevList with full details.
+// Supports multi-GPU configurations (up to 8 GPUs).
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+//
+// DEPENDS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+
+// =============================================================================
+// SYSFS CONSTANTS
+// =============================================================================
+FixedPool.GPUSys {
+    "SYS_READ":       Initialize=0
+    "SYS_WRITE":      Initialize=1
+    "SYS_OPEN":       Initialize=2
+    "SYS_CLOSE":      Initialize=3
+    "SYS_STAT":       Initialize=4
+    "SYS_MMAP":       Initialize=9
+    "SYS_MUNMAP":     Initialize=11
+    "SYS_GETDENTS64": Initialize=217
+    "O_RDONLY":        Initialize=0
+    "O_RDWR":         Initialize=2
+    "O_SYNC":         Initialize=1052672  // 0x101000
+    "PROT_READ":       Initialize=1
+    "PROT_WRITE":      Initialize=2
+    "MAP_SHARED":      Initialize=1
+}
+
+FixedPool.GPUDiscState {
+    "scan_buf":        Initialize=0, CanChange=True   // buffer for directory scanning
+    "path_buf":        Initialize=0, CanChange=True   // buffer for path construction (sub-paths)
+    "dev_buf":         Initialize=0, CanChange=True   // buffer for device base path
+    "read_buf":        Initialize=0, CanChange=True   // buffer for file reads
+}
+
+// =============================================================================
+// GPU_ReadSysfsInt — read an integer from a sysfs file (hex, e.g. "0x1002\n")
+// Returns the integer value, or -1 on error.
+// =============================================================================
+Function.GPU_ReadSysfsInt {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+
+        buf = GPUDiscState.read_buf
+        MemorySet(buf, 0, 32)
+        nread = SystemCall(GPUSys.SYS_READ, fd, buf, 31, 0, 0)
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        IfCondition LessEqual(nread, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+
+        // Parse hex value: skip "0x" prefix if present
+        pos = 0
+        IfCondition EqualTo(GetByte(buf, 0), 48) ThenBlock: {       // '0'
+            IfCondition EqualTo(GetByte(buf, 1), 120) ThenBlock: {   // 'x'
+                pos = 2
+            }
+        }
+
+        result = 0
+        WhileLoop LessThan(pos, nread) {
+            ch = GetByte(buf, pos)
+            IfCondition GreaterEqual(ch, 48) ThenBlock: {            // '0'
+                IfCondition LessEqual(ch, 57) ThenBlock: {           // '9'
+                    result = Add(Multiply(result, 16), Subtract(ch, 48))
+                    pos = Add(pos, 1)
+                    ContinueLoop
+                }
+            }
+            IfCondition GreaterEqual(ch, 97) ThenBlock: {            // 'a'
+                IfCondition LessEqual(ch, 102) ThenBlock: {          // 'f'
+                    result = Add(Multiply(result, 16), Add(Subtract(ch, 97), 10))
+                    pos = Add(pos, 1)
+                    ContinueLoop
+                }
+            }
+            IfCondition GreaterEqual(ch, 65) ThenBlock: {            // 'A'
+                IfCondition LessEqual(ch, 70) ThenBlock: {           // 'F'
+                    result = Add(Multiply(result, 16), Add(Subtract(ch, 65), 10))
+                    pos = Add(pos, 1)
+                    ContinueLoop
+                }
+            }
+            // Non-hex character (newline, etc.) — stop
+            BreakLoop
+        }
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// GPU_ReadBarSize — read size of a PCI BAR resource file via stat
+// Returns size in bytes, or 0 on error.
+// =============================================================================
+Function.GPU_ReadBarSize {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        // stat buf: 144 bytes on x86_64
+        // st_size is at offset 48
+        stat_buf = Allocate(144)
+        MemorySet(stat_buf, 0, 144)
+        rc = SystemCall(GPUSys.SYS_STAT, path, stat_buf, 0, 0, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            Deallocate(stat_buf, 144)
+            ReturnValue(0)
+        }
+        size = Dereference(Add(stat_buf, 48))
+        Deallocate(stat_buf, 144)
+        ReturnValue(size)
+    }
+}
+
+// =============================================================================
+// GPU_BuildPath — concatenate base + "/" + suffix into path_buf
+// Returns pointer to path_buf.
+// =============================================================================
+Function.GPU_BuildPath {
+    Input: base: Address
+    Input: suffix: Address
+    Output: Address
+    Body: {
+        buf = GPUDiscState.path_buf
+        pos = 0
+
+        // Copy base
+        i = 0
+        WhileLoop NotEqual(GetByte(base, i), 0) {
+            SetByte(buf, pos, GetByte(base, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        // Add "/"
+        SetByte(buf, pos, 47)
+        pos = Add(pos, 1)
+
+        // Copy suffix
+        i = 0
+        WhileLoop NotEqual(GetByte(suffix, i), 0) {
+            SetByte(buf, pos, GetByte(suffix, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        SetByte(buf, pos, 0)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// GPU_BuildDevPath — build device base path into dev_buf (separate from path_buf)
+// Format: base + "/" + name → dev_buf
+// =============================================================================
+Function.GPU_BuildDevPath {
+    Input: base: Address
+    Input: name: Address
+    Output: Address
+    Body: {
+        buf = GPUDiscState.dev_buf
+        pos = 0
+
+        // Copy base
+        i = 0
+        WhileLoop NotEqual(GetByte(base, i), 0) {
+            SetByte(buf, pos, GetByte(base, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        // Add "/"
+        SetByte(buf, pos, 47)
+        pos = Add(pos, 1)
+
+        // Copy name
+        i = 0
+        WhileLoop NotEqual(GetByte(name, i), 0) {
+            SetByte(buf, pos, GetByte(name, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        SetByte(buf, pos, 0)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// GPU_ParseBDF — parse "BBBB:SS:FF.F" from a directory name into bus/slot/func
+// Writes to the entry fields. Name format: "0000:01:00.0"
+// =============================================================================
+Function.GPU_ParseBDF {
+    Input: name: Address
+    Input: entry_ptr: Address
+    Body: {
+        // Skip domain (first 5 chars: "0000:")
+        // Bus = chars 5-6 (hex)
+        bus = 0
+        i = 5
+        WhileLoop LessThan(i, 7) {
+            ch = GetByte(name, i)
+            digit = 0
+            IfCondition GreaterEqual(ch, 48) ThenBlock: {
+                IfCondition LessEqual(ch, 57) ThenBlock: { digit = Subtract(ch, 48) }
+            }
+            IfCondition GreaterEqual(ch, 97) ThenBlock: {
+                IfCondition LessEqual(ch, 102) ThenBlock: { digit = Add(Subtract(ch, 97), 10) }
+            }
+            bus = Add(Multiply(bus, 16), digit)
+            i = Add(i, 1)
+        }
+
+        // Skip ":"
+        // Slot = chars 8-9 (hex)
+        slot = 0
+        i = 8
+        WhileLoop LessThan(i, 10) {
+            ch = GetByte(name, i)
+            digit = 0
+            IfCondition GreaterEqual(ch, 48) ThenBlock: {
+                IfCondition LessEqual(ch, 57) ThenBlock: { digit = Subtract(ch, 48) }
+            }
+            IfCondition GreaterEqual(ch, 97) ThenBlock: {
+                IfCondition LessEqual(ch, 102) ThenBlock: { digit = Add(Subtract(ch, 97), 10) }
+            }
+            slot = Add(Multiply(slot, 16), digit)
+            i = Add(i, 1)
+        }
+
+        // Skip "."
+        // Func = char 11
+        func = 0
+        ch = GetByte(name, 11)
+        IfCondition GreaterEqual(ch, 48) ThenBlock: {
+            IfCondition LessEqual(ch, 57) ThenBlock: { func = Subtract(ch, 48) }
+        }
+
+        StoreValue(Add(entry_ptr, GPUDevField.PCI_BUS), bus)
+        StoreValue(Add(entry_ptr, GPUDevField.PCI_SLOT), slot)
+        StoreValue(Add(entry_ptr, GPUDevField.PCI_FUNC), func)
+    }
+}
+
+// =============================================================================
+// GPU_Discover — scan sysfs for all AMD GPUs.
+// Populates GPUDevList.entries and GPUDevList.count.
+// Returns number of GPUs found.
+// =============================================================================
+Function.GPU_Discover {
+    Output: Integer
+    Body: {
+        // Load GPU device database from JSON
+        GPUFamily_LoadDB("Librarys/Drivers/AMDGPU/gpu_devices.json")
+
+        // Allocate working buffers
+        GPUDiscState.scan_buf = Allocate(8192)
+        GPUDiscState.path_buf = Allocate(512)
+        GPUDiscState.dev_buf  = Allocate(512)
+        GPUDiscState.read_buf = Allocate(64)
+
+        // Allocate device list (8 GPUs × 128 bytes)
+        total_size = Multiply(GPUDevConst.MAX_GPUS, GPUDevConst.ENTRY_SIZE)
+        GPUDevList.entries = Allocate(total_size)
+        MemorySet(GPUDevList.entries, 0, total_size)
+        GPUDevList.count = 0
+
+        // Open /sys/bus/pci/devices/
+        sysfs_dir = "/sys/bus/pci/devices"
+        dir_fd = SystemCall(GPUSys.SYS_OPEN, sysfs_dir, 65536, 0)
+        IfCondition LessThan(dir_fd, 0) ThenBlock: {
+            PrintMessage("[AMDGPU] ERROR: cannot open /sys/bus/pci/devices\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[AMDGPU] Scanning PCI bus for AMD GPUs...\n")
+
+        // Read directory entries
+        buf = GPUDiscState.scan_buf
+        nread = SystemCall(GPUSys.SYS_GETDENTS64, dir_fd, buf, 8192, 0, 0)
+
+        WhileLoop GreaterThan(nread, 0) {
+            offset = 0
+            WhileLoop LessThan(offset, nread) {
+                // struct linux_dirent64:
+                //   +0:  d_ino      (8 bytes)
+                //   +8:  d_off      (8 bytes)
+                //   +16: d_reclen   (2 bytes, LE)
+                //   +18: d_type     (1 byte)
+                //   +19: d_name     (variable)
+                entry = Add(buf, offset)
+                reclen_lo = GetByte(entry, 16)
+                reclen_hi = GetByte(entry, 17)
+                reclen = Add(reclen_lo, Multiply(reclen_hi, 256))
+                d_type = GetByte(entry, 18)
+                d_name = Add(entry, 19)
+
+                // Skip . and ..
+                first_ch = GetByte(d_name, 0)
+                IfCondition NotEqual(first_ch, 46) ThenBlock: {
+                    // d_type 10 = symlink (PCI devices are symlinks in sysfs)
+                    // Build device base path into dev_buf (separate buffer)
+                    dev_path = GPU_BuildDevPath(sysfs_dir, d_name)
+
+                    // Read vendor ID (GPU_BuildPath writes to path_buf, reads from dev_buf — no alias)
+                    vendor_path = GPU_BuildPath(dev_path, "vendor")
+                    vendor_id = GPU_ReadSysfsInt(vendor_path)
+
+                    // Check if AMD (0x1002)
+                    IfCondition EqualTo(vendor_id, GPUDevConst.VENDOR_AMD) ThenBlock: {
+                        // Read device ID
+                        device_path = GPU_BuildPath(dev_path, "device")
+                        device_id = GPU_ReadSysfsInt(device_path)
+
+                        // Read class (want 0x030000 = VGA or 0x038000 = other display)
+                        class_path = GPU_BuildPath(dev_path, "class")
+                        pci_class = GPU_ReadSysfsInt(class_path)
+                        class_base = Divide(pci_class, 65536)  // >> 16
+
+                        // Class 0x03 = display controller
+                        IfCondition EqualTo(class_base, 3) ThenBlock: {
+                            IfCondition LessThan(GPUDevList.count, GPUDevConst.MAX_GPUS) ThenBlock: {
+                                idx = GPUDevList.count
+                                entry_ptr = Add(GPUDevList.entries, Multiply(idx, GPUDevConst.ENTRY_SIZE))
+
+                                // Store vendor/device
+                                StoreValue(Add(entry_ptr, GPUDevField.VENDOR_ID), vendor_id)
+                                StoreValue(Add(entry_ptr, GPUDevField.DEVICE_ID), device_id)
+
+                                // Parse BDF from directory name
+                                GPU_ParseBDF(d_name, entry_ptr)
+
+                                // Read subsystem IDs (must read each before next BuildPath overwrites path_buf)
+                                GPU_BuildPath(dev_path, "subsystem_vendor")
+                                StoreValue(Add(entry_ptr, GPUDevField.SUBSYS_VENDOR), GPU_ReadSysfsInt(GPUDiscState.path_buf))
+                                GPU_BuildPath(dev_path, "subsystem_device")
+                                StoreValue(Add(entry_ptr, GPUDevField.SUBSYS_DEVICE), GPU_ReadSysfsInt(GPUDiscState.path_buf))
+
+                                // Read BAR sizes (same: read immediately after each BuildPath)
+                                GPU_BuildPath(dev_path, "resource0")
+                                StoreValue(Add(entry_ptr, GPUDevField.BAR0_SIZE), GPU_ReadBarSize(GPUDiscState.path_buf))
+                                GPU_BuildPath(dev_path, "resource2")
+                                StoreValue(Add(entry_ptr, GPUDevField.BAR2_SIZE), GPU_ReadBarSize(GPUDiscState.path_buf))
+
+                                // Identify GPU family
+                                GPUFamily_Identify(device_id, entry_ptr)
+
+                                // Print discovery
+                                bus = Dereference(Add(entry_ptr, GPUDevField.PCI_BUS))
+                                slot_v = Dereference(Add(entry_ptr, GPUDevField.PCI_SLOT))
+                                func_v = Dereference(Add(entry_ptr, GPUDevField.PCI_FUNC))
+                                gen = Dereference(Add(entry_ptr, GPUDevField.GENERATION))
+                                chip_v = Dereference(Add(entry_ptr, GPUDevField.CHIP))
+                                max_cus = Dereference(Add(entry_ptr, GPUDevField.MAX_CUS))
+                                bar0 = Dereference(Add(entry_ptr, GPUDevField.BAR0_SIZE))
+
+                                PrintMessage("[AMDGPU] Found: ")
+                                PrintNumber(bus)
+                                PrintMessage(":")
+                                PrintNumber(slot_v)
+                                PrintMessage(".")
+                                PrintNumber(func_v)
+                                PrintMessage("  [")
+                                PrintString(GPUFamily_Name(chip_v))
+                                PrintMessage("] ")
+                                PrintString(GPUFamily_GenName(gen))
+                                PrintMessage("  CUs=")
+                                PrintNumber(max_cus)
+                                PrintMessage("  BAR0=")
+                                PrintNumber(Divide(bar0, 1048576))
+                                PrintMessage("MB\n")
+
+                                GPUDevList.count = Add(GPUDevList.count, 1)
+                            }
+                        }
+                    }
+                }
+
+                offset = Add(offset, reclen)
+            }
+
+            // Read next batch
+            nread = SystemCall(GPUSys.SYS_GETDENTS64, dir_fd, buf, 8192, 0, 0)
+        }
+
+        SystemCall(GPUSys.SYS_CLOSE, dir_fd, 0, 0, 0, 0)
+
+        // Free scan buffers (keep path_buf and read_buf for later use)
+        Deallocate(GPUDiscState.scan_buf, 8192)
+        Deallocate(GPUDiscState.dev_buf, 512)
+        GPUDiscState.scan_buf = 0
+        GPUDiscState.dev_buf = 0
+
+        PrintMessage("[AMDGPU] Discovery complete: ")
+        PrintNumber(GPUDevList.count)
+        PrintMessage(" AMD GPU(s) found\n")
+
+        ReturnValue(GPUDevList.count)
+    }
+}
+
+// =============================================================================
+// GPU_GetDevice — return pointer to device entry by index
+// =============================================================================
+Function.GPU_GetDevice {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(index, GPUDevList.count) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Add(GPUDevList.entries, Multiply(index, GPUDevConst.ENTRY_SIZE)))
+    }
+}
+
+// =============================================================================
+// GPU_GetDeviceField — read a field from a device entry
+// =============================================================================
+Function.GPU_GetDeviceField {
+    Input: index: Integer
+    Input: field: Integer
+    Output: Integer
+    Body: {
+        dev = GPU_GetDevice(index)
+        IfCondition EqualTo(dev, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Dereference(Add(dev, field)))
+    }
+}
+
+// =============================================================================
+// GPU_PrintAll — print summary of all discovered GPUs
+// =============================================================================
+Function.GPU_PrintAll {
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, GPUDevList.count) {
+            dev = GPU_GetDevice(i)
+            bus = Dereference(Add(dev, GPUDevField.PCI_BUS))
+            slot_v = Dereference(Add(dev, GPUDevField.PCI_SLOT))
+            func_v = Dereference(Add(dev, GPUDevField.PCI_FUNC))
+            dev_id = Dereference(Add(dev, GPUDevField.DEVICE_ID))
+            gen = Dereference(Add(dev, GPUDevField.GENERATION))
+            chip_v = Dereference(Add(dev, GPUDevField.CHIP))
+            isa = Dereference(Add(dev, GPUDevField.ISA))
+            max_cus = Dereference(Add(dev, GPUDevField.MAX_CUS))
+            bar0 = Dereference(Add(dev, GPUDevField.BAR0_SIZE))
+            bar2 = Dereference(Add(dev, GPUDevField.BAR2_SIZE))
+
+            PrintMessage("  GPU ")
+            PrintNumber(i)
+            PrintMessage(": PCI ")
+            PrintNumber(bus)
+            PrintMessage(":")
+            PrintNumber(slot_v)
+            PrintMessage(".")
+            PrintNumber(func_v)
+            PrintMessage("  devid=0x")
+            // Print hex device ID (simple: just print decimal for now)
+            PrintNumber(dev_id)
+            PrintMessage("\n")
+            PrintMessage("        Chip: ")
+            PrintString(GPUFamily_Name(chip_v))
+            PrintMessage("  Gen: ")
+            PrintString(GPUFamily_GenName(gen))
+            PrintMessage("\n")
+            PrintMessage("        ISA:  ")
+            PrintString(GPUFamily_IsaName(isa))
+            PrintMessage("  CUs: ")
+            PrintNumber(max_cus)
+            PrintMessage("  SPs: ")
+            PrintNumber(Multiply(max_cus, 64))
+            PrintMessage("\n")
+            PrintMessage("        BAR0: ")
+            PrintNumber(Divide(bar0, 1048576))
+            PrintMessage("MB  BAR2: ")
+            PrintNumber(Divide(bar2, 1024))
+            PrintMessage("KB\n")
+
+            i = Add(i, 1)
+        }
+    }
+}

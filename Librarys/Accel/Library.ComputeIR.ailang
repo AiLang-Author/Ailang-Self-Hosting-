@@ -1,0 +1,806 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.ComputeIR.ailang
+//
+// Frontend-agnostic Compute Intermediate Representation.
+// Any API (OpenGL compute, Vulkan, SPIR-V, custom) can emit CIR ops.
+// Backend lowering passes translate CIR → target ISA (GCN, RDNA, etc.)
+//
+// Design:
+//   - CIR ops are abstract: LOAD, STORE, ALU, BARRIER, etc.
+//   - No ISA-specific details leak into the IR layer.
+//   - Register allocation is virtual (infinite VREGs) — lowering maps to physical.
+//   - Programs are linear sequences of CIR ops stored in a flat buffer.
+//   - Buffer descriptors are abstract (base address + size + stride).
+//   - Lowering to GCN uses Library.GCNEnc; future backends plug in the same way.
+//
+// USAGE
+//   LibraryImport.Accel.ComputeIR
+
+// =============================================================================
+// CIR OPCODES — the instruction set of the IR
+// Frontend-agnostic: no ISA names, no hardware details.
+// =============================================================================
+FixedPool.CIR {
+    // --- Memory ---
+    "LOAD_BUF":     Initialize=1,  CanChange=False   // vreg = buffer[index]
+    "STORE_BUF":    Initialize=2,  CanChange=False   // buffer[index] = vreg
+    "LOAD_CONST":   Initialize=3,  CanChange=False   // vreg = immediate value
+    "LOAD_PARAM":   Initialize=4,  CanChange=False   // vreg = kernel parameter (USER_DATA)
+
+    // --- Integer ALU ---
+    "ADD_U32":      Initialize=10, CanChange=False
+    "SUB_U32":      Initialize=11, CanChange=False
+    "MUL_LO_U32":   Initialize=12, CanChange=False   // low 32 bits of u32*u32
+    "MUL_HI_U32":   Initialize=13, CanChange=False   // high 32 bits of u32*u32
+    "AND_B32":      Initialize=14, CanChange=False
+    "OR_B32":       Initialize=15, CanChange=False
+    "XOR_B32":      Initialize=16, CanChange=False
+    "SHL_B32":      Initialize=17, CanChange=False
+    "SHR_U32":      Initialize=18, CanChange=False
+    "SHR_I32":      Initialize=19, CanChange=False   // arithmetic shift right
+
+    // --- Float ALU ---
+    "ADD_F32":      Initialize=30, CanChange=False
+    "SUB_F32":      Initialize=31, CanChange=False
+    "MUL_F32":      Initialize=32, CanChange=False
+    "FMA_F32":      Initialize=33, CanChange=False   // dst = a*b + c
+    "RCP_F32":      Initialize=34, CanChange=False   // dst = 1.0/src (approximate)
+    "SQRT_F32":     Initialize=35, CanChange=False
+    "MIN_F32":      Initialize=36, CanChange=False
+    "MAX_F32":      Initialize=37, CanChange=False
+    "CVT_F32_U32":  Initialize=38, CanChange=False   // float ← uint
+    "CVT_U32_F32":  Initialize=39, CanChange=False   // uint ← float
+    "CVT_F32_I32":  Initialize=40, CanChange=False   // float ← int
+    "CVT_I32_F32":  Initialize=41, CanChange=False   // int ← float
+
+    // --- Scalar ALU (uniform across wavefront) ---
+    "S_ADD_U32":    Initialize=50, CanChange=False
+    "S_MUL_I32":    Initialize=51, CanChange=False
+    "S_MOV":        Initialize=52, CanChange=False
+    "S_AND_B32":    Initialize=53, CanChange=False
+    "S_OR_B32":     Initialize=54, CanChange=False
+    "S_SHL_B32":    Initialize=55, CanChange=False
+    "S_SHR_U32":    Initialize=56, CanChange=False
+
+    // --- Compare & Select ---
+    "CMP_EQ_U32":   Initialize=60, CanChange=False   // set condition code
+    "CMP_LT_U32":   Initialize=61, CanChange=False
+    "CMP_GT_U32":   Initialize=62, CanChange=False
+    "CMP_EQ_F32":   Initialize=63, CanChange=False
+    "CMP_LT_F32":   Initialize=64, CanChange=False
+    "SELECT":       Initialize=65, CanChange=False   // dst = cond ? a : b
+
+    // --- Synchronization ---
+    "BARRIER":      Initialize=80, CanChange=False   // workgroup barrier
+    "WAITCNT":      Initialize=81, CanChange=False   // wait for memory ops
+    "FENCE_MEM":    Initialize=82, CanChange=False   // memory fence
+
+    // --- Flow ---
+    "END_PGM":      Initialize=90, CanChange=False   // terminate kernel
+    "NOP":          Initialize=91, CanChange=False
+
+    // --- Thread identity (read-only pseudo-ops, lowered to HW reads) ---
+    "THREAD_ID_X":  Initialize=100, CanChange=False  // local thread ID in workgroup
+    "THREAD_ID_Y":  Initialize=101, CanChange=False
+    "THREAD_ID_Z":  Initialize=102, CanChange=False
+    "GROUP_ID_X":   Initialize=103, CanChange=False  // workgroup ID in dispatch
+    "GROUP_ID_Y":   Initialize=104, CanChange=False
+    "GROUP_ID_Z":   Initialize=105, CanChange=False
+    "GLOBAL_ID_X":  Initialize=106, CanChange=False  // computed: group*size + thread
+    "GLOBAL_ID_Y":  Initialize=107, CanChange=False
+    "GLOBAL_ID_Z":  Initialize=108, CanChange=False
+    "GROUP_SIZE_X": Initialize=109, CanChange=False  // workgroup dimensions
+    "GROUP_SIZE_Y": Initialize=110, CanChange=False
+    "GROUP_SIZE_Z": Initialize=111, CanChange=False
+
+    // --- Composite (high-level ops, lowered to sequences) ---
+    "DOT_U32":      Initialize=120, CanChange=False  // dst += a[i] * b[i] for range
+    "MAC_F32":      Initialize=121, CanChange=False  // dst += a * b
+    "CLAMP_F32":    Initialize=122, CanChange=False  // dst = clamp(src, lo, hi)
+    "ABS_F32":      Initialize=123, CanChange=False  // dst = |src|
+}
+
+// =============================================================================
+// CIR DATA TYPES
+// =============================================================================
+FixedPool.CIRType {
+    "U8":       Initialize=1,  CanChange=False
+    "U16":      Initialize=2,  CanChange=False
+    "U32":      Initialize=3,  CanChange=False
+    "U64":      Initialize=4,  CanChange=False
+    "I8":       Initialize=5,  CanChange=False
+    "I16":      Initialize=6,  CanChange=False
+    "I32":      Initialize=7,  CanChange=False
+    "I64":      Initialize=8,  CanChange=False
+    "F16":      Initialize=9,  CanChange=False
+    "F32":      Initialize=10, CanChange=False
+    "F64":      Initialize=11, CanChange=False
+}
+
+// =============================================================================
+// CIR REGISTER CLASSES
+// Virtual registers — lowering maps these to physical (VGPR, SGPR, etc.)
+// =============================================================================
+FixedPool.CIRReg {
+    "VREG":     Initialize=0,  CanChange=False   // vector (per-thread)
+    "SREG":     Initialize=1,  CanChange=False   // scalar (uniform across wavefront)
+    "PREG":     Initialize=2,  CanChange=False   // predicate / condition code
+}
+
+// =============================================================================
+// CIR INSTRUCTION ENCODING IN THE IR BUFFER
+//
+// Each IR instruction is 5 DWORDs (40 bytes) in the flat buffer:
+//   +0:  opcode  (CIR.*)
+//   +8:  dst     (virtual register number, or buffer slot)
+//   +16: src0    (virtual register or immediate)
+//   +24: src1    (virtual register or immediate)
+//   +32: src2    (virtual register or immediate / flags)
+//
+// This is wide enough for 3-source ops (FMA, SELECT, DOT).
+// For memory ops: dst=vreg, src0=buffer_id, src1=index_vreg, src2=unused.
+// For immediates: src0 holds the value directly (LOAD_CONST).
+// =============================================================================
+FixedPool.CIRInsn {
+    "SIZE":     Initialize=40, CanChange=False   // bytes per IR instruction
+    "OFF_OP":   Initialize=0,  CanChange=False
+    "OFF_DST":  Initialize=8,  CanChange=False
+    "OFF_SRC0": Initialize=16, CanChange=False
+    "OFF_SRC1": Initialize=24, CanChange=False
+    "OFF_SRC2": Initialize=32, CanChange=False
+}
+
+// =============================================================================
+// CIR PROGRAM STATE — builder + register allocator
+// =============================================================================
+FixedPool.CIRProg {
+    "buf":          Initialize=0, CanChange=True   // mmap'd buffer for IR instructions
+    "buf_cap":      Initialize=0, CanChange=True   // capacity in bytes
+    "num_insns":    Initialize=0, CanChange=True   // instructions emitted so far
+    "next_vreg":    Initialize=0, CanChange=True   // next virtual VREG number
+    "next_sreg":    Initialize=0, CanChange=True   // next virtual SREG number
+    "num_bufs":     Initialize=0, CanChange=True   // buffer descriptors bound
+    "group_size_x": Initialize=64, CanChange=True  // workgroup size X (default 64)
+    "group_size_y": Initialize=1,  CanChange=True  // workgroup size Y
+    "group_size_z": Initialize=1,  CanChange=True  // workgroup size Z
+    "grid_x":       Initialize=1,  CanChange=True  // dispatch grid X (num workgroups)
+    "grid_y":       Initialize=1,  CanChange=True
+    "grid_z":       Initialize=1,  CanChange=True
+    "active":       Initialize=0, CanChange=True   // 1 between Begin/End
+    "lowered":      Initialize=0, CanChange=True   // 1 after lowering pass
+
+    // Machine code output (filled by lowering pass)
+    "mc_buf":       Initialize=0, CanChange=True   // machine code buffer (address)
+    "mc_cap":       Initialize=0, CanChange=True   // machine code buffer capacity
+    "mc_size":      Initialize=0, CanChange=True   // machine code bytes written
+}
+
+// =============================================================================
+// CIR BUFFER DESCRIPTORS
+// Up to 16 buffer bindings per program (like Vulkan descriptor set slots).
+// Each is 32 bytes: base_addr(8) + size(8) + stride(8) + flags(8)
+// =============================================================================
+FixedPool.CIRBufDesc {
+    "MAX_BUFS":     Initialize=16,  CanChange=False
+    "ENTRY_SIZE":   Initialize=32,  CanChange=False
+    "OFF_ADDR":     Initialize=0,   CanChange=False
+    "OFF_SIZE":     Initialize=8,   CanChange=False
+    "OFF_STRIDE":   Initialize=16,  CanChange=False
+    "OFF_FLAGS":    Initialize=24,  CanChange=False
+    // flags
+    "FLAG_READ":    Initialize=1,   CanChange=False
+    "FLAG_WRITE":   Initialize=2,   CanChange=False
+    "FLAG_RW":      Initialize=3,   CanChange=False
+}
+
+// Flat array for buffer descriptors (16 * 32 = 512 bytes)
+FixedPool.CIRBufs {
+    "base":     Initialize=0, CanChange=True   // mmap'd 512-byte descriptor array
+}
+
+// =============================================================================
+// CIR DEFAULT CAPACITIES
+// =============================================================================
+FixedPool.CIRCap {
+    "IR_BUF_SIZE":  Initialize=409600,  CanChange=False  // 400KB = 10240 IR insns max
+    "MC_BUF_SIZE":  Initialize=262144,  CanChange=False  // 256KB machine code max
+    "BUF_DESC_SIZE": Initialize=512,    CanChange=False  // 16 * 32 byte descriptors
+}
+
+// =============================================================================
+// CIR_Init — allocate program buffers (call once at startup)
+// =============================================================================
+Function.CIR_Init {
+    Output: Integer
+    Body: {
+        // Allocate IR instruction buffer
+        ir_sz = CIRCap.IR_BUF_SIZE
+        ir_buf = SystemCall(9, 0, ir_sz, 3, 34, -1, 0)
+        IfCondition LessThan(ir_buf, 0) ThenBlock: {
+            PrintMessage("[CIR] mmap IR buffer failed\n")
+            ReturnValue(-1)
+        }
+        CIRProg.buf = ir_buf
+        CIRProg.buf_cap = ir_sz
+
+        // Allocate machine code output buffer
+        mc_sz = CIRCap.MC_BUF_SIZE
+        mc_buf = SystemCall(9, 0, mc_sz, 3, 34, -1, 0)
+        IfCondition LessThan(mc_buf, 0) ThenBlock: {
+            PrintMessage("[CIR] mmap MC buffer failed\n")
+            ReturnValue(-2)
+        }
+        CIRProg.mc_buf = mc_buf
+        CIRProg.mc_cap = mc_sz
+
+        // Allocate buffer descriptor array
+        bd_sz = CIRCap.BUF_DESC_SIZE
+        bd_buf = SystemCall(9, 0, bd_sz, 3, 34, -1, 0)
+        IfCondition LessThan(bd_buf, 0) ThenBlock: {
+            PrintMessage("[CIR] mmap descriptor array failed\n")
+            ReturnValue(-3)
+        }
+        CIRBufs.base = bd_buf
+
+        PrintMessage("[CIR] initialized: IR=")
+        PrintNumber(ir_sz)
+        PrintMessage("B MC=")
+        PrintNumber(mc_sz)
+        PrintMessage("B\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CIR_Shutdown — release buffers
+// =============================================================================
+Function.CIR_Shutdown {
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(CIRProg.buf, 0) ThenBlock: {
+            discard_unmap = SystemCall(11, CIRProg.buf, CIRProg.buf_cap, 0, 0, 0)
+            CIRProg.buf = 0
+        }
+        IfCondition GreaterThan(CIRProg.mc_buf, 0) ThenBlock: {
+            discard_unmap2 = SystemCall(11, CIRProg.mc_buf, CIRProg.mc_cap, 0, 0, 0)
+            CIRProg.mc_buf = 0
+        }
+        IfCondition GreaterThan(CIRBufs.base, 0) ThenBlock: {
+            discard_unmap3 = SystemCall(11, CIRBufs.base, CIRCap.BUF_DESC_SIZE, 0, 0, 0)
+            CIRBufs.base = 0
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CIR_Begin — start building a new compute program
+// Resets instruction count and register allocators.
+// =============================================================================
+Function.CIR_Begin {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CIRProg.buf, 0) ThenBlock: {
+            PrintMessage("[CIR] not initialized\n")
+            ReturnValue(-1)
+        }
+        CIRProg.num_insns = 0
+        CIRProg.next_vreg = 0
+        CIRProg.next_sreg = 0
+        CIRProg.num_bufs = 0
+        CIRProg.mc_size = 0
+        CIRProg.active = 1
+        CIRProg.lowered = 0
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CIR_End — finalize the program (no more ops after this)
+// =============================================================================
+Function.CIR_End {
+    Output: Integer
+    Body: {
+        CIRProg.active = 0
+        ReturnValue(CIRProg.num_insns)
+    }
+}
+
+// =============================================================================
+// CIR_SetGrid — set dispatch dimensions
+// =============================================================================
+Function.CIR_SetGrid {
+    Input: gx: Integer
+    Input: gy: Integer
+    Input: gz: Integer
+    Output: Integer
+    Body: {
+        CIRProg.grid_x = gx
+        CIRProg.grid_y = gy
+        CIRProg.grid_z = gz
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CIR_SetGroupSize — set workgroup dimensions
+// =============================================================================
+Function.CIR_SetGroupSize {
+    Input: sx: Integer
+    Input: sy: Integer
+    Input: sz: Integer
+    Output: Integer
+    Body: {
+        CIRProg.group_size_x = sx
+        CIRProg.group_size_y = sy
+        CIRProg.group_size_z = sz
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CIR_AllocVReg — allocate a virtual vector register
+// Returns the vreg number.
+// =============================================================================
+Function.CIR_AllocVReg {
+    Output: Integer
+    Body: {
+        r = CIRProg.next_vreg
+        CIRProg.next_vreg = Add(r, 1)
+        ReturnValue(r)
+    }
+}
+
+// =============================================================================
+// CIR_AllocSReg — allocate a virtual scalar register
+// Returns the sreg number (offset by 0x10000 to distinguish from vregs).
+// =============================================================================
+Function.CIR_AllocSReg {
+    Output: Integer
+    Body: {
+        r = CIRProg.next_sreg
+        CIRProg.next_sreg = Add(r, 1)
+        ReturnValue(Add(r, 65536))
+    }
+}
+
+// =============================================================================
+// CIR_BindBuffer — bind a buffer descriptor to a slot
+// slot: 0-15, addr: GPU virtual address, sz: bytes, stride: bytes per element
+// =============================================================================
+Function.CIR_BindBuffer {
+    Input: slot: Integer
+    Input: addr: Integer
+    Input: sz: Integer
+    Input: stride: Integer
+    Input: flags: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(slot, 15) ThenBlock: { ReturnValue(-1) }
+        base = CIRBufs.base
+        off = Multiply(slot, 32)
+        ptr = Add(base, off)
+        StoreValue(Add(ptr, 0), addr)
+        StoreValue(Add(ptr, 8), sz)
+        StoreValue(Add(ptr, 16), stride)
+        StoreValue(Add(ptr, 24), flags)
+        // Track highest used slot
+        nbufs = CIRProg.num_bufs
+        slot1 = Add(slot, 1)
+        IfCondition GreaterThan(slot1, nbufs) ThenBlock: {
+            CIRProg.num_bufs = slot1
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// CIR_Emit — append one IR instruction to the program buffer
+// Internal helper. All CIR_Op_* functions call this.
+// =============================================================================
+Function.CIR_Emit {
+    Input: opcode: Integer
+    Input: dst: Integer
+    Input: src0: Integer
+    Input: src1: Integer
+    Input: src2: Integer
+    Output: Integer
+    Body: {
+        n = CIRProg.num_insns
+        off = Multiply(n, 40)
+        cap = CIRProg.buf_cap
+        IfCondition GreaterThan(Add(off, 40), cap) ThenBlock: {
+            PrintMessage("[CIR] IR buffer full\n")
+            ReturnValue(-1)
+        }
+        ptr = Add(CIRProg.buf, off)
+        StoreValue(Add(ptr, 0), opcode)
+        StoreValue(Add(ptr, 8), dst)
+        StoreValue(Add(ptr, 16), src0)
+        StoreValue(Add(ptr, 24), src1)
+        StoreValue(Add(ptr, 32), src2)
+        CIRProg.num_insns = Add(n, 1)
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// CIR_ReadInsn — read fields of IR instruction at index
+// Returns opcode. Sets CIRProg scratch fields for dst/src0/src1/src2.
+// =============================================================================
+FixedPool.CIRScratch {
+    "op":   Initialize=0, CanChange=True
+    "dst":  Initialize=0, CanChange=True
+    "src0": Initialize=0, CanChange=True
+    "src1": Initialize=0, CanChange=True
+    "src2": Initialize=0, CanChange=True
+}
+
+Function.CIR_ReadInsn {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        off = Multiply(idx, 40)
+        ptr = Add(CIRProg.buf, off)
+        CIRScratch.op   = Dereference(Add(ptr, 0))
+        CIRScratch.dst  = Dereference(Add(ptr, 8))
+        CIRScratch.src0 = Dereference(Add(ptr, 16))
+        CIRScratch.src1 = Dereference(Add(ptr, 24))
+        CIRScratch.src2 = Dereference(Add(ptr, 32))
+        ReturnValue(CIRScratch.op)
+    }
+}
+
+// =============================================================================
+// CIR OP EMITTERS — one per IR opcode (thin wrappers around CIR_Emit)
+// These form the public API that frontends (GL, VK, SPIR-V, custom) call.
+// =============================================================================
+
+// --- Memory ops ---
+
+// dst_vreg = buffer[slot][index_vreg]
+Function.CIR_Op_LoadBuf {
+    Input: dst_vreg: Integer
+    Input: buf_slot: Integer
+    Input: idx_vreg: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.LOAD_BUF, dst_vreg, buf_slot, idx_vreg, 0)) }
+}
+
+// buffer[slot][index_vreg] = src_vreg
+Function.CIR_Op_StoreBuf {
+    Input: src_vreg: Integer
+    Input: buf_slot: Integer
+    Input: idx_vreg: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.STORE_BUF, src_vreg, buf_slot, idx_vreg, 0)) }
+}
+
+// dst_vreg = immediate
+Function.CIR_Op_LoadConst {
+    Input: dst_vreg: Integer
+    Input: value: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.LOAD_CONST, dst_vreg, value, 0, 0)) }
+}
+
+// dst_sreg = kernel parameter N
+Function.CIR_Op_LoadParam {
+    Input: dst_sreg: Integer
+    Input: param_idx: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.LOAD_PARAM, dst_sreg, param_idx, 0, 0)) }
+}
+
+// --- Integer ALU ---
+
+Function.CIR_Op_AddU32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.ADD_U32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_SubU32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.SUB_U32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_MulLoU32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.MUL_LO_U32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_MulHiU32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.MUL_HI_U32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_AndB32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.AND_B32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_OrB32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.OR_B32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_XorB32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.XOR_B32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_ShlB32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: shift: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.SHL_B32, dst, a, shift, 0)) }
+}
+
+Function.CIR_Op_ShrU32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: shift: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.SHR_U32, dst, a, shift, 0)) }
+}
+
+// --- Float ALU ---
+
+Function.CIR_Op_AddF32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.ADD_F32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_SubF32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.SUB_F32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_MulF32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.MUL_F32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_FmaF32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Input: c: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.FMA_F32, dst, a, b, c)) }
+}
+
+Function.CIR_Op_MacF32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.MAC_F32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_RcpF32 {
+    Input: dst: Integer
+    Input: src: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.RCP_F32, dst, src, 0, 0)) }
+}
+
+Function.CIR_Op_SqrtF32 {
+    Input: dst: Integer
+    Input: src: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.SQRT_F32, dst, src, 0, 0)) }
+}
+
+Function.CIR_Op_MinF32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.MIN_F32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_MaxF32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.MAX_F32, dst, a, b, 0)) }
+}
+
+// --- Conversions ---
+
+Function.CIR_Op_CvtF32U32 {
+    Input: dst: Integer
+    Input: src: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.CVT_F32_U32, dst, src, 0, 0)) }
+}
+
+Function.CIR_Op_CvtU32F32 {
+    Input: dst: Integer
+    Input: src: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.CVT_U32_F32, dst, src, 0, 0)) }
+}
+
+// --- Scalar ops ---
+
+Function.CIR_Op_SAddU32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.S_ADD_U32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_SMulI32 {
+    Input: dst: Integer
+    Input: a: Integer
+    Input: b: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.S_MUL_I32, dst, a, b, 0)) }
+}
+
+Function.CIR_Op_SMov {
+    Input: dst: Integer
+    Input: src: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.S_MOV, dst, src, 0, 0)) }
+}
+
+// --- Thread identity ---
+
+Function.CIR_Op_ThreadIdX {
+    Input: dst: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.THREAD_ID_X, dst, 0, 0, 0)) }
+}
+
+Function.CIR_Op_ThreadIdY {
+    Input: dst: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.THREAD_ID_Y, dst, 0, 0, 0)) }
+}
+
+Function.CIR_Op_GroupIdX {
+    Input: dst: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.GROUP_ID_X, dst, 0, 0, 0)) }
+}
+
+Function.CIR_Op_GroupIdY {
+    Input: dst: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.GROUP_ID_Y, dst, 0, 0, 0)) }
+}
+
+Function.CIR_Op_GlobalIdX {
+    Input: dst: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.GLOBAL_ID_X, dst, 0, 0, 0)) }
+}
+
+Function.CIR_Op_GlobalIdY {
+    Input: dst: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.GLOBAL_ID_Y, dst, 0, 0, 0)) }
+}
+
+Function.CIR_Op_GroupSizeX {
+    Input: dst: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.GROUP_SIZE_X, dst, 0, 0, 0)) }
+}
+
+// --- Synchronization ---
+
+Function.CIR_Op_Barrier {
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.BARRIER, 0, 0, 0, 0)) }
+}
+
+Function.CIR_Op_WaitCnt {
+    Input: vm: Integer
+    Input: exp: Integer
+    Input: lgkm: Integer
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.WAITCNT, 0, vm, exp, lgkm)) }
+}
+
+// --- Flow ---
+
+Function.CIR_Op_EndPgm {
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.END_PGM, 0, 0, 0, 0)) }
+}
+
+Function.CIR_Op_Nop {
+    Output: Integer
+    Body: { ReturnValue(CIR_Emit(CIR.NOP, 0, 0, 0, 0)) }
+}
+
+// =============================================================================
+// CIR_Dump — print human-readable IR listing (for debugging)
+// =============================================================================
+Function.CIR_Dump {
+    Output: Integer
+    Body: {
+        n = CIRProg.num_insns
+        PrintMessage("[CIR] program: ")
+        PrintNumber(n)
+        PrintMessage(" instructions, ")
+        PrintNumber(CIRProg.next_vreg)
+        PrintMessage(" vregs, ")
+        PrintNumber(CIRProg.next_sreg)
+        PrintMessage(" sregs, ")
+        PrintNumber(CIRProg.num_bufs)
+        PrintMessage(" buffers\n")
+        PrintMessage("[CIR] grid=(")
+        PrintNumber(CIRProg.grid_x)
+        PrintMessage(",")
+        PrintNumber(CIRProg.grid_y)
+        PrintMessage(",")
+        PrintNumber(CIRProg.grid_z)
+        PrintMessage(") group=(")
+        PrintNumber(CIRProg.group_size_x)
+        PrintMessage(",")
+        PrintNumber(CIRProg.group_size_y)
+        PrintMessage(",")
+        PrintNumber(CIRProg.group_size_z)
+        PrintMessage(")\n")
+
+        i = 0
+        WhileLoop LessThan(i, n) {
+            discard_read = CIR_ReadInsn(i)
+            PrintMessage("  ")
+            PrintNumber(i)
+            PrintMessage(": op=")
+            PrintNumber(CIRScratch.op)
+            PrintMessage(" dst=")
+            PrintNumber(CIRScratch.dst)
+            PrintMessage(" src0=")
+            PrintNumber(CIRScratch.src0)
+            PrintMessage(" src1=")
+            PrintNumber(CIRScratch.src1)
+            PrintMessage(" src2=")
+            PrintNumber(CIRScratch.src2)
+            PrintMessage("\n")
+            i = Add(i, 1)
+        }
+        ReturnValue(n)
+    }
+}

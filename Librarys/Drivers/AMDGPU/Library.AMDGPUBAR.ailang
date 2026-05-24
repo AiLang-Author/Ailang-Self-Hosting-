@@ -1,0 +1,500 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUBAR.ailang
+//
+// BAR manager for AMD GPUs.
+// Maps PCI resource files (MMIO BAR2, VRAM BAR0) into userspace via mmap.
+// Provides register read/write and VRAM access.
+// Supports driver unbind for full GPU takeover.
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+//
+// DEPENDS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+
+// =============================================================================
+// PER-GPU BAR STATE — stored in a flat array (up to 8 GPUs)
+// =============================================================================
+FixedPool.GPUBarConst {
+    "MAX_GPUS":       Initialize=8
+    "STATE_SIZE":     Initialize=64    // bytes per GPU BAR state entry
+}
+
+// Layout of each 64-byte BAR state entry:
+//   +0:  mmio_ptr      (8 bytes) — mmaped MMIO base address (BAR2)
+//   +8:  mmio_size     (8 bytes) — MMIO map size
+//   +16: vram_ptr      (8 bytes) — mmaped VRAM base address (BAR0)
+//   +24: vram_size     (8 bytes) — VRAM map size
+//   +32: mmio_fd       (8 bytes) — file descriptor for BAR2
+//   +40: vram_fd       (8 bytes) — file descriptor for BAR0
+//   +48: unbound       (8 bytes) — 1 if driver was unbound
+//   +56: reserved      (8 bytes)
+FixedPool.GPUBarField {
+    "MMIO_PTR":       Initialize=0
+    "MMIO_SIZE":      Initialize=8
+    "VRAM_PTR":       Initialize=16
+    "VRAM_SIZE":      Initialize=24
+    "MMIO_FD":        Initialize=32
+    "VRAM_FD":        Initialize=40
+    "UNBOUND":        Initialize=48
+}
+
+FixedPool.GPUBarState {
+    "entries":        Initialize=0, CanChange=True   // ptr to allocated buffer
+    "initialized":    Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// GPU_BAR_Init — allocate BAR state array
+// =============================================================================
+Function.GPU_BAR_Init {
+    Body: {
+        IfCondition EqualTo(GPUBarState.initialized, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        total = Multiply(GPUBarConst.MAX_GPUS, GPUBarConst.STATE_SIZE)
+        GPUBarState.entries = Allocate(total)
+        MemorySet(GPUBarState.entries, 0, total)
+        GPUBarState.initialized = 1
+    }
+}
+
+// =============================================================================
+// GPU_BAR_GetState — return pointer to BAR state for GPU index
+// =============================================================================
+Function.GPU_BAR_GetState {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(index, GPUBarConst.MAX_GPUS) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Add(GPUBarState.entries, Multiply(index, GPUBarConst.STATE_SIZE)))
+    }
+}
+
+// =============================================================================
+// GPU_BAR_BuildResPath — build sysfs resource path for a GPU
+// Format: /sys/bus/pci/devices/BBBB:SS:FF.F/resourceN
+// Uses GPUDiscState.path_buf (512 bytes).
+// =============================================================================
+Function.GPU_BAR_BuildResPath {
+    Input: index: Integer
+    Input: res_suffix: Address
+    Output: Address
+    Body: {
+        dev = GPU_GetDevice(index)
+        IfCondition EqualTo(dev, 0) ThenBlock: { ReturnValue(0) }
+
+        bus  = Dereference(Add(dev, GPUDevField.PCI_BUS))
+        slot_v = Dereference(Add(dev, GPUDevField.PCI_SLOT))
+        func_v = Dereference(Add(dev, GPUDevField.PCI_FUNC))
+
+        // Build: /sys/bus/pci/devices/0000:BB:SS.F/resourceN
+        buf = GPUDiscState.path_buf
+        pos = 0
+
+        // "/sys/bus/pci/devices/0000:"
+        prefix = "/sys/bus/pci/devices/0000:"
+        i = 0
+        WhileLoop NotEqual(GetByte(prefix, i), 0) {
+            SetByte(buf, pos, GetByte(prefix, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        // Bus: 2 hex digits
+        hi = Divide(bus, 16)
+        lo = Modulo(bus, 16)
+        IfCondition LessThan(hi, 10) ThenBlock: { SetByte(buf, pos, Add(48, hi)) }
+        ElseBlock: { SetByte(buf, pos, Add(87, hi)) }
+        pos = Add(pos, 1)
+        IfCondition LessThan(lo, 10) ThenBlock: { SetByte(buf, pos, Add(48, lo)) }
+        ElseBlock: { SetByte(buf, pos, Add(87, lo)) }
+        pos = Add(pos, 1)
+
+        // ":"
+        SetByte(buf, pos, 58)
+        pos = Add(pos, 1)
+
+        // Slot: 2 hex digits
+        hi = Divide(slot_v, 16)
+        lo = Modulo(slot_v, 16)
+        IfCondition LessThan(hi, 10) ThenBlock: { SetByte(buf, pos, Add(48, hi)) }
+        ElseBlock: { SetByte(buf, pos, Add(87, hi)) }
+        pos = Add(pos, 1)
+        IfCondition LessThan(lo, 10) ThenBlock: { SetByte(buf, pos, Add(48, lo)) }
+        ElseBlock: { SetByte(buf, pos, Add(87, lo)) }
+        pos = Add(pos, 1)
+
+        // "."
+        SetByte(buf, pos, 46)
+        pos = Add(pos, 1)
+
+        // Func: 1 digit
+        SetByte(buf, pos, Add(48, func_v))
+        pos = Add(pos, 1)
+
+        // "/"
+        SetByte(buf, pos, 47)
+        pos = Add(pos, 1)
+
+        // Copy suffix (e.g. "resource0", "resource2", "driver/unbind")
+        i = 0
+        WhileLoop NotEqual(GetByte(res_suffix, i), 0) {
+            SetByte(buf, pos, GetByte(res_suffix, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        SetByte(buf, pos, 0)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_MapMMIO — mmap the MMIO register BAR (BAR2) for a GPU
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.GPU_BAR_MapMMIO {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        GPU_BAR_Init()
+
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Already mapped?
+        IfCondition NotEqual(Dereference(Add(state, GPUBarField.MMIO_PTR)), 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // Get BAR2 size from device entry
+        dev = GPU_GetDevice(index)
+        bar2_size = Dereference(Add(dev, GPUDevField.BAR2_SIZE))
+        IfCondition EqualTo(bar2_size, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] MMIO BAR2 size is 0\n")
+            ReturnValue(0)
+        }
+
+        // Build path to resource2
+        path = GPU_BAR_BuildResPath(index, "resource2")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+
+        // Open with O_RDWR | O_SYNC
+        flags = Add(GPUSys.O_RDWR, GPUSys.O_SYNC)
+        fd = SystemCall(GPUSys.SYS_OPEN, path, flags, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] Cannot open MMIO resource2 (fd=")
+            PrintNumber(fd)
+            PrintMessage(")\n")
+            ReturnValue(0)
+        }
+
+        // mmap(NULL, bar2_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+        prot = Add(GPUSys.PROT_READ, GPUSys.PROT_WRITE)
+        ptr = SystemCall(GPUSys.SYS_MMAP, 0, bar2_size, prot, GPUSys.MAP_SHARED, fd)
+
+        // mmap returns MAP_FAILED (-1 cast as pointer) on error
+        // Check for negative value (error) — mmap error codes are negative
+        IfCondition EqualTo(ptr, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] mmap MMIO failed\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+
+        // Store state
+        StoreValue(Add(state, GPUBarField.MMIO_PTR), ptr)
+        StoreValue(Add(state, GPUBarField.MMIO_SIZE), bar2_size)
+        StoreValue(Add(state, GPUBarField.MMIO_FD), fd)
+
+        PrintMessage("[AMDGPU BAR] MMIO mapped: ")
+        PrintNumber(Divide(bar2_size, 1024))
+        PrintMessage("KB\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_MapVRAM — mmap the VRAM BAR (BAR0) for a GPU
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.GPU_BAR_MapVRAM {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        GPU_BAR_Init()
+
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Already mapped?
+        IfCondition NotEqual(Dereference(Add(state, GPUBarField.VRAM_PTR)), 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // Get BAR0 size from device entry
+        dev = GPU_GetDevice(index)
+        bar0_size = Dereference(Add(dev, GPUDevField.BAR0_SIZE))
+        IfCondition EqualTo(bar0_size, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] VRAM BAR0 size is 0\n")
+            ReturnValue(0)
+        }
+
+        // Build path to resource0
+        path = GPU_BAR_BuildResPath(index, "resource0")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+
+        // Open with O_RDWR | O_SYNC
+        flags = Add(GPUSys.O_RDWR, GPUSys.O_SYNC)
+        fd = SystemCall(GPUSys.SYS_OPEN, path, flags, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] Cannot open VRAM resource0 (fd=")
+            PrintNumber(fd)
+            PrintMessage(")\n")
+            ReturnValue(0)
+        }
+
+        // mmap(NULL, bar0_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd, 0)
+        prot = Add(GPUSys.PROT_READ, GPUSys.PROT_WRITE)
+        ptr = SystemCall(GPUSys.SYS_MMAP, 0, bar0_size, prot, GPUSys.MAP_SHARED, fd)
+
+        IfCondition EqualTo(ptr, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] mmap VRAM failed\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+
+        StoreValue(Add(state, GPUBarField.VRAM_PTR), ptr)
+        StoreValue(Add(state, GPUBarField.VRAM_SIZE), bar0_size)
+        StoreValue(Add(state, GPUBarField.VRAM_FD), fd)
+
+        PrintMessage("[AMDGPU BAR] VRAM mapped: ")
+        PrintNumber(Divide(bar0_size, 1048576))
+        PrintMessage("MB\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_Unmap — unmap both BARs for a GPU
+// =============================================================================
+Function.GPU_BAR_Unmap {
+    Input: index: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Unmap MMIO
+        mmio_ptr = Dereference(Add(state, GPUBarField.MMIO_PTR))
+        IfCondition NotEqual(mmio_ptr, 0) ThenBlock: {
+            mmio_size = Dereference(Add(state, GPUBarField.MMIO_SIZE))
+            SystemCall(GPUSys.SYS_MUNMAP, mmio_ptr, mmio_size, 0, 0, 0)
+            mmio_fd = Dereference(Add(state, GPUBarField.MMIO_FD))
+            SystemCall(GPUSys.SYS_CLOSE, mmio_fd, 0, 0, 0, 0)
+            StoreValue(Add(state, GPUBarField.MMIO_PTR), 0)
+        }
+
+        // Unmap VRAM
+        vram_ptr = Dereference(Add(state, GPUBarField.VRAM_PTR))
+        IfCondition NotEqual(vram_ptr, 0) ThenBlock: {
+            vram_size = Dereference(Add(state, GPUBarField.VRAM_SIZE))
+            SystemCall(GPUSys.SYS_MUNMAP, vram_ptr, vram_size, 0, 0, 0)
+            vram_fd = Dereference(Add(state, GPUBarField.VRAM_FD))
+            SystemCall(GPUSys.SYS_CLOSE, vram_fd, 0, 0, 0, 0)
+            StoreValue(Add(state, GPUBarField.VRAM_PTR), 0)
+        }
+    }
+}
+
+// =============================================================================
+// GPU_Rd32 — read a 32-bit MMIO register
+// =============================================================================
+Function.GPU_Rd32 {
+    Input: index: Integer
+    Input: offset: Integer
+    Output: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+        mmio = Dereference(Add(state, GPUBarField.MMIO_PTR))
+        IfCondition EqualTo(mmio, 0) ThenBlock: { ReturnValue(0) }
+        // 32-bit aligned MMIO read — GPU registers require DWORD access
+        ReturnValue(Dereference(Add(mmio, offset), "dword"))
+    }
+}
+
+// =============================================================================
+// GPU_Wr32 — write a 32-bit MMIO register
+// =============================================================================
+Function.GPU_Wr32 {
+    Input: index: Integer
+    Input: offset: Integer
+    Input: value: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+        mmio = Dereference(Add(state, GPUBarField.MMIO_PTR))
+        IfCondition EqualTo(mmio, 0) ThenBlock: { ReturnValue(0) }
+        // 32-bit aligned MMIO write — GPU registers require DWORD access.
+        // StoreValue (64-bit) would clobber the adjacent register at offset+4.
+        StoreValue(Add(mmio, offset), value, "dword")
+    }
+}
+
+// =============================================================================
+// GPU_VramRd32 — read 32 bits from VRAM at given offset
+// =============================================================================
+Function.GPU_VramRd32 {
+    Input: index: Integer
+    Input: offset: Integer
+    Output: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+        vram = Dereference(Add(state, GPUBarField.VRAM_PTR))
+        IfCondition EqualTo(vram, 0) ThenBlock: { ReturnValue(0) }
+        // 32-bit aligned VRAM read
+        ReturnValue(Dereference(Add(vram, offset), "dword"))
+    }
+}
+
+// =============================================================================
+// GPU_VramWr32 — write 32 bits to VRAM at given offset
+// =============================================================================
+Function.GPU_VramWr32 {
+    Input: index: Integer
+    Input: offset: Integer
+    Input: value: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+        vram = Dereference(Add(state, GPUBarField.VRAM_PTR))
+        IfCondition EqualTo(vram, 0) ThenBlock: { ReturnValue(0) }
+        // 32-bit aligned VRAM write + WC drain
+        StoreValue(Add(vram, offset), value, "dword")
+        InlineAsm["0f ae f8"]
+    }
+}
+
+// =============================================================================
+// GPU_BAR_Unbind — unbind the kernel driver from a GPU
+// Writes the PCI BDF to /sys/bus/pci/devices/.../driver/unbind
+// Returns 1 on success, 0 on failure.
+// WARNING: This releases the GPU from the kernel driver (radeon/amdgpu).
+// The display will stop working if this GPU was driving a monitor.
+// =============================================================================
+Function.GPU_BAR_Unbind {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Already unbound?
+        IfCondition EqualTo(Dereference(Add(state, GPUBarField.UNBOUND)), 1) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // Build path: /sys/bus/pci/devices/0000:BB:SS.F/driver/unbind
+        path = GPU_BAR_BuildResPath(index, "driver/unbind")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+
+        // Open for writing
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDWR, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] Cannot open driver/unbind (no driver bound?)\n")
+            // Not necessarily an error — driver may not be bound
+            StoreValue(Add(state, GPUBarField.UNBOUND), 1)
+            ReturnValue(1)
+        }
+
+        // Write the BDF string: "0000:BB:SS.F"
+        dev = GPU_GetDevice(index)
+        bus  = Dereference(Add(dev, GPUDevField.PCI_BUS))
+        slot_v = Dereference(Add(dev, GPUDevField.PCI_SLOT))
+        func_v = Dereference(Add(dev, GPUDevField.PCI_FUNC))
+
+        bdf = Allocate(16)
+        // "0000:"
+        SetByte(bdf, 0, 48)  // '0'
+        SetByte(bdf, 1, 48)
+        SetByte(bdf, 2, 48)
+        SetByte(bdf, 3, 48)
+        SetByte(bdf, 4, 58)  // ':'
+
+        // Bus hex
+        hi = Divide(bus, 16)
+        lo = Modulo(bus, 16)
+        IfCondition LessThan(hi, 10) ThenBlock: { SetByte(bdf, 5, Add(48, hi)) }
+        ElseBlock: { SetByte(bdf, 5, Add(87, hi)) }
+        IfCondition LessThan(lo, 10) ThenBlock: { SetByte(bdf, 6, Add(48, lo)) }
+        ElseBlock: { SetByte(bdf, 6, Add(87, lo)) }
+
+        SetByte(bdf, 7, 58)  // ':'
+
+        // Slot hex
+        hi = Divide(slot_v, 16)
+        lo = Modulo(slot_v, 16)
+        IfCondition LessThan(hi, 10) ThenBlock: { SetByte(bdf, 8, Add(48, hi)) }
+        ElseBlock: { SetByte(bdf, 8, Add(87, hi)) }
+        IfCondition LessThan(lo, 10) ThenBlock: { SetByte(bdf, 9, Add(48, lo)) }
+        ElseBlock: { SetByte(bdf, 9, Add(87, lo)) }
+
+        SetByte(bdf, 10, 46)  // '.'
+        SetByte(bdf, 11, Add(48, func_v))
+        SetByte(bdf, 12, 0)
+
+        // Write BDF to unbind file
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, bdf, 12, 0, 0)
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        Deallocate(bdf, 16)
+
+        IfCondition GreaterThan(nw, 0) ThenBlock: {
+            StoreValue(Add(state, GPUBarField.UNBOUND), 1)
+            PrintMessage("[AMDGPU BAR] Driver unbound for GPU ")
+            PrintNumber(index)
+            PrintMessage("\n")
+            ReturnValue(1)
+        }
+
+        PrintMessage("[AMDGPU BAR] Unbind write failed\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_IsMMIOMapped — check if MMIO is mapped for a GPU
+// =============================================================================
+Function.GPU_BAR_IsMMIOMapped {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(state, GPUBarField.MMIO_PTR)), 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_IsVRAMMapped — check if VRAM is mapped for a GPU
+// =============================================================================
+Function.GPU_BAR_IsVRAMMapped {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(state, GPUBarField.VRAM_PTR)), 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}

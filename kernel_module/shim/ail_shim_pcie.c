@@ -30,46 +30,66 @@
 #include "ail_shim_pcie.h"
 
 /* =====================================================================
- * PCI Driver — MX3 device table and probe/remove
+ * PCI Driver — load-time selectable vendor/device via module params
  * ===================================================================== */
 
-#define MX3_VENDOR_ID   0x1FE9
-#define MX3_DEVICE_ID   0x0100
+static unsigned int pci_vendor = 0;
+static unsigned int pci_device = 0;
+module_param(pci_vendor, uint, 0444);
+module_param(pci_device, uint, 0444);
+MODULE_PARM_DESC(pci_vendor, "PCI vendor ID to bind (e.g. 0x1002 for AMD)");
+MODULE_PARM_DESC(pci_device, "PCI device ID to bind (e.g. 0x683d for Cape Verde)");
 
-static const struct pci_device_id mx3_pci_ids[] = {
-	{ PCI_DEVICE(MX3_VENDOR_ID, MX3_DEVICE_ID) },
-	{ 0, }
-};
-MODULE_DEVICE_TABLE(pci, mx3_pci_ids);
+/*
+ * Two-entry table: slot [0] filled at init from module params,
+ * slot [1] is the mandatory zero terminator.
+ */
+static struct pci_device_id ail_pci_ids[2];
 
-static int mx3_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+static int ail_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	printk(KERN_INFO "ail_shim_pcie: probe vendor=%04x dev=%04x\n",
 	       pdev->vendor, pdev->device);
-	return ail_mx3_probe(pdev);
+	return ail_pci_dev_probe(pdev);
 }
 
-static void mx3_remove(struct pci_dev *pdev)
+static void ail_pci_remove_one(struct pci_dev *pdev)
 {
-	printk(KERN_INFO "ail_shim_pcie: remove\n");
-	ail_mx3_remove(pdev);
+	printk(KERN_INFO "ail_shim_pcie: remove vendor=%04x dev=%04x\n",
+	       pdev->vendor, pdev->device);
+	ail_pci_dev_remove(pdev);
 }
 
-static struct pci_driver mx3_pci_driver = {
-	.name     = "memx_ailang_pcie",
-	.id_table = mx3_pci_ids,
-	.probe    = mx3_probe,
-	.remove   = mx3_remove,
+static struct pci_driver ail_pci_driver = {
+	.name     = "ailang_pcie",
+	.id_table = ail_pci_ids,
+	.probe    = ail_pci_probe,
+	.remove   = ail_pci_remove_one,
 };
 
 int ail_pci_register_driver(void)
 {
-	return pci_register_driver(&mx3_pci_driver);
+	if (!pci_vendor || !pci_device) {
+		printk(KERN_ERR "ail_shim_pcie: pci_vendor and pci_device must be set\n");
+		return -EINVAL;
+	}
+
+	/* Populate the device table from module parameters */
+	memset(ail_pci_ids, 0, sizeof(ail_pci_ids));
+	ail_pci_ids[0].vendor    = pci_vendor;
+	ail_pci_ids[0].device    = pci_device;
+	ail_pci_ids[0].subvendor = PCI_ANY_ID;
+	ail_pci_ids[0].subdevice = PCI_ANY_ID;
+
+	printk(KERN_INFO "ail_shim_pcie: registering for %04x:%04x\n",
+	       pci_vendor, pci_device);
+
+	return pci_register_driver(&ail_pci_driver);
 }
 
 void ail_pci_unregister_driver(void)
 {
-	pci_unregister_driver(&mx3_pci_driver);
+	pci_unregister_driver(&ail_pci_driver);
 }
 
 /* =====================================================================
@@ -195,20 +215,20 @@ int ail_pci_irq_vector(void *pdev, int nr)
  * Per-channel IRQ context. The C-side ISR calls complete() on the
  * embedded completion. Ailang waits via ail_wait_for_completion_timeout.
  */
-#define MX3_MAX_IRQ_CHANNELS 34
+#define AIL_MAX_IRQ_CHANNELS 34
 
-struct mx3_irq_channel {
+struct ail_irq_channel {
 	struct completion comp;
 	int channel_index;
 };
 
 /* Global array of IRQ channels — indexed by channel_index */
-static struct mx3_irq_channel mx3_irq_channels[MX3_MAX_IRQ_CHANNELS];
-static int mx3_irq_channels_inited;
+static struct ail_irq_channel ail_irq_channels[AIL_MAX_IRQ_CHANNELS];
+static int ail_irq_channels_inited;
 
-static irqreturn_t mx3_isr_stub(int irq, void *dev_id)
+static irqreturn_t ail_isr_stub(int irq, void *dev_id)
 {
-	struct mx3_irq_channel *ch = (struct mx3_irq_channel *)dev_id;
+	struct ail_irq_channel *ch = (struct ail_irq_channel *)dev_id;
 
 	complete(&ch->comp);
 	return IRQ_HANDLED;
@@ -216,37 +236,37 @@ static irqreturn_t mx3_isr_stub(int irq, void *dev_id)
 
 int ail_request_irq_stub(int irq, int channel_index, void *dev_ctx)
 {
-	struct mx3_irq_channel *ch;
+	struct ail_irq_channel *ch;
 	char name[32];
 
-	if (channel_index < 0 || channel_index >= MX3_MAX_IRQ_CHANNELS)
+	if (channel_index < 0 || channel_index >= AIL_MAX_IRQ_CHANNELS)
 		return -EINVAL;
 
-	if (!mx3_irq_channels_inited) {
+	if (!ail_irq_channels_inited) {
 		int i;
-		for (i = 0; i < MX3_MAX_IRQ_CHANNELS; i++) {
-			init_completion(&mx3_irq_channels[i].comp);
-			mx3_irq_channels[i].channel_index = i;
+		for (i = 0; i < AIL_MAX_IRQ_CHANNELS; i++) {
+			init_completion(&ail_irq_channels[i].comp);
+			ail_irq_channels[i].channel_index = i;
 		}
-		mx3_irq_channels_inited = 1;
+		ail_irq_channels_inited = 1;
 	}
 
-	ch = &mx3_irq_channels[channel_index];
+	ch = &ail_irq_channels[channel_index];
 	reinit_completion(&ch->comp);
 
-	snprintf(name, sizeof(name), "memx_ailang_%d", channel_index);
-	return request_irq(irq, mx3_isr_stub, 0, name, ch);
+	snprintf(name, sizeof(name), "ailang_pci_%d", channel_index);
+	return request_irq(irq, ail_isr_stub, 0, name, ch);
 }
 
 void ail_free_irq(int irq, void *dev_ctx)
 {
 	/*
 	 * dev_ctx was originally passed as the completion pointer,
-	 * but for free_irq we need the mx3_irq_channel that was
+	 * but for free_irq we need the ail_irq_channel that was
 	 * used as dev_id. We search by matching.
 	 */
 	int i;
-	for (i = 0; i < MX3_MAX_IRQ_CHANNELS; i++) {
+	for (i = 0; i < AIL_MAX_IRQ_CHANNELS; i++) {
 		/* Free all channels registered on this IRQ */
 		/* In practice, each IRQ maps to exactly one channel */
 	}
@@ -496,7 +516,7 @@ static int ailang_fops_open(struct inode *inode, struct file *filp)
 		container_of(inode->i_cdev, struct ailang_chardev, cdev);
 
 	filp->private_data = acd;
-	return ail_mx3_open(acd->drvdata, minor);
+	return ail_pci_dev_open(acd->drvdata, minor);
 }
 
 static ssize_t ailang_fops_write(struct file *filp, const char __user *ubuf,
@@ -504,7 +524,7 @@ static ssize_t ailang_fops_write(struct file *filp, const char __user *ubuf,
 {
 	struct ailang_chardev *acd = filp->private_data;
 
-	return (ssize_t)ail_mx3_write(acd->drvdata, ubuf, count);
+	return (ssize_t)ail_pci_dev_write(acd->drvdata, ubuf, count);
 }
 
 static ssize_t ailang_fops_read(struct file *filp, char __user *ubuf,
@@ -512,7 +532,7 @@ static ssize_t ailang_fops_read(struct file *filp, char __user *ubuf,
 {
 	struct ailang_chardev *acd = filp->private_data;
 
-	return (ssize_t)ail_mx3_read(acd->drvdata, ubuf, count);
+	return (ssize_t)ail_pci_dev_read(acd->drvdata, ubuf, count);
 }
 
 static long ailang_fops_ioctl(struct file *filp, unsigned int cmd,
@@ -520,7 +540,7 @@ static long ailang_fops_ioctl(struct file *filp, unsigned int cmd,
 {
 	struct ailang_chardev *acd = filp->private_data;
 
-	return ail_mx3_ioctl(acd->drvdata, cmd, arg);
+	return ail_pci_dev_ioctl(acd->drvdata, cmd, arg);
 }
 
 static int ailang_fops_release(struct inode *inode, struct file *filp)
@@ -528,7 +548,7 @@ static int ailang_fops_release(struct inode *inode, struct file *filp)
 	struct ailang_chardev *acd = filp->private_data;
 	unsigned int minor = iminor(inode);
 
-	return ail_mx3_release(acd->drvdata, minor);
+	return ail_pci_dev_release(acd->drvdata, minor);
 }
 
 static const struct file_operations ailang_fops = {

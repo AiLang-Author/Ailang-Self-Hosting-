@@ -1,0 +1,241 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AccelMX3.ailang
+//
+// Backend 1: Memryx MX3 userspace MMIO accelerator.
+// Init: mmap BARs, derive XFLOW/SRAM pointers, load firmware, alloc staging.
+// Submit: write data to SRAM, issue FW command, poll completion, read result.
+// Shutdown: unmap BARs, free staging.
+//
+// USAGE
+//   LibraryImport.Accel.AccelMX3
+
+LibraryImport.Accel.AccelMX3BAR
+LibraryImport.Accel.AccelMX3FW
+LibraryImport.Drivers.Memryx.MX3Constants
+LibraryImport.ThreadTrampoline
+
+// =============================================================================
+// AccelMX3_Init — map BARs, derive pointers, load firmware, alloc staging
+// Returns 0 on success, negative on failure.
+// =============================================================================
+Function.AccelMX3_Init {
+    Output: Integer
+    Body: {
+        // Step 1: mmap all three BARs
+        rc = MX3BAR_MapAll()
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            PrintMessage("[AccelMX3] BAR mapping failed\n")
+            ReturnValue(rc)
+        }
+
+        // Step 2: Derive XFLOW and SRAM pointers for BAR mode THREE_BAR_16MB (3)
+        // From MX3.DetectBarMode: xflow_conf_bar=2, sram_bar_idx=4
+        // So: XFLOW config = resource2 = bar2_mmap, XFLOW vbuf = resource0 = bar0_mmap
+        //     SRAM = resource4 = bar4_mmap
+        MX3User.xflow_conf = MX3User.bar2_mmap
+        MX3User.xflow_vbuf = MX3User.bar0_mmap
+        MX3User.sram       = MX3User.bar4_mmap
+
+        PrintMessage("[AccelMX3] XFLOW conf=")
+        PrintNumber(MX3User.xflow_conf)
+        PrintMessage(" vbuf=")
+        PrintNumber(MX3User.xflow_vbuf)
+        PrintMessage(" SRAM=")
+        PrintNumber(MX3User.sram)
+        PrintMessage("\n")
+
+        // Step 3: Load firmware
+        rc = AccelMX3FW_Load()
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            PrintMessage("[AccelMX3] firmware load failed: ")
+            PrintNumber(rc)
+            PrintMessage("\n")
+            // Without firmware, device can't process ops — return error
+            // so HAL falls back to CPU.
+            MX3BAR_UnmapAll()
+            ReturnValue(rc)
+        }
+
+        // Step 5: Allocate poll scratch (single page for barrier trick)
+        ps_prot = BitwiseOr(MmapProt.READ, MmapProt.WRITE)
+        ps_flags = BitwiseOr(MmapFlag.PRIVATE, MmapFlag.ANONYMOUS)
+        ps_buf = SystemCall(SysNr.MMAP, 0, 4096, ps_prot, ps_flags, -1, 0)
+        IfCondition GreaterThan(ps_buf, 0) ThenBlock: {
+            MX3User.poll_scratch = ps_buf
+        }
+
+        // Step 6: Query hardware info via firmware command
+        // Send GET_HW_INFO command to firmware
+        IfCondition EqualTo(MX3User.fw_loaded, 1) ThenBlock: {
+            // Write FW_CMD opcode to command buffer
+            MX3BAR_SramWrite32(MX3_ADDR.FW_CMD_BASE, MX3_FW_CMD.GET_HW_INFO)
+            // Trigger FW_CMD software IRQ on chip 0
+            MX3BAR_TriggerIRQ(0, MX3_SW_IRQ.FW_CMD)
+
+            // Poll for response (simple timeout)
+            hw_poll = 0
+            WhileLoop LessThan(hw_poll, 1000) {
+                hw_ack = MX3BAR_SramRead32(MX3_ADDR.FW_CMD_BASE)
+                IfCondition NotEqual(hw_ack, MX3_FW_CMD.GET_HW_INFO) ThenBlock: {
+                    hw_poll = 1000
+                } ElseBlock: {
+                    StoreValue(MX3User.poll_scratch, hw_ack)
+                    hw_poll = Add(hw_poll, 1)
+                }
+            }
+
+            // Parse response: num_chips at FW_CMD_BASE+68, generation at +136
+            hw_nchips = MX3BAR_SramRead32(Add(MX3_ADDR.FW_CMD_BASE, 68))
+            hw_gen = MX3BAR_SramRead32(Add(MX3_ADDR.FW_CMD_BASE, 136))
+            IfCondition GreaterThan(hw_nchips, 0) ThenBlock: {
+                MX3User.num_chips = hw_nchips
+            }
+            PrintMessage("[AccelMX3] chips=")
+            PrintNumber(MX3User.num_chips)
+            PrintMessage(" gen=")
+            PrintNumber(hw_gen)
+            PrintMessage("\n")
+        }
+
+        MX3User.initialized = 1
+        PrintMessage("[AccelMX3] initialized\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// AccelMX3_Shutdown — unmap BARs, free staging
+// =============================================================================
+Function.AccelMX3_Shutdown {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(MX3User.initialized, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Free poll scratch
+        IfCondition NotEqual(MX3User.poll_scratch, 0) ThenBlock: {
+            SystemCall(SysNr.MUNMAP, MX3User.poll_scratch, 4096)
+            MX3User.poll_scratch = 0
+        }
+
+        // Unmap BARs
+        MX3BAR_UnmapAll()
+
+        MX3User.xflow_conf = 0
+        MX3User.xflow_vbuf = 0
+        MX3User.sram = 0
+        MX3User.initialized = 0
+        MX3User.fw_loaded = 0
+
+        PrintMessage("[AccelMX3] shutdown\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// AccelMX3_Submit — submit a matrix op to the MX3
+//
+// Submission path:
+//   1. Copy matrix + vector data to device SRAM via BAR writes
+//   2. Write command descriptor to FW command buffer
+//   3. Trigger FW_CMD software IRQ
+//   4. Poll completion register (pure memory read, no syscall)
+//   5. Read result back from SRAM
+//
+// Returns 0 on success, negative on error.
+// =============================================================================
+Function.AccelMX3_Submit {
+    Output: Integer
+    Body: {
+        mx_op   = HALOp.op
+        mx_dst  = HALOp.dst
+        mx_mat  = HALOp.mat
+        mx_vec  = HALOp.vec
+        mx_rows = HALOp.rows
+        mx_cols = HALOp.cols
+
+        // SRAM data region starts at DATA_SRAM_OFFS (0x40000 into SRAM)
+        // Layout: [matrix | vector | result]
+        mx_mat_bytes = Multiply(Multiply(mx_rows, mx_cols), 8)
+        mx_vec_len = mx_cols
+        IfCondition EqualTo(mx_op, 2) ThenBlock: {
+            mx_vec_len = mx_rows
+        }
+        mx_vec_bytes = Multiply(mx_vec_len, 8)
+
+        // Step 1: Write matrix to SRAM
+        MX3BAR_WriteBlock(MX3_SRAM.DATA_SRAM_OFFS, mx_mat, mx_mat_bytes)
+
+        // Step 2: Write vector to SRAM (after matrix)
+        mx_vec_sram = Add(MX3_SRAM.DATA_SRAM_OFFS, mx_mat_bytes)
+        MX3BAR_WriteBlock(mx_vec_sram, mx_vec, mx_vec_bytes)
+
+        // For OuterAccum, also write vec2
+        IfCondition EqualTo(mx_op, 3) ThenBlock: {
+            mx_v2 = HALOp.vec2
+            mx_v2_bytes = Multiply(mx_cols, 8)
+            mx_v2_sram = Add(mx_vec_sram, mx_vec_bytes)
+            MX3BAR_WriteBlock(mx_v2_sram, mx_v2, mx_v2_bytes)
+            // Result area starts after vec2
+            mx_dst_sram = Add(mx_v2_sram, mx_v2_bytes)
+        } ElseBlock: {
+            mx_dst_sram = Add(mx_vec_sram, mx_vec_bytes)
+        }
+
+        // Step 3: Write command descriptor to FW command buffer
+        // Format: [op, rows, cols, mat_sram_ofs, vec_sram_ofs, dst_sram_ofs]
+        mx_cmd = MX3_ADDR.FW_CMD_BASE
+        MX3BAR_SramWrite32(mx_cmd, mx_op)
+        MX3BAR_SramWrite32(Add(mx_cmd, 4), mx_rows)
+        MX3BAR_SramWrite32(Add(mx_cmd, 8), mx_cols)
+        MX3BAR_SramWrite32(Add(mx_cmd, 12), MX3_SRAM.DATA_SRAM_OFFS)
+        MX3BAR_SramWrite32(Add(mx_cmd, 16), mx_vec_sram)
+        MX3BAR_SramWrite32(Add(mx_cmd, 20), mx_dst_sram)
+
+        // Step 4: Trigger execution
+        MX3BAR_TriggerIRQ(0, MX3_SW_IRQ.FW_CMD)
+
+        // Step 5: Poll completion — pure memory read, no syscall
+        // Poll the status word (at cmd + CQ_STATUS_OFFSET) until non-zero
+        mx_status_addr = Add(MX3_ADDR.FW_CMD_BASE, Multiply(MX3_ADMIN.CQ_STATUS_OFFSET, 4))
+        mx_timeout = 0
+        mx_poll = MX3BAR_SramRead32(mx_status_addr)
+        WhileLoop EqualTo(mx_poll, 0) {
+            // Memory barrier via scratch write (prevents compiler hoist)
+            StoreValue(MX3User.poll_scratch, mx_poll)
+            mx_poll = MX3BAR_SramRead32(mx_status_addr)
+            mx_timeout = Add(mx_timeout, 1)
+            IfCondition GreaterThan(mx_timeout, 10000000) ThenBlock: {
+                PrintMessage("[AccelMX3] submit timeout\n")
+                HALOp.status = -1
+                ReturnValue(-5)
+            }
+        }
+
+        // Step 6: Read result back from SRAM
+        IfCondition EqualTo(mx_op, 1) ThenBlock: {
+            // MatVecMul: result is [rows] elements
+            mx_res_bytes = Multiply(mx_rows, 8)
+            MX3BAR_ReadBlock(mx_dst_sram, mx_dst, mx_res_bytes)
+        }
+        IfCondition EqualTo(mx_op, 2) ThenBlock: {
+            // MatTVecMul: result is [cols] elements
+            mx_res_bytes = Multiply(mx_cols, 8)
+            MX3BAR_ReadBlock(mx_dst_sram, mx_dst, mx_res_bytes)
+        }
+        IfCondition EqualTo(mx_op, 3) ThenBlock: {
+            // OuterAccum: result is [rows x cols] matrix
+            mx_res_bytes = Multiply(Multiply(mx_rows, mx_cols), 8)
+            MX3BAR_ReadBlock(mx_dst_sram, mx_dst, mx_res_bytes)
+        }
+
+        // Clear command status for next submission
+        MX3BAR_SramWrite32(mx_status_addr, 0)
+
+        HALOp.status = 2
+        ReturnValue(0)
+    }
+}

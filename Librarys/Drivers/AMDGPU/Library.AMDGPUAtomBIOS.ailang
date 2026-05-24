@@ -1,0 +1,555 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUAtomBIOS.ailang
+//
+// AtomBIOS VBIOS ROM parser for AMD GPUs.
+// Reads the VBIOS ROM via sysfs (/sys/bus/pci/devices/.../rom),
+// parses the ATOM ROM header, PCIR header, FirmwareInfo table,
+// and VRAM_UsageByFirmware to extract hardware configuration.
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+//
+// DEPENDS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+//
+// ATOMBIOS ROM Layout (for reference):
+//   [0x0000] 0x55 0xAA — VGA ROM signature
+//   [0x0018] u16 — pointer to PCIR header
+//   [0x0048] u16 — pointer to ATOM_ROM_HEADER
+//
+//   ATOM_ROM_HEADER:
+//     +0x00 u16: size
+//     +0x02 u8:  format revision
+//     +0x03 u8:  content revision
+//     +0x04 [4]: "ATOM" magic
+//     +0x10 u16: boot message offset
+//     +0x18 u16: subsystem vendor ID
+//     +0x1A u16: subsystem device ID
+//     +0x20 u16: master data table offset
+//
+//   Master Data Table:
+//     +0x00 u16: size
+//     +0x04+i*2: offsets to individual data tables (i=0..N)
+//     Table #4 = FirmwareInfo, #11 = VRAM_UsageByFirmware
+//
+//   FirmwareInfo v2.2:
+//     +0x08 u32: default engine clock (10kHz units)
+//     +0x0C u32: default memory clock (10kHz units)
+//     +0x20 u32: max pixel PLL output (10kHz)
+//     +0x28 u32: default display engine clock (10kHz)
+//     +0x2E u16: boot VDDC (mV)
+//     +0x4E u16: boot VDDCI (mV)
+//     +0x50 u16: firmware capability flags
+//     +0x52 u16: core reference clock (10kHz)
+//     +0x54 u16: memory reference clock (10kHz)
+//     +0x58 u8:  memory module ID
+
+// =============================================================================
+// ATOMBIOS CONSTANTS
+// =============================================================================
+FixedPool.AtomConst {
+    "ROM_SIG":        Initialize=43605   // 0xAA55 little-endian
+    "ROM_MAX_SIZE":   Initialize=131072  // 128KB max ROM
+    "PCIR_PTR_OFF":   Initialize=24      // 0x18 — pointer to PCIR
+    "ATOM_PTR_OFF":   Initialize=72      // 0x48 — pointer to ATOM header
+    "ATOM_MAGIC":     Initialize=1297371713 // 'ATOM' = 0x4D4F5441
+}
+
+// Offsets within ATOM_ROM_HEADER
+FixedPool.AtomHdr {
+    "SIZE":             Initialize=0    // u16
+    "FMT_REV":          Initialize=2    // u8
+    "CNT_REV":          Initialize=3    // u8
+    "MAGIC":            Initialize=4    // [4] = "ATOM"
+    "RUNTIME_SEG":      Initialize=8    // u16
+    "PMI_OFF":          Initialize=10   // u16
+    "CONFIG_OFF":       Initialize=12   // u16
+    "BOOTMSG_OFF":      Initialize=16   // u16
+    "SUB_VENDOR":       Initialize=24   // u16
+    "SUB_DEVICE":       Initialize=26   // u16
+    "PCI_INFO_OFF":     Initialize=28   // u16
+    "MASTER_CMD_OFF":   Initialize=30   // u16
+    "MASTER_DATA_OFF":  Initialize=32   // u16
+}
+
+// Data table indices in Master Data Table
+FixedPool.AtomDataIdx {
+    "STANDARD_VESA":     Initialize=3
+    "FIRMWARE_INFO":     Initialize=4
+    "GPIO_I2C":          Initialize=10
+    "VRAM_USAGE":        Initialize=11
+    "GPIO_PIN_LUT":      Initialize=12
+    "POWERPLAY":         Initialize=15
+    "OBJECT_HEADER":     Initialize=22
+    "ASIC_INTERNAL_SS":  Initialize=26
+    "VRAM_INFO":         Initialize=28
+    "VOLTAGE_OBJECT":    Initialize=32
+}
+
+// Offsets within FirmwareInfo v2.2
+FixedPool.AtomFW {
+    "FW_REV":            Initialize=4     // u32
+    "DEF_ENGINE_CLK":    Initialize=8     // u32, 10kHz units
+    "DEF_MEMORY_CLK":    Initialize=12    // u32, 10kHz units
+    "MAX_PIX_PLL":       Initialize=32    // u32, 10kHz units
+    "DEF_DISP_ENG":      Initialize=40    // u32, 10kHz units
+    "BOOT_VDDC":         Initialize=46    // u16, mV
+    "BOOT_VDDCI":        Initialize=78    // u16, mV
+    "FW_CAPABILITY":     Initialize=80    // u16
+    "CORE_REF_CLK":      Initialize=82    // u16, 10kHz
+    "MEM_REF_CLK":       Initialize=84    // u16, 10kHz
+    "MEM_MODULE_ID":     Initialize=88    // u8
+}
+
+// Offsets within VRAM_UsageByFirmware
+FixedPool.AtomVU {
+    "START_ADDR":        Initialize=4     // u32
+    "FW_USE_KB":         Initialize=8     // u16
+    "DRV_USE_KB":        Initialize=10    // u16
+}
+
+// =============================================================================
+// PER-GPU ATOMBIOS STATE
+// =============================================================================
+// Stored per-GPU in a flat array similar to GPUBarState.
+// Each entry is 128 bytes holding parsed values.
+FixedPool.AtomField {
+    "ROM_PTR":           Initialize=0     // pointer to allocated ROM buffer
+    "ROM_SIZE":          Initialize=8     // actual ROM size
+    "ATOM_HDR_OFF":      Initialize=16    // offset of ATOM_ROM_HEADER in ROM
+    "DATA_TBL_OFF":      Initialize=24    // offset of Master Data Table
+    "FW_INFO_OFF":       Initialize=32    // offset of FirmwareInfo table
+    "DEF_ENGINE_CLK":    Initialize=40    // default engine clock (kHz)
+    "DEF_MEMORY_CLK":    Initialize=48    // default memory clock (kHz)
+    "BOOT_VDDC":         Initialize=56    // boot voltage (mV)
+    "BOOT_VDDCI":        Initialize=64    // boot VDDCI (mV)
+    "CORE_REF_CLK":      Initialize=72    // reference clock (kHz)
+    "MEM_REF_CLK":       Initialize=80    // mem reference clock (kHz)
+    "FW_CAPABILITY":     Initialize=88    // firmware capability flags
+    "FW_VRAM_START":     Initialize=96    // firmware VRAM start address
+    "FW_VRAM_KB":        Initialize=104   // firmware VRAM usage in KB
+    "PARSED":            Initialize=112   // 1 if successfully parsed
+    "ENTRY_SIZE":        Initialize=128   // bytes per entry
+}
+
+FixedPool.AtomState {
+    "entries":           Initialize=0, CanChange=True   // ptr to allocated buffer
+    "initialized":       Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// AtomBIOS_Init — allocate state array
+// =============================================================================
+Function.AtomBIOS_Init {
+    Body: {
+        IfCondition EqualTo(AtomState.initialized, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        total = Multiply(GPUBarConst.MAX_GPUS, AtomField.ENTRY_SIZE)
+        AtomState.entries = Allocate(total)
+        MemorySet(AtomState.entries, 0, total)
+        AtomState.initialized = 1
+    }
+}
+
+// =============================================================================
+// AtomBIOS_GetEntry — return pointer to atom state for GPU index
+// =============================================================================
+Function.AtomBIOS_GetEntry {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(index, GPUBarConst.MAX_GPUS) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Add(AtomState.entries, Multiply(index, AtomField.ENTRY_SIZE)))
+    }
+}
+
+// =============================================================================
+// AtomBIOS_ReadU16 — read little-endian u16 from ROM buffer
+// =============================================================================
+Function.AtomBIOS_ReadU16 {
+    Input: rom_ptr: Address
+    Input: offset: Integer
+    Output: Integer
+    Body: {
+        lo = GetByte(rom_ptr, offset)
+        hi = GetByte(rom_ptr, Add(offset, 1))
+        ReturnValue(Add(lo, Multiply(hi, 256)))
+    }
+}
+
+// =============================================================================
+// AtomBIOS_ReadU32 — read little-endian u32 from ROM buffer
+// =============================================================================
+Function.AtomBIOS_ReadU32 {
+    Input: rom_ptr: Address
+    Input: offset: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(rom_ptr, offset)
+        b1 = GetByte(rom_ptr, Add(offset, 1))
+        b2 = GetByte(rom_ptr, Add(offset, 2))
+        b3 = GetByte(rom_ptr, Add(offset, 3))
+        ReturnValue(Add(b0, Add(Multiply(b1, 256), Add(Multiply(b2, 65536), Multiply(b3, 16777216)))))
+    }
+}
+
+// =============================================================================
+// AtomBIOS_EnableROM — write "1" to sysfs rom file to enable reading
+// =============================================================================
+Function.AtomBIOS_EnableROM {
+    Input: index: Integer
+    Input: enable: Integer
+    Output: Integer
+    Body: {
+        path = GPU_BAR_BuildResPath(index, "rom")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDWR, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+
+        buf = GPUDiscState.read_buf
+        IfCondition EqualTo(enable, 1) ThenBlock: {
+            SetByte(buf, 0, 49)    // '1'
+            SetByte(buf, 1, 0)
+        }
+        ElseBlock: {
+            SetByte(buf, 0, 48)    // '0'
+            SetByte(buf, 1, 0)
+        }
+        SystemCall(GPUSys.SYS_WRITE, fd, buf, 1, 0, 0)
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// AtomBIOS_LoadROM — read the entire VBIOS ROM from sysfs
+// Enables the rom file, reads up to 128KB, then disables.
+// Returns the ROM buffer pointer, or 0 on failure.
+// =============================================================================
+Function.AtomBIOS_LoadROM {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        AtomBIOS_Init()
+        entry = AtomBIOS_GetEntry(index)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        // Check if already loaded
+        existing = Dereference(Add(entry, AtomField.ROM_PTR))
+        IfCondition NotEqual(existing, 0) ThenBlock: {
+            ReturnValue(existing)
+        }
+
+        // Enable ROM read
+        rc = AtomBIOS_EnableROM(index, 1)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("AtomBIOS: Failed to enable ROM read\n")
+            ReturnValue(0)
+        }
+
+        // Open the ROM file
+        path = GPU_BAR_BuildResPath(index, "rom")
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            AtomBIOS_EnableROM(index, 0)
+            PrintMessage("AtomBIOS: Failed to open ROM file\n")
+            ReturnValue(0)
+        }
+
+        // Allocate ROM buffer
+        rom_buf = Allocate(AtomConst.ROM_MAX_SIZE)
+        MemorySet(rom_buf, 0, AtomConst.ROM_MAX_SIZE)
+
+        // Read ROM in one shot (kernel handles chunked reads internally)
+        total_read = 0
+        WhileLoop LessThan(total_read, AtomConst.ROM_MAX_SIZE) {
+            chunk = SystemCall(GPUSys.SYS_READ, fd, Add(rom_buf, total_read), Subtract(AtomConst.ROM_MAX_SIZE, total_read), 0, 0)
+            IfCondition LessEqual(chunk, 0) ThenBlock: {
+                ExitLoop
+            }
+            total_read = Add(total_read, chunk)
+        }
+
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        // Disable ROM read
+        AtomBIOS_EnableROM(index, 0)
+
+        // Validate ROM signature: 0x55 0xAA
+        IfCondition LessThan(total_read, 256) ThenBlock: {
+            PrintMessage("AtomBIOS: ROM too small\n")
+            Deallocate(rom_buf, AtomConst.ROM_MAX_SIZE)
+            ReturnValue(0)
+        }
+
+        sig = AtomBIOS_ReadU16(rom_buf, 0)
+        IfCondition NotEqual(sig, AtomConst.ROM_SIG) ThenBlock: {
+            PrintMessage("AtomBIOS: Bad ROM signature\n")
+            Deallocate(rom_buf, AtomConst.ROM_MAX_SIZE)
+            ReturnValue(0)
+        }
+
+        // Store in state
+        StoreValue(Add(entry, AtomField.ROM_PTR), rom_buf)
+        StoreValue(Add(entry, AtomField.ROM_SIZE), total_read)
+
+        PrintMessage("AtomBIOS: Loaded ")
+        PrintNumber(total_read)
+        PrintMessage(" bytes from VBIOS ROM\n")
+
+        ReturnValue(rom_buf)
+    }
+}
+
+// =============================================================================
+// AtomBIOS_Parse — parse the loaded ROM and extract key hardware data
+// Must call AtomBIOS_LoadROM first.
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.AtomBIOS_Parse {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        entry = AtomBIOS_GetEntry(index)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        rom = Dereference(Add(entry, AtomField.ROM_PTR))
+        IfCondition EqualTo(rom, 0) ThenBlock: {
+            PrintMessage("AtomBIOS: ROM not loaded\n")
+            ReturnValue(0)
+        }
+
+        rom_size = Dereference(Add(entry, AtomField.ROM_SIZE))
+
+        // ---- Find ATOM_ROM_HEADER ----
+        atom_off = AtomBIOS_ReadU16(rom, AtomConst.ATOM_PTR_OFF)
+        IfCondition GreaterEqual(atom_off, rom_size) ThenBlock: {
+            PrintMessage("AtomBIOS: ATOM header offset out of range\n")
+            ReturnValue(0)
+        }
+
+        // Verify "ATOM" magic at atom_off + 4
+        a0 = GetByte(rom, Add(atom_off, 4))
+        a1 = GetByte(rom, Add(atom_off, 5))
+        a2 = GetByte(rom, Add(atom_off, 6))
+        a3 = GetByte(rom, Add(atom_off, 7))
+        // 'A'=65, 'T'=84, 'O'=79, 'M'=77
+        IfCondition NotEqual(a0, 65) ThenBlock: {
+            PrintMessage("AtomBIOS: ATOM magic not found\n")
+            ReturnValue(0)
+        }
+        IfCondition NotEqual(a1, 84) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(a2, 79) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(a3, 77) ThenBlock: { ReturnValue(0) }
+
+        StoreValue(Add(entry, AtomField.ATOM_HDR_OFF), atom_off)
+
+        // ---- Master Data Table ----
+        data_tbl_off = AtomBIOS_ReadU16(rom, Add(atom_off, AtomHdr.MASTER_DATA_OFF))
+        IfCondition GreaterEqual(data_tbl_off, rom_size) ThenBlock: {
+            PrintMessage("AtomBIOS: Data table offset out of range\n")
+            ReturnValue(0)
+        }
+        StoreValue(Add(entry, AtomField.DATA_TBL_OFF), data_tbl_off)
+
+        // ---- FirmwareInfo Table ----
+        // Table offsets start at data_tbl_off + 4, each u16
+        // FirmwareInfo is index 4: offset at data_tbl_off + 4 + 4*2
+        fw_off = AtomBIOS_ReadU16(rom, Add(data_tbl_off, Add(4, Multiply(AtomDataIdx.FIRMWARE_INFO, 2))))
+        IfCondition EqualTo(fw_off, 0) ThenBlock: {
+            PrintMessage("AtomBIOS: FirmwareInfo table not present\n")
+            ReturnValue(0)
+        }
+        StoreValue(Add(entry, AtomField.FW_INFO_OFF), fw_off)
+
+        // Parse FirmwareInfo fields
+        // Default engine clock: u32 at fw_off+8, units are 10kHz
+        def_eng_10k = AtomBIOS_ReadU32(rom, Add(fw_off, AtomFW.DEF_ENGINE_CLK))
+        def_eng_khz = Multiply(def_eng_10k, 10)
+        StoreValue(Add(entry, AtomField.DEF_ENGINE_CLK), def_eng_khz)
+
+        // Default memory clock
+        def_mem_10k = AtomBIOS_ReadU32(rom, Add(fw_off, AtomFW.DEF_MEMORY_CLK))
+        def_mem_khz = Multiply(def_mem_10k, 10)
+        StoreValue(Add(entry, AtomField.DEF_MEMORY_CLK), def_mem_khz)
+
+        // Boot VDDC
+        boot_vddc = AtomBIOS_ReadU16(rom, Add(fw_off, AtomFW.BOOT_VDDC))
+        StoreValue(Add(entry, AtomField.BOOT_VDDC), boot_vddc)
+
+        // Boot VDDCI
+        boot_vddci = AtomBIOS_ReadU16(rom, Add(fw_off, AtomFW.BOOT_VDDCI))
+        StoreValue(Add(entry, AtomField.BOOT_VDDCI), boot_vddci)
+
+        // Core reference clock
+        ref_10k = AtomBIOS_ReadU16(rom, Add(fw_off, AtomFW.CORE_REF_CLK))
+        ref_khz = Multiply(ref_10k, 10)
+        StoreValue(Add(entry, AtomField.CORE_REF_CLK), ref_khz)
+
+        // Memory reference clock
+        mref_10k = AtomBIOS_ReadU16(rom, Add(fw_off, AtomFW.MEM_REF_CLK))
+        mref_khz = Multiply(mref_10k, 10)
+        StoreValue(Add(entry, AtomField.MEM_REF_CLK), mref_khz)
+
+        // Firmware capability
+        fw_cap = AtomBIOS_ReadU16(rom, Add(fw_off, AtomFW.FW_CAPABILITY))
+        StoreValue(Add(entry, AtomField.FW_CAPABILITY), fw_cap)
+
+        // ---- VRAM_UsageByFirmware Table ----
+        vu_off = AtomBIOS_ReadU16(rom, Add(data_tbl_off, Add(4, Multiply(AtomDataIdx.VRAM_USAGE, 2))))
+        IfCondition NotEqual(vu_off, 0) ThenBlock: {
+            fw_vram_start = AtomBIOS_ReadU32(rom, Add(vu_off, AtomVU.START_ADDR))
+            fw_vram_kb = AtomBIOS_ReadU16(rom, Add(vu_off, AtomVU.FW_USE_KB))
+            StoreValue(Add(entry, AtomField.FW_VRAM_START), fw_vram_start)
+            StoreValue(Add(entry, AtomField.FW_VRAM_KB), fw_vram_kb)
+        }
+
+        StoreValue(Add(entry, AtomField.PARSED), 1)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// AtomBIOS_PrintInfo — print parsed AtomBIOS information for a GPU
+// =============================================================================
+Function.AtomBIOS_PrintInfo {
+    Input: index: Integer
+    Body: {
+        entry = AtomBIOS_GetEntry(index)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        parsed = Dereference(Add(entry, AtomField.PARSED))
+        IfCondition NotEqual(parsed, 1) ThenBlock: {
+            PrintMessage("AtomBIOS: Not parsed yet\n")
+            ReturnValue(0)
+        }
+
+        rom = Dereference(Add(entry, AtomField.ROM_PTR))
+        rom_size = Dereference(Add(entry, AtomField.ROM_SIZE))
+        atom_off = Dereference(Add(entry, AtomField.ATOM_HDR_OFF))
+
+        PrintMessage("--- AtomBIOS Info ---\n")
+
+        PrintMessage("  ROM size:        ")
+        PrintNumber(rom_size)
+        PrintMessage(" bytes\n")
+
+        // Print boot message from ROM
+        bootmsg_off = AtomBIOS_ReadU16(rom, Add(atom_off, AtomHdr.BOOTMSG_OFF))
+        IfCondition NotEqual(bootmsg_off, 0) ThenBlock: {
+            PrintMessage("  BIOS message:    ")
+            // Print up to 60 chars of boot message
+            i = 0
+            WhileLoop LessThan(i, 60) {
+                ch = GetByte(rom, Add(bootmsg_off, i))
+                IfCondition EqualTo(ch, 0) ThenBlock: { ExitLoop }
+                IfCondition LessThan(ch, 32) ThenBlock: { ExitLoop }
+                PrintChar(ch)
+                i = Add(i, 1)
+            }
+            PrintMessage("\n")
+        }
+
+        // SubVendor / SubDevice from ATOM header
+        sub_v = AtomBIOS_ReadU16(rom, Add(atom_off, AtomHdr.SUB_VENDOR))
+        sub_d = AtomBIOS_ReadU16(rom, Add(atom_off, AtomHdr.SUB_DEVICE))
+        PrintMessage("  Sub Vendor:      ")
+        PrintHex(sub_v)
+        PrintMessage("\n")
+        PrintMessage("  Sub Device:      ")
+        PrintHex(sub_d)
+        PrintMessage("\n")
+
+        // Clocks
+        def_eng = Dereference(Add(entry, AtomField.DEF_ENGINE_CLK))
+        def_mem = Dereference(Add(entry, AtomField.DEF_MEMORY_CLK))
+        ref_clk = Dereference(Add(entry, AtomField.CORE_REF_CLK))
+        mref_clk = Dereference(Add(entry, AtomField.MEM_REF_CLK))
+
+        PrintMessage("  Ref Clock:       ")
+        PrintNumber(Divide(ref_clk, 1000))
+        PrintMessage(" MHz\n")
+
+        PrintMessage("  Mem Ref Clock:   ")
+        PrintNumber(Divide(mref_clk, 1000))
+        PrintMessage(" MHz\n")
+
+        PrintMessage("  Def Engine:      ")
+        PrintNumber(Divide(def_eng, 1000))
+        PrintMessage(" MHz\n")
+
+        PrintMessage("  Def Memory:      ")
+        PrintNumber(Divide(def_mem, 1000))
+        PrintMessage(" MHz\n")
+
+        // Voltages
+        boot_vddc = Dereference(Add(entry, AtomField.BOOT_VDDC))
+        boot_vddci = Dereference(Add(entry, AtomField.BOOT_VDDCI))
+        PrintMessage("  Boot VDDC:       ")
+        PrintNumber(boot_vddc)
+        PrintMessage(" mV\n")
+        PrintMessage("  Boot VDDCI:      ")
+        PrintNumber(boot_vddci)
+        PrintMessage(" mV\n")
+
+        // FW capability
+        fw_cap = Dereference(Add(entry, AtomField.FW_CAPABILITY))
+        PrintMessage("  FW Capability:   ")
+        PrintHex(fw_cap)
+        PrintMessage("\n")
+
+        // VRAM firmware usage
+        fw_vram_start = Dereference(Add(entry, AtomField.FW_VRAM_START))
+        fw_vram_kb = Dereference(Add(entry, AtomField.FW_VRAM_KB))
+        PrintMessage("  FW VRAM start:   ")
+        PrintHex(fw_vram_start)
+        PrintMessage("\n")
+        PrintMessage("  FW VRAM usage:   ")
+        PrintNumber(fw_vram_kb)
+        PrintMessage(" KB\n")
+    }
+}
+
+// =============================================================================
+// AtomBIOS_GetField — get a parsed field value for a GPU
+// Returns the stored value, or 0 if not parsed.
+// field_offset: one of the AtomField constants (e.g., AtomField.DEF_ENGINE_CLK)
+// =============================================================================
+Function.AtomBIOS_GetField {
+    Input: index: Integer
+    Input: field_offset: Integer
+    Output: Integer
+    Body: {
+        entry = AtomBIOS_GetEntry(index)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        parsed = Dereference(Add(entry, AtomField.PARSED))
+        IfCondition NotEqual(parsed, 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, field_offset)))
+    }
+}
+
+// =============================================================================
+// AtomBIOS_FreeROM — deallocate the ROM buffer
+// =============================================================================
+Function.AtomBIOS_FreeROM {
+    Input: index: Integer
+    Body: {
+        entry = AtomBIOS_GetEntry(index)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        rom = Dereference(Add(entry, AtomField.ROM_PTR))
+        IfCondition NotEqual(rom, 0) ThenBlock: {
+            Deallocate(rom, AtomConst.ROM_MAX_SIZE)
+            StoreValue(Add(entry, AtomField.ROM_PTR), 0)
+            StoreValue(Add(entry, AtomField.ROM_SIZE), 0)
+            StoreValue(Add(entry, AtomField.PARSED), 0)
+        }
+    }
+}

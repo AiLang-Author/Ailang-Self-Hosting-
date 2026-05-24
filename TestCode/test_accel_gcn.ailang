@@ -1,0 +1,203 @@
+// test_accel_gcn.ailang — end-to-end GPU compute test via AccelGCN
+// Build: ./ailang.x TestCode/test_accel_gcn.ailang test_accel_gcn.x
+// Run:   sudo ./test_accel_gcn.x   (needs GPU access, radeon must be unbound)
+//
+// Tests:
+//   1. AccelGCN_Init (discover GPU, map BARs, setup ring, ring test)
+//   2. Build CIR kernel: dst[gid] = src[gid] + 42
+//   3. Lower to GCN machine code
+//   4. Upload to VRAM
+//   5. Write test data to VRAM src buffer
+//   6. Dispatch on GPU
+//   7. Read back dst buffer and verify results
+//   8. Shutdown
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.GCNEnc
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+LibraryImport.Accel.HAL
+LibraryImport.Accel.AccelGCN
+
+SubRoutine.Main {
+    PrintMessage("=== AccelGCN End-to-End Test ===\n\n")
+
+    // --- Step 1: Initialize AccelGCN ---
+    PrintMessage("--- Step 1: AccelGCN Init ---\n")
+    rc = AccelGCN_Init()
+    PrintMessage("AccelGCN_Init: ")
+    PrintNumber(rc)
+    PrintMessage("\n\n")
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("FATAL: AccelGCN init failed, aborting\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // --- Step 2: Build CIR kernel ---
+    // Kernel: dst[global_id] = src[global_id] + 42
+    // 64 elements, 64 threads per workgroup, 1 workgroup
+    PrintMessage("--- Step 2: Build CIR Kernel ---\n")
+    rc = CIR_Begin()
+
+    rc = CIR_SetGroupSize(64, 1, 1)
+    rc = CIR_SetGrid(1, 1, 1)
+
+    // Bind buffers:
+    //   Slot 0 = src (read):  64 elements * 4 bytes = 256 bytes at data offset 0
+    //   Slot 1 = dst (write): 64 elements * 4 bytes = 256 bytes at data offset 256
+    rc = CIR_BindBuffer(0, 0, 256, 4, 1)
+    rc = CIR_BindBuffer(1, 256, 256, 4, 2)
+
+    // Allocate virtual registers
+    v_gid   = CIR_AllocVReg()
+    v_val   = CIR_AllocVReg()
+    v_const = CIR_AllocVReg()
+    v_sum   = CIR_AllocVReg()
+
+    // Emit IR:
+    //   v_gid   = GLOBAL_ID_X
+    //   v_val   = LOAD_BUF(slot=0, index=v_gid)
+    //   WAITCNT(0, 0, 0)
+    //   v_const = 42
+    //   v_sum   = v_val + v_const
+    //   STORE_BUF(v_sum, slot=1, index=v_gid)
+    //   WAITCNT(0, 0, 0)
+    //   END_PGM
+    rc = CIR_Op_GlobalIdX(v_gid)
+    rc = CIR_Op_LoadBuf(v_val, 0, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_LoadConst(v_const, 42)
+    rc = CIR_Op_AddU32(v_sum, v_val, v_const)
+    rc = CIR_Op_StoreBuf(v_sum, 1, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_EndPgm()
+
+    n_insns = CIR_End()
+    PrintMessage("Instructions: ")
+    PrintNumber(n_insns)
+    PrintMessage("\n")
+
+    // Dump IR
+    rc = CIR_Dump()
+    PrintMessage("\n")
+
+    // --- Step 3: Lower to GCN ---
+    PrintMessage("--- Step 3: Lower to GCN ---\n")
+    mc_bytes = CIR_Lower_GCN()
+    PrintMessage("Machine code: ")
+    PrintNumber(mc_bytes)
+    PrintMessage(" bytes\n\n")
+
+    // --- Step 4: Write test data to VRAM src buffer ---
+    // Fill src[i] = i for i in 0..63
+    PrintMessage("--- Step 4: Write test data ---\n")
+    host_src = Allocate(256)
+    i = 0
+    WhileLoop LessThan(i, 64) {
+        // Write 32-bit value i at offset i*4 (little-endian)
+        off = Multiply(i, 4)
+        SetByte(host_src, off, BitwiseAnd(i, 255))
+        SetByte(host_src, Add(off, 1), BitwiseAnd(RightShift(i, 8), 255))
+        SetByte(host_src, Add(off, 2), 0)
+        SetByte(host_src, Add(off, 3), 0)
+        i = Add(i, 1)
+    }
+    discard_wr = AccelGCN_VramWrite(0, host_src, 256)
+    PrintMessage("Wrote 256 bytes to VRAM data area (src)\n")
+
+    // Zero the dst buffer
+    host_dst = Allocate(256)
+    MemorySet(host_dst, 0, 256)
+    discard_wr2 = AccelGCN_VramWrite(256, host_dst, 256)
+    PrintMessage("Zeroed 256 bytes at VRAM data area (dst)\n\n")
+
+    // --- Step 5: Dispatch ---
+    PrintMessage("--- Step 5: Dispatch ---\n")
+    rc = AccelGCN_Dispatch()
+    PrintMessage("AccelGCN_Dispatch: ")
+    PrintNumber(rc)
+    PrintMessage("\n\n")
+
+    // --- Step 6: Read back and verify ---
+    PrintMessage("--- Step 6: Read back + verify ---\n")
+    discard_rd = AccelGCN_VramRead(256, host_dst, 256)
+
+    errors = 0
+    i = 0
+    WhileLoop LessThan(i, 64) {
+        off = Multiply(i, 4)
+        b0 = GetByte(host_dst, off)
+        b1 = GetByte(host_dst, Add(off, 1))
+        b2 = GetByte(host_dst, Add(off, 2))
+        b3 = GetByte(host_dst, Add(off, 3))
+        got = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+        expected = Add(i, 42)
+
+        // Print first 8 and last 2 for spot-check
+        IfCondition LessThan(i, 8) ThenBlock: {
+            PrintMessage("  dst[")
+            PrintNumber(i)
+            PrintMessage("] = ")
+            PrintNumber(got)
+            PrintMessage(" (expect ")
+            PrintNumber(expected)
+            PrintMessage(")")
+            IfCondition EqualTo(got, expected) ThenBlock: {
+                PrintMessage(" OK")
+            }
+            IfCondition NotEqual(got, expected) ThenBlock: {
+                PrintMessage(" FAIL")
+            }
+            PrintMessage("\n")
+        }
+        IfCondition GreaterThan(i, 61) ThenBlock: {
+            PrintMessage("  dst[")
+            PrintNumber(i)
+            PrintMessage("] = ")
+            PrintNumber(got)
+            PrintMessage(" (expect ")
+            PrintNumber(expected)
+            PrintMessage(")")
+            IfCondition EqualTo(got, expected) ThenBlock: {
+                PrintMessage(" OK")
+            }
+            IfCondition NotEqual(got, expected) ThenBlock: {
+                PrintMessage(" FAIL")
+            }
+            PrintMessage("\n")
+        }
+
+        IfCondition NotEqual(got, expected) ThenBlock: {
+            errors = Add(errors, 1)
+        }
+        i = Add(i, 1)
+    }
+
+    PrintMessage("\nResults: ")
+    PrintNumber(Subtract(64, errors))
+    PrintMessage("/64 correct, ")
+    PrintNumber(errors)
+    PrintMessage(" errors\n")
+
+    IfCondition EqualTo(errors, 0) ThenBlock: {
+        PrintMessage("\n*** ALL PASS ***\n")
+    }
+    IfCondition GreaterThan(errors, 0) ThenBlock: {
+        PrintMessage("\n*** FAILURES DETECTED ***\n")
+    }
+
+    // --- Cleanup ---
+    PrintMessage("\n--- Cleanup ---\n")
+    Deallocate(host_src, 256)
+    Deallocate(host_dst, 256)
+    discard_shut = AccelGCN_Shutdown()
+
+    PrintMessage("\n=== AccelGCN Test Complete ===\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)
