@@ -1,0 +1,205 @@
+// test_loop_minimal.ailang — minimal dispatch loop, no proactive CP reset
+// Tests whether odd/even dispatch pattern comes from CP reset or dispatch itself.
+// Also adds a "dummy dispatch" before the real one to test if it's a warm-up issue.
+// Build: ./ailang.x TestCode/test_loop_minimal.ailang /tmp/test_loop_min.x
+// Run:   /tmp/test_loop_min.x 2>&1 | tee loop_min.txt
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.GCNEnc
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+LibraryImport.Accel.HAL
+LibraryImport.Accel.AccelGCN
+
+SubRoutine.Main {
+    PrintMessage("=== Minimal Loop: no proactive reset, 20 iters ===\n\n")
+
+    num_elems = 64
+    buf_bytes = 256
+    src_off = 0
+    dst_off = 256
+    max_iters = 20
+
+    rc = AccelGCN_Init()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("FATAL: init failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // Build kernel: dst[gid] = src[gid] + 42
+    rc = CIR_Begin()
+    rc = CIR_SetGroupSize(64, 1, 1)
+    rc = CIR_SetGrid(1, 1, 1)
+    rc = CIR_BindBuffer(0, src_off, buf_bytes, 4, 1)
+    rc = CIR_BindBuffer(1, dst_off, buf_bytes, 4, 2)
+
+    v_gid = CIR_AllocVReg()
+    v_val = CIR_AllocVReg()
+    v_42  = CIR_AllocVReg()
+    v_sum = CIR_AllocVReg()
+
+    rc = CIR_Op_GlobalIdX(v_gid)
+    rc = CIR_Op_LoadBuf(v_val, 0, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_LoadConst(v_42, 42)
+    rc = CIR_Op_AddU32(v_sum, v_val, v_42)
+    rc = CIR_Op_StoreBuf(v_sum, 1, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_EndPgm()
+
+    n_insns = CIR_End()
+    mc_bytes = CIR_Lower_GCN()
+    PrintMessage("Kernel ready\n\n")
+
+    host_src = Allocate(buf_bytes)
+    host_dst = Allocate(buf_bytes)
+    gpu = AccelGCNCfg.gpu_idx
+
+    // ================================================================
+    // TEST 1: Normal loop — just dispatch 20 times, no CP reset at all
+    // (The proactive reset at fence>=10 in AccelGCN_Dispatch will fire,
+    //  so we monitor fence_val to see when it happens)
+    // ================================================================
+    PrintMessage("--- TEST 1: Normal dispatches (AccelGCN_Dispatch) ---\n")
+    iter = 0
+    WhileLoop LessThan(iter, max_iters) {
+        // Fill src
+        i = 0
+        WhileLoop LessThan(i, num_elems) {
+            off = Multiply(i, 4)
+            val = Add(Multiply(iter, 64), i)
+            SetByte(host_src, off, BitwiseAnd(val, 255))
+            SetByte(host_src, Add(off, 1), BitwiseAnd(RightShift(val, 8), 255))
+            SetByte(host_src, Add(off, 2), BitwiseAnd(RightShift(val, 16), 255))
+            SetByte(host_src, Add(off, 3), BitwiseAnd(RightShift(val, 24), 255))
+            i = Add(i, 1)
+        }
+        discard = AccelGCN_VramWrite(src_off, host_src, buf_bytes)
+
+        // Zero dst in VRAM
+        MemorySet(host_dst, 0, buf_bytes)
+        discard = AccelGCN_VramWrite(dst_off, host_dst, buf_bytes)
+
+        // Read fence_val BEFORE dispatch
+        ring = AccelGCNCfg.ring_idx
+        fence_before = Dereference(Add(PM4_GetRing(ring), RingField.FENCE_VAL))
+
+        // Dispatch
+        rc = AccelGCN_Dispatch()
+
+        // Read fence_val AFTER dispatch
+        fence_after = Dereference(Add(PM4_GetRing(ring), RingField.FENCE_VAL))
+
+        // Direct 32-bit read for ground truth
+        val_direct = GPU_VramRd32(gpu, Add(AccelGCNCfg.data_vram, dst_off))
+
+        // VramRead for comparison
+        MemorySet(host_dst, 0, buf_bytes)
+        discard = AccelGCN_VramRead(dst_off, host_dst, buf_bytes)
+        b0 = GetByte(host_dst, 0)
+        b1 = GetByte(host_dst, 1)
+        b2 = GetByte(host_dst, 2)
+        b3 = GetByte(host_dst, 3)
+        val_read = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+
+        expected = Add(Multiply(iter, 64), 42)
+
+        PrintMessage("iter ")
+        PrintNumber(iter)
+        PrintMessage(": fence ")
+        PrintNumber(fence_before)
+        PrintMessage("->")
+        PrintNumber(fence_after)
+        PrintMessage("  direct=")
+        PrintNumber(val_direct)
+        PrintMessage("  read=")
+        PrintNumber(val_read)
+        PrintMessage("  exp=")
+        PrintNumber(expected)
+        IfCondition EqualTo(val_direct, expected) ThenBlock: {
+            IfCondition EqualTo(val_read, expected) ThenBlock: {
+                PrintMessage("  PASS")
+            }
+            IfCondition NotEqual(val_read, expected) ThenBlock: {
+                PrintMessage("  READ_FAIL")
+            }
+        }
+        IfCondition NotEqual(val_direct, expected) ThenBlock: {
+            PrintMessage("  GPU_FAIL")
+        }
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("  rc=")
+            PrintNumber(rc)
+        }
+        PrintMessage("\n")
+
+        iter = Add(iter, 1)
+    }
+
+    // ================================================================
+    // TEST 2: Double-dispatch — dispatch twice per iter, check both
+    // If first dispatch always fails but second always passes, it's
+    // a warm-up/cache issue.
+    // ================================================================
+    PrintMessage("\n--- TEST 2: Double dispatch per iteration ---\n")
+
+    // Force CP recovery to start fresh
+    discard = AccelGCN_RecoverCP()
+    PrintMessage("CP reset done, starting fresh\n")
+
+    iter = 0
+    WhileLoop LessThan(iter, 10) {
+        // Fill src
+        i = 0
+        WhileLoop LessThan(i, num_elems) {
+            off = Multiply(i, 4)
+            val = Add(Multiply(iter, 64), Add(i, 10000))
+            SetByte(host_src, off, BitwiseAnd(val, 255))
+            SetByte(host_src, Add(off, 1), BitwiseAnd(RightShift(val, 8), 255))
+            SetByte(host_src, Add(off, 2), BitwiseAnd(RightShift(val, 16), 255))
+            SetByte(host_src, Add(off, 3), BitwiseAnd(RightShift(val, 24), 255))
+            i = Add(i, 1)
+        }
+        discard = AccelGCN_VramWrite(src_off, host_src, buf_bytes)
+        MemorySet(host_dst, 0, buf_bytes)
+        discard = AccelGCN_VramWrite(dst_off, host_dst, buf_bytes)
+
+        // FIRST dispatch
+        rc1 = AccelGCN_Dispatch()
+        val1 = GPU_VramRd32(gpu, Add(AccelGCNCfg.data_vram, dst_off))
+
+        // SECOND dispatch (same data, no re-upload)
+        rc2 = AccelGCN_Dispatch()
+        val2 = GPU_VramRd32(gpu, Add(AccelGCNCfg.data_vram, dst_off))
+
+        expected = Add(Multiply(iter, 64), Add(42, 10000))
+
+        PrintMessage("iter ")
+        PrintNumber(iter)
+        PrintMessage(": exp=")
+        PrintNumber(expected)
+        PrintMessage("  1st=")
+        PrintNumber(val1)
+        IfCondition EqualTo(val1, expected) ThenBlock: { PrintMessage(" OK") }
+        IfCondition NotEqual(val1, expected) ThenBlock: { PrintMessage(" FAIL") }
+        PrintMessage("  2nd=")
+        PrintNumber(val2)
+        IfCondition EqualTo(val2, expected) ThenBlock: { PrintMessage(" OK") }
+        IfCondition NotEqual(val2, expected) ThenBlock: { PrintMessage(" FAIL") }
+        PrintMessage("\n")
+
+        iter = Add(iter, 1)
+    }
+
+    Deallocate(host_src, buf_bytes)
+    Deallocate(host_dst, buf_bytes)
+    discard = AccelGCN_Shutdown()
+    PrintMessage("\n=== Done ===\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)

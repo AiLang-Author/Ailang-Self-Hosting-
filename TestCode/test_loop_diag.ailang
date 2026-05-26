@@ -1,0 +1,153 @@
+// test_loop_diag.ailang — diagnostic loop: 3 readback methods compared
+// For each iteration, reads back via:
+//   (A) AccelGCN_VramRead (existing path)
+//   (B) GPU_VramRd32 (direct DWORD BAR read)
+//   (C) raw BAR byte read
+// Reports which methods see the correct data vs zeros.
+// Build: ./ailang.x TestCode/test_loop_diag.ailang /tmp/test_loop_diag.x
+// Run:   /tmp/test_loop_diag.x 2>&1 | tee loop_diag.txt
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.GCNEnc
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+LibraryImport.Accel.HAL
+LibraryImport.Accel.AccelGCN
+
+SubRoutine.Main {
+    PrintMessage("=== Loop Diagnostic: 3 readback methods ===\n")
+    PrintMessage("20 iterations, comparing VramRead vs VramRd32 vs raw BAR\n\n")
+
+    num_elems = 64
+    buf_bytes = 256
+    src_off = 0
+    dst_off = 256
+    max_iters = 20
+
+    rc = AccelGCN_Init()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("FATAL: init failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // Build kernel once: dst[gid] = src[gid] + 42
+    rc = CIR_Begin()
+    rc = CIR_SetGroupSize(64, 1, 1)
+    rc = CIR_SetGrid(1, 1, 1)
+    rc = CIR_BindBuffer(0, src_off, buf_bytes, 4, 1)
+    rc = CIR_BindBuffer(1, dst_off, buf_bytes, 4, 2)
+
+    v_gid = CIR_AllocVReg()
+    v_val = CIR_AllocVReg()
+    v_42  = CIR_AllocVReg()
+    v_sum = CIR_AllocVReg()
+
+    rc = CIR_Op_GlobalIdX(v_gid)
+    rc = CIR_Op_LoadBuf(v_val, 0, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_LoadConst(v_42, 42)
+    rc = CIR_Op_AddU32(v_sum, v_val, v_42)
+    rc = CIR_Op_StoreBuf(v_sum, 1, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_EndPgm()
+
+    n_insns = CIR_End()
+    mc_bytes = CIR_Lower_GCN()
+    PrintMessage("Kernel ready\n\n")
+
+    host_src = Allocate(buf_bytes)
+    host_dst = Allocate(buf_bytes)
+    gpu = AccelGCNCfg.gpu_idx
+
+    iter = 0
+    WhileLoop LessThan(iter, max_iters) {
+        // Fill src: src[i] = iter*64 + i
+        i = 0
+        WhileLoop LessThan(i, num_elems) {
+            off = Multiply(i, 4)
+            val = Add(Multiply(iter, 64), i)
+            SetByte(host_src, off, BitwiseAnd(val, 255))
+            SetByte(host_src, Add(off, 1), BitwiseAnd(RightShift(val, 8), 255))
+            SetByte(host_src, Add(off, 2), BitwiseAnd(RightShift(val, 16), 255))
+            SetByte(host_src, Add(off, 3), BitwiseAnd(RightShift(val, 24), 255))
+            i = Add(i, 1)
+        }
+        discard = AccelGCN_VramWrite(src_off, host_src, buf_bytes)
+
+        // Zero dst
+        MemorySet(host_dst, 0, buf_bytes)
+        discard = AccelGCN_VramWrite(dst_off, host_dst, buf_bytes)
+
+        // Dispatch
+        rc = AccelGCN_Dispatch()
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("iter ")
+            PrintNumber(iter)
+            PrintMessage(": DISPATCH FAILED rc=")
+            PrintNumber(rc)
+            PrintMessage("\n")
+            iter = Add(iter, 1)
+            ContinueLoop
+        }
+
+        // Expected value at dst[0]
+        exp0 = Add(Multiply(iter, 64), 42)
+
+        // --- Method A: AccelGCN_VramRead ---
+        MemorySet(host_dst, 0, buf_bytes)
+        discard = AccelGCN_VramRead(dst_off, host_dst, buf_bytes)
+        a0 = GetByte(host_dst, 0)
+        a1 = GetByte(host_dst, 1)
+        a2 = GetByte(host_dst, 2)
+        a3 = GetByte(host_dst, 3)
+        val_a = BitwiseOr(a0, BitwiseOr(LeftShift(a1, 8), BitwiseOr(LeftShift(a2, 16), LeftShift(a3, 24))))
+
+        // --- Method B: GPU_VramRd32 (direct DWORD read) ---
+        data_base = AccelGCNCfg.data_vram
+        val_b = GPU_VramRd32(gpu, Add(data_base, dst_off))
+
+        // --- Method C: raw BAR byte read ---
+        vram_state = GPU_BAR_GetState(gpu)
+        vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
+        raw_addr = Add(vram_ptr, Add(data_base, dst_off))
+        InlineAsm["0f ae f0"]
+        c0 = GetByte(raw_addr, 0)
+        c1 = GetByte(raw_addr, 1)
+        c2 = GetByte(raw_addr, 2)
+        c3 = GetByte(raw_addr, 3)
+        val_c = BitwiseOr(c0, BitwiseOr(LeftShift(c1, 8), BitwiseOr(LeftShift(c2, 16), LeftShift(c3, 24))))
+
+        // Report
+        PrintMessage("iter ")
+        PrintNumber(iter)
+        PrintMessage(": exp=")
+        PrintNumber(exp0)
+        PrintMessage("  A(VramRead)=")
+        PrintNumber(val_a)
+        IfCondition EqualTo(val_a, exp0) ThenBlock: { PrintMessage(" OK") }
+        IfCondition NotEqual(val_a, exp0) ThenBlock: { PrintMessage(" FAIL") }
+        PrintMessage("  B(Rd32)=")
+        PrintNumber(val_b)
+        IfCondition EqualTo(val_b, exp0) ThenBlock: { PrintMessage(" OK") }
+        IfCondition NotEqual(val_b, exp0) ThenBlock: { PrintMessage(" FAIL") }
+        PrintMessage("  C(raw)=")
+        PrintNumber(val_c)
+        IfCondition EqualTo(val_c, exp0) ThenBlock: { PrintMessage(" OK") }
+        IfCondition NotEqual(val_c, exp0) ThenBlock: { PrintMessage(" FAIL") }
+        PrintMessage("\n")
+
+        iter = Add(iter, 1)
+    }
+
+    Deallocate(host_src, buf_bytes)
+    Deallocate(host_dst, buf_bytes)
+    discard = AccelGCN_Shutdown()
+    PrintMessage("=== Done ===\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)

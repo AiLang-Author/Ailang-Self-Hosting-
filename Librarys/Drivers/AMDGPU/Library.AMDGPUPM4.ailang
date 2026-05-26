@@ -1530,6 +1530,35 @@ Function.PM4_EmitDispatchDirect {
 }
 
 // -----------------------------------------------------------------------------
+// PM4_EmitWriteDataVRAM — emit a WRITE_DATA packet that writes a single DWORD
+//   directly to VRAM (DST_SEL=5 = memory async/direct, WR_CONFIRM=1).
+//   Used for fence writeback — CPU polls with GPU_VramRd32.
+// -----------------------------------------------------------------------------
+Function.PM4_EmitWriteDataVRAM {
+    Input: ring_idx: Integer
+    Input: vram_off: Integer
+    Input: value: Integer
+    Body: {
+        gpu_addr = PM4_VramToGPU(vram_off)
+        addr_lo  = BitwiseAnd(gpu_addr, 4294967292)
+        addr_hi  = BitwiseAnd(RightShift(gpu_addr, 32), 255)
+
+        // header: WRITE_DATA, 4 body dwords, shader_type=0
+        hdr = PM4_BuildHeader(PM4.OP_WRITE_DATA, 4, 0)
+        PM4_EmitDWord(ring_idx, hdr)
+
+        // control: DST_SEL=5 (memory async direct) = 5<<8 = 1280
+        //          WR_CONFIRM=1 (bit 20) = 1048576
+        //          ENGINE_SEL=0 (ME)
+        control = Add(1280, 1048576)
+        PM4_EmitDWord(ring_idx, control)
+        PM4_EmitDWord(ring_idx, addr_lo)
+        PM4_EmitDWord(ring_idx, addr_hi)
+        PM4_EmitDWord(ring_idx, value)
+    }
+}
+
+// -----------------------------------------------------------------------------
 // PM4_EmitEventWriteEOP — emit an EVENT_WRITE_EOP for fence/completion
 //   addr_lo, addr_hi: GPU address for fence writeback (VRAM offset)
 //   value: fence value to write
@@ -1670,26 +1699,22 @@ Function.PM4_SubmitCompute {
         //   EVENT_WRITE_EOP for fence (7 DWORDs)
         //   SET_CONFIG_REG + SURFACE_SYNC before fence (8 DWORDs)
         //   Total: ~78 DWORDs
-        needed = 84   // 2x(COHER_CNTL2+SURFACE_SYNC) + 4xUSER_DATA + PGM + RSRC1/2 + LIMITS + THREAD_MGMT(2) + TMPRING + 3xSTART + 3xTHREAD + DISPATCH(5) + CS_PARTIAL_FLUSH(2) + EOP
+        needed = 90   // COHER_CNTL2+SURFACE_SYNC(I$/K$) + 4xUSER_DATA + PGM + RSRC1/2 + LIMITS + THREAD_MGMT(2) + TMPRING + 3xSTART + 3xTHREAD + DISPATCH(5) + CS_PARTIAL_FLUSH(2) + COHER_CNTL2+SURFACE_SYNC(TC/TCL1)(8) + SET_CONFIG_REG(3) + WRITE_DATA(5)
 
         IfCondition EqualTo(PM4_WaitForSpace(ring_idx, needed), 0) ThenBlock: {
             PrintMessage("[PM4] No ring space for compute dispatch\n")
             ReturnValue(0)
         }
 
-        // --- Cache invalidation (CRITICAL for correctness) ---
-        // The CPU writes shader code and data to VRAM via BAR, but the GPU
-        // caches (I$, K$, TC L1/L2) may hold stale data.  Without this
-        // invalidation the shader fetches garbage instructions and/or reads
-        // stale source data, producing silent wrong results (all zeros).
-        // The kernel (si.c line ~3430) emits this before every IB.
+        // --- Cache invalidation ---
+        // Invalidate I$ + K$ only.  No TC/TCL1 — GLC=1 on all shader MUBUF
+        // ops bypasses L2.  TC_ACTION_ENA livelocks after ~25 dispatches
+        // when display CRTCs are active (scanout refills evicted L2 lines).
+        // This SURFACE_SYNC also acts as PFP→ME barrier for SET_SH_REG.
         PM4_EmitSetConfigReg(ring_idx, PM4.CP_COHER_CNTL2, 0)
-        coher = Add(PM4.SH_ICACHE_ACTION_ENA,
-                Add(PM4.SH_KCACHE_ACTION_ENA,
-                Add(PM4.TC_ACTION_ENA,
-                    PM4.TCL1_ACTION_ENA)))
+        coher = Add(PM4.SH_ICACHE_ACTION_ENA, PM4.SH_KCACHE_ACTION_ENA)
         PM4_EmitSurfaceSync(ring_idx, coher, 4294967295, 0, 10)
-        PrintMessage("[DBG:PM4] SURFACE_SYNC: cache invalidate emitted\n")
+        PrintMessage("[DBG:PM4] SURFACE_SYNC: I$/K$ invalidate emitted\n")
 
         // --- Build shader program address ---
         // PGM_LO = bits [31:0] of (addr >> 8)
@@ -1805,38 +1830,45 @@ Function.PM4_SubmitCompute {
         PM4_EmitDWord(ring_idx, cs_flush_hdr)
         PM4_EmitDWord(ring_idx, Add(7, Multiply(4, 256)))
 
-        // --- Flush caches before fence (kernel si_fence_ring_emit pattern) ---
-        // Now that CS_PARTIAL_FLUSH guarantees all shader stores are in L2,
-        // flush the L2 (TC) to VRAM so CPU BAR0 reads see the data.
+        // --- L2 writeback+invalidate ---
+        // Shader BUFFER_STORE_DWORD writes land in GPU L2 (TCC).  GLC=1 forces
+        // write-through to L2, but NOT through to DRAM.  CPU reads DRAM via the
+        // BAR, so without an L2 flush the CPU sees stale data.
+        // On SI (GFX6) TC_ACTION_ENA performs writeback+invalidate of L2.
+        // TCL1_ACTION_ENA invalidates the per-CU L1 scalar/vector caches.
+        // This must come AFTER CS_PARTIAL_FLUSH (waves retired, stores in L2)
+        // and BEFORE the fence (so data is in DRAM when CPU reads after fence).
         PM4_EmitSetConfigReg(ring_idx, PM4.CP_COHER_CNTL2, 0)
-        coher2 = Add(PM4.SH_ICACHE_ACTION_ENA,
-                 Add(PM4.SH_KCACHE_ACTION_ENA,
-                 Add(PM4.TC_ACTION_ENA,
-                     PM4.TCL1_ACTION_ENA)))
-        PM4_EmitSurfaceSync(ring_idx, coher2, 4294967295, 0, 10)
+        coher_l2 = Add(PM4.TCL1_ACTION_ENA, PM4.TC_ACTION_ENA)
+        PM4_EmitSurfaceSync(ring_idx, coher_l2, 4294967295, 0, 10)
 
-        // --- Fence via EVENT_WRITE_EOP ---
+        // --- Fence ---
+        // CS_PARTIAL_FLUSH guarantees wavefronts retired, SURFACE_SYNC above
+        // guarantees L2 flushed to DRAM.
+        //
+        // Two fence paths emitted for A/B comparison:
+        //   A) SET_CONFIG_REG(SCRATCH_REG0) — MMIO poll (may read 0 if GRBM block is dark)
+        //   B) WRITE_DATA to VRAM fence slot — GPU_VramRd32 poll (same path as RPTR wb)
         gpu = Dereference(Add(ring, RingField.GPU_INDEX))
         fence_val = Add(Dereference(Add(ring, RingField.FENCE_VAL)), 1)
         StoreValue(Add(ring, RingField.FENCE_VAL), fence_val)
         fence_off = Dereference(Add(ring, RingField.FENCE_WB_OFF))
-        // Zero the fence location in VRAM before dispatch so we don't see stale data
-        GPU_VramWr32(gpu, fence_off, 0)
-        fence_gpu_addr = PM4_VramToGPU(fence_off)
-        fence_addr_lo = BitwiseAnd(fence_gpu_addr, 4294967295)
-        fence_addr_hi = BitwiseAnd(RightShift(fence_gpu_addr, 32), 255)
-        PrintMessage("[DBG:PM4] fence: vram_off=0x")
-        PrintHex(fence_off)
-        PrintMessage(" gpu=0x")
-        PrintHex(fence_gpu_addr)
-        PrintMessage(" lo=0x")
-        PrintHex(fence_addr_lo)
-        PrintMessage(" hi=0x")
-        PrintHex(fence_addr_hi)
-        PrintMessage(" val=")
+
+        PrintMessage("[DBG:PM4] fence: val=")
         PrintNumber(fence_val)
+        PrintMessage(" vram_off=0x")
+        PrintHex(fence_off)
         PrintMessage("\n")
-        PM4_EmitEventWriteEOP(ring_idx, fence_addr_lo, fence_addr_hi, fence_val)
+
+        // Clear both fence locations before submit
+        GPU_Wr32(gpu, SIReg.SCRATCH_REG0, 0)
+        GPU_VramWr32(gpu, fence_off, 0)
+
+        // A) SCRATCH_REG0 via SET_CONFIG_REG (MMIO-polled, control path)
+        PM4_EmitSetConfigReg(ring_idx, SIReg.SCRATCH_REG0, fence_val)
+
+        // B) VRAM fence via WRITE_DATA (authoritative, VRAM-polled)
+        PM4_EmitWriteDataVRAM(ring_idx, fence_off, fence_val)
 
         // --- Commit: bump WPTR hardware register ---
         pre_wptr = Dereference(Add(ring, RingField.WPTR))
@@ -1886,9 +1918,9 @@ Function.PM4_SubmitCompute {
 }
 
 // =============================================================================
-// PM4_WaitFence — wait for a specific fence value to appear
-// The GPU writes the fence value to the VRAM writeback location after
-// completing all commands up to the EVENT_WRITE_EOP.
+// PM4_WaitFence — wait for fence value in SCRATCH_REG0 (MMIO poll)
+// The GPU writes fence_val to SCRATCH_REG0 via SET_CONFIG_REG after
+// CS_PARTIAL_FLUSH guarantees all wavefronts have retired.
 // =============================================================================
 Function.PM4_WaitFence {
     Input: ring_idx: Integer
@@ -1899,13 +1931,12 @@ Function.PM4_WaitFence {
         IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
 
         gpu = Dereference(Add(ring, RingField.GPU_INDEX))
-        fence_off = Dereference(Add(ring, RingField.FENCE_WB_OFF))
 
         attempts = 0
         max = 50000000
 
         WhileLoop LessThan(attempts, max) {
-            val = GPU_VramRd32(gpu, fence_off)
+            val = GPU_Rd32(gpu, SIReg.SCRATCH_REG0)
             IfCondition GreaterEqual(val, expected) ThenBlock: {
                 PrintMessage("[DBG:FENCE] done, val=")
                 PrintNumber(val)
@@ -1919,7 +1950,7 @@ Function.PM4_WaitFence {
                 IfCondition GreaterThan(attempts, 0) ThenBlock: {
                     PrintMessage("[DBG:FENCE] poll ")
                     PrintNumber(attempts)
-                    PrintMessage(": fence_val=")
+                    PrintMessage(": SCRATCH_REG0=")
                     PrintNumber(val)
                     PrintMessage(" RPTR(mmio)=")
                     PrintNumber(PM4_ReadRPTR_MMIO(ring_idx))
@@ -1934,13 +1965,69 @@ Function.PM4_WaitFence {
         PrintMessage("[PM4] Fence timeout: expected=")
         PrintNumber(expected)
         PrintMessage(" got=")
-        PrintNumber(GPU_VramRd32(gpu, fence_off))
+        PrintNumber(GPU_Rd32(gpu, SIReg.SCRATCH_REG0))
         PrintMessage("\n")
         // Print final diagnostic
         PrintMessage("[DBG:FENCE] final RPTR(mmio)=")
         PrintNumber(PM4_ReadRPTR_MMIO(ring_idx))
         PrintMessage(" GRBM_STATUS=0x")
         PrintHex(GPU_Rd32(gpu, SIReg.GRBM_STATUS))
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_WaitFenceVRAM — wait for fence value in VRAM (authoritative path)
+// Polls FENCE_WB_OFF via GPU_VramRd32 — same observable path as RPTR writeback.
+// Prints all four signals (VRAMfence, SCRATCH_REG0, RPTR_wb, RPTR_mmio) for
+// A/B comparison on every progress tick.
+// =============================================================================
+Function.PM4_WaitFenceVRAM {
+    Input: ring_idx: Integer
+    Input: expected: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        fence_off = Dereference(Add(ring, RingField.FENCE_WB_OFF))
+
+        attempts = 0
+        max = 50000000
+        WhileLoop LessThan(attempts, max) {
+            val = GPU_VramRd32(gpu, fence_off)
+            IfCondition GreaterEqual(val, expected) ThenBlock: {
+                PrintMessage("[DBG:FENCE] VRAM fence done, val=")
+                PrintNumber(val)
+                PrintMessage(" after ")
+                PrintNumber(attempts)
+                PrintMessage(" polls\n")
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(Modulo(attempts, 10000000), 0) ThenBlock: {
+                IfCondition GreaterThan(attempts, 0) ThenBlock: {
+                    PrintMessage("[DBG:FENCE] poll ")
+                    PrintNumber(attempts)
+                    PrintMessage(": VRAMfence=")
+                    PrintNumber(val)
+                    PrintMessage(" SCRATCH(mmio)=")
+                    PrintNumber(GPU_Rd32(gpu, SIReg.SCRATCH_REG0))
+                    PrintMessage(" RPTR(wb)=")
+                    PrintNumber(PM4_ReadRPTR(ring_idx))
+                    PrintMessage(" RPTR(mmio)=")
+                    PrintNumber(PM4_ReadRPTR_MMIO(ring_idx))
+                    PrintMessage("\n")
+                }
+            }
+            attempts = Add(attempts, 1)
+        }
+        PrintMessage("[DBG:FENCE] VRAM fence TIMEOUT last=")
+        PrintNumber(GPU_VramRd32(gpu, fence_off))
+        PrintMessage(" SCRATCH(mmio)=")
+        PrintNumber(GPU_Rd32(gpu, SIReg.SCRATCH_REG0))
+        PrintMessage(" RPTR(wb)=")
+        PrintNumber(PM4_ReadRPTR(ring_idx))
         PrintMessage("\n")
         ReturnValue(0)
     }
