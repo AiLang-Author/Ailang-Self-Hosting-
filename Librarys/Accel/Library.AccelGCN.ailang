@@ -41,19 +41,20 @@ FixedPool.AccelGCNCfg {
 }
 
 // VRAM layout (after ring buffer allocation):
+//   Ring starts at 64MB (RingConf.VRAM_RING_OFFSET = 67108864)
 //   RingConf.VRAM_TOTAL_ALLOC (69632 = 68KB) is used by ring + writeback
 //   We allocate after that:
 //     +69632:  shader code area   (256KB = 262144)
 //     +331776: buffer descriptors (4KB = 4096, for V# resource entries)
 //     +335872: data buffer area   (remaining VRAM)
 FixedPool.AccelGCNLayout {
-    // All offsets start at 16MB (0x1000000) to avoid colliding with the
-    // EFI/GOP framebuffer which occupies the first ~8MB of VRAM.
-    "SHADER_OFFSET":    Initialize=16846848,  CanChange=False   // 16MB + 69632: after ring+wb
+    // All offsets start at 64MB (0x4000000) to avoid colliding with the
+    // EFI/GOP framebuffer which can occupy 33+ MB of VRAM at 4K.
+    "SHADER_OFFSET":    Initialize=67178496,  CanChange=False   // 64MB + 69632: after ring+wb
     "SHADER_SIZE":      Initialize=262144,    CanChange=False   // 256KB for shader code
-    "BUF_DESC_OFFSET":  Initialize=17108992,  CanChange=False   // 16MB + 331776: after shader
+    "BUF_DESC_OFFSET":  Initialize=67440640,  CanChange=False   // 64MB + 331776: after shader
     "BUF_DESC_SIZE":    Initialize=4096,      CanChange=False   // 4KB for V# entries
-    "DATA_OFFSET":      Initialize=17113088,  CanChange=False   // 16MB + 335872: after buf desc
+    "DATA_OFFSET":      Initialize=67444736,  CanChange=False   // 64MB + 335872: after buf desc
 }
 
 // =============================================================================
@@ -124,7 +125,7 @@ Function.AccelGCN_Init {
         // SCRATCH_UMSK moved to after PM4_CPStart — CLEAR_STATE resets it to 0
 
         // Ring setup
-        rc = PM4_SetupRing(gpu, ring, 0)
+        rc = PM4_SetupRing(gpu, ring, RingConf.VRAM_RING_OFFSET)
 
         IfCondition EqualTo(rc, 0) ThenBlock: {
             PrintMessage("[AccelGCN] ring setup failed\n")
@@ -144,12 +145,34 @@ Function.AccelGCN_Init {
             ReturnValue(-6)
         }
 
-        // Ring test
+        // Ring test (ring 0)
         rc = PM4_RingTest(ring)
         IfCondition EqualTo(rc, 0) ThenBlock: {
-            PrintMessage("[AccelGCN] ring test failed\n")
+            PrintMessage("[AccelGCN] ring 0 test failed\n")
             ReturnValue(-5)
         }
+
+        // --- Ring 1: dedicated compute ring ---
+        // SI has 3 rings: ring 0 (GFX+compute), ring 1 (compute), ring 2 (compute).
+        // The official driver uses ring 1/2 for pure compute because ring 0 has
+        // a hardware limitation (~25 dispatch tracking slots that never drain
+        // for pure compute without interleaved graphics work).
+        // Ring 1 at VRAM offset 0x4020000 (64MB + 128KB, past ring 0's allocation).
+        rc = PM4_SetupRing(gpu, 1, 67239936)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 1 setup failed\n")
+            ReturnValue(-11)
+        }
+        // Ring 1 test
+        rc = PM4_RingTest(1)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 1 test failed\n")
+            ReturnValue(-12)
+        }
+        PrintMessage("[AccelGCN] compute ring 1 ready\n")
+
+        // Use ring 1 for all compute dispatches
+        AccelGCNCfg.ring_idx = 1
 
         // Re-enable scratch regs via MMIO AFTER ring test.
         // CLEAR_STATE resets SCRATCH_UMSK to 0.  Ring test does PM4_WaitIdle,
@@ -260,10 +283,10 @@ Function.AccelGCN_Upload {
         PrintHex(aligned_off)
         PrintMessage("\n")
 
-        // Readback verify first few DWORDs of shader
+        // Readback verify ALL DWORDs of shader (76 bytes = 19 DWORDs)
         PrintMessage("[DBG:shader] all DWORDs readback:\n  ")
         dbg_i = 0
-        WhileLoop LessThan(dbg_i, 16) {
+        WhileLoop LessThan(dbg_i, 19) {
             IfCondition LessThan(Multiply(dbg_i, 4), mc_size) ThenBlock: {
                 dbg_off = Multiply(dbg_i, 4)
                 dbg_dw = BitwiseOr(GetByte(dst_ptr, dbg_off), BitwiseOr(LeftShift(GetByte(dst_ptr, Add(dbg_off, 1)), 8), BitwiseOr(LeftShift(GetByte(dst_ptr, Add(dbg_off, 2)), 16), LeftShift(GetByte(dst_ptr, Add(dbg_off, 3)), 24))))
@@ -475,9 +498,23 @@ Function.AccelGCN_Dispatch {
         PrintHex(vdesc_dw3)
         PrintMessage("\n")
 
-        // 3. Load V# directly into USER_DATA SGPRs s[0:3]
-        //    The shader does BUFFER_LOAD/STORE with srsrc=0 → reads s[0:3] as V#.
-        //    We use 4 USER_DATA registers, so TGID_X lands at s[4].
+        // 3a. Breadcrumb — first packet in the dispatch stream.
+        //     WRITE_DATA to fence_off+16, carrying the upcoming fence_val.
+        //     If the CP fetches iter N's packets, breadcrumb updates to N's fence_val;
+        //     if the CP is idle and never fetches, it stays at N-1's value.
+        bc_ring = PM4_GetRing(ring)
+        bc_fence_off = Dereference(Add(bc_ring, RingField.FENCE_WB_OFF))
+        bc_fence_val = Add(Dereference(Add(bc_ring, RingField.FENCE_VAL)), 1)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 16), 0)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 20), 0)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 24), 0)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 28), 0)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 32), 0)
+        PM4_EmitWriteDataVRAM(ring, Add(bc_fence_off, 16), bc_fence_val)
+
+        // 3b. Load V# directly into USER_DATA SGPRs s[0:3]
+        //     The shader does BUFFER_LOAD/STORE with srsrc=0 → reads s[0:3] as V#.
+        //     We use 4 USER_DATA registers, so TGID_X lands at s[4].
         PM4_EmitSetSHReg(ring, SICompute.USER_DATA_0, vdesc_dw0, PM4.SHADER_TYPE_COMPUTE)
         PM4_EmitSetSHReg(ring, SICompute.USER_DATA_1, vdesc_dw1, PM4.SHADER_TYPE_COMPUTE)
         PM4_EmitSetSHReg(ring, SICompute.USER_DATA_2, vdesc_dw2, PM4.SHADER_TYPE_COMPUTE)
@@ -511,7 +548,8 @@ Function.AccelGCN_Dispatch {
         PrintNumber(GPU_VramRd32(dbg_gpu, Add(AccelGCNCfg.data_vram, 268)))
         PrintMessage("\n")
         PrintMessage("[DBG:data] fence VRAM: ")
-        PrintNumber(GPU_VramRd32(dbg_gpu, 16842816))
+        dbg_fence_off = Dereference(Add(PM4_GetRing(ring), RingField.FENCE_WB_OFF))
+        PrintNumber(GPU_VramRd32(dbg_gpu, dbg_fence_off))
         PrintMessage("\n")
 
         // 4. Dispatch
@@ -565,6 +603,8 @@ Function.AccelGCN_Dispatch {
         PM4Dispatch.grid_x = CIRProg.grid_x
         PM4Dispatch.grid_y = CIRProg.grid_y
         PM4Dispatch.grid_z = CIRProg.grid_z
+        PM4Dispatch.buf_vram_off = AccelGCNCfg.data_vram
+        PM4Dispatch.buf_total_size = total_data_size
 
         rc = PM4_SubmitCompute(ring)
         IfCondition EqualTo(rc, 0) ThenBlock: {
