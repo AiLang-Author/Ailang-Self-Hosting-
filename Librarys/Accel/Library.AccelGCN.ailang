@@ -279,6 +279,138 @@ Function.AccelGCN_Shutdown {
 }
 
 // =============================================================================
+// AccelGCN_ComputeReset — full CP soft reset + firmware reload + ring setup
+//
+// HD 7770 (Cape Verde) has a silicon bug: the compute dispatch path leaks
+// internal event engine slots that cannot be reclaimed by software.  After
+// ~36 dispatches the EVENT_WRITE_EOP fence silently fails.  The GFX event
+// engine is NOT affected (proven by test_gfx_fence: 100/100 PASS).
+//
+// Workaround: every N dispatches, replay the exact cold-boot init sequence:
+//   1. CP halt
+//   2. GRBM soft reset (clears CP microcode + internal FIFOs)
+//   3. Reload CP firmware (PFP/ME/CE)
+//   4. Reload RLC firmware
+//   5. Re-setup IH ring
+//   6. Re-setup all 3 rings
+//   7. CPStart (ME_INITIALIZE + CLEAR_STATE)
+//   8. Re-program SH_MEM, SCRATCH_UMSK, GB_ADDR_CONFIG
+//
+// This is expensive (~50-100ms) but only happens every 30 dispatches.
+// =============================================================================
+Function.AccelGCN_ComputeReset {
+    Output: Integer
+    Body: {
+        gpu = AccelGCNCfg.gpu_idx
+        PrintMessage("[AccelGCN] === FULL COMPUTE RESET (dispatch slot reclaim) ===\n")
+
+        // 1. Halt CP
+        PM4_HaltCP(gpu)
+
+        // 2. Soft reset — wipes CP microcode, clears ALL internal FIFOs/state
+        PM4_SoftResetCP(gpu)
+
+        // 3. Re-halt after soft reset (reset clears CP_ME_CNTL)
+        PM4_HaltCP(gpu)
+
+        // 4. Reload CP firmware (PFP, ME, CE)
+        rc = PM4_LoadCPFirmware(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: CP firmware reload failed\n")
+            ReturnValue(-1)
+        }
+
+        // 5. Reload RLC firmware
+        rc = PM4_LoadRLCFirmware(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: RLC firmware reload failed\n")
+            ReturnValue(-2)
+        }
+
+        // 6. Re-setup IH ring
+        rc = PM4_SetupIHRing(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: IH ring setup failed\n")
+            ReturnValue(-3)
+        }
+
+        // 7. CP misc registers
+        GPU_Wr32(gpu, SIReg.CP_SEM_WAIT_TIMER, 0)
+        GPU_Wr32(gpu, SIReg.CP_SEM_INCOMPLETE_TIMER, 0)
+        GPU_Wr32(gpu, SIReg.CP_RB_WPTR_DELAY, 0)
+        GPU_Wr32(gpu, SIReg.CP_DEBUG, 0)
+
+        // 8. Re-setup all 3 rings (ring 0 = GFX, ring 1/2 = compute)
+        rc = PM4_SetupRing(gpu, 0, RingConf.VRAM_RING_OFFSET)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 0 setup failed\n")
+            ReturnValue(-4)
+        }
+
+        // CP control registers
+        GPU_Wr32(gpu, SIReg.CP_MAX_CONTEXT, 7)
+        GPU_Wr32(gpu, SIReg.CP_ENDIAN_SWAP, 0)
+        GPU_Wr32(gpu, SIReg.CP_DEVICE_ID, 1)
+
+        // 9. CPStart — ME_INITIALIZE + CLEAR_STATE + unhalt
+        rc = PM4_CPStart(gpu, 0)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: CPStart failed\n")
+            ReturnValue(-5)
+        }
+
+        // Ring 0 test
+        rc = PM4_RingTest(0)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 0 test failed\n")
+            ReturnValue(-6)
+        }
+
+        // 10. Re-setup compute rings
+        rc = PM4_SetupRing(gpu, 1, 67239936)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 1 setup failed\n")
+            ReturnValue(-7)
+        }
+        rc = PM4_RingTest(1)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 1 test failed\n")
+            ReturnValue(-8)
+        }
+
+        rc = PM4_SetupRing(gpu, 2, 67371008)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 2 setup failed\n")
+            ReturnValue(-9)
+        }
+        rc = PM4_RingTest(2)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 2 test failed\n")
+            ReturnValue(-10)
+        }
+
+        // 11. Re-program SH_MEM for VMID 0 (CLEAR_STATE zeros these)
+        GPU_Wr32(gpu, SIReg.SRBM_GFX_CNTL, 0)
+        GPU_Wr32(gpu, SIReg.SH_MEM_CONFIG, 0)
+        GPU_Wr32(gpu, SIReg.SH_MEM_APE1_BASE, 1)
+        GPU_Wr32(gpu, SIReg.SH_MEM_APE1_LIMIT, 0)
+        GPU_Wr32(gpu, SIReg.SH_MEM_BASES, 0)
+
+        // 12. SCRATCH_UMSK (CLEAR_STATE resets to 0)
+        GPU_Wr32(gpu, SIReg.SCRATCH_UMSK, 255)
+
+        // 13. GB_ADDR_CONFIG — Cape Verde golden value
+        GPU_Wr32(gpu, SIReg.GB_ADDR_CONFIG, 302186498)
+
+        // Reset dispatch counter
+        AccelGCNCfg.dispatch_count = 0
+
+        PrintMessage("[AccelGCN] === COMPUTE RESET COMPLETE ===\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
 // AccelGCN_Upload — copy machine code from CIRProg.mc_buf to VRAM
 // Returns GPU address of the uploaded shader (VRAM offset, 256-byte aligned).
 // =============================================================================
@@ -655,6 +787,22 @@ Function.AccelGCN_Dispatch {
         PM4Dispatch.buf_vram_off = AccelGCNCfg.data_vram
         PM4Dispatch.buf_total_size = total_data_size
         PM4Dispatch.ib_vram_off = AccelGCNCfg.ib_vram
+
+        // --- Periodic full reset (HD 7770 compute event engine bug) ---
+        // Cape Verde leaks internal compute dispatch slots after ~36 uses.
+        // Full soft reset + firmware reload reclaims them.  GFX ring unaffected.
+        IfCondition GreaterEqual(AccelGCNCfg.dispatch_count, 30) ThenBlock: {
+            PrintMessage("[AccelGCN] dispatch_count=")
+            PrintNumber(AccelGCNCfg.dispatch_count)
+            PrintMessage(", triggering full compute reset\n")
+            rst_rc = AccelGCN_ComputeReset()
+            IfCondition LessThan(rst_rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] FATAL: compute reset failed rc=")
+                PrintNumber(rst_rc)
+                PrintMessage("\n")
+                ReturnValue(-10)
+            }
+        }
 
         rc = PM4_SubmitCompute(ring)
         IfCondition EqualTo(rc, 0) ThenBlock: {
