@@ -1,0 +1,527 @@
+// test_matmul.ailang — 16×16 integer matrix multiply stress test
+// C[i,j] = Σ_k A[i,k] * B[k,j],  N=16, 256 threads
+// Tests address math, MUL_LO_U32, ADD_U32, multi-buffer, multi-workgroup.
+// Build: ./ailang.x TestCode/test_matmul.ailang -o test_matmul.x
+// Run:   sudo ./test_matmul.x 2>&1 | tee matmul_log.txt
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.GCNEnc
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+LibraryImport.Accel.HAL
+LibraryImport.Accel.AccelGCN
+
+SubRoutine.Main {
+    PrintMessage("=== 16x16 Integer Matrix Multiply Test ===\n")
+    PrintMessage("C = A * B,  N=16,  256 threads (4 WGs x 64)\n")
+    PrintMessage("Test 1: B = identity  (expect C = A)\n")
+    PrintMessage("Test 2: B = all-ones  (expect C[i,j] = row_sum(A,i))\n\n")
+
+    n = 16
+    n2 = 256
+    buf_bytes = 1024          // 256 elements * 4 bytes
+    a_off = 0                 // A at data area offset 0
+    b_off = 1024              // B at offset 1024
+    c_off = 2048              // C at offset 2048
+
+    // --- Init GPU ---
+    rc = AccelGCN_Init()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("FATAL: init failed rc=")
+        PrintNumber(rc)
+        PrintMessage("\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("Init OK\n\n")
+
+    // =====================================================================
+    // Build kernel once:
+    //   gid = GlobalIdX()        // 0..255
+    //   row = gid >> 4           // gid / 16
+    //   col = gid & 0xF         // gid % 16
+    //   acc = 0
+    //   for k = 0..15 (unrolled):
+    //       a_idx = row * 16 + k
+    //       b_idx = k * 16 + col
+    //       a_val = LoadBuf(0, a_idx)
+    //       b_val = LoadBuf(1, b_idx)
+    //       acc += a_val * b_val
+    //   c_idx = row * 16 + col
+    //   StoreBuf(acc, 2, c_idx)
+    // =====================================================================
+
+    rc = CIR_Begin()
+    rc = CIR_SetGroupSize(64, 1, 1)
+    rc = CIR_SetGrid(4, 1, 1)         // 4 WGs x 64 = 256 threads
+    rc = CIR_BindBuffer(0, a_off, buf_bytes, 4, 1)   // A read
+    rc = CIR_BindBuffer(1, b_off, buf_bytes, 4, 1)   // B read
+    rc = CIR_BindBuffer(2, c_off, buf_bytes, 4, 2)   // C write
+
+    // Allocate VRegs
+    v_gid   = CIR_AllocVReg()
+    v_row   = CIR_AllocVReg()
+    v_col   = CIR_AllocVReg()
+    v_acc   = CIR_AllocVReg()
+    v_16    = CIR_AllocVReg()
+    v_15    = CIR_AllocVReg()
+    v_4     = CIR_AllocVReg()
+    v_k     = CIR_AllocVReg()
+    v_a_idx = CIR_AllocVReg()
+    v_b_idx = CIR_AllocVReg()
+    v_a_val = CIR_AllocVReg()
+    v_b_val = CIR_AllocVReg()
+    v_tmp   = CIR_AllocVReg()
+    v_c_idx = CIR_AllocVReg()
+
+    // gid = GlobalIdX()
+    rc = CIR_Op_GlobalIdX(v_gid)
+
+    // Constants
+    rc = CIR_Op_LoadConst(v_16, 16)
+    rc = CIR_Op_LoadConst(v_15, 15)
+    rc = CIR_Op_LoadConst(v_4, 4)
+
+    // row = gid >> 4   (divide by 16)
+    rc = CIR_Op_ShrU32(v_row, v_gid, v_4)
+
+    // col = gid & 0xF
+    rc = CIR_Op_AndB32(v_col, v_gid, v_15)
+
+    // acc = 0
+    rc = CIR_Op_LoadConst(v_acc, 0)
+
+    // row_base = row * 16  (reused for each k)
+    // We compute a_idx = row*16 + k and b_idx = k*16 + col each iteration
+
+    // ---- Unrolled k = 0..15 ----
+    // k=0
+    rc = CIR_Op_LoadConst(v_k, 0)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=1
+    rc = CIR_Op_LoadConst(v_k, 1)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=2
+    rc = CIR_Op_LoadConst(v_k, 2)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=3
+    rc = CIR_Op_LoadConst(v_k, 3)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=4
+    rc = CIR_Op_LoadConst(v_k, 4)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=5
+    rc = CIR_Op_LoadConst(v_k, 5)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=6
+    rc = CIR_Op_LoadConst(v_k, 6)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=7
+    rc = CIR_Op_LoadConst(v_k, 7)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=8
+    rc = CIR_Op_LoadConst(v_k, 8)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=9
+    rc = CIR_Op_LoadConst(v_k, 9)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=10
+    rc = CIR_Op_LoadConst(v_k, 10)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=11
+    rc = CIR_Op_LoadConst(v_k, 11)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=12
+    rc = CIR_Op_LoadConst(v_k, 12)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=13
+    rc = CIR_Op_LoadConst(v_k, 13)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=14
+    rc = CIR_Op_LoadConst(v_k, 14)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // k=15
+    rc = CIR_Op_LoadConst(v_k, 15)
+    rc = CIR_Op_MulLoU32(v_a_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+    rc = CIR_Op_MulLoU32(v_b_idx, v_k, v_16)
+    rc = CIR_Op_AddU32(v_b_idx, v_b_idx, v_col)
+    rc = CIR_Op_LoadBuf(v_a_val, 0, v_a_idx)
+    rc = CIR_Op_LoadBuf(v_b_val, 1, v_b_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_MulLoU32(v_tmp, v_a_val, v_b_val)
+    rc = CIR_Op_AddU32(v_acc, v_acc, v_tmp)
+
+    // Store result: C[row*16 + col] = acc
+    rc = CIR_Op_MulLoU32(v_c_idx, v_row, v_16)
+    rc = CIR_Op_AddU32(v_c_idx, v_c_idx, v_col)
+    rc = CIR_Op_StoreBuf(v_acc, 2, v_c_idx)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_EndPgm()
+
+    n_insns = CIR_End()
+    mc_bytes = CIR_Lower_GCN()
+    PrintMessage("Kernel: ")
+    PrintNumber(n_insns)
+    PrintMessage(" CIR insns, ")
+    PrintNumber(mc_bytes)
+    PrintMessage(" bytes GCN machine code\n\n")
+
+    // Allocate host buffers (3 x 1024 bytes)
+    host_a = Allocate(buf_bytes)
+    host_b = Allocate(buf_bytes)
+    host_c = Allocate(buf_bytes)
+    host_ref = Allocate(buf_bytes)
+
+    // =====================================================================
+    // TEST 1: B = Identity matrix,  expect C = A
+    // =====================================================================
+    PrintMessage("--- Test 1: C = A * I  (identity multiply) ---\n")
+
+    // Fill A: A[i,j] = i*16 + j + 1  (values 1..256)
+    i = 0
+    WhileLoop LessThan(i, n) {
+        j = 0
+        WhileLoop LessThan(j, n) {
+            idx = Add(Multiply(i, n), j)
+            val = Add(idx, 1)
+            off = Multiply(idx, 4)
+            SetByte(host_a, off, BitwiseAnd(val, 255))
+            SetByte(host_a, Add(off, 1), BitwiseAnd(RightShift(val, 8), 255))
+            SetByte(host_a, Add(off, 2), BitwiseAnd(RightShift(val, 16), 255))
+            SetByte(host_a, Add(off, 3), BitwiseAnd(RightShift(val, 24), 255))
+            j = Add(j, 1)
+        }
+        i = Add(i, 1)
+    }
+
+    // Fill B: identity matrix — B[i,j] = (i==j) ? 1 : 0
+    MemorySet(host_b, 0, buf_bytes)
+    i = 0
+    WhileLoop LessThan(i, n) {
+        off = Multiply(Add(Multiply(i, n), i), 4)
+        SetByte(host_b, off, 1)
+        SetByte(host_b, Add(off, 1), 0)
+        SetByte(host_b, Add(off, 2), 0)
+        SetByte(host_b, Add(off, 3), 0)
+        i = Add(i, 1)
+    }
+
+    // Zero C
+    MemorySet(host_c, 0, buf_bytes)
+
+    // Upload A, B, C to VRAM
+    discard = AccelGCN_VramWrite(a_off, host_a, buf_bytes)
+    discard = AccelGCN_VramWrite(b_off, host_b, buf_bytes)
+    discard = AccelGCN_VramWrite(c_off, host_c, buf_bytes)
+
+    // Dispatch
+    PrintMessage("Dispatching kernel...\n")
+    rc = AccelGCN_Dispatch()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("FATAL: dispatch failed rc=")
+        PrintNumber(rc)
+        PrintMessage("\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("Dispatch OK\n")
+
+    // Read back C
+    discard = AccelGCN_VramRead(c_off, host_c, buf_bytes)
+
+    // Verify: C should equal A  (since C = A * I = A)
+    errors = 0
+    i = 0
+    WhileLoop LessThan(i, n) {
+        j = 0
+        WhileLoop LessThan(j, n) {
+            idx = Add(Multiply(i, n), j)
+            off = Multiply(idx, 4)
+
+            // Read got from host_c
+            b0 = GetByte(host_c, off)
+            b1 = GetByte(host_c, Add(off, 1))
+            b2 = GetByte(host_c, Add(off, 2))
+            b3 = GetByte(host_c, Add(off, 3))
+            got = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+
+            // Expected = A[i,j] = idx + 1
+            expected = Add(idx, 1)
+
+            IfCondition NotEqual(got, expected) ThenBlock: {
+                IfCondition LessThan(errors, 8) ThenBlock: {
+                    PrintMessage("  MISMATCH [")
+                    PrintNumber(i)
+                    PrintMessage(",")
+                    PrintNumber(j)
+                    PrintMessage("] got=")
+                    PrintNumber(got)
+                    PrintMessage(" exp=")
+                    PrintNumber(expected)
+                    PrintMessage("\n")
+                }
+                errors = Add(errors, 1)
+            }
+            j = Add(j, 1)
+        }
+        i = Add(i, 1)
+    }
+
+    IfCondition EqualTo(errors, 0) ThenBlock: {
+        PrintMessage("Test 1: PASS  (256/256 elements correct)\n\n")
+    }
+    IfCondition GreaterThan(errors, 0) ThenBlock: {
+        PrintMessage("Test 1: FAIL  (")
+        PrintNumber(errors)
+        PrintMessage(" mismatches out of 256)\n\n")
+    }
+
+    // =====================================================================
+    // TEST 2: B = all-ones matrix,  expect C[i,j] = sum of row i of A
+    //   row_sum(i) = Σ_{k=0..15} A[i,k] = Σ_{k=0..15} (i*16 + k + 1)
+    //             = 16*(i*16+1) + (0+1+...+15) = 256*i + 16 + 120
+    //             = 256*i + 136
+    // =====================================================================
+    PrintMessage("--- Test 2: C = A * Ones  (row-sum check) ---\n")
+
+    // Fill B: all ones
+    i = 0
+    WhileLoop LessThan(i, n2) {
+        off = Multiply(i, 4)
+        SetByte(host_b, off, 1)
+        SetByte(host_b, Add(off, 1), 0)
+        SetByte(host_b, Add(off, 2), 0)
+        SetByte(host_b, Add(off, 3), 0)
+        i = Add(i, 1)
+    }
+
+    // Zero C
+    MemorySet(host_c, 0, buf_bytes)
+
+    // Upload B, C (A is unchanged)
+    discard = AccelGCN_VramWrite(b_off, host_b, buf_bytes)
+    discard = AccelGCN_VramWrite(c_off, host_c, buf_bytes)
+
+    // Dispatch
+    PrintMessage("Dispatching kernel...\n")
+    rc = AccelGCN_Dispatch()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("FATAL: dispatch failed rc=")
+        PrintNumber(rc)
+        PrintMessage("\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("Dispatch OK\n")
+
+    // Read back C
+    discard = AccelGCN_VramRead(c_off, host_c, buf_bytes)
+
+    // Verify: C[i,j] should equal 256*i + 136 for all j
+    errors2 = 0
+    i = 0
+    WhileLoop LessThan(i, n) {
+        expected_row = Add(Multiply(256, i), 136)
+        j = 0
+        WhileLoop LessThan(j, n) {
+            idx = Add(Multiply(i, n), j)
+            off = Multiply(idx, 4)
+
+            b0 = GetByte(host_c, off)
+            b1 = GetByte(host_c, Add(off, 1))
+            b2 = GetByte(host_c, Add(off, 2))
+            b3 = GetByte(host_c, Add(off, 3))
+            got = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+
+            IfCondition NotEqual(got, expected_row) ThenBlock: {
+                IfCondition LessThan(errors2, 8) ThenBlock: {
+                    PrintMessage("  MISMATCH [")
+                    PrintNumber(i)
+                    PrintMessage(",")
+                    PrintNumber(j)
+                    PrintMessage("] got=")
+                    PrintNumber(got)
+                    PrintMessage(" exp=")
+                    PrintNumber(expected_row)
+                    PrintMessage("\n")
+                }
+                errors2 = Add(errors2, 1)
+            }
+            j = Add(j, 1)
+        }
+        i = Add(i, 1)
+    }
+
+    IfCondition EqualTo(errors2, 0) ThenBlock: {
+        PrintMessage("Test 2: PASS  (256/256 elements correct)\n\n")
+    }
+    IfCondition GreaterThan(errors2, 0) ThenBlock: {
+        PrintMessage("Test 2: FAIL  (")
+        PrintNumber(errors2)
+        PrintMessage(" mismatches out of 256)\n\n")
+    }
+
+    // =====================================================================
+    // Summary
+    // =====================================================================
+    PrintMessage("=== Final Result ===\n")
+    total_errors = Add(errors, errors2)
+    IfCondition EqualTo(total_errors, 0) ThenBlock: {
+        PrintMessage("*** ALL TESTS PASS ***\n")
+    }
+    IfCondition GreaterThan(total_errors, 0) ThenBlock: {
+        PrintMessage("*** FAILURES DETECTED ***\n")
+        PrintMessage("Test 1 errors: ")
+        PrintNumber(errors)
+        PrintMessage("\nTest 2 errors: ")
+        PrintNumber(errors2)
+        PrintMessage("\n")
+    }
+
+    Deallocate(host_a, buf_bytes)
+    Deallocate(host_b, buf_bytes)
+    Deallocate(host_c, buf_bytes)
+    Deallocate(host_ref, buf_bytes)
+    discard = AccelGCN_Shutdown()
+    PrintMessage("=== Done ===\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)
