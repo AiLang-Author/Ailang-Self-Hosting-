@@ -1,0 +1,841 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUPM4FW.ailang
+//
+// CP/RLC firmware loading, IH ring setup, and soft reset.
+// Split from Library.AMDGPUPM4.ailang for maintainability.
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUPM4FW
+//
+// DEPENDS
+//   LibraryImport.Arena
+//   LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+//   LibraryImport.Drivers.AMDGPU.AMDGPUPM4Ring
+//   LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+// =============================================================================
+// CP FIRMWARE PATHS (Southern Islands / Cape Verde)
+// The old-format radeon firmware files are arrays of big-endian 32-bit words.
+// PFP = Pre-Fetch Parser, ME = Micro Engine, CE = Constant Engine.
+// All three must be loaded while CP is halted, before ring setup.
+// =============================================================================
+FixedPool.CPFWPaths {
+    "pfp":    Initialize="/lib/firmware/radeon/VERDE_pfp.bin"
+    "me":     Initialize="/lib/firmware/radeon/VERDE_me.bin"
+    "ce":     Initialize="/lib/firmware/radeon/VERDE_ce.bin"
+    "rlc":    Initialize="/lib/firmware/radeon/verde_rlc.bin"
+}
+
+// =============================================================================
+// PM4_LoadUcodeFile — load one CP microcode firmware file into an engine
+//
+// Opens the firmware .bin file, reads it into a buffer, byte-swaps each
+// 32-bit word from big-endian to native (little-endian x86), and streams
+// to the engine's data register via MMIO.
+//
+// This mirrors the Linux kernel's si_cp_load_microcode() which does
+// be32_to_cpup() on each firmware word before WREG32 to the data register.
+//
+// gpu:       GPU index
+// addr_reg:  engine address register (e.g. SIReg.CP_PFP_UCODE_ADDR)
+// data_reg:  engine data register (e.g. SIReg.CP_PFP_UCODE_DATA)
+// fw_path:   address of firmware file path string
+//
+// Returns word count on success, negative on error.
+// =============================================================================
+Function.PM4_LoadUcodeFile {
+    Input: gpu: Integer
+    Input: addr_reg: Integer
+    Input: data_reg: Integer
+    Input: fw_path: Integer
+    Output: Integer
+    Body: {
+        // Open firmware file (syscall 2 = open, O_RDONLY = 0)
+        ufw_fd = SystemCall(2, fw_path, 0, 0)
+        IfCondition LessThan(ufw_fd, 0) ThenBlock: {
+            PrintMessage("[PM4] cannot open firmware file\n")
+            ReturnValue(-1)
+        }
+
+        // Get file size: lseek(fd, 0, SEEK_END) then lseek(fd, 0, SEEK_SET)
+        ufw_size = SystemCall(8, ufw_fd, 0, 2)
+        SystemCall(8, ufw_fd, 0, 0)
+
+        IfCondition LessThan(ufw_size, 4) ThenBlock: {
+            PrintMessage("[PM4] firmware file too small\n")
+            SystemCall(3, ufw_fd)
+            ReturnValue(-2)
+        }
+
+        // Allocate buffer and read entire file
+        ufw_buf = Allocate(ufw_size)
+        IfCondition EqualTo(ufw_buf, 0) ThenBlock: {
+            PrintMessage("[PM4] firmware alloc failed\n")
+            SystemCall(3, ufw_fd)
+            ReturnValue(-3)
+        }
+
+        ufw_read = SystemCall(0, ufw_fd, ufw_buf, ufw_size)
+        SystemCall(3, ufw_fd)
+
+        IfCondition NotEqual(ufw_read, ufw_size) ThenBlock: {
+            PrintMessage("[PM4] firmware read incomplete: got ")
+            PrintNumber(ufw_read)
+            PrintMessage(" expected ")
+            PrintNumber(ufw_size)
+            PrintMessage("\n")
+            Deallocate(ufw_buf, ufw_size)
+            ReturnValue(-4)
+        }
+
+        // Reset engine address counter to 0
+        GPU_Wr32(gpu, addr_reg, 0)
+
+        // Stream firmware words — big-endian to little-endian byte swap
+        // Big-endian layout: byte[0]=MSB, byte[1], byte[2], byte[3]=LSB
+        // Reconstruct native value: (b0 << 24) | (b1 << 16) | (b2 << 8) | b3
+        ufw_words = Divide(ufw_size, 4)
+        ufw_i = 0
+        WhileLoop LessThan(ufw_i, ufw_words) {
+            ufw_off = Multiply(ufw_i, 4)
+            ufw_b0 = GetByte(ufw_buf, ufw_off)
+            ufw_b1 = GetByte(ufw_buf, Add(ufw_off, 1))
+            ufw_b2 = GetByte(ufw_buf, Add(ufw_off, 2))
+            ufw_b3 = GetByte(ufw_buf, Add(ufw_off, 3))
+            ufw_word = Add(LeftShift(ufw_b0, 24), Add(LeftShift(ufw_b1, 16), Add(LeftShift(ufw_b2, 8), ufw_b3)))
+            GPU_Wr32(gpu, data_reg, ufw_word)
+            ufw_i = Add(ufw_i, 1)
+        }
+
+        // Reset address counter back to 0 (kernel does this after each engine load)
+        GPU_Wr32(gpu, addr_reg, 0)
+
+        Deallocate(ufw_buf, ufw_size)
+        ReturnValue(ufw_words)
+    }
+}
+
+// =============================================================================
+// PM4_LoadCPFirmware — load PFP, ME, and CE microcode for the Command Processor
+//
+// Must be called while CP is halted (after PM4_HaltCP, before PM4_UnhaltCP).
+// Reads firmware from /lib/firmware/radeon/VERDE_{pfp,me,ce}.bin.
+// These are the same firmware files the radeon/amdgpu kernel driver uses.
+//
+// Without firmware, the CP engines have no microcode and cannot parse PM4
+// packets — the ring test NOP will hang forever waiting for RPTR to advance.
+//
+// Returns 0 on success, negative on error.
+// =============================================================================
+Function.PM4_LoadCPFirmware {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[PM4] Loading CP firmware...\n")
+
+        // Load PFP (Pre-Fetch Parser)
+        PrintMessage("[PM4]   PFP: ")
+        cpfw_rc = PM4_LoadUcodeFile(gpu, SIReg.CP_PFP_UCODE_ADDR, SIReg.CP_PFP_UCODE_DATA, CPFWPaths.pfp)
+        IfCondition LessThan(cpfw_rc, 0) ThenBlock: {
+            PrintMessage("FAILED\n")
+            ReturnValue(-1)
+        }
+        PrintNumber(cpfw_rc)
+        PrintMessage(" words\n")
+
+        // Load ME (Micro Engine)
+        PrintMessage("[PM4]   ME:  ")
+        cpfw_rc = PM4_LoadUcodeFile(gpu, SIReg.CP_ME_RAM_WADDR, SIReg.CP_ME_RAM_DATA, CPFWPaths.me)
+        IfCondition LessThan(cpfw_rc, 0) ThenBlock: {
+            PrintMessage("FAILED\n")
+            ReturnValue(-2)
+        }
+        PrintNumber(cpfw_rc)
+        PrintMessage(" words\n")
+
+        // Load CE (Constant Engine)
+        PrintMessage("[PM4]   CE:  ")
+        cpfw_rc = PM4_LoadUcodeFile(gpu, SIReg.CP_CE_UCODE_ADDR, SIReg.CP_CE_UCODE_DATA, CPFWPaths.ce)
+        IfCondition LessThan(cpfw_rc, 0) ThenBlock: {
+            PrintMessage("FAILED\n")
+            ReturnValue(-3)
+        }
+        PrintNumber(cpfw_rc)
+        PrintMessage(" words\n")
+
+        PrintMessage("[PM4] CP firmware loaded successfully\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_LoadRLCFirmware — load RLC microcode and start the Run List Controller
+//
+// The RLC is required for compute dispatch tracking: without it, the ME's
+// internal dispatch FIFO (~25 entries per ring) never drains, causing
+// dispatch 26 to hang.  The RLC processes EOP interrupt signals and tells
+// the ME to free FIFO entries.
+//
+// verde_rlc.bin uses the new firmware header format:
+//   - Little-endian header (52 bytes)
+//   - ucode_array_offset_bytes at header[24] = 256
+//   - ucode_size_bytes at header[20] = 8192 (2048 DWORDs)
+//   - Microcode is LITTLE-ENDIAN (no byte swap on x86)
+//
+// Mirrors si_rlc_load_microcode() + si_rlc_resume() from Linux si.c.
+// =============================================================================
+Function.PM4_LoadRLCFirmware {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[PM4] Loading RLC firmware...\n")
+
+        // --- Stop RLC first ---
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, 0)
+        rlc_flush = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+
+        // --- Open firmware file ---
+        rlc_fd = SystemCall(2, CPFWPaths.rlc, 0, 0)
+        IfCondition LessThan(rlc_fd, 0) ThenBlock: {
+            PrintMessage("[PM4] cannot open RLC firmware file\n")
+            ReturnValue(-1)
+        }
+
+        // Get file size
+        rlc_fsize = SystemCall(8, rlc_fd, 0, 2)
+        SystemCall(8, rlc_fd, 0, 0)
+        IfCondition LessThan(rlc_fsize, 260) ThenBlock: {
+            PrintMessage("[PM4] RLC firmware too small\n")
+            SystemCall(3, rlc_fd)
+            ReturnValue(-2)
+        }
+
+        // Allocate and read
+        rlc_buf = Allocate(rlc_fsize)
+        IfCondition EqualTo(rlc_buf, 0) ThenBlock: {
+            PrintMessage("[PM4] RLC firmware alloc failed\n")
+            SystemCall(3, rlc_fd)
+            ReturnValue(-3)
+        }
+        rlc_got = SystemCall(0, rlc_fd, rlc_buf, rlc_fsize)
+        SystemCall(3, rlc_fd)
+        IfCondition NotEqual(rlc_got, rlc_fsize) ThenBlock: {
+            PrintMessage("[PM4] RLC firmware read incomplete\n")
+            Deallocate(rlc_buf, rlc_fsize)
+            ReturnValue(-4)
+        }
+
+        // --- Parse header: ucode starts at offset 256, size 8192 bytes ---
+        // header[20] = ucode_size_bytes (LE32)
+        // header[24] = ucode_array_offset_bytes (LE32)
+        rlc_ucode_off_b0 = GetByte(rlc_buf, 24)
+        rlc_ucode_off_b1 = GetByte(rlc_buf, 25)
+        rlc_ucode_off_b2 = GetByte(rlc_buf, 26)
+        rlc_ucode_off_b3 = GetByte(rlc_buf, 27)
+        rlc_ucode_off = Add(rlc_ucode_off_b0, Add(LeftShift(rlc_ucode_off_b1, 8), Add(LeftShift(rlc_ucode_off_b2, 16), LeftShift(rlc_ucode_off_b3, 24))))
+
+        rlc_usize_b0 = GetByte(rlc_buf, 20)
+        rlc_usize_b1 = GetByte(rlc_buf, 21)
+        rlc_usize_b2 = GetByte(rlc_buf, 22)
+        rlc_usize_b3 = GetByte(rlc_buf, 23)
+        rlc_ucode_size = Add(rlc_usize_b0, Add(LeftShift(rlc_usize_b1, 8), Add(LeftShift(rlc_usize_b2, 16), LeftShift(rlc_usize_b3, 24))))
+        rlc_fw_dwords = Divide(rlc_ucode_size, 4)
+
+        PrintMessage("[PM4]   RLC: ucode_off=")
+        PrintNumber(rlc_ucode_off)
+        PrintMessage(" size=")
+        PrintNumber(rlc_ucode_size)
+        PrintMessage(" (")
+        PrintNumber(rlc_fw_dwords)
+        PrintMessage(" DWORDs)\n")
+
+        // --- Program RLC registers (matches si_rlc_resume) ---
+        GPU_Wr32(gpu, SIReg.RLC_RL_BASE, 0)
+        GPU_Wr32(gpu, SIReg.RLC_RL_SIZE, 0)
+        GPU_Wr32(gpu, SIReg.RLC_LB_CNTL, 0)
+        GPU_Wr32(gpu, SIReg.RLC_LB_CNTR_MAX, 4294967295)   // 0xFFFFFFFF
+        GPU_Wr32(gpu, SIReg.RLC_LB_CNTR_INIT, 0)
+        GPU_Wr32(gpu, SIReg.RLC_LB_INIT_CU_MASK, 4294967295)  // 0xFFFFFFFF
+        // RLC save/restore and clear_state bases (from si_rlc_resume)
+        // The RLC firmware needs VRAM buffers for context save/restore and
+        // clear_state data. Without these, dispatch tracking may not drain.
+        // Place at VRAM+0x4070000 (save/restore) and VRAM+0x4074000 (clear_state).
+        // Register takes GPU MC address >> 8.
+        rlc_sr_gpu = PM4_VramToGPU(67633152)       // 0x4070000
+        GPU_Wr32(gpu, SIReg.RLC_SAVE_AND_RESTORE_BASE, Divide(rlc_sr_gpu, 256))
+        rlc_cs_gpu = PM4_VramToGPU(67649536)       // 0x4074000
+        GPU_Wr32(gpu, SIReg.RLC_CLEAR_STATE_RESTORE_BASE, Divide(rlc_cs_gpu, 256))
+
+        GPU_Wr32(gpu, SIReg.RLC_MC_CNTL, 0)
+        GPU_Wr32(gpu, SIReg.RLC_UCODE_CNTL, 0)
+
+        // --- Stream firmware to RLC SRAM ---
+        // New-format: LITTLE-ENDIAN on x86, no byte swap needed.
+        // Read 4 bytes as LE32 and write directly.
+        GPU_Wr32(gpu, SIReg.RLC_UCODE_ADDR, 0)
+        rlc_i = 0
+        WhileLoop LessThan(rlc_i, rlc_fw_dwords) {
+            rlc_off = Add(rlc_ucode_off, Multiply(rlc_i, 4))
+            rlc_b0 = GetByte(rlc_buf, rlc_off)
+            rlc_b1 = GetByte(rlc_buf, Add(rlc_off, 1))
+            rlc_b2 = GetByte(rlc_buf, Add(rlc_off, 2))
+            rlc_b3 = GetByte(rlc_buf, Add(rlc_off, 3))
+            rlc_word = Add(rlc_b0, Add(LeftShift(rlc_b1, 8), Add(LeftShift(rlc_b2, 16), LeftShift(rlc_b3, 24))))
+            GPU_Wr32(gpu, SIReg.RLC_UCODE_DATA, rlc_word)
+            rlc_i = Add(rlc_i, 1)
+        }
+        GPU_Wr32(gpu, SIReg.RLC_UCODE_ADDR, 0)
+
+        Deallocate(rlc_buf, rlc_fsize)
+
+        // --- Start RLC ---
+        // RLC_CNTL bit 0 = RLC_ENABLE
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, 1)
+        rlc_rb = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+        PrintMessage("[PM4] RLC started (RLC_CNTL=0x")
+        PrintHex(rlc_rb)
+        PrintMessage(")\n")
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_SetupIHRing — set up a minimal Interrupt Handler ring in VRAM
+//
+// The IH ring is required for the RLC to drain the ME's dispatch tracking
+// FIFO.  EVENT_WRITE_EOP with INT_SEL=2 writes an interrupt packet to the
+// IH ring; the RLC firmware reads it and tells the ME to free the dispatch
+// slot.  Without a live IH ring, the FIFO fills after ~25 dispatches and
+// the CP hangs.
+//
+// We don't need a real ISR — we just need the ring to exist so the GPU
+// can write interrupt packets into it.  We poll-drain RPTR to keep up
+// with WPTR so the ring never overflows.
+//
+// VRAM layout: 4KB ring at 0x4080000 (256 entries × 16 bytes each)
+//              WPTR writeback at 0x4081000 (4 bytes)
+//
+// Mirrors si_irq_init() from Linux radeon/si.c.
+// =============================================================================
+Function.PM4_SetupIHRing {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[PM4] Setting up IH ring...\n")
+
+        // IH ring at VRAM 0x4080000 — past RLC save/restore (0x4070000..0x4078000)
+        ih_vram_off = 67633152     // 0x4080000
+        ih_ring_size = 4096        // 256 entries × 16 bytes = 4KB
+        ih_wb_off = 67637248       // 0x4081000 — WPTR writeback location
+        ih_dummy_off = 67641344    // 0x4082000 — dummy page for INTERRUPT_CNTL2
+
+        // Zero the IH ring buffer + writeback + dummy page
+        vram_state = GPU_BAR_GetState(gpu)
+        vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
+        MemorySet(Add(vram_ptr, ih_vram_off), 0, ih_ring_size)
+        GPU_VramWr32(gpu, ih_wb_off, 0)
+        GPU_VramWr32(gpu, ih_dummy_off, 0)
+
+        // =========================================================
+        // Step 1: Disable interrupts (si_disable_interrupts)
+        // =========================================================
+        ih_rb_tmp = GPU_Rd32(gpu, SIReg.IH_RB_CNTL)
+        ih_rb_tmp = BitwiseAnd(ih_rb_tmp, 4294967294)   // clear IH_RB_ENABLE (bit 0)
+        GPU_Wr32(gpu, SIReg.IH_RB_CNTL, ih_rb_tmp)
+
+        ih_cntl_tmp = GPU_Rd32(gpu, SIReg.IH_CNTL)
+        ih_cntl_tmp = BitwiseAnd(ih_cntl_tmp, 4294967294) // clear ENABLE_INTR (bit 0)
+        GPU_Wr32(gpu, SIReg.IH_CNTL, ih_cntl_tmp)
+
+        GPU_Wr32(gpu, SIReg.IH_RB_RPTR, 0)
+        GPU_Wr32(gpu, SIReg.IH_RB_WPTR, 0)
+
+        // =========================================================
+        // Step 2: Disable interrupt sources (si_disable_interrupt_state)
+        // Clear TIME_STAMP_INT_ENABLE, keep only CNTX_BUSY/EMPTY
+        // =========================================================
+        // CNTX_BUSY_INT_ENABLE = (1<<19) = 524288
+        // CNTX_EMPTY_INT_ENABLE = (1<<20) = 1048576
+        cntx_mask = Add(524288, 1048576)    // 1572864 = 0x180000
+        r0_tmp = BitwiseAnd(GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING0), cntx_mask)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING0, r0_tmp)
+        r1_tmp = BitwiseAnd(GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING1), cntx_mask)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING1, r1_tmp)
+        r2_tmp = BitwiseAnd(GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING2), cntx_mask)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING2, r2_tmp)
+
+        // =========================================================
+        // Step 3: INTERRUPT_CNTL2 = dummy page addr >> 8
+        // Kernel: "set dummy read address to dummy page address"
+        // =========================================================
+        ih_dummy_gpu = PM4_VramToGPU(ih_dummy_off)
+        GPU_Wr32(gpu, SIReg.INTERRUPT_CNTL2, Divide(ih_dummy_gpu, 256))
+
+        // =========================================================
+        // Step 4: INTERRUPT_CNTL — clear IH_DUMMY_RD_OVERRIDE (bit 0)
+        //   and IH_REQ_NONSNOOP_EN (bit 3), matching kernel exactly
+        // =========================================================
+        int_cntl = GPU_Rd32(gpu, SIReg.INTERRUPT_CNTL)
+        int_cntl = BitwiseAnd(int_cntl, 4294967286)   // ~(1|8) = ~9 = 0xFFFFFFF6
+        GPU_Wr32(gpu, SIReg.INTERRUPT_CNTL, int_cntl)
+
+        // =========================================================
+        // Step 5: IH_RB_BASE = GPU MC addr >> 8
+        // =========================================================
+        ih_gpu_addr = PM4_VramToGPU(ih_vram_off)
+        ih_base_val = Divide(ih_gpu_addr, 256)
+        GPU_Wr32(gpu, SIReg.IH_RB_BASE, ih_base_val)
+
+        // =========================================================
+        // Step 6: IH_RB_CNTL (without IH_RB_ENABLE yet)
+        //   rb_bufsz = log2(4096/4) = log2(1024) = 10
+        //   IH_WPTR_OVERFLOW_ENABLE = (1<<16) = 65536
+        //   IH_WPTR_OVERFLOW_CLEAR  = (1<<31) = 2147483648
+        //   IH_WPTR_WRITEBACK_ENABLE = (1<<8) = 256
+        //   rb_bufsz << 1 = 10 << 1 = 20
+        // =========================================================
+        ih_rb_cntl = Add(20, Add(65536, Add(2147483648, 256)))  // 0x80010114
+        GPU_Wr32(gpu, SIReg.IH_RB_CNTL, ih_rb_cntl)
+
+        // =========================================================
+        // Step 7: WPTR writeback address
+        // =========================================================
+        ih_wb_gpu = PM4_VramToGPU(ih_wb_off)
+        ih_wb_lo = BitwiseAnd(ih_wb_gpu, 4294967292)   // align to 4 bytes
+        ih_wb_hi = BitwiseAnd(Divide(ih_wb_gpu, 4294967296), 255)
+        GPU_Wr32(gpu, SIReg.IH_RB_WPTR_ADDR_LO, ih_wb_lo)
+        GPU_Wr32(gpu, SIReg.IH_RB_WPTR_ADDR_HI, ih_wb_hi)
+
+        // =========================================================
+        // Step 8: RPTR = WPTR = 0
+        // =========================================================
+        GPU_Wr32(gpu, SIReg.IH_RB_RPTR, 0)
+        GPU_Wr32(gpu, SIReg.IH_RB_WPTR, 0)
+
+        // =========================================================
+        // Step 9: IH_CNTL — from r600d.h:
+        //   ENABLE_INTR     = (1 << 0)  = 1         (set later)
+        //   RPTR_REARM      = (1 << 4)  = 16        (MSI only, skip)
+        //   MC_WRREQ_CREDIT = (x << 15)              kernel uses x=0x10
+        //   MC_WR_CLEAN_CNT = (x << 20)              kernel uses x=0x10
+        //   MC_VMID         = (x << 25)              kernel uses x=0
+        //
+        //   MC_WRREQ_CREDIT(0x10) = 16 << 15 = 524288  = 0x80000
+        //   MC_WR_CLEAN_CNT(0x10) = 16 << 20 = 16777216 = 0x1000000
+        //   Total without ENABLE_INTR = 0x1080000 = 17301504
+        // =========================================================
+        ih_cntl_val = Add(524288, 16777216)   // 17301504 = 0x1080000
+        GPU_Wr32(gpu, SIReg.IH_CNTL, ih_cntl_val)
+
+        // =========================================================
+        // Step 10: Enable interrupts (si_enable_interrupts)
+        //   IH_CNTL  |= ENABLE_INTR   (bit 0)
+        //   IH_RB_CNTL |= IH_RB_ENABLE (bit 0)
+        // =========================================================
+        ih_cntl_en = BitwiseOr(GPU_Rd32(gpu, SIReg.IH_CNTL), 1)
+        GPU_Wr32(gpu, SIReg.IH_CNTL, ih_cntl_en)
+
+        ih_rb_en = BitwiseOr(GPU_Rd32(gpu, SIReg.IH_RB_CNTL), 1)
+        GPU_Wr32(gpu, SIReg.IH_RB_CNTL, ih_rb_en)
+
+        // =========================================================
+        // Step 11: Enable TIME_STAMP_INT on all 3 rings
+        //   MUST be AFTER IH_RB_ENABLE + ENABLE_INTR
+        //   TIME_STAMP_INT_ENABLE = (1 << 26) = 67108864
+        // =========================================================
+        ts_int_en = 67108864     // 1 << 26
+        r0_int = GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING0)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING0, BitwiseOr(r0_int, ts_int_en))
+        r1_int = GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING1)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING1, BitwiseOr(r1_int, ts_int_en))
+        r2_int = GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING2)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING2, BitwiseOr(r2_int, ts_int_en))
+
+        // Readback
+        PrintMessage("[PM4] IH ring: base_gpu=0x")
+        PrintHex(ih_gpu_addr)
+        PrintMessage(" size=4KB (256 entries)\n")
+        PrintMessage("[PM4] IH_RB_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.IH_RB_CNTL))
+        PrintMessage(" IH_RB_BASE=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.IH_RB_BASE))
+        PrintMessage("\n")
+        PrintMessage("[PM4] IH_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.IH_CNTL))
+        PrintMessage(" (expect ENABLE_INTR=1 + 0x1080000)\n")
+        PrintMessage("[PM4] INTERRUPT_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.INTERRUPT_CNTL))
+        PrintMessage(" INTERRUPT_CNTL2=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.INTERRUPT_CNTL2))
+        PrintMessage("\n")
+        PrintMessage("[PM4] CP_INT_CNTL_RING0=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING0))
+        PrintMessage(" RING1=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING1))
+        PrintMessage(" RING2=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING2))
+        PrintMessage("\n")
+
+        PrintMessage("[PM4] IH ring ready\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PM4_DrainIH — advance IH RPTR to match WPTR, preventing overflow
+//
+// Called after each dispatch fence completes. We don't process the
+// interrupt packets — we just need to keep the ring from overflowing
+// so the GPU can keep writing new entries.
+// =============================================================================
+Function.PM4_DrainIH {
+    Input: gpu: Integer
+    Body: {
+        ih_wptr = GPU_Rd32(gpu, SIReg.IH_RB_WPTR)
+        ih_rptr = GPU_Rd32(gpu, SIReg.IH_RB_RPTR)
+        IfCondition NotEqual(ih_rptr, ih_wptr) ThenBlock: {
+            PrintMessage("[IH:drain] RPTR=")
+            PrintNumber(ih_rptr)
+            PrintMessage(" WPTR=")
+            PrintNumber(ih_wptr)
+            PrintMessage(" (")
+            PrintNumber(Divide(Subtract(ih_wptr, ih_rptr), 4))
+            PrintMessage(" entries)\n")
+            // Advance RPTR to WPTR (discard all entries)
+            GPU_Wr32(gpu, SIReg.IH_RB_RPTR, ih_wptr)
+        }
+    }
+}
+
+// =============================================================================
+// PM4_SoftResetCP — reset the Command Processor via GRBM
+//
+// Follows the Linux kernel radeon si_gpu_soft_reset() sequence:
+//   1. Halt RLC (do NOT reset it — halting is safe, resetting wipes state)
+//   2. MC stop: disable VGA render, fence BAR access, blackout MC
+//   3. GRBM_SOFT_RESET (CP + full shader pipeline, NO RLC)
+//   4. SRBM_SOFT_RESET (HDP + GRBM)
+//   5. MC resume: unblackout, re-enable BAR, restore VGA
+//   6. Restart RLC
+//
+// The MC MUST be blackouted before touching soft-reset registers.
+// Without this the reset deadlocks the PCIe bus → system lockup.
+// Must be called while CP is halted.
+// =============================================================================
+Function.PM4_SoftResetCP {
+    Input: gpu: Integer
+    Body: {
+        // --- Step 1: Halt RLC ---
+        // RLC manages DCE power gating.  We HALT it (RLC_CNTL=0), we do NOT
+        // RESET it (SOFT_RESET_RLC is never set).  Halting just stops new
+        // power-gating decisions during the reset window.
+        saved_rlc = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+
+        // --- Step 2: MC stop (evergreen_mc_stop equivalent) ---
+        // Save and disable VGA render
+        saved_vga = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+        GPU_Wr32(gpu, SIReg.VGA_RENDER_CONTROL, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+
+        // Fence CPU BAR access to VRAM
+        saved_bif = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+        GPU_Wr32(gpu, SIReg.BIF_FB_EN, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+
+        // Blackout the Memory Controller
+        saved_blackout = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+        GPU_Wr32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL, BitwiseOr(saved_blackout, 1))
+        rst_flush = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+
+        // Wait ~100us for MC to settle
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 500) {
+            rst_flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+
+        // --- Step 3: GRBM soft reset — CP + full shader pipeline ---
+        // Reset CP and the entire shader pipeline.  Required to clear
+        // wedged state from previous runs (SPI/TC/TA stuck with
+        // GUI_ACTIVE=1).  Without this, dispatch 1 hangs.
+        // NOTE: MMIO readback of SE/SH regs returns 0 after this reset,
+        // but the GPU operates correctly (25 dispatches pass with correct
+        // data).  The readback issue is likely BAR/MMIO path, not GRBM.
+        grbm_mask = Add(GRBMResetBits.SOFT_RESET_CP,
+                    Add(GRBMResetBits.SOFT_RESET_CB,
+                    Add(GRBMResetBits.SOFT_RESET_DB,
+                    Add(GRBMResetBits.SOFT_RESET_GDS,
+                    Add(GRBMResetBits.SOFT_RESET_PA,
+                    Add(GRBMResetBits.SOFT_RESET_SC,
+                    Add(GRBMResetBits.SOFT_RESET_BCI,
+                    Add(GRBMResetBits.SOFT_RESET_SPI,
+                    Add(GRBMResetBits.SOFT_RESET_SX,
+                    Add(GRBMResetBits.SOFT_RESET_TC,
+                    Add(GRBMResetBits.SOFT_RESET_TA,
+                    Add(GRBMResetBits.SOFT_RESET_VGT,
+                        GRBMResetBits.SOFT_RESET_IA))))))))))))
+        GPU_Wr32(gpu, SIReg.GRBM_SOFT_RESET, grbm_mask)
+        rst_flush = GPU_Rd32(gpu, SIReg.GRBM_SOFT_RESET)
+        // Hold assert ~50us
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 200) {
+            rst_flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+        GPU_Wr32(gpu, SIReg.GRBM_SOFT_RESET, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.GRBM_SOFT_RESET)
+
+        // --- Step 4: SRBM soft reset ---
+        // HDP + GRBM.  Both needed for clean init.
+        // Do NOT include SOFT_RESET_MC — kills the memory controller.
+        srbm_mask = Add(SRBMResetBits.SOFT_RESET_HDP, SRBMResetBits.SOFT_RESET_GRBM)
+        GPU_Wr32(gpu, SIReg.SRBM_SOFT_RESET, srbm_mask)
+        rst_flush = GPU_Rd32(gpu, SIReg.SRBM_SOFT_RESET)
+        // Hold assert ~50us
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 200) {
+            rst_flush = GPU_Rd32(gpu, SIReg.SRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+        GPU_Wr32(gpu, SIReg.SRBM_SOFT_RESET, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.SRBM_SOFT_RESET)
+
+        // Post-reset settle ~50us
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 200) {
+            rst_flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+
+        // --- Step 5: MC resume (evergreen_mc_resume equivalent) ---
+        // Unblackout MC
+        GPU_Wr32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL, saved_blackout)
+        rst_flush = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+
+        // Re-enable CPU BAR access — FORCE read+write enable (0x3)
+        // After heavy GRBM_SOFT_RESET, BIF can leave the read path for
+        // 0x8000+ disabled.  Force FB_READ_EN | FB_WRITE_EN = 0x3.
+        GPU_Wr32(gpu, SIReg.BIF_FB_EN, 3)
+        rst_flush = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+        PrintMessage("[PM4] BIF_FB_EN forced=0x3 read=0x")
+        PrintHex(rst_flush)
+        PrintMessage("\n")
+
+        // GRBM_CNTL: set GRBM_READ_TIMEOUT = 0xFF (max)
+        // Prevents fast timeouts on status reads that make them return 0
+        GPU_Wr32(gpu, SIReg.GRBM_CNTL, 255)
+        rst_flush = GPU_Rd32(gpu, SIReg.GRBM_CNTL)
+        PrintMessage("[PM4] GRBM_CNTL wrote=0xFF read=0x")
+        PrintHex(rst_flush)
+        PrintMessage("\n")
+
+        // Quick GRBM read test — did the read path come alive?
+        PrintMessage("[PM4] post-BIF GRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_STATUS))
+        PrintMessage(" SCRATCH_REG0=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SCRATCH_REG0))
+        PrintMessage("\n")
+
+        // Restore VGA render
+        GPU_Wr32(gpu, SIReg.VGA_RENDER_CONTROL, saved_vga)
+        rst_flush = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+
+        // Final settle ~50us
+        rst_i = 0
+        WhileLoop LessThan(rst_i, 200) {
+            rst_flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            rst_i = Add(rst_i, 1)
+        }
+
+        // --- Step 6: Restart RLC ---
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, saved_rlc)
+        rst_flush = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+
+        // --- Step 7: Reprogram golden registers cleared by GRBM_SOFT_RESET ---
+        // GRBM_SOFT_RESET includes SOFT_RESET_SPI which resets SPI_CONFIG_CNTL
+        // to hardware defaults. Without reprogramming, the SPI won't dispatch
+        // wavefronts to shader engines and compute shaders silently fail.
+        //
+        // si_init_golden_registers() programs these via read-modify-write.
+        // Verde golden register: SPI_CONFIG_CNTL &= ~0x07ffffff; |= 0x03000000
+        //   bits [25:24] = GPR_WRITE_PRIORITY = 3 (critical for wave dispatch)
+        spi_cfg = GPU_Rd32(gpu, SIReg.SPI_CONFIG_CNTL)
+        spi_cfg = BitwiseAnd(spi_cfg, 4160749568)  // ~0x07FFFFFF = 0xF8000000
+        spi_cfg = BitwiseOr(spi_cfg, 50331648)     // 0x03000000
+        GPU_Wr32(gpu, SIReg.SPI_CONFIG_CNTL, spi_cfg)
+        PrintMessage("[PM4] SPI_CONFIG_CNTL = 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPI_CONFIG_CNTL))
+        PrintMessage("\n")
+
+        // SPI_CONFIG_CNTL_1: VTX_DONE_DELAY = 4 (bits [3:0])
+        // From si_gpu_init() in the kernel
+        GPU_Wr32(gpu, SIReg.SPI_CONFIG_CNTL_1, 4)
+
+        // SQ_CONFIG = 0 (shader queue defaults)
+        GPU_Wr32(gpu, SIReg.SQ_CONFIG, 0)
+
+        // CP_PERFMON_CNTL = 0 (disable performance monitors)
+        GPU_Wr32(gpu, SIReg.CP_PERFMON_CNTL, 0)
+
+        // --- Disable ALL clock gating (no RLC firmware loaded) ---
+        // Without the RLC managing clock gating dynamically, CUs may be
+        // clock-gated after reset, preventing compute wavefront dispatch
+        // and causing GRBM-routed MMIO reads to return 0.
+        //
+        // CRITICAL: RLC_CNTL must be 0 (halted) FIRST, then set overrides.
+        // If RLC is running when we set overrides, it can undo them.
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, 0)
+        rst_flush = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+        PrintMessage("[PM4] RLC halted (RLC_CNTL=0x")
+        PrintHex(rst_flush)
+        PrintMessage(")\n")
+
+        // RLC_CGTT_MGCG_OVERRIDE = 0xFFFFFFFF: override (disable) all MGCG
+        // This is SRBM-routed (0xC400) — should work even with GRBM dark
+        GPU_Wr32(gpu, SIReg.RLC_CGTT_MGCG_OVERRIDE, 4294967295)
+        cgtt_rb = GPU_Rd32(gpu, SIReg.RLC_CGTT_MGCG_OVERRIDE)
+        PrintMessage("[PM4] MGCG_OVERRIDE wrote=0xFFFFFFFF read=0x")
+        PrintHex(cgtt_rb)
+        PrintMessage("\n")
+
+        // RLC_CGCG_CGLS_CTRL = 0: clear CGCG_EN (bit 0) and CGLS_EN (bit 1)
+        GPU_Wr32(gpu, SIReg.RLC_CGCG_CGLS_CTRL, 0)
+        cgcg_rb = GPU_Rd32(gpu, SIReg.RLC_CGCG_CGLS_CTRL)
+        PrintMessage("[PM4] CGCG_CGLS wrote=0x0 read=0x")
+        PrintHex(cgcg_rb)
+        PrintMessage("\n")
+
+        // CGTS_SM_CTRL_REG (0x9150, GRBM-routed): set OVERRIDE + LS_OVERRIDE
+        // Write 0x600000 = (1<<21)|(1<<22) — don't RMW since read returns 0
+        GPU_Wr32(gpu, SIReg.CGTS_SM_CTRL_REG, 6291456)  // 0x600000
+        cgts_rb = GPU_Rd32(gpu, SIReg.CGTS_SM_CTRL_REG)
+        PrintMessage("[PM4] CGTS_SM wrote=0x600000 read=0x")
+        PrintHex(cgts_rb)
+        PrintMessage("\n")
+
+        // --- CP_DEBUG: enable debug/status readback paths ---
+        // Writing specific bits may keep CP status registers alive.
+        // Try 0x20 (bit 5) — common SI bring-up debug enable.
+        GPU_Wr32(gpu, SIReg.CP_DEBUG, 32)
+        cpdbg_rb = GPU_Rd32(gpu, SIReg.CP_DEBUG)
+        PrintMessage("[PM4] CP_DEBUG wrote=0x20 read=0x")
+        PrintHex(cpdbg_rb)
+        PrintMessage("\n")
+
+        // --- Post-CG GRBM read test ---
+        // Check if GRBM reads work now that clocks should be forced on
+        PrintMessage("[PM4] GRBM test: STATUS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_STATUS))
+        PrintMessage(" SPI_CFG=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPI_CONFIG_CNTL))
+        PrintMessage(" SCRATCH0=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SCRATCH_REG0))
+        PrintMessage("\n")
+
+        // --- CP queue thresholds (from si_gpu_init) ---
+        // ROQ_IB1_START(0x16) = 0x16<<0, ROQ_IB2_START(0x2B) = 0x2B<<8
+        // value = 0x2B16 = 11030
+        GPU_Wr32(gpu, SIReg.CP_QUEUE_THRESHOLDS, Add(Multiply(43, 256), 22))
+        // MEQ1_START(0x30) = 0x30<<0 = 48, MEQ2_START(0x60) = 0x60<<16 = 6291456
+        // value = 0x00600030 = 6291504
+        GPU_Wr32(gpu, SIReg.CP_MEQ_THRESHOLDS, Add(6291456, 48))
+
+        // --- SPI_STATIC_THREAD_MGMT_3: enable CUs for wavefront dispatch ---
+        // The kernel's si_setup_spi() loops over each (SE,SH) pair, reads the
+        // CU active mask, and ensures at least one CU is enabled per SH.
+        // Cape Verde: 1 SE, 2 SH per SE, 5 CUs per SH.
+        // We set GRBM_GFX_INDEX to target each (SE,SH), then write MGMT_3.
+        //
+        // The default after reset may have all bits set (all CUs masked = disabled).
+        // We need to CLEAR bits for active CUs to enable them for dispatch.
+        // Value 0x0 = no CUs masked = all CUs enabled for thread dispatch.
+        spi_se = 0
+        WhileLoop LessThan(spi_se, 1) {    // Cape Verde has 1 SE
+            spi_sh = 0
+            WhileLoop LessThan(spi_sh, 2) {  // 2 SH per SE
+                // Target this specific (SE,SH): INSTANCE_BROADCAST(1<<30) | SE | SH
+                gfx_idx = BitwiseOr(1073741824, BitwiseOr(LeftShift(spi_se, 16), LeftShift(spi_sh, 8)))
+                GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, gfx_idx)
+
+                // Read current THREAD_MGMT_3 and active CU mask
+                mgmt3 = GPU_Rd32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3)
+                cu_mask = GPU_Rd32(gpu, SIReg.CC_GC_SHADER_ARRAY_CONFIG)
+                // Bits SET = CUs ENABLED for wavefront dispatch (kernel si_setup_spi)
+                // 0xFFFF = enable all 16 possible CUs (hardware masks off fused CUs)
+                GPU_Wr32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3, 65535)
+
+                PrintMessage("[PM4] SPI_THREAD_MGMT_3 SE")
+                PrintNumber(spi_se)
+                PrintMessage("/SH")
+                PrintNumber(spi_sh)
+                PrintMessage(": was=0x")
+                PrintHex(mgmt3)
+                PrintMessage(" CU_mask=0x")
+                PrintHex(cu_mask)
+                PrintMessage(" -> 0xFFFF\n")
+
+                spi_sh = Add(spi_sh, 1)
+            }
+            spi_se = Add(spi_se, 1)
+        }
+
+        // Reset GRBM_GFX_INDEX to broadcast mode for all subsequent writes
+        // 0xE0000000 = SH_BROADCAST(1<<29) | INSTANCE_BROADCAST(1<<30) | SE_BROADCAST(1<<31)
+        bcast_val = BitwiseOr(LeftShift(1, 29), BitwiseOr(LeftShift(1, 30), LeftShift(1, 31)))
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, bcast_val)
+        PrintMessage("[PM4] GRBM_GFX_INDEX = 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_GFX_INDEX))
+        PrintMessage(" (broadcast)\n")
+
+        // --- Shader memory config for VMID 0 (from si_init_compute) ---
+        // The kernel programs SH_MEM_* per-VMID via SRBM_GFX_CNTL context select.
+        // Without this, the SPI may have undefined memory aperture config for
+        // compute waves, causing wave retirement to fail silently.
+        // Select VMID 0: VMID=0, QUEUEID=0, MEID=0, PIPEID=0
+        GPU_Wr32(gpu, SIReg.SRBM_GFX_CNTL, 0)
+        // SH_MEM_CONFIG = 0: DEFAULT_MTYPE=UC, ALIGNMENT_MODE=DWORD
+        GPU_Wr32(gpu, SIReg.SH_MEM_CONFIG, 0)
+        // SH_MEM_APE1_BASE=1, APE1_LIMIT=0: disable APE1 (base > limit)
+        GPU_Wr32(gpu, SIReg.SH_MEM_APE1_BASE, 1)
+        GPU_Wr32(gpu, SIReg.SH_MEM_APE1_LIMIT, 0)
+        // SH_MEM_BASES = 0: PRIVATE_BASE=0, SHARED_BASE=0
+        GPU_Wr32(gpu, SIReg.SH_MEM_BASES, 0)
+        PrintMessage("[PM4] SH_MEM_CONFIG=0 APE1_BASE=1 APE1_LIMIT=0 BASES=0 (VMID 0)\n")
+
+        // Readback for diagnostics (may return 0 if GRBM path is dark)
+        PrintMessage("[PM4] SH_MEM readback: CONFIG=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SH_MEM_CONFIG))
+        PrintMessage(" BASES=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SH_MEM_BASES))
+        PrintMessage(" APE1_BASE=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SH_MEM_APE1_BASE))
+        PrintMessage(" APE1_LIMIT=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SH_MEM_APE1_LIMIT))
+        PrintMessage("\n")
+
+        // --- GB_ADDR_CONFIG — memory address decode config ---
+        // Our soft reset cleared this (reads back 0x0 in v50).
+        // Without it the GPU's memory controller uses wrong row/bank/pipe mapping.
+        // Golden value for Cape Verde: 0x12010002 (from gfx_v6_0.c VERDE_GB_ADDR_CONFIG_GOLDEN)
+        //   NUM_PIPES=2 (4 pipes), PIPE_INTERLEAVE_SIZE=0 (256B),
+        //   BANK_INTERLEAVE_SIZE=0, NUM_SHADER_ENGINES=0 (1 SE),
+        //   SHADER_ENGINE_TILE_SIZE=1, NUM_GPUS=0, MULTI_GPU_TILE_SIZE=0,
+        //   ROW_SIZE=2 (2KB), NUM_LOWER_PIPES=0 (1 lower pipe)
+        GPU_Wr32(gpu, SIReg.GB_ADDR_CONFIG, 302055426)
+        PrintMessage("[PM4] GB_ADDR_CONFIG = 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GB_ADDR_CONFIG))
+        PrintMessage(" (wrote 0x12010002 golden)\n")
+
+        // Companion registers that must match GB_ADDR_CONFIG (from si_gpu_init)
+        GPU_Wr32(gpu, SIReg.DMIF_ADDR_CONFIG, 302055426)
+        GPU_Wr32(gpu, SIReg.DMIF_ADDR_CALC, 302055426)
+        GPU_Wr32(gpu, SIReg.HDP_ADDR_CONFIG, 302055426)
+        GPU_Wr32(gpu, SIReg.DMA_TILING_CONFIG, 302055426)
+
+        PrintMessage("[PM4] CP soft reset complete (MC blackout sequence)\n")
+    }
+}

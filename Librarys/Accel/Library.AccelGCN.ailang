@@ -32,12 +32,14 @@ LibraryImport.Accel.ComputeIR_GCN
 // ACCELGCN STATE
 // =============================================================================
 FixedPool.AccelGCNCfg {
-    "gpu_idx":      Initialize=0, CanChange=True   // which GPU (0 = first)
-    "ring_idx":     Initialize=0, CanChange=True   // which ring (0 = GFX)
-    "initialized":  Initialize=0, CanChange=True   // 1 after init
-    "shader_vram":  Initialize=0, CanChange=True   // VRAM offset for shader code
-    "buf_desc_vram": Initialize=0, CanChange=True  // VRAM offset for buffer descriptors
-    "data_vram":    Initialize=0, CanChange=True   // VRAM offset for data buffers
+    "gpu_idx":        Initialize=0, CanChange=True   // which GPU (0 = first)
+    "ring_idx":       Initialize=0, CanChange=True   // which ring (0 = GFX)
+    "initialized":    Initialize=0, CanChange=True   // 1 after init
+    "shader_vram":    Initialize=0, CanChange=True   // VRAM offset for shader code
+    "buf_desc_vram":  Initialize=0, CanChange=True   // VRAM offset for buffer descriptors
+    "data_vram":      Initialize=0, CanChange=True   // VRAM offset for data buffers
+    "dispatch_count": Initialize=0, CanChange=True   // dispatches on current ring (for rotation)
+    "ib_vram":        Initialize=0, CanChange=True   // VRAM offset for IB scratch buffer
 }
 
 // VRAM layout (after ring buffer allocation):
@@ -117,6 +119,26 @@ Function.AccelGCN_Init {
             ReturnValue(-10)
         }
 
+        // Load RLC (Run List Controller) firmware — required for dispatch tracking.
+        // Without RLC, the ME's internal dispatch FIFO (~25 entries per ring) never
+        // drains, causing dispatch 26 to hang.  Must load after soft reset (which
+        // wipes UCODE SRAM) but before CP ring setup.
+        rc = PM4_LoadRLCFirmware(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RLC firmware load failed\n")
+            ReturnValue(-11)
+        }
+
+        // Set up Interrupt Handler (IH) ring — required for dispatch FIFO drain.
+        // The IH ring lets EVENT_WRITE_EOP with INT_SEL=2 write interrupt packets
+        // that the RLC uses to free ME dispatch tracking slots.  Without this,
+        // the FIFO fills after ~25 dispatches and the CP hangs.
+        rc = PM4_SetupIHRing(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] IH ring setup failed\n")
+            ReturnValue(-15)
+        }
+
         // CP misc registers the kernel sets after reset, before ring setup
         GPU_Wr32(gpu, SIReg.CP_SEM_WAIT_TIMER, 0)
         GPU_Wr32(gpu, SIReg.CP_SEM_INCOMPLETE_TIMER, 0)
@@ -171,8 +193,24 @@ Function.AccelGCN_Init {
         }
         PrintMessage("[AccelGCN] compute ring 1 ready\n")
 
-        // Use ring 1 for all compute dispatches
+        // --- Ring 2: second compute ring ---
+        // Ring 2 at VRAM offset 0x4040000 (64MB + 256KB, past ring 1's allocation).
+        rc = PM4_SetupRing(gpu, 2, 67371008)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 2 setup failed\n")
+            ReturnValue(-13)
+        }
+        // Ring 2 test
+        rc = PM4_RingTest(2)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 2 test failed\n")
+            ReturnValue(-14)
+        }
+        PrintMessage("[AccelGCN] compute ring 2 ready\n")
+
+        // Use compute ring 1 for dispatches (ring 0 = GFX has limited dispatch FIFO)
         AccelGCNCfg.ring_idx = 1
+        AccelGCNCfg.dispatch_count = 0
 
         // Re-enable scratch regs via MMIO AFTER ring test.
         // CLEAR_STATE resets SCRATCH_UMSK to 0.  Ring test does PM4_WaitIdle,
@@ -195,6 +233,13 @@ Function.AccelGCN_Init {
         AccelGCNCfg.shader_vram = AccelGCNLayout.SHADER_OFFSET
         AccelGCNCfg.buf_desc_vram = AccelGCNLayout.BUF_DESC_OFFSET
         AccelGCNCfg.data_vram = AccelGCNLayout.DATA_OFFSET
+
+        // IB scratch area: 256 bytes at 0x4060000 (67502080)
+        // Used by PM4_SubmitCompute to build Indirect Buffers containing
+        // DISPATCH_DIRECT + CS_PARTIAL_FLUSH. The ME frees its dispatch
+        // tracking FIFO entry when it returns from the IB to the ring.
+        AccelGCNCfg.ib_vram = 67502080
+        PrintMessage("[AccelGCN] IB VRAM at 0x4060000\n")
 
         // Initialize Compute IR
         rc = CIR_Init()
@@ -564,7 +609,11 @@ Function.AccelGCN_Dispatch {
         num_vgprs = Multiply(Divide(Add(num_vgprs, 3), 4), 4)
         num_sgprs = Multiply(Divide(Add(num_sgprs, 7), 8), 8)
 
-        PrintMessage("[AccelGCN] dispatch: pgm=0x")
+        PrintMessage("[AccelGCN] dispatch(ring=")
+        PrintNumber(ring)
+        PrintMessage(" #")
+        PrintNumber(AccelGCNCfg.dispatch_count)
+        PrintMessage("): pgm=0x")
         PrintHex(pgm_addr)
         PrintMessage(" vgprs=")
         PrintNumber(num_vgprs)
@@ -605,6 +654,7 @@ Function.AccelGCN_Dispatch {
         PM4Dispatch.grid_z = CIRProg.grid_z
         PM4Dispatch.buf_vram_off = AccelGCNCfg.data_vram
         PM4Dispatch.buf_total_size = total_data_size
+        PM4Dispatch.ib_vram_off = AccelGCNCfg.ib_vram
 
         rc = PM4_SubmitCompute(ring)
         IfCondition EqualTo(rc, 0) ThenBlock: {
@@ -620,10 +670,57 @@ Function.AccelGCN_Dispatch {
             ReturnValue(-5)
         }
 
+        // Drain the IH ring — advance RPTR to WPTR so the ring doesn't overflow.
+        // The EOP interrupt packet has been written; the RLC should have already
+        // read it and freed the ME dispatch slot.  We just keep the ring tidy.
+        PM4_DrainIH(dbg_gpu)
+
         // HDP flush — invalidate CPU-side HDP read cache so BAR reads
         // see fresh VRAM written by the shader via GLC=1 MUBUF stores.
         // Without CACHE_FLUSH_AND_INV_TS EOP, the HDP cache is stale.
         GPU_Wr32(dbg_gpu, 21632, 1)    // HDP_MEM_COHERENCY_FLUSH_CNTL = 0x5480
+
+        // --- FULL REGISTER DUMP after every dispatch (accumulation tracking) ---
+        PrintMessage("[DBG:REGS] SRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SRBM_STATUS))
+        PrintMessage(" SRBM2=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SRBM_STATUS2))
+        PrintMessage(" GRBM=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.GRBM_STATUS))
+        PrintMessage(" GRBM2=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.GRBM_STATUS2))
+        PrintMessage("\n")
+        PrintMessage("[DBG:REGS] CP_STALL1=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_STALLED_STAT1))
+        PrintMessage(" STALL2=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_STALLED_STAT2))
+        PrintMessage(" STALL3=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_STALLED_STAT3))
+        PrintMessage(" BUSY=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_BUSY_STAT))
+        PrintMessage(" STAT=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_STAT))
+        PrintMessage("\n")
+        PrintMessage("[DBG:REGS] SPI_BUSY=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SPI_DEBUG_BUSY))
+        PrintMessage(" SQ_STS=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SQ_DEBUG_STS_GLOBAL))
+        PrintMessage(" DISP_ID=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.COMPUTE_DISPATCH_ID))
+        PrintMessage(" CP_DEBUG=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_DEBUG))
+        PrintMessage("\n")
+        PrintMessage("[DBG:REGS] ME_CNTL=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_ME_CNTL))
+        PrintMessage(" RB0=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_RB0_RPTR))
+        PrintMessage(" RB1=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_RB1_RPTR))
+        PrintMessage(" RB2=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_RB2_RPTR))
+        PrintMessage(" INT_ST=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.CP_INT_STATUS_RING0))
+        PrintMessage("\n")
 
         // --- POST-DISPATCH DIAGNOSTICS ---
         // Read dst[0..3] via GPU_VramRd32 (bypasses AccelGCN_VramRead)
@@ -663,6 +760,10 @@ Function.AccelGCN_Dispatch {
         PrintMessage("\n  NUM_THREAD_X=")
         PrintNumber(GPU_Rd32(dbg_gpu, SICompute.NUM_THREAD_X))
         PrintMessage("\n")
+
+        // Dispatch tracking — the ME dispatch FIFO should now drain via
+        // IH ring + RLC, so no periodic CP reset needed.
+        AccelGCNCfg.dispatch_count = Add(AccelGCNCfg.dispatch_count, 1)
 
         PrintMessage("[AccelGCN] dispatch complete\n")
         ReturnValue(0)
