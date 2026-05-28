@@ -1,0 +1,752 @@
+// test_attn.ailang — incremental AccelGCN_Submit path test
+// Exercises the EXACT code path ATTN uses:
+//   HALOp fields → AccelGCN_Submit → CIR build/cache → VRAM upload → dispatch → readback
+// with controlled data at increasing scales to find where it breaks.
+//
+// Each stage only runs if the previous passed. When something fails,
+// you know the LAST working stage and the FIRST broken one.
+//
+// Stages:
+//   1. MatVecMul  16×16,   64-bit, 100 iters — baseline (tiny data, tiny kernel)
+//   2. MatVecMul  64×64,   64-bit, 100 iters — grow kernel (64 unrolled iters)
+//   3. MatVecMul  128×128, 64-bit,  50 iters — DModel scale (128KB data upload)
+//   4. MatTVecMul 128×128, 64-bit,  50 iters — second op type
+//   5. OuterAccum 128×128, 64-bit,  50 iters — third op type (4 buffers)
+//   6. Mixed ops  128×128, 64-bit,  50 cycles — MVM+MTV+OA per cycle (ATTN pattern)
+//   7. MatVecMul  512×128, 64-bit,  50 iters — DFF scale (512KB upload, huge kernel)
+//   8. MatTVecMul 512×128, 64-bit,  50 iters — backward-pass scale
+//
+// Build: ./ailang.x TestCode/test_attn.ailang -o test_attn.x
+// Run:   sudo ./test_attn.x 2>&1 | tee attn_test_log.txt
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.GCNEnc
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+LibraryImport.Accel.HAL
+LibraryImport.Accel.AccelGCN
+
+// =============================================================================
+// RunMVMTest — MatVecMul: dst[i] = sum_j( mat[i,j] * vec[j] )
+//   mat[i,j] = 1 for all entries, vec[j] = j+1
+//   Expected: dst[i] = cols*(cols+1)/2  for all i
+// Returns: number of PASS iterations (== t_iters means all passed)
+// =============================================================================
+Function.RunMVMTest {
+    Input: t_rows: Integer
+    Input: t_cols: Integer
+    Input: t_iters: Integer
+    Output: Integer
+    Body: {
+        mat_elems = Multiply(t_rows, t_cols)
+        mat_bytes = Multiply(mat_elems, 8)
+        vec_bytes = Multiply(t_cols, 8)
+        dst_bytes = Multiply(t_rows, 8)
+
+        host_mat = Allocate(mat_bytes)
+        host_vec = Allocate(vec_bytes)
+        host_dst = Allocate(dst_bytes)
+
+        // Fill mat[i,j] = 1
+        idx = 0
+        WhileLoop LessThan(idx, mat_elems) {
+            StoreValue(Add(host_mat, Multiply(idx, 8)), 1)
+            idx = Add(idx, 1)
+        }
+
+        // Fill vec[j] = j + 1
+        j = 0
+        WhileLoop LessThan(j, t_cols) {
+            StoreValue(Add(host_vec, Multiply(j, 8)), Add(j, 1))
+            j = Add(j, 1)
+        }
+
+        expected = Divide(Multiply(t_cols, Add(t_cols, 1)), 2)
+        total_pass = 0
+
+        iter = 0
+        WhileLoop LessThan(iter, t_iters) {
+            MemorySet(host_dst, 0, dst_bytes)
+
+            HALOp.op   = 1
+            HALOp.dst  = host_dst
+            HALOp.mat  = host_mat
+            HALOp.vec  = host_vec
+            HALOp.rows = t_rows
+            HALOp.cols = t_cols
+
+            rc = AccelGCN_Submit()
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("  FATAL: submit failed iter=")
+                PrintNumber(iter)
+                PrintMessage(" rc=")
+                PrintNumber(rc)
+                PrintMessage("\n")
+                Deallocate(host_mat, mat_bytes)
+                Deallocate(host_vec, vec_bytes)
+                Deallocate(host_dst, dst_bytes)
+                ReturnValue(total_pass)
+            }
+
+            // Verify all rows
+            errors = 0
+            first_bad_idx = 0
+            first_bad_got = 0
+            i = 0
+            WhileLoop LessThan(i, t_rows) {
+                got = Dereference(Add(host_dst, Multiply(i, 8)))
+                IfCondition NotEqual(got, expected) ThenBlock: {
+                    IfCondition EqualTo(errors, 0) ThenBlock: {
+                        first_bad_idx = i
+                        first_bad_got = got
+                    }
+                    errors = Add(errors, 1)
+                }
+                i = Add(i, 1)
+            }
+
+            print_this = 0
+            IfCondition EqualTo(Modulo(iter, 10), 0) ThenBlock: { print_this = 1 }
+            IfCondition GreaterThan(errors, 0) ThenBlock: { print_this = 1 }
+
+            IfCondition EqualTo(print_this, 1) ThenBlock: {
+                PrintMessage("  iter ")
+                PrintNumber(iter)
+                IfCondition EqualTo(errors, 0) ThenBlock: {
+                    PrintMessage(": PASS\n")
+                }
+                IfCondition GreaterThan(errors, 0) ThenBlock: {
+                    PrintMessage(": FAIL ")
+                    PrintNumber(errors)
+                    PrintMessage("/")
+                    PrintNumber(t_rows)
+                    PrintMessage("  [")
+                    PrintNumber(first_bad_idx)
+                    PrintMessage("] got=")
+                    PrintNumber(first_bad_got)
+                    PrintMessage(" exp=")
+                    PrintNumber(expected)
+                    PrintMessage("\n")
+                }
+            }
+
+            IfCondition EqualTo(errors, 0) ThenBlock: {
+                total_pass = Add(total_pass, 1)
+            }
+
+            iter = Add(iter, 1)
+        }
+
+        Deallocate(host_mat, mat_bytes)
+        Deallocate(host_vec, vec_bytes)
+        Deallocate(host_dst, dst_bytes)
+        ReturnValue(total_pass)
+    }
+}
+
+// =============================================================================
+// RunMTVTest — MatTVecMul: dst[j] = sum_i( mat[i,j] * vec[i] )
+//   mat[i,j] = 1 for all entries, vec[i] = i+1
+//   Expected: dst[j] = rows*(rows+1)/2  for all j
+// =============================================================================
+Function.RunMTVTest {
+    Input: t_rows: Integer
+    Input: t_cols: Integer
+    Input: t_iters: Integer
+    Output: Integer
+    Body: {
+        mat_elems = Multiply(t_rows, t_cols)
+        mat_bytes = Multiply(mat_elems, 8)
+        vec_bytes = Multiply(t_rows, 8)
+        dst_bytes = Multiply(t_cols, 8)
+
+        host_mat = Allocate(mat_bytes)
+        host_vec = Allocate(vec_bytes)
+        host_dst = Allocate(dst_bytes)
+
+        // Fill mat[i,j] = 1
+        idx = 0
+        WhileLoop LessThan(idx, mat_elems) {
+            StoreValue(Add(host_mat, Multiply(idx, 8)), 1)
+            idx = Add(idx, 1)
+        }
+
+        // Fill vec[i] = i + 1
+        i = 0
+        WhileLoop LessThan(i, t_rows) {
+            StoreValue(Add(host_vec, Multiply(i, 8)), Add(i, 1))
+            i = Add(i, 1)
+        }
+
+        expected = Divide(Multiply(t_rows, Add(t_rows, 1)), 2)
+        total_pass = 0
+
+        iter = 0
+        WhileLoop LessThan(iter, t_iters) {
+            MemorySet(host_dst, 0, dst_bytes)
+
+            HALOp.op   = 2
+            HALOp.dst  = host_dst
+            HALOp.mat  = host_mat
+            HALOp.vec  = host_vec
+            HALOp.rows = t_rows
+            HALOp.cols = t_cols
+
+            rc = AccelGCN_Submit()
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("  FATAL: submit failed iter=")
+                PrintNumber(iter)
+                PrintMessage(" rc=")
+                PrintNumber(rc)
+                PrintMessage("\n")
+                Deallocate(host_mat, mat_bytes)
+                Deallocate(host_vec, vec_bytes)
+                Deallocate(host_dst, dst_bytes)
+                ReturnValue(total_pass)
+            }
+
+            errors = 0
+            first_bad_idx = 0
+            first_bad_got = 0
+            j = 0
+            WhileLoop LessThan(j, t_cols) {
+                got = Dereference(Add(host_dst, Multiply(j, 8)))
+                IfCondition NotEqual(got, expected) ThenBlock: {
+                    IfCondition EqualTo(errors, 0) ThenBlock: {
+                        first_bad_idx = j
+                        first_bad_got = got
+                    }
+                    errors = Add(errors, 1)
+                }
+                j = Add(j, 1)
+            }
+
+            print_this = 0
+            IfCondition EqualTo(Modulo(iter, 10), 0) ThenBlock: { print_this = 1 }
+            IfCondition GreaterThan(errors, 0) ThenBlock: { print_this = 1 }
+
+            IfCondition EqualTo(print_this, 1) ThenBlock: {
+                PrintMessage("  iter ")
+                PrintNumber(iter)
+                IfCondition EqualTo(errors, 0) ThenBlock: {
+                    PrintMessage(": PASS\n")
+                }
+                IfCondition GreaterThan(errors, 0) ThenBlock: {
+                    PrintMessage(": FAIL ")
+                    PrintNumber(errors)
+                    PrintMessage("/")
+                    PrintNumber(t_cols)
+                    PrintMessage("  [")
+                    PrintNumber(first_bad_idx)
+                    PrintMessage("] got=")
+                    PrintNumber(first_bad_got)
+                    PrintMessage(" exp=")
+                    PrintNumber(expected)
+                    PrintMessage("\n")
+                }
+            }
+
+            IfCondition EqualTo(errors, 0) ThenBlock: {
+                total_pass = Add(total_pass, 1)
+            }
+
+            iter = Add(iter, 1)
+        }
+
+        Deallocate(host_mat, mat_bytes)
+        Deallocate(host_vec, vec_bytes)
+        Deallocate(host_dst, dst_bytes)
+        ReturnValue(total_pass)
+    }
+}
+
+// =============================================================================
+// RunOATest — OuterAccum: mat[i,j] += avec[i] * bvec[j]
+//   mat = all zeros, avec[i] = i+1, bvec[j] = j+1
+//   Expected: mat[i,j] = (i+1)*(j+1)
+// =============================================================================
+Function.RunOATest {
+    Input: t_rows: Integer
+    Input: t_cols: Integer
+    Input: t_iters: Integer
+    Output: Integer
+    Body: {
+        mat_elems  = Multiply(t_rows, t_cols)
+        mat_bytes  = Multiply(mat_elems, 8)
+        avec_bytes = Multiply(t_rows, 8)
+        bvec_bytes = Multiply(t_cols, 8)
+
+        host_mat  = Allocate(mat_bytes)
+        host_avec = Allocate(avec_bytes)
+        host_bvec = Allocate(bvec_bytes)
+
+        // Fill avec[i] = i + 1
+        i = 0
+        WhileLoop LessThan(i, t_rows) {
+            StoreValue(Add(host_avec, Multiply(i, 8)), Add(i, 1))
+            i = Add(i, 1)
+        }
+
+        // Fill bvec[j] = j + 1
+        j = 0
+        WhileLoop LessThan(j, t_cols) {
+            StoreValue(Add(host_bvec, Multiply(j, 8)), Add(j, 1))
+            j = Add(j, 1)
+        }
+
+        total_pass = 0
+
+        iter = 0
+        WhileLoop LessThan(iter, t_iters) {
+            // Zero mat (fresh each iter — result = avec ⊗ bvec, not accumulated)
+            MemorySet(host_mat, 0, mat_bytes)
+
+            HALOp.op   = 3
+            HALOp.dst  = host_mat
+            HALOp.mat  = host_mat
+            HALOp.vec  = host_avec
+            HALOp.vec2 = host_bvec
+            HALOp.rows = t_rows
+            HALOp.cols = t_cols
+
+            rc = AccelGCN_Submit()
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("  FATAL: submit failed iter=")
+                PrintNumber(iter)
+                PrintMessage(" rc=")
+                PrintNumber(rc)
+                PrintMessage("\n")
+                Deallocate(host_mat, mat_bytes)
+                Deallocate(host_avec, avec_bytes)
+                Deallocate(host_bvec, bvec_bytes)
+                ReturnValue(total_pass)
+            }
+
+            // Verify every element: mat[i,j] == (i+1)*(j+1)
+            errors = 0
+            first_bad_r   = 0
+            first_bad_c   = 0
+            first_bad_got = 0
+            first_bad_exp = 0
+            i = 0
+            WhileLoop LessThan(i, t_rows) {
+                j = 0
+                WhileLoop LessThan(j, t_cols) {
+                    flat = Add(Multiply(i, t_cols), j)
+                    got  = Dereference(Add(host_mat, Multiply(flat, 8)))
+                    exp  = Multiply(Add(i, 1), Add(j, 1))
+                    IfCondition NotEqual(got, exp) ThenBlock: {
+                        IfCondition EqualTo(errors, 0) ThenBlock: {
+                            first_bad_r   = i
+                            first_bad_c   = j
+                            first_bad_got = got
+                            first_bad_exp = exp
+                        }
+                        errors = Add(errors, 1)
+                    }
+                    j = Add(j, 1)
+                }
+                i = Add(i, 1)
+            }
+
+            print_this = 0
+            IfCondition EqualTo(Modulo(iter, 10), 0) ThenBlock: { print_this = 1 }
+            IfCondition GreaterThan(errors, 0) ThenBlock: { print_this = 1 }
+
+            IfCondition EqualTo(print_this, 1) ThenBlock: {
+                PrintMessage("  iter ")
+                PrintNumber(iter)
+                IfCondition EqualTo(errors, 0) ThenBlock: {
+                    PrintMessage(": PASS\n")
+                }
+                IfCondition GreaterThan(errors, 0) ThenBlock: {
+                    PrintMessage(": FAIL ")
+                    PrintNumber(errors)
+                    PrintMessage("/")
+                    PrintNumber(mat_elems)
+                    PrintMessage("  [")
+                    PrintNumber(first_bad_r)
+                    PrintMessage(",")
+                    PrintNumber(first_bad_c)
+                    PrintMessage("] got=")
+                    PrintNumber(first_bad_got)
+                    PrintMessage(" exp=")
+                    PrintNumber(first_bad_exp)
+                    PrintMessage("\n")
+                }
+            }
+
+            IfCondition EqualTo(errors, 0) ThenBlock: {
+                total_pass = Add(total_pass, 1)
+            }
+
+            iter = Add(iter, 1)
+        }
+
+        Deallocate(host_mat, mat_bytes)
+        Deallocate(host_avec, avec_bytes)
+        Deallocate(host_bvec, bvec_bytes)
+        ReturnValue(total_pass)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    PrintMessage("=== test_attn: AccelGCN_Submit path test ===\n")
+    PrintMessage("Tests the EXACT code path ATTN uses:\n")
+    PrintMessage("  HALOp -> AccelGCN_Submit -> CIR/KCache -> VRAM upload -> dispatch -> readback\n")
+    PrintMessage("64-bit elements, per-dispatch data upload, KCache, 30-dispatch compute reset\n\n")
+
+    // --- Init GPU ---
+    rc = AccelGCN_Init()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("FATAL: AccelGCN_Init failed rc=")
+        PrintNumber(rc)
+        PrintMessage("\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("GPU init OK\n\n")
+
+    all_ok = 1
+
+    // =====================================================================
+    // STAGE 1: MatVecMul 16×16, 100 iterations
+    // Baseline. Tiny data (2KB mat), tiny kernel (16 unrolled iters).
+    // If THIS fails, AccelGCN_Submit itself is broken.
+    // Crosses the 30-dispatch compute reset 3 times.
+    // =====================================================================
+    PrintMessage("--- Stage 1: MatVecMul 16x16, 100 iters ---\n")
+    PrintMessage("  (tiny data, tiny kernel — baseline)\n")
+    s1_pass = RunMVMTest(16, 16, 100)
+    PrintMessage("Stage 1: ")
+    PrintNumber(s1_pass)
+    PrintMessage("/100")
+    IfCondition EqualTo(s1_pass, 100) ThenBlock: { PrintMessage(" PASS\n\n") }
+    IfCondition LessThan(s1_pass, 100) ThenBlock: {
+        PrintMessage(" *** FAIL ***\n\n")
+        all_ok = 0
+    }
+
+    // =====================================================================
+    // STAGE 2: MatVecMul 64×64, 100 iterations
+    // Grows unrolled kernel to 64 iterations (~10KB machine code).
+    // Tests KCache hit path (first dispatch = miss, rest = hits).
+    // 32KB data upload per dispatch.
+    // =====================================================================
+    IfCondition EqualTo(all_ok, 1) ThenBlock: {
+        PrintMessage("--- Stage 2: MatVecMul 64x64, 100 iters ---\n")
+        PrintMessage("  (64 unrolled iters, 32KB data, KCache exercised)\n")
+        s2_pass = RunMVMTest(64, 64, 100)
+        PrintMessage("Stage 2: ")
+        PrintNumber(s2_pass)
+        PrintMessage("/100")
+        IfCondition EqualTo(s2_pass, 100) ThenBlock: { PrintMessage(" PASS\n\n") }
+        IfCondition LessThan(s2_pass, 100) ThenBlock: {
+            PrintMessage(" *** FAIL ***\n\n")
+            all_ok = 0
+        }
+    }
+
+    // =====================================================================
+    // STAGE 3: MatVecMul 128×128, 50 iterations
+    // DModel scale. 128 unrolled iters (~30KB machine code).
+    // 128KB+ data upload per dispatch.
+    // =====================================================================
+    IfCondition EqualTo(all_ok, 1) ThenBlock: {
+        PrintMessage("--- Stage 3: MatVecMul 128x128, 50 iters ---\n")
+        PrintMessage("  (DModel scale: 128 unrolled, 131KB data upload)\n")
+        s3_pass = RunMVMTest(128, 128, 50)
+        PrintMessage("Stage 3: ")
+        PrintNumber(s3_pass)
+        PrintMessage("/50")
+        IfCondition EqualTo(s3_pass, 50) ThenBlock: { PrintMessage(" PASS\n\n") }
+        IfCondition LessThan(s3_pass, 50) ThenBlock: {
+            PrintMessage(" *** FAIL ***\n\n")
+            all_ok = 0
+        }
+    }
+
+    // =====================================================================
+    // STAGE 4: MatTVecMul 128×128, 50 iterations
+    // Second op type — transposed matrix-vector multiply.
+    // Uses KCache slot 1 (op=2). Same data scale as Stage 3.
+    // =====================================================================
+    IfCondition EqualTo(all_ok, 1) ThenBlock: {
+        PrintMessage("--- Stage 4: MatTVecMul 128x128, 50 iters ---\n")
+        PrintMessage("  (transposed multiply, KCache slot 1)\n")
+        s4_pass = RunMTVTest(128, 128, 50)
+        PrintMessage("Stage 4: ")
+        PrintNumber(s4_pass)
+        PrintMessage("/50")
+        IfCondition EqualTo(s4_pass, 50) ThenBlock: { PrintMessage(" PASS\n\n") }
+        IfCondition LessThan(s4_pass, 50) ThenBlock: {
+            PrintMessage(" *** FAIL ***\n\n")
+            all_ok = 0
+        }
+    }
+
+    // =====================================================================
+    // STAGE 5: OuterAccum 128×128, 50 iterations
+    // Third op type — outer product accumulate. 4 CIR buffers instead of 3.
+    // =====================================================================
+    IfCondition EqualTo(all_ok, 1) ThenBlock: {
+        PrintMessage("--- Stage 5: OuterAccum 128x128, 50 iters ---\n")
+        PrintMessage("  (outer product, 4 buffers, KCache slot 2)\n")
+        s5_pass = RunOATest(128, 128, 50)
+        PrintMessage("Stage 5: ")
+        PrintNumber(s5_pass)
+        PrintMessage("/50")
+        IfCondition EqualTo(s5_pass, 50) ThenBlock: { PrintMessage(" PASS\n\n") }
+        IfCondition LessThan(s5_pass, 50) ThenBlock: {
+            PrintMessage(" *** FAIL ***\n\n")
+            all_ok = 0
+        }
+    }
+
+    // =====================================================================
+    // STAGE 6: Mixed ops 128×128, 50 cycles
+    // Each cycle: MatVecMul + MatTVecMul + OuterAccum
+    // This is what ATTN does every training step — all 3 KCache slots active,
+    // CIR state swapping between ops, data sizes changing.
+    // 150 total dispatches = 5 compute resets.
+    // =====================================================================
+    IfCondition EqualTo(all_ok, 1) ThenBlock: {
+        PrintMessage("--- Stage 6: Mixed ops 128x128, 50 cycles ---\n")
+        PrintMessage("  (MVM+MTV+OA per cycle — the ATTN pattern)\n")
+
+        s6_n     = 128
+        s6_iters = 50
+        s6_pass  = 0
+
+        // Shared buffers
+        s6_mat_elems = Multiply(s6_n, s6_n)
+        s6_mat_bytes = Multiply(s6_mat_elems, 8)
+        s6_vec_bytes = Multiply(s6_n, 8)
+
+        s6_mat   = Allocate(s6_mat_bytes)
+        s6_vec   = Allocate(s6_vec_bytes)
+        s6_dst   = Allocate(s6_vec_bytes)
+        s6_avec  = Allocate(s6_vec_bytes)
+        s6_bvec  = Allocate(s6_vec_bytes)
+        s6_omat  = Allocate(s6_mat_bytes)
+
+        // Fill: mat=1, vec=j+1, avec=i+1, bvec=j+1
+        s6_idx = 0
+        WhileLoop LessThan(s6_idx, s6_mat_elems) {
+            StoreValue(Add(s6_mat, Multiply(s6_idx, 8)), 1)
+            s6_idx = Add(s6_idx, 1)
+        }
+        s6_j = 0
+        WhileLoop LessThan(s6_j, s6_n) {
+            StoreValue(Add(s6_vec,  Multiply(s6_j, 8)), Add(s6_j, 1))
+            StoreValue(Add(s6_avec, Multiply(s6_j, 8)), Add(s6_j, 1))
+            StoreValue(Add(s6_bvec, Multiply(s6_j, 8)), Add(s6_j, 1))
+            s6_j = Add(s6_j, 1)
+        }
+
+        s6_mvm_exp = Divide(Multiply(s6_n, Add(s6_n, 1)), 2)
+
+        s6_iter = 0
+        WhileLoop LessThan(s6_iter, s6_iters) {
+            s6_err = 0
+
+            // --- MVM: dst[i] = sum_j(mat[i,j] * vec[j]) ---
+            MemorySet(s6_dst, 0, s6_vec_bytes)
+            HALOp.op   = 1
+            HALOp.dst  = s6_dst
+            HALOp.mat  = s6_mat
+            HALOp.vec  = s6_vec
+            HALOp.rows = s6_n
+            HALOp.cols = s6_n
+            rc = AccelGCN_Submit()
+            IfCondition LessThan(rc, 0) ThenBlock: { s6_err = 1 }
+
+            // Spot check MVM: dst[0] should be 8256
+            IfCondition EqualTo(s6_err, 0) ThenBlock: {
+                s6_got = Dereference(s6_dst)
+                IfCondition NotEqual(s6_got, s6_mvm_exp) ThenBlock: {
+                    PrintMessage("  MVM verify fail: got=")
+                    PrintNumber(s6_got)
+                    PrintMessage(" exp=")
+                    PrintNumber(s6_mvm_exp)
+                    PrintMessage("\n")
+                    s6_err = 2
+                }
+            }
+
+            // --- MTV: dst[j] = sum_i(mat[i,j] * vec[i]) ---
+            IfCondition EqualTo(s6_err, 0) ThenBlock: {
+                MemorySet(s6_dst, 0, s6_vec_bytes)
+                HALOp.op   = 2
+                HALOp.dst  = s6_dst
+                HALOp.mat  = s6_mat
+                HALOp.vec  = s6_vec
+                HALOp.rows = s6_n
+                HALOp.cols = s6_n
+                rc = AccelGCN_Submit()
+                IfCondition LessThan(rc, 0) ThenBlock: { s6_err = 3 }
+
+                IfCondition EqualTo(s6_err, 0) ThenBlock: {
+                    s6_got = Dereference(s6_dst)
+                    IfCondition NotEqual(s6_got, s6_mvm_exp) ThenBlock: {
+                        PrintMessage("  MTV verify fail: got=")
+                        PrintNumber(s6_got)
+                        PrintMessage(" exp=")
+                        PrintNumber(s6_mvm_exp)
+                        PrintMessage("\n")
+                        s6_err = 4
+                    }
+                }
+            }
+
+            // --- OA: omat[i,j] = 0 + avec[i]*bvec[j] = (i+1)*(j+1) ---
+            IfCondition EqualTo(s6_err, 0) ThenBlock: {
+                MemorySet(s6_omat, 0, s6_mat_bytes)
+                HALOp.op   = 3
+                HALOp.dst  = s6_omat
+                HALOp.mat  = s6_omat
+                HALOp.vec  = s6_avec
+                HALOp.vec2 = s6_bvec
+                HALOp.rows = s6_n
+                HALOp.cols = s6_n
+                rc = AccelGCN_Submit()
+                IfCondition LessThan(rc, 0) ThenBlock: { s6_err = 5 }
+
+                // Spot check: mat[0,0]=1*1=1, mat[1,0]=2*1=2, mat[0,1]=1*2=2
+                IfCondition EqualTo(s6_err, 0) ThenBlock: {
+                    s6_got = Dereference(s6_omat)
+                    IfCondition NotEqual(s6_got, 1) ThenBlock: {
+                        PrintMessage("  OA verify fail [0,0]: got=")
+                        PrintNumber(s6_got)
+                        PrintMessage(" exp=1\n")
+                        s6_err = 6
+                    }
+                }
+                IfCondition EqualTo(s6_err, 0) ThenBlock: {
+                    // mat[1,0] at flat index 1*128+0 = 128
+                    s6_got = Dereference(Add(s6_omat, Multiply(s6_n, 8)))
+                    IfCondition NotEqual(s6_got, 2) ThenBlock: {
+                        PrintMessage("  OA verify fail [1,0]: got=")
+                        PrintNumber(s6_got)
+                        PrintMessage(" exp=2\n")
+                        s6_err = 7
+                    }
+                }
+            }
+
+            // Print progress
+            s6_print = 0
+            IfCondition EqualTo(Modulo(s6_iter, 10), 0) ThenBlock: { s6_print = 1 }
+            IfCondition GreaterThan(s6_err, 0) ThenBlock: { s6_print = 1 }
+
+            IfCondition EqualTo(s6_print, 1) ThenBlock: {
+                PrintMessage("  cycle ")
+                PrintNumber(s6_iter)
+                IfCondition EqualTo(s6_err, 0) ThenBlock: {
+                    PrintMessage(": PASS (MVM+MTV+OA)\n")
+                }
+                IfCondition GreaterThan(s6_err, 0) ThenBlock: {
+                    PrintMessage(": FAIL err=")
+                    PrintNumber(s6_err)
+                    PrintMessage(" (1=mvm_sub 2=mvm_ver 3=mtv_sub 4=mtv_ver 5=oa_sub 6/7=oa_ver)\n")
+                }
+            }
+
+            IfCondition EqualTo(s6_err, 0) ThenBlock: {
+                s6_pass = Add(s6_pass, 1)
+            }
+
+            // If submit itself failed, GPU may be wedged — stop immediately
+            IfCondition EqualTo(s6_err, 1) ThenBlock: { s6_iter = s6_iters }
+            IfCondition EqualTo(s6_err, 3) ThenBlock: { s6_iter = s6_iters }
+            IfCondition EqualTo(s6_err, 5) ThenBlock: { s6_iter = s6_iters }
+
+            s6_iter = Add(s6_iter, 1)
+        }
+
+        PrintMessage("Stage 6: ")
+        PrintNumber(s6_pass)
+        PrintMessage("/")
+        PrintNumber(s6_iters)
+        IfCondition EqualTo(s6_pass, s6_iters) ThenBlock: { PrintMessage(" PASS\n\n") }
+        IfCondition LessThan(s6_pass, s6_iters) ThenBlock: {
+            PrintMessage(" *** FAIL ***\n\n")
+            all_ok = 0
+        }
+
+        Deallocate(s6_mat,  s6_mat_bytes)
+        Deallocate(s6_vec,  s6_vec_bytes)
+        Deallocate(s6_dst,  s6_vec_bytes)
+        Deallocate(s6_avec, s6_vec_bytes)
+        Deallocate(s6_bvec, s6_vec_bytes)
+        Deallocate(s6_omat, s6_mat_bytes)
+    }
+
+    // =====================================================================
+    // STAGE 7: MatVecMul 512×128, 50 iterations
+    // DFF scale — this is the W1 multiply size ATTN actually uses.
+    // 512KB matrix upload, 128 unrolled iters, 8 workgroups.
+    // If earlier stages pass but THIS fails → data size / WC flush problem.
+    // =====================================================================
+    IfCondition EqualTo(all_ok, 1) ThenBlock: {
+        PrintMessage("--- Stage 7: MatVecMul 512x128, 50 iters ---\n")
+        PrintMessage("  (DFF scale: 512KB mat upload, 128 unrolled)\n")
+        s7_pass = RunMVMTest(512, 128, 50)
+        PrintMessage("Stage 7: ")
+        PrintNumber(s7_pass)
+        PrintMessage("/50")
+        IfCondition EqualTo(s7_pass, 50) ThenBlock: { PrintMessage(" PASS\n\n") }
+        IfCondition LessThan(s7_pass, 50) ThenBlock: {
+            PrintMessage(" *** FAIL ***\n\n")
+            all_ok = 0
+        }
+    }
+
+    // =====================================================================
+    // STAGE 8: MatTVecMul 512×128, 50 iterations
+    // Backward-pass scale — the transposed W1 multiply.
+    // 512 unrolled iters → ~120KB machine code. I-cache killer.
+    // If Stage 7 passes but THIS fails → kernel size is the problem.
+    // =====================================================================
+    IfCondition EqualTo(all_ok, 1) ThenBlock: {
+        PrintMessage("--- Stage 8: MatTVecMul 512x128, 50 iters ---\n")
+        PrintMessage("  (backward scale: 512 unrolled iters, ~120KB shader)\n")
+        s8_pass = RunMTVTest(512, 128, 50)
+        PrintMessage("Stage 8: ")
+        PrintNumber(s8_pass)
+        PrintMessage("/50")
+        IfCondition EqualTo(s8_pass, 50) ThenBlock: { PrintMessage(" PASS\n\n") }
+        IfCondition LessThan(s8_pass, 50) ThenBlock: {
+            PrintMessage(" *** FAIL ***\n\n")
+            all_ok = 0
+        }
+    }
+
+    // =====================================================================
+    // FINAL SUMMARY
+    // =====================================================================
+    PrintMessage("\n========================================\n")
+    PrintMessage("=          FINAL RESULT                =\n")
+    PrintMessage("========================================\n")
+    IfCondition EqualTo(all_ok, 1) ThenBlock: {
+        PrintMessage("*** ALL 8 STAGES PASS ***\n")
+        PrintMessage("AccelGCN_Submit path is solid at ATTN scales.\n")
+    }
+    IfCondition EqualTo(all_ok, 0) ThenBlock: {
+        PrintMessage("*** FAILURES DETECTED ***\n")
+        PrintMessage("Check output above for the first failing stage.\n")
+    }
+    PrintMessage("========================================\n")
+
+    discard = AccelGCN_Shutdown()
+    PrintMessage("=== Done ===\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)
