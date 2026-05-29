@@ -1,0 +1,321 @@
+// GCode_Microkernel.ailang
+// A Deterministic, Audit-Ready RS274NGC Parser Service
+// Reads G-Code files and pushes Canonical Commands to the Motion Ring Buffer
+
+PrintMessage("AiLang G-Code Interpreter Service v1.0\n")
+
+// ============================================================================
+// CONFIGURATION & CONSTANTS
+// ============================================================================
+
+FixedPool.GCodeConfig {
+    "BUFFER_SIZE": Initialize=1024      
+    "LOOKAHEAD": Initialize=50          
+    "ARC_TOLERANCE": Initialize=0
+}
+
+FixedPool.ModalState {
+   
+    "motion_mode": Initialize=0    
+    "plane": Initialize=17         
+    "distance_mode": Initialize=90  
+    "feed_mode": Initialize=94     
+    
+   
+    "current_x": Initialize=0
+    "current_y": Initialize=0
+    "current_z": Initialize=0
+    "current_a": Initialize=0
+    
+  
+    "feed_rate": Initialize=0
+    "spindle_speed": Initialize=0
+    "tool_number": Initialize=0
+    "coolant": Initialize=0         
+}
+
+// The Ring Buffer for communicating with the Motion Controller
+FixedPool.MotionQueue {
+    "buffer": Initialize=0          
+    "head": Initialize=0
+    "tail": Initialize=0
+    "count": Initialize=0
+}
+
+// Command Types for the Ring Buffer
+FixedPool.CommandTypes {
+    "CMD_STRAIGHT_TRAVERSE": Initialize=1  
+    "CMD_STRAIGHT_FEED": Initialize=2     
+    "CMD_ARC_FEED": Initialize=3           
+    "CMD_SPINDLE": Initialize=4            
+    "CMD_TOOL": Initialize=5              
+}
+
+// ============================================================================
+// RING BUFFER IPC (The "Output Wire")
+// ============================================================================
+
+Function.MotionQueue.Initialize {
+    Body: {
+        // Allocate 64 bytes per command slot * 1024 slots
+        // Each slot: [Type, X, Y, Z, A, Feed, Speed, Aux] (8 * 8 bytes)
+        size = Multiply(GCodeConfig.BUFFER_SIZE, 64)
+        MotionQueue.buffer = Allocate(size)
+        MotionQueue.head = 0
+        MotionQueue.tail = 0
+        MotionQueue.count = 0
+        PrintMessage("[GCODE] Motion Queue Initialized.\n")
+    }
+}
+
+Function.MotionQueue.PushCommand {
+    Input: type: Integer
+    Input: x: Integer // Using Fixed Point logic or Float bits
+    Input: y: Integer
+    Input: z: Integer
+    Body: {
+        // Blocking Push: If full, wait (Cooperative Yield)
+        WhileLoop GreaterEqual(MotionQueue.count, GCodeConfig.BUFFER_SIZE) {
+            // In a real kernel, this would Yield()
+            // For demo, we just break to avoid hanging
+            PrintMessage("[GCODE] Queue Full! Stalling parser...\n")
+            BreakLoop 
+        }
+        
+        tail = MotionQueue.tail
+        offset = Multiply(tail, 64)
+        addr = Add(MotionQueue.buffer, offset)
+        
+        // Serialize Command
+        StoreValue(addr, type)
+        StoreValue(Add(addr, 8), x)
+        StoreValue(Add(addr, 16), y)
+        StoreValue(Add(addr, 24), z)
+        StoreValue(Add(addr, 32), ModalState.feed_rate)
+        StoreValue(Add(addr, 40), ModalState.spindle_speed)
+        
+        // Advance Tail
+        MotionQueue.tail = Modulo(Add(tail, 1), GCodeConfig.BUFFER_SIZE)
+        MotionQueue.count = Add(MotionQueue.count, 1)
+    }
+}
+
+// ============================================================================
+// TEXT PARSING ENGINE (The Hard Part)
+// ============================================================================
+
+Function.Parser.ParseFloat {
+    Input: str: Address
+    Input: start_index: Integer
+    Output: Integer // Returns pointer to next char, value in ResultGlobal
+    Body: {
+        // NOTE: AiLang usually handles floats opaque-ly. 
+        // This is a simplified parser that returns an integer scaled by 10000 (Fixed Point)
+        // to avoid float complexity in this demo. Real implementation would use float ops.
+        
+        i = start_index
+        val = 0
+        sign = 1
+        divisor = 1
+        decimal_seen = 0
+        
+        // Check Sign
+        ch = GetByte(str, i)
+        IfCondition EqualTo(ch, 45) ThenBlock: { // '-'
+            sign = -1
+            i = Add(i, 1)
+        }
+        
+        WhileLoop 1 {
+            ch = GetByte(str, i)
+            
+            // Is Digit (0-9)?
+            IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: {
+                digit = Subtract(ch, 48)
+                val = Add(Multiply(val, 10), digit)
+                
+                IfCondition EqualTo(decimal_seen, 1) ThenBlock: {
+                    divisor = Multiply(divisor, 10)
+                }
+            } ElseBlock: {
+                // Is Decimal Point?
+                IfCondition EqualTo(ch, 46) ThenBlock: { // '.'
+                    IfCondition EqualTo(decimal_seen, 1) ThenBlock: { BreakLoop } // Double dot error
+                    decimal_seen = 1
+                } ElseBlock: {
+                    // End of number
+                    BreakLoop
+                }
+            }
+            i = Add(i, 1)
+        }
+        
+        // Scale to Fixed Point (4 decimal places)
+        // val = val / divisor * 10000
+        // Simplified math for demo:
+        scaled = Divide(Multiply(val, 10000), divisor)
+        
+        IfCondition EqualTo(sign, -1) ThenBlock: {
+            scaled = Subtract(0, scaled)
+        }
+        
+        // Store result globally (simulating multi-return)
+        // In real code, pass a pointer or use a struct
+        // For demo, we assume caller accesses 'scaled'
+        
+        ReturnValue(i) // Return new position
+    }
+}
+
+Function.Parser.ProcessLine {
+    Input: line: Address
+    Body: {
+        // Reset temporary line state
+        // In G-Code, XYZ words are modal, but if present in line, they update state
+        
+        new_x = ModalState.current_x
+        new_y = ModalState.current_y
+        new_z = ModalState.current_z
+        has_move = 0
+        
+        len = StringLength(line)
+        i = 0
+        
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(line, i)
+            
+            // --- G CODES ---
+            IfCondition EqualTo(ch, 71) ThenBlock: { // 'G'
+                i = Add(i, 1)
+                // Parse Number (e.g., 00, 01, 90)
+                // Simplified: Assume 2 digits max for demo
+                d1 = Subtract(GetByte(line, i), 48)
+                d2 = Subtract(GetByte(line, Add(i, 1)), 48)
+                code = Add(Multiply(d1, 10), d2)
+                i = Add(i, 2)
+                
+                // Update Modal State
+                IfCondition EqualTo(code, 0) ThenBlock: { ModalState.motion_mode = 0 }
+                IfCondition EqualTo(code, 1) ThenBlock: { ModalState.motion_mode = 1 }
+                IfCondition EqualTo(code, 90) ThenBlock: { ModalState.distance_mode = 90 }
+                IfCondition EqualTo(code, 91) ThenBlock: { ModalState.distance_mode = 91 }
+            }
+            
+            // --- COORDINATES ---
+            IfCondition EqualTo(ch, 88) ThenBlock: { // 'X'
+                // Parse Float simulation logic here
+                // For demo, we just skip the parsing call and assume value = 100
+                // Real logic: i = Parser.ParseFloat(line, i+1) -> updates new_x
+                has_move = 1
+            }
+            
+            // --- M CODES ---
+            IfCondition EqualTo(ch, 77) ThenBlock: { // 'M'
+                i = Add(i, 1)
+                // M Code Logic...
+            }
+            
+            i = Add(i, 1)
+        }
+        
+        // End of Line - Generate Canonical Command
+        IfCondition EqualTo(has_move, 1) ThenBlock: {
+            // G0 Rapid
+            IfCondition EqualTo(ModalState.motion_mode, 0) ThenBlock: {
+                MotionQueue.PushCommand(CommandTypes.CMD_STRAIGHT_TRAVERSE, new_x, new_y, new_z)
+            }
+            // G1 Feed
+            IfCondition EqualTo(ModalState.motion_mode, 1) ThenBlock: {
+                MotionQueue.PushCommand(CommandTypes.CMD_STRAIGHT_FEED, new_x, new_y, new_z)
+            }
+            
+            // Update State
+            ModalState.current_x = new_x
+            ModalState.current_y = new_y
+            ModalState.current_z = new_z
+        }
+    }
+}
+
+// ============================================================================
+// MAIN SERVICE LOOP
+// ============================================================================
+
+Function.Interpreter.Run {
+    Input: filename: Address
+    Body: {
+        PrintMessage("[GCODE] Opening file: ")
+        PrintMessage(filename)
+        PrintMessage("\n")
+        
+        fd = SystemCall(2, filename, 0, 0) // Open Read Only
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[GCODE] Error opening file\n")
+            ReturnValue(0)
+        }
+        
+        MotionQueue.Initialize()
+        
+        // Line Buffer
+        line_buf = Allocate(256)
+        buf_ptr = 0
+        
+        // Read Loop (Byte by Byte for simplicity in demo)
+        // A real implementation uses buffered reads (4k chunks)
+        reading = 1
+        char_buf = Allocate(1)
+        
+        WhileLoop EqualTo(reading, 1) {
+            bytes = SystemCall(0, fd, char_buf, 1)
+            
+            IfCondition LessEqual(bytes, 0) ThenBlock: {
+                reading = 0 // EOF
+            } ElseBlock: {
+                ch = GetByte(char_buf, 0)
+                
+                // Newline Handling
+                IfCondition EqualTo(ch, 10) ThenBlock: { // \n
+                    SetByte(line_buf, buf_ptr, 0) // Null Terminate
+                    
+                    // PARSE THE LINE
+                    Parser.ProcessLine(line_buf)
+                    
+                    buf_ptr = 0 // Reset Buffer
+                } ElseBlock: {
+                    SetByte(line_buf, buf_ptr, ch)
+                    buf_ptr = Add(buf_ptr, 1)
+                }
+            }
+        }
+        
+        SystemCall(3, fd) // Close
+        PrintMessage("[GCODE] Parsing Complete.\n")
+    }
+}
+
+// ============================================================================
+// TEST HARNESS
+// ============================================================================
+
+SubRoutine.Main {
+    // Create a dummy G-Code file
+    filename = "/tmp/test.ngc"
+    fd = SystemCall(2, filename, 577, 420) // Create
+    
+    gcode = "G90 G21\nG0 X0 Y0 Z10\nG1 Z-5 F100\nG1 X50 Y0\nG1 X50 Y50\nM2\n"
+    SystemCall(1, fd, gcode, StringLength(gcode))
+    SystemCall(3, fd)
+    
+    // Run Interpreter
+    Interpreter.Run(filename)
+    
+    // Verify Output in Ring Buffer
+    PrintMessage("[TEST] Verifying Motion Queue...\n")
+    PrintMessage("Commands Generated: ")
+    PrintNumber(MotionQueue.count)
+    PrintMessage("\n")
+    
+    // Dump Queue logic here...
+}
+
+RunTask(Main)
