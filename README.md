@@ -10,6 +10,8 @@ This is the official self-hosting repository for **AILang**, featuring:
 - **Comprehensive standard libraries** — display rendering, UI components, and system utilities
 - **Full development toolchain** — CLI tools, console, testing harness, and documentation
 - **Desktop environment** — display server with window management, taskbar, and UI framework
+- **26 comprehensive programming manuals** — step-by-step guides for language mastery
+- **150+ demo programs** — real-world examples covering all language features
 
 ## Quick Start
 
@@ -29,6 +31,46 @@ To uninstall:
 ```bash
 sudo rm /usr/local/bin/ailang.x /usr/local/bin/analyzer.x
 ```
+
+## Learning AILang
+
+### 📚 26 Programming Manuals
+
+The `Programming_Manual/` directory contains **26 comprehensive guides** covering:
+
+- **Language Fundamentals** — syntax, types, control flow, functions
+- **Memory Management** — allocators, pointers, pools, lifetimes
+- **Data Structures** — arrays, hashmaps, linked lists
+- **System Programming** — syscalls, file I/O, process management
+- **Concurrent Programming** — tasks, message passing, concurrency patterns
+- **Graphics & UI** — display rendering, window management, event handling
+- **Standard Library Deep Dives** — detailed exploration of each library module
+- **Performance Optimization** — profiling, optimization techniques, benchmarking
+- **Real-World Patterns** — idiomatic AILang code patterns and best practices
+
+Each manual is structured as a hands-on guide with examples and exercises.
+
+### 🎯 150+ Demo Programs
+
+The `Demo Programs/` directory includes **over 150 runnable examples**:
+
+- **Beginner Programs** — Hello World, basic arithmetic, string operations
+- **Control Flow Examples** — conditionals, loops, pattern matching
+- **Data Structure Usage** — working with arrays, pools, linked lists
+- **Functional Programming** — functions, lambdas, combinators, recursion
+- **Systems Programming** — file operations, process management, signals
+- **Graphics Programs** — rendering, animation, UI components
+- **Game Examples** — simple games demonstrating game loops and state management
+- **Concurrency Examples** — tasks, message passing, synchronization
+- **Compiler Examples** — parsing, ASTs, code generation
+- **Complete Applications** — projects demonstrating full AILang capabilities
+
+### Getting Started Recommendations
+
+1. **Read First:** `Programming_Manual/01_Introduction_to_Ailang.md`
+2. **Play With:** Start with demo programs in `Demo Programs/beginner/`
+3. **Reference:** Consult manuals as needed for deeper topics
+4. **Build:** Create your own programs using examples as templates
 
 ## Repository Structure
 
@@ -58,8 +100,20 @@ sudo rm /usr/local/bin/ailang.x /usr/local/bin/analyzer.x
 │   ├── KeyMap/                  # Keyboard mapping
 │   └── TextBuffer/              # Text buffer management
 │
+├── Programming_Manual/           # 26 comprehensive guides
+│   ├── 01_Introduction_to_Ailang.md
+│   ├── 02_Basic_Syntax_and_Types.md
+│   ├── 03_Control_Flow.md
+│   ├── ...
+│   └── 26_Advanced_Techniques.md
+│
+├── Demo Programs/                # 150+ runnable example programs
+│   ├── beginner/
+│   ├── intermediate/
+│   ├── advanced/
+│   └── applications/
+│
 ├── Applications/                 # Sample applications
-├── Demo Programs/                # Demonstration programs
 ├── TestCode/                     # Testing code examples
 ├── Tests/                        # Test suite & harness
 │   └── Test262Harness.ailang    # ECMAScript Test262 harness
@@ -77,8 +131,7 @@ sudo rm /usr/local/bin/ailang.x /usr/local/bin/analyzer.x
 ├── C-64 basic intepreter/       # Commodore 64 BASIC interpreter
 │
 ├── Language Docs BNF grammar etc/  # Language specification & grammar
-├── Programming_Manual/             # Developer guide
-├── Library Manuals/                # Library documentation
+├── Library Manuals/                # Library module documentation
 ├── Docs/                           # Additional documentation
 │
 ├── Media/                       # Media assets
@@ -112,9 +165,10 @@ sudo rm /usr/local/bin/ailang.x /usr/local/bin/analyzer.x
 
 ### Language & Compiler
 - **Verb-first syntax** — Natural language-inspired programming paradigm
-- **Self-hosted** — AILang compiler written in AILang
+- **Self-hosted** — AILang compiler written in AILang (43,000+ lines across 75 files)
 - **Static typing** — Compile-time type checking
 - **Direct code generation** — Compiles to machine code via custom toolchain
+- **Explicit semantics** — No hidden behavior, no implicit coercions
 
 ### Standard Library
 - **Display & Rendering**
@@ -139,10 +193,16 @@ sudo rm /usr/local/bin/ailang.x /usr/local/bin/analyzer.x
 
 ### Development Tools
 - **Language Server** — Full IDE support via LSP
-- **VS Code Extension** — Syntax highlighting, snippets, language features
+- **VS Code Extension** — Syntax highlighting, snippets, language features, connectome graph
 - **REPL Consoles** — Interactive AILang and AIMacro interpreters
 - **Test Harness** — ECMAScript Test262 compatibility
-- **Analyzer** — Code analysis and diagnostics
+- **Analyzer** — Three-pass static analysis (memory, control flow, data flow)
+
+### Educational Resources
+- **26 Programming Manuals** — Structured learning path from beginner to advanced
+- **150+ Demo Programs** — Runnable examples for every language feature
+- **Library Manuals** — In-depth documentation for each standard library module
+- **BNF Grammar** — Formal language specification
 
 ### Applications & Examples
 - **C64 BASIC Interpreter** — Vintage computer emulation
@@ -160,6 +220,15 @@ ailang.x your_program.ailang
 
 The compiler generates an executable binary. Library imports are resolved at compile-time from the `Librarys/` directory.
 
+### Compile and Run from VS Code
+
+**Keyboard shortcuts:**
+- `Ctrl+Shift+B` — Compile current file
+- `F5` — Compile and run
+- `Ctrl+Shift+A` — Run static analysis
+
+Binaries are output to the current directory (configurable).
+
 ## Testing
 
 Run the test suite:
@@ -176,8 +245,9 @@ See `TEST_ODDITIES.md` for known test quirks and edge cases.
 
 ## Documentation
 
+- **Programming Manual (26 guides)** — `Programming_Manual/`
+- **Demo Programs (150+)** — `Demo Programs/`
 - **Language Specification** — `Language Docs BNF grammar etc/`
-- **Programming Manual** — `Programming_Manual/`
 - **Library Reference** — `Library Manuals/`
 - **Technical Docs** — `Docs/`
 
@@ -216,6 +286,7 @@ The AILang compiler, language server, and all `.ailang` source code remain under
 - Modifications must be submitted upstream for review (per SCSL)
 - See individual module READMEs in `Librarys/` for development guidelines
 - Test coverage via `Test262Harness.ailang` and `AIMacro_Tests/`
+- Learning resources in `Programming_Manual/` and `Demo Programs/` welcome community contributions
 
 ## Related Projects
 
@@ -230,12 +301,25 @@ The AILang compiler, language server, and all `.ailang` source code remain under
 ## Support & Contact
 
 - **License inquiries:** `smc.collins1977@gmail.com`
-- **Documentation:** See `Docs/` and manuals
+- **Learning:** Start with `Programming_Manual/01_Introduction_to_Ailang.md`
+- **Examples:** Browse `Demo Programs/` for runnable code
 - **Issues & Development:** See `Plans/` directory
 - **Known quirks:** See `TEST_ODDITIES.md`
 
 ---
 
-**AILang** — A modern programming language with verb-first syntax, built by the community for performance, clarity, and self-hosting capability.
+## Project Statistics
+
+- **Compiler Size:** 43,000+ lines of AILang code
+- **Self-hosting:** Achieved in 43 days
+- **Programming Manuals:** 26 comprehensive guides
+- **Demo Programs:** 150+ runnable examples
+- **Standard Library:** Modular, hierarchical organization
+- **Test Coverage:** Extensive with Test262 harness
+- **Zero external dependencies:** Fully self-contained
+
+---
+
+**AILang** — A modern programming language with verb-first syntax, built for performance, clarity, and self-hosting capability. Learn by reading manuals and experimenting with 150+ demo programs.
 
 *Last updated: May 2026*
