@@ -7,15 +7,15 @@ Welcome to the **AILang Programming Language** — a production-grade, self-host
 This is the official self-hosting repository for **AILang**, featuring:
 
 - **Ultra-efficient compiler** (760 KB) — Self-hosted, generates highly optimized native binaries
-- **57 POSIX CoreUtils** — Production reimplementation of essential Unix utilities with custom regex engine
+- **57 POSIX CoreUtils** — reimplementation of essential Unix utilities with custom regex engine, in development
 - **Complete windowing system** (800 KB) — Full display server with window manager, compositor, and UI framework
-- **Full-featured web browser** (2.3 MB) — Built-in JavaScript JVM with 92.7% ECMAScript compliance, plus ongoing HTML/CSS development
-- **GPU computing** — Native GCN driver with compute fixes for legacy cards (GCN 1.0 / HD7750+)
+- **In development web browser** (2.3 MB) — Built-in JavaScript JVM with 92.7% ECMAScript compliance, plus ongoing HTML/CSS development
+- **GPU computing** — Native GCN driver with compute fixes for legacy cards (GCN 1.0 / HD7750+), in development
 - **Kernel module layer** — Direct OS integration (in development)
 - **Motion control library** — CNC machine programming and trajectory planning
 - **Hardware driver ecosystem** — Memryx MX3 accelerator, custom device drivers
-- **Multi-architecture IR backend** — Ready for x86_64, ARM, RISC-V, and others
-- **High-performance primitives** — 22 built-in string methods, SSE2-optimized functions, deep performance optimization
+- **Multi-architecture IR backend** — Ready for ARM, RISC-V, and others
+- **High-performance primitives** — 22 built-in string methods, SSE2-optimized functions, deep performance optimization, and more. 
 - **26 comprehensive programming manuals** — Step-by-step guides for language mastery
 - **150+ demo programs** — Real-world examples covering all features and use cases
 
