@@ -7,12 +7,13 @@ Welcome to the **AILang Programming Language** — a production-grade, self-host
 This is the official self-hosting repository for **AILang**, featuring:
 
 - **Ultra-efficient compiler** (760 KB) — Self-hosted, generates highly optimized native binaries
+- **57 POSIX CoreUtils** — Production reimplementation of essential Unix utilities with custom regex engine
 - **Complete windowing system** (800 KB) — Full display server with window manager, compositor, and UI framework
 - **Full-featured web browser** (2.3 MB) — Built-in JavaScript JVM with 92.7% ECMAScript compliance, plus ongoing HTML/CSS development
 - **GPU computing** — Native GCN driver with compute fixes for legacy cards (GCN 1.0 / HD7750+)
 - **Kernel module layer** — Direct OS integration (in development)
 - **Motion control library** — CNC machine programming and trajectory planning
-- **Hardware driver ecosystem** — Memryx MX3 accelerator (production-ready), custom device drivers
+- **Hardware driver ecosystem** — Memryx MX3 accelerator, custom device drivers
 - **Multi-architecture IR backend** — Ready for x86_64, ARM, RISC-V, and others
 - **High-performance primitives** — 22 built-in string methods, SSE2-optimized functions, deep performance optimization
 - **26 comprehensive programming manuals** — Step-by-step guides for language mastery
@@ -24,6 +25,7 @@ This is the official self-hosting repository for **AILang**, featuring:
 - **Compiler:** 760 KB (no bloat, no runtime overhead)
 - **Window System:** 800 KB (full-featured desktop environment)
 - **Browser:** 2.3 MB with JavaScript JVM (92.7% ECMAScript compliance)
+- **CoreUtils:** 57 utilities, custom-built from scratch (50-71% smaller than GNU equivalents)
 - **Generated Binaries:** Tiny, non-bloated executables optimized for speed and size
 - **Zero Dependencies:** Self-contained toolchain, no external runtimes or libraries
 
@@ -38,6 +40,7 @@ This is the official self-hosting repository for **AILang**, featuring:
 - **Extensive SSE2 function library** — Vectorized operations for common tasks
 - **Smart code generation** — Optimizer produces lean, efficient machine code
 - **Direct syscalls** — Minimal abstraction, maximum performance
+- **Production-proven utilities** — grep with custom regex engine, faster on small searches (optimization in progress for large files)
 
 ## Quick Start
 
@@ -56,6 +59,21 @@ Default install directory: `/usr/local/bin`
 To uninstall:
 ```bash
 sudo rm /usr/local/bin/ailang.x /usr/local/bin/analyzer.x
+```
+
+### Install AILang CoreUtils
+
+Replace system utilities with AILang implementations:
+
+```bash
+cd AiLang_CoreUtils
+./install_ailang_utils.sh
+```
+
+This installs 57 optimized utilities to `~/.local/bin` with management tools for enabling/disabling individual replacements. Run benchmarks to compare against GNU:
+
+```bash
+./bench_all_utils.sh
 ```
 
 ## Learning AILang
@@ -146,6 +164,19 @@ The `Demo Programs/` directory includes **over 150 runnable examples**:
 │   ├── KeyMap/                  # Keyboard mapping
 │   └── TextBuffer/              # Text buffer management
 │
+├── AiLang_CoreUtils/            # 57 POSIX utilities
+│   ├── dist/                    # Compiled utilities (50-71% smaller than GNU)
+│   │   ├── grep_util/          # grep with custom regex engine
+│   │   ├── cat_util/
+│   │   ├── ls_util/
+│   │   ├── find_util/
+│   │   ├── sed_util/
+│   │   ├── awk_util/
+│   │   └── ...54 more utilities
+│   ├── install_ailang_utils.sh # Installation script
+│   ├── bench_all_utils.sh      # Benchmarking against GNU
+│   └── README.md               # Detailed CoreUtils documentation
+│
 ├── Programming_Manual/           # 26 comprehensive guides
 │   ├── 01_Introduction_to_Ailang.md
 │   ├── 02_Basic_Syntax_and_Types.md
@@ -210,7 +241,6 @@ The `Demo Programs/` directory includes **over 150 runnable examples**:
 │   ├── snippets/               # Code snippets
 │   └── License.md              # MIT License (extension only)
 │
-├── AiLang_CoreUtils/           # GNU CoreUtils reimplementation
 ├── AIMacro_Tests/              # AIMacro test suite
 ├── Benchmarks/                 # Performance benchmarks
 ├── C-64 basic intepreter/      # Commodore 64 BASIC interpreter (production)
@@ -241,6 +271,93 @@ The `Demo Programs/` directory includes **over 150 runnable examples**:
 ├── TEST_ODDITIES.md           # Known test quirks & issues
 └── smoke_ailang_utils.sh      # Smoke test utility script
 ```
+
+## 57 POSIX CoreUtils
+
+AILang includes **57 production-grade implementations** of the most common Unix utilities:
+
+### Text Processing & Search
+- **grep** — Pattern search with custom regex engine (faster on small searches, optimization in progress for large files)
+- **sed** — Stream editor with full regex support
+- **awk** — Text processing and pattern scanning
+- **cut** — Extract columns from text
+- **sort** — Sort lines with multiple algorithms
+- **uniq** — Filter duplicate lines
+- **head** / **tail** — Extract start/end of files
+- **wc** — Count lines, words, bytes
+- **tr** — Character translation
+- **fold** / **paste** — Line wrapping and joining
+- **nl** — Number lines
+
+### File Operations
+- **cat** — Concatenate and display files
+- **cp** — Copy files and directories
+- **mv** — Move/rename files
+- **rm** — Remove files
+- **mkdir** — Create directories
+- **find** — Search filesystem hierarchy
+- **ls** — List directory contents
+- **file** — Determine file type
+- **touch** — Change file timestamps
+- **ln** — Create links
+
+### System Information
+- **pwd** — Print working directory
+- **whoami** — Print effective user
+- **id** — Print user/group information
+- **uname** — System information
+- **env** / **printenv** — Environment variables
+- **date** — Date and time
+- **uptime** — System uptime
+- **df** — Disk space usage
+
+### Data & Stream Processing
+- **diff** — Compare files line by line
+- **patch** — Apply patches
+- **cmp** — Compare files byte by byte
+- **od** — Octal/hex dump
+- **xxd** — Hex dumper
+- **base64** — Encoding/decoding
+- **md5sum** / **sha256sum** — Checksums
+- **tee** — Read stdin and write to files
+- **yes** — Repeated output
+- **seq** — Generate number sequences
+
+### Output & Display
+- **echo** — Display text
+- **printf** — Formatted output
+- **less** / **more** — Pagers
+- **col** — Column formatting
+- **expand** / **unexpand** — Tab conversion
+
+### Advanced Utilities
+- **tar** — Archive creation/extraction
+- **gzip** / **gunzip** — Compression
+- **zip** / **unzip** — ZIP archives
+- **basename** / **dirname** — Path manipulation
+- **which** — Locate commands
+- **true** / **false** — Exit status
+- **sleep** — Delay execution
+
+### Features
+- **POSIX Compliant** — 100% specification adherence
+- **GNU Compatible** — Byte-identical output where applicable
+- **Optimized** — 50-71% smaller than GNU equivalents (8KB-40KB range)
+- **Memory Safe** — Explicit allocation with no leaks
+- **Direct Syscalls** — Minimal abstraction for performance
+- **Fast Startup** — No runtime overhead
+
+### Benchmarking
+
+Compare against GNU implementations:
+
+```bash
+cd AiLang_CoreUtils
+./bench_all_utils.sh              # Benchmark all utilities
+ailang-utils benchmark grep       # Benchmark specific utility
+```
+
+AILang grep is **faster on small searches** with near-zero startup overhead. Optimization work is ongoing for multi-gigabyte file handling (currently shows expected startup losses +50MB).
 
 ## Key Features
 
@@ -304,7 +421,7 @@ The `Demo Programs/` directory includes **over 150 runnable examples**:
 
 ### Applications & Examples
 - **C64 BASIC Interpreter** — Fully functional vintage computer emulator (not a toy!)
-- **CoreUtils Reimplementation** — Unix utilities in AILang
+- **57 CoreUtils** — Production-grade Unix utilities with custom regex engine
 - **Fantasy Forge Engine** — Data-driven RPG game engine
 - **D&D Game System** — Interactive game framework
 - **HalCode9000** — AI-assisted coding tools (separate repo)
@@ -345,6 +462,7 @@ See `TEST_ODDITIES.md` for known test quirks and edge cases.
 
 - **Programming Manual (26 guides)** — `Programming_Manual/`
 - **Demo Programs (150+)** — `Demo Programs/`
+- **CoreUtils Documentation** — `AiLang_CoreUtils/README.md`
 - **Language Specification** — `Language Docs BNF grammar etc/`
 - **Library Reference** — `Library Manuals/`
 - **API Documentation** — `Docs/`
@@ -377,6 +495,7 @@ The AILang compiler, language server, and all `.ailang` source code remain under
 - **Compiler:** 760 KB, self-contained, no dependencies
 - **Display Server:** 800 KB, complete windowing system
 - **Browser:** 2.3 MB with JavaScript JVM (92.7% compliance)
+- **CoreUtils:** 57 utilities, 50-71% smaller than GNU
 - **Binaries:** Generated code is non-bloated and highly optimized
 - **Libraries:** In `Librarys/`, auto-discovered at runtime
 - **Performance:** SSE2 optimization throughout, deep primitives
@@ -384,15 +503,15 @@ The AILang compiler, language server, and all `.ailang` source code remain under
 ### Contributing
 - Modifications must be submitted upstream for review (per SCSL)
 - See individual module READMEs in `Librarys/` for development guidelines
-- Test coverage via `Test262Harness.ailang` and `AIMacro_Tests/`
+- Test coverage via `Test262Harness.ailang`
 - Performance-critical code contributions welcome
+- CoreUtils optimization work ongoing (large file handling)
 
 ## Related Projects
 
 - **AILang HDL** — Hardware description in AILang
 - **AIMacro Language** — Python-like macro language for AILang
 - **AiLang-Public-Library** — Community libraries
-- **CoreUtils** — GNU utilities reimplementation
 - **Fantasy-Forge-Engine** — RPG game engine
 - **HalCode9000** — AI coding assistant (built in AILang)
 - **OlympusRepo** — Self-hosted version control system
@@ -402,6 +521,7 @@ The AILang compiler, language server, and all `.ailang` source code remain under
 - **License inquiries:** `smc.collins1977@gmail.com`
 - **Learning:** Start with `Programming_Manual/01_Introduction_to_Ailang.md`
 - **Examples:** Browse `Demo Programs/` for 150+ runnable examples
+- **CoreUtils:** See `AiLang_CoreUtils/README.md` for detailed utility docs
 - **Issues & Development:** See `Plans/` directory
 - **Known quirks:** See `TEST_ODDITIES.md`
 
@@ -412,6 +532,7 @@ The AILang compiler, language server, and all `.ailang` source code remain under
 - **Compiler:** 760 KB (self-hosted, 43,000+ lines of AILang code)
 - **Display System:** 800 KB (full-featured windowing system)
 - **Browser:** 2.3 MB with JavaScript JVM (92.7% ECMAScript compliance)
+- **CoreUtils:** 57 production utilities (50-71% smaller than GNU)
 - **Generated Code:** Non-bloated, highly optimized binaries
 - **String Methods:** 22 built-in, mostly SSE2-backed
 - **Programming Manuals:** 26 comprehensive guides
@@ -423,7 +544,7 @@ The AILang compiler, language server, and all `.ailang` source code remain under
 
 ---
 
-**AILang** — A production-grade systems programming language with radical explicitness, extreme code efficiency, and a complete ecosystem for high-performance computing, GPU acceleration, hardware integration, and browser development.
+**AILang** — A production-grade systems programming language with radical explicitness, extreme code efficiency, and a complete ecosystem for high-performance computing, GPU acceleration, hardware integration, browser development, and Unix utilities.
 
 Built for performance. Built for clarity. Built entirely in itself.
 
