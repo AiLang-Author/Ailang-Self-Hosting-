@@ -1,0 +1,841 @@
+// Init.ailang
+// AILang OS PID 1 — the first process started by the Linux kernel.
+// Responsibilities:
+//   1. Mount essential filesystems (proc, sys, dev, tmp, dev/shm)
+//   2. Create /data/blobs directory for UUID file store
+//   3. Run login screen (framebuffer, blocks until authenticated)
+//   4. Start PostgreSQL (fork/exec as postgres user)
+//   5. Wait for PG to accept connections (poll TCP 5432)
+//   6. Connect to PG and bootstrap schema
+//   7. Start service daemon (fork/exec)
+//   8. Watchdog loop — reap children, restart PG/svc daemon if they die
+//
+// Build: ./ailang.x OS/Init.ailang -o ailang_init.x
+// Install: cp ailang_init.x /sbin/ailang_init
+// Kernel cmdline: init=/sbin/ailang_init
+//
+// Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+LibraryImport.Socket
+LibraryImport.Hash
+LibraryImport.Arrays
+LibraryImport.PostgreSQL_Complete
+LibraryImport.Display.Render.Framebuffer
+LibraryImport.TermFont
+
+Import.OS.Login
+Import.OS.Schema
+
+// =============================================================================
+// STUB: DebugLog_Push (needed by Framebuffer library, no-op here)
+// =============================================================================
+Function.DebugLog_Push {
+    Input: tag: Address
+    Input: len: Integer
+    Body: {
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.InitSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_SOCKET":    Initialize=41
+    "SYS_CONNECT":   Initialize=42
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_WAIT4":     Initialize=61
+    "SYS_MKDIR":     Initialize=83
+    "SYS_SETUID":    Initialize=105
+    "SYS_SETGID":    Initialize=106
+    "SYS_SETSID":    Initialize=112
+    "SYS_MOUNT":     Initialize=165
+}
+
+FixedPool.InitConst {
+    "WNOHANG":       Initialize=1
+    "AF_INET":       Initialize=2
+    "SOCK_STREAM":   Initialize=1
+    "DIR_MODE":      Initialize=493
+    "PG_PORT":       Initialize=5432
+    "PG_UID":        Initialize=121
+    "PG_GID":        Initialize=124
+    "MAX_PG_WAIT":   Initialize=60
+}
+
+// =============================================================================
+// INIT STATE — tracks child PIDs
+// =============================================================================
+FixedPool.InitState {
+    "pg_pid":      Initialize=0, CanChange=True
+    "svc_pid":     Initialize=0, CanChange=True
+    "sshd_pid":    Initialize=0, CanChange=True
+    "pg_ready":    Initialize=0, CanChange=True
+    "running":     Initialize=1, CanChange=True
+}
+
+// =============================================================================
+// CONFIGURABLE PATHS — override for different environments
+// =============================================================================
+FixedPool.InitPaths {
+    "pg_bin":      Initialize=0, CanChange=True
+    "pg_data":     Initialize=0, CanChange=True
+    "svc_bin":     Initialize=0, CanChange=True
+    "blob_dir":    Initialize=0, CanChange=True
+    "pg_host":     Initialize=0, CanChange=True
+    "pg_dbname":   Initialize=0, CanChange=True
+    "pg_user":     Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// INIT PATHS — set defaults
+// =============================================================================
+Function.Init_SetDefaults {
+    Body: {
+        InitPaths.pg_bin   = "/usr/bin/postgres"
+        InitPaths.pg_data  = "/var/lib/postgresql/data"
+        InitPaths.svc_bin  = "/system/bin/svc_daemon.x"
+        InitPaths.blob_dir = "/data/blobs"
+        InitPaths.pg_host  = "127.0.0.1"
+        InitPaths.pg_dbname = "ailang_system"
+        InitPaths.pg_user  = "bob"
+    }
+}
+
+// =============================================================================
+// MOUNT FILESYSTEM — wrapper around syscall 165
+// mount(source, target, fstype, flags, data)
+// =============================================================================
+Function.Init_Mount {
+    Input: source: Integer
+    Input: target: Integer
+    Input: fstype: Integer
+    Input: flags:  Integer
+    Body: {
+        rc = SystemCall(InitSys.SYS_MOUNT, source, target, fstype, flags, 0)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[INIT] WARNING: mount failed for ")
+            PrintString(target)
+            PrintMessage("\n")
+        } ElseBlock: {
+            PrintMessage("[INIT] Mounted ")
+            PrintString(target)
+            PrintMessage("\n")
+        }
+    }
+}
+
+// =============================================================================
+// MOUNT ESSENTIAL FILESYSTEMS
+// =============================================================================
+Function.Init_MountAll {
+    Body: {
+        PrintMessage("[INIT] Mounting essential filesystems...\n")
+
+        // Create mount points (may already exist)
+        SystemCall(InitSys.SYS_MKDIR, "/proc",    InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/sys",     InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/dev",     InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/tmp",     InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/dev/shm", InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/dev/pts", InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/run",     InitConst.DIR_MODE, 0, 0, 0)
+
+        // Mount proc, sysfs, devtmpfs, tmpfs
+        Init_Mount("proc",     "/proc",    "proc",     0)
+        Init_Mount("sysfs",    "/sys",     "sysfs",    0)
+        Init_Mount("devtmpfs", "/dev",     "devtmpfs", 0)
+        Init_Mount("tmpfs",    "/tmp",     "tmpfs",    0)
+        Init_Mount("tmpfs",    "/dev/shm", "tmpfs",    0)
+        Init_Mount("devpts",   "/dev/pts", "devpts",   0)
+        Init_Mount("tmpfs",    "/run",     "tmpfs",    0)
+
+        // Create data directories for UUID file store
+        SystemCall(InitSys.SYS_MKDIR, "/data",              InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, InitPaths.blob_dir,   InitConst.DIR_MODE, 0, 0, 0)
+        PrintMessage("[INIT] Created blob store: ")
+        PrintString(InitPaths.blob_dir)
+        PrintMessage("\n")
+
+        // Create /run/postgresql for PG socket
+        SystemCall(InitSys.SYS_MKDIR, "/run/postgresql",    InitConst.DIR_MODE, 0, 0, 0)
+        // chown to postgres user — syscall 92 = chown(path, uid, gid)
+        SystemCall(92, "/run/postgresql", InitConst.PG_UID, InitConst.PG_GID, 0, 0)
+    }
+}
+
+// =============================================================================
+// START POSTGRESQL — fork/exec as postgres user
+// Returns child PID, or 0 on failure.
+// =============================================================================
+// =============================================================================
+// INIT POSTGRESQL DATA DIRECTORY — run initdb if PG_VERSION doesn't exist
+// =============================================================================
+Function.Init_InitPGData {
+    Body: {
+        // Check if PG_VERSION exists in data dir
+        pg_version_path = StringConcat(InitPaths.pg_data, "/PG_VERSION")
+        fd = SystemCall(InitSys.SYS_OPEN, pg_version_path, 0, 0, 0, 0)
+        Deallocate(pg_version_path, 0)
+
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            // PG_VERSION exists — already initialized
+            SystemCall(InitSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            PrintMessage("[INIT] PostgreSQL data directory already initialized\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[INIT] Initializing PostgreSQL data directory...\n")
+
+        // Ensure data directory exists and is owned by postgres
+        SystemCall(InitSys.SYS_MKDIR, "/var",                       InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/var/lib",                   InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/var/lib/postgresql",        InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, InitPaths.pg_data,            InitConst.DIR_MODE, 0, 0, 0)
+        // chown to postgres
+        SystemCall(92, InitPaths.pg_data, InitConst.PG_UID, InitConst.PG_GID, 0, 0)
+        SystemCall(92, "/var/lib/postgresql", InitConst.PG_UID, InitConst.PG_GID, 0, 0)
+
+        // Run initdb as postgres user
+        // argv: ["initdb", "-D", data_dir, NULL]
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0),  "/usr/bin/initdb")
+        StoreValue(Add(argv, 8),  "-D")
+        StoreValue(Add(argv, 16), InitPaths.pg_data)
+        StoreValue(Add(argv, 24), 0)
+
+        envp = Allocate(24)
+        StoreValue(Add(envp, 0), "HOME=/var/lib/postgresql")
+        StoreValue(Add(envp, 8), "PATH=/usr/local/bin:/usr/bin:/bin")
+        StoreValue(Add(envp, 16), 0)
+
+        pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // CHILD — switch to postgres user
+            SystemCall(InitSys.SYS_SETGID, InitConst.PG_GID, 0, 0, 0, 0)
+            SystemCall(InitSys.SYS_SETUID, InitConst.PG_UID, 0, 0, 0, 0)
+            SystemCall(InitSys.SYS_EXECVE, "/usr/bin/initdb", argv, envp, 0, 0)
+            PrintMessage("[INIT] ERROR: initdb execve failed\n")
+            SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        // Wait for initdb to complete
+        status_buf = Allocate(8)
+        StoreValue(status_buf, 0)
+        SystemCall(InitSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
+        wstatus = Dereference(status_buf)
+        exit_code = BitwiseAnd(Divide(wstatus, 256), 255)
+        Deallocate(status_buf, 8)
+        Deallocate(argv, 32)
+        Deallocate(envp, 24)
+
+        IfCondition EqualTo(exit_code, 0) ThenBlock: {
+            PrintMessage("[INIT] initdb completed successfully\n")
+
+            // Configure pg_hba.conf for trust authentication
+            hba_path = StringConcat(InitPaths.pg_data, "/pg_hba.conf")
+            hba_fd = SystemCall(InitSys.SYS_OPEN, hba_path, 577, 420, 0, 0)  // O_WRONLY|O_CREAT|O_TRUNC=577, 0644=420
+            IfCondition GreaterEqual(hba_fd, 0) ThenBlock: {
+                hba_content = "local all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\nhost all all 10.0.2.0/24 trust\n"
+                hba_len = StringLength(hba_content)
+                SystemCall(InitSys.SYS_WRITE, hba_fd, hba_content, hba_len, 0, 0)
+                SystemCall(InitSys.SYS_CLOSE, hba_fd, 0, 0, 0, 0)
+                PrintMessage("[INIT] pg_hba.conf configured (trust auth)\n")
+            }
+            Deallocate(hba_path, 0)
+
+            // Configure postgresql.conf to listen on all interfaces
+            // We append to the file
+            conf_path = StringConcat(InitPaths.pg_data, "/postgresql.conf")
+            conf_fd = SystemCall(InitSys.SYS_OPEN, conf_path, 1089, 420, 0, 0)  // O_WRONLY|O_APPEND|O_CREAT=1089
+            IfCondition GreaterEqual(conf_fd, 0) ThenBlock: {
+                conf_append = "\nlisten_addresses = '*'\n"
+                conf_len = StringLength(conf_append)
+                SystemCall(InitSys.SYS_WRITE, conf_fd, conf_append, conf_len, 0, 0)
+                SystemCall(InitSys.SYS_CLOSE, conf_fd, 0, 0, 0, 0)
+                PrintMessage("[INIT] postgresql.conf: listen on all interfaces\n")
+            }
+            Deallocate(conf_path, 0)
+        } ElseBlock: {
+            PrintMessage("[INIT] ERROR: initdb failed with exit code ")
+            PrintNumber(exit_code)
+            PrintMessage("\n")
+        }
+    }
+}
+
+Function.Init_StartPostgres {
+    Output: Integer
+    Body: {
+        PrintMessage("[INIT] Starting PostgreSQL...\n")
+
+        // Build argv: ["postgres", "-D", data_dir, NULL]
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0),  InitPaths.pg_bin)
+        StoreValue(Add(argv, 8),  "-D")
+        StoreValue(Add(argv, 16), InitPaths.pg_data)
+        StoreValue(Add(argv, 24), 0)
+
+        // Build envp
+        envp = Allocate(24)
+        StoreValue(Add(envp, 0), "HOME=/var/lib/postgresql")
+        StoreValue(Add(envp, 8), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        StoreValue(Add(envp, 16), 0)
+
+        pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // CHILD PROCESS
+            // Create new session
+            SystemCall(InitSys.SYS_SETSID, 0, 0, 0, 0, 0)
+
+            // Switch to postgres user
+            SystemCall(InitSys.SYS_SETGID, InitConst.PG_GID, 0, 0, 0, 0)
+            SystemCall(InitSys.SYS_SETUID, InitConst.PG_UID, 0, 0, 0, 0)
+
+            // Exec postgres
+            SystemCall(InitSys.SYS_EXECVE, InitPaths.pg_bin, argv, envp, 0, 0)
+
+            // If we get here, exec failed
+            PrintMessage("[INIT] ERROR: postgres execve failed\n")
+            SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        Deallocate(argv, 32)
+        Deallocate(envp, 24)
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[INIT] ERROR: fork failed for PostgreSQL\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[INIT] PostgreSQL PID=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// CHECK IF PG IS READY — try TCP connect to 127.0.0.1:5432
+// Returns 1 if ready, 0 if not.
+// =============================================================================
+Function.Init_CheckPGReady {
+    Output: Integer
+    Body: {
+        // Create TCP socket
+        sock = SystemCall(InitSys.SYS_SOCKET, InitConst.AF_INET, InitConst.SOCK_STREAM, 0, 0, 0)
+        IfCondition LessThan(sock, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Build sockaddr_in for 127.0.0.1:5432
+        addr = Allocate(16)
+        MemorySet(addr, 0, 16)
+        SetByte(addr, 0, 2)     // AF_INET
+        SetByte(addr, 1, 0)
+        // Port 5432 in big-endian: 5432 = 0x1538 → high=0x15=21, low=0x38=56
+        SetByte(addr, 2, 21)    // port high byte
+        SetByte(addr, 3, 56)    // port low byte
+        // 127.0.0.1
+        SetByte(addr, 4, 127)
+        SetByte(addr, 5, 0)
+        SetByte(addr, 6, 0)
+        SetByte(addr, 7, 1)
+
+        rc = SystemCall(InitSys.SYS_CONNECT, sock, addr, 16, 0, 0)
+        Deallocate(addr, 16)
+        SystemCall(InitSys.SYS_CLOSE, sock, 0, 0, 0, 0)
+
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// WAIT FOR PG READY — poll TCP 5432 until PG accepts connections
+// Retries up to MAX_PG_WAIT seconds.
+// =============================================================================
+Function.Init_WaitForPG {
+    Output: Integer
+    Body: {
+        PrintMessage("[INIT] Waiting for PostgreSQL to accept connections...")
+
+        // Allocate timespec for 1 second sleep
+        ts = Allocate(16)
+        StoreValue(ts, 1)              // 1 second
+        StoreValue(Add(ts, 8), 0)      // 0 nanoseconds
+
+        attempts = 0
+        WhileLoop LessThan(attempts, InitConst.MAX_PG_WAIT) {
+            ready = Init_CheckPGReady()
+            IfCondition EqualTo(ready, 1) ThenBlock: {
+                PrintMessage(" ready!\n")
+                Deallocate(ts, 16)
+                ReturnValue(1)
+            }
+            PrintMessage(".")
+            SystemCall(InitSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+            attempts = Add(attempts, 1)
+        }
+
+        Deallocate(ts, 16)
+        PrintMessage(" TIMEOUT!\n")
+        PrintMessage("[INIT] ERROR: PostgreSQL did not become ready after ")
+        PrintNumber(InitConst.MAX_PG_WAIT)
+        PrintMessage(" seconds\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// BOOTSTRAP SCHEMA — connect to PG and run Schema_Bootstrap
+// =============================================================================
+Function.Init_BootstrapSchema {
+    Output: Integer
+    Body: {
+        PrintMessage("[INIT] Bootstrapping schema...\n")
+        conn = PG_Connect(InitPaths.pg_host, InitConst.PG_PORT, InitPaths.pg_dbname, InitPaths.pg_user, "")
+        IfCondition EqualTo(conn, 0) ThenBlock: {
+            PrintMessage("[INIT] ERROR: Cannot connect to PostgreSQL for schema bootstrap\n")
+            ReturnValue(0)
+        }
+
+        Schema_Bootstrap(conn)
+        PG_Disconnect(conn)
+        PrintMessage("[INIT] Schema bootstrap complete\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// START SERVICE DAEMON — fork/exec
+// Returns child PID, or 0 on failure.
+// =============================================================================
+Function.Init_StartServiceDaemon {
+    Output: Integer
+    Body: {
+        PrintMessage("[INIT] Starting service daemon...\n")
+
+        // Build argv: [svc_bin, NULL]
+        argv = Allocate(16)
+        StoreValue(Add(argv, 0), InitPaths.svc_bin)
+        StoreValue(Add(argv, 8), 0)
+
+        // Build envp
+        envp = Allocate(24)
+        StoreValue(Add(envp, 0), "HOME=/root")
+        StoreValue(Add(envp, 8), "PATH=/system/bin:/usr/local/bin:/usr/bin:/bin")
+        StoreValue(Add(envp, 16), 0)
+
+        pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // CHILD PROCESS
+            SystemCall(InitSys.SYS_SETSID, 0, 0, 0, 0, 0)
+            SystemCall(InitSys.SYS_EXECVE, InitPaths.svc_bin, argv, envp, 0, 0)
+            PrintMessage("[INIT] ERROR: svc_daemon execve failed\n")
+            SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        Deallocate(argv, 16)
+        Deallocate(envp, 24)
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[INIT] ERROR: fork failed for service daemon\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[INIT] Service daemon PID=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// FORK/EXEC HELPER — run a command and wait for it to complete
+// Returns exit code, or -1 on failure.
+// =============================================================================
+Function.Init_RunCommand {
+    Input: cmd_path: Integer
+    Input: argv: Integer
+    Output: Integer
+    Body: {
+        pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // CHILD
+            envp = Allocate(16)
+            StoreValue(Add(envp, 0), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            StoreValue(Add(envp, 8), 0)
+            SystemCall(InitSys.SYS_EXECVE, cmd_path, argv, envp, 0, 0)
+            SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+
+        // Wait for child
+        status_buf = Allocate(8)
+        StoreValue(status_buf, 0)
+        SystemCall(InitSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
+        wstatus = Dereference(status_buf)
+        exit_code = BitwiseAnd(Divide(wstatus, 256), 255)
+        Deallocate(status_buf, 8)
+        ReturnValue(exit_code)
+    }
+}
+
+// =============================================================================
+// SETUP NETWORK — bring up lo and eth0, run udhcpc for DHCP
+// =============================================================================
+Function.Init_SetupNetwork {
+    Body: {
+        PrintMessage("[INIT] Setting up network...\n")
+
+        // ifconfig lo 127.0.0.1 up
+        argv_lo = Allocate(40)
+        StoreValue(Add(argv_lo, 0), "/sbin/ifconfig")
+        StoreValue(Add(argv_lo, 8), "lo")
+        StoreValue(Add(argv_lo, 16), "127.0.0.1")
+        StoreValue(Add(argv_lo, 24), "up")
+        StoreValue(Add(argv_lo, 32), 0)
+        rc = Init_RunCommand("/sbin/ifconfig", argv_lo)
+        Deallocate(argv_lo, 40)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[INIT] lo interface up\n")
+        } ElseBlock: {
+            PrintMessage("[INIT] WARNING: lo setup failed\n")
+        }
+
+        // ifconfig eth0 up
+        argv_eth = Allocate(32)
+        StoreValue(Add(argv_eth, 0), "/sbin/ifconfig")
+        StoreValue(Add(argv_eth, 8), "eth0")
+        StoreValue(Add(argv_eth, 16), "up")
+        StoreValue(Add(argv_eth, 24), 0)
+        rc2 = Init_RunCommand("/sbin/ifconfig", argv_eth)
+        Deallocate(argv_eth, 32)
+        IfCondition EqualTo(rc2, 0) ThenBlock: {
+            PrintMessage("[INIT] eth0 interface up\n")
+        } ElseBlock: {
+            PrintMessage("[INIT] WARNING: eth0 setup failed\n")
+        }
+
+        // udhcpc -i eth0 -n -q  (get DHCP lease, non-persistent, quit after)
+        argv_dhcp = Allocate(48)
+        StoreValue(Add(argv_dhcp, 0),  "/sbin/udhcpc")
+        StoreValue(Add(argv_dhcp, 8),  "-i")
+        StoreValue(Add(argv_dhcp, 16), "eth0")
+        StoreValue(Add(argv_dhcp, 24), "-n")
+        StoreValue(Add(argv_dhcp, 32), "-q")
+        StoreValue(Add(argv_dhcp, 40), 0)
+        rc3 = Init_RunCommand("/sbin/udhcpc", argv_dhcp)
+        Deallocate(argv_dhcp, 48)
+        IfCondition EqualTo(rc3, 0) ThenBlock: {
+            PrintMessage("[INIT] DHCP lease acquired\n")
+        } ElseBlock: {
+            PrintMessage("[INIT] WARNING: DHCP failed (rc=")
+            PrintNumber(rc3)
+            PrintMessage(")\n")
+        }
+    }
+}
+
+// =============================================================================
+// START SSHD — fork/exec openssh daemon for remote access
+// Returns child PID, or 0 on failure.
+// =============================================================================
+Function.Init_StartSSHD {
+    Output: Integer
+    Body: {
+        PrintMessage("[INIT] Starting sshd...\n")
+
+        // Ensure required directories exist
+        SystemCall(InitSys.SYS_MKDIR, "/var",          InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/var/run",      InitConst.DIR_MODE, 0, 0, 0)
+        SystemCall(InitSys.SYS_MKDIR, "/var/empty",    InitConst.DIR_MODE, 0, 0, 0)
+
+        // Build argv: ["/usr/sbin/sshd", "-D", NULL]
+        // -D = don't detach (stay in foreground, we manage it)
+        argv = Allocate(24)
+        StoreValue(Add(argv, 0), "/usr/sbin/sshd")
+        StoreValue(Add(argv, 8), "-D")
+        StoreValue(Add(argv, 16), 0)
+
+        // Build envp
+        envp = Allocate(24)
+        StoreValue(Add(envp, 0), "HOME=/root")
+        StoreValue(Add(envp, 8), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+        StoreValue(Add(envp, 16), 0)
+
+        pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // CHILD PROCESS
+            SystemCall(InitSys.SYS_SETSID, 0, 0, 0, 0, 0)
+            SystemCall(InitSys.SYS_EXECVE, "/usr/sbin/sshd", argv, envp, 0, 0)
+            PrintMessage("[INIT] ERROR: sshd execve failed\n")
+            SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        Deallocate(argv, 24)
+        Deallocate(envp, 24)
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[INIT] ERROR: fork failed for sshd\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[INIT] sshd PID=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// SLEEP HELPER — sleep N seconds
+// =============================================================================
+Function.Init_Sleep {
+    Input: seconds: Integer
+    Body: {
+        ts = Allocate(16)
+        StoreValue(ts, seconds)
+        StoreValue(Add(ts, 8), 0)
+        SystemCall(InitSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        Deallocate(ts, 16)
+    }
+}
+
+// =============================================================================
+// WATCHDOG LOOP — PID 1 must never exit.
+// Reaps children, restarts PostgreSQL and service daemon if they die.
+// =============================================================================
+Function.Init_Watchdog {
+    Body: {
+        PrintMessage("[INIT] Entering watchdog loop — PID 1 active\n")
+
+        // Allocate status buffer for waitpid
+        status_buf = Allocate(8)
+
+        // Sleep interval: 1 second
+        ts = Allocate(16)
+        StoreValue(ts, 1)
+        StoreValue(Add(ts, 8), 0)
+
+        WhileLoop EqualTo(InitState.running, 1) {
+            // Non-blocking wait for any child
+            StoreValue(status_buf, 0)
+            died_pid = SystemCall(InitSys.SYS_WAIT4, -1, status_buf, InitConst.WNOHANG, 0, 0)
+
+            IfCondition GreaterThan(died_pid, 0) ThenBlock: {
+                // Extract exit code
+                wstatus = Dereference(status_buf)
+                exit_code = BitwiseAnd(Divide(wstatus, 256), 255)
+
+                PrintMessage("[INIT] Child died: PID=")
+                PrintNumber(died_pid)
+                PrintMessage(" exit=")
+                PrintNumber(exit_code)
+                PrintMessage("\n")
+
+                // Check if PostgreSQL died
+                IfCondition EqualTo(died_pid, InitState.pg_pid) ThenBlock: {
+                    PrintMessage("[INIT] PostgreSQL died! Restarting...\n")
+                    Init_Sleep(2)
+                    InitState.pg_pid = Init_StartPostgres()
+                    IfCondition GreaterThan(InitState.pg_pid, 0) ThenBlock: {
+                        pg_ok = Init_WaitForPG()
+                        IfCondition EqualTo(pg_ok, 0) ThenBlock: {
+                            PrintMessage("[INIT] ERROR: PostgreSQL failed to restart\n")
+                        }
+                    }
+                }
+
+                // Check if service daemon died
+                IfCondition EqualTo(died_pid, InitState.svc_pid) ThenBlock: {
+                    PrintMessage("[INIT] Service daemon died! Restarting...\n")
+                    Init_Sleep(2)
+                    InitState.svc_pid = Init_StartServiceDaemon()
+                }
+
+                // Check if sshd died
+                IfCondition EqualTo(died_pid, InitState.sshd_pid) ThenBlock: {
+                    PrintMessage("[INIT] sshd died! Restarting...\n")
+                    Init_Sleep(1)
+                    InitState.sshd_pid = Init_StartSSHD()
+                }
+            }
+
+            // Sleep 1 second between checks
+            SystemCall(InitSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        }
+
+        Deallocate(status_buf, 8)
+        Deallocate(ts, 16)
+    }
+}
+
+// =============================================================================
+// MAIN ENTRY POINT — the boot sequence
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("========================================\n")
+    PrintMessage("  AILang OS Init — PID 1\n")
+    PrintMessage("========================================\n\n")
+
+    // Set default paths
+    Init_SetDefaults()
+
+    // Step 1: Mount essential filesystems
+    Init_MountAll()
+
+    // Step 1b: Setup network (lo + eth0 + DHCP)
+    PrintMessage("\n[INIT] Step 1b: Network setup\n")
+    Init_SetupNetwork()
+
+    // Step 1c: Start sshd for remote access
+    PrintMessage("\n[INIT] Step 1c: Start sshd\n")
+    InitState.sshd_pid = Init_StartSSHD()
+
+    // Step 2: Login screen (blocks until authenticated)
+    // Check if /dev/fb0 exists — if not, skip login (serial console mode)
+    PrintMessage("\n[INIT] Step 2: Login screen\n")
+    fb_fd = SystemCall(InitSys.SYS_OPEN, "/dev/fb0", 0, 0, 0, 0)
+    IfCondition GreaterEqual(fb_fd, 0) ThenBlock: {
+        // Framebuffer available — run graphical login
+        SystemCall(InitSys.SYS_CLOSE, fb_fd, 0, 0, 0, 0)
+        login_result = Login_Run()
+        IfCondition EqualTo(login_result, 0) ThenBlock: {
+            PrintMessage("[INIT] Login failed or cancelled. Halting.\n")
+            WhileLoop EqualTo(1, 1) {
+                Init_Sleep(3600)
+            }
+        }
+        PrintMessage("[INIT] Login successful\n\n")
+    } ElseBlock: {
+        // No framebuffer — serial console mode, skip graphical login
+        PrintMessage("[INIT] No /dev/fb0 — serial console mode, skipping graphical login\n\n")
+    }
+
+    // Step 3: Initialize PG data directory if needed, then start PostgreSQL
+    PrintMessage("[INIT] Step 3: Start PostgreSQL\n")
+    Init_InitPGData()
+    InitState.pg_pid = Init_StartPostgres()
+    IfCondition EqualTo(InitState.pg_pid, 0) ThenBlock: {
+        PrintMessage("[INIT] FATAL: Cannot start PostgreSQL\n")
+        WhileLoop EqualTo(1, 1) {
+            Init_Sleep(3600)
+        }
+    }
+
+    // Step 4: Wait for PG to accept connections
+    PrintMessage("\n[INIT] Step 4: Wait for PostgreSQL\n")
+    pg_ready = Init_WaitForPG()
+    IfCondition EqualTo(pg_ready, 0) ThenBlock: {
+        PrintMessage("[INIT] FATAL: PostgreSQL not responding\n")
+        WhileLoop EqualTo(1, 1) {
+            Init_Sleep(3600)
+        }
+    }
+
+    // Step 4b: Create ailang_system database and bob user if needed
+    PrintMessage("\n[INIT] Step 4b: Create database and user\n")
+    // createdb ailang_system (run as postgres)
+    argv_cdb = Allocate(24)
+    StoreValue(Add(argv_cdb, 0), "/usr/bin/createdb")
+    StoreValue(Add(argv_cdb, 8), "ailang_system")
+    StoreValue(Add(argv_cdb, 16), 0)
+    cdb_pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+    IfCondition EqualTo(cdb_pid, 0) ThenBlock: {
+        SystemCall(InitSys.SYS_SETGID, InitConst.PG_GID, 0, 0, 0, 0)
+        SystemCall(InitSys.SYS_SETUID, InitConst.PG_UID, 0, 0, 0, 0)
+        envp_pg = Allocate(16)
+        StoreValue(Add(envp_pg, 0), "HOME=/var/lib/postgresql")
+        StoreValue(Add(envp_pg, 8), 0)
+        SystemCall(InitSys.SYS_EXECVE, "/usr/bin/createdb", argv_cdb, envp_pg, 0, 0)
+        SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+    }
+    cdb_status = Allocate(8)
+    SystemCall(InitSys.SYS_WAIT4, cdb_pid, cdb_status, 0, 0, 0)
+    cdb_exit = BitwiseAnd(Divide(Dereference(cdb_status), 256), 255)
+    Deallocate(cdb_status, 8)
+    Deallocate(argv_cdb, 24)
+    IfCondition EqualTo(cdb_exit, 0) ThenBlock: {
+        PrintMessage("[INIT] Created ailang_system database\n")
+    } ElseBlock: {
+        PrintMessage("[INIT] ailang_system database already exists (or createdb failed)\n")
+    }
+
+    // createuser -s bob (run as postgres)
+    argv_cu = Allocate(32)
+    StoreValue(Add(argv_cu, 0), "/usr/bin/createuser")
+    StoreValue(Add(argv_cu, 8), "-s")
+    StoreValue(Add(argv_cu, 16), "bob")
+    StoreValue(Add(argv_cu, 24), 0)
+    cu_pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+    IfCondition EqualTo(cu_pid, 0) ThenBlock: {
+        SystemCall(InitSys.SYS_SETGID, InitConst.PG_GID, 0, 0, 0, 0)
+        SystemCall(InitSys.SYS_SETUID, InitConst.PG_UID, 0, 0, 0, 0)
+        envp_pg2 = Allocate(16)
+        StoreValue(Add(envp_pg2, 0), "HOME=/var/lib/postgresql")
+        StoreValue(Add(envp_pg2, 8), 0)
+        SystemCall(InitSys.SYS_EXECVE, "/usr/bin/createuser", argv_cu, envp_pg2, 0, 0)
+        SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+    }
+    cu_status = Allocate(8)
+    SystemCall(InitSys.SYS_WAIT4, cu_pid, cu_status, 0, 0, 0)
+    cu_exit = BitwiseAnd(Divide(Dereference(cu_status), 256), 255)
+    Deallocate(cu_status, 8)
+    Deallocate(argv_cu, 32)
+    IfCondition EqualTo(cu_exit, 0) ThenBlock: {
+        PrintMessage("[INIT] Created superuser bob\n")
+    } ElseBlock: {
+        PrintMessage("[INIT] bob user already exists (or createuser failed)\n")
+    }
+
+    // Step 5: Bootstrap schema
+    PrintMessage("\n[INIT] Step 5: Bootstrap schema\n")
+    schema_ok = Init_BootstrapSchema()
+    IfCondition EqualTo(schema_ok, 0) ThenBlock: {
+        PrintMessage("[INIT] WARNING: Schema bootstrap failed (continuing anyway)\n")
+    }
+
+    // Step 6: Start service daemon
+    PrintMessage("\n[INIT] Step 6: Start service daemon\n")
+    InitState.svc_pid = Init_StartServiceDaemon()
+    IfCondition EqualTo(InitState.svc_pid, 0) ThenBlock: {
+        PrintMessage("[INIT] WARNING: Service daemon failed to start\n")
+    }
+
+    // Step 7: Watchdog loop — PID 1 never exits
+    PrintMessage("\n[INIT] Step 7: Entering watchdog\n")
+    PrintMessage("========================================\n")
+    PrintMessage("  AILang OS is running\n")
+    PrintMessage("========================================\n\n")
+    Init_Watchdog()
+
+    // Should never reach here — PID 1 must not exit
+    PrintMessage("[INIT] FATAL: Watchdog exited! PID 1 must not die.\n")
+    WhileLoop EqualTo(1, 1) {
+        Init_Sleep(3600)
+    }
+}
+
+RunTask(Main)

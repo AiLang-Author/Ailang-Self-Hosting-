@@ -1,0 +1,586 @@
+// FileTree.ailang
+// PG-backed virtual filesystem. Maps paths like /home/bob/doc.txt
+// to rows in the files table + UUID blobs on disk.
+// Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.Hash
+LibraryImport.Arrays
+LibraryImport.StringUtils
+LibraryImport.PostgreSQL_Complete
+
+Import.OS.UUIDStore
+
+// =============================================================================
+// SQL BUFFER HELPERS — reduce boilerplate for dynamic query building
+// All FT_Buf* functions operate on a shared 512-byte buffer.
+// =============================================================================
+FixedPool.FTBuf {
+    "ptr":  Initialize=0, CanChange=True
+    "off":  Initialize=0, CanChange=True
+}
+
+// Allocate and reset the SQL buffer
+Function.FT_BufInit {
+    Output: Integer
+    Body: {
+        buf = Allocate(512)
+        MemorySet(buf, 0, 512)
+        FTBuf.ptr = buf
+        FTBuf.off = 0
+        ReturnValue(buf)
+    }
+}
+
+// Append a string literal to the buffer
+Function.FT_BufStr {
+    Input: s: Integer
+    Body: {
+        slen = StringLength(s)
+        i = 0
+        WhileLoop LessThan(i, slen) {
+            SetByte(FTBuf.ptr, FTBuf.off, GetByte(s, i))
+            FTBuf.off = Add(FTBuf.off, 1)
+            i = Add(i, 1)
+        }
+    }
+}
+
+// Append an integer (converted to string) to the buffer
+Function.FT_BufInt {
+    Input: n: Integer
+    Body: {
+        ns = NumberToString(n)
+        nslen = StringLength(ns)
+        i = 0
+        WhileLoop LessThan(i, nslen) {
+            SetByte(FTBuf.ptr, FTBuf.off, GetByte(ns, i))
+            FTBuf.off = Add(FTBuf.off, 1)
+            i = Add(i, 1)
+        }
+    }
+}
+
+// Null-terminate the buffer and return pointer
+Function.FT_BufDone {
+    Output: Integer
+    Body: {
+        SetByte(FTBuf.ptr, FTBuf.off, 0)
+        ReturnValue(FTBuf.ptr)
+    }
+}
+
+// Execute query, destroy result if non-null, deallocate buffer
+// Returns PG result (0 = error, non-zero = success handle)
+Function.FT_BufExec {
+    Input: conn: Integer
+    Output: Integer
+    Body: {
+        SetByte(FTBuf.ptr, FTBuf.off, 0)
+        r = PG_Query(conn, FTBuf.ptr)
+        Deallocate(FTBuf.ptr, 512)
+        ReturnValue(r)
+    }
+}
+
+// Execute query that returns no data (INSERT/UPDATE/DELETE), clean up
+Function.FT_BufExecVoid {
+    Input: conn: Integer
+    Body: {
+        SetByte(FTBuf.ptr, FTBuf.off, 0)
+        r = PG_Query(conn, FTBuf.ptr)
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        Deallocate(FTBuf.ptr, 512)
+    }
+}
+
+// =============================================================================
+// RESOLVE PATH — walk path components from root to find file ID
+// Input: conn (PG connection), path (string like "/home/bob/doc.txt")
+// Returns: file ID (>0) or 0 if not found
+// =============================================================================
+Function.FileTree_Resolve {
+    Input: conn: Integer
+    Input: path: Integer
+    Output: Integer
+    Body: {
+        plen = StringLength(path)
+
+        // Empty path or not starting with /
+        IfCondition LessEqual(plen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(path, 0), 47) ThenBlock: { ReturnValue(0) }
+
+        // Path is just "/" — return root ID
+        IfCondition EqualTo(plen, 1) ThenBlock: {
+            // Query root: SELECT id FROM files WHERE name='/' AND parent_id IS NULL
+            r = PG_Query(conn, "SELECT id FROM files WHERE name='/' AND parent_id IS NULL")
+            IfCondition EqualTo(r, 0) ThenBlock: { ReturnValue(0) }
+            cnt = Array.Size(r)
+            IfCondition EqualTo(cnt, 0) ThenBlock: {
+                PG_DestroyResult(r)
+                ReturnValue(0)
+            }
+            row = Array.Get(r, 0)
+            id_str = Hash.Get(row, "id")
+            root_id = StringToNumber(id_str)
+            PG_DestroyResult(r)
+            ReturnValue(root_id)
+        }
+
+        // Get root ID first
+        r = PG_Query(conn, "SELECT id FROM files WHERE name='/' AND parent_id IS NULL")
+        IfCondition EqualTo(r, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Array.Size(r)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(r)
+            ReturnValue(0)
+        }
+        row = Array.Get(r, 0)
+        id_str = Hash.Get(row, "id")
+        current_id = StringToNumber(id_str)
+        PG_DestroyResult(r)
+
+        // Walk path components: split by '/'
+        // Skip leading slash
+        pos = 1
+        comp_buf = Allocate(256)
+
+        WhileLoop LessThan(pos, plen) {
+            // Extract next component
+            clen = 0
+            WhileLoop LessThan(pos, plen) {
+                ch = GetByte(path, pos)
+                IfCondition EqualTo(ch, 47) ThenBlock: {
+                    pos = Add(pos, 1)
+                    BreakLoop
+                }
+                SetByte(comp_buf, clen, ch)
+                clen = Add(clen, 1)
+                pos = Add(pos, 1)
+            }
+
+            // Skip empty components (double slashes)
+            IfCondition EqualTo(clen, 0) ThenBlock: {
+                ContinueLoop
+            }
+            SetByte(comp_buf, clen, 0)
+
+            // Query: SELECT id FROM files WHERE parent_id=current_id AND name='component'
+            FT_BufInit()
+            FT_BufStr("SELECT id FROM files WHERE parent_id=")
+            FT_BufInt(current_id)
+            FT_BufStr(" AND name='")
+            FT_BufStr(comp_buf)
+            FT_BufStr("'")
+            r = FT_BufExec(conn)
+
+            IfCondition EqualTo(r, 0) ThenBlock: {
+                Deallocate(comp_buf, 256)
+                ReturnValue(0)
+            }
+            cnt = Array.Size(r)
+            IfCondition EqualTo(cnt, 0) ThenBlock: {
+                PG_DestroyResult(r)
+                Deallocate(comp_buf, 256)
+                ReturnValue(0)
+            }
+
+            row = Array.Get(r, 0)
+            id_str = Hash.Get(row, "id")
+            current_id = StringToNumber(id_str)
+            PG_DestroyResult(r)
+        }
+
+        Deallocate(comp_buf, 256)
+        ReturnValue(current_id)
+    }
+}
+
+// =============================================================================
+// LIST DIRECTORY — returns PG result set of children
+// Caller must PG_DestroyResult when done. Returns 0 on error.
+// =============================================================================
+Function.FileTree_ListDir {
+    Input: conn:   Integer
+    Input: dir_id: Integer
+    Output: Integer
+    Body: {
+        FT_BufInit()
+        FT_BufStr("SELECT id, name, type, blob_uuid, blob_size, owner, permissions FROM files WHERE parent_id=")
+        FT_BufInt(dir_id)
+        FT_BufStr(" ORDER BY type DESC, name ASC")
+        r = FT_BufExec(conn)
+        ReturnValue(r)
+    }
+}
+
+// =============================================================================
+// CREATE DIRECTORY — insert a dir row in files table
+// Returns new dir ID or 0 on error.
+// =============================================================================
+Function.FileTree_CreateDir {
+    Input: conn:      Integer
+    Input: parent_id: Integer
+    Input: name:      Integer
+    Output: Integer
+    Body: {
+        FT_BufInit()
+        FT_BufStr("INSERT INTO files (parent_id, name, type) VALUES (")
+        FT_BufInt(parent_id)
+        FT_BufStr(", '")
+        FT_BufStr(name)
+        FT_BufStr("', 'dir') RETURNING id")
+        r = FT_BufExec(conn)
+
+        IfCondition EqualTo(r, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Array.Size(r)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(r)
+            ReturnValue(0)
+        }
+
+        row = Array.Get(r, 0)
+        id_str = Hash.Get(row, "id")
+        new_id = StringToNumber(id_str)
+        PG_DestroyResult(r)
+        ReturnValue(new_id)
+    }
+}
+
+// =============================================================================
+// CREATE FILE — generate UUID, write blob to disk, insert PG row
+// Returns new file ID or 0 on error.
+// =============================================================================
+Function.FileTree_CreateFile {
+    Input: conn:      Integer
+    Input: parent_id: Integer
+    Input: name:      Integer
+    Input: data:      Integer
+    Input: size:      Integer
+    Output: Integer
+    Body: {
+        // Generate UUID for blob storage
+        uuid = UUID_Generate()
+        IfCondition EqualTo(uuid, 0) ThenBlock: {
+            PrintMessage("[FT] ERROR: UUID generation failed\n")
+            ReturnValue(0)
+        }
+
+        // Write blob to disk
+        rc = UUID_Create(uuid, data, size)
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            PrintMessage("[FT] ERROR: blob write failed\n")
+            ReturnValue(0)
+        }
+
+        // Insert row in files table
+        FT_BufInit()
+        FT_BufStr("INSERT INTO files (parent_id, name, type, blob_uuid, blob_size) VALUES (")
+        FT_BufInt(parent_id)
+        FT_BufStr(", '")
+        FT_BufStr(name)
+        FT_BufStr("', 'file', '")
+        FT_BufStr(uuid)
+        FT_BufStr("', ")
+        FT_BufInt(size)
+        FT_BufStr(") RETURNING id")
+        r = FT_BufExec(conn)
+
+        IfCondition EqualTo(r, 0) ThenBlock: {
+            // PG insert failed — clean up the blob
+            UUID_Delete(uuid)
+            PrintMessage("[FT] ERROR: file row insert failed\n")
+            ReturnValue(0)
+        }
+        cnt = Array.Size(r)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(r)
+            UUID_Delete(uuid)
+            ReturnValue(0)
+        }
+
+        row = Array.Get(r, 0)
+        id_str = Hash.Get(row, "id")
+        new_id = StringToNumber(id_str)
+        PG_DestroyResult(r)
+
+        ReturnValue(new_id)
+    }
+}
+
+// =============================================================================
+// READ FILE — look up blob_uuid from PG, read blob from disk
+// Returns bytes read (>= 0) or -1 on error.
+// =============================================================================
+Function.FileTree_ReadFile {
+    Input: conn:    Integer
+    Input: file_id: Integer
+    Input: buf:     Integer
+    Input: max:     Integer
+    Output: Integer
+    Body: {
+        // Get blob_uuid from files table
+        FT_BufInit()
+        FT_BufStr("SELECT blob_uuid FROM files WHERE id=")
+        FT_BufInt(file_id)
+        r = FT_BufExec(conn)
+
+        IfCondition EqualTo(r, 0) ThenBlock: { ReturnValue(-1) }
+        cnt = Array.Size(r)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(r)
+            ReturnValue(-1)
+        }
+
+        row = Array.Get(r, 0)
+        uuid = Hash.Get(row, "blob_uuid")
+        PG_DestroyResult(r)
+
+        // Check for null/empty UUID (directory or broken entry)
+        IfCondition EqualTo(uuid, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(StringLength(uuid), 0) ThenBlock: { ReturnValue(-1) }
+
+        // Read blob from disk
+        bytes = UUID_Read(uuid, buf, max)
+        ReturnValue(bytes)
+    }
+}
+
+// =============================================================================
+// GET FILE INFO — returns a PG result row with file metadata
+// Caller must PG_DestroyResult. Returns 0 on error.
+// =============================================================================
+Function.FileTree_GetInfo {
+    Input: conn:    Integer
+    Input: file_id: Integer
+    Output: Integer
+    Body: {
+        FT_BufInit()
+        FT_BufStr("SELECT id, parent_id, name, type, blob_uuid, blob_size, owner, permissions FROM files WHERE id=")
+        FT_BufInt(file_id)
+        r = FT_BufExec(conn)
+        ReturnValue(r)
+    }
+}
+
+// =============================================================================
+// DELETE FILE — remove PG row + delete blob from disk
+// Returns 0 on success, -1 on error.
+// =============================================================================
+Function.FileTree_Delete {
+    Input: conn:    Integer
+    Input: file_id: Integer
+    Output: Integer
+    Body: {
+        // First get the blob_uuid so we can delete the blob
+        FT_BufInit()
+        FT_BufStr("SELECT blob_uuid, type FROM files WHERE id=")
+        FT_BufInt(file_id)
+        r = FT_BufExec(conn)
+
+        IfCondition EqualTo(r, 0) ThenBlock: { ReturnValue(-1) }
+        cnt = Array.Size(r)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(r)
+            ReturnValue(-1)
+        }
+
+        row = Array.Get(r, 0)
+        uuid = Hash.Get(row, "blob_uuid")
+        ftype = Hash.Get(row, "type")
+        PG_DestroyResult(r)
+
+        // If it's a directory, check it's empty first
+        IfCondition EqualTo(StringLength(ftype), 3) ThenBlock: {
+            IfCondition EqualTo(StringStartsWith(ftype, "dir"), 1) ThenBlock: {
+                FT_BufInit()
+                FT_BufStr("SELECT COUNT(*) AS cnt FROM files WHERE parent_id=")
+                FT_BufInt(file_id)
+                r = FT_BufExec(conn)
+
+                IfCondition NotEqual(r, 0) ThenBlock: {
+                    row = Array.Get(r, 0)
+                    cnt_str = Hash.Get(row, "cnt")
+                    child_count = StringToNumber(cnt_str)
+                    PG_DestroyResult(r)
+
+                    IfCondition GreaterThan(child_count, 0) ThenBlock: {
+                        PrintMessage("[FT] ERROR: directory not empty\n")
+                        ReturnValue(-1)
+                    }
+                }
+            }
+        }
+
+        // Delete the PG row
+        FT_BufInit()
+        FT_BufStr("DELETE FROM files WHERE id=")
+        FT_BufInt(file_id)
+        FT_BufExecVoid(conn)
+
+        // Delete the blob from disk (if it has one)
+        IfCondition NotEqual(uuid, 0) ThenBlock: {
+            IfCondition GreaterThan(StringLength(uuid), 0) ThenBlock: {
+                UUID_Delete(uuid)
+            }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MOVE / RENAME — update parent_id and/or name in PG
+// Blob on disk doesn't move (like git).
+// Returns 0 on success, -1 on error.
+// =============================================================================
+Function.FileTree_Move {
+    Input: conn:       Integer
+    Input: file_id:    Integer
+    Input: new_parent: Integer
+    Input: new_name:   Integer
+    Output: Integer
+    Body: {
+        FT_BufInit()
+        FT_BufStr("UPDATE files SET parent_id=")
+        FT_BufInt(new_parent)
+        FT_BufStr(", name='")
+        FT_BufStr(new_name)
+        FT_BufStr("' WHERE id=")
+        FT_BufInt(file_id)
+        FT_BufExecVoid(conn)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// UPDATE FILE — overwrite file content with new data
+// Updates blob on disk + blob_size in PG.
+// Returns 0 on success, -1 on error.
+// =============================================================================
+Function.FileTree_UpdateFile {
+    Input: conn:    Integer
+    Input: file_id: Integer
+    Input: data:    Integer
+    Input: size:    Integer
+    Output: Integer
+    Body: {
+        // Get current blob_uuid
+        FT_BufInit()
+        FT_BufStr("SELECT blob_uuid FROM files WHERE id=")
+        FT_BufInt(file_id)
+        r = FT_BufExec(conn)
+
+        IfCondition EqualTo(r, 0) ThenBlock: { ReturnValue(-1) }
+        cnt = Array.Size(r)
+        IfCondition EqualTo(cnt, 0) ThenBlock: {
+            PG_DestroyResult(r)
+            ReturnValue(-1)
+        }
+
+        row = Array.Get(r, 0)
+        uuid = Hash.Get(row, "blob_uuid")
+        PG_DestroyResult(r)
+
+        IfCondition EqualTo(uuid, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(StringLength(uuid), 0) ThenBlock: { ReturnValue(-1) }
+
+        // Overwrite blob on disk
+        rc = UUID_Overwrite(uuid, data, size)
+        IfCondition NotEqual(rc, 0) ThenBlock: { ReturnValue(-1) }
+
+        // Update size in PG
+        FT_BufInit()
+        FT_BufStr("UPDATE files SET blob_size=")
+        FT_BufInt(size)
+        FT_BufStr(" WHERE id=")
+        FT_BufInt(file_id)
+        FT_BufExecVoid(conn)
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// RESOLVE PARENT + NAME — resolve all but last component, return parent_id
+// and pointer to the filename component. Used for create-by-path operations.
+// Returns parent_id (>0) or 0 on error. Sets filename pointer via output.
+// =============================================================================
+Function.FileTree_ResolveMkdir {
+    Input: conn: Integer
+    Input: path: Integer
+    Output: Integer
+    Body: {
+        // Walk to the final component, creating directories as needed
+        plen = StringLength(path)
+        IfCondition LessEqual(plen, 1) ThenBlock: { ReturnValue(0) }
+
+        // Get root ID
+        root_id = FileTree_Resolve(conn, "/")
+        IfCondition EqualTo(root_id, 0) ThenBlock: { ReturnValue(0) }
+
+        current_id = root_id
+        pos = 1
+        comp_buf = Allocate(256)
+
+        WhileLoop LessThan(pos, plen) {
+            // Extract next component
+            clen = 0
+            WhileLoop LessThan(pos, plen) {
+                ch = GetByte(path, pos)
+                IfCondition EqualTo(ch, 47) ThenBlock: {
+                    pos = Add(pos, 1)
+                    BreakLoop
+                }
+                SetByte(comp_buf, clen, ch)
+                clen = Add(clen, 1)
+                pos = Add(pos, 1)
+            }
+
+            IfCondition EqualTo(clen, 0) ThenBlock: { ContinueLoop }
+            SetByte(comp_buf, clen, 0)
+
+            // Try to resolve this component
+            FT_BufInit()
+            FT_BufStr("SELECT id FROM files WHERE parent_id=")
+            FT_BufInt(current_id)
+            FT_BufStr(" AND name='")
+            FT_BufStr(comp_buf)
+            FT_BufStr("'")
+            r = FT_BufExec(conn)
+
+            IfCondition EqualTo(r, 0) ThenBlock: {
+                // Query failed — create directory
+                new_id = FileTree_CreateDir(conn, current_id, comp_buf)
+                IfCondition EqualTo(new_id, 0) ThenBlock: {
+                    Deallocate(comp_buf, 256)
+                    ReturnValue(0)
+                }
+                current_id = new_id
+                ContinueLoop
+            }
+
+            cnt = Array.Size(r)
+            IfCondition EqualTo(cnt, 0) ThenBlock: {
+                PG_DestroyResult(r)
+                // Component doesn't exist — create directory
+                new_id = FileTree_CreateDir(conn, current_id, comp_buf)
+                IfCondition EqualTo(new_id, 0) ThenBlock: {
+                    Deallocate(comp_buf, 256)
+                    ReturnValue(0)
+                }
+                current_id = new_id
+                ContinueLoop
+            }
+
+            row = Array.Get(r, 0)
+            id_str = Hash.Get(row, "id")
+            current_id = StringToNumber(id_str)
+            PG_DestroyResult(r)
+        }
+
+        Deallocate(comp_buf, 256)
+        ReturnValue(current_id)
+    }
+}

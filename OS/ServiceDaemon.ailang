@@ -1,0 +1,491 @@
+// ServiceDaemon.ailang
+// PG-driven service launcher and process monitor.
+// Reads the services table, fork/execs autostart services by priority,
+// tracks PIDs in service_status, restarts per restart_policy.
+// Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.Hash
+LibraryImport.Arrays
+LibraryImport.StringUtils
+LibraryImport.PostgreSQL_Complete
+
+Import.OS.Schema
+
+// =============================================================================
+// SYSCALL CONSTANTS
+// =============================================================================
+FixedPool.SvcSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_WAIT4":     Initialize=61
+    "SYS_KILL":      Initialize=62
+    "SYS_NANOSLEEP": Initialize=35
+    "SYS_GETPID":    Initialize=39
+    "SYS_CLOCK":     Initialize=228
+}
+
+FixedPool.SvcConst {
+    "MAX_SERVICES":  Initialize=32
+    "ENTRY_SIZE":    Initialize=40
+    "OFF_PID":       Initialize=0
+    "OFF_NAME":      Initialize=8
+    "OFF_PATH":      Initialize=16
+    "OFF_POLICY":    Initialize=24
+    "OFF_RESTARTS":  Initialize=32
+}
+
+// =============================================================================
+// DAEMON STATE
+// =============================================================================
+FixedPool.SvcState {
+    "conn":          Initialize=0, CanChange=True
+    "table":         Initialize=0, CanChange=True
+    "count":         Initialize=0, CanChange=True
+    "running":       Initialize=1, CanChange=True
+}
+
+// =============================================================================
+// LAUNCH A SINGLE SERVICE — fork/exec binary_path
+// Returns child PID (>0) or 0 on failure.
+// =============================================================================
+Function.Svc_Launch {
+    Input: svc_path: Integer
+    Input: svc_name: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[SVC] Launching: ")
+        PrintString(svc_name)
+        PrintMessage(" -> ")
+        PrintString(svc_path)
+        PrintMessage("\n")
+
+        // Build argv: [path, NULL]
+        argv = Allocate(16)
+        StoreValue(argv, svc_path)
+        StoreValue(Add(argv, 8), 0)
+
+        // Build minimal envp: [NULL]
+        envp = Allocate(8)
+        StoreValue(envp, 0)
+
+        pid = SystemCall(SvcSys.SYS_FORK, 0, 0, 0, 0, 0)
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child process: exec the service binary
+            SystemCall(SvcSys.SYS_EXECVE, svc_path, argv, envp, 0, 0)
+            // If we get here, exec failed
+            PrintMessage("[SVC] ERROR: execve failed for ")
+            PrintString(svc_path)
+            PrintMessage("\n")
+            SystemCall(SvcSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        Deallocate(argv, 16)
+        Deallocate(envp, 8)
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[SVC] ERROR: fork failed for ")
+            PrintString(svc_name)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[SVC]   PID=")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// =============================================================================
+// RECORD SERVICE STATUS IN PG
+// =============================================================================
+Function.Svc_RecordStart {
+    Input: conn:     Integer
+    Input: svc_name: Integer
+    Input: pid:      Integer
+    Body: {
+        // Build: INSERT INTO service_status (service_name, pid, state, started_at)
+        //        VALUES ('name', pid, 'running', epoch)
+        //        ON CONFLICT (service_name) DO UPDATE SET pid=pid, state='running', started_at=epoch
+        //
+        // We need to build the SQL string dynamically since we have integer PID.
+        // Use a fixed buffer approach.
+
+        buf = Allocate(512)
+        boff = 0
+
+        prefix = "INSERT INTO service_status (service_name, pid, state, started_at) VALUES ('"
+        plen = StringLength(prefix)
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            SetByte(buf, boff, GetByte(prefix, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        // Copy service name
+        nlen = StringLength(svc_name)
+        i = 0
+        WhileLoop LessThan(i, nlen) {
+            SetByte(buf, boff, GetByte(svc_name, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        // "', "
+        SetByte(buf, boff, 39)
+        boff = Add(boff, 1)
+        SetByte(buf, boff, 44)
+        boff = Add(boff, 1)
+        SetByte(buf, boff, 32)
+        boff = Add(boff, 1)
+
+        // Convert PID to string
+        pid_str = NumberToString(pid)
+        pslen = StringLength(pid_str)
+        i = 0
+        WhileLoop LessThan(i, pslen) {
+            SetByte(buf, boff, GetByte(pid_str, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        // ", 'running', 0) ON CONFLICT ..."
+        suffix = ", 'running', 0) ON CONFLICT (service_name) DO UPDATE SET pid="
+        slen = StringLength(suffix)
+        i = 0
+        WhileLoop LessThan(i, slen) {
+            SetByte(buf, boff, GetByte(suffix, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        // PID again
+        i = 0
+        WhileLoop LessThan(i, pslen) {
+            SetByte(buf, boff, GetByte(pid_str, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        // ", state='running', started_at=0, restart_count=0"
+        tail = ", state='running', started_at=0, restart_count=0"
+        tlen = StringLength(tail)
+        i = 0
+        WhileLoop LessThan(i, tlen) {
+            SetByte(buf, boff, GetByte(tail, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        // Null terminate
+        SetByte(buf, boff, 0)
+
+        r = PG_Query(conn, buf)
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        Deallocate(buf, 512)
+    }
+}
+
+// =============================================================================
+// RECORD SERVICE STOPPED IN PG
+// =============================================================================
+Function.Svc_RecordStopped {
+    Input: conn:     Integer
+    Input: svc_name: Integer
+    Input: exit_code: Integer
+    Body: {
+        buf = Allocate(512)
+        boff = 0
+
+        prefix = "UPDATE service_status SET state='stopped', pid=0, exit_code="
+        plen = StringLength(prefix)
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            SetByte(buf, boff, GetByte(prefix, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        ec_str = NumberToString(exit_code)
+        eclen = StringLength(ec_str)
+        i = 0
+        WhileLoop LessThan(i, eclen) {
+            SetByte(buf, boff, GetByte(ec_str, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        mid = " WHERE service_name='"
+        mlen = StringLength(mid)
+        i = 0
+        WhileLoop LessThan(i, mlen) {
+            SetByte(buf, boff, GetByte(mid, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        nlen = StringLength(svc_name)
+        i = 0
+        WhileLoop LessThan(i, nlen) {
+            SetByte(buf, boff, GetByte(svc_name, i))
+            boff = Add(boff, 1)
+            i = Add(i, 1)
+        }
+
+        SetByte(buf, boff, 39)
+        boff = Add(boff, 1)
+        SetByte(buf, boff, 0)
+
+        r = PG_Query(conn, buf)
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        Deallocate(buf, 512)
+    }
+}
+
+// =============================================================================
+// FIND SERVICE BY PID — returns index into tracking table, or -1
+// =============================================================================
+Function.Svc_FindByPID {
+    Input: table: Integer
+    Input: count: Integer
+    Input: pid:   Integer
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, count) {
+            entry = Add(table, Multiply(i, SvcConst.ENTRY_SIZE))
+            entry_pid = Dereference(Add(entry, SvcConst.OFF_PID))
+            IfCondition EqualTo(entry_pid, pid) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// SERVICE DAEMON MAIN — connect to PG, launch services, monitor
+// =============================================================================
+Function.ServiceDaemon_Run {
+    Output: Integer
+    Body: {
+        PrintMessage("=== AILang Service Daemon ===\n")
+
+        // Connect to PostgreSQL
+        conn = PG_Connect("127.0.0.1", 5432, "ailang_system", "bob", "")
+        IfCondition EqualTo(conn, 0) ThenBlock: {
+            PrintMessage("[SVC] FATAL: Cannot connect to PostgreSQL\n")
+            ReturnValue(1)
+        }
+        PrintMessage("[SVC] Connected to PostgreSQL\n")
+        SvcState.conn = conn
+
+        // Bootstrap schema (idempotent)
+        Schema_Bootstrap(conn)
+
+        // Clear stale service_status entries from previous boot
+        r = PG_Query(conn, "UPDATE service_status SET state='stopped', pid=0")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        // Query autostart services
+        result = PG_Query(conn, "SELECT name, binary_path, restart_policy FROM services WHERE autostart = true AND enabled = true ORDER BY priority ASC")
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            PrintMessage("[SVC] WARNING: No autostart services found or query failed\n")
+            ReturnValue(2)
+        }
+
+        svc_count = Array.Size(result)
+        PrintMessage("[SVC] Found ")
+        PrintNumber(svc_count)
+        PrintMessage(" autostart services\n")
+
+        IfCondition EqualTo(svc_count, 0) ThenBlock: {
+            PG_DestroyResult(result)
+            PrintMessage("[SVC] No services to launch.\n")
+            ReturnValue(0)
+        }
+
+        // Cap at MAX_SERVICES
+        IfCondition GreaterThan(svc_count, SvcConst.MAX_SERVICES) ThenBlock: {
+            svc_count = SvcConst.MAX_SERVICES
+        }
+
+        // Allocate tracking table: [pid(8) | name_ptr(8) | path_ptr(8) | policy_ptr(8) | restarts(8)] x count
+        table_size = Multiply(svc_count, SvcConst.ENTRY_SIZE)
+        table = Allocate(table_size)
+        MemorySet(table, 0, table_size)
+        SvcState.table = table
+        SvcState.count = svc_count
+
+        // Launch each service
+        i = 0
+        WhileLoop LessThan(i, svc_count) {
+            row = Array.Get(result, i)
+            svc_name   = Hash.Get(row, "name")
+            svc_path   = Hash.Get(row, "binary_path")
+            svc_policy = Hash.Get(row, "restart_policy")
+
+            entry = Add(table, Multiply(i, SvcConst.ENTRY_SIZE))
+
+            // Skip internal services (prefix "internal:")
+            IfCondition GreaterEqual(StringLength(svc_path), 9) ThenBlock: {
+                is_internal = StringStartsWith(svc_path, "internal:")
+                IfCondition EqualTo(is_internal, 1) ThenBlock: {
+                    PrintMessage("[SVC] Skipping internal service: ")
+                    PrintString(svc_name)
+                    PrintMessage("\n")
+                    StoreValue(Add(entry, SvcConst.OFF_PID), 0)
+                    StoreValue(Add(entry, SvcConst.OFF_NAME), svc_name)
+                    StoreValue(Add(entry, SvcConst.OFF_PATH), svc_path)
+                    StoreValue(Add(entry, SvcConst.OFF_POLICY), svc_policy)
+                    StoreValue(Add(entry, SvcConst.OFF_RESTARTS), 0)
+                    i = Add(i, 1)
+                    ContinueLoop
+                }
+            }
+
+            pid = Svc_Launch(svc_path, svc_name)
+
+            // Store in tracking table
+            StoreValue(Add(entry, SvcConst.OFF_PID), pid)
+            StoreValue(Add(entry, SvcConst.OFF_NAME), svc_name)
+            StoreValue(Add(entry, SvcConst.OFF_PATH), svc_path)
+            StoreValue(Add(entry, SvcConst.OFF_POLICY), svc_policy)
+            StoreValue(Add(entry, SvcConst.OFF_RESTARTS), 0)
+
+            // Record in PG
+            IfCondition GreaterThan(pid, 0) ThenBlock: {
+                Svc_RecordStart(conn, svc_name, pid)
+            }
+
+            i = Add(i, 1)
+        }
+
+        PG_DestroyResult(result)
+
+        PrintMessage("[SVC] All autostart services launched. Entering monitor loop.\n")
+
+        // =================================================================
+        // MONITOR LOOP — reap children, restart per policy
+        // =================================================================
+        // Allocate status buffer for waitpid
+        status_buf = Allocate(8)
+
+        // Allocate timespec for nanosleep (500ms)
+        ts = Allocate(16)
+        StoreValue(ts, 0)
+        StoreValue(Add(ts, 8), 500000000)
+
+        WhileLoop EqualTo(SvcState.running, 1) {
+            // Non-blocking wait for any child
+            StoreValue(status_buf, 0)
+            died_pid = SystemCall(SvcSys.SYS_WAIT4, -1, status_buf, 1, 0, 0)
+
+            IfCondition GreaterThan(died_pid, 0) ThenBlock: {
+                wstatus = Dereference(status_buf)
+                // Extract exit code: (wstatus >> 8) & 0xFF
+                exit_code = BitwiseAnd(Divide(wstatus, 256), 255)
+
+                PrintMessage("[SVC] Process died: PID=")
+                PrintNumber(died_pid)
+                PrintMessage(" exit=")
+                PrintNumber(exit_code)
+                PrintMessage("\n")
+
+                // Find which service this was
+                idx = Svc_FindByPID(table, svc_count, died_pid)
+                IfCondition GreaterEqual(idx, 0) ThenBlock: {
+                    entry = Add(table, Multiply(idx, SvcConst.ENTRY_SIZE))
+                    svc_name   = Dereference(Add(entry, SvcConst.OFF_NAME))
+                    svc_path   = Dereference(Add(entry, SvcConst.OFF_PATH))
+                    svc_policy = Dereference(Add(entry, SvcConst.OFF_POLICY))
+                    restarts   = Dereference(Add(entry, SvcConst.OFF_RESTARTS))
+
+                    PrintMessage("[SVC] Service '")
+                    PrintString(svc_name)
+                    PrintMessage("' exited (policy=")
+                    PrintString(svc_policy)
+                    PrintMessage(")\n")
+
+                    // Record stopped status
+                    Svc_RecordStopped(conn, svc_name, exit_code)
+
+                    // Check restart policy
+                    should_restart = 0
+                    IfCondition EqualTo(StringLength(svc_policy), 6) ThenBlock: {
+                        IfCondition EqualTo(StringStartsWith(svc_policy, "always"), 1) ThenBlock: {
+                            should_restart = 1
+                        }
+                    }
+                    IfCondition EqualTo(StringLength(svc_policy), 10) ThenBlock: {
+                        IfCondition EqualTo(StringStartsWith(svc_policy, "on-failure"), 1) ThenBlock: {
+                            IfCondition NotEqual(exit_code, 0) ThenBlock: {
+                                should_restart = 1
+                            }
+                        }
+                    }
+
+                    IfCondition EqualTo(should_restart, 1) ThenBlock: {
+                        // Cap restarts at 10 to avoid infinite crash loops
+                        IfCondition LessThan(restarts, 10) ThenBlock: {
+                            restarts = Add(restarts, 1)
+                            StoreValue(Add(entry, SvcConst.OFF_RESTARTS), restarts)
+
+                            PrintMessage("[SVC] Restarting '")
+                            PrintString(svc_name)
+                            PrintMessage("' (attempt ")
+                            PrintNumber(restarts)
+                            PrintMessage("/10)\n")
+
+                            new_pid = Svc_Launch(svc_path, svc_name)
+                            StoreValue(Add(entry, SvcConst.OFF_PID), new_pid)
+                            IfCondition GreaterThan(new_pid, 0) ThenBlock: {
+                                Svc_RecordStart(conn, svc_name, new_pid)
+                            }
+                        } ElseBlock: {
+                            PrintMessage("[SVC] Service '")
+                            PrintString(svc_name)
+                            PrintMessage("' exceeded 10 restarts, giving up.\n")
+                        }
+                    }
+                }
+            }
+
+            // Sleep 500ms between checks
+            SystemCall(SvcSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        }
+
+        Deallocate(status_buf, 8)
+        Deallocate(ts, 16)
+        Deallocate(table, table_size)
+
+        PG_Disconnect(conn)
+        PrintMessage("[SVC] Service daemon shutdown.\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// ENTRY POINT — standalone test
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+    rc = ServiceDaemon_Run()
+    PrintMessage("[SVC] Exit code: ")
+    PrintNumber(rc)
+    PrintMessage("\n")
+}
+
+RunTask(Main)
