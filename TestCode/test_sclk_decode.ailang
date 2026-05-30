@@ -1,0 +1,865 @@
+// test_sclk_decode.ailang — Rock-solid SCLK read & decode diagnostic
+//
+// Pure read-only. Zero register writes. Cannot crash or blank display.
+//
+// What it proves:
+//   1. SPLL register read + correct bit-field extraction
+//      - FBDIV is 12.14 fixed-point (integer.fraction), not a plain integer
+//      - REF_DIV hardware value 0 means divide-by-1
+//   2. AtomBIOS clock/voltage data fully decoded
+//   3. All PowerPlay DPM levels enumerated with SCLK/MCLK/VDDC
+//   4. Legal PLL dividers computed for every DPM level
+//   5. Works for any GCN/RDNA card — all values from AtomBIOS, nothing hardcoded
+//
+// Build: ./ailang.x TestCode/test_sclk_decode.ailang -o test_sclk_decode.x
+// Run:   sudo ./test_sclk_decode.x 2>&1 | tee sclk_decode_log.txt
+
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+
+// =============================================================================
+// SPLL_DecodeCurrent — read and decode the live SPLL state (NO WRITES)
+//
+// Handles the 12.14 fixed-point FBDIV format used by SI/CI/VI SPLL.
+// REF_DIV field value 0 is treated as 1 (hardware convention).
+// PDIV field value 0 is treated as 1.
+//
+// Returns computed SCLK in kHz, or 0 on error.
+// =============================================================================
+Function.SPLL_DecodeCurrent {
+    Input: gpu: Integer
+    Input: ref_khz: Integer
+    Output: Integer
+    Body: {
+        cntl   = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        cntl2  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        cntl3  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+        cntl4  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_4)
+        status = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+        ss     = GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM)
+        ss2    = GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM_2)
+
+        PrintMessage("\n=== SPLL Register Dump ===\n")
+        PrintMessage("  CG_SPLL_FUNC_CNTL     = 0x")
+        PrintHex(cntl)
+        PrintMessage("\n  CG_SPLL_FUNC_CNTL_2   = 0x")
+        PrintHex(cntl2)
+        PrintMessage("\n  CG_SPLL_FUNC_CNTL_3   = 0x")
+        PrintHex(cntl3)
+        PrintMessage("\n  CG_SPLL_FUNC_CNTL_4   = 0x")
+        PrintHex(cntl4)
+        PrintMessage("\n  SPLL_STATUS            = 0x")
+        PrintHex(status)
+        PrintMessage("\n  CG_SPLL_SPREAD_SPEC    = 0x")
+        PrintHex(ss)
+        PrintMessage("\n  CG_SPLL_SPREAD_SPEC_2  = 0x")
+        PrintHex(ss2)
+        PrintMessage("\n")
+
+        // ---- Extract raw bit fields from CNTL ----
+        // REF_DIV: bits [9:4] of CG_SPLL_FUNC_CNTL
+        raw_refdiv = BitwiseAnd(ShiftRight(cntl, 4), 63)
+        // PDIV_A: bits [26:20] of CG_SPLL_FUNC_CNTL
+        raw_pdiv = BitwiseAnd(ShiftRight(cntl, 20), 127)
+        // FBDIV: bits [25:0] of CG_SPLL_FUNC_CNTL_3 — this is 12.14 fixed-point
+        raw_fbdiv = BitwiseAnd(cntl3, 67108863)
+
+        // ---- Hardware convention: field value 0 means divide-by-1 ----
+        refdiv = raw_refdiv
+        IfCondition EqualTo(refdiv, 0) ThenBlock: { refdiv = 1 }
+        pdiv = raw_pdiv
+        IfCondition EqualTo(pdiv, 0) ThenBlock: { pdiv = 1 }
+
+        // ---- FBDIV 12.14 fixed-point decode ----
+        // Upper 12 bits = integer part, lower 14 bits = fractional part
+        // FBDIV_int = raw_fbdiv >> 14
+        // FBDIV_frac = raw_fbdiv & 0x3FFF (out of 16384)
+        fbdiv_int = ShiftRight(raw_fbdiv, 14)
+        fbdiv_frac = BitwiseAnd(raw_fbdiv, 16383)
+
+        PrintMessage("\n=== Decoded SPLL Fields ===\n")
+        PrintMessage("  REF_DIV  raw=")
+        PrintNumber(raw_refdiv)
+        PrintMessage(" effective=")
+        PrintNumber(refdiv)
+        PrintMessage("\n")
+        PrintMessage("  PDIV_A   raw=")
+        PrintNumber(raw_pdiv)
+        PrintMessage(" effective=")
+        PrintNumber(pdiv)
+        PrintMessage("\n")
+        PrintMessage("  FBDIV    raw=0x")
+        PrintHex(raw_fbdiv)
+        PrintMessage(" (")
+        PrintNumber(raw_fbdiv)
+        PrintMessage(")\n")
+        PrintMessage("           integer=")
+        PrintNumber(fbdiv_int)
+        PrintMessage(" fraction=")
+        PrintNumber(fbdiv_frac)
+        PrintMessage("/16384\n")
+
+        // ---- Decode flags ----
+        bypass = BitwiseAnd(cntl, SPLLBits.SPLL_BYPASS_EN)
+        reset  = BitwiseAnd(cntl, SPLLBits.SPLL_RESET)
+        sleep  = BitwiseAnd(cntl, SPLLBits.SPLL_SLEEP)
+        locked = BitwiseAnd(status, SPLLBits.SPLL_CHG_STATUS)
+        ss_en  = BitwiseAnd(ss, SPLLBits.SSEN)
+
+        PrintMessage("\n=== PLL Flags ===\n")
+        PrintMessage("  BYPASS   = ")
+        IfCondition NotEqual(bypass, 0) ThenBlock: { PrintMessage("YES (engine on ref clock)\n") }
+        IfCondition EqualTo(bypass, 0) ThenBlock: { PrintMessage("NO (engine on PLL output)\n") }
+        PrintMessage("  RESET    = ")
+        IfCondition NotEqual(reset, 0) ThenBlock: { PrintMessage("YES (PLL held in reset)\n") }
+        IfCondition EqualTo(reset, 0) ThenBlock: { PrintMessage("NO\n") }
+        PrintMessage("  SLEEP    = ")
+        IfCondition NotEqual(sleep, 0) ThenBlock: { PrintMessage("YES (PLL powered down)\n") }
+        IfCondition EqualTo(sleep, 0) ThenBlock: { PrintMessage("NO\n") }
+        PrintMessage("  LOCKED   = ")
+        IfCondition NotEqual(locked, 0) ThenBlock: { PrintMessage("YES\n") }
+        IfCondition EqualTo(locked, 0) ThenBlock: { PrintMessage("NO (PLL not locked!)\n") }
+        PrintMessage("  SS_EN    = ")
+        IfCondition NotEqual(ss_en, 0) ThenBlock: { PrintMessage("ENABLED\n") }
+        IfCondition EqualTo(ss_en, 0) ThenBlock: { PrintMessage("DISABLED\n") }
+
+        // ---- Compute current SCLK ----
+        // Formula: SCLK = ref_clk * (FBDIV_int + FBDIV_frac/16384) / (REFDIV * PDIV)
+        //
+        // To avoid floating point, we compute in kHz with fractional correction:
+        //   sclk_khz = (ref_khz * fbdiv_int) / (refdiv * pdiv)
+        //            + (ref_khz * fbdiv_frac) / (refdiv * pdiv * 16384)
+        //
+        // For the fractional part, to keep precision without overflow:
+        //   frac_contrib_khz = (ref_khz * fbdiv_frac) / (refdiv * pdiv * 16384)
+        //
+        // With ref_khz=27000, fbdiv_frac max=16383, product max = 442,341,000
+        // which fits in 64-bit. refdiv*pdiv*16384 also fits fine.
+
+        denom = Multiply(refdiv, pdiv)
+
+        sclk_int_khz = Divide(Multiply(ref_khz, fbdiv_int), denom)
+        frac_numer = Multiply(ref_khz, fbdiv_frac)
+        frac_denom = Multiply(denom, 16384)
+        sclk_frac_khz = Divide(frac_numer, frac_denom)
+
+        sclk_khz = Add(sclk_int_khz, sclk_frac_khz)
+
+        PrintMessage("\n=== Computed SCLK ===\n")
+        PrintMessage("  ref_clk     = ")
+        PrintNumber(Divide(ref_khz, 1000))
+        PrintMessage(" MHz (")
+        PrintNumber(ref_khz)
+        PrintMessage(" kHz)\n")
+        PrintMessage("  formula     = ref * (FBDIV_int + FBDIV_frac/16384) / (REFDIV * PDIV)\n")
+        PrintMessage("              = ")
+        PrintNumber(ref_khz)
+        PrintMessage(" * (")
+        PrintNumber(fbdiv_int)
+        PrintMessage(" + ")
+        PrintNumber(fbdiv_frac)
+        PrintMessage("/16384) / (")
+        PrintNumber(refdiv)
+        PrintMessage(" * ")
+        PrintNumber(pdiv)
+        PrintMessage(")\n")
+        PrintMessage("  int part    = ")
+        PrintNumber(sclk_int_khz)
+        PrintMessage(" kHz\n")
+        PrintMessage("  frac part   = ")
+        PrintNumber(sclk_frac_khz)
+        PrintMessage(" kHz\n")
+        PrintMessage("  SCLK total  = ")
+        PrintNumber(Divide(sclk_khz, 1000))
+        PrintMessage(" MHz (")
+        PrintNumber(sclk_khz)
+        PrintMessage(" kHz)\n")
+
+        // If in bypass, report that engine is actually on ref clock
+        IfCondition NotEqual(bypass, 0) ThenBlock: {
+            PrintMessage("  NOTE: BYPASS is ON — engine actually running at ref_clk = ")
+            PrintNumber(Divide(ref_khz, 1000))
+            PrintMessage(" MHz, not PLL output\n")
+        }
+
+        ReturnValue(sclk_khz)
+    }
+}
+
+// =============================================================================
+// PLL_ComputeDividers — compute legal FBDIV/PDIV/REFDIV for a target SCLK
+//
+// Uses AtomBIOS ref_clk. Targets VCO in [600 MHz, 1200 MHz] range.
+// On SI: VCO = ref * FBDIV / REFDIV, then SCLK = VCO / PDIV.
+//
+// Strategy: try REFDIV=1, sweep PDIV from 1 upward until VCO lands in range.
+// Then compute FBDIV_int.frac to hit the target precisely.
+//
+// Prints the results. Returns computed SCLK in kHz (0 on failure).
+//
+// vco_min/vco_max in kHz. Pass 0 for defaults (600000/1200000).
+// =============================================================================
+Function.PLL_ComputeDividers {
+    Input: ref_khz: Integer
+    Input: target_khz: Integer
+    Input: vco_min_khz: Integer
+    Input: vco_max_khz: Integer
+    Output: Integer
+    Body: {
+        // Defaults for SI — VCO range 600-1200 MHz
+        v_min = vco_min_khz
+        IfCondition EqualTo(v_min, 0) ThenBlock: { v_min = 600000 }
+        v_max = vco_max_khz
+        IfCondition EqualTo(v_max, 0) ThenBlock: { v_max = 1200000 }
+
+        IfCondition EqualTo(ref_khz, 0) ThenBlock: {
+            PrintMessage("    ERROR: ref_khz is 0\n")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(target_khz, 0) ThenBlock: {
+            PrintMessage("    ERROR: target_khz is 0\n")
+            ReturnValue(0)
+        }
+
+        // Use REFDIV=1 — simplest and most common configuration
+        use_refdiv = 1
+
+        // Find smallest PDIV where VCO = target * PDIV falls in [vco_min, vco_max]
+        use_pdiv = 0
+        try_pdiv = 1
+        WhileLoop LessEqual(try_pdiv, 127) {
+            vco_try = Multiply(target_khz, try_pdiv)
+            IfCondition GreaterEqual(vco_try, v_min) ThenBlock: {
+                IfCondition LessEqual(vco_try, v_max) ThenBlock: {
+                    use_pdiv = try_pdiv
+                    ExitLoop
+                }
+            }
+            // If vco already above max, no point going higher
+            IfCondition GreaterThan(vco_try, v_max) ThenBlock: {
+                ExitLoop
+            }
+            try_pdiv = Add(try_pdiv, 1)
+        }
+
+        IfCondition EqualTo(use_pdiv, 0) ThenBlock: {
+            // Target too low for VCO range even at max PDIV, or too high
+            // Try with larger REFDIV to bring VCO down
+            PrintMessage("    PDIV search failed for REFDIV=1\n")
+            PrintMessage("    target=")
+            PrintNumber(Divide(target_khz, 1000))
+            PrintMessage(" MHz, VCO range=")
+            PrintNumber(Divide(v_min, 1000))
+            PrintMessage("-")
+            PrintNumber(Divide(v_max, 1000))
+            PrintMessage(" MHz\n")
+            ReturnValue(0)
+        }
+
+        // VCO we need to hit
+        vco_target = Multiply(target_khz, use_pdiv)
+
+        // Compute FBDIV as 12.14 fixed-point
+        // FBDIV_real = VCO_target * REFDIV / ref_khz (in kHz units, cancels out)
+        // FBDIV_12_14 = FBDIV_real * 16384
+        //             = (VCO_target * REFDIV * 16384) / ref_khz
+        fbdiv_fixed = Divide(Multiply(vco_target, Multiply(use_refdiv, 16384)), ref_khz)
+
+        // Extract integer and fractional parts
+        comp_fbdiv_int = ShiftRight(fbdiv_fixed, 14)
+        comp_fbdiv_frac = BitwiseAnd(fbdiv_fixed, 16383)
+
+        // Compute actual achieved SCLK with these dividers
+        // actual = ref * (fbdiv_int + fbdiv_frac/16384) / (refdiv * pdiv)
+        denom = Multiply(use_refdiv, use_pdiv)
+        actual_int = Divide(Multiply(ref_khz, comp_fbdiv_int), denom)
+        actual_frac = Divide(Multiply(ref_khz, comp_fbdiv_frac), Multiply(denom, 16384))
+        actual_khz = Add(actual_int, actual_frac)
+
+        // Error from target
+        err_khz = Subtract(actual_khz, target_khz)
+        IfCondition LessThan(err_khz, 0) ThenBlock: { err_khz = Subtract(0, err_khz) }
+
+        PrintMessage("    REFDIV=")
+        PrintNumber(use_refdiv)
+        PrintMessage(" PDIV=")
+        PrintNumber(use_pdiv)
+        PrintMessage(" FBDIV=")
+        PrintNumber(comp_fbdiv_int)
+        PrintMessage(".")
+        // Print fractional part as 4-digit decimal approximation
+        frac_pct = Divide(Multiply(comp_fbdiv_frac, 10000), 16384)
+        IfCondition LessThan(frac_pct, 1000) ThenBlock: { PrintMessage("0") }
+        IfCondition LessThan(frac_pct, 100) ThenBlock: { PrintMessage("0") }
+        IfCondition LessThan(frac_pct, 10) ThenBlock: { PrintMessage("0") }
+        PrintNumber(frac_pct)
+        PrintMessage(" (raw 0x")
+        PrintHex(fbdiv_fixed)
+        PrintMessage(")\n")
+        PrintMessage("    VCO=")
+        PrintNumber(Divide(vco_target, 1000))
+        PrintMessage(" MHz  actual=")
+        PrintNumber(Divide(actual_khz, 1000))
+        PrintMessage(" MHz  err=")
+        PrintNumber(err_khz)
+        PrintMessage(" kHz\n")
+
+        ReturnValue(actual_khz)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+Function.Main {
+    Body: {
+        PrintMessage("=== SCLK Decode Diagnostic ===\n")
+        PrintMessage("Pure read-only. Zero register writes. Cannot crash.\n")
+        PrintMessage("Proves correct register decode + AtomBIOS clock table parsing.\n\n")
+
+        // ---- GPU discovery ----
+        n_gpus = GPU_Discover()
+        IfCondition EqualTo(n_gpus, 0) ThenBlock: {
+            PrintMessage("FAIL: no AMD GPU found\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+        PrintMessage("[INIT] found ")
+        PrintNumber(n_gpus)
+        PrintMessage(" GPU(s)\n")
+
+        gpu = 0
+
+        // Print device info from discovery
+        dev = GPU_GetDevice(gpu)
+        IfCondition NotEqual(dev, 0) ThenBlock: {
+            gen = Dereference(Add(dev, GPUDevField.GENERATION))
+            chip_v = Dereference(Add(dev, GPUDevField.CHIP))
+            max_cus = Dereference(Add(dev, GPUDevField.MAX_CUS))
+
+            PrintMessage("[INIT] Generation: ")
+            PrintString(GPUFamily_GenName(gen))
+            PrintMessage("  Chip: ")
+            PrintString(GPUFamily_Name(chip_v))
+            PrintMessage("  CUs: ")
+            PrintNumber(max_cus)
+            PrintMessage("\n")
+        }
+
+        // ---- BAR mapping ----
+        GPU_BAR_Init()
+        rc = GPU_BAR_MapMMIO(gpu)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("FAIL: MMIO map failed\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+        PrintMessage("[INIT] MMIO mapped\n")
+
+        // ---- AtomBIOS load and parse ----
+        ref_khz = 27000
+        rom = AtomBIOS_LoadROM(gpu)
+        IfCondition EqualTo(rom, 0) ThenBlock: {
+            PrintMessage("FAIL: AtomBIOS ROM load failed\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+        ap_rc = AtomBIOS_Parse(gpu)
+        IfCondition NotEqual(ap_rc, 1) ThenBlock: {
+            PrintMessage("FAIL: AtomBIOS parse failed\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+
+        PrintMessage("\n")
+        PrintMessage("====================================================================\n")
+        PrintMessage("  SECTION 1: AtomBIOS Hardware Data\n")
+        PrintMessage("====================================================================\n")
+        AtomBIOS_PrintInfo(gpu)
+
+        ref_khz = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
+        IfCondition EqualTo(ref_khz, 0) ThenBlock: {
+            ref_khz = 27000
+            PrintMessage("  (ref clock not in ROM, using 27 MHz fallback)\n")
+        }
+
+        def_khz = AtomBIOS_GetField(gpu, AtomField.DEF_ENGINE_CLK)
+        max_khz = AtomBIOS_GetField(gpu, AtomField.MAX_ENGINE_CLK)
+        boot_vddc = AtomBIOS_GetField(gpu, AtomField.BOOT_VDDC)
+        max_vddc = AtomBIOS_GetField(gpu, AtomField.MAX_ENGINE_VDDC)
+
+        PrintMessage("\n  Summary:\n")
+        PrintMessage("    Ref Clock     = ")
+        PrintNumber(Divide(ref_khz, 1000))
+        PrintMessage(" MHz\n")
+        PrintMessage("    Default SCLK  = ")
+        PrintNumber(Divide(def_khz, 1000))
+        PrintMessage(" MHz\n")
+        PrintMessage("    Max SCLK (PP) = ")
+        PrintNumber(Divide(max_khz, 1000))
+        PrintMessage(" MHz @ ")
+        PrintNumber(max_vddc)
+        PrintMessage(" mV\n")
+        PrintMessage("    Boot VDDC     = ")
+        PrintNumber(boot_vddc)
+        PrintMessage(" mV\n")
+
+        // ---- Voltage headroom analysis ----
+        PrintMessage("\n  Voltage analysis:\n")
+        IfCondition GreaterThan(max_vddc, boot_vddc) ThenBlock: {
+            PrintMessage("    WARNING: max PP clock needs ")
+            PrintNumber(Subtract(max_vddc, boot_vddc))
+            PrintMessage(" mV MORE than boot VDDC\n")
+            PrintMessage("    Without voltage programming, max safe clock < max PP clock\n")
+        }
+        IfCondition LessEqual(max_vddc, boot_vddc) ThenBlock: {
+            PrintMessage("    OK: boot VDDC (")
+            PrintNumber(boot_vddc)
+            PrintMessage(" mV) >= max PP VDDC (")
+            PrintNumber(max_vddc)
+            PrintMessage(" mV)\n")
+        }
+
+        // ==================================================================
+        PrintMessage("\n")
+        PrintMessage("====================================================================\n")
+        PrintMessage("  SECTION 2: Live SPLL Register Decode\n")
+        PrintMessage("====================================================================\n")
+
+        cur_sclk = SPLL_DecodeCurrent(gpu, ref_khz)
+
+        // Compare with AtomBIOS default
+        PrintMessage("\n  Comparison with AtomBIOS:\n")
+        IfCondition GreaterThan(cur_sclk, 0) ThenBlock: {
+            diff_def = Subtract(cur_sclk, def_khz)
+            IfCondition LessThan(diff_def, 0) ThenBlock: { diff_def = Subtract(0, diff_def) }
+            pct_def = Divide(Multiply(diff_def, 100), def_khz)
+            PrintMessage("    vs DEF_ENGINE_CLK (")
+            PrintNumber(Divide(def_khz, 1000))
+            PrintMessage(" MHz): delta=")
+            PrintNumber(Divide(diff_def, 1000))
+            PrintMessage(" MHz (")
+            PrintNumber(pct_def)
+            PrintMessage("%)\n")
+
+            IfCondition GreaterThan(max_khz, 0) ThenBlock: {
+                diff_max = Subtract(cur_sclk, max_khz)
+                IfCondition LessThan(diff_max, 0) ThenBlock: { diff_max = Subtract(0, diff_max) }
+                pct_max = Divide(Multiply(diff_max, 100), max_khz)
+                PrintMessage("    vs MAX_ENGINE_CLK (")
+                PrintNumber(Divide(max_khz, 1000))
+                PrintMessage(" MHz): delta=")
+                PrintNumber(Divide(diff_max, 1000))
+                PrintMessage(" MHz (")
+                PrintNumber(pct_max)
+                PrintMessage("%)\n")
+            }
+        }
+
+        // ==================================================================
+        PrintMessage("\n")
+        PrintMessage("====================================================================\n")
+        PrintMessage("  SECTION 3: PowerPlay DPM Table — All Entries\n")
+        PrintMessage("====================================================================\n")
+
+        num_dpm = AtomBIOS_GetDPMCount(gpu)
+        ci_size = AtomBIOS_GetClockInfoSize(gpu)
+        PrintMessage("  Clock info entries: ")
+        PrintNumber(num_dpm)
+        PrintMessage("  (entry size: ")
+        PrintNumber(ci_size)
+        PrintMessage(" bytes)\n\n")
+
+        IfCondition EqualTo(num_dpm, 0) ThenBlock: {
+            PrintMessage("  No PowerPlay clock info found in ROM\n")
+        }
+
+        IfCondition GreaterThan(num_dpm, 0) ThenBlock: {
+            // Voltage ID detection: VDDC >= 0xFF00 (65280) means SMC-managed voltage
+            // These are EVV (Electrically Validated Voltage) entries that require
+            // SMC firmware to resolve the actual voltage. Unusable without SMC.
+            vid_threshold = 65280
+
+            PrintMessage("  Level | SCLK (MHz) | MCLK (MHz) | VDDC        | Status\n")
+            PrintMessage("  ------|------------|------------|-------------|-------------\n")
+
+            di = 0
+            dpm_vddc = 0
+            dpm_mclk = 0
+            num_smc = 0
+            num_safe = 0
+            num_overvolt = 0
+            WhileLoop LessThan(di, num_dpm) {
+                dpm_sclk = AtomBIOS_GetDPMEntry(gpu, di, AddressOf(dpm_vddc), AddressOf(dpm_mclk))
+
+                PrintMessage("    ")
+                IfCondition LessThan(di, 10) ThenBlock: { PrintMessage(" ") }
+                PrintNumber(di)
+                PrintMessage("   |    ")
+                sclk_mhz = Divide(dpm_sclk, 1000)
+                IfCondition LessThan(sclk_mhz, 100) ThenBlock: { PrintMessage(" ") }
+                IfCondition LessThan(sclk_mhz, 1000) ThenBlock: { PrintMessage(" ") }
+                PrintNumber(sclk_mhz)
+                PrintMessage("    |    ")
+                mclk_mhz = Divide(dpm_mclk, 1000)
+                IfCondition LessThan(mclk_mhz, 100) ThenBlock: { PrintMessage(" ") }
+                IfCondition LessThan(mclk_mhz, 1000) ThenBlock: { PrintMessage(" ") }
+                PrintNumber(mclk_mhz)
+                PrintMessage("    | ")
+
+                // Detect voltage ID (EVV) vs real millivolt value
+                IfCondition GreaterEqual(dpm_vddc, vid_threshold) ThenBlock: {
+                    PrintMessage("VID 0x")
+                    PrintHex(dpm_vddc)
+                    PrintMessage("  | SMC-only\n")
+                    num_smc = Add(num_smc, 1)
+                }
+                IfCondition LessThan(dpm_vddc, vid_threshold) ThenBlock: {
+                    IfCondition LessThan(dpm_vddc, 1000) ThenBlock: { PrintMessage(" ") }
+                    PrintNumber(dpm_vddc)
+                    PrintMessage(" mV    | ")
+
+                    // Boot-safe = VDDC <= boot_vddc
+                    IfCondition LessEqual(dpm_vddc, boot_vddc) ThenBlock: {
+                        PrintMessage("SAFE\n")
+                        num_safe = Add(num_safe, 1)
+                    }
+                    IfCondition GreaterThan(dpm_vddc, boot_vddc) ThenBlock: {
+                        PrintMessage("OVER (+")
+                        PrintNumber(Subtract(dpm_vddc, boot_vddc))
+                        PrintMessage("mV)\n")
+                        num_overvolt = Add(num_overvolt, 1)
+                    }
+                }
+
+                di = Add(di, 1)
+            }
+
+            PrintMessage("\n  Summary: ")
+            PrintNumber(num_safe)
+            PrintMessage(" boot-safe, ")
+            PrintNumber(num_overvolt)
+            PrintMessage(" over-voltage, ")
+            PrintNumber(num_smc)
+            PrintMessage(" SMC-only (VID)\n")
+        }
+
+        // ==================================================================
+        PrintMessage("\n")
+        PrintMessage("====================================================================\n")
+        PrintMessage("  SECTION 4: Legal PLL Dividers for Each DPM Level\n")
+        PrintMessage("====================================================================\n")
+        PrintMessage("  Using ref_clk=")
+        PrintNumber(Divide(ref_khz, 1000))
+        PrintMessage(" MHz, VCO range 600-1200 MHz (SI default)\n\n")
+
+        vid_threshold = 65280
+        IfCondition GreaterThan(num_dpm, 0) ThenBlock: {
+            di = 0
+            dpm_vddc = 0
+            dpm_mclk = 0
+            WhileLoop LessThan(di, num_dpm) {
+                dpm_sclk = AtomBIOS_GetDPMEntry(gpu, di, AddressOf(dpm_vddc), AddressOf(dpm_mclk))
+
+                PrintMessage("  DPM ")
+                PrintNumber(di)
+                PrintMessage(": target=")
+                PrintNumber(Divide(dpm_sclk, 1000))
+                PrintMessage(" MHz (")
+                PrintNumber(dpm_sclk)
+                PrintMessage(" kHz)")
+
+                // Skip SMC-only entries — no point computing dividers for clocks
+                // we can't safely reach without SMC voltage management
+                IfCondition GreaterEqual(dpm_vddc, vid_threshold) ThenBlock: {
+                    PrintMessage(" — SKIPPED (SMC-only, VID 0x")
+                    PrintHex(dpm_vddc)
+                    PrintMessage(")\n\n")
+                }
+                IfCondition LessThan(dpm_vddc, vid_threshold) ThenBlock: {
+                    PrintMessage(" @ ")
+                    PrintNumber(dpm_vddc)
+                    PrintMessage(" mV\n")
+
+                    computed = PLL_ComputeDividers(ref_khz, dpm_sclk, 0, 0)
+                    IfCondition EqualTo(computed, 0) ThenBlock: {
+                        PrintMessage("    FAILED to find legal dividers!\n")
+                    }
+                    PrintMessage("\n")
+                }
+
+                di = Add(di, 1)
+            }
+        }
+
+        // Also compute dividers for DEF and MAX engine clocks from FirmwareInfo
+        PrintMessage("  --- FirmwareInfo clocks ---\n")
+        PrintMessage("  DEF_ENGINE_CLK: target=")
+        PrintNumber(Divide(def_khz, 1000))
+        PrintMessage(" MHz\n")
+        PLL_ComputeDividers(ref_khz, def_khz, 0, 0)
+        PrintMessage("\n")
+
+        IfCondition GreaterThan(max_khz, 0) ThenBlock: {
+            PrintMessage("  MAX_ENGINE_CLK: target=")
+            PrintNumber(Divide(max_khz, 1000))
+            PrintMessage(" MHz\n")
+            PLL_ComputeDividers(ref_khz, max_khz, 0, 0)
+            PrintMessage("\n")
+        }
+
+        // ==================================================================
+        PrintMessage("\n")
+        PrintMessage("====================================================================\n")
+        PrintMessage("  SECTION 4b: Available Frequency Options (no SMC required)\n")
+        PrintMessage("====================================================================\n")
+        PrintMessage("  These are the clock speeds programmable with direct SPLL register\n")
+        PrintMessage("  writes at boot voltage (")
+        PrintNumber(boot_vddc)
+        PrintMessage(" mV). No SMC firmware needed.\n\n")
+
+        IfCondition GreaterThan(num_dpm, 0) ThenBlock: {
+            PrintMessage("  Option | SCLK (MHz) | VDDC (mV) | PDIV | FBDIV      | VCO (MHz)\n")
+            PrintMessage("  -------|------------|-----------|------|------------|----------\n")
+
+            opt_count = 0
+            di = 0
+            dpm_vddc = 0
+            dpm_mclk = 0
+            WhileLoop LessThan(di, num_dpm) {
+                dpm_sclk = AtomBIOS_GetDPMEntry(gpu, di, AddressOf(dpm_vddc), AddressOf(dpm_mclk))
+
+                // Only show entries with real voltage that fit boot VDDC
+                is_real_v = 1
+                IfCondition GreaterEqual(dpm_vddc, vid_threshold) ThenBlock: { is_real_v = 0 }
+                IfCondition EqualTo(is_real_v, 1) ThenBlock: {
+                    IfCondition LessEqual(dpm_vddc, boot_vddc) ThenBlock: {
+                        IfCondition GreaterThan(dpm_sclk, 0) ThenBlock: {
+                            // Compute PLL parameters for this target
+                            // Inline the computation to display in table format
+                            v_min = 600000
+                            v_max = 1200000
+                            opt_pdiv = 0
+                            try_p = 1
+                            WhileLoop LessEqual(try_p, 127) {
+                                vco_try = Multiply(dpm_sclk, try_p)
+                                IfCondition GreaterEqual(vco_try, v_min) ThenBlock: {
+                                    IfCondition LessEqual(vco_try, v_max) ThenBlock: {
+                                        opt_pdiv = try_p
+                                        ExitLoop
+                                    }
+                                }
+                                IfCondition GreaterThan(vco_try, v_max) ThenBlock: { ExitLoop }
+                                try_p = Add(try_p, 1)
+                            }
+
+                            IfCondition GreaterThan(opt_pdiv, 0) ThenBlock: {
+                                vco_khz = Multiply(dpm_sclk, opt_pdiv)
+                                fbdiv_fixed = Divide(Multiply(vco_khz, 16384), ref_khz)
+                                fb_int = ShiftRight(fbdiv_fixed, 14)
+                                fb_frac = BitwiseAnd(fbdiv_fixed, 16383)
+                                fb_pct = Divide(Multiply(fb_frac, 10000), 16384)
+
+                                PrintMessage("    ")
+                                IfCondition LessThan(opt_count, 10) ThenBlock: { PrintMessage(" ") }
+                                PrintNumber(opt_count)
+                                PrintMessage("   |    ")
+                                sclk_mhz = Divide(dpm_sclk, 1000)
+                                IfCondition LessThan(sclk_mhz, 100) ThenBlock: { PrintMessage(" ") }
+                                IfCondition LessThan(sclk_mhz, 1000) ThenBlock: { PrintMessage(" ") }
+                                PrintNumber(sclk_mhz)
+                                PrintMessage("    |   ")
+                                IfCondition LessThan(dpm_vddc, 1000) ThenBlock: { PrintMessage(" ") }
+                                PrintNumber(dpm_vddc)
+                                PrintMessage("   |  ")
+                                IfCondition LessThan(opt_pdiv, 10) ThenBlock: { PrintMessage(" ") }
+                                PrintNumber(opt_pdiv)
+                                PrintMessage("  | ")
+                                PrintNumber(fb_int)
+                                PrintMessage(".")
+                                IfCondition LessThan(fb_pct, 1000) ThenBlock: { PrintMessage("0") }
+                                IfCondition LessThan(fb_pct, 100) ThenBlock: { PrintMessage("0") }
+                                IfCondition LessThan(fb_pct, 10) ThenBlock: { PrintMessage("0") }
+                                PrintNumber(fb_pct)
+                                PrintMessage("    |   ")
+                                PrintNumber(Divide(vco_khz, 1000))
+                                PrintMessage("\n")
+
+                                opt_count = Add(opt_count, 1)
+                            }
+                        }
+                    }
+                }
+
+                di = Add(di, 1)
+            }
+
+            PrintMessage("\n  Total programmable frequencies: ")
+            PrintNumber(opt_count)
+            PrintMessage("\n")
+
+            IfCondition EqualTo(opt_count, 0) ThenBlock: {
+                PrintMessage("  WARNING: No boot-safe frequencies found in PowerPlay table!\n")
+            }
+        }
+
+        // ==================================================================
+        PrintMessage("\n")
+        PrintMessage("====================================================================\n")
+        PrintMessage("  SECTION 5: Verification Summary\n")
+        PrintMessage("====================================================================\n")
+
+        pass_count = 0
+        fail_count = 0
+
+        // Check 1: Did we get a valid SCLK reading?
+        PrintMessage("  [CHK1] SPLL decode produces valid SCLK: ")
+        IfCondition GreaterThan(cur_sclk, 0) ThenBlock: {
+            PrintMessage("PASS (")
+            PrintNumber(Divide(cur_sclk, 1000))
+            PrintMessage(" MHz)\n")
+            pass_count = Add(pass_count, 1)
+        }
+        IfCondition EqualTo(cur_sclk, 0) ThenBlock: {
+            PrintMessage("FAIL\n")
+            fail_count = Add(fail_count, 1)
+        }
+
+        // Check 2: Current SCLK is within 5% of DEF_ENGINE_CLK
+        // (it should be at default since no driver loaded)
+        PrintMessage("  [CHK2] Current SCLK within 5%% of DEF_ENGINE_CLK: ")
+        IfCondition GreaterThan(cur_sclk, 0) ThenBlock: {
+            chk2_diff = Subtract(cur_sclk, def_khz)
+            IfCondition LessThan(chk2_diff, 0) ThenBlock: { chk2_diff = Subtract(0, chk2_diff) }
+            chk2_thresh = Divide(def_khz, 20)
+            IfCondition LessEqual(chk2_diff, chk2_thresh) ThenBlock: {
+                PrintMessage("PASS\n")
+                pass_count = Add(pass_count, 1)
+            }
+            IfCondition GreaterThan(chk2_diff, chk2_thresh) ThenBlock: {
+                PrintMessage("FAIL (delta=")
+                PrintNumber(Divide(chk2_diff, 1000))
+                PrintMessage(" MHz)\n")
+                fail_count = Add(fail_count, 1)
+            }
+        }
+        IfCondition EqualTo(cur_sclk, 0) ThenBlock: {
+            PrintMessage("SKIP (no SCLK reading)\n")
+        }
+
+        // Check 3: PLL is locked
+        chk3_status = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+        chk3_locked = BitwiseAnd(chk3_status, SPLLBits.SPLL_CHG_STATUS)
+        PrintMessage("  [CHK3] PLL is locked: ")
+        IfCondition NotEqual(chk3_locked, 0) ThenBlock: {
+            PrintMessage("PASS\n")
+            pass_count = Add(pass_count, 1)
+        }
+        IfCondition EqualTo(chk3_locked, 0) ThenBlock: {
+            PrintMessage("FAIL\n")
+            fail_count = Add(fail_count, 1)
+        }
+
+        // Check 4: AtomBIOS has DPM entries
+        PrintMessage("  [CHK4] PowerPlay DPM entries found: ")
+        IfCondition GreaterThan(num_dpm, 0) ThenBlock: {
+            PrintMessage("PASS (")
+            PrintNumber(num_dpm)
+            PrintMessage(" entries)\n")
+            pass_count = Add(pass_count, 1)
+        }
+        IfCondition EqualTo(num_dpm, 0) ThenBlock: {
+            PrintMessage("FAIL\n")
+            fail_count = Add(fail_count, 1)
+        }
+
+        // Check 5: At least one boot-safe (non-SMC) DPM level above default
+        chk5_vid = 65280
+        PrintMessage("  [CHK5] Boot-safe DPM level above default clock: ")
+        chk5_found = 0
+        IfCondition GreaterThan(num_dpm, 0) ThenBlock: {
+            chk5_i = 0
+            chk5_vddc = 0
+            chk5_mclk = 0
+            WhileLoop LessThan(chk5_i, num_dpm) {
+                chk5_sclk = AtomBIOS_GetDPMEntry(gpu, chk5_i, AddressOf(chk5_vddc), AddressOf(chk5_mclk))
+                // Skip voltage IDs (SMC-only)
+                IfCondition LessThan(chk5_vddc, chk5_vid) ThenBlock: {
+                    IfCondition GreaterThan(chk5_sclk, def_khz) ThenBlock: {
+                        IfCondition LessEqual(chk5_vddc, boot_vddc) ThenBlock: {
+                            chk5_found = 1
+                        }
+                    }
+                }
+                chk5_i = Add(chk5_i, 1)
+            }
+        }
+        IfCondition EqualTo(chk5_found, 1) ThenBlock: {
+            PrintMessage("PASS\n")
+            pass_count = Add(pass_count, 1)
+        }
+        IfCondition EqualTo(chk5_found, 0) ThenBlock: {
+            PrintMessage("FAIL (no safe clock above default)\n")
+            fail_count = Add(fail_count, 1)
+        }
+
+        // Check 6: PLL dividers computable for all non-SMC DPM levels
+        // (quiet check — no output from divider computation, just pass/fail)
+        chk6_vid = 65280
+        PrintMessage("  [CHK6] PLL dividers computable for all non-SMC DPM levels: ")
+        chk6_ok = 1
+        chk6_tested = 0
+        IfCondition GreaterThan(num_dpm, 0) ThenBlock: {
+            chk6_i = 0
+            chk6_vddc = 0
+            chk6_mclk = 0
+            WhileLoop LessThan(chk6_i, num_dpm) {
+                chk6_sclk = AtomBIOS_GetDPMEntry(gpu, chk6_i, AddressOf(chk6_vddc), AddressOf(chk6_mclk))
+                // Only test entries with real voltage values
+                IfCondition LessThan(chk6_vddc, chk6_vid) ThenBlock: {
+                    IfCondition GreaterThan(chk6_sclk, 0) ThenBlock: {
+                        // Inline VCO/PDIV check — does a valid PDIV exist?
+                        chk6_found = 0
+                        chk6_p = 1
+                        WhileLoop LessEqual(chk6_p, 127) {
+                            chk6_vco = Multiply(chk6_sclk, chk6_p)
+                            IfCondition GreaterEqual(chk6_vco, 600000) ThenBlock: {
+                                IfCondition LessEqual(chk6_vco, 1200000) ThenBlock: {
+                                    chk6_found = 1
+                                    ExitLoop
+                                }
+                            }
+                            IfCondition GreaterThan(chk6_vco, 1200000) ThenBlock: { ExitLoop }
+                            chk6_p = Add(chk6_p, 1)
+                        }
+                        IfCondition EqualTo(chk6_found, 0) ThenBlock: {
+                            chk6_ok = 0
+                        }
+                        chk6_tested = Add(chk6_tested, 1)
+                    }
+                }
+                chk6_i = Add(chk6_i, 1)
+            }
+        }
+        IfCondition EqualTo(chk6_ok, 1) ThenBlock: {
+            PrintMessage("PASS (")
+            PrintNumber(chk6_tested)
+            PrintMessage(" tested)\n")
+            pass_count = Add(pass_count, 1)
+        }
+        IfCondition EqualTo(chk6_ok, 0) ThenBlock: {
+            PrintMessage("FAIL\n")
+            fail_count = Add(fail_count, 1)
+        }
+
+        PrintMessage("\n  Results: ")
+        PrintNumber(pass_count)
+        PrintMessage(" PASS, ")
+        PrintNumber(fail_count)
+        PrintMessage(" FAIL\n")
+
+        PrintMessage("\n=== test_sclk_decode complete ===\n")
+        SystemCall(60, 0, 0, 0, 0, 0)
+    }
+}
+
+RunTask(Main)

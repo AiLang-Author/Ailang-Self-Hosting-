@@ -1,0 +1,999 @@
+// test_sclk_safe.ailang — Safe SCLK reprogramming with CRTC blanking
+//
+// Selects the highest boot-safe clock from PowerPlay DPM, blanks all active
+// CRTCs, reprograms SPLL with correct 12.14 fixed-point FBDIV and VCO-valid
+// PDIV, then unblanks. Screen blinks briefly during the switch.
+//
+// Safety:
+//   - If PLL lock fails: bypass stays ON (engine at 27 MHz ref), CRTCs unblank
+//   - If no safe target: does nothing
+//   - Voltage checked against boot VDDC — no over-voltage possible
+//   - SMC-only VID entries skipped automatically
+//
+// Crash-safe logging:
+//   Opens sclk_safe_log.txt directly (no pipe/tee) and fdatasyncs after each
+//   critical register write. If the GPU locks the bus, the log shows which
+//   step was last completed.
+//
+// Build: ./ailang.x TestCode/test_sclk_safe.ailang -o test_sclk_safe.x
+// Run:   sudo ./test_sclk_safe.x
+
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.AMDGPUDisplay
+
+// =============================================================================
+// CRASH-SAFE LOG — globals
+// =============================================================================
+FixedPool.LogState {
+    "fd": Initialize=0
+}
+
+// File open flags (Linux x86_64)
+FixedPool.OFlags {
+    "O_WRONLY":  Initialize=1
+    "O_CREAT":   Initialize=64
+    "O_TRUNC":   Initialize=512
+}
+
+// =============================================================================
+// LogOpen — open sclk_safe_log.txt for direct-to-disk breadcrumb logging
+// =============================================================================
+Function.LogOpen {
+    Body: {
+        flags = Add(OFlags.O_WRONLY, Add(OFlags.O_CREAT, OFlags.O_TRUNC))
+        // mode 0644 = 420
+        LogState.fd = SystemCall(2, "sclk_safe_log.txt", flags, 420, 0, 0)
+        IfCondition LessThan(LogState.fd, 0) ThenBlock: {
+            PrintMessage("[LOG] WARNING: could not open sclk_safe_log.txt (fd=")
+            PrintNumber(LogState.fd)
+            PrintMessage("), breadcrumbs disabled\n")
+            LogState.fd = 0
+        }
+        IfCondition GreaterThan(LogState.fd, 0) ThenBlock: {
+            PrintMessage("[LOG] Breadcrumb log: sclk_safe_log.txt (fd=")
+            PrintNumber(LogState.fd)
+            PrintMessage(")\n")
+        }
+    }
+}
+
+// =============================================================================
+// LogSync — write a breadcrumb tag + newline, then fdatasync to force to disk
+// =============================================================================
+Function.LogSync {
+    Input: tag: Address
+    Body: {
+        IfCondition GreaterThan(LogState.fd, 0) ThenBlock: {
+            tag_len = StringLength(tag)
+            SystemCall(1, LogState.fd, tag, tag_len, 0, 0)
+            nl = "\n"
+            SystemCall(1, LogState.fd, nl, 1, 0, 0)
+            // fdatasync = syscall 75
+            SystemCall(75, LogState.fd, 0, 0, 0, 0)
+        }
+    }
+}
+
+// =============================================================================
+// LogSyncHex — write tag + hex value + newline, then fdatasync
+// =============================================================================
+Function.LogSyncHex {
+    Input: tag: Address
+    Input: val: Integer
+    Body: {
+        IfCondition GreaterThan(LogState.fd, 0) ThenBlock: {
+            tag_len = StringLength(tag)
+            SystemCall(1, LogState.fd, tag, tag_len, 0, 0)
+            // Write hex value as 8-char string
+            hex_buf = Allocate(20)
+            hi = 0
+            WhileLoop LessThan(hi, 8) {
+                nib = BitwiseAnd(ShiftRight(val, Multiply(Subtract(7, hi), 4)), 15)
+                IfCondition LessThan(nib, 10) ThenBlock: {
+                    SetByte(hex_buf, hi, Add(48, nib))
+                }
+                IfCondition GreaterEqual(nib, 10) ThenBlock: {
+                    SetByte(hex_buf, hi, Add(87, nib))
+                }
+                hi = Add(hi, 1)
+            }
+            SetByte(hex_buf, 8, 10)
+            SystemCall(1, LogState.fd, hex_buf, 9, 0, 0)
+            Deallocate(hex_buf, 20)
+            // fdatasync = syscall 75
+            SystemCall(75, LogState.fd, 0, 0, 0, 0)
+        }
+    }
+}
+
+// =============================================================================
+// LogClose — close the log file
+// =============================================================================
+Function.LogClose {
+    Body: {
+        IfCondition GreaterThan(LogState.fd, 0) ThenBlock: {
+            SystemCall(75, LogState.fd, 0, 0, 0, 0)
+            SystemCall(3, LogState.fd, 0, 0, 0, 0)
+            LogState.fd = 0
+        }
+    }
+}
+
+// =============================================================================
+// SpinDelay — waste ~N microseconds by reading a harmless GPU register
+// Each MMIO read over PCIe takes ~200-500ns, so 50 reads ≈ 10-25 µs.
+// =============================================================================
+Function.SpinDelay {
+    Input: gpu: Integer
+    Input: iters: Integer
+    Body: {
+        di = 0
+        WhileLoop LessThan(di, iters) {
+            discard = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            di = Add(di, 1)
+        }
+    }
+}
+
+// =============================================================================
+// SPLL_DecodeCurrent — read and decode the live SPLL state (NO WRITES)
+// Returns computed SCLK in kHz, or 0 on error.
+// =============================================================================
+Function.SPLL_DecodeCurrent {
+    Input: gpu: Integer
+    Input: ref_khz: Integer
+    Output: Integer
+    Body: {
+        cntl   = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        cntl3  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+        status = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+
+        raw_refdiv = BitwiseAnd(ShiftRight(cntl, 4), 63)
+        raw_pdiv = BitwiseAnd(ShiftRight(cntl, 20), 127)
+        raw_fbdiv = BitwiseAnd(cntl3, 67108863)
+
+        refdiv = raw_refdiv
+        IfCondition EqualTo(refdiv, 0) ThenBlock: { refdiv = 1 }
+        pdiv = raw_pdiv
+        IfCondition EqualTo(pdiv, 0) ThenBlock: { pdiv = 1 }
+
+        fbdiv_int = ShiftRight(raw_fbdiv, 14)
+        fbdiv_frac = BitwiseAnd(raw_fbdiv, 16383)
+
+        denom = Multiply(refdiv, pdiv)
+        sclk_int_khz = Divide(Multiply(ref_khz, fbdiv_int), denom)
+        sclk_frac_khz = Divide(Multiply(ref_khz, fbdiv_frac), Multiply(denom, 16384))
+        sclk_khz = Add(sclk_int_khz, sclk_frac_khz)
+
+        // Check bypass
+        bypass = BitwiseAnd(cntl, SPLLBits.SPLL_BYPASS_EN)
+        locked = BitwiseAnd(status, SPLLBits.SPLL_CHG_STATUS)
+
+        PrintMessage("  SPLL: REFDIV=")
+        PrintNumber(refdiv)
+        PrintMessage(" PDIV=")
+        PrintNumber(pdiv)
+        PrintMessage(" FBDIV=")
+        PrintNumber(fbdiv_int)
+        PrintMessage(".")
+        frac_pct = Divide(Multiply(fbdiv_frac, 10000), 16384)
+        IfCondition LessThan(frac_pct, 1000) ThenBlock: { PrintMessage("0") }
+        IfCondition LessThan(frac_pct, 100) ThenBlock: { PrintMessage("0") }
+        IfCondition LessThan(frac_pct, 10) ThenBlock: { PrintMessage("0") }
+        PrintNumber(frac_pct)
+        PrintMessage(" → ")
+        PrintNumber(Divide(sclk_khz, 1000))
+        PrintMessage(" MHz")
+        IfCondition NotEqual(bypass, 0) ThenBlock: { PrintMessage(" [BYPASS]") }
+        IfCondition NotEqual(locked, 0) ThenBlock: { PrintMessage(" [LOCKED]") }
+        IfCondition EqualTo(locked, 0) ThenBlock: { PrintMessage(" [UNLOCKED]") }
+        PrintMessage("\n")
+
+        ReturnValue(sclk_khz)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+Function.Main {
+    Body: {
+        PrintMessage("=== Safe SCLK Reprogramming Test ===\n")
+        PrintMessage("Selects max boot-safe clock, blanks display, reprograms SPLL, unblanks.\n")
+        PrintMessage("Screen will blink briefly during clock switch.\n\n")
+
+        // Open crash-safe breadcrumb log (direct file + fdatasync)
+        LogOpen()
+
+        // ================================================================
+        // PHASE 0: INIT
+        // ================================================================
+        LogSync("PHASE0_INIT")
+        n_gpus = GPU_Discover()
+        IfCondition EqualTo(n_gpus, 0) ThenBlock: {
+            PrintMessage("FAIL: no AMD GPU found\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+
+        gpu = 0
+        GPU_BAR_Init()
+        rc = GPU_BAR_MapMMIO(gpu)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("FAIL: MMIO map failed\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+        PrintMessage("[INIT] MMIO mapped\n")
+
+        // Load AtomBIOS
+        rom = AtomBIOS_LoadROM(gpu)
+        IfCondition EqualTo(rom, 0) ThenBlock: {
+            PrintMessage("FAIL: AtomBIOS ROM load failed\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+        ap_rc = AtomBIOS_Parse(gpu)
+        IfCondition NotEqual(ap_rc, 1) ThenBlock: {
+            PrintMessage("FAIL: AtomBIOS parse failed\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+        PrintMessage("[INIT] AtomBIOS loaded and parsed\n")
+        LogSync("PHASE0_ATOMBIOS_OK")
+
+        ref_khz = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
+        IfCondition EqualTo(ref_khz, 0) ThenBlock: { ref_khz = 27000 }
+        boot_vddc = AtomBIOS_GetField(gpu, AtomField.BOOT_VDDC)
+        def_khz = AtomBIOS_GetField(gpu, AtomField.DEF_ENGINE_CLK)
+
+        PrintMessage("[INIT] ref=")
+        PrintNumber(Divide(ref_khz, 1000))
+        PrintMessage(" MHz  boot_vddc=")
+        PrintNumber(boot_vddc)
+        PrintMessage(" mV  def_sclk=")
+        PrintNumber(Divide(def_khz, 1000))
+        PrintMessage(" MHz\n")
+
+        // ================================================================
+        // PHASE 1: TARGET SELECTION
+        // ================================================================
+        PrintMessage("\n====================================================================\n")
+        PrintMessage("  PHASE 1: Target Selection (max boot-safe DPM clock)\n")
+        PrintMessage("====================================================================\n")
+
+        num_dpm = AtomBIOS_GetDPMCount(gpu)
+        PrintMessage("  DPM entries: ")
+        PrintNumber(num_dpm)
+        PrintMessage("\n")
+
+        IfCondition EqualTo(num_dpm, 0) ThenBlock: {
+            PrintMessage("  No DPM entries — cannot select target. Aborting.\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+
+        // Scan DPM table for the highest SCLK that is:
+        //   1. Not an SMC-only VID entry (VDDC < 0xFF00)
+        //   2. Within boot voltage (VDDC <= boot_vddc)
+        vid_threshold = 65280
+        best_sclk = 0
+        best_vddc = 0
+        best_idx = 0
+
+        di = 0
+        dpm_vddc = 0
+        dpm_mclk = 0
+        WhileLoop LessThan(di, num_dpm) {
+            dpm_sclk = AtomBIOS_GetDPMEntry(gpu, di, AddressOf(dpm_vddc), AddressOf(dpm_mclk))
+
+            PrintMessage("  DPM ")
+            PrintNumber(di)
+            PrintMessage(": ")
+            PrintNumber(Divide(dpm_sclk, 1000))
+            PrintMessage(" MHz @ ")
+
+            // Check if usable
+            IfCondition GreaterEqual(dpm_vddc, vid_threshold) ThenBlock: {
+                PrintMessage("VID 0x")
+                PrintHex(dpm_vddc)
+                PrintMessage(" — SMC-only, skip\n")
+            }
+            IfCondition LessThan(dpm_vddc, vid_threshold) ThenBlock: {
+                PrintNumber(dpm_vddc)
+                PrintMessage(" mV")
+
+                IfCondition GreaterThan(dpm_vddc, boot_vddc) ThenBlock: {
+                    PrintMessage(" — over-voltage (+")
+                    PrintNumber(Subtract(dpm_vddc, boot_vddc))
+                    PrintMessage(" mV), skip\n")
+                }
+                IfCondition LessEqual(dpm_vddc, boot_vddc) ThenBlock: {
+                    // Candidate — take if higher than current best
+                    IfCondition GreaterThan(dpm_sclk, best_sclk) ThenBlock: {
+                        best_sclk = dpm_sclk
+                        best_vddc = dpm_vddc
+                        best_idx = di
+                        PrintMessage(" — CANDIDATE (new best)\n")
+                    }
+                    IfCondition LessEqual(dpm_sclk, best_sclk) ThenBlock: {
+                        PrintMessage(" — safe but not highest\n")
+                    }
+                }
+            }
+
+            di = Add(di, 1)
+        }
+
+        IfCondition EqualTo(best_sclk, 0) ThenBlock: {
+            PrintMessage("\n  No boot-safe clock found. Aborting.\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+
+        PrintMessage("\n  Selected: DPM ")
+        PrintNumber(best_idx)
+        PrintMessage(" → ")
+        PrintNumber(Divide(best_sclk, 1000))
+        PrintMessage(" MHz @ ")
+        PrintNumber(best_vddc)
+        PrintMessage(" mV\n")
+
+        // ================================================================
+        // PHASE 2: COMPUTE PLL DIVIDERS
+        // ================================================================
+        PrintMessage("\n====================================================================\n")
+        PrintMessage("  PHASE 2: PLL Divider Computation\n")
+        PrintMessage("====================================================================\n")
+
+        // Find optimal PDIV (smallest where VCO in 600-1200 MHz)
+        vco_min = 600000
+        vco_max = 1200000
+        use_refdiv = 1
+        use_pdiv = 0
+        try_pdiv = 1
+        WhileLoop LessEqual(try_pdiv, 127) {
+            vco_try = Multiply(best_sclk, try_pdiv)
+            IfCondition GreaterEqual(vco_try, vco_min) ThenBlock: {
+                IfCondition LessEqual(vco_try, vco_max) ThenBlock: {
+                    use_pdiv = try_pdiv
+                    ExitLoop
+                }
+            }
+            IfCondition GreaterThan(vco_try, vco_max) ThenBlock: { ExitLoop }
+            try_pdiv = Add(try_pdiv, 1)
+        }
+
+        IfCondition EqualTo(use_pdiv, 0) ThenBlock: {
+            PrintMessage("  FAIL: no valid PDIV for target. Aborting.\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+
+        vco_khz = Multiply(best_sclk, use_pdiv)
+
+        // Compute FBDIV as 12.14 fixed-point
+        // FBDIV_12_14 = (VCO * REFDIV * 16384) / ref_khz
+        fbdiv_fixed = Divide(Multiply(vco_khz, Multiply(use_refdiv, 16384)), ref_khz)
+        fbdiv_int = ShiftRight(fbdiv_fixed, 14)
+        fbdiv_frac = BitwiseAnd(fbdiv_fixed, 16383)
+
+        // Compute actual achieved SCLK
+        denom = Multiply(use_refdiv, use_pdiv)
+        actual_int = Divide(Multiply(ref_khz, fbdiv_int), denom)
+        actual_frac = Divide(Multiply(ref_khz, fbdiv_frac), Multiply(denom, 16384))
+        actual_khz = Add(actual_int, actual_frac)
+
+        err_khz = Subtract(actual_khz, best_sclk)
+        IfCondition LessThan(err_khz, 0) ThenBlock: { err_khz = Subtract(0, err_khz) }
+
+        PrintMessage("  Target:  ")
+        PrintNumber(Divide(best_sclk, 1000))
+        PrintMessage(" MHz (")
+        PrintNumber(best_sclk)
+        PrintMessage(" kHz)\n")
+        PrintMessage("  REFDIV:  ")
+        PrintNumber(use_refdiv)
+        PrintMessage("\n")
+        PrintMessage("  PDIV:    ")
+        PrintNumber(use_pdiv)
+        PrintMessage("\n")
+        PrintMessage("  FBDIV:   ")
+        PrintNumber(fbdiv_int)
+        PrintMessage(".")
+        frac_pct = Divide(Multiply(fbdiv_frac, 10000), 16384)
+        IfCondition LessThan(frac_pct, 1000) ThenBlock: { PrintMessage("0") }
+        IfCondition LessThan(frac_pct, 100) ThenBlock: { PrintMessage("0") }
+        IfCondition LessThan(frac_pct, 10) ThenBlock: { PrintMessage("0") }
+        PrintNumber(frac_pct)
+        PrintMessage(" (raw 12.14 = 0x")
+        PrintHex(fbdiv_fixed)
+        PrintMessage(")\n")
+        PrintMessage("  VCO:     ")
+        PrintNumber(Divide(vco_khz, 1000))
+        PrintMessage(" MHz\n")
+        PrintMessage("  Actual:  ")
+        PrintNumber(Divide(actual_khz, 1000))
+        PrintMessage(" MHz (err=")
+        PrintNumber(err_khz)
+        PrintMessage(" kHz)\n")
+
+        // ================================================================
+        // PHASE 3: PRE-FLIGHT — read current state
+        // ================================================================
+        PrintMessage("\n====================================================================\n")
+        PrintMessage("  PHASE 3: Pre-flight Check\n")
+        PrintMessage("====================================================================\n")
+
+        PrintMessage("  Current SPLL state:\n")
+        cur_sclk = SPLL_DecodeCurrent(gpu, ref_khz)
+
+        // Already at target?
+        diff = Subtract(actual_khz, cur_sclk)
+        IfCondition LessThan(diff, 0) ThenBlock: { diff = Subtract(0, diff) }
+        threshold = Divide(best_sclk, 100)
+        IfCondition LessThan(diff, threshold) ThenBlock: {
+            PrintMessage("\n  Already within 1%% of target — no reprogram needed.\n")
+            PrintMessage("  current=")
+            PrintNumber(Divide(cur_sclk, 1000))
+            PrintMessage(" MHz, target=")
+            PrintNumber(Divide(actual_khz, 1000))
+            PrintMessage(" MHz\n")
+            PrintMessage("\n=== test_sclk_safe complete (no change needed) ===\n")
+            SystemCall(60, 0, 0, 0, 0, 0)
+        }
+
+        PrintMessage("  Delta from target: ")
+        PrintNumber(Divide(diff, 1000))
+        PrintMessage(" MHz — reprogram needed\n")
+
+        // Active CRTCs
+        active_count = 0
+        pipe = 0
+        WhileLoop LessThan(pipe, 6) {
+            active = DCE6_IsCRTCActive(gpu, pipe)
+            IfCondition EqualTo(active, 1) ThenBlock: {
+                PrintMessage("  CRTC ")
+                PrintNumber(pipe)
+                PrintMessage(": ACTIVE\n")
+                active_count = Add(active_count, 1)
+            }
+            pipe = Add(pipe, 1)
+        }
+        PrintMessage("  Active CRTCs: ")
+        PrintNumber(active_count)
+        PrintMessage("\n")
+
+        // ================================================================
+        // PHASE 4: DISPLAY QUENCH
+        // ================================================================
+        PrintMessage("\n====================================================================\n")
+        PrintMessage("  PHASE 4: Display Quench (blanking active CRTCs)\n")
+        PrintMessage("====================================================================\n")
+        LogSync("PHASE4_BLANK_BEGIN")
+
+        blanked = DCE6_BlankAllActive(gpu)
+        PrintMessage("  Blanked ")
+        PrintNumber(blanked)
+        PrintMessage(" CRTCs\n")
+        LogSync("PHASE4_BLANK_DONE")
+
+        // ================================================================
+        // PHASE 5: SPLL REPROGRAM
+        // ================================================================
+        PrintMessage("\n====================================================================\n")
+        PrintMessage("  PHASE 5: SPLL Reprogram\n")
+        PrintMessage("====================================================================\n")
+        LogSync("PHASE5_BEGIN")
+
+        // Read current registers
+        cntl   = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        cntl2  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        cntl3  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+        ss_reg = GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM)
+        cntl_mode = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
+
+        PrintMessage("  Before: CNTL=0x")
+        PrintHex(cntl)
+        PrintMessage(" CNTL2=0x")
+        PrintHex(cntl2)
+        PrintMessage(" CNTL3=0x")
+        PrintHex(cntl3)
+        PrintMessage(" CNTL_MODE=0x")
+        PrintHex(cntl_mode)
+        PrintMessage("\n")
+        LogSyncHex("STEP0_CNTL_BEFORE=0x", cntl)
+        LogSyncHex("STEP0_CNTL2_BEFORE=0x", cntl2)
+        LogSyncHex("STEP0_CNTL3_BEFORE=0x", cntl3)
+        LogSyncHex("STEP0_CNTL_MODE_BEFORE=0x", cntl_mode)
+
+        // =====================================================================
+        // Step 1: Disable spread spectrum
+        // =====================================================================
+        PrintMessage("  [1] Disable spread spectrum\n")
+        LogSync("STEP1_SS_DISABLE_PRE")
+        ss_new = BitwiseAnd(ss_reg, Subtract(4294967295, SPLLBits.SSEN))
+        GPU_Wr32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM, ss_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM)
+        LogSyncHex("STEP1_SS_DISABLE_POST=0x", fence)
+
+        // =====================================================================
+        // Step 2: Set SPLL bypass via HW handshake (si_set_clk_bypass_mode)
+        //
+        // This is the CRITICAL sequence the kernel driver uses:
+        //   a) Set SPLL_BYPASS_EN in CG_SPLL_FUNC_CNTL
+        //   b) Set SPLL_CTLREQ_CHG in CG_SPLL_FUNC_CNTL_2 to REQUEST mux switch
+        //   c) Poll SPLL_STATUS for SPLL_CHG_STATUS — HW confirms engine is on ref
+        //   d) Clear SPLL_CTLREQ_CHG and SCLK_MUX_UPDATE in CG_SPLL_FUNC_CNTL_2
+        //
+        // Without step (b)+(c), the bypass bit posts to PCIe but the clock mux
+        // hasn't actually switched when we hit SPLL_RESET — bus hangs.
+        // =====================================================================
+        PrintMessage("  [2a] Enable SPLL bypass (engine -> ref clock)\n")
+        LogSync("STEP2A_BYPASS_EN_PRE")
+        cntl_new = BitwiseOr(cntl, SPLLBits.SPLL_BYPASS_EN)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        LogSyncHex("STEP2A_BYPASS_EN_POST=0x", fence)
+
+        PrintMessage("  [2b] Request clock change via FUNC_CNTL_2 handshake\n")
+        LogSync("STEP2B_CTLREQ_CHG_PRE")
+        cntl2_new = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        cntl2_new = BitwiseOr(cntl2_new, SPLLBits.SPLL_CTLREQ_CHG)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        LogSyncHex("STEP2B_CTLREQ_CHG_POST=0x", fence)
+
+        PrintMessage("  [2c] Polling SPLL_STATUS for HW mux switch confirmation...")
+        LogSync("STEP2C_MUX_POLL_BEGIN")
+        mux_count = 0
+        mux_ok = 0
+        WhileLoop LessThan(mux_count, 100000) {
+            mux_st = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+            IfCondition NotEqual(BitwiseAnd(mux_st, SPLLBits.SPLL_CHG_STATUS), 0) ThenBlock: {
+                mux_ok = 1
+                ExitLoop
+            }
+            mux_count = Add(mux_count, 1)
+        }
+
+        IfCondition EqualTo(mux_ok, 0) ThenBlock: {
+            PrintMessage(" TIMEOUT!\n")
+            PrintMessage("  *** MUX HANDSHAKE FAILED — engine NOT confirmed on ref clock ***\n")
+            LogSyncHex("STEP2C_MUX_TIMEOUT_STATUS=0x", GPU_Rd32(gpu, SIReg.SPLL_STATUS))
+            // Clear the request bit before bailing
+            cntl2_clr = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+            cntl2_clr = BitwiseAnd(cntl2_clr, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
+            cntl2_clr = BitwiseAnd(cntl2_clr, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
+            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_clr)
+            // Remove bypass
+            cntl_bail = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_BYPASS_EN))
+            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_bail)
+            PrintMessage("  Emergency unblank...\n")
+            LogSync("STEP2C_EMERGENCY_UNBLANK")
+            DCE6_UnblankAllActive(gpu)
+            PrintMessage("  Display restored. Aborting.\n")
+            LogSync("FAILED_MUX_HANDSHAKE")
+            LogClose()
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+
+        PrintMessage(" confirmed after ")
+        PrintNumber(mux_count)
+        PrintMessage(" polls\n")
+        LogSyncHex("STEP2C_MUX_OK_POLLS=", mux_count)
+        LogSyncHex("STEP2C_MUX_OK_STATUS=0x", mux_st)
+
+        PrintMessage("  [2d] Clear CTLREQ_CHG + SCLK_MUX_UPDATE\n")
+        LogSync("STEP2D_CTLREQ_CLR_PRE")
+        cntl2_new = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        cntl2_new = BitwiseAnd(cntl2_new, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
+        cntl2_new = BitwiseAnd(cntl2_new, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        LogSyncHex("STEP2D_CTLREQ_CLR_POST=0x", fence)
+
+        // =====================================================================
+        // Step 3: SPLL powerdown (si_spll_powerdown sequence)
+        //
+        // Kernel driver sequence:
+        //   a) Set SPLL_SW_DIR_CONTROL in SPLL_CNTL_MODE — take SW control
+        //   b) Assert SPLL_RESET in CG_SPLL_FUNC_CNTL
+        //   c) Assert SPLL_SLEEP in CG_SPLL_FUNC_CNTL
+        //   d) Clear SPLL_SW_DIR_CONTROL — return to HW control
+        // =====================================================================
+        PrintMessage("  [3a] Set SPLL_SW_DIR_CONTROL (software PLL control)\n")
+        LogSync("STEP3A_SW_DIR_PRE")
+        cntl_mode_new = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
+        cntl_mode_new = BitwiseOr(cntl_mode_new, SPLLBits.SPLL_SW_DIR_CONTROL)
+        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, cntl_mode_new)
+        fence = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
+        LogSyncHex("STEP3A_SW_DIR_POST=0x", fence)
+
+        PrintMessage("  [3b] Assert SPLL reset\n")
+        LogSync("STEP3B_RESET_PRE")
+        cntl_new = BitwiseOr(cntl_new, SPLLBits.SPLL_RESET)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        LogSyncHex("STEP3B_RESET_POST=0x", fence)
+
+        PrintMessage("  [3c] Assert SPLL sleep\n")
+        LogSync("STEP3C_SLEEP_PRE")
+        cntl_new = BitwiseOr(cntl_new, SPLLBits.SPLL_SLEEP)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        LogSyncHex("STEP3C_SLEEP_POST=0x", fence)
+
+        PrintMessage("  [3d] Clear SPLL_SW_DIR_CONTROL\n")
+        LogSync("STEP3D_SW_DIR_CLR_PRE")
+        cntl_mode_new = BitwiseAnd(cntl_mode_new, Subtract(4294967295, SPLLBits.SPLL_SW_DIR_CONTROL))
+        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, cntl_mode_new)
+        fence = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
+        LogSyncHex("STEP3D_SW_DIR_CLR_POST=0x", fence)
+
+        // =====================================================================
+        // Step 4: Program new dividers (PLL is reset+sleeping, safe to modify)
+        // =====================================================================
+        PrintMessage("  [4] Program dividers: REFDIV=")
+        PrintNumber(use_refdiv)
+        PrintMessage(" PDIV=")
+        PrintNumber(use_pdiv)
+        PrintMessage(" FBDIV=0x")
+        PrintHex(fbdiv_fixed)
+        PrintMessage("\n")
+        LogSync("STEP4_DIVIDERS_PRE")
+
+        // Clear old REFDIV and PDIV, set new values
+        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_REF_DIV_MASK))
+        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_PDIV_A_MASK))
+        cntl_new = BitwiseOr(cntl_new, Multiply(use_refdiv, 16))
+        cntl_new = BitwiseOr(cntl_new, Multiply(use_pdiv, 1048576))
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        LogSyncHex("STEP4_CNTL_POST=0x", fence)
+
+        // Program FBDIV in CNTL_3
+        cntl3_new = BitwiseAnd(cntl3, Subtract(4294967295, SPLLBits.SPLL_FB_DIV_MASK))
+        cntl3_new = BitwiseOr(cntl3_new, fbdiv_fixed)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3, cntl3_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+        LogSyncHex("STEP4_CNTL3_POST=0x", fence)
+
+        // =====================================================================
+        // Step 5: SPLL powerup — deassert sleep then reset (reverse of powerdown)
+        //
+        // Kernel driver si_spll_powerup:
+        //   a) Set SPLL_SW_DIR_CONTROL
+        //   b) Clear SPLL_SLEEP
+        //   c) Clear SPLL_RESET
+        //   d) Clear SPLL_SW_DIR_CONTROL
+        // =====================================================================
+        PrintMessage("  [5a] Set SPLL_SW_DIR_CONTROL for powerup\n")
+        LogSync("STEP5A_SW_DIR_PRE")
+        cntl_mode_new = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
+        cntl_mode_new = BitwiseOr(cntl_mode_new, SPLLBits.SPLL_SW_DIR_CONTROL)
+        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, cntl_mode_new)
+        fence = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
+        LogSyncHex("STEP5A_SW_DIR_POST=0x", fence)
+
+        PrintMessage("  [5b] Clear SPLL sleep\n")
+        LogSync("STEP5B_CLR_SLEEP_PRE")
+        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_SLEEP))
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        LogSyncHex("STEP5B_CLR_SLEEP_POST=0x", fence)
+
+        PrintMessage("  [5c] Clear SPLL reset\n")
+        LogSync("STEP5C_CLR_RESET_PRE")
+        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_RESET))
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        LogSyncHex("STEP5C_CLR_RESET_POST=0x", fence)
+
+        PrintMessage("  [5d] Clear SPLL_SW_DIR_CONTROL\n")
+        LogSync("STEP5D_SW_DIR_CLR_PRE")
+        cntl_mode_new = BitwiseAnd(cntl_mode_new, Subtract(4294967295, SPLLBits.SPLL_SW_DIR_CONTROL))
+        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, cntl_mode_new)
+        fence = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
+        LogSyncHex("STEP5D_SW_DIR_CLR_POST=0x", fence)
+
+        // =====================================================================
+        // Step 6: Poll for PLL lock
+        // =====================================================================
+        PrintMessage("  [6] Polling for PLL lock...")
+        LogSync("STEP6_LOCK_POLL_BEGIN")
+        lock_count = 0
+        lock_ok = 0
+        WhileLoop LessThan(lock_count, 100000) {
+            st = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+            IfCondition NotEqual(BitwiseAnd(st, SPLLBits.SPLL_CHG_STATUS), 0) ThenBlock: {
+                lock_ok = 1
+                ExitLoop
+            }
+            lock_count = Add(lock_count, 1)
+        }
+
+        IfCondition EqualTo(lock_ok, 0) ThenBlock: {
+            PrintMessage(" TIMEOUT after 100000 polls!\n")
+            PrintMessage("  *** PLL LOCK FAILED — leaving bypass ON (engine at 27 MHz) ***\n")
+            PrintMessage("  SPLL_STATUS=0x")
+            PrintHex(GPU_Rd32(gpu, SIReg.SPLL_STATUS))
+            PrintMessage("\n")
+            LogSyncHex("STEP6_LOCK_TIMEOUT_STATUS=0x", GPU_Rd32(gpu, SIReg.SPLL_STATUS))
+
+            // Emergency: unblank CRTCs and bail
+            PrintMessage("  Emergency unblank...\n")
+            LogSync("STEP6_EMERGENCY_UNBLANK")
+            DCE6_UnblankAllActive(gpu)
+            PrintMessage("  Display restored. Engine running at 27 MHz ref clock.\n")
+            PrintMessage("\n=== test_sclk_safe FAILED (PLL lock timeout) ===\n")
+            LogSync("FAILED_PLL_LOCK_TIMEOUT")
+            LogClose()
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+
+        PrintMessage(" LOCKED after ")
+        PrintNumber(lock_count)
+        PrintMessage(" polls\n")
+        LogSyncHex("STEP6_LOCKED_POLLS=", lock_count)
+        LogSyncHex("STEP6_SPLL_STATUS=0x", GPU_Rd32(gpu, SIReg.SPLL_STATUS))
+
+        // Stabilization delay (~40-100 us)
+        PrintMessage("  [6b] PLL stabilization delay...\n")
+        LogSync("STEP6B_STABILIZE_PRE")
+        SpinDelay(gpu, 200)
+        LogSync("STEP6B_STABILIZE_POST")
+
+        // Re-verify lock after delay
+        recheck_st = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+        recheck_locked = BitwiseAnd(recheck_st, SPLLBits.SPLL_CHG_STATUS)
+        IfCondition EqualTo(recheck_locked, 0) ThenBlock: {
+            PrintMessage("  *** PLL LOST LOCK after stabilization! ***\n")
+            PrintMessage("  SPLL_STATUS=0x")
+            PrintHex(recheck_st)
+            PrintMessage("\n")
+            LogSyncHex("STEP6B_LOCK_LOST_STATUS=0x", recheck_st)
+            PrintMessage("  Emergency unblank...\n")
+            LogSync("STEP6B_EMERGENCY_UNBLANK")
+            DCE6_UnblankAllActive(gpu)
+            PrintMessage("  Display restored. Engine running at 27 MHz ref clock.\n")
+            PrintMessage("\n=== test_sclk_safe FAILED (PLL lost lock after stabilize) ===\n")
+            LogSync("FAILED_PLL_LOST_LOCK")
+            LogClose()
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+        PrintMessage("  Lock confirmed after stabilization\n")
+        LogSync("STEP6B_LOCK_CONFIRMED")
+
+        // =====================================================================
+        // Step 7: Disable bypass via HW handshake (reverse of step 2)
+        //
+        // Same CTLREQ_CHG handshake but now clearing SPLL_BYPASS_EN.
+        // Engine switches from 27 MHz ref to PLL output at new frequency.
+        // CRTCs are blanked so scanout glitch doesn't matter.
+        // =====================================================================
+        PrintMessage("  [7a] Clear SPLL bypass\n")
+        LogSync("STEP7A_BYPASS_DIS_PRE")
+        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_BYPASS_EN))
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        LogSyncHex("STEP7A_BYPASS_DIS_POST=0x", fence)
+
+        PrintMessage("  [7b] Request clock change via FUNC_CNTL_2 handshake\n")
+        LogSync("STEP7B_CTLREQ_CHG_PRE")
+        cntl2_new = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        cntl2_new = BitwiseOr(cntl2_new, SPLLBits.SPLL_CTLREQ_CHG)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        LogSyncHex("STEP7B_CTLREQ_CHG_POST=0x", fence)
+
+        PrintMessage("  [7c] Polling SPLL_STATUS for HW mux switch confirmation...")
+        LogSync("STEP7C_MUX_POLL_BEGIN")
+        mux_count2 = 0
+        mux_ok2 = 0
+        WhileLoop LessThan(mux_count2, 100000) {
+            mux_st2 = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+            IfCondition NotEqual(BitwiseAnd(mux_st2, SPLLBits.SPLL_CHG_STATUS), 0) ThenBlock: {
+                mux_ok2 = 1
+                ExitLoop
+            }
+            mux_count2 = Add(mux_count2, 1)
+        }
+
+        IfCondition EqualTo(mux_ok2, 0) ThenBlock: {
+            PrintMessage(" TIMEOUT!\n")
+            LogSyncHex("STEP7C_MUX_TIMEOUT_STATUS=0x", GPU_Rd32(gpu, SIReg.SPLL_STATUS))
+            // Clear request and try to recover
+            cntl2_clr2 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+            cntl2_clr2 = BitwiseAnd(cntl2_clr2, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
+            cntl2_clr2 = BitwiseAnd(cntl2_clr2, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
+            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_clr2)
+            PrintMessage("  Emergency unblank...\n")
+            LogSync("STEP7C_EMERGENCY_UNBLANK")
+            DCE6_UnblankAllActive(gpu)
+            PrintMessage("  Display restored. Engine running at 27 MHz ref clock.\n")
+            PrintMessage("\n=== test_sclk_safe FAILED (bypass-disable mux timeout) ===\n")
+            LogSync("FAILED_BYPASS_DIS_MUX")
+            LogClose()
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+
+        PrintMessage(" confirmed after ")
+        PrintNumber(mux_count2)
+        PrintMessage(" polls\n")
+        LogSyncHex("STEP7C_MUX_OK_POLLS=", mux_count2)
+
+        PrintMessage("  [7d] Clear CTLREQ_CHG + SCLK_MUX_UPDATE\n")
+        LogSync("STEP7D_CTLREQ_CLR_PRE")
+        cntl2_new = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        cntl2_new = BitwiseAnd(cntl2_new, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
+        cntl2_new = BitwiseAnd(cntl2_new, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_new)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        LogSyncHex("STEP7D_CTLREQ_CLR_POST=0x", fence)
+
+        // Post-bypass delay: let engine stabilize on new clock
+        SpinDelay(gpu, 200)
+        LogSync("STEP7_POST_DELAY_OK")
+
+        PrintMessage("  After: CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL))
+        PrintMessage(" CNTL2=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2))
+        PrintMessage(" CNTL3=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3))
+        PrintMessage("\n")
+
+        // Verify PLL still locked after bypass disable
+        post_st = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+        post_locked = BitwiseAnd(post_st, SPLLBits.SPLL_CHG_STATUS)
+        LogSyncHex("STEP7_POST_STATUS=0x", post_st)
+        IfCondition EqualTo(post_locked, 0) ThenBlock: {
+            PrintMessage("  *** PLL LOST LOCK after bypass disable! ***\n")
+            LogSync("STEP7_LOCK_LOST")
+            // Re-enable bypass as safety
+            cntl_new = BitwiseOr(cntl_new, SPLLBits.SPLL_BYPASS_EN)
+            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
+            // Handshake the bypass back on
+            cntl2_bail = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+            cntl2_bail = BitwiseOr(cntl2_bail, SPLLBits.SPLL_CTLREQ_CHG)
+            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_bail)
+            SpinDelay(gpu, 500)
+            cntl2_bail = BitwiseAnd(cntl2_bail, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
+            cntl2_bail = BitwiseAnd(cntl2_bail, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
+            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_bail)
+            LogSync("STEP7_BYPASS_RESTORED")
+            DCE6_UnblankAllActive(gpu)
+            PrintMessage("  Display restored. Engine running at 27 MHz ref clock.\n")
+            PrintMessage("\n=== test_sclk_safe FAILED (PLL lost lock after bypass disable) ===\n")
+            LogSync("FAILED_PLL_LOST_AFTER_BYPASS")
+            LogClose()
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+        LogSync("STEP7_ALL_OK")
+
+        // ================================================================
+        // PHASE 6: DISPLAY UNQUENCH
+        // ================================================================
+        PrintMessage("\n====================================================================\n")
+        PrintMessage("  PHASE 6: Display Unquench\n")
+        PrintMessage("====================================================================\n")
+        LogSync("PHASE6_UNBLANK_BEGIN")
+
+        unblanked = DCE6_UnblankAllActive(gpu)
+        PrintMessage("  Unblanked ")
+        PrintNumber(unblanked)
+        PrintMessage(" CRTCs\n")
+        LogSync("PHASE6_UNBLANK_DONE")
+
+        // ================================================================
+        // PHASE 7: VERIFICATION
+        // ================================================================
+        PrintMessage("\n====================================================================\n")
+        PrintMessage("  PHASE 7: Verification\n")
+        PrintMessage("====================================================================\n")
+
+        PrintMessage("  New SPLL state:\n")
+        new_sclk = SPLL_DecodeCurrent(gpu, ref_khz)
+
+        // Compare with target
+        verify_diff = Subtract(new_sclk, actual_khz)
+        IfCondition LessThan(verify_diff, 0) ThenBlock: { verify_diff = Subtract(0, verify_diff) }
+
+        PrintMessage("\n  Target:   ")
+        PrintNumber(Divide(best_sclk, 1000))
+        PrintMessage(" MHz\n")
+        PrintMessage("  Achieved: ")
+        PrintNumber(Divide(new_sclk, 1000))
+        PrintMessage(" MHz\n")
+        PrintMessage("  Previous: ")
+        PrintNumber(Divide(cur_sclk, 1000))
+        PrintMessage(" MHz\n")
+        PrintMessage("  Speedup:  ")
+        IfCondition GreaterThan(cur_sclk, 0) ThenBlock: {
+            speedup_pct = Divide(Multiply(Subtract(new_sclk, cur_sclk), 100), cur_sclk)
+            PrintNumber(speedup_pct)
+            PrintMessage("%%\n")
+        }
+        IfCondition EqualTo(cur_sclk, 0) ThenBlock: {
+            PrintMessage("N/A\n")
+        }
+
+        // Final result
+        PrintMessage("\n  --- Results ---\n")
+
+        chk_pass = 0
+        chk_fail = 0
+
+        // CHK1: PLL locked
+        chk1_st = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+        chk1_locked = BitwiseAnd(chk1_st, SPLLBits.SPLL_CHG_STATUS)
+        PrintMessage("  [CHK1] PLL locked: ")
+        IfCondition NotEqual(chk1_locked, 0) ThenBlock: {
+            PrintMessage("PASS\n")
+            chk_pass = Add(chk_pass, 1)
+        }
+        IfCondition EqualTo(chk1_locked, 0) ThenBlock: {
+            PrintMessage("FAIL\n")
+            chk_fail = Add(chk_fail, 1)
+        }
+
+        // CHK2: Bypass disabled
+        chk2_cntl = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        chk2_bypass = BitwiseAnd(chk2_cntl, SPLLBits.SPLL_BYPASS_EN)
+        PrintMessage("  [CHK2] Bypass disabled: ")
+        IfCondition EqualTo(chk2_bypass, 0) ThenBlock: {
+            PrintMessage("PASS\n")
+            chk_pass = Add(chk_pass, 1)
+        }
+        IfCondition NotEqual(chk2_bypass, 0) ThenBlock: {
+            PrintMessage("FAIL (still in bypass)\n")
+            chk_fail = Add(chk_fail, 1)
+        }
+
+        // CHK3: SCLK within 1% of target
+        PrintMessage("  [CHK3] SCLK within 1%% of target: ")
+        chk3_thresh = Divide(best_sclk, 100)
+        IfCondition LessEqual(verify_diff, chk3_thresh) ThenBlock: {
+            PrintMessage("PASS (delta=")
+            PrintNumber(verify_diff)
+            PrintMessage(" kHz)\n")
+            chk_pass = Add(chk_pass, 1)
+        }
+        IfCondition GreaterThan(verify_diff, chk3_thresh) ThenBlock: {
+            PrintMessage("FAIL (delta=")
+            PrintNumber(Divide(verify_diff, 1000))
+            PrintMessage(" MHz)\n")
+            chk_fail = Add(chk_fail, 1)
+        }
+
+        // CHK4: Display restored (CRTCs unblanked)
+        PrintMessage("  [CHK4] Display restored: ")
+        IfCondition EqualTo(blanked, unblanked) ThenBlock: {
+            PrintMessage("PASS (")
+            PrintNumber(unblanked)
+            PrintMessage(" CRTCs)\n")
+            chk_pass = Add(chk_pass, 1)
+        }
+        IfCondition NotEqual(blanked, unblanked) ThenBlock: {
+            PrintMessage("FAIL\n")
+            chk_fail = Add(chk_fail, 1)
+        }
+
+        PrintMessage("\n  Results: ")
+        PrintNumber(chk_pass)
+        PrintMessage(" PASS, ")
+        PrintNumber(chk_fail)
+        PrintMessage(" FAIL\n")
+
+        IfCondition EqualTo(chk_fail, 0) ThenBlock: {
+            PrintMessage("\n  ENGINE CLOCK SUCCESSFULLY SET TO ")
+            PrintNumber(Divide(new_sclk, 1000))
+            PrintMessage(" MHz\n")
+        }
+
+        PrintMessage("\n=== test_sclk_safe complete ===\n")
+        LogSync("COMPLETE_SUCCESS")
+        LogClose()
+        SystemCall(60, 0, 0, 0, 0, 0)
+    }
+}
+
+RunTask(Main)

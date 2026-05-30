@@ -111,6 +111,29 @@ FixedPool.AtomVU {
     "DRV_USE_KB":        Initialize=10    // u16
 }
 
+// PowerPlay table header offsets (ATOM_PPLIB_POWERPLAYTABLE, packed)
+// +0: ATOM_COMMON_TABLE_HEADER (4 bytes)
+// +4: ucDataRevision(u8) +5: ucNumStates(u8) +6: ucStateEntrySize(u8)
+// +7: ucClockInfoSize(u8) +8: ucNonClockSize(u8)
+// +9: usStateArrayOffset(u16) +11: usClockInfoArrayOffset(u16)
+// +13: usNonClockInfoArrayOffset(u16)
+//
+// Clock Info Array:  [0]=numEntries(u8) [1]=entrySize(u8) [2..]=entries
+//
+// SI clock info entry (ATOM_PPLIB_SI_CLOCK_INFO, 16 bytes packed):
+//   +0: u16 usEngineClockLow    (lower 16 of SCLK, 10kHz units)
+//   +2: u8  ucEngineClockHigh   (upper 8 bits)
+//   +3: u16 usMemoryClockLow
+//   +5: u8  ucMemoryClockHigh
+//   +6: u16 usVDDC              (mV)
+//   +8: u16 usVDDCI             (mV)
+//  +10: u8  ucPCIEGen
+//  +11: u8  reserved
+//  +12: u32 ulFlags
+FixedPool.AtomPP {
+    "CLOCK_INFO_ARRAY_OFF":  Initialize=11   // u16 offset in PP header to clock info array
+}
+
 // =============================================================================
 // PER-GPU ATOMBIOS STATE
 // =============================================================================
@@ -132,7 +155,9 @@ FixedPool.AtomField {
     "FW_VRAM_START":     Initialize=96    // firmware VRAM start address
     "FW_VRAM_KB":        Initialize=104   // firmware VRAM usage in KB
     "PARSED":            Initialize=112   // 1 if successfully parsed
-    "ENTRY_SIZE":        Initialize=128   // bytes per entry
+    "MAX_ENGINE_CLK":    Initialize=120   // max performance SCLK from PowerPlay (kHz)
+    "MAX_ENGINE_VDDC":   Initialize=128   // VDDC required for max SCLK (mV)
+    "ENTRY_SIZE":        Initialize=144   // bytes per entry
 }
 
 FixedPool.AtomState {
@@ -229,9 +254,140 @@ Function.AtomBIOS_EnableROM {
 }
 
 // =============================================================================
-// AtomBIOS_LoadROM — read the entire VBIOS ROM from sysfs
-// Enables the rom file, reads up to 128KB, then disables.
+// AtomBIOS_LoadROM_VRAM — read VBIOS from VRAM shadow (BAR0 offset 0)
+//
+// On POSTed discrete GPUs the system BIOS copies the VBIOS to the start
+// of VRAM.  This is the most reliable path for bare-metal use when the
+// kernel driver is blacklisted (sysfs rom file is inaccessible).
+// Reads 256KB via 32-bit DWORD reads from the mapped VRAM BAR.
 // Returns the ROM buffer pointer, or 0 on failure.
+// =============================================================================
+Function.AtomBIOS_LoadROM_VRAM {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        // Check VRAM BAR is mapped
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: {
+            PrintMessage("AtomBIOS: VRAM BAR state not found\n")
+            ReturnValue(0)
+        }
+        vram = Dereference(Add(state, GPUBarField.VRAM_PTR))
+        IfCondition EqualTo(vram, 0) ThenBlock: {
+            PrintMessage("AtomBIOS: VRAM BAR not mapped\n")
+            ReturnValue(0)
+        }
+
+        // Check ROM signature at VRAM offset 0: 0x55 0xAA
+        sig_lo = GetByte(vram, 0)
+        sig_hi = GetByte(vram, 1)
+        sig = Add(sig_lo, Multiply(sig_hi, 256))
+        IfCondition NotEqual(sig, AtomConst.ROM_SIG) ThenBlock: {
+            PrintMessage("AtomBIOS: No VBIOS shadow at VRAM offset 0 (sig=0x")
+            PrintHex(sig)
+            PrintMessage(")\n")
+            ReturnValue(0)
+        }
+
+        // ROM image size is at byte 2 (in 512-byte units)
+        rom_blocks = GetByte(vram, 2)
+        rom_size = Multiply(rom_blocks, 512)
+        IfCondition EqualTo(rom_size, 0) ThenBlock: {
+            // Fallback: use 64KB (common minimum)
+            rom_size = 65536
+        }
+        // Cap to 256KB
+        IfCondition GreaterThan(rom_size, 262144) ThenBlock: {
+            rom_size = 262144
+        }
+
+        // Allocate and copy ROM from VRAM
+        rom_buf = Allocate(AtomConst.ROM_MAX_SIZE)
+        MemorySet(rom_buf, 0, AtomConst.ROM_MAX_SIZE)
+
+        // Copy via 32-bit DWORD reads (VRAM BAR requires aligned access)
+        rom_dwords = Divide(rom_size, 4)
+        i = 0
+        WhileLoop LessThan(i, rom_dwords) {
+            off = Multiply(i, 4)
+            dw = Dereference(Add(vram, off), "dword")
+            StoreValue(Add(rom_buf, off), dw, "dword")
+            i = Add(i, 1)
+        }
+
+        PrintMessage("AtomBIOS: Loaded ")
+        PrintNumber(rom_size)
+        PrintMessage(" bytes from VRAM shadow\n")
+
+        ReturnValue(rom_buf)
+    }
+}
+
+// =============================================================================
+// AtomBIOS_LoadROM_Sysfs — read VBIOS from sysfs rom file (fallback)
+// Only works if a kernel driver is bound or the PCI core exposes the file.
+// Returns the ROM buffer pointer, or 0 on failure.
+// =============================================================================
+Function.AtomBIOS_LoadROM_Sysfs {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        // Enable ROM read
+        rc = AtomBIOS_EnableROM(index, 1)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Open the ROM file
+        path = GPU_BAR_BuildResPath(index, "rom")
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            AtomBIOS_EnableROM(index, 0)
+            ReturnValue(0)
+        }
+
+        // Allocate ROM buffer
+        rom_buf = Allocate(AtomConst.ROM_MAX_SIZE)
+        MemorySet(rom_buf, 0, AtomConst.ROM_MAX_SIZE)
+
+        // Read ROM
+        total_read = 0
+        WhileLoop LessThan(total_read, AtomConst.ROM_MAX_SIZE) {
+            chunk = SystemCall(GPUSys.SYS_READ, fd, Add(rom_buf, total_read), Subtract(AtomConst.ROM_MAX_SIZE, total_read), 0, 0)
+            IfCondition LessEqual(chunk, 0) ThenBlock: {
+                ExitLoop
+            }
+            total_read = Add(total_read, chunk)
+        }
+
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        AtomBIOS_EnableROM(index, 0)
+
+        // Validate
+        IfCondition LessThan(total_read, 256) ThenBlock: {
+            Deallocate(rom_buf, AtomConst.ROM_MAX_SIZE)
+            ReturnValue(0)
+        }
+
+        sig = AtomBIOS_ReadU16(rom_buf, 0)
+        IfCondition NotEqual(sig, AtomConst.ROM_SIG) ThenBlock: {
+            Deallocate(rom_buf, AtomConst.ROM_MAX_SIZE)
+            ReturnValue(0)
+        }
+
+        PrintMessage("AtomBIOS: Loaded ")
+        PrintNumber(total_read)
+        PrintMessage(" bytes from sysfs ROM\n")
+
+        ReturnValue(rom_buf)
+    }
+}
+
+// =============================================================================
+// AtomBIOS_LoadROM — load the VBIOS ROM for a GPU
+//
+// Tries VRAM shadow first (works with driver blacklisted), then falls back
+// to sysfs rom file.  Returns the ROM buffer pointer, or 0 on failure.
 // =============================================================================
 Function.AtomBIOS_LoadROM {
     Input: index: Integer
@@ -247,62 +403,31 @@ Function.AtomBIOS_LoadROM {
             ReturnValue(existing)
         }
 
-        // Enable ROM read
-        rc = AtomBIOS_EnableROM(index, 1)
-        IfCondition EqualTo(rc, 0) ThenBlock: {
-            PrintMessage("AtomBIOS: Failed to enable ROM read\n")
+        // Primary path: read from VRAM shadow at BAR0 offset 0
+        rom_buf = AtomBIOS_LoadROM_VRAM(index)
+
+        // Fallback: sysfs rom file
+        IfCondition EqualTo(rom_buf, 0) ThenBlock: {
+            PrintMessage("AtomBIOS: VRAM shadow failed, trying sysfs...\n")
+            rom_buf = AtomBIOS_LoadROM_Sysfs(index)
+        }
+
+        IfCondition EqualTo(rom_buf, 0) ThenBlock: {
+            PrintMessage("AtomBIOS: FAILED to load ROM from any source\n")
             ReturnValue(0)
         }
 
-        // Open the ROM file
-        path = GPU_BAR_BuildResPath(index, "rom")
-        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDONLY, 0)
-        IfCondition LessThan(fd, 0) ThenBlock: {
-            AtomBIOS_EnableROM(index, 0)
-            PrintMessage("AtomBIOS: Failed to open ROM file\n")
-            ReturnValue(0)
-        }
-
-        // Allocate ROM buffer
-        rom_buf = Allocate(AtomConst.ROM_MAX_SIZE)
-        MemorySet(rom_buf, 0, AtomConst.ROM_MAX_SIZE)
-
-        // Read ROM in one shot (kernel handles chunked reads internally)
-        total_read = 0
-        WhileLoop LessThan(total_read, AtomConst.ROM_MAX_SIZE) {
-            chunk = SystemCall(GPUSys.SYS_READ, fd, Add(rom_buf, total_read), Subtract(AtomConst.ROM_MAX_SIZE, total_read), 0, 0)
-            IfCondition LessEqual(chunk, 0) ThenBlock: {
-                ExitLoop
-            }
-            total_read = Add(total_read, chunk)
-        }
-
-        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
-
-        // Disable ROM read
-        AtomBIOS_EnableROM(index, 0)
-
-        // Validate ROM signature: 0x55 0xAA
-        IfCondition LessThan(total_read, 256) ThenBlock: {
-            PrintMessage("AtomBIOS: ROM too small\n")
-            Deallocate(rom_buf, AtomConst.ROM_MAX_SIZE)
-            ReturnValue(0)
-        }
-
-        sig = AtomBIOS_ReadU16(rom_buf, 0)
-        IfCondition NotEqual(sig, AtomConst.ROM_SIG) ThenBlock: {
-            PrintMessage("AtomBIOS: Bad ROM signature\n")
-            Deallocate(rom_buf, AtomConst.ROM_MAX_SIZE)
-            ReturnValue(0)
+        // Determine actual ROM size from image header (byte 2 = 512-byte blocks)
+        rom_blocks = GetByte(rom_buf, 2)
+        rom_size = Multiply(rom_blocks, 512)
+        IfCondition EqualTo(rom_size, 0) ThenBlock: { rom_size = 65536 }
+        IfCondition GreaterThan(rom_size, AtomConst.ROM_MAX_SIZE) ThenBlock: {
+            rom_size = AtomConst.ROM_MAX_SIZE
         }
 
         // Store in state
         StoreValue(Add(entry, AtomField.ROM_PTR), rom_buf)
-        StoreValue(Add(entry, AtomField.ROM_SIZE), total_read)
-
-        PrintMessage("AtomBIOS: Loaded ")
-        PrintNumber(total_read)
-        PrintMessage(" bytes from VBIOS ROM\n")
+        StoreValue(Add(entry, AtomField.ROM_SIZE), rom_size)
 
         ReturnValue(rom_buf)
     }
@@ -411,6 +536,80 @@ Function.AtomBIOS_Parse {
             StoreValue(Add(entry, AtomField.FW_VRAM_KB), fw_vram_kb)
         }
 
+        // ---- PowerPlay Table — extract max performance SCLK ----
+        // The Clock Info Array contains one entry per DPM state with SCLK + VDDC.
+        // We scan all entries to find the highest SCLK the boot voltage can sustain.
+        pp_off = AtomBIOS_ReadU16(rom, Add(data_tbl_off, Add(4, Multiply(AtomDataIdx.POWERPLAY, 2))))
+        IfCondition NotEqual(pp_off, 0) ThenBlock: {
+            IfCondition LessThan(pp_off, rom_size) ThenBlock: {
+                // Clock info array offset: u16 at PP table + 11, relative to PP start
+                ci_rel = AtomBIOS_ReadU16(rom, Add(pp_off, AtomPP.CLOCK_INFO_ARRAY_OFF))
+                ci_abs = Add(pp_off, ci_rel)
+
+                IfCondition LessThan(ci_abs, rom_size) ThenBlock: {
+                    // Array header: [0]=numEntries(u8)  [1]=entrySize(u8)
+                    num_ci = GetByte(rom, ci_abs)
+                    ci_esz = GetByte(rom, Add(ci_abs, 1))
+                    ci_data = Add(ci_abs, 2)
+
+                    // Sanity: entrySize must be >= 8 (need SCLK + VDDC), entries <= 32
+                    IfCondition GreaterEqual(ci_esz, 8) ThenBlock: {
+                        IfCondition GreaterThan(num_ci, 32) ThenBlock: {
+                            num_ci = 32
+                        }
+
+                        max_sclk_10k = 0
+                        max_vddc_pp = 0
+                        boot_v = Dereference(Add(entry, AtomField.BOOT_VDDC))
+
+                        j = 0
+                        WhileLoop LessThan(j, num_ci) {
+                            e_off = Add(ci_data, Multiply(j, ci_esz))
+
+                            // SCLK = u16[+0] | (u8[+2] << 16), 10kHz units
+                            sclk_lo = AtomBIOS_ReadU16(rom, e_off)
+                            sclk_hi = GetByte(rom, Add(e_off, 2))
+                            sclk_10k = Add(sclk_lo, Multiply(sclk_hi, 65536))
+
+                            // VDDC = u16[+6], millivolts
+                            vddc_e = AtomBIOS_ReadU16(rom, Add(e_off, 6))
+
+                            // Track highest SCLK whose VDDC is within boot voltage + 100mV headroom
+                            IfCondition LessEqual(vddc_e, Add(boot_v, 100)) ThenBlock: {
+                                IfCondition GreaterThan(sclk_10k, max_sclk_10k) ThenBlock: {
+                                    max_sclk_10k = sclk_10k
+                                    max_vddc_pp = vddc_e
+                                }
+                            }
+
+                            j = Add(j, 1)
+                        }
+
+                        // If nothing fit within voltage headroom, take the absolute max
+                        // (user can monitor stability)
+                        IfCondition EqualTo(max_sclk_10k, 0) ThenBlock: {
+                            j = 0
+                            WhileLoop LessThan(j, num_ci) {
+                                e_off = Add(ci_data, Multiply(j, ci_esz))
+                                sclk_lo = AtomBIOS_ReadU16(rom, e_off)
+                                sclk_hi = GetByte(rom, Add(e_off, 2))
+                                sclk_10k = Add(sclk_lo, Multiply(sclk_hi, 65536))
+                                vddc_e = AtomBIOS_ReadU16(rom, Add(e_off, 6))
+                                IfCondition GreaterThan(sclk_10k, max_sclk_10k) ThenBlock: {
+                                    max_sclk_10k = sclk_10k
+                                    max_vddc_pp = vddc_e
+                                }
+                                j = Add(j, 1)
+                            }
+                        }
+
+                        StoreValue(Add(entry, AtomField.MAX_ENGINE_CLK), Multiply(max_sclk_10k, 10))
+                        StoreValue(Add(entry, AtomField.MAX_ENGINE_VDDC), max_vddc_pp)
+                    }
+                }
+            }
+        }
+
         StoreValue(Add(entry, AtomField.PARSED), 1)
         ReturnValue(1)
     }
@@ -489,6 +688,17 @@ Function.AtomBIOS_PrintInfo {
         PrintNumber(Divide(def_mem, 1000))
         PrintMessage(" MHz\n")
 
+        // Max performance clock from PowerPlay table
+        max_eng = Dereference(Add(entry, AtomField.MAX_ENGINE_CLK))
+        max_vddc_pp = Dereference(Add(entry, AtomField.MAX_ENGINE_VDDC))
+        IfCondition GreaterThan(max_eng, 0) ThenBlock: {
+            PrintMessage("  Max Engine (PP): ")
+            PrintNumber(Divide(max_eng, 1000))
+            PrintMessage(" MHz @ ")
+            PrintNumber(max_vddc_pp)
+            PrintMessage(" mV\n")
+        }
+
         // Voltages
         boot_vddc = Dereference(Add(entry, AtomField.BOOT_VDDC))
         boot_vddci = Dereference(Add(entry, AtomField.BOOT_VDDCI))
@@ -532,6 +742,135 @@ Function.AtomBIOS_GetField {
         parsed = Dereference(Add(entry, AtomField.PARSED))
         IfCondition NotEqual(parsed, 1) ThenBlock: { ReturnValue(0) }
         ReturnValue(Dereference(Add(entry, field_offset)))
+    }
+}
+
+// =============================================================================
+// AtomBIOS_GetDPMCount — return number of clock info entries in PowerPlay table
+// Returns 0 if no PowerPlay table or not parsed.
+// =============================================================================
+Function.AtomBIOS_GetDPMCount {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        entry = AtomBIOS_GetEntry(index)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        parsed = Dereference(Add(entry, AtomField.PARSED))
+        IfCondition NotEqual(parsed, 1) ThenBlock: { ReturnValue(0) }
+
+        rom = Dereference(Add(entry, AtomField.ROM_PTR))
+        IfCondition EqualTo(rom, 0) ThenBlock: { ReturnValue(0) }
+        rom_size = Dereference(Add(entry, AtomField.ROM_SIZE))
+        data_tbl_off = Dereference(Add(entry, AtomField.DATA_TBL_OFF))
+
+        pp_off = AtomBIOS_ReadU16(rom, Add(data_tbl_off, Add(4, Multiply(AtomDataIdx.POWERPLAY, 2))))
+        IfCondition EqualTo(pp_off, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(pp_off, rom_size) ThenBlock: { ReturnValue(0) }
+
+        ci_rel = AtomBIOS_ReadU16(rom, Add(pp_off, AtomPP.CLOCK_INFO_ARRAY_OFF))
+        ci_abs = Add(pp_off, ci_rel)
+        IfCondition GreaterEqual(ci_abs, rom_size) ThenBlock: { ReturnValue(0) }
+
+        num_ci = GetByte(rom, ci_abs)
+        ci_esz = GetByte(rom, Add(ci_abs, 1))
+        IfCondition LessThan(ci_esz, 8) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(num_ci, 32) ThenBlock: { num_ci = 32 }
+
+        ReturnValue(num_ci)
+    }
+}
+
+// =============================================================================
+// AtomBIOS_GetDPMEntry — read one PowerPlay clock info entry
+//
+// Returns SCLK in kHz via output. Writes VDDC (mV) to vddc_out address.
+// entry_idx: 0-based DPM level index.
+// vddc_out:  address where VDDC (mV) is stored (pass address of a variable).
+// mclk_out:  address where MCLK (kHz) is stored.
+//
+// Returns 0 if entry doesn't exist.
+// =============================================================================
+Function.AtomBIOS_GetDPMEntry {
+    Input: index: Integer
+    Input: entry_idx: Integer
+    Input: vddc_out: Address
+    Input: mclk_out: Address
+    Output: Integer
+    Body: {
+        entry = AtomBIOS_GetEntry(index)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        parsed = Dereference(Add(entry, AtomField.PARSED))
+        IfCondition NotEqual(parsed, 1) ThenBlock: { ReturnValue(0) }
+
+        rom = Dereference(Add(entry, AtomField.ROM_PTR))
+        IfCondition EqualTo(rom, 0) ThenBlock: { ReturnValue(0) }
+        rom_size = Dereference(Add(entry, AtomField.ROM_SIZE))
+        data_tbl_off = Dereference(Add(entry, AtomField.DATA_TBL_OFF))
+
+        pp_off = AtomBIOS_ReadU16(rom, Add(data_tbl_off, Add(4, Multiply(AtomDataIdx.POWERPLAY, 2))))
+        IfCondition EqualTo(pp_off, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(pp_off, rom_size) ThenBlock: { ReturnValue(0) }
+
+        ci_rel = AtomBIOS_ReadU16(rom, Add(pp_off, AtomPP.CLOCK_INFO_ARRAY_OFF))
+        ci_abs = Add(pp_off, ci_rel)
+        IfCondition GreaterEqual(ci_abs, rom_size) ThenBlock: { ReturnValue(0) }
+
+        num_ci = GetByte(rom, ci_abs)
+        ci_esz = GetByte(rom, Add(ci_abs, 1))
+        IfCondition LessThan(ci_esz, 8) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(num_ci, 32) ThenBlock: { num_ci = 32 }
+        IfCondition GreaterEqual(entry_idx, num_ci) ThenBlock: { ReturnValue(0) }
+
+        ci_data = Add(ci_abs, 2)
+        e_off = Add(ci_data, Multiply(entry_idx, ci_esz))
+
+        // SCLK = u16[+0] | (u8[+2] << 16), 10kHz units → convert to kHz
+        sclk_lo = AtomBIOS_ReadU16(rom, e_off)
+        sclk_hi = GetByte(rom, Add(e_off, 2))
+        sclk_khz = Multiply(Add(sclk_lo, Multiply(sclk_hi, 65536)), 10)
+
+        // MCLK = u16[+3] | (u8[+5] << 16), 10kHz units → convert to kHz
+        mclk_lo = AtomBIOS_ReadU16(rom, Add(e_off, 3))
+        mclk_hi = GetByte(rom, Add(e_off, 5))
+        mclk_khz = Multiply(Add(mclk_lo, Multiply(mclk_hi, 65536)), 10)
+
+        // VDDC = u16[+6], millivolts
+        vddc_val = AtomBIOS_ReadU16(rom, Add(e_off, 6))
+
+        StoreValue(vddc_out, vddc_val)
+        StoreValue(mclk_out, mclk_khz)
+
+        ReturnValue(sclk_khz)
+    }
+}
+
+// =============================================================================
+// AtomBIOS_GetClockInfoSize — return the entry size of clock info entries
+// Useful for detecting SI (16 byte) vs CI/VI (8 byte) layout.
+// =============================================================================
+Function.AtomBIOS_GetClockInfoSize {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        entry = AtomBIOS_GetEntry(index)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        parsed = Dereference(Add(entry, AtomField.PARSED))
+        IfCondition NotEqual(parsed, 1) ThenBlock: { ReturnValue(0) }
+
+        rom = Dereference(Add(entry, AtomField.ROM_PTR))
+        IfCondition EqualTo(rom, 0) ThenBlock: { ReturnValue(0) }
+        rom_size = Dereference(Add(entry, AtomField.ROM_SIZE))
+        data_tbl_off = Dereference(Add(entry, AtomField.DATA_TBL_OFF))
+
+        pp_off = AtomBIOS_ReadU16(rom, Add(data_tbl_off, Add(4, Multiply(AtomDataIdx.POWERPLAY, 2))))
+        IfCondition EqualTo(pp_off, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(pp_off, rom_size) ThenBlock: { ReturnValue(0) }
+
+        ci_rel = AtomBIOS_ReadU16(rom, Add(pp_off, AtomPP.CLOCK_INFO_ARRAY_OFF))
+        ci_abs = Add(pp_off, ci_rel)
+        IfCondition GreaterEqual(ci_abs, rom_size) ThenBlock: { ReturnValue(0) }
+
+        ReturnValue(GetByte(rom, Add(ci_abs, 1)))
     }
 }
 
