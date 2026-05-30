@@ -1,0 +1,1031 @@
+// wifi_ipc.ailang
+// WiFi configuration utility for AILang OS.
+// IPC client for the display server — runs as a windowed app.
+// Scans for wireless networks, connects via wpa_supplicant, runs DHCP.
+//
+// Protocol:
+//   1. Connect to /tmp/ailang_display.sock
+//   2. Register as "wifi" service
+//   3. Create window with config/wifi.html
+//   4. Service loop: scan, connect, disconnect, status
+//
+// Build: ./ailang.x Applications/wifi_ipc.ailang -o wifi_ipc.x
+// Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.Arrays
+LibraryImport.Hash
+
+// ============================================================================
+// SYSCALL NUMBERS
+// ============================================================================
+FixedPool.WfSys {
+    "SYS_READ":      Initialize=0
+    "SYS_WRITE":     Initialize=1
+    "SYS_OPEN":      Initialize=2
+    "SYS_CLOSE":     Initialize=3
+    "SYS_FORK":      Initialize=57
+    "SYS_EXECVE":    Initialize=59
+    "SYS_EXIT":      Initialize=60
+    "SYS_WAIT4":     Initialize=61
+    "SYS_NANOSLEEP": Initialize=35
+}
+
+// ============================================================================
+// STATE
+// ============================================================================
+FixedPool.WfState {
+    "running":     Initialize=1
+    "win_id":      Initialize=0
+    "msg_count":   Initialize=0
+    "sock":        Initialize=0
+    "edit_mode":   Initialize=0
+    "wlan_iface":  Initialize=0
+}
+
+// edit_mode: 0=none, 1=editing SSID, 2=editing passphrase
+
+// SSID buffer
+FixedPool.WfSSID {
+    "buf": Initialize=0
+    "len": Initialize=0
+    "max": Initialize=64
+}
+
+// Passphrase buffer
+FixedPool.WfPass {
+    "buf": Initialize=0
+    "len": Initialize=0
+    "max": Initialize=64
+}
+
+// ============================================================================
+// IPC SEND HELPERS
+// ============================================================================
+Function.WfSendAddLine {
+    Input: sock: Integer
+    Input: text: Address
+    Input: color: Integer
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.addline")
+        JSON.SetNumber(req, "win_id", WfState.win_id)
+        JSON.SetString(req, "text", text)
+        IfCondition NotEqual(color, 0) ThenBlock: {
+            JSON.SetNumber(req, "color", color)
+        }
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+Function.WfSendClear {
+    Input: sock: Integer
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.clear")
+        JSON.SetNumber(req, "win_id", WfState.win_id)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+Function.WfSendSetLabel {
+    Input: sock: Integer
+    Input: id: Address
+    Input: text: Address
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.setlabel")
+        JSON.SetNumber(req, "win_id", WfState.win_id)
+        JSON.SetString(req, "id", id)
+        JSON.SetString(req, "text", text)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+// ============================================================================
+// FORK/EXEC HELPER — run command and wait for completion
+// Returns exit code, or -1 on failure.
+// ============================================================================
+Function.Wf_RunCommand {
+    Input: cmd_path: Address
+    Input: argv: Address
+    Output: Integer
+    Body: {
+        pid = SystemCall(WfSys.SYS_FORK, 0, 0, 0, 0, 0)
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child: close inherited fds
+            cfd = 3
+            WhileLoop LessThan(cfd, 64) {
+                SystemCall(WfSys.SYS_CLOSE, cfd, 0, 0, 0, 0)
+                cfd = Add(cfd, 1)
+            }
+            envp = Allocate(16)
+            StoreValue(Add(envp, 0), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            StoreValue(Add(envp, 8), 0)
+            SystemCall(WfSys.SYS_EXECVE, cmd_path, argv, envp, 0, 0)
+            SystemCall(WfSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
+
+        // Wait for child
+        status_buf = Allocate(8)
+        StoreValue(status_buf, 0)
+        SystemCall(WfSys.SYS_WAIT4, pid, status_buf, 0, 0, 0)
+        wstatus = Dereference(status_buf)
+        exit_code = BitwiseAnd(Divide(wstatus, 256), 255)
+        Deallocate(status_buf, 8)
+        ReturnValue(exit_code)
+    }
+}
+
+// ============================================================================
+// FORK/EXEC DAEMON — start a background process, don't wait
+// Returns child PID, or 0 on failure.
+// ============================================================================
+Function.Wf_StartDaemon {
+    Input: cmd_path: Address
+    Input: argv: Address
+    Output: Integer
+    Body: {
+        pid = SystemCall(WfSys.SYS_FORK, 0, 0, 0, 0, 0)
+
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child: close inherited fds
+            cfd = 3
+            WhileLoop LessThan(cfd, 64) {
+                SystemCall(WfSys.SYS_CLOSE, cfd, 0, 0, 0, 0)
+                cfd = Add(cfd, 1)
+            }
+            envp = Allocate(16)
+            StoreValue(Add(envp, 0), "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            StoreValue(Add(envp, 8), 0)
+            SystemCall(WfSys.SYS_EXECVE, cmd_path, argv, envp, 0, 0)
+            SystemCall(WfSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        ReturnValue(pid)
+    }
+}
+
+// ============================================================================
+// FILE I/O HELPERS
+// ============================================================================
+Function.Wf_WriteFile {
+    Input: path: Address
+    Input: content: Address
+    Input: content_len: Integer
+    Output: Integer
+    Body: {
+        // O_WRONLY|O_CREAT|O_TRUNC = 577, mode 0644 = 420
+        fd = SystemCall(WfSys.SYS_OPEN, path, 577, 420)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(WfSys.SYS_WRITE, fd, content, content_len)
+        SystemCall(WfSys.SYS_CLOSE, fd)
+        ReturnValue(1)
+    }
+}
+
+Function.Wf_ReadFile {
+    Input: path: Address
+    Input: buf: Address
+    Input: max: Integer
+    Output: Integer
+    Body: {
+        fd = SystemCall(WfSys.SYS_OPEN, path, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        n = SystemCall(WfSys.SYS_READ, fd, buf, max)
+        SystemCall(WfSys.SYS_CLOSE, fd)
+        IfCondition LessThan(n, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(n)
+    }
+}
+
+// ============================================================================
+// SLEEP HELPER — nanosleep for N milliseconds
+// ============================================================================
+Function.Wf_SleepMs {
+    Input: ms: Integer
+    Body: {
+        ts = Allocate(16)
+        StoreValue(ts, Divide(ms, 1000))
+        StoreValue(Add(ts, 8), Multiply(Modulo(ms, 1000), 1000000))
+        SystemCall(WfSys.SYS_NANOSLEEP, ts, 0, 0, 0, 0)
+        Deallocate(ts, 16)
+    }
+}
+
+// ============================================================================
+// DETECT WIRELESS INTERFACE — check wlan0, wlan1, etc.
+// Sets WfState.wlan_iface to the path string, or 0 if none found
+// ============================================================================
+Function.Wf_DetectInterface {
+    Output: Integer
+    Body: {
+        // Try /sys/class/net/wlan0
+        path = Allocate(64)
+
+        idx = 0
+        WhileLoop LessThan(idx, 4) {
+            MemoryCopy(path, "/sys/class/net/wlan", 19)
+            SetByte(path, 19, Add(48, idx))
+            SetByte(path, 20, 0)
+
+            fd = SystemCall(WfSys.SYS_OPEN, path, 0, 0)
+            IfCondition GreaterEqual(fd, 0) ThenBlock: {
+                SystemCall(WfSys.SYS_CLOSE, fd)
+
+                iface = Allocate(8)
+                MemoryCopy(iface, "wlan", 4)
+                SetByte(iface, 4, Add(48, idx))
+                SetByte(iface, 5, 0)
+                WfState.wlan_iface = iface
+
+                PrintMessage("[WIFI] Found interface: ")
+                PrintString(iface)
+                PrintMessage("\n")
+                Deallocate(path, 64)
+                ReturnValue(1)
+            }
+
+            idx = Add(idx, 1)
+        }
+
+        Deallocate(path, 64)
+        PrintMessage("[WIFI] No wireless interface found\n")
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// SCAN — run iw scan, parse output, display networks
+// Uses: iw dev <iface> scan > /tmp/wifi_scan.txt
+// Then reads and parses the output file
+// ============================================================================
+Function.Wf_Scan {
+    Input: sock: Integer
+    Body: {
+        iface = WfState.wlan_iface
+        IfCondition EqualTo(iface, 0) ThenBlock: {
+            WfSendSetLabel(sock, "log", "No wireless interface")
+            ReturnValue(0)
+        }
+
+        WfSendSetLabel(sock, "log", "Bringing up interface...")
+        WfSendClear(sock)
+
+        // ifconfig wlan0 up
+        argv_up = Allocate(32)
+        StoreValue(Add(argv_up, 0), "/sbin/ifconfig")
+        StoreValue(Add(argv_up, 8), iface)
+        StoreValue(Add(argv_up, 16), "up")
+        StoreValue(Add(argv_up, 24), 0)
+        Wf_RunCommand("/sbin/ifconfig", argv_up)
+        Deallocate(argv_up, 32)
+
+        Wf_SleepMs(500)
+
+        WfSendSetLabel(sock, "log", "Scanning...")
+
+        // We need to run: sh -c "iw dev wlan0 scan 2>/dev/null | grep SSID > /tmp/wifi_scan.txt"
+        // Build shell command string
+        shcmd = Allocate(256)
+        MemoryCopy(shcmd, "/usr/sbin/iw dev ", 17)
+        ilen = StringLength(iface)
+        MemoryCopy(Add(shcmd, 17), iface, ilen)
+        spos = Add(17, ilen)
+        tail_cmd = " scan 2>/dev/null > /tmp/wifi_scan.txt"
+        tlen = StringLength(tail_cmd)
+        MemoryCopy(Add(shcmd, spos), tail_cmd, tlen)
+        spos = Add(spos, tlen)
+        SetByte(shcmd, spos, 0)
+
+        argv_scan = Allocate(32)
+        StoreValue(Add(argv_scan, 0), "/bin/sh")
+        StoreValue(Add(argv_scan, 8), "-c")
+        StoreValue(Add(argv_scan, 16), shcmd)
+        StoreValue(Add(argv_scan, 24), 0)
+        Wf_RunCommand("/bin/sh", argv_scan)
+        Deallocate(argv_scan, 32)
+        Deallocate(shcmd, 256)
+
+        // Read scan results
+        scan_buf = Allocate(8192)
+        n = Wf_ReadFile("/tmp/wifi_scan.txt", scan_buf, 8191)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            WfSendSetLabel(sock, "log", "Scan failed or no results")
+            WfSendAddLine(sock, "No scan results — try again or check interface", 16750848)
+            Deallocate(scan_buf, 8192)
+            ReturnValue(0)
+        }
+        SetByte(scan_buf, n, 0)
+
+        // Parse: look for lines containing "SSID:" and extract the name
+        // iw scan output has lines like: "	SSID: MyNetwork"
+        net_count = 0
+        line_start = 0
+        pos = 0
+        WhileLoop LessEqual(pos, n) {
+            ch = 0
+            IfCondition LessThan(pos, n) ThenBlock: {
+                ch = GetByte(scan_buf, pos)
+            }
+
+            is_end = 0
+            IfCondition EqualTo(ch, 10) ThenBlock: { is_end = 1 }
+            IfCondition EqualTo(pos, n) ThenBlock: { is_end = 1 }
+
+            IfCondition EqualTo(is_end, 1) ThenBlock: {
+                line_len = Subtract(pos, line_start)
+                IfCondition GreaterThan(line_len, 0) ThenBlock: {
+                    // Search for "SSID: " in this line
+                    si = line_start
+                    WhileLoop LessThan(si, Subtract(pos, 5)) {
+                        IfCondition EqualTo(GetByte(scan_buf, si), 83) ThenBlock: {
+                            // 'S'
+                            IfCondition EqualTo(GetByte(scan_buf, Add(si, 1)), 83) ThenBlock: {
+                                IfCondition EqualTo(GetByte(scan_buf, Add(si, 2)), 73) ThenBlock: {
+                                    IfCondition EqualTo(GetByte(scan_buf, Add(si, 3)), 68) ThenBlock: {
+                                        IfCondition EqualTo(GetByte(scan_buf, Add(si, 4)), 58) ThenBlock: {
+                                            // Found "SSID:"
+                                            name_start = Add(si, 5)
+                                            // Skip spaces
+                                            WhileLoop LessThan(name_start, pos) {
+                                                IfCondition NotEqual(GetByte(scan_buf, name_start), 32) ThenBlock: {
+                                                    BreakLoop
+                                                }
+                                                name_start = Add(name_start, 1)
+                                            }
+                                            name_len = Subtract(pos, name_start)
+                                            IfCondition GreaterThan(name_len, 0) ThenBlock: {
+                                                // Build display line
+                                                dline = Allocate(128)
+                                                MemoryCopy(dline, "  ", 2)
+                                                IfCondition GreaterThan(name_len, 120) ThenBlock: { name_len = 120 }
+                                                MemoryCopy(Add(dline, 2), Add(scan_buf, name_start), name_len)
+                                                SetByte(dline, Add(2, name_len), 0)
+                                                WfSendAddLine(sock, dline, 65416)
+                                                Deallocate(dline, 128)
+                                                net_count = Add(net_count, 1)
+                                            }
+                                            BreakLoop
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        si = Add(si, 1)
+                    }
+                }
+                line_start = Add(pos, 1)
+            }
+
+            pos = Add(pos, 1)
+        }
+
+        Deallocate(scan_buf, 8192)
+
+        // Update log
+        IfCondition EqualTo(net_count, 0) ThenBlock: {
+            WfSendSetLabel(sock, "log", "No networks found")
+        } ElseBlock: {
+            lbuf = Allocate(64)
+            MemoryCopy(lbuf, "Found ", 6)
+            nbuf = Allocate(16)
+            IfCondition EqualTo(net_count, 0) ThenBlock: {
+                SetByte(nbuf, 0, 48)
+                SetByte(nbuf, 1, 0)
+            } ElseBlock: {
+                tmp = Allocate(16)
+                tn = 0
+                tv = net_count
+                WhileLoop GreaterThan(tv, 0) {
+                    SetByte(tmp, tn, Add(48, Modulo(tv, 10)))
+                    tv = Divide(tv, 10)
+                    tn = Add(tn, 1)
+                }
+                ti = 0
+                WhileLoop LessThan(ti, tn) {
+                    SetByte(nbuf, ti, GetByte(tmp, Subtract(Subtract(tn, 1), ti)))
+                    ti = Add(ti, 1)
+                }
+                SetByte(nbuf, tn, 0)
+                Deallocate(tmp, 16)
+            }
+            nlen = StringLength(nbuf)
+            MemoryCopy(Add(lbuf, 6), nbuf, nlen)
+            MemoryCopy(Add(lbuf, Add(6, nlen)), " networks", 9)
+            SetByte(lbuf, Add(15, nlen), 0)
+            WfSendSetLabel(sock, "log", lbuf)
+            Deallocate(nbuf, 16)
+            Deallocate(lbuf, 64)
+        }
+
+        PrintMessage("[WIFI] Scan complete\n")
+    }
+}
+
+// ============================================================================
+// CONNECT — write wpa_supplicant.conf, start wpa_supplicant + DHCP
+// ============================================================================
+Function.Wf_Connect {
+    Input: sock: Integer
+    Body: {
+        iface = WfState.wlan_iface
+        IfCondition EqualTo(iface, 0) ThenBlock: {
+            WfSendSetLabel(sock, "log", "No wireless interface")
+            ReturnValue(0)
+        }
+
+        IfCondition EqualTo(WfSSID.len, 0) ThenBlock: {
+            WfSendSetLabel(sock, "log", "Enter SSID first")
+            ReturnValue(0)
+        }
+
+        WfSendSetLabel(sock, "log", "Connecting...")
+        WfSendSetLabel(sock, "status", "WiFi: Connecting...")
+
+        // Kill any existing wpa_supplicant
+        argv_kill = Allocate(32)
+        StoreValue(Add(argv_kill, 0), "/bin/sh")
+        StoreValue(Add(argv_kill, 8), "-c")
+        StoreValue(Add(argv_kill, 16), "killall wpa_supplicant 2>/dev/null; killall udhcpc 2>/dev/null")
+        StoreValue(Add(argv_kill, 24), 0)
+        Wf_RunCommand("/bin/sh", argv_kill)
+        Deallocate(argv_kill, 32)
+
+        Wf_SleepMs(500)
+
+        // Build wpa_supplicant.conf
+        // Format:
+        // ctrl_interface=/var/run/wpa_supplicant
+        // network={
+        //     ssid="<SSID>"
+        //     psk="<passphrase>"
+        // }
+        // For open networks (no pass): key_mgmt=NONE
+        conf = Allocate(512)
+        cpos = 0
+
+        header = "ctrl_interface=/var/run/wpa_supplicant\nupdate_config=1\n\nnetwork={\n    ssid=\""
+        hlen = StringLength(header)
+        MemoryCopy(Add(conf, cpos), header, hlen)
+        cpos = Add(cpos, hlen)
+
+        // SSID
+        SetByte(WfSSID.buf, WfSSID.len, 0)
+        MemoryCopy(Add(conf, cpos), WfSSID.buf, WfSSID.len)
+        cpos = Add(cpos, WfSSID.len)
+
+        SetByte(conf, cpos, 34)
+        cpos = Add(cpos, 1)
+        SetByte(conf, cpos, 10)
+        cpos = Add(cpos, 1)
+
+        IfCondition GreaterThan(WfPass.len, 0) ThenBlock: {
+            // WPA/WPA2
+            psk_line = "    psk=\""
+            plen = StringLength(psk_line)
+            MemoryCopy(Add(conf, cpos), psk_line, plen)
+            cpos = Add(cpos, plen)
+
+            SetByte(WfPass.buf, WfPass.len, 0)
+            MemoryCopy(Add(conf, cpos), WfPass.buf, WfPass.len)
+            cpos = Add(cpos, WfPass.len)
+
+            SetByte(conf, cpos, 34)
+            cpos = Add(cpos, 1)
+            SetByte(conf, cpos, 10)
+            cpos = Add(cpos, 1)
+        } ElseBlock: {
+            // Open network
+            open_line = "    key_mgmt=NONE\n"
+            olen = StringLength(open_line)
+            MemoryCopy(Add(conf, cpos), open_line, olen)
+            cpos = Add(cpos, olen)
+        }
+
+        footer = "}\n"
+        flen = StringLength(footer)
+        MemoryCopy(Add(conf, cpos), footer, flen)
+        cpos = Add(cpos, flen)
+        SetByte(conf, cpos, 0)
+
+        // Ensure /var/run/wpa_supplicant directory exists
+        argv_mkdir = Allocate(32)
+        StoreValue(Add(argv_mkdir, 0), "/bin/sh")
+        StoreValue(Add(argv_mkdir, 8), "-c")
+        StoreValue(Add(argv_mkdir, 16), "mkdir -p /var/run/wpa_supplicant")
+        StoreValue(Add(argv_mkdir, 24), 0)
+        Wf_RunCommand("/bin/sh", argv_mkdir)
+        Deallocate(argv_mkdir, 32)
+
+        // Write config file
+        Wf_WriteFile("/etc/wpa_supplicant.conf", conf, cpos)
+        Deallocate(conf, 512)
+        PrintMessage("[WIFI] Wrote /etc/wpa_supplicant.conf\n")
+
+        // Bring interface up
+        argv_up = Allocate(32)
+        StoreValue(Add(argv_up, 0), "/sbin/ifconfig")
+        StoreValue(Add(argv_up, 8), iface)
+        StoreValue(Add(argv_up, 16), "up")
+        StoreValue(Add(argv_up, 24), 0)
+        Wf_RunCommand("/sbin/ifconfig", argv_up)
+        Deallocate(argv_up, 32)
+
+        // Start wpa_supplicant: wpa_supplicant -i wlan0 -c /etc/wpa_supplicant.conf -B -D nl80211,wext
+        argv_wpa = Allocate(80)
+        StoreValue(Add(argv_wpa, 0),  "/usr/sbin/wpa_supplicant")
+        StoreValue(Add(argv_wpa, 8),  "-i")
+        StoreValue(Add(argv_wpa, 16), iface)
+        StoreValue(Add(argv_wpa, 24), "-c")
+        StoreValue(Add(argv_wpa, 32), "/etc/wpa_supplicant.conf")
+        StoreValue(Add(argv_wpa, 40), "-B")
+        StoreValue(Add(argv_wpa, 48), "-D")
+        StoreValue(Add(argv_wpa, 56), "nl80211,wext")
+        StoreValue(Add(argv_wpa, 64), 0)
+        rc = Wf_RunCommand("/usr/sbin/wpa_supplicant", argv_wpa)
+        Deallocate(argv_wpa, 80)
+
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            WfSendSetLabel(sock, "log", "wpa_supplicant failed")
+            WfSendSetLabel(sock, "status", "WiFi: Auth failed")
+            PrintMessage("[WIFI] wpa_supplicant failed\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[WIFI] wpa_supplicant started\n")
+        WfSendSetLabel(sock, "log", "Authenticating...")
+
+        // Wait for association
+        Wf_SleepMs(3000)
+
+        // Run DHCP: udhcpc -i wlan0 -n -q
+        argv_dhcp = Allocate(48)
+        StoreValue(Add(argv_dhcp, 0),  "/sbin/udhcpc")
+        StoreValue(Add(argv_dhcp, 8),  "-i")
+        StoreValue(Add(argv_dhcp, 16), iface)
+        StoreValue(Add(argv_dhcp, 24), "-n")
+        StoreValue(Add(argv_dhcp, 32), "-q")
+        StoreValue(Add(argv_dhcp, 40), 0)
+        rc2 = Wf_RunCommand("/sbin/udhcpc", argv_dhcp)
+        Deallocate(argv_dhcp, 48)
+
+        IfCondition EqualTo(rc2, 0) ThenBlock: {
+            WfSendSetLabel(sock, "status", "WiFi: Connected")
+            WfSendSetLabel(sock, "log", "Connected — DHCP OK")
+            WfSendAddLine(sock, "Connected successfully!", 65416)
+            PrintMessage("[WIFI] Connected and DHCP acquired\n")
+        } ElseBlock: {
+            WfSendSetLabel(sock, "status", "WiFi: No DHCP")
+            WfSendSetLabel(sock, "log", "Associated but DHCP failed")
+            PrintMessage("[WIFI] DHCP failed\n")
+        }
+    }
+}
+
+// ============================================================================
+// DISCONNECT — kill wpa_supplicant, take interface down
+// ============================================================================
+Function.Wf_Disconnect {
+    Input: sock: Integer
+    Body: {
+        WfSendSetLabel(sock, "log", "Disconnecting...")
+
+        argv_kill = Allocate(32)
+        StoreValue(Add(argv_kill, 0), "/bin/sh")
+        StoreValue(Add(argv_kill, 8), "-c")
+        StoreValue(Add(argv_kill, 16), "killall wpa_supplicant 2>/dev/null; killall udhcpc 2>/dev/null")
+        StoreValue(Add(argv_kill, 24), 0)
+        Wf_RunCommand("/bin/sh", argv_kill)
+        Deallocate(argv_kill, 32)
+
+        iface = WfState.wlan_iface
+        IfCondition NotEqual(iface, 0) ThenBlock: {
+            argv_down = Allocate(32)
+            StoreValue(Add(argv_down, 0), "/sbin/ifconfig")
+            StoreValue(Add(argv_down, 8), iface)
+            StoreValue(Add(argv_down, 16), "down")
+            StoreValue(Add(argv_down, 24), 0)
+            Wf_RunCommand("/sbin/ifconfig", argv_down)
+            Deallocate(argv_down, 32)
+        }
+
+        WfSendSetLabel(sock, "status", "WiFi: Disconnected")
+        WfSendSetLabel(sock, "log", "Disconnected")
+        PrintMessage("[WIFI] Disconnected\n")
+    }
+}
+
+// ============================================================================
+// STATUS — check current connection state via iw
+// ============================================================================
+Function.Wf_Status {
+    Input: sock: Integer
+    Body: {
+        iface = WfState.wlan_iface
+        IfCondition EqualTo(iface, 0) ThenBlock: {
+            WfSendSetLabel(sock, "log", "No wireless interface")
+            ReturnValue(0)
+        }
+
+        WfSendClear(sock)
+
+        // Run: sh -c "iw dev wlan0 link > /tmp/wifi_status.txt 2>&1"
+        shcmd = Allocate(256)
+        MemoryCopy(shcmd, "/usr/sbin/iw dev ", 17)
+        ilen = StringLength(iface)
+        MemoryCopy(Add(shcmd, 17), iface, ilen)
+        spos = Add(17, ilen)
+        tail = " link > /tmp/wifi_status.txt 2>&1"
+        tlen = StringLength(tail)
+        MemoryCopy(Add(shcmd, spos), tail, tlen)
+        SetByte(shcmd, Add(spos, tlen), 0)
+
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0), "/bin/sh")
+        StoreValue(Add(argv, 8), "-c")
+        StoreValue(Add(argv, 16), shcmd)
+        StoreValue(Add(argv, 24), 0)
+        Wf_RunCommand("/bin/sh", argv)
+        Deallocate(argv, 32)
+        Deallocate(shcmd, 256)
+
+        // Also get IP address: sh -c "ifconfig wlan0 >> /tmp/wifi_status.txt 2>&1"
+        shcmd2 = Allocate(256)
+        MemoryCopy(shcmd2, "/sbin/ifconfig ", 15)
+        MemoryCopy(Add(shcmd2, 15), iface, ilen)
+        spos2 = Add(15, ilen)
+        tail2 = " >> /tmp/wifi_status.txt 2>&1"
+        t2len = StringLength(tail2)
+        MemoryCopy(Add(shcmd2, spos2), tail2, t2len)
+        SetByte(shcmd2, Add(spos2, t2len), 0)
+
+        argv2 = Allocate(32)
+        StoreValue(Add(argv2, 0), "/bin/sh")
+        StoreValue(Add(argv2, 8), "-c")
+        StoreValue(Add(argv2, 16), shcmd2)
+        StoreValue(Add(argv2, 24), 0)
+        Wf_RunCommand("/bin/sh", argv2)
+        Deallocate(argv2, 32)
+        Deallocate(shcmd2, 256)
+
+        // Read and display result
+        rbuf = Allocate(4096)
+        n = Wf_ReadFile("/tmp/wifi_status.txt", rbuf, 4095)
+        IfCondition LessEqual(n, 0) ThenBlock: {
+            WfSendAddLine(sock, "Cannot read status", 16750848)
+            Deallocate(rbuf, 4096)
+            ReturnValue(0)
+        }
+        SetByte(rbuf, n, 0)
+
+        // Display line by line
+        ls = 0
+        p = 0
+        WhileLoop LessEqual(p, n) {
+            is_end = 0
+            IfCondition EqualTo(p, n) ThenBlock: { is_end = 1 }
+            IfCondition LessThan(p, n) ThenBlock: {
+                IfCondition EqualTo(GetByte(rbuf, p), 10) ThenBlock: { is_end = 1 }
+            }
+            IfCondition EqualTo(is_end, 1) ThenBlock: {
+                ll = Subtract(p, ls)
+                IfCondition GreaterThan(ll, 0) ThenBlock: {
+                    dline = Allocate(256)
+                    IfCondition GreaterThan(ll, 250) ThenBlock: { ll = 250 }
+                    MemoryCopy(dline, Add(rbuf, ls), ll)
+                    SetByte(dline, ll, 0)
+                    WfSendAddLine(sock, dline, 14737632)
+                    Deallocate(dline, 256)
+                }
+                ls = Add(p, 1)
+            }
+            p = Add(p, 1)
+        }
+
+        Deallocate(rbuf, 4096)
+        WfSendSetLabel(sock, "log", "Status updated")
+    }
+}
+
+// ============================================================================
+// UPDATE SSID/PASS DISPLAY
+// ============================================================================
+Function.Wf_UpdateDisplay {
+    Input: sock: Integer
+    Body: {
+        SetByte(WfSSID.buf, WfSSID.len, 0)
+        WfSendSetLabel(sock, "ssid", WfSSID.buf)
+
+        // Show passphrase as bullets
+        pbuf = Allocate(Add(WfPass.max, 1))
+        bi = 0
+        WhileLoop LessThan(bi, WfPass.len) {
+            SetByte(pbuf, bi, 42)
+            bi = Add(bi, 1)
+        }
+        SetByte(pbuf, WfPass.len, 0)
+        WfSendSetLabel(sock, "pass", pbuf)
+        Deallocate(pbuf, Add(WfPass.max, 1))
+    }
+}
+
+// ============================================================================
+// KEY HANDLER — keyboard input for SSID/passphrase editing
+// ============================================================================
+Function.WfHandleKey {
+    Input: sock:    Integer
+    Input: keycode: Integer
+    Input: ch:      Integer
+    Input: shift:   Integer
+    Body: {
+        IfCondition EqualTo(WfState.edit_mode, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Escape (scancode 1) — cancel editing
+        IfCondition EqualTo(keycode, 1) ThenBlock: {
+            WfState.edit_mode = 0
+            WfSendSetLabel(sock, "log", "Edit cancelled")
+            ReturnValue(1)
+        }
+
+        // Enter (scancode 28) — finish editing
+        IfCondition EqualTo(keycode, 28) ThenBlock: {
+            WfState.edit_mode = 0
+            WfSendSetLabel(sock, "log", "Ready")
+            ReturnValue(1)
+        }
+
+        // Backspace (scancode 14)
+        IfCondition EqualTo(keycode, 14) ThenBlock: {
+            IfCondition EqualTo(WfState.edit_mode, 1) ThenBlock: {
+                IfCondition GreaterThan(WfSSID.len, 0) ThenBlock: {
+                    WfSSID.len = Subtract(WfSSID.len, 1)
+                    SetByte(WfSSID.buf, WfSSID.len, 0)
+                }
+            }
+            IfCondition EqualTo(WfState.edit_mode, 2) ThenBlock: {
+                IfCondition GreaterThan(WfPass.len, 0) ThenBlock: {
+                    WfPass.len = Subtract(WfPass.len, 1)
+                    SetByte(WfPass.buf, WfPass.len, 0)
+                }
+            }
+            Wf_UpdateDisplay(sock)
+            ReturnValue(1)
+        }
+
+        // Printable ASCII
+        IfCondition GreaterThan(ch, 31) ThenBlock: {
+            IfCondition LessThan(ch, 127) ThenBlock: {
+                IfCondition EqualTo(WfState.edit_mode, 1) ThenBlock: {
+                    IfCondition LessThan(WfSSID.len, WfSSID.max) ThenBlock: {
+                        SetByte(WfSSID.buf, WfSSID.len, ch)
+                        WfSSID.len = Add(WfSSID.len, 1)
+                    }
+                }
+                IfCondition EqualTo(WfState.edit_mode, 2) ThenBlock: {
+                    IfCondition LessThan(WfPass.len, WfPass.max) ThenBlock: {
+                        SetByte(WfPass.buf, WfPass.len, ch)
+                        WfPass.len = Add(WfPass.len, 1)
+                    }
+                }
+                Wf_UpdateDisplay(sock)
+                ReturnValue(1)
+            }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// ACTION HANDLER
+// ============================================================================
+Function.WfHandleAction {
+    Input: sock: Integer
+    Input: action: Address
+    Input: action_len: Integer
+    Body: {
+        IfCondition LessThan(action_len, 3) ThenBlock: { ReturnValue(0) }
+
+        // All actions start with "wf."
+        c0 = GetByte(action, 0)
+        c1 = GetByte(action, 1)
+        c2 = GetByte(action, 2)
+        // 'w'=119 'f'=102 '.'=46
+        IfCondition NotEqual(c0, 119) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c1, 102) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c2, 46) ThenBlock: { ReturnValue(0) }
+
+        // Scan
+        cmp = StringCompare(action, "wf.scan")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Wf_Scan(sock)
+            ReturnValue(1)
+        }
+
+        // Connect
+        cmp = StringCompare(action, "wf.conn")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Wf_Connect(sock)
+            ReturnValue(1)
+        }
+
+        // Disconnect
+        cmp = StringCompare(action, "wf.disc")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Wf_Disconnect(sock)
+            ReturnValue(1)
+        }
+
+        // Status
+        cmp = StringCompare(action, "wf.stat")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Wf_Status(sock)
+            ReturnValue(1)
+        }
+
+        // Edit SSID
+        cmp = StringCompare(action, "wf.essid")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            WfState.edit_mode = 1
+            WfSendSetLabel(sock, "log", "Type SSID, Enter to confirm")
+            ReturnValue(1)
+        }
+
+        // Edit Passphrase
+        cmp = StringCompare(action, "wf.epass")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            WfState.edit_mode = 2
+            WfSendSetLabel(sock, "log", "Type passphrase, Enter to confirm")
+            ReturnValue(1)
+        }
+
+        // Clear
+        cmp = StringCompare(action, "wf.clr")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            WfSSID.len = 0
+            SetByte(WfSSID.buf, 0, 0)
+            WfPass.len = 0
+            SetByte(WfPass.buf, 0, 0)
+            WfState.edit_mode = 0
+            Wf_UpdateDisplay(sock)
+            WfSendSetLabel(sock, "log", "Cleared")
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  WiFi Config IPC Client\n")
+    PrintMessage("============================================\n\n")
+
+    // Allocate buffers
+    WfSSID.buf = Allocate(Add(WfSSID.max, 1))
+    MemorySet(WfSSID.buf, 0, Add(WfSSID.max, 1))
+    WfPass.buf = Allocate(Add(WfPass.max, 1))
+    MemorySet(WfPass.buf, 0, Add(WfPass.max, 1))
+
+    // Detect wireless interface
+    Wf_DetectInterface()
+
+    // Connect to display server
+    sock_path = "/tmp/ailang_display.sock"
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[WIFI] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[WIFI] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[WIFI] Connected to display server\n")
+    WfState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"wifi\"}")
+    PrintMessage("[WIFI] Sent register\n")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"WiFi Config\",\"w\":480,\"h\":380,\"html\":\"config/wifi.html\"}")
+    PrintMessage("[WIFI] Sent window.create\n")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[WIFI] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        WfState.win_id = wid
+        PrintMessage("[WIFI] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Show initial status
+    IfCondition EqualTo(WfState.wlan_iface, 0) ThenBlock: {
+        WfSendSetLabel(sock, "status", "WiFi: No adapter found")
+        WfSendSetLabel(sock, "log", "No wireless interface detected")
+    } ElseBlock: {
+        lbuf = Allocate(64)
+        MemoryCopy(lbuf, "Interface: ", 11)
+        ilen = StringLength(WfState.wlan_iface)
+        MemoryCopy(Add(lbuf, 11), WfState.wlan_iface, ilen)
+        SetByte(lbuf, Add(11, ilen), 0)
+        WfSendSetLabel(sock, "log", lbuf)
+        Deallocate(lbuf, 64)
+    }
+
+    PrintMessage("[WIFI] Ready\n\n")
+
+    // Service loop
+    WhileLoop EqualTo(WfState.running, 1) {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: {
+            PrintMessage("[WIFI] Connection closed\n")
+            WfState.running = 0
+        } ElseBlock: {
+            WfState.msg_count = Add(WfState.msg_count, 1)
+
+            pmsg = ParseJSON(msg)
+            IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                mobj = JSON.AsObject(pmsg)
+                method = JSON.GetString(mobj, "method")
+
+                IfCondition NotEqual(method, 0) ThenBlock: {
+                    cmp_closed = StringCompare(method, "window.closed")
+                    IfCondition EqualTo(cmp_closed, 0) ThenBlock: {
+                        PrintMessage("[WIFI] Window closed\n")
+                        WfState.running = 0
+                    }
+
+                    cmp_action = StringCompare(method, "input.action")
+                    IfCondition EqualTo(cmp_action, 0) ThenBlock: {
+                        action = JSON.GetString(mobj, "action")
+                        IfCondition NotEqual(action, 0) ThenBlock: {
+                            action_len = JSON.GetNumber(mobj, "action_len")
+                            WfHandleAction(sock, action, action_len)
+                        }
+                    }
+
+                    cmp_key = StringCompare(method, "input.key")
+                    IfCondition EqualTo(cmp_key, 0) ThenBlock: {
+                        kc = JSON.GetNumber(mobj, "keycode")
+                        kch = JSON.GetNumber(mobj, "char")
+                        ksh = JSON.GetNumber(mobj, "shift")
+                        WfHandleKey(sock, kc, kch, ksh)
+                    }
+                }
+                JSON.Free(pmsg)
+            }
+        }
+    }
+
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  WiFi Config handled ")
+    PrintNumber(WfState.msg_count)
+    PrintMessage(" messages\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)

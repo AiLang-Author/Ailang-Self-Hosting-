@@ -1,0 +1,1355 @@
+// installer_ipc.ailang
+// Internal package manager for AILang OS.
+// IPC client for the display server — runs as a windowed app.
+// Tracks packages in a PG table, scans for binaries/configs/services,
+// deploys missing HTML configs, registers missing services.
+//
+// Protocol:
+//   1. Connect to /tmp/ailang_display.sock
+//   2. Register as "installer" service
+//   3. Create window with config/installer.html
+//   4. Service loop: scan, install, repair, schema, filter
+//
+// Build: ./ailang.x Applications/installer_ipc.ailang -o installer_ipc.x
+// Run:   Launched from Start Menu "Installer" or: ./installer_ipc.x
+// Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.Arrays
+LibraryImport.Hash
+LibraryImport.PostgreSQL_Complete
+LibraryImport.OS.Schema
+
+// ============================================================================
+// STATE
+// ============================================================================
+FixedPool.PkgState {
+    "running":     Initialize=1
+    "win_id":      Initialize=0
+    "msg_count":   Initialize=0
+    "sock":        Initialize=0
+    "db":          Initialize=0
+    "filter":      Initialize=0
+    "total_pkgs":  Initialize=15
+    "scan_ok":     Initialize=0
+    "scan_partial":Initialize=0
+    "scan_missing":Initialize=0
+}
+
+// filter: 0=all, 1=system, 2=apps, 3=missing
+
+// ============================================================================
+// PACKAGE REGISTRY — 15 packages
+// Each entry: name, display_name, binary_name, html_config, category, priority, depends_on
+// Stored as 7 parallel pointer arrays (14 entries each)
+// ============================================================================
+FixedPool.PkgReg {
+    "names":        Initialize=0
+    "display":      Initialize=0
+    "binaries":     Initialize=0
+    "configs":      Initialize=0
+    "categories":   Initialize=0
+    "priorities":   Initialize=0
+    "depends":      Initialize=0
+    "count":        Initialize=15
+}
+
+// Per-package scan results: has_bin, has_cfg, has_svc (14 bytes each)
+FixedPool.PkgScan {
+    "has_bin":  Initialize=0
+    "has_cfg":  Initialize=0
+    "has_svc":  Initialize=0
+}
+
+// ============================================================================
+// SYSCALL WRAPPERS
+// ============================================================================
+Function.PkgSysOpen {
+    Input: filename: Address
+    Output: Integer
+    Body: { ReturnValue(SystemCall(2, filename, 0, 0)) }
+}
+
+Function.PkgSysClose {
+    Input: fd: Integer
+    Body: { SystemCall(3, fd) }
+}
+
+Function.PkgSysWrite {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: count: Integer
+    Output: Integer
+    Body: { ReturnValue(SystemCall(1, fd, buf, count)) }
+}
+
+Function.PkgSysRead {
+    Input: fd: Integer
+    Input: buf: Address
+    Input: count: Integer
+    Output: Integer
+    Body: { ReturnValue(SystemCall(0, fd, buf, count)) }
+}
+
+// ============================================================================
+// FILE EXISTENCE CHECK — returns 1 if file exists, 0 otherwise
+// ============================================================================
+Function.Pkg_FileExists {
+    Input: path: Address
+    Output: Integer
+    Body: {
+        fd = PkgSysOpen(path)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            PkgSysClose(fd)
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// WRITE FILE — write content string to a file path
+// Uses O_WRONLY|O_CREAT|O_TRUNC = 577 (0x241), mode 0644 = 420
+// ============================================================================
+Function.Pkg_WriteFile {
+    Input: path: Address
+    Input: content: Address
+    Input: content_len: Integer
+    Output: Integer
+    Body: {
+        fd = SystemCall(2, path, 577, 420)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        PkgSysWrite(fd, content, content_len)
+        PkgSysClose(fd)
+        ReturnValue(1)
+    }
+}
+
+// ============================================================================
+// NUMBER TO STRING
+// ============================================================================
+Function.PkgNumToStr {
+    Input: val: Integer
+    Input: buf: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(24)
+        n = 0
+        v = val
+        WhileLoop GreaterThan(v, 0) {
+            SetByte(tmp, n, Add(48, Modulo(v, 10)))
+            v = Divide(v, 10)
+            n = Add(n, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            SetByte(buf, i, GetByte(tmp, Subtract(Subtract(n, 1), i)))
+            i = Add(i, 1)
+        }
+        SetByte(buf, n, 0)
+        Deallocate(tmp, 24)
+        ReturnValue(n)
+    }
+}
+
+// ============================================================================
+// IPC SEND HELPERS
+// ============================================================================
+Function.PkgSendAddLine {
+    Input: sock: Integer
+    Input: text: Address
+    Input: color: Integer
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.addline")
+        JSON.SetNumber(req, "win_id", PkgState.win_id)
+        JSON.SetString(req, "text", text)
+        IfCondition NotEqual(color, 0) ThenBlock: {
+            JSON.SetNumber(req, "color", color)
+        }
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+Function.PkgSendClear {
+    Input: sock: Integer
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.clear")
+        JSON.SetNumber(req, "win_id", PkgState.win_id)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+Function.PkgSendSetLabel {
+    Input: sock: Integer
+    Input: id: Address
+    Input: text: Address
+    Body: {
+        req = JSON.NewObject()
+        JSON.SetString(req, "method", "window.setlabel")
+        JSON.SetNumber(req, "win_id", PkgState.win_id)
+        JSON.SetString(req, "id", id)
+        JSON.SetString(req, "text", text)
+        msg = JSON.SerializeObject(req)
+        Socket.SendMsg(sock, msg)
+        JSON.Free(req)
+    }
+}
+
+// ============================================================================
+// INIT PACKAGE REGISTRY — populate the 14-entry parallel arrays
+// ============================================================================
+Function.Pkg_InitRegistry {
+    Body: {
+        c = PkgReg.count
+        sz = Multiply(c, 8)
+        PkgReg.names      = Allocate(sz)
+        PkgReg.display     = Allocate(sz)
+        PkgReg.binaries    = Allocate(sz)
+        PkgReg.configs     = Allocate(sz)
+        PkgReg.categories  = Allocate(sz)
+        PkgReg.priorities  = Allocate(sz)
+        PkgReg.depends     = Allocate(sz)
+        PkgScan.has_bin    = Allocate(c)
+        PkgScan.has_cfg    = Allocate(c)
+        PkgScan.has_svc    = Allocate(c)
+        MemorySet(PkgScan.has_bin, 0, c)
+        MemorySet(PkgScan.has_cfg, 0, c)
+        MemorySet(PkgScan.has_svc, 0, c)
+
+        // 0: display_server
+        StoreValue(Add(PkgReg.names, 0),       "display_server")
+        StoreValue(Add(PkgReg.display, 0),     "Display Server")
+        StoreValue(Add(PkgReg.binaries, 0),    "display.x")
+        StoreValue(Add(PkgReg.configs, 0),     0)
+        StoreValue(Add(PkgReg.categories, 0),  "system")
+        StoreValue(Add(PkgReg.priorities, 0),  10)
+        StoreValue(Add(PkgReg.depends, 0),     "")
+
+        // 1: installer
+        StoreValue(Add(PkgReg.names, 8),       "installer")
+        StoreValue(Add(PkgReg.display, 8),     "Installer")
+        StoreValue(Add(PkgReg.binaries, 8),    "installer_ipc.x")
+        StoreValue(Add(PkgReg.configs, 8),     "installer.html")
+        StoreValue(Add(PkgReg.categories, 8),  "system")
+        StoreValue(Add(PkgReg.priorities, 8),  5)
+        StoreValue(Add(PkgReg.depends, 8),     "display_server")
+
+        // 2: notepad
+        StoreValue(Add(PkgReg.names, 16),      "notepad")
+        StoreValue(Add(PkgReg.display, 16),    "Notepad")
+        StoreValue(Add(PkgReg.binaries, 16),   "notepad.x")
+        StoreValue(Add(PkgReg.configs, 16),    "notepad.html")
+        StoreValue(Add(PkgReg.categories, 16), "app")
+        StoreValue(Add(PkgReg.priorities, 16), 10)
+        StoreValue(Add(PkgReg.depends, 16),    "display_server")
+
+        // 3: calculator
+        StoreValue(Add(PkgReg.names, 24),      "calculator")
+        StoreValue(Add(PkgReg.display, 24),    "Calculator")
+        StoreValue(Add(PkgReg.binaries, 24),   "calc.x")
+        StoreValue(Add(PkgReg.configs, 24),    "calculator.html")
+        StoreValue(Add(PkgReg.categories, 24), "app")
+        StoreValue(Add(PkgReg.priorities, 24), 15)
+        StoreValue(Add(PkgReg.depends, 24),    "display_server")
+
+        // 4: files
+        StoreValue(Add(PkgReg.names, 32),      "files")
+        StoreValue(Add(PkgReg.display, 32),    "Files")
+        StoreValue(Add(PkgReg.binaries, 32),   0)
+        StoreValue(Add(PkgReg.configs, 32),    "filedialog.html")
+        StoreValue(Add(PkgReg.categories, 32), "app")
+        StoreValue(Add(PkgReg.priorities, 32), 20)
+        StoreValue(Add(PkgReg.depends, 32),    "display_server")
+
+        // 5: canvas_demo
+        StoreValue(Add(PkgReg.names, 40),      "canvas_demo")
+        StoreValue(Add(PkgReg.display, 40),    "Canvas")
+        StoreValue(Add(PkgReg.binaries, 40),   "canvas_demo.x")
+        StoreValue(Add(PkgReg.configs, 40),    "canvas_demo.html")
+        StoreValue(Add(PkgReg.categories, 40), "app")
+        StoreValue(Add(PkgReg.priorities, 40), 30)
+        StoreValue(Add(PkgReg.depends, 40),    "display_server")
+
+        // 6: videoplayer
+        StoreValue(Add(PkgReg.names, 48),      "videoplayer")
+        StoreValue(Add(PkgReg.display, 48),    "Video")
+        StoreValue(Add(PkgReg.binaries, 48),   "videoplayer.x")
+        StoreValue(Add(PkgReg.configs, 48),    "videoplayer.html")
+        StoreValue(Add(PkgReg.categories, 48), "app")
+        StoreValue(Add(PkgReg.priorities, 48), 35)
+        StoreValue(Add(PkgReg.depends, 48),    "display_server")
+
+        // 7: terminal
+        StoreValue(Add(PkgReg.names, 56),      "terminal")
+        StoreValue(Add(PkgReg.display, 56),    "Terminal")
+        StoreValue(Add(PkgReg.binaries, 56),   "terminal.x")
+        StoreValue(Add(PkgReg.configs, 56),    "terminal.html")
+        StoreValue(Add(PkgReg.categories, 56), "app")
+        StoreValue(Add(PkgReg.priorities, 56), 40)
+        StoreValue(Add(PkgReg.depends, 56),    "display_server")
+
+        // 8: chrome
+        StoreValue(Add(PkgReg.names, 64),      "chrome")
+        StoreValue(Add(PkgReg.display, 64),    "Chrome")
+        StoreValue(Add(PkgReg.binaries, 64),   "chrome.x")
+        StoreValue(Add(PkgReg.configs, 64),    "chrome.html")
+        StoreValue(Add(PkgReg.categories, 64), "app")
+        StoreValue(Add(PkgReg.priorities, 64), 40)
+        StoreValue(Add(PkgReg.depends, 64),    "display_server")
+
+        // 9: ladybird
+        StoreValue(Add(PkgReg.names, 72),      "ladybird")
+        StoreValue(Add(PkgReg.display, 72),    "Ladybird")
+        StoreValue(Add(PkgReg.binaries, 72),   "ladybird.x")
+        StoreValue(Add(PkgReg.configs, 72),    "ladybird.html")
+        StoreValue(Add(PkgReg.categories, 72), "app")
+        StoreValue(Add(PkgReg.priorities, 72), 45)
+        StoreValue(Add(PkgReg.depends, 72),    "display_server")
+
+        // 10: browser
+        StoreValue(Add(PkgReg.names, 80),      "browser")
+        StoreValue(Add(PkgReg.display, 80),    "Browser")
+        StoreValue(Add(PkgReg.binaries, 80),   "browser.x")
+        StoreValue(Add(PkgReg.configs, 80),    "browser.html")
+        StoreValue(Add(PkgReg.categories, 80), "app")
+        StoreValue(Add(PkgReg.priorities, 80), 50)
+        StoreValue(Add(PkgReg.depends, 80),    "display_server")
+
+        // 11: claude
+        StoreValue(Add(PkgReg.names, 88),      "claude")
+        StoreValue(Add(PkgReg.display, 88),    "Claude Code")
+        StoreValue(Add(PkgReg.binaries, 88),   "claude.x")
+        StoreValue(Add(PkgReg.configs, 88),    "claude.html")
+        StoreValue(Add(PkgReg.categories, 88), "app")
+        StoreValue(Add(PkgReg.priorities, 88), 50)
+        StoreValue(Add(PkgReg.depends, 88),    "display_server")
+
+        // 12: grep
+        StoreValue(Add(PkgReg.names, 96),      "grep")
+        StoreValue(Add(PkgReg.display, 96),    "Grep Search")
+        StoreValue(Add(PkgReg.binaries, 96),   "grep.x")
+        StoreValue(Add(PkgReg.configs, 96),    "grep.html")
+        StoreValue(Add(PkgReg.categories, 96), "app")
+        StoreValue(Add(PkgReg.priorities, 96), 50)
+        StoreValue(Add(PkgReg.depends, 96),    "display_server")
+
+        // 13: vscode
+        StoreValue(Add(PkgReg.names, 104),     "vscode")
+        StoreValue(Add(PkgReg.display, 104),   "VS Code")
+        StoreValue(Add(PkgReg.binaries, 104),  "vscode.x")
+        StoreValue(Add(PkgReg.configs, 104),   "vscode.html")
+        StoreValue(Add(PkgReg.categories, 104),"app")
+        StoreValue(Add(PkgReg.priorities, 104),50)
+        StoreValue(Add(PkgReg.depends, 104),   "display_server")
+
+        // 14: wifi
+        StoreValue(Add(PkgReg.names, 112),     "wifi")
+        StoreValue(Add(PkgReg.display, 112),   "WiFi Config")
+        StoreValue(Add(PkgReg.binaries, 112),  "wifi_ipc.x")
+        StoreValue(Add(PkgReg.configs, 112),   "wifi.html")
+        StoreValue(Add(PkgReg.categories, 112),"app")
+        StoreValue(Add(PkgReg.priorities, 112),10)
+        StoreValue(Add(PkgReg.depends, 112),   "display_server")
+    }
+}
+
+// ============================================================================
+// GET EMBEDDED HTML — return content string for a given config filename
+// Returns 0 if no embedded content for this config
+// ============================================================================
+Function.Pkg_GetEmbeddedHTML {
+    Input: config_name: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(config_name, 0) ThenBlock: { ReturnValue(0) }
+
+        cmp = StringCompare(config_name, "terminal.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Terminal\" design-w=\"640\" design-h=\"384\" toolbar=\"file\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#000000\">\n    <panel grow=\"1\" bg=\"#000000\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "notepad.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Untitled - Notepad\" design-w=\"620\" design-h=\"460\" toolbar=\"file\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#FFFFFF\">\n    <textfield grow=\"1\" bg=\"#FFFFFF\" fg=\"#1A1A1A\" border-color=\"#CCCCCC\" padding=\"4\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "calculator.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Calculator\" design-w=\"280\" design-h=\"380\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"4\" padding=\"8\" bg=\"#1C1C2E\">\n    <panel height=\"56\" bg=\"#0D1117\" padding=\"8\">\n      <label text=\"0\" fg=\"#00FF88\" text-align=\"right\" height=\"40\" font-size=\"24\" id=\"display\"/>\n    </panel>\n    <group layout=\"hbox\" gap=\"4\">\n      <button label=\"C\"   action=\"c.clr\" grow=\"1\" height=\"52\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"+/-\" action=\"c.neg\" grow=\"1\" height=\"52\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"%\"   action=\"c.pct\" grow=\"1\" height=\"52\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"/\"   action=\"c.div\" grow=\"1\" height=\"52\" bg=\"#FF9500\" fg=\"#FFFFFF\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"4\">\n      <button label=\"7\" action=\"c.7\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"8\" action=\"c.8\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"9\" action=\"c.9\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"x\" action=\"c.mul\" grow=\"1\" height=\"52\" bg=\"#FF9500\" fg=\"#FFFFFF\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"4\">\n      <button label=\"4\" action=\"c.4\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"5\" action=\"c.5\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"6\" action=\"c.6\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"-\" action=\"c.sub\" grow=\"1\" height=\"52\" bg=\"#FF9500\" fg=\"#FFFFFF\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"4\">\n      <button label=\"1\" action=\"c.1\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"2\" action=\"c.2\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"3\" action=\"c.3\" grow=\"1\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"+\" action=\"c.add\" grow=\"1\" height=\"52\" bg=\"#FF9500\" fg=\"#FFFFFF\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"4\">\n      <button label=\"0\"   action=\"c.0\"  grow=\"2\" height=\"52\" bg=\"#2A2A3C\" fg=\"#E0E0E0\"/>\n      <button label=\"=\"   action=\"c.eq\" grow=\"1\" height=\"52\" bg=\"#00CC66\" fg=\"#FFFFFF\"/>\n      <button label=\"DEL\" action=\"c.bk\" grow=\"1\" height=\"52\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n    </group>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "chrome.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Chrome\" design-w=\"1024\" design-h=\"700\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#000000\">\n    <panel grow=\"1\" bg=\"#000000\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "claude.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Claude Code\" design-w=\"800\" design-h=\"600\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#000000\">\n    <panel grow=\"1\" bg=\"#1a1a2e\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "browser.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Ailang Browser\" design-w=\"1024\" design-h=\"700\" toolbar=\"browser\" addressbar=\"true\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#FFFFFF\">\n    <panel grow=\"1\" bg=\"#FFFFFF\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "canvas_demo.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Canvas Demo\" design-w=\"640\" design-h=\"480\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#000000\">\n    <panel grow=\"1\" bg=\"#000000\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "videoplayer.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Video Player\" design-w=\"640\" design-h=\"480\" toolbar=\"file\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#000000\">\n    <panel grow=\"1\" bg=\"#000000\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "vscode.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"VS Code\" design-w=\"1024\" design-h=\"700\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#1e1e1e\">\n    <panel grow=\"1\" bg=\"#1e1e1e\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "ladybird.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Ladybird\" design-w=\"1024\" design-h=\"700\" toolbar=\"browser\" addressbar=\"true\">\n  <group layout=\"vbox\" gap=\"0\" padding=\"0\" bg=\"#1C1C2E\">\n    <panel grow=\"1\" bg=\"#FFFFFF\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "filedialog.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Open File\" design-w=\"560\" design-h=\"460\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"4\" padding=\"6\" bg=\"#2D2D44\">\n    <group layout=\"hbox\" gap=\"4\" height=\"28\">\n      <button label=\"<-\" action=\"fd.back\" width=\"36\" height=\"24\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"->\" action=\"fd.fwd\" width=\"36\" height=\"24\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <label text=\"/\" fg=\"#C0C0C0\" text-align=\"left\" grow=\"1\" height=\"24\" id=\"pathbar\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"4\" grow=\"1\">\n      <panel layout=\"vbox\" gap=\"0\" width=\"160\" bg=\"#1C1C2E\" border=\"1\" padding=\"2\" id=\"treepane\"/>\n      <panel layout=\"vbox\" gap=\"1\" grow=\"1\" bg=\"#1C1C2E\" border=\"1\" padding=\"2\" id=\"filelist\"/>\n    </group>\n    <separator height=\"1\" fg=\"#555555\"/>\n    <group layout=\"hbox\" gap=\"4\" height=\"32\">\n      <label text=\"\" fg=\"#C0C0C0\" text-align=\"left\" grow=\"1\" height=\"24\" id=\"filename_lbl\"/>\n      <button label=\"Cancel\" action=\"fd.cancel\" width=\"70\" height=\"24\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Open\" action=\"fd.ok\" width=\"70\" height=\"24\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n    </group>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "grep.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Grep Search\" design-w=\"640\" design-h=\"360\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"3\" padding=\"6\" bg=\"#2D2D44\">\n    <group layout=\"hbox\" gap=\"4\" height=\"24\">\n      <label text=\"Pattern:\" fg=\"#C0C0C0\" width=\"56\" height=\"20\"/>\n      <textfield grow=\"1\" height=\"20\" bg=\"#1C1C2E\" fg=\"#00FF88\" border-color=\"#444444\" padding=\"2\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"4\" height=\"22\">\n      <label text=\"File:\" fg=\"#C0C0C0\" width=\"36\" height=\"18\"/>\n      <label text=\"Main.ailang\" fg=\"#00FF88\" text-align=\"left\" grow=\"1\" height=\"18\" bg=\"#1C1C2E\" id=\"filepath\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"2\" height=\"22\">\n      <button label=\"Main\" action=\"g.f0\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Auckland\" action=\"g.f1\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"AKBind\" action=\"g.f2\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"AKEvent\" action=\"g.f3\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"HTMLParse\" action=\"g.f4\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"SysDisp\" action=\"g.f5\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"2\" height=\"22\">\n      <button label=\"WinMgr\" action=\"g.f6\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"IPCBrok\" action=\"g.f7\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"EvtRout\" action=\"g.f8\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"FileDlg\" action=\"g.f9\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Deskbar\" action=\"g.fa\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"grep\" action=\"g.fb\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"6\" height=\"20\">\n      <checkbox label=\"-i case\" action=\"g.ci\" height=\"18\" fg=\"#E0E0E0\"/>\n      <checkbox label=\"-v inv\" action=\"g.inv\" height=\"18\" fg=\"#E0E0E0\"/>\n      <checkbox label=\"-n num\" action=\"g.ln\" height=\"18\" fg=\"#E0E0E0\"/>\n      <checkbox label=\"-c cnt\" action=\"g.cnt\" height=\"18\" fg=\"#E0E0E0\"/>\n      <checkbox label=\"-F fix\" action=\"g.fix\" height=\"18\" fg=\"#E0E0E0\"/>\n      <checkbox label=\"-w wrd\" action=\"g.wm\" height=\"18\" fg=\"#E0E0E0\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"4\" height=\"26\">\n      <button label=\"Search\" action=\"g.run\" width=\"80\" height=\"22\" bg=\"#00CC66\" fg=\"#FFFFFF\"/>\n      <button label=\"Clear\" action=\"g.clr\" width=\"60\" height=\"22\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <label text=\"Ready\" fg=\"#C0C0C0\" text-align=\"left\" grow=\"1\" height=\"22\" id=\"status\"/>\n    </group>\n    <panel layout=\"vbox\" gap=\"1\" grow=\"1\" bg=\"#1C1C2E\" border=\"1\" padding=\"2\" id=\"results\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "installer.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"Package Manager\" design-w=\"560\" design-h=\"420\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"3\" padding=\"6\" bg=\"#2D2D44\">\n    <group layout=\"hbox\" gap=\"4\" height=\"24\">\n      <label text=\"Packages: --/15\" fg=\"#00FF88\" text-align=\"left\" grow=\"1\" height=\"20\" id=\"status\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"4\" height=\"28\">\n      <button label=\"Scan\"        action=\"pkg.scan\"    width=\"70\"  height=\"24\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Install All\" action=\"pkg.inst\"    width=\"90\"  height=\"24\" bg=\"#00CC66\" fg=\"#FFFFFF\"/>\n      <button label=\"Repair\"      action=\"pkg.fix\"     width=\"70\"  height=\"24\" bg=\"#FF9500\" fg=\"#FFFFFF\"/>\n      <button label=\"Schema\"      action=\"pkg.schema\"  width=\"70\"  height=\"24\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"2\" height=\"22\">\n      <button label=\"All\"     action=\"pkg.fall\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"System\"  action=\"pkg.fsys\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Apps\"    action=\"pkg.fapp\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Missing\" action=\"pkg.fmis\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"4\" height=\"20\">\n      <label text=\"Ready\" fg=\"#C0C0C0\" text-align=\"left\" grow=\"1\" height=\"18\" id=\"log\"/>\n    </group>\n    <panel layout=\"vbox\" gap=\"1\" grow=\"1\" bg=\"#1C1C2E\" border=\"1\" padding=\"2\" id=\"results\"/>\n  </group>\n</window>\n")
+        }
+
+        cmp = StringCompare(config_name, "wifi.html")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue("<window title=\"WiFi Config\" design-w=\"480\" design-h=\"380\" toolbar=\"about\">\n  <group layout=\"vbox\" gap=\"3\" padding=\"6\" bg=\"#2D2D44\">\n    <group layout=\"hbox\" gap=\"4\" height=\"24\">\n      <label text=\"WiFi: Not connected\" fg=\"#FF9500\" text-align=\"left\" grow=\"1\" height=\"20\" id=\"status\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"4\" height=\"28\">\n      <button label=\"Scan\"       action=\"wf.scan\"   width=\"70\"  height=\"24\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Connect\"    action=\"wf.conn\"   width=\"80\"  height=\"24\" bg=\"#00CC66\" fg=\"#FFFFFF\"/>\n      <button label=\"Disconnect\" action=\"wf.disc\"   width=\"90\"  height=\"24\" bg=\"#FF5555\" fg=\"#FFFFFF\"/>\n      <button label=\"Status\"     action=\"wf.stat\"   width=\"70\"  height=\"24\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"4\" height=\"22\">\n      <label text=\"SSID:\" fg=\"#C0C0C0\" width=\"42\" height=\"18\"/>\n      <label text=\"\" fg=\"#00FF88\" text-align=\"left\" grow=\"1\" height=\"18\" bg=\"#1C1C2E\" id=\"ssid\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"4\" height=\"22\">\n      <label text=\"Pass:\" fg=\"#C0C0C0\" width=\"42\" height=\"18\"/>\n      <label text=\"\" fg=\"#00FF88\" text-align=\"left\" grow=\"1\" height=\"18\" bg=\"#1C1C2E\" id=\"pass\"/>\n    </group>\n    <group layout=\"hbox\" gap=\"2\" height=\"22\">\n      <button label=\"Edit SSID\" action=\"wf.essid\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Edit Pass\" action=\"wf.epass\" grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n      <button label=\"Clear\"     action=\"wf.clr\"   grow=\"1\" height=\"20\" bg=\"#3D3D50\" fg=\"#E0E0E0\"/>\n    </group>\n    <separator height=\"1\" fg=\"#444444\"/>\n    <group layout=\"hbox\" gap=\"4\" height=\"20\">\n      <label text=\"Ready\" fg=\"#C0C0C0\" text-align=\"left\" grow=\"1\" height=\"18\" id=\"log\"/>\n    </group>\n    <panel layout=\"vbox\" gap=\"1\" grow=\"1\" bg=\"#1C1C2E\" border=\"1\" padding=\"2\" id=\"results\"/>\n  </group>\n</window>\n")
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// SEED PACKAGES TABLE — insert all 15 packages into PG
+// ============================================================================
+Function.Pkg_SeedRegistry {
+    Input: conn: Integer
+    Body: {
+        PrintMessage("[PKG] Seeding packages table...\n")
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('display_server', 'Display Server', 'system', 'display.x', '/system/bin/display.x', NULL, 10, '') ON CONFLICT (name) DO UPDATE SET display_name='Display Server', category='system', binary_name='display.x', binary_path='/system/bin/display.x', priority=10")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('installer', 'Installer', 'system', 'installer_ipc.x', '/system/bin/installer_ipc.x', 'installer.html', 5, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Installer', category='system', binary_name='installer_ipc.x', binary_path='/system/bin/installer_ipc.x', html_config='installer.html', priority=5")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('notepad', 'Notepad', 'app', 'notepad.x', '/system/bin/notepad.x', 'notepad.html', 10, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Notepad', binary_name='notepad.x', binary_path='/system/bin/notepad.x', html_config='notepad.html', priority=10")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('calculator', 'Calculator', 'app', 'calc.x', '/system/bin/calc.x', 'calculator.html', 15, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Calculator', binary_name='calc.x', binary_path='/system/bin/calc.x', html_config='calculator.html', priority=15")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('files', 'Files', 'app', NULL, 'internal:app.files', 'filedialog.html', 20, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Files', binary_path='internal:app.files', html_config='filedialog.html', priority=20")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('canvas_demo', 'Canvas', 'app', 'canvas_demo.x', '/system/bin/canvas_demo.x', 'canvas_demo.html', 30, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Canvas', binary_name='canvas_demo.x', binary_path='/system/bin/canvas_demo.x', html_config='canvas_demo.html', priority=30")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('videoplayer', 'Video', 'app', 'videoplayer.x', '/system/bin/videoplayer.x', 'videoplayer.html', 35, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Video', binary_name='videoplayer.x', binary_path='/system/bin/videoplayer.x', html_config='videoplayer.html', priority=35")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('terminal', 'Terminal', 'app', 'terminal.x', '/system/bin/terminal.x', 'terminal.html', 40, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Terminal', binary_name='terminal.x', binary_path='/system/bin/terminal.x', html_config='terminal.html', priority=40")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('chrome', 'Chrome', 'app', 'chrome.x', '/system/bin/chrome.x', 'chrome.html', 40, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Chrome', binary_name='chrome.x', binary_path='/system/bin/chrome.x', html_config='chrome.html', priority=40")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('ladybird', 'Ladybird', 'app', 'ladybird.x', '/system/bin/ladybird.x', 'ladybird.html', 45, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Ladybird', binary_name='ladybird.x', binary_path='/system/bin/ladybird.x', html_config='ladybird.html', priority=45")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('browser', 'Browser', 'app', 'browser.x', '/system/bin/browser.x', 'browser.html', 50, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Browser', binary_name='browser.x', binary_path='/system/bin/browser.x', html_config='browser.html', priority=50")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('claude', 'Claude Code', 'app', 'claude.x', '/system/bin/claude.x', 'claude.html', 50, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Claude Code', binary_name='claude.x', binary_path='/system/bin/claude.x', html_config='claude.html', priority=50")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('grep', 'Grep Search', 'app', 'grep.x', '/system/bin/grep.x', 'grep.html', 50, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='Grep Search', binary_name='grep.x', binary_path='/system/bin/grep.x', html_config='grep.html', priority=50")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('vscode', 'VS Code', 'app', 'vscode.x', '/system/bin/vscode.x', 'vscode.html', 50, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='VS Code', binary_name='vscode.x', binary_path='/system/bin/vscode.x', html_config='vscode.html', priority=50")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        r = PG_Query(conn, "INSERT INTO packages (name, display_name, category, binary_name, binary_path, html_config, priority, depends_on) VALUES ('wifi', 'WiFi Config', 'app', 'wifi_ipc.x', '/system/bin/wifi_ipc.x', 'wifi.html', 10, 'display_server') ON CONFLICT (name) DO UPDATE SET display_name='WiFi Config', binary_name='wifi_ipc.x', binary_path='/system/bin/wifi_ipc.x', html_config='wifi.html', priority=10")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        PrintMessage("[PKG] 15 packages seeded\n")
+    }
+}
+
+// ============================================================================
+// CONNECT TO DATABASE
+// ============================================================================
+Function.Pkg_ConnectDB {
+    Output: Integer
+    Body: {
+        conn = PG_Connect("127.0.0.1", 5432, "ailang_system", "bob", "")
+        IfCondition EqualTo(conn, 0) ThenBlock: {
+            PrintMessage("[PKG] ERROR: Cannot connect to PostgreSQL\n")
+            ReturnValue(0)
+        }
+        PkgState.db = conn
+        PrintMessage("[PKG] Connected to PostgreSQL\n")
+        ReturnValue(conn)
+    }
+}
+
+// ============================================================================
+// BOOTSTRAP PACKAGES TABLE — create table + seed if empty
+// ============================================================================
+Function.Pkg_BootstrapPackagesTable {
+    Input: conn: Integer
+    Body: {
+        // Create table and columns (idempotent)
+        r = PG_Query(conn, "CREATE TABLE IF NOT EXISTS packages (name TEXT PRIMARY KEY)")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS display_name TEXT")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS version TEXT DEFAULT '1.0'")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS category TEXT DEFAULT 'app'")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS binary_name TEXT")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS binary_path TEXT")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS html_config TEXT")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS has_binary BOOLEAN DEFAULT false")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS has_config BOOLEAN DEFAULT false")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS has_service BOOLEAN DEFAULT false")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS installed BOOLEAN DEFAULT false")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS depends_on TEXT DEFAULT ''")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS priority INTEGER DEFAULT 50")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+        r = PG_Query(conn, "ALTER TABLE packages ADD COLUMN IF NOT EXISTS enabled BOOLEAN DEFAULT true")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        // Seed data
+        Pkg_SeedRegistry(conn)
+    }
+}
+
+// ============================================================================
+// SCAN — check binary, config, service status for all packages
+// ============================================================================
+Function.Pkg_RunScan {
+    Input: sock: Integer
+    Input: conn: Integer
+    Body: {
+        PrintMessage("[PKG] Running scan...\n")
+        PkgSendSetLabel(sock, "log", "Scanning...")
+
+        ok_count = 0
+        partial_count = 0
+        missing_count = 0
+
+        bin_path = Allocate(128)
+        cfg_path = Allocate(128)
+
+        i = 0
+        WhileLoop LessThan(i, PkgReg.count) {
+            off = Multiply(i, 8)
+            pkg_name = Dereference(Add(PkgReg.names, off))
+            bin_name = Dereference(Add(PkgReg.binaries, off))
+            cfg_name = Dereference(Add(PkgReg.configs, off))
+
+            // Check binary
+            has_bin = 0
+            IfCondition NotEqual(bin_name, 0) ThenBlock: {
+                // Build /system/bin/<binary_name>
+                MemoryCopy(bin_path, "/system/bin/", 12)
+                blen = StringLength(bin_name)
+                MemoryCopy(Add(bin_path, 12), bin_name, blen)
+                SetByte(bin_path, Add(12, blen), 0)
+                has_bin = Pkg_FileExists(bin_path)
+            } ElseBlock: {
+                // No binary needed (e.g. "files" is internal)
+                has_bin = 1
+            }
+            SetByte(PkgScan.has_bin, i, has_bin)
+
+            // Check config
+            has_cfg = 0
+            IfCondition NotEqual(cfg_name, 0) ThenBlock: {
+                // Build config/<config_name>
+                MemoryCopy(cfg_path, "config/", 7)
+                clen = StringLength(cfg_name)
+                MemoryCopy(Add(cfg_path, 7), cfg_name, clen)
+                SetByte(cfg_path, Add(7, clen), 0)
+                has_cfg = Pkg_FileExists(cfg_path)
+
+                // Also check /config/<config_name> (absolute on rootfs)
+                IfCondition EqualTo(has_cfg, 0) ThenBlock: {
+                    MemoryCopy(cfg_path, "/config/", 8)
+                    MemoryCopy(Add(cfg_path, 8), cfg_name, clen)
+                    SetByte(cfg_path, Add(8, clen), 0)
+                    has_cfg = Pkg_FileExists(cfg_path)
+                }
+
+                // Also check /system/config/<config_name>
+                IfCondition EqualTo(has_cfg, 0) ThenBlock: {
+                    MemoryCopy(cfg_path, "/system/config/", 15)
+                    MemoryCopy(Add(cfg_path, 15), cfg_name, clen)
+                    SetByte(cfg_path, Add(15, clen), 0)
+                    has_cfg = Pkg_FileExists(cfg_path)
+                }
+            } ElseBlock: {
+                // No config needed (e.g. display_server)
+                has_cfg = 1
+            }
+            SetByte(PkgScan.has_cfg, i, has_cfg)
+
+            // Check service in PG
+            has_svc = 0
+            IfCondition NotEqual(conn, 0) ThenBlock: {
+                // Build query: SELECT name FROM services WHERE name='<pkg_name>'
+                sql = Allocate(256)
+                MemoryCopy(sql, "SELECT name FROM services WHERE name='", 38)
+                nlen = StringLength(pkg_name)
+                MemoryCopy(Add(sql, 38), pkg_name, nlen)
+                SetByte(sql, Add(38, nlen), 39)
+                SetByte(sql, Add(39, nlen), 0)
+
+                qr = PG_Query(conn, sql)
+                IfCondition NotEqual(qr, 0) ThenBlock: {
+                    rc = Array.Size(qr)
+                    IfCondition GreaterThan(rc, 0) ThenBlock: {
+                        has_svc = 1
+                    }
+                    PG_DestroyResult(qr)
+                }
+                Deallocate(sql, 256)
+            }
+            SetByte(PkgScan.has_svc, i, has_svc)
+
+            // Update PG packages table status
+            IfCondition NotEqual(conn, 0) ThenBlock: {
+                usql = Allocate(256)
+                MemoryCopy(usql, "UPDATE packages SET has_binary=", 31)
+                upos = 31
+
+                IfCondition EqualTo(has_bin, 1) ThenBlock: {
+                    MemoryCopy(Add(usql, upos), "true", 4)
+                    upos = Add(upos, 4)
+                } ElseBlock: {
+                    MemoryCopy(Add(usql, upos), "false", 5)
+                    upos = Add(upos, 5)
+                }
+
+                MemoryCopy(Add(usql, upos), ", has_config=", 13)
+                upos = Add(upos, 13)
+                IfCondition EqualTo(has_cfg, 1) ThenBlock: {
+                    MemoryCopy(Add(usql, upos), "true", 4)
+                    upos = Add(upos, 4)
+                } ElseBlock: {
+                    MemoryCopy(Add(usql, upos), "false", 5)
+                    upos = Add(upos, 5)
+                }
+
+                MemoryCopy(Add(usql, upos), ", has_service=", 14)
+                upos = Add(upos, 14)
+                IfCondition EqualTo(has_svc, 1) ThenBlock: {
+                    MemoryCopy(Add(usql, upos), "true", 4)
+                    upos = Add(upos, 4)
+                } ElseBlock: {
+                    MemoryCopy(Add(usql, upos), "false", 5)
+                    upos = Add(upos, 5)
+                }
+
+                // installed = all three present
+                MemoryCopy(Add(usql, upos), ", installed=", 12)
+                upos = Add(upos, 12)
+                IfCondition And(EqualTo(has_bin, 1), And(EqualTo(has_cfg, 1), EqualTo(has_svc, 1))) ThenBlock: {
+                    MemoryCopy(Add(usql, upos), "true", 4)
+                    upos = Add(upos, 4)
+                } ElseBlock: {
+                    MemoryCopy(Add(usql, upos), "false", 5)
+                    upos = Add(upos, 5)
+                }
+
+                MemoryCopy(Add(usql, upos), " WHERE name='", 14)
+                upos = Add(upos, 14)
+                MemoryCopy(Add(usql, upos), pkg_name, nlen)
+                upos = Add(upos, nlen)
+                SetByte(usql, upos, 39)
+                upos = Add(upos, 1)
+                SetByte(usql, upos, 0)
+
+                ur = PG_Query(conn, usql)
+                IfCondition NotEqual(ur, 0) ThenBlock: { PG_DestroyResult(ur) }
+                Deallocate(usql, 256)
+            }
+
+            // Count status
+            IfCondition And(EqualTo(has_bin, 1), And(EqualTo(has_cfg, 1), EqualTo(has_svc, 1))) ThenBlock: {
+                ok_count = Add(ok_count, 1)
+            } ElseBlock: {
+                IfCondition EqualTo(has_bin, 0) ThenBlock: {
+                    missing_count = Add(missing_count, 1)
+                } ElseBlock: {
+                    partial_count = Add(partial_count, 1)
+                }
+            }
+
+            i = Add(i, 1)
+        }
+
+        Deallocate(bin_path, 128)
+        Deallocate(cfg_path, 128)
+
+        PkgState.scan_ok = ok_count
+        PkgState.scan_partial = partial_count
+        PkgState.scan_missing = missing_count
+
+        // Update status label: "Packages: <ok>/14"
+        sbuf = Allocate(64)
+        MemoryCopy(sbuf, "Packages: ", 10)
+        nbuf = Allocate(16)
+        nlen = PkgNumToStr(ok_count, nbuf)
+        MemoryCopy(Add(sbuf, 10), nbuf, nlen)
+        spos = Add(10, nlen)
+        SetByte(sbuf, spos, 47)
+        spos = Add(spos, 1)
+        nlen = PkgNumToStr(PkgReg.count, nbuf)
+        MemoryCopy(Add(sbuf, spos), nbuf, nlen)
+        spos = Add(spos, nlen)
+        SetByte(sbuf, spos, 0)
+        PkgSendSetLabel(sock, "status", sbuf)
+        Deallocate(nbuf, 16)
+        Deallocate(sbuf, 64)
+
+        PkgSendSetLabel(sock, "log", "Scan complete")
+        PrintMessage("[PKG] Scan complete\n")
+    }
+}
+
+// ============================================================================
+// SHOW LIST — display packages in results panel (with filter)
+// ============================================================================
+Function.Pkg_ShowList {
+    Input: sock: Integer
+    Body: {
+        PkgSendClear(sock)
+
+        i = 0
+        WhileLoop LessThan(i, PkgReg.count) {
+            off = Multiply(i, 8)
+            disp_name = Dereference(Add(PkgReg.display, off))
+            cat = Dereference(Add(PkgReg.categories, off))
+
+            hb = GetByte(PkgScan.has_bin, i)
+            hc = GetByte(PkgScan.has_cfg, i)
+            hs = GetByte(PkgScan.has_svc, i)
+
+            // Apply filter
+            show = 1
+            IfCondition EqualTo(PkgState.filter, 1) ThenBlock: {
+                // System only
+                cmp = StringCompare(cat, "system")
+                IfCondition NotEqual(cmp, 0) ThenBlock: { show = 0 }
+            }
+            IfCondition EqualTo(PkgState.filter, 2) ThenBlock: {
+                // Apps only
+                cmp = StringCompare(cat, "app")
+                IfCondition NotEqual(cmp, 0) ThenBlock: { show = 0 }
+            }
+            IfCondition EqualTo(PkgState.filter, 3) ThenBlock: {
+                // Missing only — not fully installed
+                IfCondition And(EqualTo(hb, 1), And(EqualTo(hc, 1), EqualTo(hs, 1))) ThenBlock: {
+                    show = 0
+                }
+            }
+
+            IfCondition EqualTo(show, 1) ThenBlock: {
+                // Build line: "[OK]  Name            bin:Y cfg:Y svc:Y"
+                line = Allocate(128)
+                MemorySet(line, 32, 128)
+                lpos = 0
+
+                // Status tag
+                IfCondition And(EqualTo(hb, 1), And(EqualTo(hc, 1), EqualTo(hs, 1))) ThenBlock: {
+                    MemoryCopy(Add(line, lpos), "[OK]  ", 6)
+                    lpos = 6
+                } ElseBlock: {
+                    IfCondition EqualTo(hb, 0) ThenBlock: {
+                        MemoryCopy(Add(line, lpos), "[--]  ", 6)
+                        lpos = 6
+                    } ElseBlock: {
+                        MemoryCopy(Add(line, lpos), "[!!]  ", 6)
+                        lpos = 6
+                    }
+                }
+
+                // Display name (pad to 18 chars)
+                dlen = StringLength(disp_name)
+                MemoryCopy(Add(line, lpos), disp_name, dlen)
+                lpos = Add(lpos, dlen)
+                pad = Subtract(18, dlen)
+                IfCondition GreaterThan(pad, 0) ThenBlock: {
+                    // Already filled with spaces via MemorySet
+                    lpos = Add(lpos, pad)
+                }
+
+                // bin:Y/N
+                MemoryCopy(Add(line, lpos), "bin:", 4)
+                lpos = Add(lpos, 4)
+                IfCondition EqualTo(hb, 1) ThenBlock: {
+                    SetByte(line, lpos, 89)
+                } ElseBlock: {
+                    SetByte(line, lpos, 78)
+                }
+                lpos = Add(lpos, 1)
+                SetByte(line, lpos, 32)
+                lpos = Add(lpos, 1)
+
+                // cfg:Y/N
+                MemoryCopy(Add(line, lpos), "cfg:", 4)
+                lpos = Add(lpos, 4)
+                IfCondition EqualTo(hc, 1) ThenBlock: {
+                    SetByte(line, lpos, 89)
+                } ElseBlock: {
+                    SetByte(line, lpos, 78)
+                }
+                lpos = Add(lpos, 1)
+                SetByte(line, lpos, 32)
+                lpos = Add(lpos, 1)
+
+                // svc:Y/N
+                MemoryCopy(Add(line, lpos), "svc:", 4)
+                lpos = Add(lpos, 4)
+                IfCondition EqualTo(hs, 1) ThenBlock: {
+                    SetByte(line, lpos, 89)
+                } ElseBlock: {
+                    SetByte(line, lpos, 78)
+                }
+                lpos = Add(lpos, 1)
+                SetByte(line, lpos, 0)
+
+                // Color: green=0x00FF88, orange=0xFF9500, gray=0x808080
+                color = 0
+                IfCondition And(EqualTo(hb, 1), And(EqualTo(hc, 1), EqualTo(hs, 1))) ThenBlock: {
+                    color = 65416
+                } ElseBlock: {
+                    IfCondition EqualTo(hb, 0) ThenBlock: {
+                        color = 8421504
+                    } ElseBlock: {
+                        color = 16750848
+                    }
+                }
+
+                PkgSendAddLine(sock, line, color)
+                Deallocate(line, 128)
+            }
+
+            i = Add(i, 1)
+        }
+    }
+}
+
+// ============================================================================
+// INSTALL ALL — deploy missing configs + register missing services
+// ============================================================================
+Function.Pkg_InstallAll {
+    Input: sock: Integer
+    Input: conn: Integer
+    Body: {
+        PrintMessage("[PKG] Installing all...\n")
+        PkgSendSetLabel(sock, "log", "Installing...")
+
+        installed = 0
+
+        i = 0
+        WhileLoop LessThan(i, PkgReg.count) {
+            off = Multiply(i, 8)
+            pkg_name = Dereference(Add(PkgReg.names, off))
+            bin_name = Dereference(Add(PkgReg.binaries, off))
+            cfg_name = Dereference(Add(PkgReg.configs, off))
+            disp_name = Dereference(Add(PkgReg.display, off))
+
+            hc = GetByte(PkgScan.has_cfg, i)
+            hs = GetByte(PkgScan.has_svc, i)
+
+            // Deploy missing config
+            IfCondition EqualTo(hc, 0) ThenBlock: {
+                IfCondition NotEqual(cfg_name, 0) ThenBlock: {
+                    html = Pkg_GetEmbeddedHTML(cfg_name)
+                    IfCondition NotEqual(html, 0) ThenBlock: {
+                        html_len = StringLength(html)
+
+                        // Write to /config/<name>
+                        wpath = Allocate(128)
+                        MemoryCopy(wpath, "/config/", 8)
+                        cnlen = StringLength(cfg_name)
+                        MemoryCopy(Add(wpath, 8), cfg_name, cnlen)
+                        SetByte(wpath, Add(8, cnlen), 0)
+                        Pkg_WriteFile(wpath, html, html_len)
+
+                        // Also write to /system/config/<name>
+                        MemoryCopy(wpath, "/system/config/", 15)
+                        MemoryCopy(Add(wpath, 15), cfg_name, cnlen)
+                        SetByte(wpath, Add(15, cnlen), 0)
+                        Pkg_WriteFile(wpath, html, html_len)
+
+                        Deallocate(wpath, 128)
+                        installed = Add(installed, 1)
+                        PrintMessage("[PKG]   Deployed config: ")
+                        PrintString(cfg_name)
+                        PrintMessage("\n")
+                    }
+                }
+            }
+
+            // Register missing service
+            IfCondition EqualTo(hs, 0) ThenBlock: {
+                IfCondition NotEqual(conn, 0) ThenBlock: {
+                    // Build INSERT statement
+                    isql = Allocate(512)
+                    MemoryCopy(isql, "INSERT INTO services (name, display_name, binary_path, enabled, priority) VALUES ('", 83)
+                    ipos = 83
+
+                    // name
+                    pnlen = StringLength(pkg_name)
+                    MemoryCopy(Add(isql, ipos), pkg_name, pnlen)
+                    ipos = Add(ipos, pnlen)
+                    MemoryCopy(Add(isql, ipos), "', '", 4)
+                    ipos = Add(ipos, 4)
+
+                    // display_name
+                    dnlen = StringLength(disp_name)
+                    MemoryCopy(Add(isql, ipos), disp_name, dnlen)
+                    ipos = Add(ipos, dnlen)
+                    MemoryCopy(Add(isql, ipos), "', '", 4)
+                    ipos = Add(ipos, 4)
+
+                    // binary_path
+                    IfCondition NotEqual(bin_name, 0) ThenBlock: {
+                        MemoryCopy(Add(isql, ipos), "/system/bin/", 12)
+                        ipos = Add(ipos, 12)
+                        bnlen = StringLength(bin_name)
+                        MemoryCopy(Add(isql, ipos), bin_name, bnlen)
+                        ipos = Add(ipos, bnlen)
+                    } ElseBlock: {
+                        // internal app
+                        ipath = "internal:app.files"
+                        iplen = StringLength(ipath)
+                        MemoryCopy(Add(isql, ipos), ipath, iplen)
+                        ipos = Add(ipos, iplen)
+                    }
+
+                    MemoryCopy(Add(isql, ipos), "', true, 50) ON CONFLICT (name) DO NOTHING", 43)
+                    ipos = Add(ipos, 43)
+                    SetByte(isql, ipos, 0)
+
+                    ir = PG_Query(conn, isql)
+                    IfCondition NotEqual(ir, 0) ThenBlock: { PG_DestroyResult(ir) }
+                    Deallocate(isql, 512)
+
+                    installed = Add(installed, 1)
+                    PrintMessage("[PKG]   Registered service: ")
+                    PrintString(pkg_name)
+                    PrintMessage("\n")
+                }
+            }
+
+            i = Add(i, 1)
+        }
+
+        // Log result
+        lbuf = Allocate(64)
+        MemoryCopy(lbuf, "Installed ", 10)
+        nbuf = Allocate(16)
+        nlen = PkgNumToStr(installed, nbuf)
+        MemoryCopy(Add(lbuf, 10), nbuf, nlen)
+        MemoryCopy(Add(lbuf, Add(10, nlen)), " items", 6)
+        SetByte(lbuf, Add(16, nlen), 0)
+        PkgSendSetLabel(sock, "log", lbuf)
+        Deallocate(nbuf, 16)
+        Deallocate(lbuf, 64)
+
+        // Re-scan to update status
+        Pkg_RunScan(sock, conn)
+        Pkg_ShowList(sock)
+    }
+}
+
+// ============================================================================
+// REPAIR — only fix packages that have their binary present
+// ============================================================================
+Function.Pkg_Repair {
+    Input: sock: Integer
+    Input: conn: Integer
+    Body: {
+        PrintMessage("[PKG] Repair...\n")
+        PkgSendSetLabel(sock, "log", "Repairing...")
+
+        repaired = 0
+
+        i = 0
+        WhileLoop LessThan(i, PkgReg.count) {
+            off = Multiply(i, 8)
+            hb = GetByte(PkgScan.has_bin, i)
+
+            // Only fix packages with binary present
+            IfCondition EqualTo(hb, 1) ThenBlock: {
+                hc = GetByte(PkgScan.has_cfg, i)
+                hs = GetByte(PkgScan.has_svc, i)
+                pkg_name = Dereference(Add(PkgReg.names, off))
+                cfg_name = Dereference(Add(PkgReg.configs, off))
+                disp_name = Dereference(Add(PkgReg.display, off))
+                bin_name = Dereference(Add(PkgReg.binaries, off))
+
+                // Deploy missing config
+                IfCondition EqualTo(hc, 0) ThenBlock: {
+                    IfCondition NotEqual(cfg_name, 0) ThenBlock: {
+                        html = Pkg_GetEmbeddedHTML(cfg_name)
+                        IfCondition NotEqual(html, 0) ThenBlock: {
+                            html_len = StringLength(html)
+                            wpath = Allocate(128)
+
+                            MemoryCopy(wpath, "/config/", 8)
+                            cnlen = StringLength(cfg_name)
+                            MemoryCopy(Add(wpath, 8), cfg_name, cnlen)
+                            SetByte(wpath, Add(8, cnlen), 0)
+                            Pkg_WriteFile(wpath, html, html_len)
+
+                            MemoryCopy(wpath, "/system/config/", 15)
+                            MemoryCopy(Add(wpath, 15), cfg_name, cnlen)
+                            SetByte(wpath, Add(15, cnlen), 0)
+                            Pkg_WriteFile(wpath, html, html_len)
+
+                            Deallocate(wpath, 128)
+                            repaired = Add(repaired, 1)
+                        }
+                    }
+                }
+
+                // Register missing service
+                IfCondition EqualTo(hs, 0) ThenBlock: {
+                    IfCondition NotEqual(conn, 0) ThenBlock: {
+                        isql = Allocate(512)
+                        MemoryCopy(isql, "INSERT INTO services (name, display_name, binary_path, enabled, priority) VALUES ('", 83)
+                        ipos = 83
+                        pnlen = StringLength(pkg_name)
+                        MemoryCopy(Add(isql, ipos), pkg_name, pnlen)
+                        ipos = Add(ipos, pnlen)
+                        MemoryCopy(Add(isql, ipos), "', '", 4)
+                        ipos = Add(ipos, 4)
+                        dnlen = StringLength(disp_name)
+                        MemoryCopy(Add(isql, ipos), disp_name, dnlen)
+                        ipos = Add(ipos, dnlen)
+                        MemoryCopy(Add(isql, ipos), "', '", 4)
+                        ipos = Add(ipos, 4)
+                        IfCondition NotEqual(bin_name, 0) ThenBlock: {
+                            MemoryCopy(Add(isql, ipos), "/system/bin/", 12)
+                            ipos = Add(ipos, 12)
+                            bnlen = StringLength(bin_name)
+                            MemoryCopy(Add(isql, ipos), bin_name, bnlen)
+                            ipos = Add(ipos, bnlen)
+                        } ElseBlock: {
+                            ipath = "internal:app.files"
+                            iplen = StringLength(ipath)
+                            MemoryCopy(Add(isql, ipos), ipath, iplen)
+                            ipos = Add(ipos, iplen)
+                        }
+                        MemoryCopy(Add(isql, ipos), "', true, 50) ON CONFLICT (name) DO NOTHING", 43)
+                        ipos = Add(ipos, 43)
+                        SetByte(isql, ipos, 0)
+
+                        ir = PG_Query(conn, isql)
+                        IfCondition NotEqual(ir, 0) ThenBlock: { PG_DestroyResult(ir) }
+                        Deallocate(isql, 512)
+                        repaired = Add(repaired, 1)
+                    }
+                }
+            }
+
+            i = Add(i, 1)
+        }
+
+        lbuf = Allocate(64)
+        MemoryCopy(lbuf, "Repaired ", 9)
+        nbuf = Allocate(16)
+        nlen = PkgNumToStr(repaired, nbuf)
+        MemoryCopy(Add(lbuf, 9), nbuf, nlen)
+        MemoryCopy(Add(lbuf, Add(9, nlen)), " items", 6)
+        SetByte(lbuf, Add(15, nlen), 0)
+        PkgSendSetLabel(sock, "log", lbuf)
+        Deallocate(nbuf, 16)
+        Deallocate(lbuf, 64)
+
+        Pkg_RunScan(sock, conn)
+        Pkg_ShowList(sock)
+    }
+}
+
+// ============================================================================
+// SCHEMA ACTION — run full Schema_Bootstrap
+// ============================================================================
+Function.Pkg_RunSchema {
+    Input: sock: Integer
+    Input: conn: Integer
+    Body: {
+        PkgSendSetLabel(sock, "log", "Bootstrapping schema...")
+        PrintMessage("[PKG] Running Schema_Bootstrap...\n")
+
+        IfCondition NotEqual(conn, 0) ThenBlock: {
+            Schema_Bootstrap(conn)
+            Pkg_BootstrapPackagesTable(conn)
+        }
+
+        PkgSendSetLabel(sock, "log", "Schema bootstrap complete")
+        PrintMessage("[PKG] Schema bootstrap done\n")
+
+        Pkg_RunScan(sock, conn)
+        Pkg_ShowList(sock)
+    }
+}
+
+// ============================================================================
+// ACTION HANDLER
+// ============================================================================
+Function.PkgHandleAction {
+    Input: sock: Integer
+    Input: action: Address
+    Input: action_len: Integer
+    Body: {
+        IfCondition LessThan(action_len, 4) ThenBlock: { ReturnValue(0) }
+
+        // All actions start with "pkg."
+        c0 = GetByte(action, 0)
+        c1 = GetByte(action, 1)
+        c2 = GetByte(action, 2)
+        c3 = GetByte(action, 3)
+
+        // 'p'=112 'k'=107 'g'=103 '.'=46
+        IfCondition NotEqual(c0, 112) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c1, 107) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c2, 103) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c3, 46) ThenBlock: { ReturnValue(0) }
+
+        conn = PkgState.db
+
+        // Scan
+        cmp = StringCompare(action, "pkg.scan")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Pkg_RunScan(sock, conn)
+            Pkg_ShowList(sock)
+            ReturnValue(1)
+        }
+
+        // Install All
+        cmp = StringCompare(action, "pkg.inst")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Pkg_InstallAll(sock, conn)
+            ReturnValue(1)
+        }
+
+        // Repair
+        cmp = StringCompare(action, "pkg.fix")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Pkg_Repair(sock, conn)
+            ReturnValue(1)
+        }
+
+        // Schema
+        cmp = StringCompare(action, "pkg.schema")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            Pkg_RunSchema(sock, conn)
+            ReturnValue(1)
+        }
+
+        // Filter: All
+        cmp = StringCompare(action, "pkg.fall")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            PkgState.filter = 0
+            Pkg_ShowList(sock)
+            ReturnValue(1)
+        }
+
+        // Filter: System
+        cmp = StringCompare(action, "pkg.fsys")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            PkgState.filter = 1
+            Pkg_ShowList(sock)
+            ReturnValue(1)
+        }
+
+        // Filter: Apps
+        cmp = StringCompare(action, "pkg.fapp")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            PkgState.filter = 2
+            Pkg_ShowList(sock)
+            ReturnValue(1)
+        }
+
+        // Filter: Missing
+        cmp = StringCompare(action, "pkg.fmis")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            PkgState.filter = 3
+            Pkg_ShowList(sock)
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// ============================================================================
+// MAIN
+// ============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  Package Manager IPC Client\n")
+    PrintMessage("============================================\n\n")
+
+    // Init package registry
+    Pkg_InitRegistry()
+
+    // Connect to PostgreSQL
+    conn = Pkg_ConnectDB()
+
+    // Bootstrap packages table
+    IfCondition NotEqual(conn, 0) ThenBlock: {
+        Pkg_BootstrapPackagesTable(conn)
+    }
+
+    // Connect to display server
+    sock_path = "/tmp/ailang_display.sock"
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[PKG] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[PKG] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    PrintMessage("[PKG] Connected to display server\n")
+    PkgState.sock = sock
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"installer\"}")
+    PrintMessage("[PKG] Sent register\n")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Package Manager\",\"w\":560,\"h\":420,\"html\":\"config/installer.html\"}")
+    PrintMessage("[PKG] Sent window.create\n")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[PKG] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        PkgState.win_id = wid
+        PrintMessage("[PKG] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // Initial scan
+    Pkg_RunScan(sock, conn)
+    Pkg_ShowList(sock)
+
+    PrintMessage("[PKG] Ready\n\n")
+
+    // Service loop
+    WhileLoop EqualTo(PkgState.running, 1) {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: {
+            PrintMessage("[PKG] Connection closed\n")
+            PkgState.running = 0
+        } ElseBlock: {
+            PkgState.msg_count = Add(PkgState.msg_count, 1)
+
+            pmsg = ParseJSON(msg)
+            IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                mobj = JSON.AsObject(pmsg)
+                method = JSON.GetString(mobj, "method")
+
+                IfCondition NotEqual(method, 0) ThenBlock: {
+                    cmp_closed = StringCompare(method, "window.closed")
+                    IfCondition EqualTo(cmp_closed, 0) ThenBlock: {
+                        PrintMessage("[PKG] Window closed\n")
+                        PkgState.running = 0
+                    }
+
+                    cmp_action = StringCompare(method, "input.action")
+                    IfCondition EqualTo(cmp_action, 0) ThenBlock: {
+                        action = JSON.GetString(mobj, "action")
+                        IfCondition NotEqual(action, 0) ThenBlock: {
+                            action_len = JSON.GetNumber(mobj, "action_len")
+                            PkgHandleAction(sock, action, action_len)
+                        }
+                    }
+                }
+                JSON.Free(pmsg)
+            }
+        }
+    }
+
+    // Cleanup
+    Socket.Close(sock)
+    IfCondition NotEqual(conn, 0) ThenBlock: {
+        PG_Disconnect(conn)
+    }
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  Package Manager handled ")
+    PrintNumber(PkgState.msg_count)
+    PrintMessage(" messages\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)
