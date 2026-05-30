@@ -7,7 +7,7 @@
 ```ailang
 LibraryImport.JSON
 ```
-> Requires: `LibraryImport.XArrays`, `LibraryImport.StringUtils`
+> Requires: `LibraryImport.Arrays`, `LibraryImport.StringUtils`
 
 ## DESCRIPTION
 
@@ -27,10 +27,10 @@ JSON provides a complete RFC 8259-compliant parser and serializer built on a
 | `JType.STRING` | 1 | Address of null-terminated String |
 | `JType.NUMBER` | 2 | Address of raw number literal String |
 | `JType.BOOL`   | 3 | Integer: 0 or 1 |
-| `JType.OBJECT` | 4 | Address of HashMap (String→value) |
-| `JType.ARRAY`  | 5 | Address of XArray of tagged values |
+| `JType.OBJECT` | 4 | Address of SHash (String→tagged value) via Library.Arrays |
+| `JType.ARRAY`  | 5 | Address of Array of tagged values (Library.Array / Library.Arrays) |
 
-Objects are backed by `Library.HashMap`; arrays are backed by `Library.XArrays`.
+Objects are backed by `SHash` (from `Library.Arrays`); arrays are backed by `Library.Array`. Modern code may also use `Library.Hash` for new JSON-like structures.
 
 ---
 
@@ -39,8 +39,8 @@ Objects are backed by `Library.HashMap`; arrays are backed by `Library.XArrays`.
 ### Creating containers
 
 ```ailang
-JSON.NewObject   → obj       # empty JSON object (HashMap-backed)
-JSON.NewArray    → arr       # empty JSON array  (XArray-backed)
+JSON.NewObject   → obj       # empty JSON object (SHash-backed via Arrays)
+JSON.NewArray    → arr       # empty JSON array  (Array-backed)
 ```
 
 ### Setting fields on objects
@@ -289,8 +289,9 @@ JSON.Free root
 
 ## SEE ALSO
 - `Library.StringUtils` — string length, printing, concatenation
-- `Library.HashMap` — backing store for JSON objects
-- `Library.XArrays` — backing store for JSON arrays
+- `Library.Arrays` (SHash + Array) — backing store for JSON objects and arrays
+- `Library.Hash` — newer, faster hash table (recommended for new non-JSON work)
+- `Library.Array` — dynamic arrays used for JSON arrays
 - `Library.HTTP` — transport that typically carries JSON payloads
 - `Library.Socket` — low-level TCP transport
 

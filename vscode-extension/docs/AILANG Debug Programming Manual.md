@@ -25,6 +25,8 @@
 
 AILANG provides a comprehensive built-in debug system as a language primitive. Unlike external debuggers, AILANG's debug features are part of the language itself, enabling:
 
+> **Current Implementation Note:** Core features (Debug blocks, DebugAssert, DebugBreak, DebugPerf, DebugMemory.Dump) are fully functional in the self-hosting compiler. Advanced features (DebugTrace, DebugInspect, DebugControl, some DebugMemory ops) have lexer/AST support but parser or codegen is partial/incomplete as of the latest build. The documented API reflects the intended full design.
+
 - **Zero-overhead production builds** - Debug code compiles to NOPs when disabled
 - **Conditional compilation** - Debug blocks only compile when the required level is met
 - **Progressive detail levels** - Fine-grained control from basic assertions to full tracing
@@ -261,6 +263,8 @@ Program exits with code 1.
 
 Track function execution flow and variable values.
 
+> ⚠️ **Partial support:** `DebugTrace.*` keywords are tokenized but the statement parser does not yet have a dedicated handler (unlike `DebugPerf.*` / `DebugMemory.*`). Compilation path currently emits NOP. Syntax may not parse today.
+
 ### Syntax
 
 ```ailang
@@ -434,10 +438,9 @@ DebugMemory.Leak.Check()
 ### Behavior
 
 - Active at debug level 3 and above
-- `Dump`: Hex dump memory region
-- `Watch`: Monitor address for changes (future)
-- `Pattern`: Fill memory with pattern (e.g., 0xDEADBEEF)
-- `Leak.Start/Check`: Track allocations for leak detection
+- `Dump`: Hex dump memory region (fully implemented)
+- `Watch`: Monitor address for changes (future / not implemented)
+- `Pattern`, `Leak.Start`, `Leak.Check`: Parser recognizes some forms; compiler currently emits NOP placeholders (partial)
 
 ### Examples
 
@@ -469,6 +472,8 @@ Function.ProcessBuffer {
 ## Debug Inspection
 
 Examine runtime state.
+
+> ⚠️ **Not yet implemented:** `DebugInspect.*` (and `DebugControl`) have token definitions but no parser rules or compiler support. These sections describe the planned design.
 
 ### Syntax
 

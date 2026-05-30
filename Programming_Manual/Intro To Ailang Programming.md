@@ -286,13 +286,24 @@ These are intentional omissions, not missing features:
 
 ---
 
+## Demo Programs & Teaching Examples
+
+The `Demo Programs/programs/` directory contains 130+ progressive, numbered teaching examples — from `001_hello_world.ailang` through advanced recursion, error handling with `Result`/`Option`, classic algorithms (Tower of Hanoi, fast exponentiation), and AILang-specific control-flow idioms (`Fork` + `Branch` combinatorial decision trees).
+
+**Master index + recommended clean teaching curriculum:**
+
+`Demo Programs/DEMO_PROGRAMS_TEACHING_INDEX.md`
+
+These are the best way to learn the language by reading real, small, focused programs in order.
+
 ## See Also
 
 `AILang Operators Reference`,
 `Library.Arena`,
 `Library.StringUtils`,
 `Library.Regex_Thompson`,
-`Memory Management Reference Manual`
+`Memory Management Reference Manual`,
+`Demo Programs/DEMO_PROGRAMS_TEACHING_INDEX.md` (the full progressive curriculum)
 
 ---
 

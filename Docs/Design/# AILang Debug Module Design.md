@@ -3,16 +3,26 @@
 
 ### Current Status
 
-**Already Implemented:**
-- ✅ Lexer tokens: `Token.DEBUG` (21), `Token.DEBUGASSERT` (22), `Token.DEBUGTRACE` (23), `Token.DEBUGBREAK` (24), `Token.DEBUGMEMORY` (25), `Token.DEBUGPERF` (26), `Token.DEBUGINSPECT` (27), `Token.DEBUGCONTROL` (28)
-- ✅ Parser: `Parse_DebugBlock()`, `Parse_DebugAssert()`
-- ✅ AST types: `AST.DEBUG_BLOCK` (900), `AST.DEBUG_ASSERT` (901), `AST.DEBUG_TRACE` (902), `AST.DEBUG_BREAK` (903)
+> **Note:** This design document predates the self-hosting implementation. The debug system described here has been largely implemented in the AILANG self-hosting compiler (Librarys/Compiler/Debug/). The "Missing" items below were completed. See updated status.
 
-**Missing (To Implement):**
-- ❌ Debug state/level tracking
-- ❌ Compile module for debug statements
-- ❌ Emit support for debug instructions (RDTSC, INT3)
-- ❌ Parser: level number conversion (currently hardcoded to 1)
+**Fully Implemented (Self-Hosting Compiler):**
+- ✅ Lexer tokens: all from `DEBUG` (21) through `DEBUGCONTROL` (28)
+- ✅ Parser: `Parse_DebugBlock()` (level parsing fixed via Parse_StringToInt), `Parse_DebugAssert()`, `Parse_DebugPerf()`, `Parse_DebugBreak()`, `Parse_DebugMemory()`
+- ✅ AST types: `DEBUG_BLOCK` (900) through `DEBUG_CONTROL` (907)
+- ✅ Debug state: `FixedPool.Dbg` (level, perf_enabled, counters, perf_slots) in Library.CDebugTypes.ailang
+- ✅ Compile module: Library.CCompileDebug.ailang with full support for blocks (conditional), asserts, breakpoints (INT3), perf (RDTSC timing + output), memory dump
+- ✅ Emit support: Library.CEmitDebugX86.ailang (INT3, RDTSC/RDTSCP, serialized RDTSC, 1-9 byte NOPs, CPUID, UD2)
+- ✅ Integration: wired into CCompileMain statement dispatch and CCompileDebug_TryCompile
+- ✅ CLI: `-D`, `-D0`..`-D4`, `-P` flags; runtime debug level via console `debug N`
+- ✅ Zero-overhead production: level 0 and below-level blocks compile to single NOP
+- ✅ Runtime behaviors: assertion failures exit with message, perf prints cycles, memory dump emits hex
+
+**Remaining Gaps (as of this update):**
+- ⚠️ DebugTrace.* (token + AST + compile dispatch exist, but no Parse_DebugTrace handler → syntax rejected by parser; compiler path is NOP stub)
+- ⚠️ DebugInspect.*, DebugControl.* (tokens exist in lexer, but no parser rules, no compile handlers)
+- ⚠️ DebugMemory: Dump fully working; Pattern / Leak.Start / Leak.Check / Watch are parser stubs or compile NOPs
+- ⚠️ AST_TypeName (in CASTDebug) only lists BLOCK/ASSERT for debug nodes
+- ⚠️ No higher-level interactive debugger beyond emitting INT3 for GDB
 
 ---
 
@@ -344,49 +354,31 @@ Debug_Init(0, 0)
 
 ---
 
-### Parser Fix Needed
+### Parser Fix Needed — RESOLVED
 
-In `Library.CParserStatements.ailang`, the `Parse_DebugBlock` function has a TODO:
+The parser level conversion TODO has been implemented. In `Library.CParserStatements.ailang:674`:
 
 ```ailang
-// Current code:
-IfCondition EqualTo(PParser.p_current_type, PToken.P_NUMBER) ThenBlock: {
-    // TODO: Convert string to int
-    level = 1  // <-- HARDCODED!
-    Parse_Advance()
-}
-
-// Fix needed - use StringToInt:
+// Parse number - FIXED: Convert string to int
 IfCondition EqualTo(PParser.p_current_type, PToken.P_NUMBER) ThenBlock: {
     level_str = PParser.p_current_value
-    level = Str_ToInt(level_str)
+    level = Parse_StringToInt(level_str)
     Parse_Advance()
 }
 ```
 
+(See `Parse_StringToInt` helper in the same file.)
+```
+
 ---
 
-### Command Line Integration
+### Command Line Integration — IMPLEMENTED
 
-The console/compiler needs to parse `-D` and `-P` flags:
+Flag handling and `Debug_Init(level, perf)` are wired up in the self-hosting compiler path (via CCompileMain and console). The Dbg pool uses `Dbg.level` / `Dbg.perf_enabled` (not the design's `Debug.` names).
 
-```ailang
-// In ailang_console.ailang or main compiler:
-IfCondition StringEquals(arg, "-D") ThenBlock: {
-    Debug_Init(1, 0)
-}
-IfCondition StringEquals(arg, "-D2") ThenBlock: {
-    Debug_Init(2, 0)
-}
-IfCondition StringEquals(arg, "-D3") ThenBlock: {
-    Debug_Init(3, 0)
-}
-IfCondition StringEquals(arg, "-D4") ThenBlock: {
-    Debug_Init(4, 0)
-}
-IfCondition StringEquals(arg, "-P") ThenBlock: {
-    Debug.perf_enabled = 1
-}
+See:
+- Librarys/Compiler/Compile/Library.CCompileMain.ailang (flag parsing + Debug_Init call)
+- ailang_console.ailang or equivalent for REPL `debug N` / `perf on`
 ```
 
 ---

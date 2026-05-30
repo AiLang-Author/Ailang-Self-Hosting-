@@ -10,8 +10,8 @@
 LibraryImport.OOP
 ```
 
-> Requires: `LibraryImport.XArrays`, `LibraryImport.TArrays`,
-> `LibraryImport.HashMap` (pulled in automatically)
+> Requires: `LibraryImport.Arrays`, `LibraryImport.Array`,
+> `LibraryImport.Hash` (pulled in automatically)
 
 ---
 
@@ -29,16 +29,16 @@ right fit for the problem.
 
 ### Object model
 
-Every object is a `HashMap` with two keys:
+Every object is a hash table (Hash or SHash) with two keys:
 
 ```
 {
   "__class__": "ClassName"       — class name string
-  "__data__":  {field: value}    — instance field HashMap
+  "__data__":  {field: value}    — instance field storage (hash table)
 }
 ```
 
-Every class definition is a `HashMap` stored in the global
+Every class definition is a hash table stored in the global
 `ClassRegistry`:
 
 ```
@@ -420,14 +420,14 @@ WhileLoop NotEqual(current, 0) {
 
 ## PERFORMANCE NOTES
 
-Every field access is a `HashMap` lookup. Every method call is a
-HashMap traversal up the inheritance chain plus a `CallIndirect`.
+Every field access is a hash table lookup. Every method call is a
+hash table traversal up the inheritance chain plus a `CallIndirect`.
 This is appropriate for high-level modeling code — it is not
 appropriate for hot paths, tight loops, or systems code.
 
 For performance-critical objects, use `LinkagePool` instead —
 field access is a single `[R15 + offset]` instruction with no
-HashMap overhead. `Library.OOP` is the right choice when the OOP
+hash table overhead. `Library.OOP` is the right choice when the OOP
 model matters more than raw speed.
 
 ---
@@ -449,7 +449,7 @@ model matters more than raw speed.
 
 ## SEE ALSO
 
-`Library.HashMap`,
+`Library.Hash` (modern) / `Library.Arrays` SHash,
 `Library.Option`,
 `LinkagePool` (Memory Management Reference Manual),
 `AILang Language Introduction`
@@ -458,7 +458,7 @@ model matters more than raw speed.
 
 ## VERSION
 
-Opt-in OOP library. Implemented entirely on `HashMap` + `CallIndirect`
+Opt-in OOP library. Implemented entirely on hash tables (`Hash` / `Arrays` SHash) + `CallIndirect`
 with no compiler support. Single inheritance, mixins, dynamic dispatch,
 super calls, and full introspection.
 

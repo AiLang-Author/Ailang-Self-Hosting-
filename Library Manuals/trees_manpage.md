@@ -7,7 +7,7 @@
 ```
 LibraryImport.Trees
 ```
-> Requires: `LibraryImport.TArrays`
+> Requires: `LibraryImport.Arrays`
 
 ## DESCRIPTION
 Trees implements a classic **B-tree** — a balanced multi-way search tree where each node is a multiple of the page size (4096 bytes) for optimal disk and cache locality. The tree stores sorted key-value pairs and supports point queries, predecessor/successor, and range scans.
@@ -225,8 +225,8 @@ Trees.free   tree
 
 ## SEE ALSO
 `Library.SortedSet` — ordered unique-key set (often backed by Trees)
-`Library.TArrays` — used internally for node storage and range results
-`Library.HashMap` — unordered key-value storage
+`Library.Arrays` / `Library.Array` — used internally for node storage and range results
+`Library.Hash` — modern unordered key-value storage (preferred over the deprecated HashMap)
 
 ## VERSION
 2026-05-15 — initial specification (Phase 1 Tier 1)
