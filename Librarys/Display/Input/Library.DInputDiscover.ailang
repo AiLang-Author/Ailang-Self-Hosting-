@@ -335,23 +335,36 @@ Function.Discover_FindDevicesFallback {
         path_buf = Allocate(32)
         keybits  = Allocate(96)
         relbits  = Allocate(16)
+        absbits  = Allocate(16)
 
         // EVIOCGBIT(EV_KEY=1, 96) = 0x80604521 = 2153792801
         EVIOCGBIT_KEY = 2153792801
         // EVIOCGBIT(EV_REL=2, 16) = 0x80104522 = 2148549922
         EVIOCGBIT_REL = 2148549922
+        // EVIOCGBIT(EV_ABS=3, 16) = 0x80104523 = 2148549923
+        EVIOCGBIT_ABS = 2148549923
 
         dev = 0
-        WhileLoop LessThan(dev, 8) {
-            // Build "/dev/input/eventN"
+        WhileLoop LessThan(dev, 20) {
+            // Build "/dev/input/event0" .. "/dev/input/event19"
             prefix = "/dev/input/event"
             pi = 0
             WhileLoop LessThan(pi, 16) {
                 SetByte(path_buf, pi, GetByte(prefix, pi))
                 pi = Add(pi, 1)
             }
-            SetByte(path_buf, 16, Add(48, dev))
-            SetByte(path_buf, 17, 0)
+            // Write device number as 1 or 2 digit ASCII
+            IfCondition LessThan(dev, 10) ThenBlock: {
+                SetByte(path_buf, 16, Add(48, dev))
+                SetByte(path_buf, 17, 0)
+            }
+            IfCondition GreaterEqual(dev, 10) ThenBlock: {
+                tens = Divide(dev, 10)
+                ones = Subtract(dev, Multiply(tens, 10))
+                SetByte(path_buf, 16, Add(48, tens))
+                SetByte(path_buf, 17, Add(48, ones))
+                SetByte(path_buf, 18, 0)
+            }
 
             flags = Add(DiscoverSys.O_RDONLY, DiscoverSys.O_NONBLOCK)
             fd = SystemCall(DiscoverSys.SYS_OPEN, path_buf, flags, 0)
@@ -367,30 +380,32 @@ Function.Discover_FindDevicesFallback {
                 // Check for BTN_LEFT (scancode 272): byte 34, bit 0 → mask 1
                 has_btn_left = BitwiseAnd(GetByte(keybits, 34), 1)
 
-                // If has KEY_A → this is a keyboard
+                // If has KEY_A → keyboard — keep scanning, take highest event# (USB > PS/2)
                 IfCondition GreaterThan(has_key_a, 0) ThenBlock: {
-                    // Only take first keyboard found
-                    IfCondition EqualTo(Subtract(DiscoverState.kbd_event, 65536), -1) ThenBlock: {
-                        DiscoverState.kbd_event = Add(dev, 65536)
-                        PrintMessage("[Discover] kbd via probe: event")
-                        PrintNumber(dev)
-                        PrintMessage("\n")
-                    }
+                    DiscoverState.kbd_event = Add(dev, 65536)
+                    PrintMessage("[Discover] kbd via probe: event")
+                    PrintNumber(dev)
+                    PrintMessage("\n")
                 }
 
-                // If has BTN_LEFT → check for REL_X to confirm mouse
+                // If has BTN_LEFT → check for REL_X or ABS_X to confirm mouse/tablet
                 IfCondition GreaterThan(has_btn_left, 0) ThenBlock: {
+                    is_mouse = 0
                     MemorySet(relbits, 0, 16)
                     SystemCall(DiscoverSys.SYS_IOCTL, fd, EVIOCGBIT_REL, relbits, 0, 0)
                     has_rel_x = BitwiseAnd(GetByte(relbits, 0), 1)
-                    IfCondition GreaterThan(has_rel_x, 0) ThenBlock: {
-                        // Only take first mouse found
-                        IfCondition EqualTo(Subtract(DiscoverState.mouse_event, 65536), -1) ThenBlock: {
-                            DiscoverState.mouse_event = Add(dev, 65536)
-                            PrintMessage("[Discover] mouse via probe: event")
-                            PrintNumber(dev)
-                            PrintMessage("\n")
-                        }
+                    IfCondition GreaterThan(has_rel_x, 0) ThenBlock: { is_mouse = 1 }
+                    // Also check ABS_X for tablet/touchpad devices (QEMU USB mouse)
+                    MemorySet(absbits, 0, 16)
+                    SystemCall(DiscoverSys.SYS_IOCTL, fd, EVIOCGBIT_ABS, absbits, 0, 0)
+                    has_abs_x = BitwiseAnd(GetByte(absbits, 0), 1)
+                    IfCondition GreaterThan(has_abs_x, 0) ThenBlock: { is_mouse = 1 }
+                    IfCondition EqualTo(is_mouse, 1) ThenBlock: {
+                        // Keep scanning, take highest event# (USB > PS/2)
+                        DiscoverState.mouse_event = Add(dev, 65536)
+                        PrintMessage("[Discover] mouse via probe: event")
+                        PrintNumber(dev)
+                        PrintMessage("\n")
                     }
                 }
 
@@ -402,6 +417,7 @@ Function.Discover_FindDevicesFallback {
         Deallocate(path_buf, 32)
         Deallocate(keybits, 96)
         Deallocate(relbits, 16)
+        Deallocate(absbits, 16)
         ReturnValue(1)
     }
 }
@@ -480,6 +496,126 @@ Function.Discover_OpenAll {
         }
 
         Deallocate(path_buf, DiscoverConst.PATH_SIZE)
+        ReturnValue(opened)
+    }
+}
+
+// =============================================================================
+// Discover_Rescan — hot-plug support
+// Prunes dead devices, then scans for missing keyboard/mouse.
+// Call periodically from the main loop (every ~60 frames).
+// Returns number of newly opened devices.
+// =============================================================================
+Function.Discover_Rescan {
+    Output: Integer
+    Body: {
+        // First prune any dead fds
+        Evdev_PruneDead()
+
+        need_kbd   = 0
+        need_mouse = 0
+        IfCondition EqualTo(Evdev_HasDevice(InputDevType.KEYBOARD), 0) ThenBlock: { need_kbd   = 1 }
+        IfCondition EqualTo(Evdev_HasDevice(InputDevType.MOUSE),    0) ThenBlock: { need_mouse = 1 }
+
+        // Nothing missing — done
+        IfCondition EqualTo(Add(need_kbd, need_mouse), 0) ThenBlock: { ReturnValue(0) }
+
+        path_buf  = Allocate(32)
+        keybits   = Allocate(96)
+        relbits   = Allocate(16)
+        absbits2  = Allocate(16)
+        opened    = 0
+
+        EVIOCGBIT_KEY = 2153792801
+        EVIOCGBIT_REL = 2148549922
+        EVIOCGBIT_ABS = 2148549923
+
+        dev = 0
+        WhileLoop LessThan(dev, 20) {
+            // Build "/dev/input/event0" .. "/dev/input/event19"
+            prefix = "/dev/input/event"
+            pi = 0
+            WhileLoop LessThan(pi, 16) {
+                SetByte(path_buf, pi, GetByte(prefix, pi))
+                pi = Add(pi, 1)
+            }
+            IfCondition LessThan(dev, 10) ThenBlock: {
+                SetByte(path_buf, 16, Add(48, dev))
+                SetByte(path_buf, 17, 0)
+            }
+            IfCondition GreaterEqual(dev, 10) ThenBlock: {
+                tens = Divide(dev, 10)
+                ones = Subtract(dev, Multiply(tens, 10))
+                SetByte(path_buf, 16, Add(48, tens))
+                SetByte(path_buf, 17, Add(48, ones))
+                SetByte(path_buf, 18, 0)
+            }
+
+            flags = Add(DiscoverSys.O_RDONLY, DiscoverSys.O_NONBLOCK)
+            fd = SystemCall(DiscoverSys.SYS_OPEN, path_buf, flags, 0)
+            IfCondition GreaterEqual(fd, 0) ThenBlock: {
+                found_type = 0
+
+                // Check keyboard
+                IfCondition EqualTo(need_kbd, 1) ThenBlock: {
+                    MemorySet(keybits, 0, 96)
+                    SystemCall(DiscoverSys.SYS_IOCTL, fd, EVIOCGBIT_KEY, keybits, 0, 0)
+                    has_key_a = BitwiseAnd(GetByte(keybits, 3), 64)
+                    IfCondition GreaterThan(has_key_a, 0) ThenBlock: {
+                        // Also check it's NOT a mouse (has BTN_LEFT=272)
+                        has_btn = BitwiseAnd(GetByte(keybits, 34), 1)
+                        IfCondition EqualTo(has_btn, 0) ThenBlock: {
+                            found_type = InputDevType.KEYBOARD
+                        }
+                    }
+                }
+
+                // Check mouse (REL_X or ABS_X with BTN_LEFT)
+                IfCondition EqualTo(found_type, 0) ThenBlock: {
+                IfCondition EqualTo(need_mouse, 1) ThenBlock: {
+                    MemorySet(keybits, 0, 96)
+                    SystemCall(DiscoverSys.SYS_IOCTL, fd, EVIOCGBIT_KEY, keybits, 0, 0)
+                    has_btn_left = BitwiseAnd(GetByte(keybits, 34), 1)
+                    IfCondition GreaterThan(has_btn_left, 0) ThenBlock: {
+                        is_ptr = 0
+                        MemorySet(relbits, 0, 16)
+                        SystemCall(DiscoverSys.SYS_IOCTL, fd, EVIOCGBIT_REL, relbits, 0, 0)
+                        has_rel_x = BitwiseAnd(GetByte(relbits, 0), 1)
+                        IfCondition GreaterThan(has_rel_x, 0) ThenBlock: { is_ptr = 1 }
+                        MemorySet(absbits2, 0, 16)
+                        SystemCall(DiscoverSys.SYS_IOCTL, fd, EVIOCGBIT_ABS, absbits2, 0, 0)
+                        has_abs_x = BitwiseAnd(GetByte(absbits2, 0), 1)
+                        IfCondition GreaterThan(has_abs_x, 0) ThenBlock: { is_ptr = 1 }
+                        IfCondition EqualTo(is_ptr, 1) ThenBlock: {
+                            found_type = InputDevType.MOUSE
+                        }
+                    }
+                }}
+
+                IfCondition GreaterThan(found_type, 0) ThenBlock: {
+                    // Close the probe fd — Evdev_OpenDevice opens its own
+                    SystemCall(DiscoverSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+                    ofd = Evdev_OpenDevice(path_buf, found_type)
+                    IfCondition GreaterEqual(ofd, 0) ThenBlock: {
+                        PrintMessage("[Discover] Hot-plug: opened ")
+                        PrintString(path_buf)
+                        PrintMessage("\n")
+                        opened = Add(opened, 1)
+                        // Update need flags
+                        IfCondition EqualTo(found_type, InputDevType.KEYBOARD) ThenBlock: { need_kbd = 0 }
+                        IfCondition EqualTo(found_type, InputDevType.MOUSE) ThenBlock: { need_mouse = 0 }
+                    }
+                } ElseBlock: {
+                    SystemCall(DiscoverSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+                }
+            }
+            dev = Add(dev, 1)
+        }
+
+        Deallocate(path_buf, 32)
+        Deallocate(keybits, 96)
+        Deallocate(relbits, 16)
+        Deallocate(absbits2, 16)
         ReturnValue(opened)
     }
 }

@@ -13,8 +13,10 @@ FixedPool.EvdevSys {
     "SYS_OPEN":   Initialize=2
     "SYS_READ":   Initialize=0
     "SYS_CLOSE":  Initialize=3
+    "SYS_IOCTL":  Initialize=16
     "O_RDONLY":   Initialize=0
     "O_NONBLOCK": Initialize=2048
+    "EVIOCGRAB":  Initialize=1074021776
 }
 
 // =============================================================================
@@ -33,6 +35,9 @@ Function.Evdev_OpenDevice {
             PrintMessage("\n")
             ReturnValue(-1)
         }
+
+        // EVIOCGRAB — exclusive access. VT/fbcon gets zero input.
+        SystemCall(EvdevSys.SYS_IOCTL, fd, EvdevSys.EVIOCGRAB, 1, 0, 0)
 
         IfCondition EqualTo(InputDevTable.initialized, 0) ThenBlock: {
             tbl_ptr = Allocate(Multiply(InputDevConst.MAX_DEVICES, InputDevConst.RECORD_SIZE))
@@ -89,6 +94,84 @@ Function.Evdev_CloseAll {
         InputDevTable.count       = 0
         InputDevTable.table       = 0
         ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// CHECK IF WE HAVE A DEVICE OF GIVEN TYPE
+// =============================================================================
+Function.Evdev_HasDevice {
+    Input:  dev_type: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(InputDevTable.initialized, 0) ThenBlock: { ReturnValue(0) }
+        count = InputDevTable.count
+        tbl   = InputDevTable.table
+        i = 0
+        WhileLoop LessThan(i, count) {
+            offset = Multiply(i, InputDevConst.RECORD_SIZE)
+            dt     = Dereference(Add(tbl, Add(offset, 8)))
+            IfCondition EqualTo(dt, dev_type) ThenBlock: {
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PRUNE DEAD DEVICES — remove entries whose fd returns ENODEV on read
+// =============================================================================
+Function.Evdev_PruneDead {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(InputDevTable.initialized, 0) ThenBlock: { ReturnValue(0) }
+        count   = InputDevTable.count
+        tbl     = InputDevTable.table
+        pruned  = 0
+        tmpbuf  = Allocate(24)
+
+        i = 0
+        WhileLoop LessThan(i, count) {
+            offset = Multiply(i, InputDevConst.RECORD_SIZE)
+            fd     = Dereference(Add(tbl, offset))
+            IfCondition GreaterThan(fd, 0) ThenBlock: {
+                // Try a non-blocking read — EAGAIN (-11) means alive
+                n = SystemCall(EvdevSys.SYS_READ, fd, tmpbuf, 24, 0, 0)
+                // n >= 0 or n == -11 (EAGAIN): device is alive
+                // Other negative: device is dead
+                alive = 0
+                IfCondition GreaterEqual(n, 0) ThenBlock: { alive = 1 }
+                IfCondition EqualTo(n, -11)    ThenBlock: { alive = 1 }
+                IfCondition EqualTo(alive, 0)  ThenBlock: {
+                    PrintMessage("[Evdev] Device fd=")
+                    PrintNumber(fd)
+                    PrintMessage(" dead, removing\n")
+                    SystemCall(EvdevSys.SYS_CLOSE, fd, 0, 0)
+                    // Shift remaining entries down
+                    j = i
+                    WhileLoop LessThan(j, Subtract(count, 1)) {
+                        src = Multiply(Add(j, 1), InputDevConst.RECORD_SIZE)
+                        dst = Multiply(j, InputDevConst.RECORD_SIZE)
+                        StoreValue(Add(tbl, dst),         Dereference(Add(tbl, src)))
+                        StoreValue(Add(tbl, Add(dst, 8)), Dereference(Add(tbl, Add(src, 8))))
+                        j = Add(j, 1)
+                    }
+                    count   = Subtract(count, 1)
+                    pruned  = Add(pruned, 1)
+                    // Don't increment i — re-check this slot
+                } ElseBlock: {
+                    i = Add(i, 1)
+                }
+            } ElseBlock: {
+                i = Add(i, 1)
+            }
+        }
+        InputDevTable.count = count
+
+        Deallocate(tmpbuf, 24)
+        ReturnValue(pruned)
     }
 }
 
@@ -255,6 +338,36 @@ Function.Evdev_HandleRel {
 }
 
 // =============================================================================
+// PROCESS EV_ABS — mouse/tablet absolute position
+// QEMU USB mouse sends ABS_X/ABS_Y in range 0..32767
+// Scale to screen: pos = value * max_screen / 32767
+// =============================================================================
+Function.Evdev_HandleAbs {
+    Input:  ev_code:  Integer
+    Input:  ev_value: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev_code, AbsAxis.X) ThenBlock: {
+            // Scale: screen_x = ev_value * (max_x+1) / 32768
+            new_x = Divide(Multiply(ev_value, Add(MouseState.max_x, 1)), 32768)
+            IfCondition LessThan(new_x, MouseState.min_x) ThenBlock: { new_x = MouseState.min_x }
+            IfCondition GreaterThan(new_x, MouseState.max_x) ThenBlock: { new_x = MouseState.max_x }
+            MouseState.x = new_x
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(ev_code, AbsAxis.Y) ThenBlock: {
+            new_y = Divide(Multiply(ev_value, Add(MouseState.max_y, 1)), 32768)
+            IfCondition LessThan(new_y, MouseState.min_y) ThenBlock: { new_y = MouseState.min_y }
+            IfCondition GreaterThan(new_y, MouseState.max_y) ThenBlock: { new_y = MouseState.max_y }
+            MouseState.y = new_y
+            Ring1_Post(Ring1Event.MOUSE_MOVE, MouseState.x, MouseState.y, MouseState.buttons)
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
 // PROCESS ONE EVENT
 // =============================================================================
 Function.Evdev_ProcessEvent {
@@ -271,6 +384,9 @@ Function.Evdev_ProcessEvent {
         }
         IfCondition EqualTo(ev_type, EvType.REL) ThenBlock: {
             ReturnValue(Evdev_HandleRel(ev_code, ev_value))
+        }
+        IfCondition EqualTo(ev_type, EvType.ABS) ThenBlock: {
+            ReturnValue(Evdev_HandleAbs(ev_code, ev_value))
         }
         ReturnValue(0)
     }
