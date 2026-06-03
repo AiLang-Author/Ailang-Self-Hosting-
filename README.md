@@ -6,7 +6,7 @@ Welcome to the **AILang Programming Language** — a production-grade, self-host
 
 This is the official self-hosting repository for **AILang**, featuring:
 
-- **Ultra-efficient compiler** (760 KB) — Self-hosted, generates highly optimized native binaries
+- **Ultra-efficient compiler** (1.x Mb) — Self-hosted, generates highly optimized native binaries
 - **57 POSIX CoreUtils** — reimplementation of essential Unix utilities with custom regex engine, in development
 - **Complete windowing system** (800 KB) — Full display server with window manager, compositor, and UI framework
 - **In development web browser** (2.3 MB) — Built-in JavaScript JVM with 92.7% ECMAScript compliance, plus ongoing HTML/CSS development
