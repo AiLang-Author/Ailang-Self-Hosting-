@@ -31,9 +31,20 @@ SRC[chrome]="Applications/chrome_ipc.ailang";       BIN[chrome]="chrome.x";     
 SRC[ladybird]="Applications/ladybird_ipc.ailang";   BIN[ladybird]="ladybird.x";    DEST[ladybird]="/system/bin/ladybird.x"
 SRC[claude]="Applications/claude_ipc.ailang";       BIN[claude]="claude.x";        DEST[claude]="/system/bin/claude.x"
 SRC[vscode]="Applications/vscode_ipc.ailang";       BIN[vscode]="vscode.x";        DEST[vscode]="/system/bin/vscode.x"
+SRC[ide]="Applications/ide_ipc.ailang";             BIN[ide]="ide.x";              DEST[ide]="/system/bin/ide.x"
 SRC[pkg]="Applications/installer_ipc.ailang";       BIN[pkg]="installer_ipc.x";    DEST[pkg]="/system/bin/installer_ipc.x"
+SRC[display]="Main.ailang"; BIN[display]="display.x"; DEST[display]="/system/bin/display.x"
+SRC[videoplayer]="Applications/videoplayer.ailang"; BIN[videoplayer]="videoplayer.x"; DEST[videoplayer]="/system/bin/videoplayer.x"
+SRC[mediacenter]="MediaCenter/MediaCenter.ailang";  BIN[mediacenter]="MediaCenter.x"; DEST[mediacenter]="/system/bin/MediaCenter.x"
 
-NEEDS_REBOOT=(init)
+NEEDS_REBOOT=(init display)
+
+OVERLAY="/home/bob/buildroot/board/ailang_os/rootfs_overlay"
+OVERLAY_BIN="$OVERLAY/system/bin"
+OVERLAY_SBIN="$OVERLAY/sbin"
+
+# Codec workers — built with gcc, not ailang compiler
+CODEC_WORKERS=(mp3_worker aac_worker opus_worker flac_worker vorbis_worker pcm_worker h264_worker h265_worker vp9_worker av1_worker demux_worker)
 
 build_and_push() {
     local comp="$1"
@@ -56,6 +67,15 @@ build_and_push() {
     echo "  PUSH  $bin -> $TARGET:$dest"
     $SCP "/tmp/$bin" "root@$TARGET:$dest"
 
+    # Also copy to rootfs overlay for image builds
+    local overlay_dest="$OVERLAY$dest"
+    local overlay_dir="$(dirname "$overlay_dest")"
+    if [ -d "$OVERLAY" ]; then
+        mkdir -p "$overlay_dir"
+        cp "/tmp/$bin" "$overlay_dest"
+        echo "  COPY  $bin -> overlay:$dest"
+    fi
+
     for rb in "${NEEDS_REBOOT[@]}"; do
         if [ "$comp" = "$rb" ]; then
             echo "  NOTE  $comp requires reboot to take effect"
@@ -64,9 +84,34 @@ build_and_push() {
     echo "  OK    $comp"
 }
 
+build_codec_workers() {
+    echo "  BUILD codec workers (gcc)"
+    pushd MediaCenter/Codec >/dev/null
+    make clean 2>/dev/null; make 2>&1
+    if [ $? -ne 0 ]; then
+        echo "  FAIL  codec worker compilation failed"
+        popd >/dev/null
+        return 1
+    fi
+    for w in "${CODEC_WORKERS[@]}"; do
+        if [ ! -f "$w" ]; then
+            echo "  SKIP  $w not built"
+            continue
+        fi
+        echo "  PUSH  $w -> $TARGET:/system/bin/$w"
+        $SCP "$w" "root@$TARGET:/system/bin/$w"
+        # Also copy to rootfs overlay for image builds
+        if [ -d "$OVERLAY_BIN" ]; then
+            cp "$w" "$OVERLAY_BIN/$w"
+        fi
+    done
+    popd >/dev/null
+    echo "  OK    codec workers"
+}
+
 # Resolve "all"
 if [ "${COMPONENTS[0]}" = "all" ]; then
-    COMPONENTS=(init installer terminal notepad calc grep wifi browser chrome ladybird claude vscode pkg)
+    COMPONENTS=(init installer display terminal notepad calc grep wifi browser chrome ladybird claude vscode ide pkg videoplayer mediacenter)
 fi
 
 echo "Target: $TARGET"
@@ -76,6 +121,14 @@ echo ""
 FAILED=0
 for comp in "${COMPONENTS[@]}"; do
     build_and_push "$comp" || FAILED=$((FAILED + 1))
+done
+
+# Build + deploy codec workers when deploying mediacenter or all
+for comp in "${COMPONENTS[@]}"; do
+    if [ "$comp" = "mediacenter" ] || [ "$comp" = "all" ] || [ "$comp" = "codecs" ]; then
+        build_codec_workers || FAILED=$((FAILED + 1))
+        break
+    fi
 done
 
 echo ""

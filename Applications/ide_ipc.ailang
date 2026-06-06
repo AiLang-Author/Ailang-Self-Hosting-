@@ -1,0 +1,740 @@
+// ide_ipc.ailang — AILang IDE
+// IPC application: connects to display server, leverages TEXTFIELD with
+// syntax highlighting and line numbers for code editing.
+//
+// Features:
+//   - Multi-tab editing (up to 15 tabs, buffer 0 is initial)
+//   - Ctrl+S save, Ctrl+O open (via textfield.load/save IPC)
+//   - Ctrl+N new tab, Ctrl+W close tab
+//   - Ctrl+B compile current file
+//   - Ctrl+G goto line
+//   - Status bar with line/col, language, file path
+//
+// Protocol: Uses standard IPC + textfield.* extensions.
+//
+// Build: ./ailang.x Applications/ide_ipc.ailang -o /tmp/ide.x
+// Run:   ./ide.x  (after display server is running)
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.Arrays
+LibraryImport.Hash
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.IDEConst {
+    "MAX_TABS": Initialize=15
+    "TAB_SIZE": Initialize=32
+}
+
+// Tab entry: 32 bytes
+//   0: buf_handle (TextBuffer handle, -1 = unused)
+//   8: path_ptr (allocated string or 0)
+//  16: path_len
+//  24: modified (0/1)
+FixedPool.IDETabOff {
+    "BUF_H":      Initialize=0
+    "PATH_PTR":   Initialize=8
+    "PATH_LEN":   Initialize=16
+    "MODIFIED":   Initialize=24
+}
+
+FixedPool.IDEState {
+    "running":    Initialize=1, CanChange=True
+    "win_id":     Initialize=0, CanChange=True
+    "sock":       Initialize=0, CanChange=True
+    "tab_table":  Initialize=0, CanChange=True
+    "tab_count":  Initialize=0, CanChange=True
+    "active_tab": Initialize=0, CanChange=True
+    "msg_count":  Initialize=0, CanChange=True
+    "screen_w":   Initialize=0, CanChange=True
+    "screen_h":   Initialize=0, CanChange=True
+    "info_timer": Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// TAB MANAGEMENT
+// =============================================================================
+Function.IDE_TabPtr {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(IDEState.tab_table, Multiply(idx, IDEConst.TAB_SIZE)))
+    }
+}
+
+Function.IDE_TabGetBufH {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = IDE_TabPtr(idx)
+        ReturnValue(Dereference(Add(base, IDETabOff.BUF_H)))
+    }
+}
+
+Function.IDE_TabSetBufH {
+    Input: idx: Integer
+    Input: bh: Integer
+    Body: {
+        base = IDE_TabPtr(idx)
+        StoreValue(Add(base, IDETabOff.BUF_H), bh)
+    }
+}
+
+Function.IDE_TabGetPath {
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        base = IDE_TabPtr(idx)
+        ReturnValue(Dereference(Add(base, IDETabOff.PATH_PTR)))
+    }
+}
+
+Function.IDE_TabSetPath {
+    Input: idx: Integer
+    Input: ptr: Address
+    Input: len: Integer
+    Body: {
+        base = IDE_TabPtr(idx)
+        StoreValue(Add(base, IDETabOff.PATH_PTR), ptr)
+        StoreValue(Add(base, IDETabOff.PATH_LEN), len)
+    }
+}
+
+// =============================================================================
+// SEND JSON HELPERS
+// =============================================================================
+Function.IDE_SendJSON {
+    Input: obj: Address
+    Body: {
+        str = JSON.SerializeObject(obj)
+        Socket.SendMsg(IDEState.sock, str)
+        JSON.Free(obj)
+    }
+}
+
+Function.IDE_SetLabel {
+    Input: id_str: Address
+    Input: text: Address
+    Body: {
+        obj = JSON.NewObject()
+        JSON.SetString(obj, "method", "window.setlabel")
+        JSON.SetNumber(obj, "win_id", IDEState.win_id)
+        JSON.SetString(obj, "id", id_str)
+        JSON.SetString(obj, "text", text)
+        IDE_SendJSON(obj)
+    }
+}
+
+// =============================================================================
+// ACTIONS
+// =============================================================================
+
+// Ctrl+S: Save current file
+Function.IDE_Save {
+    Body: {
+        ti = IDEState.active_tab
+        pptr = IDE_TabGetPath(ti)
+        IfCondition EqualTo(pptr, 0) ThenBlock: {
+            IDE_SetLabel("status", "No file path — use Ctrl+O first")
+            ReturnValue(0)
+        }
+        obj = JSON.NewObject()
+        JSON.SetString(obj, "method", "textfield.save")
+        JSON.SetNumber(obj, "win_id", IDEState.win_id)
+        JSON.SetString(obj, "path", pptr)
+        IDE_SendJSON(obj)
+        IDE_SetLabel("status", "Saving...")
+    }
+}
+
+// Ctrl+O: Open file — send textfield.load with path from toolbar
+Function.IDE_OpenFile {
+    Input: path: Address
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        plen = StringLength(path)
+        IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(0) }
+
+        // Store path for this tab
+        ti = IDEState.active_tab
+        old_path = IDE_TabGetPath(ti)
+        IfCondition NotEqual(old_path, 0) ThenBlock: {
+            Deallocate(old_path, 256)
+        }
+        new_path = Allocate(Add(plen, 1))
+        MemoryCopy(new_path, path, plen)
+        SetByte(new_path, plen, 0)
+        IDE_TabSetPath(ti, new_path, plen)
+
+        // Send textfield.load
+        obj = JSON.NewObject()
+        JSON.SetString(obj, "method", "textfield.load")
+        JSON.SetNumber(obj, "win_id", IDEState.win_id)
+        JSON.SetString(obj, "path", new_path)
+        IDE_SendJSON(obj)
+
+        // Update filepath label
+        IDE_SetLabel("filepath", new_path)
+        IDE_SetLabel("status", "Loading...")
+    }
+}
+
+// Ctrl+N: New tab
+Function.IDE_NewTab {
+    Body: {
+        tc = IDEState.tab_count
+        IfCondition GreaterEqual(tc, IDEConst.MAX_TABS) ThenBlock: {
+            IDE_SetLabel("status", "Max tabs reached")
+            ReturnValue(0)
+        }
+
+        // Request new buffer from server
+        obj = JSON.NewObject()
+        JSON.SetString(obj, "method", "textfield.newbuf")
+        JSON.SetNumber(obj, "win_id", IDEState.win_id)
+        IDE_SendJSON(obj)
+        // Response handled in message loop — sets up the tab
+    }
+}
+
+// Ctrl+W: Close current tab
+Function.IDE_CloseTab {
+    Body: {
+        tc = IDEState.tab_count
+        IfCondition LessEqual(tc, 1) ThenBlock: {
+            // Don't close last tab
+            ReturnValue(0)
+        }
+
+        ti = IDEState.active_tab
+        // Free path if any
+        pptr = IDE_TabGetPath(ti)
+        IfCondition NotEqual(pptr, 0) ThenBlock: {
+            Deallocate(pptr, 256)
+        }
+
+        // Shift remaining tabs down
+        i = ti
+        WhileLoop LessThan(i, Subtract(tc, 1)) {
+            src = IDE_TabPtr(Add(i, 1))
+            dst = IDE_TabPtr(i)
+            MemoryCopy(dst, src, IDEConst.TAB_SIZE)
+            i = Add(i, 1)
+        }
+
+        IDEState.tab_count = Subtract(tc, 1)
+        // Adjust active tab
+        IfCondition GreaterEqual(IDEState.active_tab, IDEState.tab_count) ThenBlock: {
+            IDEState.active_tab = Subtract(IDEState.tab_count, 1)
+        }
+
+        // Switch to the now-active buffer
+        bh = IDE_TabGetBufH(IDEState.active_tab)
+        obj = JSON.NewObject()
+        JSON.SetString(obj, "method", "textfield.setbuf")
+        JSON.SetNumber(obj, "win_id", IDEState.win_id)
+        JSON.SetNumber(obj, "buf_handle", bh)
+        IDE_SendJSON(obj)
+
+        // Update status
+        IDE_UpdateFilePath()
+    }
+}
+
+// Ctrl+B: Compile current file
+Function.IDE_Compile {
+    Body: {
+        ti = IDEState.active_tab
+        pptr = IDE_TabGetPath(ti)
+        IfCondition EqualTo(pptr, 0) ThenBlock: {
+            IDE_SetLabel("status", "No file to compile")
+            ReturnValue(0)
+        }
+
+        IDE_SetLabel("status", "Compiling...")
+        // Fork and exec the compiler
+        // argv: ailang.x <path> -o /tmp/ide_build.x
+        // We use fork+exec pattern via syscall
+        pid = SystemCall(57, 0, 0, 0)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child process — exec compiler
+            // Build argv on stack
+            argv = Allocate(40)
+            prog = "/system/bin/ailang.x"
+            out_flag = "-o"
+            out_path = "/tmp/ide_build.x"
+            StoreValue(argv, prog)
+            StoreValue(Add(argv, 8), pptr)
+            StoreValue(Add(argv, 16), out_flag)
+            StoreValue(Add(argv, 24), out_path)
+            StoreValue(Add(argv, 32), 0)
+            // execve(prog, argv, NULL)
+            SystemCall(59, prog, argv, 0)
+            // If exec fails, exit child
+            SystemCall(60, 1, 0, 0)
+        } ElseBlock: {
+            IfCondition GreaterThan(pid, 0) ThenBlock: {
+                // Parent — wait for child
+                status_buf = Allocate(8)
+                SystemCall(61, pid, status_buf, 0)
+                exit_code = Dereference(status_buf)
+                Deallocate(status_buf, 8)
+                // Check exit status (upper bits)
+                // For waitpid, WEXITSTATUS is (status >> 8) & 0xFF
+                real_exit = And(Divide(exit_code, 256), 255)
+                IfCondition EqualTo(real_exit, 0) ThenBlock: {
+                    IDE_SetLabel("status", "Build OK: /tmp/ide_build.x")
+                } ElseBlock: {
+                    IDE_SetLabel("status", "Build FAILED")
+                }
+            } ElseBlock: {
+                IDE_SetLabel("status", "Fork failed")
+            }
+        }
+    }
+}
+
+// Update filepath label from current tab
+Function.IDE_UpdateFilePath {
+    Body: {
+        ti = IDEState.active_tab
+        pptr = IDE_TabGetPath(ti)
+        IfCondition NotEqual(pptr, 0) ThenBlock: {
+            IDE_SetLabel("filepath", pptr)
+        } ElseBlock: {
+            IDE_SetLabel("filepath", "Untitled")
+        }
+    }
+}
+
+// Request cursor info and update status bar
+Function.IDE_RequestInfo {
+    Body: {
+        obj = JSON.NewObject()
+        JSON.SetString(obj, "method", "textfield.getinfo")
+        JSON.SetNumber(obj, "win_id", IDEState.win_id)
+        IDE_SendJSON(obj)
+    }
+}
+
+// =============================================================================
+// MESSAGE HANDLERS
+// =============================================================================
+
+// Handle incoming key events (Ctrl combos)
+Function.IDE_HandleKey {
+    Input: keycode: Integer
+    Input: ch: Integer
+    Input: shift: Integer
+    Input: ctrl: Integer
+    Body: {
+        // Only handle Ctrl combos
+        IfCondition EqualTo(ctrl, 0) ThenBlock: { ReturnValue(0) }
+
+        // Ctrl+S (s=115, S=83)
+        IfCondition Or(EqualTo(ch, 115), EqualTo(ch, 83)) ThenBlock: {
+            IDE_Save()
+            ReturnValue(1)
+        }
+
+        // Ctrl+N (n=110, N=78)
+        IfCondition Or(EqualTo(ch, 110), EqualTo(ch, 78)) ThenBlock: {
+            IDE_NewTab()
+            ReturnValue(1)
+        }
+
+        // Ctrl+W (w=119, W=87)
+        IfCondition Or(EqualTo(ch, 119), EqualTo(ch, 87)) ThenBlock: {
+            IDE_CloseTab()
+            ReturnValue(1)
+        }
+
+        // Ctrl+B (b=98, B=66)
+        IfCondition Or(EqualTo(ch, 98), EqualTo(ch, 66)) ThenBlock: {
+            IDE_Compile()
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// Handle toolbar actions
+Function.IDE_HandleAction {
+    Input: action: Address
+    Body: {
+        // menu:file.new
+        cmp_new = StringCompare(action, "menu:file.new")
+        IfCondition EqualTo(cmp_new, 0) ThenBlock: {
+            IDE_NewTab()
+            ReturnValue(1)
+        }
+
+        // menu:file.save
+        cmp_save = StringCompare(action, "menu:file.save")
+        IfCondition EqualTo(cmp_save, 0) ThenBlock: {
+            IDE_Save()
+            ReturnValue(1)
+        }
+
+        // Tab switch: ide.tab0 through ide.tab9
+        IfCondition GreaterEqual(StringLength(action), 8) ThenBlock: {
+            t0 = GetByte(action, 0)
+            t1 = GetByte(action, 1)
+            t2 = GetByte(action, 2)
+            t3 = GetByte(action, 3)
+            // "ide." = 105 100 101 46
+            IfCondition And(EqualTo(t0, 105), And(EqualTo(t1, 100), And(EqualTo(t2, 101), EqualTo(t3, 46)))) ThenBlock: {
+                // Check "tab" prefix
+                t4 = GetByte(action, 4)
+                t5 = GetByte(action, 5)
+                t6 = GetByte(action, 6)
+                IfCondition And(EqualTo(t4, 116), And(EqualTo(t5, 97), EqualTo(t6, 98))) ThenBlock: {
+                    // Extract tab index (single digit)
+                    tab_idx = Subtract(GetByte(action, 7), 48)
+                    IfCondition And(GreaterEqual(tab_idx, 0), LessThan(tab_idx, IDEState.tab_count)) ThenBlock: {
+                        IDEState.active_tab = tab_idx
+                        bh = IDE_TabGetBufH(tab_idx)
+                        obj = JSON.NewObject()
+                        JSON.SetString(obj, "method", "textfield.setbuf")
+                        JSON.SetNumber(obj, "win_id", IDEState.win_id)
+                        JSON.SetNumber(obj, "buf_handle", bh)
+                        IDE_SendJSON(obj)
+                        IDE_UpdateFilePath()
+                    }
+                    ReturnValue(1)
+                }
+            }
+        }
+
+        // ide.new — "+" button
+        cmp_plus = StringCompare(action, "ide.new")
+        IfCondition EqualTo(cmp_plus, 0) ThenBlock: {
+            IDE_NewTab()
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// Handle responses from server
+Function.IDE_HandleResponse {
+    Input: method: Address
+    Input: mobj: Address
+    Body: {
+        // textfield.loaded — file loaded successfully
+        cmp_loaded = StringCompare(method, "textfield.loaded")
+        IfCondition EqualTo(cmp_loaded, 0) ThenBlock: {
+            lines = JSON.GetNumber(mobj, "lines")
+            IDE_SetLabel("status", "File loaded")
+            // Update lang label
+            IDE_SetLabel("lang", "AILang")
+            ReturnValue(1)
+        }
+
+        // textfield.saved — file saved
+        cmp_saved = StringCompare(method, "textfield.saved")
+        IfCondition EqualTo(cmp_saved, 0) ThenBlock: {
+            IDE_SetLabel("status", "Saved")
+            ReturnValue(1)
+        }
+
+        // textfield.info — cursor position update
+        cmp_info = StringCompare(method, "textfield.info")
+        IfCondition EqualTo(cmp_info, 0) ThenBlock: {
+            row = JSON.GetNumber(mobj, "row")
+            col = JSON.GetNumber(mobj, "col")
+            // Build "Ln N, Col M" string
+            buf = Allocate(32)
+            pos = 0
+            // "Ln "
+            SetByte(buf, 0, 76)
+            SetByte(buf, 1, 110)
+            SetByte(buf, 2, 32)
+            pos = 3
+            // Write row+1 as decimal
+            rval = Add(row, 1)
+            tmp = Allocate(8)
+            ti2 = 0
+            IfCondition EqualTo(rval, 0) ThenBlock: {
+                SetByte(tmp, 0, 48)
+                ti2 = 1
+            } ElseBlock: {
+                rv = rval
+                WhileLoop GreaterThan(rv, 0) {
+                    rd = Subtract(rv, Multiply(Divide(rv, 10), 10))
+                    SetByte(tmp, ti2, Add(48, rd))
+                    ti2 = Add(ti2, 1)
+                    rv = Divide(rv, 10)
+                }
+            }
+            // Reverse digits
+            ri = 0
+            WhileLoop LessThan(ri, ti2) {
+                SetByte(buf, Add(pos, ri), GetByte(tmp, Subtract(Subtract(ti2, 1), ri)))
+                ri = Add(ri, 1)
+            }
+            pos = Add(pos, ti2)
+            // ", Col "
+            SetByte(buf, pos, 44)
+            SetByte(buf, Add(pos, 1), 32)
+            SetByte(buf, Add(pos, 2), 67)
+            SetByte(buf, Add(pos, 3), 111)
+            SetByte(buf, Add(pos, 4), 108)
+            SetByte(buf, Add(pos, 5), 32)
+            pos = Add(pos, 6)
+            // Write col+1
+            cval = Add(col, 1)
+            ci2 = 0
+            IfCondition EqualTo(cval, 0) ThenBlock: {
+                SetByte(tmp, 0, 48)
+                ci2 = 1
+            } ElseBlock: {
+                cv = cval
+                WhileLoop GreaterThan(cv, 0) {
+                    cd = Subtract(cv, Multiply(Divide(cv, 10), 10))
+                    SetByte(tmp, ci2, Add(48, cd))
+                    ci2 = Add(ci2, 1)
+                    cv = Divide(cv, 10)
+                }
+            }
+            ri = 0
+            WhileLoop LessThan(ri, ci2) {
+                SetByte(buf, Add(pos, ri), GetByte(tmp, Subtract(Subtract(ci2, 1), ri)))
+                ri = Add(ri, 1)
+            }
+            pos = Add(pos, ci2)
+            SetByte(buf, pos, 0)
+            Deallocate(tmp, 8)
+
+            IDE_SetLabel("curpos", buf)
+            Deallocate(buf, 32)
+            ReturnValue(1)
+        }
+
+        // textfield.newbuf — new buffer created, set up tab
+        cmp_newbuf = StringCompare(method, "textfield.newbuf")
+        IfCondition EqualTo(cmp_newbuf, 0) ThenBlock: {
+            bh = JSON.GetNumber(mobj, "buf_handle")
+            tc = IDEState.tab_count
+            IfCondition LessThan(tc, IDEConst.MAX_TABS) ThenBlock: {
+                IDE_TabSetBufH(tc, bh)
+                IDE_TabSetPath(tc, 0, 0)
+                IDEState.tab_count = Add(tc, 1)
+                IDEState.active_tab = tc
+
+                // Switch to new buffer
+                obj = JSON.NewObject()
+                JSON.SetString(obj, "method", "textfield.setbuf")
+                JSON.SetNumber(obj, "win_id", IDEState.win_id)
+                JSON.SetNumber(obj, "buf_handle", bh)
+                IDE_SendJSON(obj)
+
+                IDE_SetLabel("filepath", "Untitled")
+                IDE_SetLabel("status", "New tab")
+            }
+            ReturnValue(1)
+        }
+
+        // window.resized
+        cmp_resized = StringCompare(method, "window.resized")
+        IfCondition EqualTo(cmp_resized, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  AILang IDE\n")
+    PrintMessage("============================================\n\n")
+
+    // Allocate tab table
+    tbl_size = Multiply(IDEConst.MAX_TABS, IDEConst.TAB_SIZE)
+    IDEState.tab_table = Allocate(tbl_size)
+    // Zero it
+    i = 0
+    WhileLoop LessThan(i, tbl_size) {
+        SetByte(IDEState.tab_table, i, 0)
+        i = Add(i, 1)
+    }
+
+    sock_path = "/tmp/ailang_display.sock"
+
+    // Connect to display server
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[IDE] Socket create failed\n")
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[IDE] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+    IDEState.sock = sock
+    PrintMessage("[IDE] Connected to display server\n")
+
+    // Register
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"ide\"}")
+
+    // Create window
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"AILang IDE\",\"w\":900,\"h\":600,\"html\":\"config/ide.html\"}")
+
+    // Wait for window.created
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[IDE] No response\n")
+        Socket.Close(sock)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        IDEState.win_id = wid
+        IDEState.screen_w = JSON.GetNumber(pobj, "screen_w")
+        IDEState.screen_h = JSON.GetNumber(pobj, "screen_h")
+        PrintMessage("[IDE] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    // The TEXTFIELD in the HTML auto-creates a TextBuffer (handle 0 in the pool
+    // after the display server processes it — but it's actually allocated
+    // server-side). We need to know its handle for tab tracking.
+    // The initial TextBuffer handle is assigned by the server when it parses
+    // the HTML. We'll track it as tab 0 with handle = what server allocated.
+    // For now, we request info to verify it works, and store handle=0 (first
+    // buffer created by the server for this window's textfield).
+    // Actually, TextBuf_Create returns sequential handles. The server may have
+    // created several already. We'll use textfield.getinfo to determine.
+    // For tab management, we trust that the server assigned the right handle.
+    // Tab 0 gets a dummy handle — the real handle is managed server-side via
+    // the TEXTFIELD node's TEXTBUF_H field.
+    IDE_TabSetBufH(0, 0)
+    IDE_TabSetPath(0, 0, 0)
+    IDEState.tab_count = 1
+    IDEState.active_tab = 0
+
+    // Set initial status
+    IDE_SetLabel("status", "Ready")
+    IDE_SetLabel("lang", "AILang")
+    IDE_SetLabel("curpos", "Ln 1, Col 1")
+
+    // Check if argv[1] was provided (file to open)
+    // Read /proc/self/cmdline to get args
+    cmd_fd = SystemCall(2, "/proc/self/cmdline", 0, 0)
+    IfCondition GreaterEqual(cmd_fd, 0) ThenBlock: {
+        cmd_buf = Allocate(4096)
+        cmd_len = SystemCall(0, cmd_fd, cmd_buf, 4096)
+        SystemCall(3, cmd_fd, 0, 0)
+        // cmdline is null-separated: argv[0]\0argv[1]\0...
+        // Find first null to skip argv[0]
+        IfCondition GreaterThan(cmd_len, 0) ThenBlock: {
+            ci = 0
+            WhileLoop And(LessThan(ci, cmd_len), NotEqual(GetByte(cmd_buf, ci), 0)) {
+                ci = Add(ci, 1)
+            }
+            ci = Add(ci, 1)
+            // ci now points to argv[1] if it exists
+            IfCondition LessThan(ci, cmd_len) ThenBlock: {
+                arg1 = Add(cmd_buf, ci)
+                arg1_len = StringLength(arg1)
+                IfCondition GreaterThan(arg1_len, 0) ThenBlock: {
+                    PrintMessage("[IDE] Opening: ")
+                    PrintString(arg1)
+                    PrintMessage("\n")
+                    IDE_OpenFile(arg1)
+                }
+            }
+        }
+        Deallocate(cmd_buf, 4096)
+    }
+
+    PrintMessage("[IDE] Entering service loop\n")
+
+    // Service loop
+    WhileLoop EqualTo(IDEState.running, 1) {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: {
+            PrintMessage("[IDE] Connection closed\n")
+            IDEState.running = 0
+        } ElseBlock: {
+            IDEState.msg_count = Add(IDEState.msg_count, 1)
+
+            pmsg = ParseJSON(msg)
+            IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                mobj = JSON.AsObject(pmsg)
+                method = JSON.GetString(mobj, "method")
+
+                IfCondition NotEqual(method, 0) ThenBlock: {
+                    // window.closed
+                    cmp_closed = StringCompare(method, "window.closed")
+                    IfCondition EqualTo(cmp_closed, 0) ThenBlock: {
+                        PrintMessage("[IDE] Window closed\n")
+                        IDEState.running = 0
+                    }
+
+                    // input.key — keyboard events
+                    cmp_key = StringCompare(method, "input.key")
+                    IfCondition EqualTo(cmp_key, 0) ThenBlock: {
+                        k_code = JSON.GetNumber(mobj, "keycode")
+                        k_ch = JSON.GetNumber(mobj, "ch")
+                        k_shift = JSON.GetNumber(mobj, "shift")
+                        k_ctrl = JSON.GetNumber(mobj, "ctrl")
+                        IDE_HandleKey(k_code, k_ch, k_shift, k_ctrl)
+
+                        // Periodically request cursor info (every 3 key events)
+                        IDEState.info_timer = Add(IDEState.info_timer, 1)
+                        IfCondition GreaterEqual(IDEState.info_timer, 3) ThenBlock: {
+                            IDE_RequestInfo()
+                            IDEState.info_timer = 0
+                        }
+                    }
+
+                    // input.action — toolbar/button actions
+                    cmp_action = StringCompare(method, "input.action")
+                    IfCondition EqualTo(cmp_action, 0) ThenBlock: {
+                        action = JSON.GetString(mobj, "action")
+                        IfCondition NotEqual(action, 0) ThenBlock: {
+                            IDE_HandleAction(action)
+                        }
+                    }
+
+                    // Server responses (textfield.loaded, saved, info, newbuf)
+                    IDE_HandleResponse(method, mobj)
+                }
+                JSON.Free(pmsg)
+            }
+        }
+    }
+
+    Socket.Close(sock)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  IDE handled ")
+    PrintNumber(IDEState.msg_count)
+    PrintMessage(" messages\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)

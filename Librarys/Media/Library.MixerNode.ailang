@@ -1,0 +1,350 @@
+// Library.MixerNode.ailang
+// N-input audio mixer node — reads from multiple decoded audio frame rings,
+// mixes all inputs with per-input volume + master volume, outputs to
+// the AudioEngine (ALSA sink).
+//
+// Replaces the flat 3-bus mixer for node-graph-based pipelines.
+// Each audio decoder connects to a mixer input slot. DAW/NLE can have
+// 32+ tracks feeding the same mixer.
+//
+// Mix formula (per sample):
+//   out = clamp16( sum( input[i].sample * input[i].vol / 256 ) * master / 256 )
+//
+// Volume: 0-1024 fixed-point (256 = unity, 512 = 2x, 1024 = 4x)
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Media.CodecRing
+LibraryImport.Display.Render.AudioEngine
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.MNConst {
+    "MAX_INPUTS":      Initialize=32
+    "INPUT_ENTRY_SIZE": Initialize=16
+    "FRAME_DESC_SIZE": Initialize=20
+}
+
+// Per-input slot: [0] ring_ptr(8) [8] volume(8)
+FixedPool.MNOff {
+    "RING_PTR": Initialize=0
+    "VOLUME":   Initialize=8
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.MixerNodeState {
+    "input_table":     Initialize=0
+    "input_count":     Initialize=0
+    "master_vol":      Initialize=256
+    "mix_buf":         Initialize=0
+    "mix_buf_size":    Initialize=0
+    "samples_written": Initialize=0
+    "initialized":     Initialize=0
+}
+
+// =============================================================================
+// INIT — allocate input table and mix buffer
+// =============================================================================
+Function.MixerNode_Init {
+    Body: {
+        tbl_sz = Multiply(MNConst.MAX_INPUTS, MNConst.INPUT_ENTRY_SIZE)
+        MixerNodeState.input_table = Allocate(tbl_sz)
+        MemorySet(MixerNodeState.input_table, 0, tbl_sz)
+
+        // Mix buffer: one ALSA period worth of stereo S16LE
+        // period_size * channels * 2 bytes = 1024 * 2 * 2 = 4096
+        mix_sz = Multiply(Multiply(AudioState.period_size, AudioState.channels), 2)
+        MixerNodeState.mix_buf      = Allocate(mix_sz)
+        MixerNodeState.mix_buf_size = mix_sz
+        MemorySet(MixerNodeState.mix_buf, 0, mix_sz)
+
+        MixerNodeState.input_count    = 0
+        MixerNodeState.master_vol     = 256
+        MixerNodeState.samples_written = 0
+        MixerNodeState.initialized    = 1
+
+        PrintMessage("[MixerNode] Init: max_inputs=")
+        PrintNumber(MNConst.MAX_INPUTS)
+        PrintMessage(" mix_buf=")
+        PrintNumber(mix_sz)
+        PrintMessage(" bytes\n")
+    }
+}
+
+// =============================================================================
+// ADD INPUT — connect a decoded audio frame ring to a mixer slot
+// Returns slot index or -1
+// =============================================================================
+Function.MixerNode_AddInput {
+    Input: ring_ptr: Address
+    Input: volume:   Integer
+    Output: Integer
+    Body: {
+        cnt = MixerNodeState.input_count
+        IfCondition GreaterEqual(cnt, MNConst.MAX_INPUTS) ThenBlock: {
+            PrintMessage("[MixerNode] No free input slots\n")
+            ReturnValue(-1)
+        }
+
+        entry = Add(MixerNodeState.input_table, Multiply(cnt, MNConst.INPUT_ENTRY_SIZE))
+        StoreValue(Add(entry, MNOff.RING_PTR), ring_ptr)
+        StoreValue(Add(entry, MNOff.VOLUME),   volume)
+        MixerNodeState.input_count = Add(cnt, 1)
+
+        PrintMessage("[MixerNode] Input ")
+        PrintNumber(cnt)
+        PrintMessage(" added, vol=")
+        PrintNumber(volume)
+        PrintMessage("\n")
+
+        ReturnValue(cnt)
+    }
+}
+
+// =============================================================================
+// REMOVE INPUT — disconnect a ring from the mixer
+// =============================================================================
+Function.MixerNode_RemoveInput {
+    Input: slot: Integer
+    Body: {
+        cnt = MixerNodeState.input_count
+        IfCondition Or(LessThan(slot, 0), GreaterEqual(slot, cnt)) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        entry = Add(MixerNodeState.input_table, Multiply(slot, MNConst.INPUT_ENTRY_SIZE))
+
+        // Shift remaining entries down
+        i = slot
+        WhileLoop LessThan(i, Subtract(cnt, 1)) {
+            src = Add(MixerNodeState.input_table, Multiply(Add(i, 1), MNConst.INPUT_ENTRY_SIZE))
+            dst = Add(MixerNodeState.input_table, Multiply(i, MNConst.INPUT_ENTRY_SIZE))
+            MemoryCopy(dst, src, MNConst.INPUT_ENTRY_SIZE)
+            i = Add(i, 1)
+        }
+
+        MixerNodeState.input_count = Subtract(cnt, 1)
+
+        // Zero the now-unused last slot
+        last = Add(MixerNodeState.input_table, Multiply(Subtract(cnt, 1), MNConst.INPUT_ENTRY_SIZE))
+        MemorySet(last, 0, MNConst.INPUT_ENTRY_SIZE)
+    }
+}
+
+// =============================================================================
+// SET INPUT VOLUME
+// =============================================================================
+Function.MixerNode_SetInputVol {
+    Input: slot: Integer
+    Input: vol:  Integer
+    Body: {
+        IfCondition LessThan(vol, 0) ThenBlock: { vol = 0 }
+        IfCondition GreaterThan(vol, 1024) ThenBlock: { vol = 1024 }
+
+        cnt = MixerNodeState.input_count
+        IfCondition And(GreaterEqual(slot, 0), LessThan(slot, cnt)) ThenBlock: {
+            entry = Add(MixerNodeState.input_table, Multiply(slot, MNConst.INPUT_ENTRY_SIZE))
+            StoreValue(Add(entry, MNOff.VOLUME), vol)
+        }
+    }
+}
+
+// =============================================================================
+// SET MASTER VOLUME
+// =============================================================================
+Function.MixerNode_SetMasterVol {
+    Input: vol: Integer
+    Body: {
+        IfCondition LessThan(vol, 0) ThenBlock: { vol = 0 }
+        IfCondition GreaterThan(vol, 1024) ThenBlock: { vol = 1024 }
+        MixerNodeState.master_vol = vol
+    }
+}
+
+// =============================================================================
+// READ S16LE SAMPLE from a frame ring's decoded audio data
+// buf = pointer to CRFrameDesc payload (after the descriptor header)
+// off = byte offset into the PCM data
+// Returns signed 16-bit value
+// =============================================================================
+Function.MixerNode_ReadS16 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        lo = GetByte(buf, off)
+        hi = GetByte(buf, Add(off, 1))
+        val = BitwiseOr(lo, ShiftLeft(hi, 8))
+        IfCondition GreaterEqual(val, 32768) ThenBlock: {
+            val = Subtract(val, 65536)
+        }
+        ReturnValue(val)
+    }
+}
+
+// =============================================================================
+// CLAMP S16
+// =============================================================================
+Function.MixerNode_Clamp16 {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(val, 32767) ThenBlock: { ReturnValue(32767) }
+        IfCondition LessThan(val, -32768) ThenBlock: { ReturnValue(-32768) }
+        ReturnValue(val)
+    }
+}
+
+// =============================================================================
+// TICK — mix one period from all input rings, write to ALSA via AudioEngine
+//
+// Called every ALSA period completion (hw_ns = MediaClock_HWTimeNS).
+// For each input ring, reads available decoded audio frames, mixes into
+// mix_buf, then writes mix_buf to Audio_WriteFrames.
+//
+// Returns number of frames written.
+// =============================================================================
+Function.MixerNode_Tick {
+    Input: hw_ns: Integer
+    Output: Integer
+    Body: {
+        cnt    = MixerNodeState.input_count
+        IfCondition EqualTo(cnt, 0) ThenBlock: { ReturnValue(0) }
+
+        period = AudioState.period_size
+        chans  = AudioState.channels
+        total_samples = Multiply(period, chans)
+        mix    = MixerNodeState.mix_buf
+        mvol   = MixerNodeState.master_vol
+
+        // Zero the mix buffer
+        MemorySet(mix, 0, MixerNodeState.mix_buf_size)
+
+        // Accumulation buffers — use 32-bit intermediate to avoid clipping per-input
+        acc = Allocate(Multiply(total_samples, 4))
+        MemorySet(acc, 0, Multiply(total_samples, 4))
+
+        // For each input, drain one period worth of audio frames
+        inp = 0
+        WhileLoop LessThan(inp, cnt) {
+            entry   = Add(MixerNodeState.input_table, Multiply(inp, MNConst.INPUT_ENTRY_SIZE))
+            ring    = Dereference(Add(entry, MNOff.RING_PTR))
+            vol     = Dereference(Add(entry, MNOff.VOLUME))
+
+            IfCondition And(NotEqual(ring, 0), GreaterThan(vol, 0)) ThenBlock: {
+                // Read available frames from this ring
+                out_len    = Allocate(4)
+                out_type   = Allocate(4)
+                out_flags  = Allocate(4)
+                out_pts_ns = Allocate(8)
+
+                samples_added = 0
+                WhileLoop LessThan(samples_added, total_samples) {
+                    total_rec = CodecRing_PeekHeader(ring, out_len, out_type, out_flags, out_pts_ns)
+                    IfCondition EqualTo(total_rec, 0) ThenBlock: {
+                        // No more frames for this input
+                        ReturnValue(0)
+                    }
+
+                    len = Dereference(out_len, "dword")
+                    buf = Allocate(len)
+                    CodecRing_Consume(ring, buf, len, total_rec)
+
+                    // Skip CRFrameDesc header (20 bytes) to get to PCM data
+                    pcm_start = Add(buf, MNConst.FRAME_DESC_SIZE)
+                    pcm_bytes = Subtract(len, MNConst.FRAME_DESC_SIZE)
+
+                    // Read sample_count from CRFrameDesc
+                    sc = Dereference(Add(buf, 12), "dword")
+                    pcm_samples = Multiply(sc, chans)
+
+                    // Mix samples into accumulator
+                    s = 0
+                    WhileLoop And(LessThan(s, pcm_samples), LessThan(Add(samples_added, s), total_samples)) {
+                        sample = MixerNode_ReadS16(pcm_start, Multiply(s, 2))
+                        scaled = Divide(Multiply(sample, vol), 256)
+                        idx = Add(samples_added, s)
+                        old = Dereference(Add(acc, Multiply(idx, 4)), "sdword")
+                        StoreValue(Add(acc, Multiply(idx, 4)), Add(old, scaled), "dword")
+                        s = Add(s, 1)
+                    }
+
+                    samples_added = Add(samples_added, pcm_samples)
+                    Deallocate(buf, len)
+                }
+
+                Deallocate(out_len, 4)
+                Deallocate(out_type, 4)
+                Deallocate(out_flags, 4)
+                Deallocate(out_pts_ns, 8)
+            }
+            inp = Add(inp, 1)
+        }
+
+        // Apply master volume and clamp to S16LE, write to mix_buf
+        i = 0
+        WhileLoop LessThan(i, total_samples) {
+            raw = Dereference(Add(acc, Multiply(i, 4)), "sdword")
+            out = Divide(Multiply(raw, mvol), 256)
+            out = MixerNode_Clamp16(out)
+
+            // Convert back to unsigned for storage
+            IfCondition LessThan(out, 0) ThenBlock: {
+                out = Add(out, 65536)
+            }
+
+            off = Multiply(i, 2)
+            SetByte(mix, off, BitwiseAnd(out, 255))
+            SetByte(mix, Add(off, 1), BitwiseAnd(ShiftRight(out, 8), 255))
+
+            i = Add(i, 1)
+        }
+
+        Deallocate(acc, Multiply(total_samples, 4))
+
+        // Write mixed period to ALSA
+        written = Audio_WriteFrames(mix, period)
+        IfCondition GreaterThan(written, 0) ThenBlock: {
+            MixerNodeState.samples_written = Add(MixerNodeState.samples_written, written)
+        }
+
+        ReturnValue(written)
+    }
+}
+
+// =============================================================================
+// GET SAMPLES WRITTEN — total frames pushed to ALSA
+// =============================================================================
+Function.MixerNode_GetSamplesWritten {
+    Output: Integer
+    Body: {
+        ReturnValue(MixerNodeState.samples_written)
+    }
+}
+
+// =============================================================================
+// SHUTDOWN
+// =============================================================================
+Function.MixerNode_Shutdown {
+    Body: {
+        IfCondition EqualTo(MixerNodeState.initialized, 0) ThenBlock: { ReturnValue(0) }
+
+        IfCondition NotEqual(MixerNodeState.input_table, 0) ThenBlock: {
+            tbl_sz = Multiply(MNConst.MAX_INPUTS, MNConst.INPUT_ENTRY_SIZE)
+            Deallocate(MixerNodeState.input_table, tbl_sz)
+            MixerNodeState.input_table = 0
+        }
+
+        IfCondition NotEqual(MixerNodeState.mix_buf, 0) ThenBlock: {
+            Deallocate(MixerNodeState.mix_buf, MixerNodeState.mix_buf_size)
+            MixerNodeState.mix_buf = 0
+        }
+
+        MixerNodeState.initialized = 0
+        PrintMessage("[MixerNode] Shutdown complete\n")
+    }
+}

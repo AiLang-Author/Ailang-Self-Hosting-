@@ -279,8 +279,9 @@ def apply_opacity(color, opacity):
 # ============================================================================
 
 class TVGWriter:
-    def __init__(self):
+    def __init__(self, coord_range=0):
         self.buf = bytearray()
+        self.coord_range = coord_range  # 0=i16(default), 3=i32
 
     def write_byte(self, v):
         self.buf.append(v & 0xFF)
@@ -296,10 +297,14 @@ class TVGWriter:
         self.buf.append(v & 0x7F)
 
     def write_unit(self, v):
-        """Write a Unit as i16."""
+        """Write a coordinate unit as i16 or i32 depending on coord_range."""
         iv = int(round(v))
-        iv = max(-32768, min(32767, iv))
-        self.buf += struct.pack("<h", iv)
+        if self.coord_range == 3:  # i32
+            iv = max(-2147483648, min(2147483647, iv))
+            self.buf += struct.pack("<i", iv)
+        else:  # i16 (default)
+            iv = max(-32768, min(32767, iv))
+            self.buf += struct.pack("<h", iv)
 
 
 def segments_from_commands(commands):
@@ -616,19 +621,55 @@ def encode_tvg_widget(draw_ops, width, height, scale_bits=0):
 # LEGACY GLYPH ENCODER (unchanged behavior for font glyphs)
 # ============================================================================
 
-def encode_tvg(paths, width, height, scale_bits=0):
-    """Encode parsed SVG paths as TinyVG binary (single black fill)."""
-    w = TVGWriter()
+def flip_y_paths(paths, height):
+    """Flip Y coordinates in all paths: y → height - y.
+
+    FontForge exports SVG glyphs with Y-up (font convention) where
+    y=0 is the baseline and y=ascent is the top. The TVG rasterizer
+    uses Y-down (screen convention). This function corrects the
+    coordinate system mismatch.
+    """
+    flipped = []
+    for path_cmds in paths:
+        new_cmds = []
+        for cmd, params in path_cmds:
+            if cmd == 'M' or cmd == 'L':
+                new_cmds.append((cmd, [params[0], height - params[1]]))
+            elif cmd == 'C':
+                new_cmds.append((cmd, [
+                    params[0], height - params[1],
+                    params[2], height - params[3],
+                    params[4], height - params[5],
+                ]))
+            elif cmd == 'Q':
+                new_cmds.append((cmd, [
+                    params[0], height - params[1],
+                    params[2], height - params[3],
+                ]))
+            elif cmd == 'Z':
+                new_cmds.append((cmd, []))
+            else:
+                new_cmds.append((cmd, params))
+        flipped.append(new_cmds)
+    return flipped
+
+
+def encode_tvg(paths, width, height, scale_bits=0, coord_range=0):
+    """Encode parsed SVG paths as TinyVG binary (single black fill).
+    coord_range: 0=i16(default), 3=i32.  scale_bits: fractional precision."""
+    w = TVGWriter(coord_range=coord_range)
     w.write_byte(0x72)
     w.write_byte(0x56)
     w.write_byte(1)
 
-    flags = (scale_bits & 0xF) | (0 << 4) | (0 << 6)
+    flags = (scale_bits & 0xF) | (0 << 4) | ((coord_range & 3) << 6)
     w.write_byte(flags)
 
     scale = 1 << scale_bits
-    w.write_unit(int(width * scale))
-    w.write_unit(int(height * scale))
+    # Width and height in the header are UNSCALED design units.
+    # Coordinates in the body are scaled by (1 << scale_bits).
+    w.write_unit(int(round(width)))
+    w.write_unit(int(round(height)))
 
     w.write_varuint(1)
     w.write_byte(0)
@@ -661,24 +702,24 @@ def encode_tvg(paths, width, height, scale_bits=0):
             sx, sy = start[1][0], start[1][1]
         else:
             sx, sy = 0, 0
-        w.write_unit(int(sx * scale))
-        w.write_unit(int(sy * scale))
+        w.write_unit(round(sx * scale))
+        w.write_unit(round(sy * scale))
 
         for cmd, params in seg:
             if cmd == 'M':
                 continue
             if cmd == 'L':
                 w.write_byte(0)
-                w.write_unit(int(params[0] * scale))
-                w.write_unit(int(params[1] * scale))
+                w.write_unit(round(params[0] * scale))
+                w.write_unit(round(params[1] * scale))
             elif cmd == 'C':
                 w.write_byte(3)
                 for p in params:
-                    w.write_unit(int(p * scale))
+                    w.write_unit(round(p * scale))
             elif cmd == 'Q':
                 w.write_byte(7)
                 for p in params:
-                    w.write_unit(int(p * scale))
+                    w.write_unit(round(p * scale))
             elif cmd == 'Z':
                 w.write_byte(6)
 
@@ -1062,7 +1103,10 @@ def convert_file(svg_path, tvg_path):
         paths, width, height = parse_svg_file(svg_path)
         if not paths:
             return False
-        tvg_data = encode_tvg(paths, width, height)
+        # Use i32 coords + 8 fractional bits for full precision on curves.
+        # 64-bit AILang runtime has plenty of headroom; this preserves
+        # sub-unit detail (e.g. 19.5 → 4992 instead of truncated 19).
+        tvg_data = encode_tvg(paths, width, height, scale_bits=8, coord_range=3)
 
     with open(tvg_path, 'wb') as f:
         f.write(tvg_data)

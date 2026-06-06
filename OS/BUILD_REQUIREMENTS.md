@@ -73,8 +73,9 @@ rootfs_overlay/
       DejaVuSans.vif        — Primary UI font (vector format)
       AlteixSans.vif        — Secondary font
     icons/
-      default.vif           — Default app icon
-      silver_atoms.vif      — System icon set
+      default.vif           — General icons (radix 16x16 pack)
+      app_icons.vif         — Application icons (32x32 tvg pack)
+      silver_atoms.vif      — System widget atoms (silver look)
   config/
     keymap.cfg              — CRITICAL: display server opens "config/keymap.cfg"
                               relative to cwd (which is / on boot).

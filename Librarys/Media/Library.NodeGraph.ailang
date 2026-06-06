@@ -1,0 +1,814 @@
+// Library.NodeGraph.ailang
+// Node graph manager — wires demux → decode → mix → present pipelines.
+//
+// Every media operation is a graph of nodes connected by shm rings.
+// Each node is a standalone process (fork/exec'd worker) with typed
+// input/output ports. The graph manager tracks topology, handles
+// lifecycle (create/connect/start/stop/destroy), and ticks all
+// PRESENTER nodes on each ALSA period completion.
+//
+// Node types:
+//   SOURCE    (1) — demux_worker: file → N packet rings
+//   DECODER   (2) — codec worker: 1 packet ring → 1 frame ring
+//   MIXER     (3) — mixer node: N audio frame rings → 1 mixed PCM ring
+//   PRESENTER (4) — terminal: 1 frame ring → ALSA sink or ShmCanvas
+//   EFFECT    (5) — future: 1 frame ring → 1 frame ring
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+LibraryImport.Arena
+LibraryImport.StringUtils
+LibraryImport.Media.CodecRing
+LibraryImport.Media.MediaClock
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.NGConst {
+    "MAX_NODES":     Initialize=64
+    "MAX_EDGES":     Initialize=128
+    "MAX_PIPELINES": Initialize=16
+    "NODE_SIZE":     Initialize=128
+    "EDGE_SIZE":     Initialize=40
+    "PIPE_SIZE":     Initialize=136
+
+    // Node types
+    "TYPE_SOURCE":    Initialize=1
+    "TYPE_DECODER":   Initialize=2
+    "TYPE_MIXER":     Initialize=3
+    "TYPE_PRESENTER": Initialize=4
+    "TYPE_EFFECT":    Initialize=5
+
+    // Node states
+    "STATE_IDLE":     Initialize=0
+    "STATE_RUNNING":  Initialize=1
+    "STATE_PAUSED":   Initialize=2
+    "STATE_STOPPED":  Initialize=3
+}
+
+// Node entry offsets (128 bytes)
+FixedPool.NGNode {
+    "ID":           Initialize=0
+    "TYPE":         Initialize=8
+    "STATE":        Initialize=16
+    "PID":          Initialize=24
+    "CLOCK_PTR":    Initialize=32
+    "INPUT_COUNT":  Initialize=40
+    "OUTPUT_COUNT": Initialize=48
+    "INPUTS":       Initialize=56
+    "OUTPUTS":      Initialize=88
+    "PIPELINE_ID":  Initialize=120
+}
+
+// Edge entry offsets (40 bytes)
+FixedPool.NGEdge {
+    "SRC_NODE": Initialize=0
+    "SRC_PORT": Initialize=8
+    "DST_NODE": Initialize=16
+    "DST_PORT": Initialize=24
+    "RING_PTR": Initialize=32
+}
+
+// Pipeline entry offsets (136 bytes)
+//   [0]   pipeline_id   8
+//   [8]   state         8
+//   [16]  node_count    8
+//   [24]  node_ids[14]  112  (up to 14 nodes per pipeline)
+FixedPool.NGPipe {
+    "ID":         Initialize=0
+    "STATE":      Initialize=8
+    "NODE_COUNT": Initialize=16
+    "NODE_IDS":   Initialize=24
+}
+
+// Syscall constants for fork/exec/kill
+FixedPool.NGSys {
+    "SYS_FORK":     Initialize=57
+    "SYS_EXECVE":   Initialize=59
+    "SYS_KILL":     Initialize=62
+    "SYS_WAITPID":  Initialize=61
+    "SIGTERM":      Initialize=15
+    "SIGSTOP":      Initialize=19
+    "SIGCONT":      Initialize=18
+}
+
+// =============================================================================
+// STATE
+// =============================================================================
+FixedPool.NGState {
+    "node_table":     Initialize=0
+    "edge_table":     Initialize=0
+    "pipe_table":     Initialize=0
+    "next_node_id":   Initialize=1
+    "next_edge_id":   Initialize=1
+    "next_pipe_id":   Initialize=1
+    "initialized":    Initialize=0
+}
+
+// =============================================================================
+// INIT
+// =============================================================================
+Function.NodeGraph_Init {
+    Body: {
+        node_sz = Multiply(NGConst.MAX_NODES, NGConst.NODE_SIZE)
+        edge_sz = Multiply(NGConst.MAX_EDGES, NGConst.EDGE_SIZE)
+        pipe_sz = Multiply(NGConst.MAX_PIPELINES, NGConst.PIPE_SIZE)
+
+        NGState.node_table = Allocate(node_sz)
+        MemorySet(NGState.node_table, 0, node_sz)
+
+        NGState.edge_table = Allocate(edge_sz)
+        MemorySet(NGState.edge_table, 0, edge_sz)
+
+        NGState.pipe_table = Allocate(pipe_sz)
+        MemorySet(NGState.pipe_table, 0, pipe_sz)
+
+        NGState.next_node_id = 1
+        NGState.next_edge_id = 1
+        NGState.next_pipe_id = 1
+        NGState.initialized  = 1
+
+        PrintMessage("[NodeGraph] Init: ")
+        PrintNumber(NGConst.MAX_NODES)
+        PrintMessage(" nodes, ")
+        PrintNumber(NGConst.MAX_EDGES)
+        PrintMessage(" edges, ")
+        PrintNumber(NGConst.MAX_PIPELINES)
+        PrintMessage(" pipelines\n")
+    }
+}
+
+// =============================================================================
+// NODE TABLE ACCESS
+// =============================================================================
+Function.NodeGraph_NodePtr {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(NGState.node_table, Multiply(slot, NGConst.NODE_SIZE)))
+    }
+}
+
+Function.NodeGraph_EdgePtr {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(NGState.edge_table, Multiply(slot, NGConst.EDGE_SIZE)))
+    }
+}
+
+Function.NodeGraph_PipePtr {
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Add(NGState.pipe_table, Multiply(slot, NGConst.PIPE_SIZE)))
+    }
+}
+
+// =============================================================================
+// FIND FREE SLOT — scan table for first entry with id==0
+// =============================================================================
+Function.NodeGraph_FindFreeNode {
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_NODES) {
+            ptr = NodeGraph_NodePtr(i)
+            nid = Dereference(Add(ptr, NGNode.ID))
+            IfCondition EqualTo(nid, 0) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.NodeGraph_FindFreeEdge {
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_EDGES) {
+            ptr = NodeGraph_EdgePtr(i)
+            src = Dereference(Add(ptr, NGEdge.SRC_NODE))
+            dst = Dereference(Add(ptr, NGEdge.DST_NODE))
+            IfCondition And(EqualTo(src, 0), EqualTo(dst, 0)) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+Function.NodeGraph_FindFreePipe {
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_PIPELINES) {
+            ptr = NodeGraph_PipePtr(i)
+            pid = Dereference(Add(ptr, NGPipe.ID))
+            IfCondition EqualTo(pid, 0) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// FIND NODE BY ID — returns slot index, -1 if not found
+// =============================================================================
+Function.NodeGraph_FindNodeByID {
+    Input: node_id: Integer
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_NODES) {
+            ptr = NodeGraph_NodePtr(i)
+            nid = Dereference(Add(ptr, NGNode.ID))
+            IfCondition EqualTo(nid, node_id) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// CREATE NODE — allocate a node slot, assign type
+// Returns node_id (>0) or -1 on failure
+// =============================================================================
+Function.NodeGraph_CreateNode {
+    Input: node_type: Integer
+    Output: Integer
+    Body: {
+        slot = NodeGraph_FindFreeNode()
+        IfCondition LessThan(slot, 0) ThenBlock: {
+            PrintMessage("[NodeGraph] No free node slots\n")
+            ReturnValue(-1)
+        }
+
+        nid = NGState.next_node_id
+        NGState.next_node_id = Add(nid, 1)
+
+        ptr = NodeGraph_NodePtr(slot)
+        StoreValue(Add(ptr, NGNode.ID),           nid)
+        StoreValue(Add(ptr, NGNode.TYPE),          node_type)
+        StoreValue(Add(ptr, NGNode.STATE),         NGConst.STATE_IDLE)
+        StoreValue(Add(ptr, NGNode.PID),           0)
+        StoreValue(Add(ptr, NGNode.CLOCK_PTR),     0)
+        StoreValue(Add(ptr, NGNode.INPUT_COUNT),   0)
+        StoreValue(Add(ptr, NGNode.OUTPUT_COUNT),  0)
+        StoreValue(Add(ptr, NGNode.PIPELINE_ID),   0)
+
+        PrintMessage("[NodeGraph] Created node ")
+        PrintNumber(nid)
+        PrintMessage(" type=")
+        PrintNumber(node_type)
+        PrintMessage("\n")
+
+        ReturnValue(nid)
+    }
+}
+
+// =============================================================================
+// CONNECT — wire src_node output port to dst_node input port via a ring
+// The ring pointer is supplied by the caller (already created via CodecRing)
+// Returns edge_id or -1
+// =============================================================================
+Function.NodeGraph_Connect {
+    Input: src_node_id: Integer
+    Input: src_port:    Integer
+    Input: dst_node_id: Integer
+    Input: dst_port:    Integer
+    Input: ring_ptr:    Integer
+    Output: Integer
+    Body: {
+        eslot = NodeGraph_FindFreeEdge()
+        IfCondition LessThan(eslot, 0) ThenBlock: {
+            PrintMessage("[NodeGraph] No free edge slots\n")
+            ReturnValue(-1)
+        }
+
+        eid = NGState.next_edge_id
+        NGState.next_edge_id = Add(eid, 1)
+
+        eptr = NodeGraph_EdgePtr(eslot)
+        StoreValue(Add(eptr, NGEdge.SRC_NODE), src_node_id)
+        StoreValue(Add(eptr, NGEdge.SRC_PORT), src_port)
+        StoreValue(Add(eptr, NGEdge.DST_NODE), dst_node_id)
+        StoreValue(Add(eptr, NGEdge.DST_PORT), dst_port)
+        StoreValue(Add(eptr, NGEdge.RING_PTR), ring_ptr)
+
+        // Update node output/input ring pointers
+        src_slot = NodeGraph_FindNodeByID(src_node_id)
+        IfCondition GreaterEqual(src_slot, 0) ThenBlock: {
+            sptr = NodeGraph_NodePtr(src_slot)
+            oc = Dereference(Add(sptr, NGNode.OUTPUT_COUNT))
+            IfCondition LessThan(oc, 4) ThenBlock: {
+                StoreValue(Add(Add(sptr, NGNode.OUTPUTS), Multiply(oc, 8)), ring_ptr)
+                StoreValue(Add(sptr, NGNode.OUTPUT_COUNT), Add(oc, 1))
+            }
+        }
+
+        dst_slot = NodeGraph_FindNodeByID(dst_node_id)
+        IfCondition GreaterEqual(dst_slot, 0) ThenBlock: {
+            dptr = NodeGraph_NodePtr(dst_slot)
+            ic = Dereference(Add(dptr, NGNode.INPUT_COUNT))
+            IfCondition LessThan(ic, 4) ThenBlock: {
+                StoreValue(Add(Add(dptr, NGNode.INPUTS), Multiply(ic, 8)), ring_ptr)
+                StoreValue(Add(dptr, NGNode.INPUT_COUNT), Add(ic, 1))
+            }
+        }
+
+        PrintMessage("[NodeGraph] Edge ")
+        PrintNumber(eid)
+        PrintMessage(": node ")
+        PrintNumber(src_node_id)
+        PrintMessage("[")
+        PrintNumber(src_port)
+        PrintMessage("] → node ")
+        PrintNumber(dst_node_id)
+        PrintMessage("[")
+        PrintNumber(dst_port)
+        PrintMessage("]\n")
+
+        ReturnValue(eid)
+    }
+}
+
+// =============================================================================
+// START NODE — fork/exec the appropriate worker process
+// worker_path: path to the worker binary
+// session_id:  passed as argv[1] to the worker
+// extra_arg:   optional argv[2] (e.g. file path for demux_worker), 0 if none
+// =============================================================================
+Function.NodeGraph_StartNode {
+    Input: node_id:     Integer
+    Input: worker_path: Address
+    Input: session_id:  Integer
+    Input: extra_arg:   Address
+    Body: {
+        slot = NodeGraph_FindNodeByID(node_id)
+        IfCondition LessThan(slot, 0) ThenBlock: {
+            PrintMessage("[NodeGraph] StartNode: node not found\n")
+            ReturnValue(-1)
+        }
+
+        ptr = NodeGraph_NodePtr(slot)
+        state = Dereference(Add(ptr, NGNode.STATE))
+        IfCondition NotEqual(state, NGConst.STATE_IDLE) ThenBlock: {
+            PrintMessage("[NodeGraph] StartNode: node not idle\n")
+            ReturnValue(-1)
+        }
+
+        // Convert session_id to string
+        sid_str = Allocate(12)
+        IntToString(session_id, sid_str, 12)
+
+        // Build argv array
+        // argv[0] = worker_path, argv[1] = session_id_str, argv[2] = extra_arg or NULL, argv[3] = NULL
+        argv = Allocate(32)
+        StoreValue(Add(argv, 0),  worker_path)
+        StoreValue(Add(argv, 8),  sid_str)
+        IfCondition NotEqual(extra_arg, 0) ThenBlock: {
+            StoreValue(Add(argv, 16), extra_arg)
+            StoreValue(Add(argv, 24), 0)
+        } ElseBlock: {
+            StoreValue(Add(argv, 16), 0)
+        }
+
+        pid = SystemCall(NGSys.SYS_FORK)
+        IfCondition EqualTo(pid, 0) ThenBlock: {
+            // Child — exec the worker
+            SystemCall(NGSys.SYS_EXECVE, worker_path, argv, 0)
+            // If execve returns, it failed
+            HaltProgram
+        }
+
+        IfCondition LessThan(pid, 0) ThenBlock: {
+            PrintMessage("[NodeGraph] fork failed\n")
+            Deallocate(sid_str, 12)
+            Deallocate(argv, 32)
+            ReturnValue(-1)
+        }
+
+        // Parent — record PID and mark running
+        StoreValue(Add(ptr, NGNode.PID),   pid)
+        StoreValue(Add(ptr, NGNode.STATE), NGConst.STATE_RUNNING)
+
+        PrintMessage("[NodeGraph] Started node ")
+        PrintNumber(node_id)
+        PrintMessage(" pid=")
+        PrintNumber(pid)
+        PrintMessage(" worker=")
+        PrintString(worker_path)
+        PrintMessage("\n")
+
+        Deallocate(sid_str, 12)
+        Deallocate(argv, 32)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// STOP NODE — send SIGTERM to worker, mark STOPPED
+// =============================================================================
+Function.NodeGraph_StopNode {
+    Input: node_id: Integer
+    Body: {
+        slot = NodeGraph_FindNodeByID(node_id)
+        IfCondition LessThan(slot, 0) ThenBlock: { ReturnValue(0) }
+
+        ptr = NodeGraph_NodePtr(slot)
+        pid   = Dereference(Add(ptr, NGNode.PID))
+        state = Dereference(Add(ptr, NGNode.STATE))
+
+        IfCondition And(GreaterThan(pid, 0), NotEqual(state, NGConst.STATE_STOPPED)) ThenBlock: {
+            SystemCall(NGSys.SYS_KILL, pid, NGSys.SIGTERM)
+            // Reap child (non-blocking — WNOHANG=1)
+            SystemCall(NGSys.SYS_WAITPID, pid, 0, 1)
+        }
+
+        StoreValue(Add(ptr, NGNode.STATE), NGConst.STATE_STOPPED)
+        StoreValue(Add(ptr, NGNode.PID),   0)
+    }
+}
+
+// =============================================================================
+// PAUSE / RESUME NODE — SIGSTOP / SIGCONT
+// =============================================================================
+Function.NodeGraph_PauseNode {
+    Input: node_id: Integer
+    Body: {
+        slot = NodeGraph_FindNodeByID(node_id)
+        IfCondition LessThan(slot, 0) ThenBlock: { ReturnValue(0) }
+
+        ptr   = NodeGraph_NodePtr(slot)
+        pid   = Dereference(Add(ptr, NGNode.PID))
+        state = Dereference(Add(ptr, NGNode.STATE))
+
+        IfCondition And(GreaterThan(pid, 0), EqualTo(state, NGConst.STATE_RUNNING)) ThenBlock: {
+            SystemCall(NGSys.SYS_KILL, pid, NGSys.SIGSTOP)
+            StoreValue(Add(ptr, NGNode.STATE), NGConst.STATE_PAUSED)
+        }
+    }
+}
+
+Function.NodeGraph_ResumeNode {
+    Input: node_id: Integer
+    Body: {
+        slot = NodeGraph_FindNodeByID(node_id)
+        IfCondition LessThan(slot, 0) ThenBlock: { ReturnValue(0) }
+
+        ptr   = NodeGraph_NodePtr(slot)
+        pid   = Dereference(Add(ptr, NGNode.PID))
+        state = Dereference(Add(ptr, NGNode.STATE))
+
+        IfCondition And(GreaterThan(pid, 0), EqualTo(state, NGConst.STATE_PAUSED)) ThenBlock: {
+            SystemCall(NGSys.SYS_KILL, pid, NGSys.SIGCONT)
+            StoreValue(Add(ptr, NGNode.STATE), NGConst.STATE_RUNNING)
+        }
+    }
+}
+
+// =============================================================================
+// DESTROY NODE — stop if running, clear slot
+// =============================================================================
+Function.NodeGraph_DestroyNode {
+    Input: node_id: Integer
+    Body: {
+        slot = NodeGraph_FindNodeByID(node_id)
+        IfCondition LessThan(slot, 0) ThenBlock: { ReturnValue(0) }
+
+        NodeGraph_StopNode(node_id)
+
+        ptr = NodeGraph_NodePtr(slot)
+        MemorySet(ptr, 0, NGConst.NODE_SIZE)
+
+        // Clear edges referencing this node
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_EDGES) {
+            eptr = NodeGraph_EdgePtr(i)
+            src  = Dereference(Add(eptr, NGEdge.SRC_NODE))
+            dst  = Dereference(Add(eptr, NGEdge.DST_NODE))
+            IfCondition Or(EqualTo(src, node_id), EqualTo(dst, node_id)) ThenBlock: {
+                MemorySet(eptr, 0, NGConst.EDGE_SIZE)
+            }
+            i = Add(i, 1)
+        }
+
+        PrintMessage("[NodeGraph] Destroyed node ")
+        PrintNumber(node_id)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// PIPELINE — group of connected nodes that form a complete media path
+// =============================================================================
+Function.NodeGraph_CreatePipeline {
+    Output: Integer
+    Body: {
+        slot = NodeGraph_FindFreePipe()
+        IfCondition LessThan(slot, 0) ThenBlock: {
+            PrintMessage("[NodeGraph] No free pipeline slots\n")
+            ReturnValue(-1)
+        }
+
+        pid = NGState.next_pipe_id
+        NGState.next_pipe_id = Add(pid, 1)
+
+        pptr = NodeGraph_PipePtr(slot)
+        StoreValue(Add(pptr, NGPipe.ID),         pid)
+        StoreValue(Add(pptr, NGPipe.STATE),       NGConst.STATE_IDLE)
+        StoreValue(Add(pptr, NGPipe.NODE_COUNT),  0)
+
+        PrintMessage("[NodeGraph] Created pipeline ")
+        PrintNumber(pid)
+        PrintMessage("\n")
+        ReturnValue(pid)
+    }
+}
+
+// Add a node to a pipeline
+Function.NodeGraph_PipeAddNode {
+    Input: pipeline_id: Integer
+    Input: node_id:     Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_PIPELINES) {
+            pptr = NodeGraph_PipePtr(i)
+            pid  = Dereference(Add(pptr, NGPipe.ID))
+            IfCondition EqualTo(pid, pipeline_id) ThenBlock: {
+                nc = Dereference(Add(pptr, NGPipe.NODE_COUNT))
+                IfCondition LessThan(nc, 14) ThenBlock: {
+                    StoreValue(Add(Add(pptr, NGPipe.NODE_IDS), Multiply(nc, 8)), node_id)
+                    StoreValue(Add(pptr, NGPipe.NODE_COUNT), Add(nc, 1))
+
+                    // Tag the node with its pipeline
+                    nslot = NodeGraph_FindNodeByID(node_id)
+                    IfCondition GreaterEqual(nslot, 0) ThenBlock: {
+                        nptr = NodeGraph_NodePtr(nslot)
+                        StoreValue(Add(nptr, NGNode.PIPELINE_ID), pipeline_id)
+                    }
+                }
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// STOP PIPELINE — stop all nodes in a pipeline
+// =============================================================================
+Function.NodeGraph_StopPipeline {
+    Input: pipeline_id: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_PIPELINES) {
+            pptr = NodeGraph_PipePtr(i)
+            pid  = Dereference(Add(pptr, NGPipe.ID))
+            IfCondition EqualTo(pid, pipeline_id) ThenBlock: {
+                nc = Dereference(Add(pptr, NGPipe.NODE_COUNT))
+                j = 0
+                WhileLoop LessThan(j, nc) {
+                    nid = Dereference(Add(Add(pptr, NGPipe.NODE_IDS), Multiply(j, 8)))
+                    NodeGraph_StopNode(nid)
+                    j = Add(j, 1)
+                }
+                StoreValue(Add(pptr, NGPipe.STATE), NGConst.STATE_STOPPED)
+                PrintMessage("[NodeGraph] Stopped pipeline ")
+                PrintNumber(pipeline_id)
+                PrintMessage("\n")
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// PAUSE / RESUME PIPELINE
+// =============================================================================
+Function.NodeGraph_PausePipeline {
+    Input: pipeline_id: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_PIPELINES) {
+            pptr = NodeGraph_PipePtr(i)
+            pid  = Dereference(Add(pptr, NGPipe.ID))
+            IfCondition EqualTo(pid, pipeline_id) ThenBlock: {
+                nc = Dereference(Add(pptr, NGPipe.NODE_COUNT))
+                j = 0
+                WhileLoop LessThan(j, nc) {
+                    nid = Dereference(Add(Add(pptr, NGPipe.NODE_IDS), Multiply(j, 8)))
+                    NodeGraph_PauseNode(nid)
+                    j = Add(j, 1)
+                }
+                StoreValue(Add(pptr, NGPipe.STATE), NGConst.STATE_PAUSED)
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.NodeGraph_ResumePipeline {
+    Input: pipeline_id: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_PIPELINES) {
+            pptr = NodeGraph_PipePtr(i)
+            pid  = Dereference(Add(pptr, NGPipe.ID))
+            IfCondition EqualTo(pid, pipeline_id) ThenBlock: {
+                nc = Dereference(Add(pptr, NGPipe.NODE_COUNT))
+                j = 0
+                WhileLoop LessThan(j, nc) {
+                    nid = Dereference(Add(Add(pptr, NGPipe.NODE_IDS), Multiply(j, 8)))
+                    NodeGraph_ResumeNode(nid)
+                    j = Add(j, 1)
+                }
+                StoreValue(Add(pptr, NGPipe.STATE), NGConst.STATE_RUNNING)
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// DESTROY PIPELINE — stop all nodes, destroy them, clear pipeline slot
+// =============================================================================
+Function.NodeGraph_DestroyPipeline {
+    Input: pipeline_id: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_PIPELINES) {
+            pptr = NodeGraph_PipePtr(i)
+            pid  = Dereference(Add(pptr, NGPipe.ID))
+            IfCondition EqualTo(pid, pipeline_id) ThenBlock: {
+                nc = Dereference(Add(pptr, NGPipe.NODE_COUNT))
+                j = 0
+                WhileLoop LessThan(j, nc) {
+                    nid = Dereference(Add(Add(pptr, NGPipe.NODE_IDS), Multiply(j, 8)))
+                    NodeGraph_DestroyNode(nid)
+                    j = Add(j, 1)
+                }
+                MemorySet(pptr, 0, NGConst.PIPE_SIZE)
+                PrintMessage("[NodeGraph] Destroyed pipeline ")
+                PrintNumber(pipeline_id)
+                PrintMessage("\n")
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// TICK — called every ALSA period completion.
+// Iterates all PRESENTER nodes and drains their input frame rings.
+// hw_ns = the hardware-authoritative clock (MediaClock_HWTimeNS).
+//
+// For audio presenters: read frames from input ring, write PCM to mixer.
+// For video presenters: check if frame PTS <= hw_ns, present to ShmCanvas.
+//
+// The actual drain logic is in MediaCenter since it knows about the
+// mixer and canvas subsystems. NodeGraph_Tick just identifies which
+// presenter nodes need servicing and calls the registered tick callback.
+// =============================================================================
+Function.NodeGraph_Tick {
+    Input: hw_ns: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_NODES) {
+            ptr   = NodeGraph_NodePtr(i)
+            nid   = Dereference(Add(ptr, NGNode.ID))
+            state = Dereference(Add(ptr, NGNode.STATE))
+            ntype = Dereference(Add(ptr, NGNode.TYPE))
+
+            IfCondition And(NotEqual(nid, 0), EqualTo(state, NGConst.STATE_RUNNING)) ThenBlock: {
+                // Presenter nodes: drain frames that are due
+                IfCondition EqualTo(ntype, NGConst.TYPE_PRESENTER) ThenBlock: {
+                    ic = Dereference(Add(ptr, NGNode.INPUT_COUNT))
+                    IfCondition GreaterThan(ic, 0) ThenBlock: {
+                        ring = Dereference(Add(ptr, NGNode.INPUTS))
+                        // Drain frames from input ring
+                        NodeGraph_DrainPresenter(nid, ring, hw_ns)
+                    }
+                }
+
+                // Mixer nodes: mix inputs
+                IfCondition EqualTo(ntype, NGConst.TYPE_MIXER) ThenBlock: {
+                    NodeGraph_TickMixer(nid, hw_ns)
+                }
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+// =============================================================================
+// DRAIN PRESENTER — read frames from ring where PTS <= hw_ns
+// Implemented as a stub — MediaCenter hooks this with actual mixer/canvas logic
+// =============================================================================
+Function.NodeGraph_DrainPresenter {
+    Input: node_id: Integer
+    Input: ring:    Address
+    Input: hw_ns:   Integer
+    Body: {
+        // Peek at frames and present those whose PTS has been reached
+        out_len    = Allocate(4)
+        out_type   = Allocate(4)
+        out_flags  = Allocate(4)
+        out_pts_ns = Allocate(8)
+
+        drained = 0
+        WhileLoop LessThan(drained, 32) {
+            total = CodecRing_PeekHeader(ring, out_len, out_type, out_flags, out_pts_ns)
+            IfCondition EqualTo(total, 0) ThenBlock: {
+                // No more records
+                ReturnValue(0)
+            }
+
+            pts = Dereference(out_pts_ns)
+            IfCondition GreaterThan(pts, hw_ns) ThenBlock: {
+                // Frame not yet due — stop draining
+                ReturnValue(0)
+            }
+
+            len = Dereference(out_len, "dword")
+            flags = Dereference(out_flags, "dword")
+
+            // Consume frame — actual presentation handled by MediaCenter
+            // which reads the frame data and routes to mixer or canvas
+            buf = Allocate(len)
+            CodecRing_Consume(ring, buf, len, total)
+
+            // TODO: MediaCenter callback to present frame
+            // For audio: Mixer_AppWrite(buf + sizeof(CRFrameDesc), pcm_bytes)
+            // For video: ShmCanvas_WriteFrame(canvas_id, buf + sizeof(CRFrameDesc), ...)
+
+            Deallocate(buf, len)
+            drained = Add(drained, 1)
+        }
+
+        Deallocate(out_len, 4)
+        Deallocate(out_type, 4)
+        Deallocate(out_flags, 4)
+        Deallocate(out_pts_ns, 8)
+    }
+}
+
+// =============================================================================
+// TICK MIXER — placeholder for mixer node tick
+// The actual N-input mixer is in Library.MixerNode.ailang
+// =============================================================================
+Function.NodeGraph_TickMixer {
+    Input: node_id: Integer
+    Input: hw_ns:   Integer
+    Body: {
+        // Mixer tick logic delegated to MixerNode library
+        // This is called per-tick for each active mixer node
+    }
+}
+
+// =============================================================================
+// SHUTDOWN — destroy all pipelines and nodes
+// =============================================================================
+Function.NodeGraph_Shutdown {
+    Body: {
+        IfCondition EqualTo(NGState.initialized, 0) ThenBlock: { ReturnValue(0) }
+
+        // Stop all nodes
+        i = 0
+        WhileLoop LessThan(i, NGConst.MAX_NODES) {
+            ptr = NodeGraph_NodePtr(i)
+            nid = Dereference(Add(ptr, NGNode.ID))
+            IfCondition NotEqual(nid, 0) ThenBlock: {
+                NodeGraph_StopNode(nid)
+            }
+            i = Add(i, 1)
+        }
+
+        node_sz = Multiply(NGConst.MAX_NODES, NGConst.NODE_SIZE)
+        edge_sz = Multiply(NGConst.MAX_EDGES, NGConst.EDGE_SIZE)
+        pipe_sz = Multiply(NGConst.MAX_PIPELINES, NGConst.PIPE_SIZE)
+
+        Deallocate(NGState.node_table, node_sz)
+        Deallocate(NGState.edge_table, edge_sz)
+        Deallocate(NGState.pipe_table, pipe_sz)
+
+        NGState.node_table = 0
+        NGState.edge_table = 0
+        NGState.pipe_table = 0
+        NGState.initialized = 0
+
+        PrintMessage("[NodeGraph] Shutdown complete\n")
+    }
+}

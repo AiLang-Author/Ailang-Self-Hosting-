@@ -55,6 +55,7 @@ typedef struct {
 #define CR_FLAG_KEYFRAME  0x0001
 #define CR_FLAG_EOF       0x0002
 #define CR_FLAG_FLUSH     0x0004
+#define CR_FLAG_CONFIG    0x0008  /* codec extradata / config packet (SPS/PPS, ADTS, etc.) */
 
 /* ============================================================
  * Frame descriptor — written as payload for RTYPE_FRAME
