@@ -135,6 +135,10 @@ The kernel cmdline is baked in at compile time (`CONFIG_CMDLINE_OVERRIDE=y`), so
 
 ## QEMU
 
+AILang OS uses **EFI boot only**. Direct kernel boot (`-kernel`/`-append`) does
+not work because `CONFIG_CMDLINE_OVERRIDE=y` bakes `root=PARTUUID=...` into the
+kernel — QEMU's `-append` is ignored, and the PARTUUID won't resolve without GPT.
+
 ```bash
 # EFI boot (default, matches real hardware)
 ~/buildroot/board/ailang_os/run_qemu.sh
@@ -144,7 +148,7 @@ The kernel cmdline is baked in at compile time (`CONFIG_CMDLINE_OVERRIDE=y`), so
 # PG:  psql -h localhost -p 15432 -U bob ailang_system
 ```
 
-The `--kernel` mode does NOT work with the current kernel because `CONFIG_CMDLINE_OVERRIDE=y` ignores the QEMU-provided root= parameter. Use EFI boot.
+See `OS/BUILD_REQUIREMENTS.md` for the full QEMU command line reference.
 
 ## Live Deployment (deploy.sh)
 
