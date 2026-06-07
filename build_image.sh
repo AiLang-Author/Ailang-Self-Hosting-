@@ -122,6 +122,22 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         ok "  settings.x ($(stat -c%s /tmp/settings.x) bytes)"
     fi
 
+    # Service Daemon
+    info "  Compiling svc_daemon.x..."
+    $AILANG OS/ServiceDaemon.ailang -o /tmp/svc_daemon.x 2>&1 | tail -1
+    cp /tmp/svc_daemon.x "$OVERLAY/system/bin/svc_daemon.x"
+    chmod +x "$OVERLAY/system/bin/svc_daemon.x"
+    ok "  svc_daemon.x ($(stat -c%s /tmp/svc_daemon.x) bytes)"
+
+    # User Management
+    if [ -f "Applications/usermgmt_ipc.ailang" ]; then
+        info "  Compiling usermgmt.x..."
+        $AILANG Applications/usermgmt_ipc.ailang -o /tmp/usermgmt.x 2>&1 | tail -1
+        cp /tmp/usermgmt.x "$OVERLAY/system/bin/usermgmt.x"
+        chmod +x "$OVERLAY/system/bin/usermgmt.x"
+        ok "  usermgmt.x ($(stat -c%s /tmp/usermgmt.x) bytes)"
+    fi
+
     # Installer
     if [ -f "Applications/installer_ipc.ailang" ]; then
         info "  Compiling installer_ipc.x..."
@@ -135,6 +151,7 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
     info "  Syncing config files to overlay..."
     for f in config/*.html config/*.cfg; do
         [ -f "$f" ] && cp "$f" "$OVERLAY/$f"
+        [ -f "$f" ] && cp "$f" "$OVERLAY/system/$f"
     done
     ok "  Config files synced"
 else

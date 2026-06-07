@@ -1,0 +1,1023 @@
+// usermgmt_ipc.ailang
+// Standalone IPC User Management application — connects to display server,
+// provides GUI for first-boot setup and ongoing user management.
+//
+// Modes:
+//   --setup : First-boot mode — forces creation of admin account to replace
+//             the default "user" account. Launched automatically by ServiceDaemon
+//             when setup_complete = 'false'.
+//   (none)  : Normal mode — requires re-authentication, then allows
+//             create/delete users, change passwords, manage security.
+//
+// Protocol:
+//   1. Connect to /tmp/ailang_display.sock
+//   2. Send {"method":"register","service":"usermgmt"}
+//   3. Send {"method":"window.create",...} with appropriate HTML
+//   4. Service loop: handle input.action messages
+//   5. On window.closed → exit
+//
+// Build: ./ailang.x Applications/usermgmt_ipc.ailang -o usermgmt.x
+// Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Socket
+LibraryImport.StringUtils
+LibraryImport.JSON
+LibraryImport.Arrays
+LibraryImport.Hash
+LibraryImport.PostgreSQL_Complete
+
+FixedPool.UMState {
+    "running":      Initialize=1
+    "win_id":       Initialize=0
+    "sock":         Initialize=0
+    "pg_conn":      Initialize=0
+    "msg_count":    Initialize=0
+    "setup_mode":   Initialize=0
+    "authenticated": Initialize=0
+    "current_user": Initialize=0
+    "current_user_len": Initialize=0
+    "edit_mode":    Initialize=0, CanChange=True
+}
+
+// Character buffers for keyboard input (same pattern as wifi_ipc)
+FixedPool.UMUser {
+    "buf":  Initialize=0, CanChange=True
+    "len":  Initialize=0, CanChange=True
+    "max":  Initialize=63
+}
+FixedPool.UMPass {
+    "buf":  Initialize=0, CanChange=True
+    "len":  Initialize=0, CanChange=True
+    "max":  Initialize=63
+}
+FixedPool.UMConf {
+    "buf":  Initialize=0, CanChange=True
+    "len":  Initialize=0, CanChange=True
+    "max":  Initialize=63
+}
+
+// =============================================================================
+// SQL ESCAPE — double single-quotes to prevent SQL injection
+// =============================================================================
+Function.UM_SqlEscape {
+    Input: dest: Address
+    Input: off: Integer
+    Input: src: Address
+    Input: srclen: Integer
+    Output: Integer
+    Body: {
+        i = 0
+        pos = off
+        WhileLoop LessThan(i, srclen) {
+            ch = GetByte(src, i)
+            IfCondition EqualTo(ch, 39) ThenBlock: {
+                SetByte(dest, pos, 39)
+                pos = Add(pos, 1)
+                SetByte(dest, pos, 39)
+                pos = Add(pos, 1)
+            } ElseBlock: {
+                SetByte(dest, pos, ch)
+                pos = Add(pos, 1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(pos)
+    }
+}
+
+// =============================================================================
+// INT TO STR — convert integer to decimal string, returns length
+// =============================================================================
+Function.UM_IntToStr {
+    Input: buf: Address
+    Input: value: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(value, 0) ThenBlock: {
+            SetByte(buf, 0, 48)
+            SetByte(buf, 1, 0)
+            ReturnValue(1)
+        }
+        tmp = Allocate(8)
+        ti = 0
+        v = value
+        WhileLoop GreaterThan(v, 0) {
+            d = Subtract(v, Multiply(Divide(v, 10), 10))
+            SetByte(tmp, ti, Add(48, d))
+            ti = Add(ti, 1)
+            v = Divide(v, 10)
+        }
+        bi = 0
+        ri = Subtract(ti, 1)
+        WhileLoop GreaterEqual(ri, 0) {
+            ch = GetByte(tmp, ri)
+            SetByte(buf, bi, ch)
+            bi = Add(bi, 1)
+            ri = Subtract(ri, 1)
+        }
+        SetByte(buf, bi, 0)
+        ReturnValue(bi)
+    }
+}
+
+// =============================================================================
+// WRITE INT — write integer at position in buffer, returns new position
+// =============================================================================
+Function.UM_WriteInt {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: value: Integer
+    Output: Integer
+    Body: {
+        tmp = Allocate(8)
+        slen = UM_IntToStr(tmp, value)
+        MemoryCopy(Add(buf, pos), tmp, slen)
+        ReturnValue(Add(pos, slen))
+    }
+}
+
+// =============================================================================
+// COPY STRING — copy string literal into buffer at position
+// =============================================================================
+Function.UM_CopyStr {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: src: Address
+    Output: Integer
+    Body: {
+        slen = StringLength(src)
+        MemoryCopy(Add(buf, pos), src, slen)
+        ReturnValue(Add(pos, slen))
+    }
+}
+
+// =============================================================================
+// SET LABEL — update a label in the window
+// {"method":"window.setlabel","win_id":N,"id":"xxx","text":"yyy"}
+// =============================================================================
+Function.UM_SetLabel {
+    Input: id_str: Address
+    Input: text: Address
+    Body: {
+        buf = Allocate(512)
+        pos = 0
+        pos = UM_CopyStr(buf, pos, "{\"method\":\"window.setlabel\",\"win_id\":")
+        pos = UM_WriteInt(buf, pos, UMState.win_id)
+        pos = UM_CopyStr(buf, pos, ",\"id\":\"")
+
+        id_len = StringLength(id_str)
+        MemoryCopy(Add(buf, pos), id_str, id_len)
+        pos = Add(pos, id_len)
+
+        pos = UM_CopyStr(buf, pos, "\",\"text\":\"")
+
+        tlen = StringLength(text)
+        MemoryCopy(Add(buf, pos), text, tlen)
+        pos = Add(pos, tlen)
+
+        SetByte(buf, pos, 34)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 125)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 0)
+
+        Socket.SendMsg(UMState.sock, buf)
+        Deallocate(buf, 512)
+    }
+}
+
+// =============================================================================
+// SET STATUS — update the status label
+// =============================================================================
+Function.UM_SetStatus {
+    Input: text: Address
+    Body: {
+        UM_SetLabel("status", text)
+    }
+}
+
+// =============================================================================
+// UPDATE DISPLAY — refresh username/password/confirm labels from buffers
+// =============================================================================
+Function.UM_UpdateDisplay {
+    Body: {
+        // Username label — show plaintext
+        SetByte(UMUser.buf, UMUser.len, 0)
+        UM_SetLabel("username", UMUser.buf)
+
+        // Password label — show bullets (ASCII 42 = '*')
+        pbuf = Allocate(Add(UMPass.max, 1))
+        bi = 0
+        WhileLoop LessThan(bi, UMPass.len) {
+            SetByte(pbuf, bi, 42)
+            bi = Add(bi, 1)
+        }
+        SetByte(pbuf, UMPass.len, 0)
+        UM_SetLabel("password", pbuf)
+        Deallocate(pbuf, Add(UMPass.max, 1))
+
+        // Confirm label — show bullets (only in setup mode)
+        IfCondition EqualTo(UMState.setup_mode, 1) ThenBlock: {
+            cbuf = Allocate(Add(UMConf.max, 1))
+            ci = 0
+            WhileLoop LessThan(ci, UMConf.len) {
+                SetByte(cbuf, ci, 42)
+                ci = Add(ci, 1)
+            }
+            SetByte(cbuf, UMConf.len, 0)
+            UM_SetLabel("confirm", cbuf)
+            Deallocate(cbuf, Add(UMConf.max, 1))
+        }
+    }
+}
+
+// =============================================================================
+// HANDLE KEY — keyboard input for username/password editing
+// edit_mode: 0=none, 1=username, 2=password, 3=confirm
+// =============================================================================
+Function.UM_HandleKey {
+    Input: keycode: Integer
+    Input: ch:      Integer
+    Input: shift:   Integer
+    Body: {
+        IfCondition EqualTo(UMState.edit_mode, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Escape (scancode 1) — cancel editing
+        IfCondition EqualTo(keycode, 1) ThenBlock: {
+            UMState.edit_mode = 0
+            UM_SetStatus("Edit cancelled")
+            ReturnValue(1)
+        }
+
+        // Enter (scancode 28) — finish editing this field
+        IfCondition EqualTo(keycode, 28) ThenBlock: {
+            UMState.edit_mode = 0
+            UM_SetStatus("")
+            ReturnValue(1)
+        }
+
+        // Backspace (scancode 14)
+        IfCondition EqualTo(keycode, 14) ThenBlock: {
+            IfCondition EqualTo(UMState.edit_mode, 1) ThenBlock: {
+                IfCondition GreaterThan(UMUser.len, 0) ThenBlock: {
+                    UMUser.len = Subtract(UMUser.len, 1)
+                    SetByte(UMUser.buf, UMUser.len, 0)
+                }
+            }
+            IfCondition EqualTo(UMState.edit_mode, 2) ThenBlock: {
+                IfCondition GreaterThan(UMPass.len, 0) ThenBlock: {
+                    UMPass.len = Subtract(UMPass.len, 1)
+                    SetByte(UMPass.buf, UMPass.len, 0)
+                }
+            }
+            IfCondition EqualTo(UMState.edit_mode, 3) ThenBlock: {
+                IfCondition GreaterThan(UMConf.len, 0) ThenBlock: {
+                    UMConf.len = Subtract(UMConf.len, 1)
+                    SetByte(UMConf.buf, UMConf.len, 0)
+                }
+            }
+            UM_UpdateDisplay()
+            ReturnValue(1)
+        }
+
+        // Printable ASCII (32-126)
+        IfCondition GreaterThan(ch, 31) ThenBlock: {
+            IfCondition LessThan(ch, 127) ThenBlock: {
+                IfCondition EqualTo(UMState.edit_mode, 1) ThenBlock: {
+                    IfCondition LessThan(UMUser.len, UMUser.max) ThenBlock: {
+                        SetByte(UMUser.buf, UMUser.len, ch)
+                        UMUser.len = Add(UMUser.len, 1)
+                    }
+                }
+                IfCondition EqualTo(UMState.edit_mode, 2) ThenBlock: {
+                    IfCondition LessThan(UMPass.len, UMPass.max) ThenBlock: {
+                        SetByte(UMPass.buf, UMPass.len, ch)
+                        UMPass.len = Add(UMPass.len, 1)
+                    }
+                }
+                IfCondition EqualTo(UMState.edit_mode, 3) ThenBlock: {
+                    IfCondition LessThan(UMConf.len, UMConf.max) ThenBlock: {
+                        SetByte(UMConf.buf, UMConf.len, ch)
+                        UMConf.len = Add(UMConf.len, 1)
+                    }
+                }
+                UM_UpdateDisplay()
+                ReturnValue(1)
+            }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SEND WINDOW UPDATE HTML — switch the window to a different HTML file
+// {"method":"window.sethtml","win_id":N,"html":"config/usermgmt.html"}
+// =============================================================================
+Function.UM_SetWindowHtml {
+    Input: html_path: Address
+    Body: {
+        buf = Allocate(256)
+        pos = 0
+        pos = UM_CopyStr(buf, pos, "{\"method\":\"window.sethtml\",\"win_id\":")
+        pos = UM_WriteInt(buf, pos, UMState.win_id)
+        pos = UM_CopyStr(buf, pos, ",\"html\":\"")
+
+        hlen = StringLength(html_path)
+        MemoryCopy(Add(buf, pos), html_path, hlen)
+        pos = Add(pos, hlen)
+
+        SetByte(buf, pos, 34)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 125)
+        pos = Add(pos, 1)
+        SetByte(buf, pos, 0)
+
+        Socket.SendMsg(UMState.sock, buf)
+        Deallocate(buf, 256)
+    }
+}
+
+// =============================================================================
+// SETUP: CREATE ADMIN — replace default user/password with new credentials
+// Called from setup mode when user submits the form.
+// =============================================================================
+Function.UM_SetupCreateAdmin {
+    Input: mobj: Address
+    Body: {
+        conn = UMState.pg_conn
+
+        // Read from character buffers (populated by keyboard input)
+        username = UMUser.buf
+        username_len = UMUser.len
+        password = UMPass.buf
+        password_len = UMPass.len
+        confirm = UMConf.buf
+        confirm_len = UMConf.len
+
+        // Validate username length >= 3
+        IfCondition LessThan(username_len, 3) ThenBlock: {
+            UM_SetStatus("Username must be at least 3 characters")
+            ReturnValue(0)
+        }
+
+        // Validate password length >= 8
+        IfCondition LessThan(password_len, 8) ThenBlock: {
+            UM_SetStatus("Password must be at least 8 characters")
+            ReturnValue(0)
+        }
+
+        // Validate passwords match (compare byte-by-byte since lengths are known)
+        IfCondition NotEqual(password_len, confirm_len) ThenBlock: {
+            UM_SetStatus("Passwords do not match")
+            ReturnValue(0)
+        }
+        pw_match = 1
+        ci = 0
+        WhileLoop LessThan(ci, password_len) {
+            pc = GetByte(password, ci)
+            cc = GetByte(confirm, ci)
+            IfCondition NotEqual(pc, cc) ThenBlock: {
+                pw_match = 0
+            }
+            ci = Add(ci, 1)
+        }
+        IfCondition EqualTo(pw_match, 0) ThenBlock: {
+            UM_SetStatus("Passwords do not match")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[USERMGMT] Creating admin account: ")
+        PrintString(username)
+        PrintMessage("\n")
+
+        // UPDATE users SET username=$1, password_hash=crypt($2, gen_salt('bf',12)),
+        //   display_name=$1, is_admin=true WHERE username='user'
+        qbuf = Allocate(1024)
+        pos = 0
+        pos = UM_CopyStr(qbuf, pos, "UPDATE users SET username = '")
+        pos = UM_SqlEscape(qbuf, pos, username, username_len)
+        pos = UM_CopyStr(qbuf, pos, "', password_hash = crypt('")
+        pos = UM_SqlEscape(qbuf, pos, password, password_len)
+        pos = UM_CopyStr(qbuf, pos, "', gen_salt('bf', 12)), display_name = '")
+        pos = UM_SqlEscape(qbuf, pos, username, username_len)
+        pos = UM_CopyStr(qbuf, pos, "', is_admin = true WHERE username = 'user'")
+        SetByte(qbuf, pos, 0)
+
+        r = PG_Query(conn, qbuf)
+        Deallocate(qbuf, 1024)
+
+        IfCondition EqualTo(r, 0) ThenBlock: {
+            UM_SetStatus("Error: Failed to update user account")
+            PrintMessage("[USERMGMT] ERROR: UPDATE users failed\n")
+            ReturnValue(0)
+        }
+        PG_DestroyResult(r)
+
+        // Mark setup as complete
+        r = PG_Query(conn, "UPDATE settings SET value = 'true' WHERE app_id = 'system' AND key = 'setup_complete'")
+        IfCondition NotEqual(r, 0) ThenBlock: { PG_DestroyResult(r) }
+
+        PrintMessage("[USERMGMT] Setup complete — admin account created\n")
+        UM_SetStatus("Account created! Closing...")
+
+        // Close the window (display server will resume normal desktop)
+        buf = Allocate(128)
+        pos2 = 0
+        pos2 = UM_CopyStr(buf, pos2, "{\"method\":\"window.close\",\"win_id\":")
+        pos2 = UM_WriteInt(buf, pos2, UMState.win_id)
+        SetByte(buf, pos2, 125)
+        pos2 = Add(pos2, 1)
+        SetByte(buf, pos2, 0)
+        Socket.SendMsg(UMState.sock, buf)
+        Deallocate(buf, 128)
+
+        UMState.running = 0
+    }
+}
+
+// =============================================================================
+// AUTHENTICATE — verify current user password for normal mode access
+// =============================================================================
+Function.UM_Authenticate {
+    Input: mobj: Address
+    Body: {
+        conn = UMState.pg_conn
+        // Read from character buffers (populated by keyboard input)
+        username = UMUser.buf
+        username_len = UMUser.len
+        password = UMPass.buf
+        password_len = UMPass.len
+
+        IfCondition EqualTo(username_len, 0) ThenBlock: {
+            UM_SetStatus("Enter your username")
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(password_len, 0) ThenBlock: {
+            UM_SetStatus("Enter your password")
+            ReturnValue(0)
+        }
+
+        // SELECT id, is_admin FROM users WHERE username = '...' AND password_hash = crypt('...', password_hash)
+        qbuf = Allocate(512)
+        pos = 0
+        pos = UM_CopyStr(qbuf, pos, "SELECT id, is_admin FROM users WHERE username = '")
+        pos = UM_SqlEscape(qbuf, pos, username, username_len)
+        pos = UM_CopyStr(qbuf, pos, "' AND password_hash = crypt('")
+        pos = UM_SqlEscape(qbuf, pos, password, password_len)
+        pos = UM_CopyStr(qbuf, pos, "', password_hash)")
+        SetByte(qbuf, pos, 0)
+
+        result = PG_Query(conn, qbuf)
+        Deallocate(qbuf, 512)
+
+        valid = 0
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            row_count = Array.Size(result)
+            IfCondition GreaterThan(row_count, 0) ThenBlock: {
+                row = Array.Get(result, 0)
+                is_admin_str = Hash.Get(row, "is_admin")
+                // Only admins can manage users
+                IfCondition NotEqual(is_admin_str, 0) ThenBlock: {
+                    c0 = GetByte(is_admin_str, 0)
+                    // 't' = 116
+                    IfCondition EqualTo(c0, 116) ThenBlock: {
+                        valid = 1
+                    }
+                }
+            }
+            PG_DestroyResult(result)
+        }
+
+        IfCondition EqualTo(valid, 0) ThenBlock: {
+            UM_SetStatus("Invalid credentials or not an admin")
+            ReturnValue(0)
+        }
+
+        // Store current user for later reference
+        ubuf = Allocate(64)
+        MemoryCopy(ubuf, username, username_len)
+        SetByte(ubuf, username_len, 0)
+        UMState.current_user = ubuf
+        UMState.current_user_len = username_len
+        UMState.authenticated = 1
+
+        PrintMessage("[USERMGMT] Authenticated as admin: ")
+        PrintString(username)
+        PrintMessage("\n")
+
+        // Switch to the management HTML
+        UM_SetWindowHtml("config/usermgmt.html")
+
+        // Load user list
+        UM_LoadUserList()
+    }
+}
+
+// =============================================================================
+// LOAD USER LIST — query all users and send to window
+// =============================================================================
+Function.UM_LoadUserList {
+    Body: {
+        conn = UMState.pg_conn
+        result = PG_Query(conn, "SELECT username, display_name, is_admin FROM users ORDER BY id")
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            UM_SetStatus("Error loading user list")
+            ReturnValue(0)
+        }
+
+        row_count = Array.Size(result)
+
+        // Build a comma-separated list of users for the label
+        // Format: "username (Admin)" or "username"
+        listbuf = Allocate(1024)
+        lpos = 0
+        i = 0
+        WhileLoop LessThan(i, row_count) {
+            row = Array.Get(result, i)
+            uname = Hash.Get(row, "username")
+            is_admin_str = Hash.Get(row, "is_admin")
+
+            IfCondition GreaterThan(i, 0) ThenBlock: {
+                // Newline separator: \n
+                SetByte(listbuf, lpos, 10)
+                lpos = Add(lpos, 1)
+            }
+
+            ulen = StringLength(uname)
+            MemoryCopy(Add(listbuf, lpos), uname, ulen)
+            lpos = Add(lpos, ulen)
+
+            // Check is_admin
+            IfCondition NotEqual(is_admin_str, 0) ThenBlock: {
+                c0 = GetByte(is_admin_str, 0)
+                IfCondition EqualTo(c0, 116) ThenBlock: {
+                    tag = " (Admin)"
+                    tlen = StringLength(tag)
+                    MemoryCopy(Add(listbuf, lpos), tag, tlen)
+                    lpos = Add(lpos, tlen)
+                }
+            }
+
+            i = Add(i, 1)
+        }
+        SetByte(listbuf, lpos, 0)
+        PG_DestroyResult(result)
+
+        UM_SetLabel("user_list", listbuf)
+        Deallocate(listbuf, 1024)
+
+        PrintMessage("[USERMGMT] Loaded ")
+        PrintNumber(row_count)
+        PrintMessage(" users\n")
+    }
+}
+
+// =============================================================================
+// CREATE USER — add a new user account
+// =============================================================================
+Function.UM_CreateUser {
+    Input: mobj: Address
+    Body: {
+        conn = UMState.pg_conn
+        username = JSON.GetString(mobj, "new_username")
+        username_len = JSON.GetNumber(mobj, "new_username_len")
+        password = JSON.GetString(mobj, "new_password")
+        password_len = JSON.GetNumber(mobj, "new_password_len")
+        is_admin_str = JSON.GetString(mobj, "new_is_admin")
+        is_admin_len = JSON.GetNumber(mobj, "new_is_admin_len")
+
+        IfCondition LessThan(username_len, 3) ThenBlock: {
+            UM_SetStatus("Username must be at least 3 characters")
+            ReturnValue(0)
+        }
+        IfCondition LessThan(password_len, 8) ThenBlock: {
+            UM_SetStatus("Password must be at least 8 characters")
+            ReturnValue(0)
+        }
+
+        // Determine is_admin bool
+        is_admin_val = "false"
+        IfCondition GreaterThan(is_admin_len, 0) ThenBlock: {
+            c0 = GetByte(is_admin_str, 0)
+            // '1' = 49 or 't' = 116 or 'y' = 121
+            IfCondition EqualTo(c0, 49) ThenBlock: { is_admin_val = "true" }
+            IfCondition EqualTo(c0, 116) ThenBlock: { is_admin_val = "true" }
+            IfCondition EqualTo(c0, 121) ThenBlock: { is_admin_val = "true" }
+        }
+
+        // INSERT INTO users (username, password_hash, display_name, is_admin, created_at)
+        //   VALUES ('...', crypt('...', gen_salt('bf', 12)), '...', true/false, 0)
+        qbuf = Allocate(1024)
+        pos = 0
+        pos = UM_CopyStr(qbuf, pos, "INSERT INTO users (username, password_hash, display_name, is_admin, created_at) VALUES ('")
+        pos = UM_SqlEscape(qbuf, pos, username, username_len)
+        pos = UM_CopyStr(qbuf, pos, "', crypt('")
+        pos = UM_SqlEscape(qbuf, pos, password, password_len)
+        pos = UM_CopyStr(qbuf, pos, "', gen_salt('bf', 12)), '")
+        pos = UM_SqlEscape(qbuf, pos, username, username_len)
+        pos = UM_CopyStr(qbuf, pos, "', ")
+        pos = UM_CopyStr(qbuf, pos, is_admin_val)
+        pos = UM_CopyStr(qbuf, pos, ", 0)")
+        SetByte(qbuf, pos, 0)
+
+        r = PG_Query(conn, qbuf)
+        Deallocate(qbuf, 1024)
+
+        IfCondition EqualTo(r, 0) ThenBlock: {
+            UM_SetStatus("Error: User may already exist")
+            PrintMessage("[USERMGMT] ERROR: INSERT user failed\n")
+            ReturnValue(0)
+        }
+        PG_DestroyResult(r)
+
+        PrintMessage("[USERMGMT] Created user: ")
+        PrintString(username)
+        PrintMessage("\n")
+
+        UM_SetStatus("User created successfully")
+        UM_LoadUserList()
+    }
+}
+
+// =============================================================================
+// DELETE USER — remove a user account
+// Cannot delete self or last admin.
+// =============================================================================
+Function.UM_DeleteUser {
+    Input: mobj: Address
+    Body: {
+        conn = UMState.pg_conn
+        target = JSON.GetString(mobj, "del_username")
+        target_len = JSON.GetNumber(mobj, "del_username_len")
+
+        IfCondition EqualTo(target_len, 0) ThenBlock: {
+            UM_SetStatus("Enter username to delete")
+            ReturnValue(0)
+        }
+
+        // Cannot delete self — compare byte-by-byte
+        IfCondition NotEqual(UMState.current_user, 0) ThenBlock: {
+            IfCondition EqualTo(target_len, UMState.current_user_len) ThenBlock: {
+                is_self = 1
+                di = 0
+                WhileLoop LessThan(di, target_len) {
+                    tc = GetByte(target, di)
+                    uc = GetByte(UMState.current_user, di)
+                    IfCondition NotEqual(tc, uc) ThenBlock: { is_self = 0 }
+                    di = Add(di, 1)
+                }
+                IfCondition EqualTo(is_self, 1) ThenBlock: {
+                    UM_SetStatus("Cannot delete your own account")
+                    ReturnValue(0)
+                }
+            }
+        }
+
+        // Check if this is the last admin
+        qbuf = Allocate(512)
+        pos = 0
+        pos = UM_CopyStr(qbuf, pos, "SELECT count(*) as cnt FROM users WHERE is_admin = true AND username != '")
+        pos = UM_SqlEscape(qbuf, pos, target, target_len)
+        pos = UM_CopyStr(qbuf, pos, "'")
+        SetByte(qbuf, pos, 0)
+
+        result = PG_Query(conn, qbuf)
+        Deallocate(qbuf, 512)
+
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            row_count = Array.Size(result)
+            IfCondition GreaterThan(row_count, 0) ThenBlock: {
+                row = Array.Get(result, 0)
+                cnt_str = Hash.Get(row, "cnt")
+                IfCondition NotEqual(cnt_str, 0) ThenBlock: {
+                    c0 = GetByte(cnt_str, 0)
+                    // '0' = 48 — no other admins
+                    IfCondition EqualTo(c0, 48) ThenBlock: {
+                        PG_DestroyResult(result)
+                        UM_SetStatus("Cannot delete the last admin user")
+                        ReturnValue(0)
+                    }
+                }
+            }
+            PG_DestroyResult(result)
+        }
+
+        // DELETE FROM users WHERE username = '...'
+        qbuf2 = Allocate(256)
+        pos2 = 0
+        pos2 = UM_CopyStr(qbuf2, pos2, "DELETE FROM users WHERE username = '")
+        pos2 = UM_SqlEscape(qbuf2, pos2, target, target_len)
+        pos2 = UM_CopyStr(qbuf2, pos2, "'")
+        SetByte(qbuf2, pos2, 0)
+
+        r = PG_Query(conn, qbuf2)
+        Deallocate(qbuf2, 256)
+
+        IfCondition EqualTo(r, 0) ThenBlock: {
+            UM_SetStatus("Error deleting user")
+            ReturnValue(0)
+        }
+        PG_DestroyResult(r)
+
+        PrintMessage("[USERMGMT] Deleted user: ")
+        PrintString(target)
+        PrintMessage("\n")
+
+        UM_SetStatus("User deleted")
+        UM_LoadUserList()
+    }
+}
+
+// =============================================================================
+// CHANGE PASSWORD — update a user's password
+// =============================================================================
+Function.UM_ChangePassword {
+    Input: mobj: Address
+    Body: {
+        conn = UMState.pg_conn
+        target = JSON.GetString(mobj, "chpw_username")
+        target_len = JSON.GetNumber(mobj, "chpw_username_len")
+        newpass = JSON.GetString(mobj, "chpw_password")
+        newpass_len = JSON.GetNumber(mobj, "chpw_password_len")
+
+        IfCondition EqualTo(target_len, 0) ThenBlock: {
+            UM_SetStatus("Enter username")
+            ReturnValue(0)
+        }
+        IfCondition LessThan(newpass_len, 8) ThenBlock: {
+            UM_SetStatus("Password must be at least 8 characters")
+            ReturnValue(0)
+        }
+
+        // UPDATE users SET password_hash = crypt('...', gen_salt('bf', 12)) WHERE username = '...'
+        qbuf = Allocate(512)
+        pos = 0
+        pos = UM_CopyStr(qbuf, pos, "UPDATE users SET password_hash = crypt('")
+        pos = UM_SqlEscape(qbuf, pos, newpass, newpass_len)
+        pos = UM_CopyStr(qbuf, pos, "', gen_salt('bf', 12)) WHERE username = '")
+        pos = UM_SqlEscape(qbuf, pos, target, target_len)
+        pos = UM_CopyStr(qbuf, pos, "'")
+        SetByte(qbuf, pos, 0)
+
+        r = PG_Query(conn, qbuf)
+        Deallocate(qbuf, 512)
+
+        IfCondition EqualTo(r, 0) ThenBlock: {
+            UM_SetStatus("Error changing password")
+            ReturnValue(0)
+        }
+        PG_DestroyResult(r)
+
+        PrintMessage("[USERMGMT] Changed password for: ")
+        PrintString(target)
+        PrintMessage("\n")
+
+        UM_SetStatus("Password changed successfully")
+    }
+}
+
+// =============================================================================
+// HANDLE ACTION — dispatch Auckland action strings
+// =============================================================================
+Function.UM_HandleAction {
+    Input: mobj: Address
+    Input: action: Address
+    Input: action_len: Integer
+    Body: {
+        // Edit mode actions
+        cmp_eu = StringCompare(action, "um.edit_user")
+        IfCondition EqualTo(cmp_eu, 0) ThenBlock: {
+            UMState.edit_mode = 1
+            UM_SetStatus("Type username, Enter to confirm")
+            ReturnValue(0)
+        }
+        cmp_ep = StringCompare(action, "um.edit_pass")
+        IfCondition EqualTo(cmp_ep, 0) ThenBlock: {
+            UMState.edit_mode = 2
+            UM_SetStatus("Type password, Enter to confirm")
+            ReturnValue(0)
+        }
+        cmp_ec = StringCompare(action, "um.edit_conf")
+        IfCondition EqualTo(cmp_ec, 0) ThenBlock: {
+            UMState.edit_mode = 3
+            UM_SetStatus("Confirm password, Enter to confirm")
+            ReturnValue(0)
+        }
+
+        // Setup mode actions: um.create_admin
+        cmp_ca = StringCompare(action, "um.create_admin")
+        IfCondition EqualTo(cmp_ca, 0) ThenBlock: {
+            UM_SetupCreateAdmin(mobj)
+            ReturnValue(0)
+        }
+
+        // Normal mode actions
+        cmp_auth = StringCompare(action, "um.authenticate")
+        IfCondition EqualTo(cmp_auth, 0) ThenBlock: {
+            UM_Authenticate(mobj)
+            ReturnValue(0)
+        }
+
+        cmp_create = StringCompare(action, "um.create_user")
+        IfCondition EqualTo(cmp_create, 0) ThenBlock: {
+            IfCondition EqualTo(UMState.authenticated, 0) ThenBlock: {
+                UM_SetStatus("Please authenticate first")
+                ReturnValue(0)
+            }
+            UM_CreateUser(mobj)
+            ReturnValue(0)
+        }
+
+        cmp_delete = StringCompare(action, "um.delete_user")
+        IfCondition EqualTo(cmp_delete, 0) ThenBlock: {
+            IfCondition EqualTo(UMState.authenticated, 0) ThenBlock: {
+                UM_SetStatus("Please authenticate first")
+                ReturnValue(0)
+            }
+            UM_DeleteUser(mobj)
+            ReturnValue(0)
+        }
+
+        cmp_chpw = StringCompare(action, "um.change_password")
+        IfCondition EqualTo(cmp_chpw, 0) ThenBlock: {
+            IfCondition EqualTo(UMState.authenticated, 0) ThenBlock: {
+                UM_SetStatus("Please authenticate first")
+                ReturnValue(0)
+            }
+            UM_ChangePassword(mobj)
+            ReturnValue(0)
+        }
+
+        cmp_refresh = StringCompare(action, "um.refresh")
+        IfCondition EqualTo(cmp_refresh, 0) ThenBlock: {
+            IfCondition EqualTo(UMState.authenticated, 1) ThenBlock: {
+                UM_LoadUserList()
+            }
+            ReturnValue(0)
+        }
+
+        PrintMessage("[USERMGMT] Unknown action: ")
+        PrintString(action)
+        PrintMessage("\n")
+    }
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+
+    PrintMessage("============================================\n")
+    PrintMessage("  User Management IPC Client\n")
+    PrintMessage("============================================\n\n")
+
+    // Allocate character buffers for keyboard input
+    UMUser.buf = Allocate(Add(UMUser.max, 1))
+    SetByte(UMUser.buf, 0, 0)
+    UMPass.buf = Allocate(Add(UMPass.max, 1))
+    SetByte(UMPass.buf, 0, 0)
+    UMConf.buf = Allocate(Add(UMConf.max, 1))
+    SetByte(UMConf.buf, 0, 0)
+
+    // Connect to PostgreSQL (as bob superuser, trust auth)
+    pg_conn = PG_Connect("127.0.0.1", 5432, "ailang_system", "bob", "")
+    IfCondition EqualTo(pg_conn, 0) ThenBlock: {
+        PrintMessage("[USERMGMT] FATAL: Cannot connect to PostgreSQL\n")
+        HaltProgram
+    }
+    UMState.pg_conn = pg_conn
+    PrintMessage("[USERMGMT] Connected to PostgreSQL\n")
+
+    // Auto-detect setup mode by checking setup_complete flag
+    sc_result = PG_Query(pg_conn, "SELECT value FROM settings WHERE app_id = 'system' AND key = 'setup_complete'")
+    IfCondition NotEqual(sc_result, 0) ThenBlock: {
+        sc_rows = Array.Size(sc_result)
+        IfCondition GreaterThan(sc_rows, 0) ThenBlock: {
+            sc_row = Array.Get(sc_result, 0)
+            sc_val = Hash.Get(sc_row, "value")
+            IfCondition NotEqual(sc_val, 0) ThenBlock: {
+                sc_cmp = StringCompare(sc_val, "false")
+                IfCondition EqualTo(sc_cmp, 0) ThenBlock: {
+                    UMState.setup_mode = 1
+                    PrintMessage("[USERMGMT] Running in SETUP mode (setup_complete=false)\n")
+                }
+            }
+        }
+        PG_DestroyResult(sc_result)
+    }
+
+    // Connect to display server
+    sock_path = "/tmp/ailang_display.sock"
+    sock = Socket.Create(1, 1)
+    IfCondition LessThan(sock, 0) ThenBlock: {
+        PrintMessage("[USERMGMT] Socket create failed\n")
+        PG_Disconnect(pg_conn)
+        HaltProgram
+    }
+
+    cres = Socket.ConnectUnix(sock, sock_path)
+    IfCondition LessThan(cres, 0) ThenBlock: {
+        PrintMessage("[USERMGMT] Connect failed — is display server running?\n")
+        Socket.Close(sock)
+        PG_Disconnect(pg_conn)
+        HaltProgram
+    }
+    UMState.sock = sock
+    PrintMessage("[USERMGMT] Connected to display server\n")
+
+    // Register as usermgmt service
+    Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"usermgmt\"}")
+    PrintMessage("[USERMGMT] Sent register\n")
+
+    // Create window with appropriate HTML
+    IfCondition EqualTo(UMState.setup_mode, 1) ThenBlock: {
+        Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"AILang OS Setup\",\"w\":460,\"h\":380,\"html\":\"config/usermgmt_setup.html\"}")
+    } ElseBlock: {
+        Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"User Management\",\"w\":460,\"h\":480,\"html\":\"config/usermgmt_lock.html\"}")
+    }
+    PrintMessage("[USERMGMT] Sent window.create\n")
+
+    // Wait for window.created response
+    resp = Socket.RecvMsg(sock)
+    IfCondition EqualTo(resp, 0) ThenBlock: {
+        PrintMessage("[USERMGMT] No response to window.create\n")
+        Socket.Close(sock)
+        PG_Disconnect(pg_conn)
+        HaltProgram
+    }
+
+    parsed = ParseJSON(resp)
+    IfCondition NotEqual(parsed, 0) ThenBlock: {
+        pobj = JSON.AsObject(parsed)
+        wid = JSON.GetNumber(pobj, "win_id")
+        UMState.win_id = wid
+        PrintMessage("[USERMGMT] Window created, win_id=")
+        PrintNumber(wid)
+        PrintMessage("\n")
+        JSON.Free(parsed)
+    }
+
+    PrintMessage("[USERMGMT] Waiting for input...\n\n")
+
+    // Service loop
+    WhileLoop EqualTo(UMState.running, 1) {
+        msg = Socket.RecvMsg(sock)
+        IfCondition EqualTo(msg, 0) ThenBlock: {
+            PrintMessage("[USERMGMT] Connection closed\n")
+            UMState.running = 0
+        } ElseBlock: {
+            UMState.msg_count = Add(UMState.msg_count, 1)
+
+            pmsg = ParseJSON(msg)
+            IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                mobj = JSON.AsObject(pmsg)
+                method = JSON.GetString(mobj, "method")
+
+                IfCondition NotEqual(method, 0) ThenBlock: {
+                    // window.closed
+                    cmp_closed = StringCompare(method, "window.closed")
+                    IfCondition EqualTo(cmp_closed, 0) ThenBlock: {
+                        PrintMessage("[USERMGMT] Window closed by user\n")
+                        UMState.running = 0
+                    }
+
+                    // input.action
+                    cmp_action = StringCompare(method, "input.action")
+                    IfCondition EqualTo(cmp_action, 0) ThenBlock: {
+                        action = JSON.GetString(mobj, "action")
+                        IfCondition NotEqual(action, 0) ThenBlock: {
+                            action_len = JSON.GetNumber(mobj, "action_len")
+                            UM_HandleAction(mobj, action, action_len)
+                        }
+                    }
+
+                    // input.key — keyboard input for text fields
+                    cmp_key = StringCompare(method, "input.key")
+                    IfCondition EqualTo(cmp_key, 0) ThenBlock: {
+                        kc = JSON.GetNumber(mobj, "keycode")
+                        kch = JSON.GetNumber(mobj, "char")
+                        ksh = JSON.GetNumber(mobj, "shift")
+                        UM_HandleKey(kc, kch, ksh)
+                    }
+                }
+                JSON.Free(pmsg)
+            }
+        }
+    }
+
+    Socket.Close(sock)
+    PG_Disconnect(pg_conn)
+
+    PrintMessage("\n============================================\n")
+    PrintMessage("  User Management handled ")
+    PrintNumber(UMState.msg_count)
+    PrintMessage(" messages\n")
+    PrintMessage("============================================\n")
+}
+
+RunTask(Main)
