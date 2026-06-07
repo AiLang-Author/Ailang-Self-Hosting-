@@ -70,6 +70,9 @@ FixedPool.LoginState {
     "caps":         Initialize=0, CanChange=True
     "done":         Initialize=0, CanChange=True
     "authenticated": Initialize=0, CanChange=True
+    "use_stdin":    Initialize=0, CanChange=True
+    "old_termios":  Initialize=0, CanChange=True
+    "tty_fd":       Initialize=-1, CanChange=True
 }
 
 // =============================================================================
@@ -255,16 +258,16 @@ Function.Login_TranslateKey {
 // =============================================================================
 Function.Login_InitColors {
     Body: {
-        LoginColors.bg           = FB_RGB(25, 25, 50)
-        LoginColors.box_bg       = FB_RGB(40, 40, 70)
-        LoginColors.box_border   = FB_RGB(100, 100, 160)
-        LoginColors.input_bg     = FB_RGB(15, 15, 30)
-        LoginColors.input_border = FB_RGB(70, 70, 120)
-        LoginColors.text         = FB_RGB(200, 200, 220)
+        LoginColors.bg           = FB_RGB(30, 40, 80)
+        LoginColors.box_bg       = FB_RGB(50, 60, 100)
+        LoginColors.box_border   = FB_RGB(150, 150, 200)
+        LoginColors.input_bg     = FB_RGB(20, 25, 50)
+        LoginColors.input_border = FB_RGB(100, 100, 160)
+        LoginColors.text         = FB_RGB(220, 220, 240)
         LoginColors.title        = FB_RGB(255, 255, 255)
         LoginColors.error        = FB_RGB(255, 80, 80)
-        LoginColors.cursor       = FB_RGB(180, 180, 255)
-        LoginColors.active_border = FB_RGB(140, 140, 220)
+        LoginColors.cursor       = FB_RGB(200, 200, 255)
+        LoginColors.active_border = FB_RGB(180, 180, 240)
     }
 }
 
@@ -628,17 +631,120 @@ Function.Login_HandleKey {
 }
 
 // =============================================================================
-// OPEN KEYBOARD — try /dev/input/event0..7
+// TERMIOS RAW MODE — for stdin/console keyboard input
+// Mirrors TUI library approach: disable ICANON+ECHO, set VMIN=0 VTIME=0
+// for non-blocking character-at-a-time reads from fd 0.
+// termios struct: 60 bytes on x86-64 Linux
+//   c_iflag: offset 0  (4 bytes)
+//   c_oflag: offset 4  (4 bytes)
+//   c_cflag: offset 8  (4 bytes)
+//   c_lflag: offset 12 (4 bytes)
+//   c_line:  offset 16 (1 byte)
+//   c_cc:    offset 17 (19 bytes)
+// TCGETS=21505, TCSETS=21506
+// =============================================================================
+Function.Login_EnableRawMode {
+    Body: {
+        // Open /dev/tty0 explicitly — /dev/console (fd 0) may not support reads
+        // O_RDWR = 2
+        tfd = SystemCall(LoginSys.SYS_OPEN, "/dev/tty0", 2, 0, 0, 0)
+        IfCondition LessThan(tfd, 0) ThenBlock: {
+            // Try /dev/tty1 as fallback
+            tfd = SystemCall(LoginSys.SYS_OPEN, "/dev/tty1", 2, 0, 0, 0)
+        }
+        IfCondition LessThan(tfd, 0) ThenBlock: {
+            // Last resort: try /dev/console
+            tfd = SystemCall(LoginSys.SYS_OPEN, "/dev/console", 2, 0, 0, 0)
+        }
+        IfCondition LessThan(tfd, 0) ThenBlock: {
+            PrintMessage("[LOGIN] ERROR: Cannot open any tty device\n")
+            ReturnValue(0)
+        }
+        LoginState.tty_fd = tfd
+        PrintMessage("[LOGIN] Opened tty fd=")
+        PrintNumber(tfd)
+        PrintMessage("\n")
+
+        // Save old termios from the tty
+        old_t = Allocate(60)
+        LoginState.old_termios = old_t
+        result = SystemCall(LoginSys.SYS_IOCTL, tfd, 21505, old_t, 0, 0)
+        IfCondition LessThan(result, 0) ThenBlock: {
+            PrintMessage("[LOGIN] WARNING: TCGETS failed on tty\n")
+            ReturnValue(0)
+        }
+
+        // Copy to new termios
+        new_t = Allocate(60)
+        i = 0
+        WhileLoop LessThan(i, 60) {
+            SetByte(new_t, i, GetByte(old_t, i))
+            i = Add(i, 1)
+        }
+
+        // Read c_lflag (4 bytes at offset 12)
+        lflag_b0 = GetByte(new_t, 12)
+        lflag_b1 = GetByte(new_t, 13)
+        lflag_b2 = GetByte(new_t, 14)
+        lflag_b3 = GetByte(new_t, 15)
+        lflag = Add(lflag_b0, Add(Multiply(lflag_b1, 256), Add(Multiply(lflag_b2, 65536), Multiply(lflag_b3, 16777216))))
+
+        // Clear ICANON (2) + ECHO (8) + ISIG (1) = 11
+        lflag = BitwiseAnd(lflag, BitwiseNot(11))
+
+        // Write back c_lflag
+        SetByte(new_t, 12, BitwiseAnd(lflag, 255))
+        SetByte(new_t, 13, BitwiseAnd(Divide(lflag, 256), 255))
+        SetByte(new_t, 14, BitwiseAnd(Divide(lflag, 65536), 255))
+        SetByte(new_t, 15, BitwiseAnd(Divide(lflag, 16777216), 255))
+
+        // Set VMIN=0 VTIME=0 for non-blocking reads (c_cc starts at offset 17)
+        // VMIN = c_cc[6] = offset 23, VTIME = c_cc[5] = offset 22
+        SetByte(new_t, 23, 0)   // VMIN = 0 (don't block)
+        SetByte(new_t, 22, 0)   // VTIME = 0 (no timeout)
+
+        // Apply raw mode to the tty
+        SystemCall(LoginSys.SYS_IOCTL, tfd, 21506, new_t, 0, 0)
+        Deallocate(new_t, 60)
+
+        // NOTE: We do NOT set KD_GRAPHICS here because it prevents the kernel
+        // from delivering keyboard input to the tty. With ECHO+ICANON disabled,
+        // the VT won't echo typed characters back to the framebuffer anyway.
+
+        PrintMessage("[LOGIN] Raw mode enabled on tty fd=")
+        PrintNumber(tfd)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+Function.Login_DisableRawMode {
+    Body: {
+        tfd = LoginState.tty_fd
+        IfCondition GreaterEqual(tfd, 0) ThenBlock: {
+            // Restore original termios
+            IfCondition NotEqual(LoginState.old_termios, 0) ThenBlock: {
+                SystemCall(LoginSys.SYS_IOCTL, tfd, 21506, LoginState.old_termios, 0, 0)
+                Deallocate(LoginState.old_termios, 60)
+                LoginState.old_termios = 0
+            }
+
+            // Close the tty fd
+            SystemCall(LoginSys.SYS_CLOSE, tfd, 0, 0, 0, 0)
+            LoginState.tty_fd = -1
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// OPEN KEYBOARD — try evdev first, fall back to stdin/console
 // =============================================================================
 Function.Login_OpenKeyboard {
     Output: Integer
     Body: {
         // Try event0 through event19, find the REAL keyboard
-        // On real hardware, keyboards can be event8+ due to ACPI, power buttons, etc.
         path_buf = Allocate(32)
-
-        // EVIOCGBIT(EV_KEY=1, 96 bytes) = 0x80604521
-        // Returns bitmask of supported keys. KEY_A=30 → byte 3, bit 6 (mask 64)
         keybits = Allocate(96)
 
         dev = 0
@@ -651,7 +757,6 @@ Function.Login_OpenKeyboard {
                 SetByte(path_buf, i, GetByte(prefix, i))
                 i = Add(i, 1)
             }
-            // Write device number as 1 or 2 digit ASCII
             IfCondition LessThan(dev, 10) ThenBlock: {
                 SetByte(path_buf, plen, Add(48, dev))
                 SetByte(path_buf, Add(plen, 1), 0)
@@ -667,26 +772,22 @@ Function.Login_OpenKeyboard {
             // Open non-blocking: O_RDONLY | O_NONBLOCK = 0 | 2048 = 2048
             fd = SystemCall(LoginSys.SYS_OPEN, path_buf, 2048, 0, 0, 0)
             IfCondition GreaterEqual(fd, 0) ThenBlock: {
-                // Probe: is this a keyboard? EVIOCGBIT(EV_KEY, 96)
+                // Probe: EVIOCGBIT(EV_KEY, 96) = 0x80604521 = 2153792801
                 MemorySet(keybits, 0, 96)
                 irc = SystemCall(LoginSys.SYS_IOCTL, fd, 2153792801, keybits, 0, 0)
-                // 2153792801 = 0x80604521 = EVIOCGBIT(1, 96)
 
                 // Check KEY_A (30): byte 3, bit 6 → mask 64
                 has_key_a = BitwiseAnd(GetByte(keybits, 3), 64)
                 IfCondition GreaterThan(has_key_a, 0) ThenBlock: {
-                    PrintMessage("[LOGIN] Opened keyboard: ")
+                    PrintMessage("[LOGIN] Opened evdev keyboard: ")
                     PrintString(path_buf)
                     PrintMessage("\n")
                     Deallocate(keybits, 96)
                     Deallocate(path_buf, 32)
+                    LoginState.use_stdin = 0
                     ReturnValue(fd)
                 }
 
-                // Not a keyboard — close and try next
-                PrintMessage("[LOGIN] Skipping non-keyboard: ")
-                PrintString(path_buf)
-                PrintMessage("\n")
                 SystemCall(LoginSys.SYS_CLOSE, fd, 0, 0, 0, 0)
             }
             dev = Add(dev, 1)
@@ -694,7 +795,10 @@ Function.Login_OpenKeyboard {
 
         Deallocate(keybits, 96)
         Deallocate(path_buf, 32)
-        PrintMessage("[LOGIN] WARNING: No keyboard found in event0-19\n")
+        PrintMessage("[LOGIN] No evdev keyboard found — using console/stdin\n")
+
+        // Fall back to stdin (fd 0) — raw mode already enabled by caller
+        LoginState.use_stdin = 1
         ReturnValue(-1)
     }
 }
@@ -757,74 +861,70 @@ Function.Login_PollKeyboard {
 }
 
 // =============================================================================
-// HEADLESS INPUT — read from stdin (for testing in terminal)
+// STDIN INPUT — raw mode, non-blocking (VMIN=0, VTIME=0)
+// Used both as headless fallback and as primary console input.
+// read() returns 0 when no data available (non-blocking via VMIN=0).
 // =============================================================================
 Function.Login_PollStdin {
     Output: Integer
     Body: {
         rbuf = Allocate(1)
-        n = SystemCall(LoginSys.SYS_READ, 0, rbuf, 1, 0, 0)
-        IfCondition LessEqual(n, 0) ThenBlock: {
-            Deallocate(rbuf, 1)
-            // EOF on stdin (pipe closed) — treat as done only if not already authenticated
-            IfCondition EqualTo(LoginState.authenticated, 0) ThenBlock: {
-                LoginState.done = 1
-            }
-            ReturnValue(0)
+        count = 0
+        rfd = LoginState.tty_fd
+        IfCondition LessThan(rfd, 0) ThenBlock: {
+            rfd = 0
         }
 
-        ch = GetByte(rbuf, 0)
+        // Read chars in a loop (non-blocking: VMIN=0 returns 0 when empty)
+        WhileLoop 1 {
+            n = SystemCall(LoginSys.SYS_READ, rfd, rbuf, 1, 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: {
+                BreakLoop
+            }
+
+            ch = GetByte(rbuf, 0)
+            count = Add(count, 1)
+
+            // Enter (10 = newline, 13 = CR)
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                Login_HandleKey(LoginConst.KEY_ENTER, 1)
+            }
+            IfCondition EqualTo(ch, 13) ThenBlock: {
+                Login_HandleKey(LoginConst.KEY_ENTER, 1)
+            }
+
+            // Backspace (127 or 8)
+            IfCondition EqualTo(ch, 127) ThenBlock: {
+                Login_HandleKey(LoginConst.KEY_BACKSPACE, 1)
+            }
+            IfCondition EqualTo(ch, 8) ThenBlock: {
+                Login_HandleKey(LoginConst.KEY_BACKSPACE, 1)
+            }
+
+            // Tab
+            IfCondition EqualTo(ch, 9) ThenBlock: {
+                Login_HandleKey(LoginConst.KEY_TAB, 1)
+            }
+
+            // Printable char — directly append (stdin gives us ASCII already)
+            IfCondition And(GreaterEqual(ch, 32), LessEqual(ch, 126)) ThenBlock: {
+                IfCondition EqualTo(LoginState.active_field, LoginConst.FIELD_USER) ThenBlock: {
+                    IfCondition LessThan(LoginState.user_len, LoginConst.MAX_USER) ThenBlock: {
+                        SetByte(LoginState.user_buf, LoginState.user_len, ch)
+                        LoginState.user_len = Add(LoginState.user_len, 1)
+                    }
+                } ElseBlock: {
+                    IfCondition LessThan(LoginState.pass_len, LoginConst.MAX_PASS) ThenBlock: {
+                        SetByte(LoginState.pass_buf, LoginState.pass_len, ch)
+                        LoginState.pass_len = Add(LoginState.pass_len, 1)
+                    }
+                }
+                LoginState.error_msg = 0
+            }
+        }
+
         Deallocate(rbuf, 1)
-
-        // Enter (10 = newline, 13 = CR)
-        IfCondition EqualTo(ch, 10) ThenBlock: {
-            Login_HandleKey(LoginConst.KEY_ENTER, 1)
-            ReturnValue(1)
-        }
-        IfCondition EqualTo(ch, 13) ThenBlock: {
-            Login_HandleKey(LoginConst.KEY_ENTER, 1)
-            ReturnValue(1)
-        }
-
-        // Backspace (127 or 8)
-        IfCondition EqualTo(ch, 127) ThenBlock: {
-            Login_HandleKey(LoginConst.KEY_BACKSPACE, 1)
-            ReturnValue(1)
-        }
-        IfCondition EqualTo(ch, 8) ThenBlock: {
-            Login_HandleKey(LoginConst.KEY_BACKSPACE, 1)
-            ReturnValue(1)
-        }
-
-        // Tab
-        IfCondition EqualTo(ch, 9) ThenBlock: {
-            Login_HandleKey(LoginConst.KEY_TAB, 1)
-            ReturnValue(1)
-        }
-
-        // Escape
-        IfCondition EqualTo(ch, 27) ThenBlock: {
-            LoginState.done = 1
-            ReturnValue(1)
-        }
-
-        // Printable char — directly append (stdin gives us ASCII already)
-        IfCondition And(GreaterEqual(ch, 32), LessEqual(ch, 126)) ThenBlock: {
-            IfCondition EqualTo(LoginState.active_field, LoginConst.FIELD_USER) ThenBlock: {
-                IfCondition LessThan(LoginState.user_len, LoginConst.MAX_USER) ThenBlock: {
-                    SetByte(LoginState.user_buf, LoginState.user_len, ch)
-                    LoginState.user_len = Add(LoginState.user_len, 1)
-                }
-            } ElseBlock: {
-                IfCondition LessThan(LoginState.pass_len, LoginConst.MAX_PASS) ThenBlock: {
-                    SetByte(LoginState.pass_buf, LoginState.pass_len, ch)
-                    LoginState.pass_len = Add(LoginState.pass_len, 1)
-                }
-            }
-            LoginState.error_msg = 0
-        }
-
-        ReturnValue(1)
+        ReturnValue(count)
     }
 }
 
@@ -867,10 +967,14 @@ Function.Login_Run {
             ReturnValue(0)
         }
 
-        // Open keyboard (evdev) — skip in headless mode
-        IfCondition EqualTo(LoginState.headless, 0) ThenBlock: {
-            LoginState.kbd_fd = Login_OpenKeyboard()
-        }
+        // Enable raw mode on /dev/tty0 — disables ECHO+ICANON so the VT
+        // doesn't render typed characters over our framebuffer, and gives us
+        // non-blocking character-at-a-time reads.
+        Login_EnableRawMode()
+
+        // Use tty input (stdin path reads from tty_fd)
+        // Evdev is unreliable at early boot before USB enumeration completes.
+        LoginState.use_stdin = 1
 
         // Allocate timespec for 50ms sleep
         ts = Allocate(16)
@@ -882,8 +986,8 @@ Function.Login_Run {
             // Draw
             Login_Draw()
 
-            // Poll input
-            IfCondition EqualTo(LoginState.headless, 1) ThenBlock: {
+            // Poll input — evdev or stdin depending on what was found
+            IfCondition EqualTo(LoginState.use_stdin, 1) ThenBlock: {
                 Login_PollStdin()
             } ElseBlock: {
                 Login_PollKeyboard()
@@ -899,6 +1003,8 @@ Function.Login_Run {
         IfCondition GreaterEqual(LoginState.kbd_fd, 0) ThenBlock: {
             SystemCall(LoginSys.SYS_CLOSE, LoginState.kbd_fd, 0, 0, 0, 0)
         }
+        // Restore terminal if we used raw mode
+        Login_DisableRawMode()
         FB_Close()
         Deallocate(LoginKeyMap.table, 128)
         Deallocate(LoginKeyMap.stable, 128)
@@ -919,3 +1025,18 @@ Function.Login_Run {
         ReturnValue(result)
     }
 }
+
+// =============================================================================
+// MAIN — standalone entry point
+// Exit code 0 = authenticated, 1 = failed/cancelled
+// =============================================================================
+SubRoutine.Main {
+    Arena_Init()
+    result = Login_Run()
+    IfCondition EqualTo(result, 1) ThenBlock: {
+        SystemCall(60, 0, 0, 0, 0, 0)
+    }
+    SystemCall(60, 1, 0, 0, 0, 0)
+}
+
+RunTask(Main)

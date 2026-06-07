@@ -97,6 +97,13 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
     chmod +x "$OVERLAY/system/bin/display.x"
     ok "  display.x ($(stat -c%s /tmp/display.x) bytes)"
 
+    # Login
+    info "  Compiling login.x..."
+    $AILANG OS/Login.ailang -o /tmp/login.x 2>&1 | tail -1
+    cp /tmp/login.x "$OVERLAY/system/bin/login.x"
+    chmod +x "$OVERLAY/system/bin/login.x"
+    ok "  login.x ($(stat -c%s /tmp/login.x) bytes)"
+
     # IDE
     if [ -f "Applications/ide_ipc.ailang" ]; then
         info "  Compiling ide.x..."
