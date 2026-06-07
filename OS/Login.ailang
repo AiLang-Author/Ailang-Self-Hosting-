@@ -1,12 +1,15 @@
 // Login.ailang
 // Framebuffer login screen for AILang OS.
 // Draws username + password fields, reads keyboard, validates credentials.
-// Phase 1: validates against hardcoded SHA-256 hash (pre-PG).
-// Phase 2: validates against PG users table (post-PG startup).
+// Validates against PG users table using pgcrypto bcrypt.
 // Copyright © 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
 
 LibraryImport.Arena
 LibraryImport.StringUtils
+LibraryImport.Socket
+LibraryImport.Hash
+LibraryImport.Arrays
+LibraryImport.PostgreSQL_Complete
 LibraryImport.Display.Render.Framebuffer
 LibraryImport.TermFont
 
@@ -404,36 +407,131 @@ Function.Login_Draw {
 }
 
 // =============================================================================
-// VALIDATE CREDENTIALS — Phase 1: simple string match
-// For bring-up only. Replace with PG query in Phase 2.
+// SQL ESCAPE HELPER — copy buffer contents into SQL query, doubling single quotes
+// Appends escaped content from src (length srclen) into dest at offset.
+// Returns new offset.
+// =============================================================================
+Function.Login_SqlEscape {
+    Input: dest: Address
+    Input: off: Integer
+    Input: src: Address
+    Input: srclen: Integer
+    Output: Integer
+    Body: {
+        i = 0
+        pos = off
+        WhileLoop LessThan(i, srclen) {
+            ch = GetByte(src, i)
+            IfCondition EqualTo(ch, 39) ThenBlock: {
+                // Single quote (39) → two single quotes
+                SetByte(dest, pos, 39)
+                pos = Add(pos, 1)
+                SetByte(dest, pos, 39)
+                pos = Add(pos, 1)
+            } ElseBlock: {
+                SetByte(dest, pos, ch)
+                pos = Add(pos, 1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(pos)
+    }
+}
+
+// =============================================================================
+// VALIDATE CREDENTIALS — PostgreSQL bcrypt validation via pgcrypto
+// Connects to PG as bob (superuser, trust auth), queries:
+//   SELECT id FROM users WHERE username = '<user>'
+//     AND password_hash = crypt('<pass>', password_hash)
 // Returns 1 if valid, 0 if not.
 // =============================================================================
 Function.Login_Validate {
     Output: Integer
     Body: {
-        // Check username = "bob" and password = "ailang"
-        // This is bootstrap-only. Real validation uses PG users table.
         user = LoginState.user_buf
         pass = LoginState.pass_buf
         ulen = LoginState.user_len
         plen = LoginState.pass_len
 
-        // Compare username
-        IfCondition NotEqual(ulen, 3) ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(user, 0), 98)  ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(user, 1), 111) ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(user, 2), 98)  ThenBlock: { ReturnValue(0) }
+        // Basic sanity — empty fields fail immediately
+        IfCondition EqualTo(ulen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(0) }
 
-        // Compare password
-        IfCondition NotEqual(plen, 6) ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(pass, 0), 97)  ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(pass, 1), 105) ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(pass, 2), 108) ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(pass, 3), 97)  ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(pass, 4), 110) ThenBlock: { ReturnValue(0) }
-        IfCondition NotEqual(GetByte(pass, 5), 103) ThenBlock: { ReturnValue(0) }
+        // Connect to PostgreSQL (localhost, trust auth as bob superuser)
+        conn = PG_Connect("127.0.0.1", 5432, "ailang_system", "bob", "")
+        IfCondition EqualTo(conn, 0) ThenBlock: {
+            PrintMessage("[LOGIN] ERROR: Cannot connect to PostgreSQL\n")
+            ReturnValue(0)
+        }
 
-        ReturnValue(1)
+        // Build query: SELECT id FROM users WHERE username = '...' AND password_hash = crypt('...', password_hash)
+        // Max query size: ~256 bytes base + escaped user (64) + escaped pass (128) = 512 is safe
+        qbuf = Allocate(512)
+        pos = 0
+
+        // "SELECT id FROM users WHERE username = '"
+        prefix = "SELECT id FROM users WHERE username = '"
+        pxlen = StringLength(prefix)
+        i = 0
+        WhileLoop LessThan(i, pxlen) {
+            SetByte(qbuf, pos, GetByte(prefix, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        // Escaped username
+        pos = Login_SqlEscape(qbuf, pos, user, ulen)
+
+        // "' AND password_hash = crypt('"
+        mid = "' AND password_hash = crypt('"
+        mlen = StringLength(mid)
+        i = 0
+        WhileLoop LessThan(i, mlen) {
+            SetByte(qbuf, pos, GetByte(mid, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        // Escaped password
+        pos = Login_SqlEscape(qbuf, pos, pass, plen)
+
+        // "', password_hash)"
+        suffix = "', password_hash)"
+        slen = StringLength(suffix)
+        i = 0
+        WhileLoop LessThan(i, slen) {
+            SetByte(qbuf, pos, GetByte(suffix, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+
+        // Null-terminate
+        SetByte(qbuf, pos, 0)
+
+        // Execute query
+        result = PG_Query(conn, qbuf)
+        Deallocate(qbuf, 512)
+
+        // Check result: if we got at least 1 row, credentials are valid
+        valid = 0
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            row_count = Array.Size(result)
+            IfCondition GreaterThan(row_count, 0) ThenBlock: {
+                valid = 1
+            }
+            PG_DestroyResult(result)
+        }
+
+        // Disconnect
+        PG_Disconnect(conn)
+
+        IfCondition EqualTo(valid, 1) ThenBlock: {
+            PrintMessage("[LOGIN] PG auth: credentials valid\n")
+        } ElseBlock: {
+            PrintMessage("[LOGIN] PG auth: credentials invalid\n")
+        }
+
+        ReturnValue(valid)
     }
 }
 

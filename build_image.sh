@@ -106,6 +106,24 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         ok "  ide.x ($(stat -c%s /tmp/ide.x) bytes)"
     fi
 
+    # Settings
+    if [ -f "Applications/settings_ipc.ailang" ]; then
+        info "  Compiling settings.x..."
+        $AILANG Applications/settings_ipc.ailang -o /tmp/settings.x 2>&1 | tail -1
+        cp /tmp/settings.x "$OVERLAY/system/bin/settings.x"
+        chmod +x "$OVERLAY/system/bin/settings.x"
+        ok "  settings.x ($(stat -c%s /tmp/settings.x) bytes)"
+    fi
+
+    # Installer
+    if [ -f "Applications/installer_ipc.ailang" ]; then
+        info "  Compiling installer_ipc.x..."
+        $AILANG Applications/installer_ipc.ailang -o /tmp/installer_ipc.x 2>&1 | tail -1
+        cp /tmp/installer_ipc.x "$OVERLAY/system/bin/installer_ipc.x"
+        chmod +x "$OVERLAY/system/bin/installer_ipc.x"
+        ok "  installer_ipc.x ($(stat -c%s /tmp/installer_ipc.x) bytes)"
+    fi
+
     # Copy config files
     info "  Syncing config files to overlay..."
     for f in config/*.html config/*.cfg; do
@@ -114,6 +132,90 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
     ok "  Config files synced"
 else
     info "Step 1: SKIPPED (--image-only)"
+fi
+
+# =============================================================================
+# STEP 1b: PRE-POPULATE POSTGRESQL DATA DIRECTORY
+# Build a ready-to-boot PG data dir with schema + base services baked in.
+# At runtime, Init just starts PG — no schema bootstrap needed.
+# =============================================================================
+PGDATA_OVERLAY="$OVERLAY/var/lib/postgresql/data"
+SCHEMA_SQL="$OVERLAY/system/schema.sql"
+PG_BUILD_PORT=54321
+PGBIN="/usr/lib/postgresql/16/bin"
+
+if [ -f "$SCHEMA_SQL" ]; then
+    info "Step 1b: Pre-populating PostgreSQL data directory"
+
+    # Clean previous data dir
+    rm -rf "$PGDATA_OVERLAY"
+    mkdir -p "$PGDATA_OVERLAY"
+
+    # initdb
+    "$PGBIN/initdb" -D "$PGDATA_OVERLAY" -U postgres --no-locale --encoding=UTF8 > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        fail "initdb failed"
+    fi
+
+    # Configure for local trust auth
+    cat > "$PGDATA_OVERLAY/pg_hba.conf" << 'HBAEOF'
+local all all trust
+host all all 127.0.0.1/32 trust
+host all all ::1/128 trust
+HBAEOF
+
+    # Listen on all interfaces (matches Init_InitPGData behavior), use non-conflicting port for build
+    sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '0.0.0.0'/" "$PGDATA_OVERLAY/postgresql.conf"
+    sed -i "s/#port = 5432/port = $PG_BUILD_PORT/" "$PGDATA_OVERLAY/postgresql.conf"
+
+    # Use /tmp for unix socket during build (avoids /var/run/postgresql permission issues)
+    mkdir -p /tmp/pg_build_sock
+    echo "unix_socket_directories = '/tmp/pg_build_sock'" >> "$PGDATA_OVERLAY/postgresql.conf"
+
+    # Start temp PG instance
+    "$PGBIN/pg_ctl" start -D "$PGDATA_OVERLAY" -l /tmp/pg_build.log -w -o "-p $PG_BUILD_PORT" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        cat /tmp/pg_build.log
+        fail "Failed to start temp PostgreSQL"
+    fi
+
+    # Create database + user
+    "$PGBIN/createdb" -h 127.0.0.1 -p $PG_BUILD_PORT -U postgres ailang_system 2>/dev/null
+    "$PGBIN/psql" -h 127.0.0.1 -p $PG_BUILD_PORT -U postgres -c "DO \$\$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname='bob') THEN CREATE ROLE bob SUPERUSER LOGIN; END IF; END \$\$;" > /dev/null 2>&1
+
+    # Load schema
+    "$PGBIN/psql" -h 127.0.0.1 -p $PG_BUILD_PORT -U postgres -d ailang_system -f "$SCHEMA_SQL" > /dev/null 2>&1
+    if [ $? -ne 0 ]; then
+        "$PGBIN/pg_ctl" stop -D "$PGDATA_OVERLAY" -m fast > /dev/null 2>&1
+        fail "Schema load failed"
+    fi
+
+    # Verify services were loaded
+    SVC_COUNT=$("$PGBIN/psql" -h 127.0.0.1 -p $PG_BUILD_PORT -U postgres -d ailang_system -t -c "SELECT count(*) FROM services" 2>/dev/null | tr -d ' ')
+    ok "  Schema loaded: $SVC_COUNT services registered"
+
+    # Stop temp PG
+    "$PGBIN/pg_ctl" stop -D "$PGDATA_OVERLAY" -m fast > /dev/null 2>&1
+
+    # Reset port and socket dir back to defaults for runtime
+    sed -i "s/port = $PG_BUILD_PORT/#port = 5432/" "$PGDATA_OVERLAY/postgresql.conf"
+    sed -i "/unix_socket_directories = '\/tmp\/pg_build_sock'/d" "$PGDATA_OVERLAY/postgresql.conf"
+    rm -rf /tmp/pg_build_sock /tmp/pg_build.log
+
+    # Write runtime pg_hba.conf (trust auth, role-aware)
+    cat > "$PGDATA_OVERLAY/pg_hba.conf" << 'HBAEOF'
+local all postgres trust
+local all bob trust
+host all all 127.0.0.1/32 trust
+host all all ::1/128 trust
+host all all 10.0.2.0/24 trust
+HBAEOF
+
+    # Ownership: data dir is owned by host user (bob) in overlay.
+    # ailang_init does chown -R postgres:postgres at runtime before starting PG.
+    ok "  PostgreSQL data directory pre-populated"
+else
+    warn "Step 1b: SKIPPED — $SCHEMA_SQL not found"
 fi
 
 # =============================================================================
