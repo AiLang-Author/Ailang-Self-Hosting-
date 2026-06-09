@@ -147,9 +147,22 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         ok "  installer_ipc.x ($(stat -c%s /tmp/installer_ipc.x) bytes)"
     fi
 
+    # Telegram (TDLib worker + libtdjson)
+    if [ -f "Telegram/tdlib_worker.c" ]; then
+        info "  Building Telegram TDLib worker..."
+        if [ ! -f "Telegram/tdlib-install/lib/libtdjson.so" ]; then
+            chmod +x Telegram/build_tdlib.sh
+            Telegram/build_tdlib.sh --skip-clone
+        else
+            make -C Telegram
+        fi
+        make -C Telegram install DESTDIR="$OVERLAY"
+        ok "  Telegram worker + libtdjson installed to overlay"
+    fi
+
     # Copy config files
     info "  Syncing config files to overlay..."
-    for f in config/*.html config/*.cfg; do
+    for f in config/*.html config/*.cfg config/*.json; do
         [ -f "$f" ] && cp "$f" "$OVERLAY/$f"
         [ -f "$f" ] && cp "$f" "$OVERLAY/system/$f"
     done
@@ -395,6 +408,7 @@ if [ "$RUN_QEMU" -eq 1 ]; then
         -device virtio-vga,xres=1024,yres=768 \
         -device qemu-xhci -device usb-kbd -device usb-mouse \
         -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22,hostfwd=tcp::15432-:5432 \
+        -serial file:/tmp/qemu_serial.log \
         -display gtk
 fi
 
