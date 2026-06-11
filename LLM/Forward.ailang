@@ -1,7 +1,7 @@
 // LLM/Forward.ailang
 // Transformer forward pass for LLaMA/SmolLM2 architecture.
 // Single-token incremental inference with KV cache.
-// Integer arithmetic only — Q8 fixed-point throughout.
+// Integer arithmetic only — Q20 fixed-point throughout (int64).
 // Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
 
 // =============================================================================
@@ -39,8 +39,8 @@ FixedPool.RoPETbl {
 
 // =============================================================================
 // SILU LOOKUP TABLE — x * sigmoid(x) approximation
-// 512 entries covering input range [-1024..+1024] mapped to indices [0..511]
-// Output in Q8 fixed-point.
+// 512 entries covering input range [-4194304..+4194304] (Q20 ≈ ±4.0)
+// mapped to indices [0..511]. Output in Q20 fixed-point.
 // =============================================================================
 FixedPool.SiLUTbl {
     "tbl":          Initialize=0, CanChange=True   // 512 entries * 8 bytes
@@ -315,43 +315,29 @@ Function.LLM_InitSiLU {
         //     Easier: sigmoid(-|x|) = 1 - sigmoid(|x|)
         //
         // Simple approach: for each table entry, compute SiLU directly
+        // Q20 SiLU table: 512 entries
+        // index i → x_q20 = (i - 256) * 16384   (float range -4.0 to +4.0)
+        // Table index = (x_q20 + 4194304) / 16384, clamped to [0, 511]
+        // EXPTBL[i] = exp(-i/32) * 256 (Q8).
+        // To get exp(-float_x): float_x = x_q20 / 1048576
+        //   table index = float_x * 32 = x_q20 / 32768
         FwdW.idx = 0
         WhileLoop LessThan(FwdW.idx, 512) {
-            // x_scaled = (i - 256) * 4, represents the input value
-            // But we want the table input to be the Q8 value divided by some scaling
-            // Let's make it simpler: the input to SiLU will be a Q8 value.
-            // Table index = (x_q8 + 1024) / 4, mapping [-1024, +1024] → [0, 512)
-            // x_q8 = (i - 256) * 4
-
-            FwdW.val = Subtract(FwdW.idx, 256)   // range -256..+255
-            FwdW.val = Multiply(FwdW.val, 4)       // x in range -1024..+1020
-
-            // Compute sigmoid(x) where x is Q8 (so actual float = x/256)
-            // sigmoid(x/256) ≈ we need exp(-x/256)
-            // EXPTBL[i] = exp(-i/32)*256, so for exp(-x/256):
-            //   -x/256 = -(x/256), map to table: i = x/256 * 32 = x/8
-            // For x >= 0: exp(-x/256) = EXPTBL[x/8] (clamped to [0,255])
-            //   sigmoid = 256 / (1 + exp(-x/256)) ≈ 256*256 / (256 + EXPTBL[x/8])
-            // For x < 0: sigmoid = 256 - sigmoid(|x|)
-            //   (using 1-sigmoid(-x) = sigmoid(x))
+            FwdW.val = Multiply(Subtract(FwdW.idx, 256), 16384)   // x_q20
 
             IfCondition GreaterEqual(FwdW.val, 0) ThenBlock: {
-                FwdW.val2 = TF_Clamp(Divide(FwdW.val, 8), 0, 255)
+                FwdW.val2 = TF_Clamp(Divide(FwdW.val, 32768), 0, 255)
                 FwdW.score = TFAct_Exp(FwdW.val2)
                 // sigmoid_q8 = 256 * 256 / (256 + exp_val)
                 FwdW.score = Divide(65536, Add(256, FwdW.score))
-                // SiLU = x * sigmoid / 256 (to keep Q8)
+                // SiLU_q20 = x_q20 * sigmoid_q8 / 256
                 FwdW.val2 = Divide(Multiply(FwdW.val, FwdW.score), 256)
             }
             IfCondition LessThan(FwdW.val, 0) ThenBlock: {
-                FwdW.val2 = TF_Clamp(Divide(Subtract(0, FwdW.val), 8), 0, 255)
+                FwdW.val2 = TF_Clamp(Divide(Subtract(0, FwdW.val), 32768), 0, 255)
                 FwdW.score = TFAct_Exp(FwdW.val2)
-                // sigmoid(-|x|) = 1 - sigmoid(|x|) = 1 - 256*256/(256+exp_val)
-                //                = (256 + exp_val - 256*256/(256+exp_val)) ... complex
-                // Easier: sigmoid(-|x|) = exp_val / (256 + exp_val)  * (256/256)
-                //         = 256 * exp_val / (256 + exp_val)
                 FwdW.score = Divide(Multiply(256, FwdW.score), Add(256, FwdW.score))
-                // SiLU = x * sigmoid / 256
+                // SiLU_q20 = x_q20 * sigmoid_q8 / 256
                 FwdW.val2 = Divide(Multiply(FwdW.val, FwdW.score), 256)
             }
 
@@ -367,15 +353,15 @@ Function.LLM_InitSiLU {
 
 // =============================================================================
 // LLM_SiLU — apply SiLU activation via lookup
-// Input: x (Q8 fixed-point value)
-// Output: SiLU(x) (Q8 fixed-point)
+// Input: x (Q20 fixed-point value)
+// Output: SiLU(x) (Q20 fixed-point)
 // =============================================================================
 Function.LLM_SiLU {
     Input: x: Integer
     Output: Integer
     Body: {
-        // Map x to table index: idx = (x + 1024) / 4, clamped to [0, 511]
-        FwdW.val = TF_Clamp(Divide(Add(x, 1024), 4), 0, 511)
+        // Map x_q20 to table index: idx = (x + 4194304) / 16384, clamped to [0, 511]
+        FwdW.val = TF_Clamp(Divide(Add(x, 4194304), 16384), 0, 511)
         ReturnValue(Dereference(Add(SiLUTbl.tbl, Multiply(FwdW.val, 8))))
     }
 }
@@ -386,15 +372,15 @@ Function.LLM_SiLU {
 // RMSNorm(x, gamma) = (x / RMS(x)) * gamma
 // where RMS(x) = sqrt(mean(x^2))
 //
-// In Q8 integer math:
+// In Q20 integer math (int64):
 //   1. Compute sum of squares: sum(x[i]^2) for i in [0, dim)
 //   2. mean_sq = sum / dim
 //   3. rms = isqrt(mean_sq)
 //   4. out[i] = x[i] * gamma[i] / rms
 //
-// Since x is Q8, x^2 is Q16. Sum of Q16 over dim 576 → max ~576 * 330^2 ≈ 63M.
-// mean_sq ≈ 109K (Q16). sqrt(109K) ≈ 330 (Q8). Good.
-// Then: x[i] * gamma[i] is Q16. Divide by rms (Q8) → Q8 output.
+// x is Q20, so x^2 is Q40. Sum of Q40 over dim 576 fits int64 easily.
+// mean_sq is Q40. sqrt(Q40) → Q20. Good.
+// x[i] * gamma[i] is Q40. Divide by rms (Q20) → Q20 output.
 //
 // dst and src may alias (in-place).
 // =============================================================================
@@ -414,14 +400,14 @@ Function.LLM_RMSNorm {
         }
 
         // Step 2: mean and RMS
-        // mean_sq = sum / dim (Q16)
-        // rms = sqrt(mean_sq) (Q8)
+        // mean_sq = sum / dim (Q40)
+        // rms = sqrt(mean_sq) (Q20)
         FwdW.rms = TF_ISqrt(Divide(FwdW.sum, dim))
         IfCondition EqualTo(FwdW.rms, 0) ThenBlock: { FwdW.rms = 1 }
 
         // Step 3: normalize and scale
         // out[i] = x[i] * gamma[i] / rms
-        // x is Q8, gamma is Q8, product is Q16, divide by rms (Q8) → Q8
+        // x is Q20, gamma is Q20, product is Q40, divide by rms (Q20) → Q20
         FwdW.idx = 0
         WhileLoop LessThan(FwdW.idx, dim) {
             FwdW.val = Dereference(Add(src, Multiply(FwdW.idx, 8)))
@@ -435,6 +421,59 @@ Function.LLM_RMSNorm {
 }
 
 // =============================================================================
+// LLM_SoftmaxQ20 — softmax over Q20 input values
+// Input scores are Q20, output is Q8 probabilities (0-256 = 0.0-1.0)
+//
+// Same as TFAct_Softmax but with Q20-appropriate diff scaling:
+//   EXPTBL[i] = exp(-i/32) * 256 (Q8)
+//   For Q20 diff: float_diff = diff_q20 / 1048576
+//   Table index = float_diff * 32 = diff_q20 / 32768
+// =============================================================================
+Function.LLM_SoftmaxQ20 {
+    Input: dst: Integer
+    Input: src: Integer
+    Input: len: Integer
+    Body: {
+        // Step 1: find max
+        sm_max = Dereference(src)
+        sm_i = 1
+        WhileLoop LessThan(sm_i, len) {
+            sm_v = Dereference(Add(src, Multiply(sm_i, 8)))
+            IfCondition GreaterThan(sm_v, sm_max) ThenBlock: { sm_max = sm_v }
+            sm_i = Add(sm_i, 1)
+        }
+
+        // Step 2: compute exp values via table
+        // diff_q20 / 32768 maps to exp table index
+        sm_i = 0
+        WhileLoop LessThan(sm_i, len) {
+            sm_diff = Subtract(sm_max, Dereference(Add(src, Multiply(sm_i, 8))))
+            sm_idx = TF_Clamp(Divide(sm_diff, 32768), 0, 255)
+            StoreValue(Add(dst, Multiply(sm_i, 8)), TFAct_Exp(sm_idx))
+            sm_i = Add(sm_i, 1)
+        }
+
+        // Step 3: sum
+        sm_total = 0
+        sm_i = 0
+        WhileLoop LessThan(sm_i, len) {
+            sm_total = Add(sm_total, Dereference(Add(dst, Multiply(sm_i, 8))))
+            sm_i = Add(sm_i, 1)
+        }
+        IfCondition EqualTo(sm_total, 0) ThenBlock: { sm_total = 1 }
+
+        // Step 4: normalize → Q8 output (0-256)
+        sm_i = 0
+        WhileLoop LessThan(sm_i, len) {
+            sm_v = Dereference(Add(dst, Multiply(sm_i, 8)))
+            StoreValue(Add(dst, Multiply(sm_i, 8)), Divide(Multiply(sm_v, 256), sm_total))
+            sm_i = Add(sm_i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
 // LLM_ApplyRoPE — apply rotary position embeddings to Q and K vectors
 //
 // For each dimension pair (2i, 2i+1) in each head:
@@ -442,8 +481,8 @@ Function.LLM_RMSNorm {
 //   q_new[2i+1] = q[2i]   * sin + q[2i+1] * cos
 // Same for K (but only n_kv_heads heads).
 //
-// cos/sin values are Q8. Q/K values are Q8.
-// Product is Q16, divide by 256 → Q8.
+// cos/sin values are Q8 (±256). Q/K values are Q20.
+// Product is Q28, divide by 256 → Q20.
 // =============================================================================
 Function.LLM_ApplyRoPE {
     Input: q_vec: Address
@@ -509,18 +548,16 @@ Function.LLM_ApplyRoPE {
 }
 
 // =============================================================================
-// LLM_MatVecMulQ8 — fast inline matrix-vector multiply with Q8 descale
+// LLM_MatVecMulQ20 — fast inline matrix-vector multiply with Q20 descale
 //
-// dst[row] = (sum over col: mat[row][col] * vec[col]) / 256
+// dst[row] = (sum over col: mat[row][col] * vec[col]) / 1048576
 //
-// Unlike TF_MatVecMul which calls TF_MatGet → TF_Offset → TF_VecGet
-// (3 function calls per inner iteration), this function uses direct
-// Dereference with byte-offset arithmetic — zero function calls in
-// the hot loop.  The /256 descale is folded in to avoid a second pass.
+// Q20 × Q20 = Q40 accumulator.  /1048576 (2^20) → Q20 output.
+// int64 accumulator range: 576 × (±1M)² ≈ ±5.76×10^17. Fits int64.
 //
 // mat is row-major [rows × cols], 8 bytes per element.
 // =============================================================================
-Function.LLM_MatVecMulQ8 {
+Function.LLM_MatVecMulQ20 {
     Input: dst:  Integer
     Input: mat:  Integer
     Input: vec:  Integer
@@ -539,7 +576,7 @@ Function.LLM_MatVecMulQ8 {
                     Dereference(Add(vec, mv_col_off))))
                 mv_col_off = Add(mv_col_off, 8)
             }
-            StoreValue(Add(dst, Multiply(mv_row, 8)), Divide(mv_sum, 256))
+            StoreValue(Add(dst, Multiply(mv_row, 8)), Divide(mv_sum, 1048576))
             mv_mat_off = Add(mv_mat_off, mv_row_bytes)
             mv_row = Add(mv_row, 1)
         }
@@ -650,11 +687,11 @@ Function.LLM_Forward {
             // Q: [d_model × d_model] * xb → q
             FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.WQ))
             TF_MatVecMul(LLMBuf.q, FwdW.ptr, LLMBuf.xb, LLMConfig.d_model, LLMConfig.d_model)
-            // Descale Q8×Q8 → Q8
+            // Descale Q20×Q20=Q40 → Q20
             FwdW.idx = 0
             WhileLoop LessThan(FwdW.idx, LLMConfig.d_model) {
                 StoreValue(Add(LLMBuf.q, Multiply(FwdW.idx, 8)),
-                           Divide(Dereference(Add(LLMBuf.q, Multiply(FwdW.idx, 8))), 256))
+                           Divide(Dereference(Add(LLMBuf.q, Multiply(FwdW.idx, 8))), 1048576))
                 FwdW.idx = Add(FwdW.idx, 1)
             }
 
@@ -695,7 +732,7 @@ Function.LLM_Forward {
             FwdW.idx = 0
             WhileLoop LessThan(FwdW.idx, FwdW.kv_dim) {
                 StoreValue(Add(LLMBuf.k, Multiply(FwdW.idx, 8)),
-                           Divide(Dereference(Add(LLMBuf.k, Multiply(FwdW.idx, 8))), 256))
+                           Divide(Dereference(Add(LLMBuf.k, Multiply(FwdW.idx, 8))), 1048576))
                 FwdW.idx = Add(FwdW.idx, 1)
             }
 
@@ -705,7 +742,7 @@ Function.LLM_Forward {
             FwdW.idx = 0
             WhileLoop LessThan(FwdW.idx, FwdW.kv_dim) {
                 StoreValue(Add(LLMBuf.v, Multiply(FwdW.idx, 8)),
-                           Divide(Dereference(Add(LLMBuf.v, Multiply(FwdW.idx, 8))), 256))
+                           Divide(Dereference(Add(LLMBuf.v, Multiply(FwdW.idx, 8))), 1048576))
                 FwdW.idx = Add(FwdW.idx, 1)
             }
 
@@ -766,11 +803,11 @@ Function.LLM_Forward {
                         FwdW.idx2 = Add(FwdW.idx2, 1)
                     }
 
-                    // Scale by 1/sqrt(head_dim) and descale Q16→Q8
-                    // dot product is Q8*Q8=Q16 summed over head_dim
-                    // Divide by 256 (Q16→Q8) and by sqrt(64)=8
-                    // Combined: divide by 2048
-                    FwdW.score = Divide(FwdW.score, 2048)
+                    // Scale by 1/sqrt(head_dim) and descale Q40→Q20
+                    // dot product is Q20*Q20=Q40 summed over head_dim
+                    // Divide by 1048576 (Q40→Q20) and by sqrt(64)=8
+                    // Combined: divide by 8388608
+                    FwdW.score = Divide(FwdW.score, 8388608)
 
                     // Store attention score for this position
                     // att[head * max_seq + t]
@@ -782,9 +819,9 @@ Function.LLM_Forward {
                 }
 
                 // ── 6. Softmax over attention scores [0..pos] ──
-                // Use existing TFAct_Softmax
+                // Q20-adapted softmax for attention scores
                 FwdW.ptr = Add(LLMBuf.att, Multiply(Multiply(FwdW.head, LLMMode.max_seq), 8))
-                TFAct_Softmax(FwdW.ptr, FwdW.ptr, Add(pos, 1))
+                LLM_SoftmaxQ20(FwdW.ptr, FwdW.ptr, Add(pos, 1))
 
                 // ── 7. Weighted sum of cached V using attention weights ──
                 // xb[head_slice] = sum over t: att[t] * v_cache[layer][t][kv_head_slice]
@@ -822,7 +859,7 @@ Function.LLM_Forward {
             FwdW.idx = 0
             WhileLoop LessThan(FwdW.idx, LLMConfig.d_model) {
                 StoreValue(Add(LLMBuf.xb2, Multiply(FwdW.idx, 8)),
-                           Divide(Dereference(Add(LLMBuf.xb2, Multiply(FwdW.idx, 8))), 256))
+                           Divide(Dereference(Add(LLMBuf.xb2, Multiply(FwdW.idx, 8))), 1048576))
                 FwdW.idx = Add(FwdW.idx, 1)
             }
 
@@ -840,7 +877,7 @@ Function.LLM_Forward {
             FwdW.idx = 0
             WhileLoop LessThan(FwdW.idx, LLMConfig.d_ff) {
                 StoreValue(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8)),
-                           Divide(Dereference(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8))), 256))
+                           Divide(Dereference(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8))), 1048576))
                 FwdW.idx = Add(FwdW.idx, 1)
             }
 
@@ -850,7 +887,7 @@ Function.LLM_Forward {
             FwdW.idx = 0
             WhileLoop LessThan(FwdW.idx, LLMConfig.d_ff) {
                 StoreValue(Add(LLMBuf.ffn_up, Multiply(FwdW.idx, 8)),
-                           Divide(Dereference(Add(LLMBuf.ffn_up, Multiply(FwdW.idx, 8))), 256))
+                           Divide(Dereference(Add(LLMBuf.ffn_up, Multiply(FwdW.idx, 8))), 1048576))
                 FwdW.idx = Add(FwdW.idx, 1)
             }
 
@@ -859,9 +896,9 @@ Function.LLM_Forward {
             WhileLoop LessThan(FwdW.idx, LLMConfig.d_ff) {
                 FwdW.val = LLM_SiLU(Dereference(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8))))
                 FwdW.val2 = Dereference(Add(LLMBuf.ffn_up, Multiply(FwdW.idx, 8)))
-                // SiLU output is Q8, up is Q8, product is Q16, divide by 256 → Q8
+                // SiLU output is Q20, up is Q20, product is Q40, /1048576 → Q20
                 StoreValue(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8)),
-                           Divide(Multiply(FwdW.val, FwdW.val2), 256))
+                           Divide(Multiply(FwdW.val, FwdW.val2), 1048576))
                 FwdW.idx = Add(FwdW.idx, 1)
             }
 
@@ -871,7 +908,7 @@ Function.LLM_Forward {
             FwdW.idx = 0
             WhileLoop LessThan(FwdW.idx, LLMConfig.d_model) {
                 StoreValue(Add(LLMBuf.ffn_down, Multiply(FwdW.idx, 8)),
-                           Divide(Dereference(Add(LLMBuf.ffn_down, Multiply(FwdW.idx, 8))), 256))
+                           Divide(Dereference(Add(LLMBuf.ffn_down, Multiply(FwdW.idx, 8))), 1048576))
                 FwdW.idx = Add(FwdW.idx, 1)
             }
 
@@ -906,11 +943,11 @@ Function.LLM_Forward {
         // output is [vocab_size × d_model], x is [d_model], logits is [vocab_size]
         TF_MatVecMul(LLMBuf.logits, LLMWeights.output, LLMBuf.x,
                      LLMConfig.vocab_size, LLMConfig.d_model)
-        // Descale logits
+        // Descale Q20×Q20=Q40 → Q20 logits
         FwdW.idx = 0
         WhileLoop LessThan(FwdW.idx, LLMConfig.vocab_size) {
             StoreValue(Add(LLMBuf.logits, Multiply(FwdW.idx, 8)),
-                       Divide(Dereference(Add(LLMBuf.logits, Multiply(FwdW.idx, 8))), 256))
+                       Divide(Dereference(Add(LLMBuf.logits, Multiply(FwdW.idx, 8))), 1048576))
             FwdW.idx = Add(FwdW.idx, 1)
         }
         ReturnValue(0)
