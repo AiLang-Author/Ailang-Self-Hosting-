@@ -1339,7 +1339,197 @@ Function.AccelGCN_Submit {
             wg_count = Divide(Add(gcn_rows, 63), 64)
             dst_bytes_padded = Multiply(Multiply(wg_count, 64), 8)
 
-            // Step 2: Upload mat and vec to VRAM, zero dst area
+            // Check total data fits in VRAM data region
+            // BAR=256MB (268435456) - DATA_OFFSET (67641344) = 200794112 bytes
+            total_data_size = Add(Add(mat_bytes, vec_bytes), dst_bytes_padded)
+            IfCondition GreaterThan(total_data_size, 200794112) ThenBlock: {
+                // Too large for single dispatch — tile across multiple dispatches.
+                // Each tile processes a chunk of rows. Pick tile_rows so that
+                // tile_mat + vec + tile_dst < 190 MB (safe margin).
+                // tile_mat = tile_rows * cols * 8
+                // Solve: tile_rows * cols * 8 + cols * 8 + tile_rows * 8 < 190_000_000
+                //   ≈ tile_rows * cols * 8 < 190_000_000
+                //   tile_rows < 190_000_000 / (cols * 8)
+                tile_rows = Divide(190000000, Multiply(gcn_cols, 8))
+                // Align to workgroup size (64)
+                tile_rows = Multiply(Divide(tile_rows, 64), 64)
+                IfCondition LessThan(tile_rows, 64) ThenBlock: { tile_rows = 64 }
+
+                tile_start = 0
+                WhileLoop LessThan(tile_start, gcn_rows) {
+                    tile_end = Add(tile_start, tile_rows)
+                    IfCondition GreaterThan(tile_end, gcn_rows) ThenBlock: {
+                        tile_end = gcn_rows
+                    }
+                    tile_n = Subtract(tile_end, tile_start)
+
+                    // Recompute sizes for this tile
+                    tile_mat_bytes = Multiply(Multiply(tile_n, gcn_cols), 8)
+                    tile_dst_bytes = Multiply(tile_n, 8)
+                    tile_wg = Divide(Add(tile_n, 63), 64)
+                    tile_dst_pad = Multiply(Multiply(tile_wg, 64), 8)
+
+                    tile_mat_vram = 0
+                    tile_vec_vram = tile_mat_bytes
+                    tile_dst_vram = Add(tile_mat_bytes, vec_bytes)
+
+                    // Upload tile matrix (rows [tile_start..tile_end) of original mat)
+                    tile_mat_src = Add(gcn_mat, Multiply(Multiply(tile_start, gcn_cols), 8))
+                    discard = AccelGCN_VramWrite(tile_mat_vram, tile_mat_src, tile_mat_bytes)
+                    discard = AccelGCN_VramWrite(tile_vec_vram, gcn_vec, vec_bytes)
+                    tmp_zero = Allocate(tile_dst_pad)
+                    MemorySet(tmp_zero, 0, tile_dst_pad)
+                    discard = AccelGCN_VramWrite(tile_dst_vram, tmp_zero, tile_dst_pad)
+                    Deallocate(tmp_zero, tile_dst_pad)
+
+                    // Build kernel for tile dimensions (uses cache)
+                    cache_slot = KCache_Lookup(1, tile_n, gcn_cols)
+                    IfCondition GreaterEqual(cache_slot, 0) ThenBlock: {
+                        discard_kr = KCache_Restore(cache_slot)
+                        rc = CIR_BindBuffer(0, tile_mat_vram, tile_mat_bytes, 4, 1)
+                        rc = CIR_BindBuffer(1, tile_vec_vram, vec_bytes, 4, 1)
+                        rc = CIR_BindBuffer(2, tile_dst_vram, tile_dst_pad, 4, 2)
+                        CIRProg.num_bufs = 3
+                    }
+                    IfCondition LessThan(cache_slot, 0) ThenBlock: {
+                        // Emit kernel — reuse the same looped GCN kernel builder
+                        // by recursing through HALOp with tile dimensions
+                        rc = CIR_Begin()
+                        rc = CIR_SetGroupSize(64, 1, 1)
+                        rc = CIR_SetGrid(tile_wg, 1, 1)
+                        rc = CIR_BindBuffer(0, tile_mat_vram, tile_mat_bytes, 4, 1)
+                        rc = CIR_BindBuffer(1, tile_vec_vram, vec_bytes, 4, 1)
+                        rc = CIR_BindBuffer(2, tile_dst_vram, tile_dst_pad, 4, 2)
+
+                        // Emit the same looped GCN kernel (copy of the cache-miss path)
+                        CIRGcn.mc_pos = 0
+                        GCNEnc_Emit_SOP2(38, 8, 4, 255)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(64)
+                        GCNEnc_Emit_VOP2(37, 1, 8, 0)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP1(1, 2, 128)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP1(1, 3, 128)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP1(1, 16, 255)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(gcn_cols)
+                        GCNEnc_Emit_VOP3(361, 4, 257, 272, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_SOP1(3, 9, 128)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_SOP1(3, 10, 255)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(gcn_cols)
+                        loop_start = CIRGcn.mc_pos
+                        GCNEnc_Emit_VOP1(1, 16, 9)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 5, 260, 16)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 6, 129, 5)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 7, 129, 6)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 14, 129, 16)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 15, 129, 14)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 6)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_MUBUF(12, 8, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 7)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_MUBUF(12, 9, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 14)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(tile_vec_vram)
+                        GCNEnc_Emit_MUBUF(12, 10, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 15)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(tile_vec_vram)
+                        GCNEnc_Emit_MUBUF(12, 11, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_S_WAITCNT(0, 0, 0)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP3(361, 12, 264, 266, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP3(362, 13, 264, 266, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP3(361, 14, 264, 267, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(37, 13, 269, 14)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP3(361, 15, 265, 266, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(37, 13, 269, 15)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 2, 258, 12)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(40, 3, 259, 13)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_SOP2(0, 9, 9, 129)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_SOPC(9, 9, 10)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        loop_off = Divide(Subtract(loop_start, Add(CIRGcn.mc_pos, 4)), 4)
+                        GCNEnc_Emit_SOPP(5, loop_off)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 6, 129, 1)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 7, 129, 6)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 6)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(tile_dst_vram)
+                        GCNEnc_Emit_MUBUF(28, 2, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 7)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(tile_dst_vram)
+                        GCNEnc_Emit_MUBUF(28, 3, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_S_WAITCNT(0, 0, 0)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_S_ENDPGM()
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        CIRProg.mc_size = CIRGcn.mc_pos
+                        CIRProg.lowered = 1
+                        CIRGcn.num_vgprs = 18
+                        CIRGcn.num_sgprs = 11
+                        discard_ks = KCache_Store(1, tile_n, gcn_cols)
+                    }
+
+                    // Dispatch tile
+                    rc = AccelGCN_Dispatch()
+                    IfCondition LessThan(rc, 0) ThenBlock: {
+                        HALOp.status = -1
+                        ReturnValue(-1)
+                    }
+
+                    // Read back tile results into correct offset of dst
+                    tile_dst_host = Add(gcn_dst, Multiply(tile_start, 8))
+                    discard = AccelGCN_VramRead(tile_dst_vram, tile_dst_host, tile_dst_bytes)
+
+                    tile_start = tile_end
+                }
+
+                HALOp.status = 1
+                ReturnValue(0)
+            }
+
+            // Step 2: Upload mat and vec to VRAM, zero dst area (single dispatch path)
             discard = AccelGCN_VramWrite(mat_vram, gcn_mat, mat_bytes)
             discard = AccelGCN_VramWrite(vec_vram, gcn_vec, vec_bytes)
             // Zero dst area in VRAM (so upper 4 bytes of each 8-byte slot stay 0)
@@ -1360,9 +1550,10 @@ Function.AccelGCN_Submit {
                 CIRProg.num_bufs = 3
             }
             IfCondition LessThan(cache_slot, 0) ThenBlock: {
-                // Cache miss — full CIR build + lower
-                // 64-bit math: treat each 8-byte element as 2 consecutive DWORDs
-                // Buffer stride=4 (DWORD addressing), element i → DWORD i*2 (lo), i*2+1 (hi)
+                // Cache miss — emit GCN directly with scalar loop
+                // (CIR has no branch/loop ops, so we bypass CIR for the kernel
+                //  and emit GCN machine code directly. CIR is still used for
+                //  buffer descriptors and dispatch metadata.)
                 rc = CIR_Begin()
                 rc = CIR_SetGroupSize(64, 1, 1)
                 rc = CIR_SetGrid(wg_count, 1, 1)
@@ -1370,88 +1561,213 @@ Function.AccelGCN_Submit {
                 rc = CIR_BindBuffer(1, vec_vram, vec_bytes, 4, 1)
                 rc = CIR_BindBuffer(2, dst_vram, dst_bytes_padded, 4, 2)
 
-                v_gid     = CIR_AllocVReg()
-                v_acc_lo  = CIR_AllocVReg()
-                v_acc_hi  = CIR_AllocVReg()
-                v_cols    = CIR_AllocVReg()
-                v_two     = CIR_AllocVReg()
-                v_one     = CIR_AllocVReg()
-                v_k       = CIR_AllocVReg()
-                v_k2      = CIR_AllocVReg()
-                v_k2p1    = CIR_AllocVReg()
-                v_a_idx   = CIR_AllocVReg()
-                v_a_idx2  = CIR_AllocVReg()
-                v_a_idx2p1 = CIR_AllocVReg()
-                v_a_lo    = CIR_AllocVReg()
-                v_a_hi    = CIR_AllocVReg()
-                v_b_lo    = CIR_AllocVReg()
-                v_b_hi    = CIR_AllocVReg()
-                v_p_lo    = CIR_AllocVReg()
-                v_p_hi    = CIR_AllocVReg()
-                v_t1      = CIR_AllocVReg()
-                v_t2      = CIR_AllocVReg()
-                v_dst_idx = CIR_AllocVReg()
-                v_dst_idx2 = CIR_AllocVReg()
-                v_dst_idx2p1 = CIR_AllocVReg()
+                // Register plan (all physical):
+                //   v0  = thread_id_x (HW preload)
+                //   v1  = global_id (row)
+                //   v2  = acc_lo
+                //   v3  = acc_hi
+                //   v4  = row_base = gid * cols  (precomputed)
+                //   v5  = a_idx
+                //   v6  = a_dw (a_idx*2)
+                //   v7  = a_dw+1
+                //   v8  = a_lo
+                //   v9  = a_hi
+                //   v10 = b_lo
+                //   v11 = b_hi
+                //   v12 = prod_lo
+                //   v13 = prod_hi
+                //   v14 = temp
+                //   v15 = temp2
+                //   v16 = k_vreg (copy of s9 for vector add)
+                //   v17 = scratch (byte offset calc in MUBUF)
+                //   s0-s3 = V# (buffer descriptor, HW)
+                //   s4  = group_id_x (HW preload)
+                //   s8  = scratch SGPR
+                //   s9  = k (loop counter)
+                //   s10 = cols (loop bound)
+                CIRGcn.mc_pos = 0
 
-                rc = CIR_Op_GlobalIdX(v_gid)
-                rc = CIR_Op_LoadConst(v_cols, gcn_cols)
-                rc = CIR_Op_LoadConst(v_two, 2)
-                rc = CIR_Op_LoadConst(v_one, 1)
-                rc = CIR_Op_LoadConst(v_acc_lo, 0)
-                rc = CIR_Op_LoadConst(v_acc_hi, 0)
+                // ── Prologue ──
+                // global_id = group_id_x * 64 + thread_id_x
+                // S_MUL_I32 s8, s4, 64  (SOP2 op=38)
+                GCNEnc_Emit_SOP2(38, 8, 4, 255)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(64)
+                // V_ADD_I32 v1, s8, v0  (VOP2 op=37)
+                GCNEnc_Emit_VOP2(37, 1, 8, 0)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
 
-                k = 0
-                WhileLoop LessThan(k, gcn_cols) {
-                    // Compute element index: a_idx = gid * cols + k
-                    rc = CIR_Op_LoadConst(v_k, k)
-                    rc = CIR_Op_MulLoU32(v_a_idx, v_gid, v_cols)
-                    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_k)
+                // acc_lo=0, acc_hi=0
+                // V_MOV_B32 v2, 0  (VOP1 op=1, src=128 = inline 0)
+                GCNEnc_Emit_VOP1(1, 2, 128)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // V_MOV_B32 v3, 0
+                GCNEnc_Emit_VOP1(1, 3, 128)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
 
-                    // DWORD indices: a_idx*2 (lo), a_idx*2+1 (hi)
-                    rc = CIR_Op_MulLoU32(v_a_idx2, v_a_idx, v_two)
-                    rc = CIR_Op_AddU32(v_a_idx2p1, v_a_idx2, v_one)
+                // row_base = gid * cols → v4
+                // V_MOV_B32 v16, literal(cols) — need cols in vreg for MUL
+                GCNEnc_Emit_VOP1(1, 16, 255)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(gcn_cols)
+                // V_MUL_LO_U32 v4, v1, v16  (VOP3 op=361)
+                GCNEnc_Emit_VOP3(361, 4, 257, 272, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
 
-                    // DWORD indices for vec[k]: k*2 (lo), k*2+1 (hi)
-                    rc = CIR_Op_MulLoU32(v_k2, v_k, v_two)
-                    rc = CIR_Op_AddU32(v_k2p1, v_k2, v_one)
+                // S_MOV_B32 s9, 0  — loop counter k = 0
+                GCNEnc_Emit_SOP1(3, 9, 128)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // S_MOV_B32 s10, literal(cols)  — loop bound
+                GCNEnc_Emit_SOP1(3, 10, 255)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(gcn_cols)
 
-                    // Load 64-bit mat element (lo + hi DWORDs)
-                    rc = CIR_Op_LoadBuf(v_a_lo, 0, v_a_idx2)
-                    rc = CIR_Op_LoadBuf(v_a_hi, 0, v_a_idx2p1)
-                    // Load 64-bit vec element (lo + hi DWORDs)
-                    rc = CIR_Op_LoadBuf(v_b_lo, 1, v_k2)
-                    rc = CIR_Op_LoadBuf(v_b_hi, 1, v_k2p1)
-                    rc = CIR_Op_WaitCnt(0, 0, 0)
+                // ── Record loop start position ──
+                loop_start = CIRGcn.mc_pos
 
-                    // 64-bit multiply: prod = a * b (low 64 bits)
-                    // prod_lo = MUL_LO(a_lo, b_lo)
-                    // prod_hi = MUL_HI(a_lo, b_lo) + MUL_LO(a_lo, b_hi) + MUL_LO(a_hi, b_lo)
-                    rc = CIR_Op_MulLoU32(v_p_lo, v_a_lo, v_b_lo)
-                    rc = CIR_Op_MulHiU32(v_p_hi, v_a_lo, v_b_lo)
-                    rc = CIR_Op_MulLoU32(v_t1, v_a_lo, v_b_hi)
-                    rc = CIR_Op_AddU32(v_p_hi, v_p_hi, v_t1)
-                    rc = CIR_Op_MulLoU32(v_t2, v_a_hi, v_b_lo)
-                    rc = CIR_Op_AddU32(v_p_hi, v_p_hi, v_t2)
+                // ── Loop body ──
+                // Copy k to VGPR: V_MOV_B32 v16, s9
+                GCNEnc_Emit_VOP1(1, 16, 9)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
 
-                    // 64-bit accumulate: acc += prod
-                    // ADD_U32 sets VCC carry, ADDC_U32 reads it
-                    rc = CIR_Op_AddU32(v_acc_lo, v_acc_lo, v_p_lo)
-                    rc = CIR_Op_AddcU32(v_acc_hi, v_acc_hi, v_p_hi)
+                // a_idx = row_base + k → v5
+                // V_ADD_I32 v5, v4, v16
+                GCNEnc_Emit_VOP2(37, 5, 260, 16)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
 
-                    k = Add(k, 1)
-                }
+                // a_dw = a_idx * 2 → v6: V_LSHLREV_B32 v6, 1, v5
+                GCNEnc_Emit_VOP2(26, 6, 129, 5)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // a_dw+1 → v7: V_ADD_I32 v7, v6, 1
+                GCNEnc_Emit_VOP2(37, 7, 129, 6)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
 
-                // Store 64-bit result: dst[gid] = acc (lo + hi DWORDs)
-                rc = CIR_Op_MulLoU32(v_dst_idx2, v_gid, v_two)
-                rc = CIR_Op_AddU32(v_dst_idx2p1, v_dst_idx2, v_one)
-                rc = CIR_Op_StoreBuf(v_acc_lo, 2, v_dst_idx2)
-                rc = CIR_Op_StoreBuf(v_acc_hi, 2, v_dst_idx2p1)
-                rc = CIR_Op_WaitCnt(0, 0, 0)
-                rc = CIR_Op_EndPgm()
+                // k_dw = k * 2 → reuse v14: V_LSHLREV_B32 v14, 1, v16
+                GCNEnc_Emit_VOP2(26, 14, 129, 16)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // k_dw+1 → v15: V_ADD_I32 v15, v14, 1
+                GCNEnc_Emit_VOP2(37, 15, 129, 14)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
 
-                n_insns = CIR_End()
-                mc_bytes = CIR_Lower_GCN()
+                // Load mat[a_dw] → v8 (needs byte offset for MUBUF offen)
+                // v17 = v6 << 2 (DWORD to byte)
+                GCNEnc_Emit_VOP2(26, 17, 130, 6)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // BUFFER_LOAD_DWORD v8, v17, s[0:3], off offen offset=0
+                GCNEnc_Emit_MUBUF(12, 8, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // Load mat[a_dw+1] → v9
+                GCNEnc_Emit_VOP2(26, 17, 130, 7)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                GCNEnc_Emit_MUBUF(12, 9, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // Load vec[k_dw] → v10: byte offset = buf1_off + v14*4
+                // v17 = v14 << 2
+                GCNEnc_Emit_VOP2(26, 17, 130, 14)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // Add buf1 byte offset (vec_vram)
+                GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(vec_vram)
+                GCNEnc_Emit_MUBUF(12, 10, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // Load vec[k_dw+1] → v11
+                GCNEnc_Emit_VOP2(26, 17, 130, 15)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(vec_vram)
+                GCNEnc_Emit_MUBUF(12, 11, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // S_WAITCNT vmcnt(0) — wait for all loads
+                GCNEnc_Emit_S_WAITCNT(0, 0, 0)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // 64-bit multiply: prod = a * b
+                // prod_lo = MUL_LO(a_lo, b_lo)
+                GCNEnc_Emit_VOP3(361, 12, 264, 266, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                // prod_hi = MUL_HI(a_lo, b_lo)
+                GCNEnc_Emit_VOP3(362, 13, 264, 266, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                // t1 = MUL_LO(a_lo, b_hi)
+                GCNEnc_Emit_VOP3(361, 14, 264, 267, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                // prod_hi += t1
+                GCNEnc_Emit_VOP2(37, 13, 269, 14)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // t2 = MUL_LO(a_hi, b_lo)
+                GCNEnc_Emit_VOP3(361, 15, 265, 266, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                // prod_hi += t2
+                GCNEnc_Emit_VOP2(37, 13, 269, 15)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // 64-bit accumulate: acc += prod
+                // V_ADD_I32 v2, v2, v12 (sets VCC carry)
+                GCNEnc_Emit_VOP2(37, 2, 258, 12)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // V_ADDC_U32 v3, v3, v13 (reads VCC carry)
+                GCNEnc_Emit_VOP2(40, 3, 259, 13)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // ── Loop control ──
+                // S_ADD_U32 s9, s9, 1  (SOP2 op=0)
+                GCNEnc_Emit_SOP2(0, 9, 9, 129)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // S_CMP_LT_U32 s9, s10  (SOPC op=9) — sets SCC=1 if s9 < s10
+                GCNEnc_Emit_SOPC(9, 9, 10)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // S_CBRANCH_SCC1 offset (SOPP op=5)
+                // offset = (loop_start - (mc_pos + 4)) / 4  (signed DWORDs from next PC)
+                loop_off = Divide(Subtract(loop_start, Add(CIRGcn.mc_pos, 4)), 4)
+                GCNEnc_Emit_SOPP(5, loop_off)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // ── Epilogue: store result ──
+                // dst_dw = gid * 2 → v6: V_LSHLREV_B32 v6, 1, v1
+                GCNEnc_Emit_VOP2(26, 6, 129, 1)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // dst_dw+1 → v7: V_ADD_I32 v7, v6, 1
+                GCNEnc_Emit_VOP2(37, 7, 129, 6)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // byte offset for store: v17 = v6 << 2 + dst_vram
+                GCNEnc_Emit_VOP2(26, 17, 130, 6)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(dst_vram)
+                // BUFFER_STORE_DWORD v2, v17, s[0:3], off offen
+                GCNEnc_Emit_MUBUF(28, 2, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // byte offset for hi: v17 = v7 << 2 + dst_vram
+                GCNEnc_Emit_VOP2(26, 17, 130, 7)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(dst_vram)
+                GCNEnc_Emit_MUBUF(28, 3, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // S_WAITCNT vmcnt(0)
+                GCNEnc_Emit_S_WAITCNT(0, 0, 0)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // S_ENDPGM
+                GCNEnc_Emit_S_ENDPGM()
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // Set CIRProg metadata for dispatch
+                CIRProg.mc_size = CIRGcn.mc_pos
+                CIRProg.lowered = 1
+                CIRGcn.num_vgprs = 18
+                CIRGcn.num_sgprs = 11
 
                 // Store to cache for next time
                 discard_ks = KCache_Store(1, gcn_rows, gcn_cols)
@@ -1466,7 +1782,6 @@ Function.AccelGCN_Submit {
                 HALOp.status = -1
                 ReturnValue(-1)
             }
-
             // Step 5: Read back full 64-bit results (GPU wrote both lo and hi DWORDs)
             discard = AccelGCN_VramRead(dst_vram, gcn_dst, dst_bytes)
 
@@ -1999,12 +2314,7 @@ Function.AccelGCN_VramWrite {
         vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
         dst = Add(vram_ptr, Add(AccelGCNCfg.data_vram, offset))
 
-        i = 0
-        WhileLoop LessThan(i, nbytes) {
-            b = GetByte(src, i)
-            SetByte(dst, i, b)
-            i = Add(i, 1)
-        }
+        MemoryCopy(dst, src, nbytes)
         // Flush CPU WC (write-combine) buffer so data is visible in VRAM
         // before GPU reads it.  Without this, the shader may read stale/zero
         // data from VRAM while CPU writes still sit in the WC buffer.
@@ -2040,12 +2350,7 @@ Function.AccelGCN_VramRead {
         vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
         src = Add(vram_ptr, Add(AccelGCNCfg.data_vram, offset))
 
-        i = 0
-        WhileLoop LessThan(i, nbytes) {
-            b = GetByte(src, i)
-            SetByte(dst, i, b)
-            i = Add(i, 1)
-        }
+        MemoryCopy(dst, src, nbytes)
         ReturnValue(nbytes)
     }
 }

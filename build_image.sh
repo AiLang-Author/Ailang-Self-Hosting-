@@ -53,6 +53,21 @@ ok()    { echo -e "${GRN}[OK]${RST}    $*"; }
 warn()  { echo -e "${YEL}[WARN]${RST}  $*"; }
 fail()  { echo -e "${RED}[FAIL]${RST}  $*"; exit 1; }
 
+# Compile an AILang source file and abort on failure
+# Usage: compile <source> <output>
+compile() {
+    local src="$1" out="$2"
+    rm -f "$out"
+    $AILANG "$src" -o "$out" 2>&1 | tail -1
+    if [ ! -f "$out" ]; then
+        echo ""
+        echo -e "${RED}[FAIL]${RST}  Compilation failed for: $src"
+        echo -e "${RED}[FAIL]${RST}  Re-running with full output:"
+        $AILANG "$src" -o "$out" 2>&1 | tail -20
+        exit 1
+    fi
+}
+
 # =============================================================================
 # PARSE ARGS
 # =============================================================================
@@ -85,21 +100,21 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
 
     # Init (PID 1)
     info "  Compiling ailang_init..."
-    $AILANG OS/Init.ailang -o /tmp/ailang_init 2>&1 | tail -1
+    compile OS/Init.ailang /tmp/ailang_init
     cp /tmp/ailang_init "$OVERLAY/sbin/ailang_init"
     chmod +x "$OVERLAY/sbin/ailang_init"
     ok "  ailang_init ($(stat -c%s /tmp/ailang_init) bytes)"
 
     # Display server
     info "  Compiling display.x..."
-    $AILANG Main.ailang -o /tmp/display.x 2>&1 | tail -1
+    compile Main.ailang /tmp/display.x
     cp /tmp/display.x "$OVERLAY/system/bin/display.x"
     chmod +x "$OVERLAY/system/bin/display.x"
     ok "  display.x ($(stat -c%s /tmp/display.x) bytes)"
 
     # Login
     info "  Compiling login.x..."
-    $AILANG OS/Login.ailang -o /tmp/login.x 2>&1 | tail -1
+    compile OS/Login.ailang /tmp/login.x
     cp /tmp/login.x "$OVERLAY/system/bin/login.x"
     chmod +x "$OVERLAY/system/bin/login.x"
     ok "  login.x ($(stat -c%s /tmp/login.x) bytes)"
@@ -107,7 +122,7 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
     # IDE
     if [ -f "Applications/ide_ipc.ailang" ]; then
         info "  Compiling ide.x..."
-        $AILANG Applications/ide_ipc.ailang -o /tmp/ide.x 2>&1 | tail -1
+        compile Applications/ide_ipc.ailang /tmp/ide.x
         cp /tmp/ide.x "$OVERLAY/system/bin/ide.x"
         chmod +x "$OVERLAY/system/bin/ide.x"
         ok "  ide.x ($(stat -c%s /tmp/ide.x) bytes)"
@@ -116,7 +131,7 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
     # Settings
     if [ -f "Applications/settings_ipc.ailang" ]; then
         info "  Compiling settings.x..."
-        $AILANG Applications/settings_ipc.ailang -o /tmp/settings.x 2>&1 | tail -1
+        compile Applications/settings_ipc.ailang /tmp/settings.x
         cp /tmp/settings.x "$OVERLAY/system/bin/settings.x"
         chmod +x "$OVERLAY/system/bin/settings.x"
         ok "  settings.x ($(stat -c%s /tmp/settings.x) bytes)"
@@ -124,7 +139,7 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
 
     # Service Daemon
     info "  Compiling svc_daemon.x..."
-    $AILANG OS/ServiceDaemon.ailang -o /tmp/svc_daemon.x 2>&1 | tail -1
+    compile OS/ServiceDaemon.ailang /tmp/svc_daemon.x
     cp /tmp/svc_daemon.x "$OVERLAY/system/bin/svc_daemon.x"
     chmod +x "$OVERLAY/system/bin/svc_daemon.x"
     ok "  svc_daemon.x ($(stat -c%s /tmp/svc_daemon.x) bytes)"
@@ -132,7 +147,7 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
     # User Management
     if [ -f "Applications/usermgmt_ipc.ailang" ]; then
         info "  Compiling usermgmt.x..."
-        $AILANG Applications/usermgmt_ipc.ailang -o /tmp/usermgmt.x 2>&1 | tail -1
+        compile Applications/usermgmt_ipc.ailang /tmp/usermgmt.x
         cp /tmp/usermgmt.x "$OVERLAY/system/bin/usermgmt.x"
         chmod +x "$OVERLAY/system/bin/usermgmt.x"
         ok "  usermgmt.x ($(stat -c%s /tmp/usermgmt.x) bytes)"
@@ -141,7 +156,7 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
     # Installer
     if [ -f "Applications/installer_ipc.ailang" ]; then
         info "  Compiling installer_ipc.x..."
-        $AILANG Applications/installer_ipc.ailang -o /tmp/installer_ipc.x 2>&1 | tail -1
+        compile Applications/installer_ipc.ailang /tmp/installer_ipc.x
         cp /tmp/installer_ipc.x "$OVERLAY/system/bin/installer_ipc.x"
         chmod +x "$OVERLAY/system/bin/installer_ipc.x"
         ok "  installer_ipc.x ($(stat -c%s /tmp/installer_ipc.x) bytes)"

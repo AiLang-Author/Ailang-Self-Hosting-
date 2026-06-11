@@ -1,0 +1,490 @@
+// LLM.ailang
+// Entry point for the AILang LLM inference runtime.
+// Standalone accelerator — same pattern as ATTN.ailang.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Hash
+
+LibraryImport.TF.Math
+LibraryImport.TF.Vec
+LibraryImport.TF.Mat
+LibraryImport.TF.Act
+LibraryImport.TF.ThreadPool
+LibraryImport.Accel.HAL
+LibraryImport.LLM.GGUF
+LibraryImport.LLM.Quant
+LibraryImport.LLM.BPE
+
+Import.LLM.State
+Import.LLM.Loader
+Import.LLM.Init
+Import.LLM.Tokenizer
+Import.LLM.Forward
+
+// =============================================================================
+// MODEL PATH — edit this to point at your .gguf file
+// TODO: read from argv once CLI arg parsing is added
+// =============================================================================
+FixedPool.LLMArgs {
+    "model_path": Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    PrintMessage("======================================================\n")
+    PrintMessage("  AILang LLM Inference Runtime v0.1\n")
+    PrintMessage("  (c) 2026 Sean Collins, 2 Paws Machine and Engineering\n")
+    PrintMessage("  Int32 + Int64 Q20 dual-path integer inference\n")
+    PrintMessage("======================================================\n\n")
+
+    // Model path — set this before compiling, or add argv parsing
+    LLMArgs.model_path = "/home/bob/SmolLM2-135M-Instruct-Q8_0.gguf"
+
+    PrintMessage("[LLM] Loading model: ")
+    PrintString(LLMArgs.model_path)
+    PrintMessage("\n\n")
+
+    // Load and parse GGUF
+    rc = LLM_LoadModel(LLMArgs.model_path)
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[LLM] FATAL: model load failed with code ")
+        PrintNumber(rc)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+
+    // Print model configuration
+    LLM_PrintConfig()
+
+    // Print tensor count
+    PrintMessage("[LLM] Tensor count: ")
+    PrintNumber(TensorDir.count)
+    PrintMessage("\n")
+
+    // Compute memory estimates
+    PrintMessage("[LLM] Memory estimates:\n")
+
+    // Per-layer weight size estimate (rough: 4 matrices of d_model^2 + 3 of d_model*d_ff)
+    // At Q8_0: ~1.0625 bytes/param, at int32: 4 bytes/param, at int64: 8 bytes/param
+    dd = Multiply(LLMConfig.d_model, LLMConfig.d_model)
+    df = Multiply(LLMConfig.d_model, LLMConfig.d_ff)
+    params_per_layer = Add(Multiply(dd, 4), Multiply(df, 3))
+
+    PrintMessage("[LLM]   Params/layer:  ")
+    PrintNumber(params_per_layer)
+    PrintMessage("\n")
+
+    total_params = Multiply(params_per_layer, LLMConfig.n_layers)
+    PrintMessage("[LLM]   Total params:  ~")
+    PrintNumber(Divide(total_params, 1000000))
+    PrintMessage("M\n")
+
+    int32_mb = Divide(Multiply(total_params, 4), 1048576)
+    int64_mb = Divide(Multiply(total_params, 8), 1048576)
+    PrintMessage("[LLM]   Int32 RAM:     ~")
+    PrintNumber(int32_mb)
+    PrintMessage("MB\n")
+    PrintMessage("[LLM]   Int64 Q20 RAM: ~")
+    PrintNumber(int64_mb)
+    PrintMessage("MB\n")
+
+    PrintMessage("\n[LLM] Phase 1 complete — model metadata loaded.\n")
+
+    // ================================================================
+    // PHASE 2: mmap model + dequantize weights
+    // ================================================================
+    PrintMessage("[LLM] Phase 2: weight dequantization\n\n")
+
+    // mmap the model file for direct tensor data access
+    mmap_result = LLM_MmapModel(LLMArgs.model_path)
+    IfCondition EqualTo(mmap_result, 0) ThenBlock: {
+        PrintMessage("[LLM] FATAL: mmap failed\n")
+        ReturnValue(1)
+    }
+
+    // Dequantize all tensors into per-layer weight buffers
+    rc = LLM_InitWeights()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[LLM] FATAL: weight init failed\n")
+        ReturnValue(1)
+    }
+
+    // Print summary
+    LLM_PrintWeightSummary()
+
+    // Print first few values of token embedding as sanity check
+    // token_embd is [vocab_size × d_model], so token 0 = elements [0..575],
+    // token 1 = elements [576..1151], etc.
+    PrintMessage("\n[LLM] Sanity check — token_embd:\n")
+    IfCondition NotEqual(LLMWeights.tok_embd, 0) ThenBlock: {
+        PrintMessage("  token 0, first 16 vals: ")
+        sanity_i = 0
+        WhileLoop LessThan(sanity_i, 16) {
+            PrintNumber(Dereference(Add(LLMWeights.tok_embd, Multiply(sanity_i, 8))))
+            PrintMessage(" ")
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("\n")
+        // Token 1 (offset = d_model * 8 = 576 * 8 = 4608)
+        PrintMessage("  token 1, first 16 vals: ")
+        sanity_i = 0
+        WhileLoop LessThan(sanity_i, 16) {
+            PrintNumber(Dereference(Add(LLMWeights.tok_embd, Add(4608, Multiply(sanity_i, 8)))))
+            PrintMessage(" ")
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("\n")
+    }
+
+    // Scan for first zero token and first non-zero token beyond 1
+    PrintMessage("  scanning embedding table...\n")
+    sanity_i = 0
+    sanity_nz = 0
+    sanity_last_nz = 0
+    WhileLoop LessThan(sanity_i, 100) {
+        sanity_off = Multiply(sanity_i, 576)
+        sanity_off = Multiply(sanity_off, 8)
+        sanity_v = Dereference(Add(LLMWeights.tok_embd, sanity_off))
+        IfCondition NotEqual(sanity_v, 0) ThenBlock: {
+            sanity_nz = Add(sanity_nz, 1)
+            sanity_last_nz = sanity_i
+        }
+        sanity_i = Add(sanity_i, 1)
+    }
+    PrintMessage("  tokens 0-99: non-zero count=")
+    PrintNumber(sanity_nz)
+    PrintMessage(" last_nz_tok=")
+    PrintNumber(sanity_last_nz)
+    PrintMessage("\n")
+    // Check element 32 (first element of block 1 for token 0)
+    // token_embd is 49152*576 elements in Q8_0: 49152*576/32 = 884736 blocks
+    // token 0 spans blocks 0..17 (576/32 = 18 blocks per token)
+    // So block 18 starts token 1
+    PrintMessage("  embd elem 32: ")
+    PrintNumber(Dereference(Add(LLMWeights.tok_embd, Multiply(32, 8))))
+    PrintMessage(" elem 576: ")
+    PrintNumber(Dereference(Add(LLMWeights.tok_embd, Multiply(576, 8))))
+    PrintMessage(" elem 577: ")
+    PrintNumber(Dereference(Add(LLMWeights.tok_embd, Multiply(577, 8))))
+    PrintMessage("\n")
+
+    // Also check a layer weight
+    PrintMessage("  blk.0 attn_norm, first 8 vals: ")
+    IfCondition NotEqual(LLMWeights.layers, 0) ThenBlock: {
+        norm_ptr = Dereference(Add(LLMWeights.layers, LLMLayerField.ATTN_NORM))
+        IfCondition NotEqual(norm_ptr, 0) ThenBlock: {
+            sanity_i = 0
+            WhileLoop LessThan(sanity_i, 8) {
+                PrintNumber(Dereference(Add(norm_ptr, Multiply(sanity_i, 8))))
+                PrintMessage(" ")
+                sanity_i = Add(sanity_i, 1)
+            }
+        }
+    }
+    PrintMessage("\n")
+
+    // ── RAW GGUF DATA CHECK ──
+    // Read raw f16 scale bytes from the mmap'd region for token_embd
+    PrintMessage("\n[DBG] Raw GGUF data check for token_embd:\n")
+    dbg_entry = GGUF_FindTensor("token_embd.weight", 17)
+    IfCondition NotEqual(dbg_entry, 0) ThenBlock: {
+        dbg_off = Dereference(Add(dbg_entry, TensorField.DATA_OFFSET))
+        dbg_type = Dereference(Add(dbg_entry, TensorField.TYPE))
+        dbg_dim0 = Dereference(Add(dbg_entry, TensorField.DIM0))
+        dbg_dim1 = Dereference(Add(dbg_entry, TensorField.DIM1))
+        PrintMessage("  tensor offset=")
+        PrintNumber(dbg_off)
+        PrintMessage(" type=")
+        PrintNumber(dbg_type)
+        PrintMessage(" dim0=")
+        PrintNumber(dbg_dim0)
+        PrintMessage(" dim1=")
+        PrintNumber(dbg_dim1)
+        PrintMessage("\n")
+        PrintMessage("  data_base=")
+        PrintNumber(InitW.data_base)
+        PrintMessage(" mmap_ptr=")
+        PrintNumber(InitW.mmap_ptr)
+        PrintMessage(" data_offset=")
+        PrintNumber(LLMConfig.data_offset)
+        PrintMessage("\n")
+
+        // Raw pointer to start of token_embd data in mmap
+        dbg_raw = Add(InitW.data_base, dbg_off)
+        PrintMessage("  raw_ptr=")
+        PrintNumber(dbg_raw)
+        PrintMessage("\n")
+
+        // Block 0: first 4 bytes (f16 scale + first 2 int8 vals)
+        PrintMessage("  blk0 raw bytes: ")
+        sanity_i = 0
+        WhileLoop LessThan(sanity_i, 8) {
+            PrintNumber(GetByte(dbg_raw, sanity_i))
+            PrintMessage(" ")
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("\n")
+        // f16 scale = byte[0] + byte[1]<<8
+        dbg_f16 = Add(GetByte(dbg_raw, 0), ShiftLeft(GetByte(dbg_raw, 1), 8))
+        PrintMessage("  blk0 f16_scale=0x")
+        PrintNumber(dbg_f16)
+        PrintMessage(" → Q8=")
+        PrintNumber(Quant_F16ToInt(dbg_f16))
+        PrintMessage("\n")
+
+        // Block 18 (token 1 start): offset = 18 * 34 = 612
+        dbg_blk18 = Add(dbg_raw, 612)
+        PrintMessage("  blk18 raw bytes: ")
+        sanity_i = 0
+        WhileLoop LessThan(sanity_i, 8) {
+            PrintNumber(GetByte(dbg_blk18, sanity_i))
+            PrintMessage(" ")
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("\n")
+        dbg_f16 = Add(GetByte(dbg_blk18, 0), ShiftLeft(GetByte(dbg_blk18, 1), 8))
+        PrintMessage("  blk18 f16_scale=0x")
+        PrintNumber(dbg_f16)
+        PrintMessage(" → Q8=")
+        PrintNumber(Quant_F16ToInt(dbg_f16))
+        PrintMessage("\n")
+
+        // Block 540 (token 30 start): offset = 540 * 34 = 18360
+        dbg_blk540 = Add(dbg_raw, 18360)
+        PrintMessage("  blk540 raw bytes: ")
+        sanity_i = 0
+        WhileLoop LessThan(sanity_i, 8) {
+            PrintNumber(GetByte(dbg_blk540, sanity_i))
+            PrintMessage(" ")
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("\n")
+        dbg_f16 = Add(GetByte(dbg_blk540, 0), ShiftLeft(GetByte(dbg_blk540, 1), 8))
+        PrintMessage("  blk540 f16_scale=0x")
+        PrintNumber(dbg_f16)
+        PrintMessage(" → Q8=")
+        PrintNumber(Quant_F16ToInt(dbg_f16))
+        PrintMessage("\n")
+
+        // Block 900 (token 50 start): offset = 900 * 34 = 30600
+        dbg_blk900 = Add(dbg_raw, 30600)
+        PrintMessage("  blk900 raw bytes: ")
+        sanity_i = 0
+        WhileLoop LessThan(sanity_i, 8) {
+            PrintNumber(GetByte(dbg_blk900, sanity_i))
+            PrintMessage(" ")
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("\n")
+        dbg_f16 = Add(GetByte(dbg_blk900, 0), ShiftLeft(GetByte(dbg_blk900, 1), 8))
+        PrintMessage("  blk900 f16_scale=0x")
+        PrintNumber(dbg_f16)
+        PrintMessage(" → Q8=")
+        PrintNumber(Quant_F16ToInt(dbg_f16))
+        PrintMessage("\n")
+
+        // Count non-zero f16 scales in first 100 blocks
+        PrintMessage("  scanning first 1000 blk scales...\n")
+        sanity_i = 0
+        sanity_nz = 0
+        sanity_last_nz = 0
+        WhileLoop LessThan(sanity_i, 1000) {
+            dbg_blk_ptr = Add(dbg_raw, Multiply(sanity_i, 34))
+            dbg_f16 = Add(GetByte(dbg_blk_ptr, 0), ShiftLeft(GetByte(dbg_blk_ptr, 1), 8))
+            IfCondition NotEqual(dbg_f16, 0) ThenBlock: {
+                sanity_nz = Add(sanity_nz, 1)
+                sanity_last_nz = sanity_i
+            }
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("  blks 0-999: non-zero scales=")
+        PrintNumber(sanity_nz)
+        PrintMessage(" last_nz=")
+        PrintNumber(sanity_last_nz)
+        PrintMessage("\n")
+    }
+
+    PrintMessage("\n[LLM] Phase 2 complete — weights dequantized.\n")
+
+    // ================================================================
+    // PHASE 3: BPE tokenizer
+    // ================================================================
+    PrintMessage("[LLM] Phase 3: BPE tokenizer\n\n")
+
+    rc = LLM_InitTokenizer()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[LLM] FATAL: tokenizer init failed\n")
+        ReturnValue(1)
+    }
+
+    // Test encode/decode roundtrip
+    PrintMessage("\n[LLM] Tokenizer test:\n")
+
+    // Allocate token ID buffer (max 256 tokens for test)
+    test_ids = Allocate(2048)
+    MemorySet(test_ids, 0, 2048)
+
+    // Test 1: simple text
+    PrintMessage("  Input:   \"Hello, world!\"\n")
+    test_n = LLM_Tokenize("Hello, world!", 13, test_ids, 256)
+    PrintMessage("  Tokens:  ")
+    PrintNumber(test_n)
+    PrintMessage(" IDs: [")
+    sanity_i = 0
+    WhileLoop LessThan(sanity_i, test_n) {
+        IfCondition GreaterThan(sanity_i, 0) ThenBlock: { PrintMessage(", ") }
+        PrintNumber(Dereference(Add(test_ids, Multiply(sanity_i, 8))))
+        sanity_i = Add(sanity_i, 1)
+    }
+    PrintMessage("]\n")
+    PrintMessage("  Decoded: \"")
+    LLM_PrintTokens(test_ids, test_n)
+    PrintMessage("\"\n")
+
+    // Test 2: prompt text
+    PrintMessage("\n  Input:   \"The capital of France is\"\n")
+    test_n = LLM_Tokenize("The capital of France is", 24, test_ids, 256)
+    PrintMessage("  Tokens:  ")
+    PrintNumber(test_n)
+    PrintMessage(" IDs: [")
+    sanity_i = 0
+    WhileLoop LessThan(sanity_i, test_n) {
+        IfCondition GreaterThan(sanity_i, 0) ThenBlock: { PrintMessage(", ") }
+        PrintNumber(Dereference(Add(test_ids, Multiply(sanity_i, 8))))
+        sanity_i = Add(sanity_i, 1)
+    }
+    PrintMessage("]\n")
+    PrintMessage("  Decoded: \"")
+    LLM_PrintTokens(test_ids, test_n)
+    PrintMessage("\"\n")
+
+    Deallocate(test_ids, 2048)
+
+    PrintMessage("\n[LLM] Phase 3 complete — tokenizer ready.\n")
+
+    // ================================================================
+    // PHASE 4: Forward pass setup + text generation
+    // ================================================================
+    PrintMessage("[LLM] Phase 4: forward pass\n\n")
+
+    // Initialize HAL with GCN backend for GPU-accelerated matmul
+    HALCfg.backend = 2
+    rc = HAL_Init()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[LLM] WARNING: GPU init failed (rc=")
+        PrintNumber(rc)
+        PrintMessage("), falling back to CPU\n")
+    }
+
+    // Initialize activation tables (exp table for softmax)
+    TFAct_Init()
+
+    // Allocate forward pass buffers and KV cache
+    LLM_AllocBuffers()
+
+    // Initialize sin/cos, RoPE, and SiLU lookup tables
+    LLM_InitSinTable()
+    LLM_InitRoPETables()
+    LLM_InitSiLU()
+
+    // ── Tokenize prompt ──
+    prompt_ids = Allocate(4096)   // max 512 tokens
+    MemorySet(prompt_ids, 0, 4096)
+
+    prompt_text = "The capital of France is"
+    PrintMessage("\n[LLM] Prompt: \"")
+    PrintString(prompt_text)
+    PrintMessage("\"\n")
+
+    prompt_len = LLM_Tokenize(prompt_text, 24, prompt_ids, 512)
+    PrintMessage("[LLM] Prompt tokens: ")
+    PrintNumber(prompt_len)
+    PrintMessage("\n")
+
+    // ── Prefill: run forward pass on each prompt token ──
+    PrintMessage("[LLM] Prefilling...\n")
+    gen_pos = 0
+    WhileLoop LessThan(gen_pos, prompt_len) {
+        gen_tok = Dereference(Add(prompt_ids, Multiply(gen_pos, 8)))
+        LLM_Forward(gen_tok, gen_pos)
+        gen_pos = Add(gen_pos, 1)
+    }
+    PrintMessage("[LLM] Prefill complete.\n\n")
+
+    // ── Diagnostic: dump logits after prefill ──
+    PrintMessage("[DBG] Logits after prefill:\n")
+    dbg_max = Dereference(LLMBuf.logits)
+    dbg_max_idx = 0
+    dbg_min = dbg_max
+    dbg_i = 1
+    WhileLoop LessThan(dbg_i, LLMConfig.vocab_size) {
+        dbg_v = Dereference(Add(LLMBuf.logits, Multiply(dbg_i, 8)))
+        IfCondition GreaterThan(dbg_v, dbg_max) ThenBlock: {
+            dbg_max = dbg_v
+            dbg_max_idx = dbg_i
+        }
+        IfCondition LessThan(dbg_v, dbg_min) ThenBlock: {
+            dbg_min = dbg_v
+        }
+        dbg_i = Add(dbg_i, 1)
+    }
+    PrintMessage("  max=")
+    PrintNumber(dbg_max)
+    PrintMessage(" at idx=")
+    PrintNumber(dbg_max_idx)
+    PrintMessage("  min=")
+    PrintNumber(dbg_min)
+    PrintMessage("\n  logits[0..7]: ")
+    dbg_i = 0
+    WhileLoop LessThan(dbg_i, 8) {
+        PrintNumber(Dereference(Add(LLMBuf.logits, Multiply(dbg_i, 8))))
+        PrintMessage(" ")
+        dbg_i = Add(dbg_i, 1)
+    }
+    PrintMessage("\n  x[0..7] after fwd: ")
+    dbg_i = 0
+    WhileLoop LessThan(dbg_i, 8) {
+        PrintNumber(Dereference(Add(LLMBuf.x, Multiply(dbg_i, 8))))
+        PrintMessage(" ")
+        dbg_i = Add(dbg_i, 1)
+    }
+    PrintMessage("\n")
+
+    // ── Autoregressive generation ──
+    PrintMessage("[LLM] Generating (greedy, max 64 tokens):\n")
+    PrintMessage("  \"")
+    PrintString(prompt_text)
+
+    gen_max = 3
+    gen_count = 0
+    WhileLoop LessThan(gen_count, gen_max) {
+        // Sample next token (greedy argmax)
+        next_tok = TF_VecArgMax(LLMBuf.logits, LLMConfig.vocab_size)
+
+        // Check for EOS
+        IfCondition EqualTo(next_tok, LLMTokenizer.eos_id) ThenBlock: {
+            BreakLoop
+        }
+
+        // Print decoded token
+        LLM_TokenToString(next_tok)
+
+        // Forward pass with new token
+        LLM_Forward(next_tok, gen_pos)
+        gen_pos = Add(gen_pos, 1)
+        gen_count = Add(gen_count, 1)
+    }
+    PrintMessage("\"\n\n")
+
+    PrintMessage("[LLM] Generated ")
+    PrintNumber(gen_count)
+    PrintMessage(" tokens.\n")
+    PrintMessage("[LLM] Done.\n")
+
+    Deallocate(prompt_ids, 4096)
+}
+
+RunTask(Main)

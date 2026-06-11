@@ -1,0 +1,547 @@
+// Library.BPE.ailang
+// Byte Pair Encoding tokenizer for GPT-2 style models.
+// Builds reverse vocab hash, parses merge rules, encodes/decodes text.
+// All state in FixedPool carriers — no locals across function calls.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+// =============================================================================
+// BPE STATE
+// =============================================================================
+FixedPool.BPEState {
+    "rev_vocab":    Initialize=0, CanChange=True   // Hash table: token string → token ID
+    "merge_left":   Initialize=0, CanChange=True   // ptr to merge left-token ID array (8 bytes each)
+    "merge_right":  Initialize=0, CanChange=True   // ptr to merge right-token ID array (8 bytes each)
+    "merge_result": Initialize=0, CanChange=True   // ptr to merge result-token ID array (8 bytes each)
+    "merge_hash":   Initialize=0, CanChange=True   // Hash table: (left_id << 20 | right_id) → merge index
+    "byte_table":   Initialize=0, CanChange=True   // 256 * 8 bytes: per-byte token ID lookup
+    "rev_byte":     Initialize=0, CanChange=True   // 256 bytes: unicode_offset → original byte (reverse GPT-2 map)
+    "n_merges":     Initialize=0, CanChange=True
+    "initialized":  Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// BPE WORK CARRIER — scratch state for encode/decode loops
+// =============================================================================
+FixedPool.BPEW {
+    "tokens":       Initialize=0, CanChange=True   // working token ID array during encode
+    "n_tokens":     Initialize=0, CanChange=True   // current count
+    "max_tokens":   Initialize=0, CanChange=True   // capacity
+    "idx":          Initialize=0, CanChange=True   // general loop counter
+    "best_merge":   Initialize=0, CanChange=True   // best merge index found
+    "best_pos":     Initialize=0, CanChange=True   // position of best merge
+    "left_id":      Initialize=0, CanChange=True
+    "right_id":     Initialize=0, CanChange=True
+    "merged_id":    Initialize=0, CanChange=True
+    "key":          Initialize=0, CanChange=True   // hash key
+    "found":        Initialize=0, CanChange=True
+    "merge_idx":    Initialize=0, CanChange=True
+    "copy_i":       Initialize=0, CanChange=True
+    "str_ptr":      Initialize=0, CanChange=True
+    "str_len":      Initialize=0, CanChange=True
+    "byte_val":     Initialize=0, CanChange=True
+    "search_i":     Initialize=0, CanChange=True
+    "space_pos":    Initialize=0, CanChange=True
+    "left_str":     Initialize=0, CanChange=True   // scratch buffer for left token of merge
+    "right_str":    Initialize=0, CanChange=True   // scratch buffer for right token of merge
+    "scratch":      Initialize=0, CanChange=True   // 256-byte scratch buffer
+    "dec_i":        Initialize=0, CanChange=True   // decode loop index
+    "dec_byte":     Initialize=0, CanChange=True   // decode byte value
+    "dec_cp":       Initialize=0, CanChange=True   // decoded codepoint
+    "dec_out":      Initialize=0, CanChange=True   // single-byte output buffer for decode
+}
+
+// =============================================================================
+// BPE_Init — build reverse vocab hash and parse merge rules
+// Must be called after GGUF has populated LLMTokenizer.vocab/merges.
+// =============================================================================
+Function.BPE_Init {
+    Body: {
+        IfCondition EqualTo(BPEState.initialized, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        PrintMessage("[BPE] Initializing tokenizer...\n")
+
+        // Allocate scratch buffer
+        BPEW.scratch = Allocate(256)
+        MemorySet(BPEW.scratch, 0, 256)
+
+        // ── Build reverse vocab: string → token ID ──
+        // Use Library.Hash for the hash table
+        BPEState.rev_vocab = Hash.Create(65536)
+
+        BPEW.idx = 0
+        WhileLoop LessThan(BPEW.idx, LLMTokenizer.vocab_size) {
+            BPEW.str_ptr = Dereference(Add(LLMTokenizer.vocab, Multiply(BPEW.idx, 8)))
+            IfCondition NotEqual(BPEW.str_ptr, 0) ThenBlock: {
+                // Store token_id + 1 so 0 means "not found"
+                Hash.Set(BPEState.rev_vocab, BPEW.str_ptr, Add(BPEW.idx, 1))
+            }
+            BPEW.idx = Add(BPEW.idx, 1)
+        }
+
+        PrintMessage("[BPE]   Reverse vocab: ")
+        PrintNumber(LLMTokenizer.vocab_size)
+        PrintMessage(" entries\n")
+
+        // ── Build byte-to-token-ID table ──
+        // GPT-2 maps each byte to a unicode codepoint:
+        //   Printable bytes (0x21-0x7E, 0xA1-0xFF) → same codepoint (1-byte UTF-8)
+        //   Other bytes → U+0100 + offset (2-byte UTF-8: 0xC4 0x8X)
+        // We build the UTF-8 string for each byte and look it up in the vocab.
+        BPEState.byte_table = Allocate(2048)  // 256 * 8
+        MemorySet(BPEState.byte_table, 0, 2048)
+
+        BPEW.idx = 0
+        BPEW.copy_i = 0   // running offset for non-printable bytes
+        WhileLoop LessThan(BPEW.idx, 256) {
+            MemorySet(BPEW.scratch, 0, 8)
+
+            // Check if byte is in the "printable" set (maps to itself)
+            // Printable: 0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF
+            BPEW.found = 0
+
+            IfCondition GreaterEqual(BPEW.idx, 33) ThenBlock: {
+                IfCondition LessEqual(BPEW.idx, 126) ThenBlock: {
+                    // 0x21-0x7E: printable ASCII (1 byte UTF-8)
+                    SetByte(BPEW.scratch, 0, BPEW.idx)
+                    SetByte(BPEW.scratch, 1, 0)
+                    BPEW.found = 1
+                }
+            }
+            IfCondition EqualTo(BPEW.found, 0) ThenBlock: {
+                IfCondition GreaterEqual(BPEW.idx, 161) ThenBlock: {
+                    IfCondition LessEqual(BPEW.idx, 172) ThenBlock: {
+                        // 0xA1-0xAC: extended printable (1 byte UTF-8)
+                        SetByte(BPEW.scratch, 0, BPEW.idx)
+                        SetByte(BPEW.scratch, 1, 0)
+                        BPEW.found = 1
+                    }
+                }
+            }
+            IfCondition EqualTo(BPEW.found, 0) ThenBlock: {
+                IfCondition GreaterEqual(BPEW.idx, 174) ThenBlock: {
+                    // 0xAE-0xFF: extended printable (1 byte UTF-8)
+                    SetByte(BPEW.scratch, 0, BPEW.idx)
+                    SetByte(BPEW.scratch, 1, 0)
+                    BPEW.found = 1
+                }
+            }
+
+            IfCondition EqualTo(BPEW.found, 0) ThenBlock: {
+                // Non-printable: maps to U+0100 + offset
+                // UTF-8 encoding of U+0100..U+017F is 0xC4 0x80..0xBF or 0xC5 0x80..0xBF
+                BPEW.byte_val = Add(256, BPEW.copy_i)  // unicode codepoint
+                BPEW.copy_i = Add(BPEW.copy_i, 1)
+                // UTF-8: 2-byte encoding for U+0080..U+07FF
+                // byte0 = 0xC0 | (cp >> 6)
+                // byte1 = 0x80 | (cp & 0x3F)
+                SetByte(BPEW.scratch, 0, BitwiseOr(192, ShiftRight(BPEW.byte_val, 6)))
+                SetByte(BPEW.scratch, 1, BitwiseOr(128, BitwiseAnd(BPEW.byte_val, 63)))
+                SetByte(BPEW.scratch, 2, 0)
+            }
+
+            // Look up in reverse vocab
+            BPEW.merged_id = Hash.Get(BPEState.rev_vocab, BPEW.scratch)
+            IfCondition GreaterThan(BPEW.merged_id, 0) ThenBlock: {
+                StoreValue(Add(BPEState.byte_table, Multiply(BPEW.idx, 8)), Subtract(BPEW.merged_id, 1))
+            }
+            IfCondition EqualTo(BPEW.merged_id, 0) ThenBlock: {
+                StoreValue(Add(BPEState.byte_table, Multiply(BPEW.idx, 8)), LLMTokenizer.unk_id)
+            }
+
+            BPEW.idx = Add(BPEW.idx, 1)
+        }
+
+        PrintMessage("[BPE]   Byte-to-token table: 256 entries\n")
+
+        // ── Build reverse byte table (unicode offset → original byte) ──
+        // For decode: 2-byte UTF-8 sequences (U+0100..U+017F) → original byte value
+        // The non-printable bytes were assigned codepoints U+0100 + offset in this order:
+        //   0x00-0x08 (9 bytes), 0x09-0x0D (5 bytes), 0x0E-0x1F (18 bytes),
+        //   0x20 (space), 0x7F (DEL), 0x80-0xA0 (33 bytes), 0xAD (1 byte)
+        // Total: 68 non-printable bytes → offsets 0..67
+        BPEState.rev_byte = Allocate(256)
+        MemorySet(BPEState.rev_byte, 0, 256)
+
+        // Replay the same iteration order used in forward mapping
+        BPEW.copy_i = 0   // running offset counter (same as forward pass)
+        BPEW.idx = 0
+        WhileLoop LessThan(BPEW.idx, 256) {
+            BPEW.found = 0
+            // Check printable ranges (these map to themselves, no rev_byte entry needed)
+            IfCondition GreaterEqual(BPEW.idx, 33) ThenBlock: {
+                IfCondition LessEqual(BPEW.idx, 126) ThenBlock: {
+                    BPEW.found = 1
+                }
+            }
+            IfCondition EqualTo(BPEW.found, 0) ThenBlock: {
+                IfCondition GreaterEqual(BPEW.idx, 161) ThenBlock: {
+                    IfCondition LessEqual(BPEW.idx, 172) ThenBlock: {
+                        BPEW.found = 1
+                    }
+                }
+            }
+            IfCondition EqualTo(BPEW.found, 0) ThenBlock: {
+                IfCondition GreaterEqual(BPEW.idx, 174) ThenBlock: {
+                    BPEW.found = 1
+                }
+            }
+            // Non-printable: rev_byte[offset] = original byte
+            IfCondition EqualTo(BPEW.found, 0) ThenBlock: {
+                SetByte(BPEState.rev_byte, BPEW.copy_i, BPEW.idx)
+                BPEW.copy_i = Add(BPEW.copy_i, 1)
+            }
+            BPEW.idx = Add(BPEW.idx, 1)
+        }
+
+        // Allocate 2-byte buffer for single-byte output during decode
+        BPEW.dec_out = Allocate(8)
+        MemorySet(BPEW.dec_out, 0, 8)
+
+        // ── Parse merge rules ──
+        // Each merge string is "left_token right_token" (space-separated)
+        // We find the token IDs for left and right, store them for fast lookup
+        BPEState.n_merges = LLMTokenizer.merge_count
+        BPEState.merge_left = Allocate(Multiply(BPEState.n_merges, 8))
+        BPEState.merge_right = Allocate(Multiply(BPEState.n_merges, 8))
+        BPEState.merge_result = Allocate(Multiply(BPEState.n_merges, 8))
+        MemorySet(BPEState.merge_left, 0, Multiply(BPEState.n_merges, 8))
+        MemorySet(BPEState.merge_right, 0, Multiply(BPEState.n_merges, 8))
+        MemorySet(BPEState.merge_result, 0, Multiply(BPEState.n_merges, 8))
+
+        // Merge hash: maps (left_id << 20 | right_id) → merge_index + 1
+        BPEState.merge_hash = Hash.Create(131072)
+
+        BPEW.idx = 0
+        WhileLoop LessThan(BPEW.idx, BPEState.n_merges) {
+            BPEW.str_ptr = Dereference(Add(LLMTokenizer.merges, Multiply(BPEW.idx, 8)))
+
+            // Find space separator in merge string
+            BPEW.space_pos = 0
+            BPEW.search_i = 0
+            WhileLoop LessThan(BPEW.search_i, 200) {
+                BPEW.byte_val = GetByte(BPEW.str_ptr, BPEW.search_i)
+                IfCondition EqualTo(BPEW.byte_val, 0) ThenBlock: {
+                    BreakLoop
+                }
+                IfCondition EqualTo(BPEW.byte_val, 32) ThenBlock: {
+                    BPEW.space_pos = BPEW.search_i
+                    BreakLoop
+                }
+                BPEW.search_i = Add(BPEW.search_i, 1)
+            }
+
+            // Copy left part to scratch (before space)
+            MemorySet(BPEW.scratch, 0, 256)
+            BPEW.copy_i = 0
+            WhileLoop LessThan(BPEW.copy_i, BPEW.space_pos) {
+                SetByte(BPEW.scratch, BPEW.copy_i, GetByte(BPEW.str_ptr, BPEW.copy_i))
+                BPEW.copy_i = Add(BPEW.copy_i, 1)
+            }
+            SetByte(BPEW.scratch, BPEW.space_pos, 0)
+
+            // Look up left token ID
+            BPEW.left_id = Hash.Get(BPEState.rev_vocab, BPEW.scratch)
+            IfCondition GreaterThan(BPEW.left_id, 0) ThenBlock: {
+                BPEW.left_id = Subtract(BPEW.left_id, 1)
+            }
+
+            // Copy right part to scratch (after space)
+            MemorySet(BPEW.scratch, 0, 256)
+            BPEW.copy_i = 0
+            BPEW.search_i = Add(BPEW.space_pos, 1)
+            WhileLoop NotEqual(GetByte(BPEW.str_ptr, BPEW.search_i), 0) {
+                SetByte(BPEW.scratch, BPEW.copy_i, GetByte(BPEW.str_ptr, BPEW.search_i))
+                BPEW.copy_i = Add(BPEW.copy_i, 1)
+                BPEW.search_i = Add(BPEW.search_i, 1)
+            }
+            SetByte(BPEW.scratch, BPEW.copy_i, 0)
+
+            // Look up right token ID
+            BPEW.right_id = Hash.Get(BPEState.rev_vocab, BPEW.scratch)
+            IfCondition GreaterThan(BPEW.right_id, 0) ThenBlock: {
+                BPEW.right_id = Subtract(BPEW.right_id, 1)
+            }
+
+            // Look up merged result: concatenate left+right strings, find in vocab
+            // Build concatenated string in scratch
+            MemorySet(BPEW.scratch, 0, 256)
+            // Copy left part
+            BPEW.copy_i = 0
+            WhileLoop LessThan(BPEW.copy_i, BPEW.space_pos) {
+                SetByte(BPEW.scratch, BPEW.copy_i, GetByte(BPEW.str_ptr, BPEW.copy_i))
+                BPEW.copy_i = Add(BPEW.copy_i, 1)
+            }
+            // Copy right part (after space)
+            BPEW.search_i = Add(BPEW.space_pos, 1)
+            WhileLoop NotEqual(GetByte(BPEW.str_ptr, BPEW.search_i), 0) {
+                SetByte(BPEW.scratch, BPEW.copy_i, GetByte(BPEW.str_ptr, BPEW.search_i))
+                BPEW.copy_i = Add(BPEW.copy_i, 1)
+                BPEW.search_i = Add(BPEW.search_i, 1)
+            }
+            SetByte(BPEW.scratch, BPEW.copy_i, 0)
+
+            BPEW.merged_id = Hash.Get(BPEState.rev_vocab, BPEW.scratch)
+            IfCondition GreaterThan(BPEW.merged_id, 0) ThenBlock: {
+                BPEW.merged_id = Subtract(BPEW.merged_id, 1)
+            }
+
+            // Store parsed merge
+            StoreValue(Add(BPEState.merge_left, Multiply(BPEW.idx, 8)), BPEW.left_id)
+            StoreValue(Add(BPEState.merge_right, Multiply(BPEW.idx, 8)), BPEW.right_id)
+            StoreValue(Add(BPEState.merge_result, Multiply(BPEW.idx, 8)), BPEW.merged_id)
+
+            // Insert into merge hash: key = (left_id << 20) | right_id
+            // This assumes vocab < 1M tokens (20 bits)
+            BPEW.key = BitwiseOr(ShiftLeft(BPEW.left_id, 20), BPEW.right_id)
+            // Store merge_index + 1 (so 0 = not found) using integer key
+            // We need to convert key to a string for Hash.Set — use the scratch buffer
+            // Actually, use StoreValue to write the key as 8 bytes then pass as string
+            // Simpler: use a flat array lookup keyed by the merge pair hash
+            // For now, store in the merge arrays and do linear scan — optimize later
+
+            BPEW.idx = Add(BPEW.idx, 1)
+        }
+
+        PrintMessage("[BPE]   Parsed merges: ")
+        PrintNumber(BPEState.n_merges)
+        PrintMessage(" rules\n")
+
+        BPEState.initialized = 1
+        PrintMessage("[BPE] Tokenizer ready.\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// BPE_LookupToken — find token ID for a string
+// Returns token ID, or LLMTokenizer.unk_id if not found.
+// =============================================================================
+Function.BPE_LookupToken {
+    Input: str: Address
+    Output: Integer
+    Body: {
+        BPEW.found = Hash.Get(BPEState.rev_vocab, str)
+        IfCondition GreaterThan(BPEW.found, 0) ThenBlock: {
+            ReturnValue(Subtract(BPEW.found, 1))
+        }
+        ReturnValue(LLMTokenizer.unk_id)
+    }
+}
+
+// =============================================================================
+// BPE_FindMerge — find merge index for a token pair (left_id, right_id)
+// Returns merge index, or -1 if no merge exists.
+// Linear scan through merge arrays — the lower the index, the higher priority.
+// =============================================================================
+Function.BPE_FindMerge {
+    Input: left_id: Integer
+    Input: right_id: Integer
+    Output: Integer
+    Body: {
+        BPEW.search_i = 0
+        WhileLoop LessThan(BPEW.search_i, BPEState.n_merges) {
+            IfCondition EqualTo(Dereference(Add(BPEState.merge_left, Multiply(BPEW.search_i, 8))), left_id) ThenBlock: {
+                IfCondition EqualTo(Dereference(Add(BPEState.merge_right, Multiply(BPEW.search_i, 8))), right_id) ThenBlock: {
+                    ReturnValue(BPEW.search_i)
+                }
+            }
+            BPEW.search_i = Add(BPEW.search_i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// BPE_Encode — encode a string into token IDs
+//
+// Input:  text = null-terminated string
+//         text_len = length of string
+//         out_ids = pre-allocated output array (8 bytes per token)
+//         max_ids = capacity of out_ids
+// Output: number of token IDs written
+//
+// Algorithm:
+//   1. Convert each byte to its single-byte token ID
+//   2. Repeatedly find the highest-priority merge (lowest index) among
+//      all adjacent pairs, apply it, until no more merges exist
+// =============================================================================
+Function.BPE_Encode {
+    Input: text: Address
+    Input: text_len: Integer
+    Input: out_ids: Address
+    Input: max_ids: Integer
+    Output: Integer
+    Body: {
+        // Allocate working token array (worst case: 1 token per byte)
+        BPEW.max_tokens = Add(text_len, 16)
+        BPEW.tokens = Allocate(Multiply(BPEW.max_tokens, 8))
+        MemorySet(BPEW.tokens, 0, Multiply(BPEW.max_tokens, 8))
+
+        // Step 1: convert each byte to its GPT-2 byte-level token
+        // Uses pre-built byte_table that maps each byte through the GPT-2
+        // byte-to-unicode mapping and into the vocab
+        BPEW.n_tokens = 0
+        BPEW.idx = 0
+        WhileLoop LessThan(BPEW.idx, text_len) {
+            BPEW.byte_val = GetByte(text, BPEW.idx)
+            StoreValue(
+                Add(BPEW.tokens, Multiply(BPEW.n_tokens, 8)),
+                Dereference(Add(BPEState.byte_table, Multiply(BPEW.byte_val, 8)))
+            )
+            BPEW.n_tokens = Add(BPEW.n_tokens, 1)
+            BPEW.idx = Add(BPEW.idx, 1)
+        }
+
+        // Step 2: iteratively apply BPE merges
+        // Find the pair with the lowest merge index (highest priority),
+        // merge it, repeat until no merges found
+        BPEW.found = 1
+        WhileLoop EqualTo(BPEW.found, 1) {
+            BPEW.found = 0
+            BPEW.best_merge = BPEState.n_merges  // sentinel: worse than any real merge
+            BPEW.best_pos = 0
+
+            // Scan all adjacent pairs
+            BPEW.idx = 0
+            WhileLoop LessThan(BPEW.idx, Subtract(BPEW.n_tokens, 1)) {
+                BPEW.left_id = Dereference(Add(BPEW.tokens, Multiply(BPEW.idx, 8)))
+                BPEW.right_id = Dereference(Add(BPEW.tokens, Multiply(Add(BPEW.idx, 1), 8)))
+
+                BPEW.merge_idx = BPE_FindMerge(BPEW.left_id, BPEW.right_id)
+                IfCondition GreaterEqual(BPEW.merge_idx, 0) ThenBlock: {
+                    IfCondition LessThan(BPEW.merge_idx, BPEW.best_merge) ThenBlock: {
+                        BPEW.best_merge = BPEW.merge_idx
+                        BPEW.best_pos = BPEW.idx
+                        BPEW.found = 1
+                    }
+                }
+
+                BPEW.idx = Add(BPEW.idx, 1)
+            }
+
+            // Apply the best merge if found
+            IfCondition EqualTo(BPEW.found, 1) ThenBlock: {
+                BPEW.merged_id = Dereference(Add(BPEState.merge_result, Multiply(BPEW.best_merge, 8)))
+
+                // Replace the pair at best_pos with merged token
+                StoreValue(Add(BPEW.tokens, Multiply(BPEW.best_pos, 8)), BPEW.merged_id)
+
+                // Shift everything after best_pos+2 left by one
+                BPEW.copy_i = Add(BPEW.best_pos, 1)
+                WhileLoop LessThan(BPEW.copy_i, Subtract(BPEW.n_tokens, 1)) {
+                    StoreValue(
+                        Add(BPEW.tokens, Multiply(BPEW.copy_i, 8)),
+                        Dereference(Add(BPEW.tokens, Multiply(Add(BPEW.copy_i, 1), 8)))
+                    )
+                    BPEW.copy_i = Add(BPEW.copy_i, 1)
+                }
+                BPEW.n_tokens = Subtract(BPEW.n_tokens, 1)
+            }
+        }
+
+        // Copy result to output
+        BPEW.idx = 0
+        WhileLoop LessThan(BPEW.idx, BPEW.n_tokens) {
+            IfCondition GreaterEqual(BPEW.idx, max_ids) ThenBlock: {
+                BreakLoop
+            }
+            StoreValue(
+                Add(out_ids, Multiply(BPEW.idx, 8)),
+                Dereference(Add(BPEW.tokens, Multiply(BPEW.idx, 8)))
+            )
+            BPEW.idx = Add(BPEW.idx, 1)
+        }
+
+        Deallocate(BPEW.tokens, Multiply(BPEW.max_tokens, 8))
+
+        IfCondition LessThan(BPEW.n_tokens, max_ids) ThenBlock: {
+            ReturnValue(BPEW.n_tokens)
+        }
+        ReturnValue(max_ids)
+    }
+}
+
+// =============================================================================
+// BPE_Decode — convert a token ID to its string, print it
+// Reverses GPT-2 byte-to-unicode mapping:
+//   - 1-byte chars in printable ranges → output as-is
+//   - 2-byte UTF-8 (0xC4/0xC5 lead byte) → decode codepoint, look up original
+//     byte via rev_byte table
+// =============================================================================
+Function.BPE_Decode {
+    Input: token_id: Integer
+    Body: {
+        IfCondition LessThan(token_id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(token_id, LLMTokenizer.vocab_size) ThenBlock: { ReturnValue(0) }
+
+        BPEW.str_ptr = Dereference(Add(LLMTokenizer.vocab, Multiply(token_id, 8)))
+        IfCondition EqualTo(BPEW.str_ptr, 0) ThenBlock: { ReturnValue(0) }
+
+        // Walk the token string, reversing GPT-2 byte-to-unicode mapping
+        // GPT-2 vocab strings use:
+        //   - 1-byte (0x21-0x7E, 0xA1-0xAC, 0xAE-0xFF) for printable bytes
+        //   - 2-byte UTF-8 (0xC4 0x80-0xBF, 0xC5 0x80-0xBF) for non-printable bytes
+        BPEW.dec_i = 0
+        WhileLoop NotEqual(GetByte(BPEW.str_ptr, BPEW.dec_i), 0) {
+            BPEW.dec_byte = GetByte(BPEW.str_ptr, BPEW.dec_i)
+            BPEW.found = 0
+
+            // Check for 2-byte UTF-8 sequence: lead byte 0xC2-0xC5 (194-197)
+            // 0xC4 (196) and 0xC5 (197) cover U+0100..U+017F (our GPT-2 remapped bytes)
+            // 0xC2 (194) and 0xC3 (195) cover U+0080..U+00FF (printable extended)
+            IfCondition GreaterEqual(BPEW.dec_byte, 194) ThenBlock: {
+                IfCondition LessEqual(BPEW.dec_byte, 197) ThenBlock: {
+                    // 2-byte UTF-8: codepoint = ((b0 & 0x1F) << 6) | (b1 & 0x3F)
+                    BPEW.dec_cp = ShiftLeft(BitwiseAnd(BPEW.dec_byte, 31), 6)
+                    BPEW.dec_i = Add(BPEW.dec_i, 1)
+                    BPEW.dec_cp = BitwiseOr(BPEW.dec_cp, BitwiseAnd(GetByte(BPEW.str_ptr, BPEW.dec_i), 63))
+
+                    // Codepoint >= 256: GPT-2 remapped non-printable → reverse via rev_byte
+                    IfCondition GreaterEqual(BPEW.dec_cp, 256) ThenBlock: {
+                        BPEW.dec_byte = GetByte(BPEState.rev_byte, Subtract(BPEW.dec_cp, 256))
+                        SetByte(BPEW.dec_out, 0, BPEW.dec_byte)
+                        SetByte(BPEW.dec_out, 1, 0)
+                        PrintString(BPEW.dec_out)
+                    }
+                    // Codepoint < 256: printable extended byte (0x80-0xFF mapped to itself)
+                    IfCondition LessThan(BPEW.dec_cp, 256) ThenBlock: {
+                        SetByte(BPEW.dec_out, 0, BPEW.dec_cp)
+                        SetByte(BPEW.dec_out, 1, 0)
+                        PrintString(BPEW.dec_out)
+                    }
+                    BPEW.dec_i = Add(BPEW.dec_i, 1)
+                    BPEW.found = 1
+                }
+            }
+
+            // Any other byte (< 194 or > 197): output as-is, advance
+            // Covers: ASCII printable (0x21-0x7E), extended printable stored as
+            // raw bytes (0xA1-0xAC, 0xAE-0xFF), and any other unexpected bytes
+            IfCondition EqualTo(BPEW.found, 0) ThenBlock: {
+                SetByte(BPEW.dec_out, 0, BPEW.dec_byte)
+                SetByte(BPEW.dec_out, 1, 0)
+                PrintString(BPEW.dec_out)
+                BPEW.dec_i = Add(BPEW.dec_i, 1)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// BPE_DecodeSequence — decode an array of token IDs, printing each
+// =============================================================================
+Function.BPE_DecodeSequence {
+    Input: ids: Address
+    Input: n_ids: Integer
+    Body: {
+        BPEW.idx = 0
+        WhileLoop LessThan(BPEW.idx, n_ids) {
+            BPE_Decode(Dereference(Add(ids, Multiply(BPEW.idx, 8))))
+            BPEW.idx = Add(BPEW.idx, 1)
+        }
+        ReturnValue(0)
+    }
+}
