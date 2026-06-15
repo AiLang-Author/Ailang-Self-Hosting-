@@ -1,8 +1,9 @@
-// test_sclk_safe.ailang — Safe SCLK reprogramming with CRTC blanking
+// test_sclk_safe.ailang — Safe SCLK reprogramming with dual-GPU auto-select
 //
-// Selects the highest boot-safe clock from PowerPlay DPM, blanks all active
-// CRTCs, reprograms SPLL with correct 12.14 fixed-point FBDIV and VCO-valid
-// PDIV, then unblanks. Screen blinks briefly during the switch.
+// Auto-selects the compute GPU (zero active CRTCs) in a dual-GPU setup,
+// then incrementally steps through each boot-safe DPM level from lowest
+// to highest, reprogramming SPLL at each step and verifying PLL lock.
+// Display stays alive on the separate display card throughout.
 //
 // Safety:
 //   - If PLL lock fails: bypass stays ON (engine at 27 MHz ref), CRTCs unblank
@@ -210,7 +211,7 @@ Function.Main {
         LogOpen()
 
         // ================================================================
-        // PHASE 0: INIT
+        // PHASE 0: INIT — discover GPUs and auto-select compute card
         // ================================================================
         LogSync("PHASE0_INIT")
         n_gpus = GPU_Discover()
@@ -219,27 +220,91 @@ Function.Main {
             SystemCall(60, 1, 0, 0, 0, 0)
         }
 
-        gpu = 0
         GPU_BAR_Init()
-        rc = GPU_BAR_MapMMIO(gpu)
-        IfCondition EqualTo(rc, 0) ThenBlock: {
-            PrintMessage("FAIL: MMIO map failed\n")
+
+        // Map MMIO on all GPUs so we can check CRTC state
+        gi = 0
+        WhileLoop LessThan(gi, n_gpus) {
+            map_rc = GPU_BAR_MapMMIO(gi)
+            IfCondition EqualTo(map_rc, 0) ThenBlock: {
+                PrintMessage("[INIT] WARNING: MMIO map failed for GPU ")
+                PrintNumber(gi)
+                PrintMessage("\n")
+            }
+            IfCondition NotEqual(map_rc, 0) ThenBlock: {
+                PrintMessage("[INIT] MMIO mapped for GPU ")
+                PrintNumber(gi)
+                PrintMessage("\n")
+            }
+            gi = Add(gi, 1)
+        }
+
+        // Auto-select compute GPU: pick the GPU with zero active CRTCs
+        // (that's the card with no display attached)
+        gpu = -1
+        display_gpu = -1
+        gi = 0
+        WhileLoop LessThan(gi, n_gpus) {
+            IfCondition EqualTo(GPU_BAR_IsMMIOMapped(gi), 1) ThenBlock: {
+                crtc_count = 0
+                pipe = 0
+                WhileLoop LessThan(pipe, 6) {
+                    IfCondition EqualTo(DCE6_IsCRTCActive(gi, pipe), 1) ThenBlock: {
+                        crtc_count = Add(crtc_count, 1)
+                    }
+                    pipe = Add(pipe, 1)
+                }
+                PrintMessage("[INIT] GPU ")
+                PrintNumber(gi)
+                PrintMessage(": active CRTCs = ")
+                PrintNumber(crtc_count)
+                PrintMessage("\n")
+
+                IfCondition EqualTo(crtc_count, 0) ThenBlock: {
+                    gpu = gi
+                }
+                IfCondition GreaterThan(crtc_count, 0) ThenBlock: {
+                    display_gpu = gi
+                }
+            }
+            gi = Add(gi, 1)
+        }
+
+        IfCondition LessThan(gpu, 0) ThenBlock: {
+            PrintMessage("FAIL: no GPU with zero active CRTCs found.\n")
+            PrintMessage("      Both cards have displays attached — cannot safely clock.\n")
+            PrintMessage("      Disconnect the monitor from the compute card and reboot.\n")
             SystemCall(60, 1, 0, 0, 0, 0)
         }
-        PrintMessage("[INIT] MMIO mapped\n")
 
-        // Load AtomBIOS
+        PrintMessage("\n[INIT] Selected GPU ")
+        PrintNumber(gpu)
+        PrintMessage(" as COMPUTE card (0 active CRTCs)\n")
+        IfCondition GreaterEqual(display_gpu, 0) ThenBlock: {
+            PrintMessage("[INIT] GPU ")
+            PrintNumber(display_gpu)
+            PrintMessage(" is DISPLAY card (display safe on separate GPU)\n")
+        }
+        PrintMessage("\n")
+
+        // Load AtomBIOS for the compute GPU
         rom = AtomBIOS_LoadROM(gpu)
         IfCondition EqualTo(rom, 0) ThenBlock: {
-            PrintMessage("FAIL: AtomBIOS ROM load failed\n")
+            PrintMessage("FAIL: AtomBIOS ROM load failed for GPU ")
+            PrintNumber(gpu)
+            PrintMessage("\n")
             SystemCall(60, 1, 0, 0, 0, 0)
         }
         ap_rc = AtomBIOS_Parse(gpu)
         IfCondition NotEqual(ap_rc, 1) ThenBlock: {
-            PrintMessage("FAIL: AtomBIOS parse failed\n")
+            PrintMessage("FAIL: AtomBIOS parse failed for GPU ")
+            PrintNumber(gpu)
+            PrintMessage("\n")
             SystemCall(60, 1, 0, 0, 0, 0)
         }
-        PrintMessage("[INIT] AtomBIOS loaded and parsed\n")
+        PrintMessage("[INIT] AtomBIOS loaded and parsed for GPU ")
+        PrintNumber(gpu)
+        PrintMessage("\n")
         LogSync("PHASE0_ATOMBIOS_OK")
 
         ref_khz = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
@@ -256,10 +321,10 @@ Function.Main {
         PrintMessage(" MHz\n")
 
         // ================================================================
-        // PHASE 1: TARGET SELECTION
+        // PHASE 1: TARGET SELECTION — incremental DPM stepping
         // ================================================================
         PrintMessage("\n====================================================================\n")
-        PrintMessage("  PHASE 1: Target Selection (max boot-safe DPM clock)\n")
+        PrintMessage("  PHASE 1: Target Selection (incremental DPM stepping)\n")
         PrintMessage("====================================================================\n")
 
         num_dpm = AtomBIOS_GetDPMCount(gpu)
@@ -272,14 +337,13 @@ Function.Main {
             SystemCall(60, 1, 0, 0, 0, 0)
         }
 
-        // Scan DPM table for the highest SCLK that is:
-        //   1. Not an SMC-only VID entry (VDDC < 0xFF00)
-        //   2. Within boot voltage (VDDC <= boot_vddc)
-        vid_threshold = 65280
-        best_sclk = 0
-        best_vddc = 0
-        best_idx = 0
+        // Collect all boot-safe DPM entries into a flat buffer:
+        //   Each entry: 8 bytes SCLK (kHz) + 8 bytes VDDC (mV) + 8 bytes DPM index = 24 bytes
+        // Max 16 DPM entries
+        safe_buf = Allocate(384)
+        safe_count = 0
 
+        vid_threshold = 65280
         di = 0
         dpm_vddc = 0
         dpm_mclk = 0
@@ -308,34 +372,54 @@ Function.Main {
                     PrintMessage(" mV), skip\n")
                 }
                 IfCondition LessEqual(dpm_vddc, boot_vddc) ThenBlock: {
-                    // Candidate — take if higher than current best
-                    IfCondition GreaterThan(dpm_sclk, best_sclk) ThenBlock: {
-                        best_sclk = dpm_sclk
-                        best_vddc = dpm_vddc
-                        best_idx = di
-                        PrintMessage(" — CANDIDATE (new best)\n")
-                    }
-                    IfCondition LessEqual(dpm_sclk, best_sclk) ThenBlock: {
-                        PrintMessage(" — safe but not highest\n")
-                    }
+                    // Safe candidate — add to step list
+                    off = Multiply(safe_count, 24)
+                    StoreValue(Add(safe_buf, off), dpm_sclk)
+                    StoreValue(Add(safe_buf, Add(off, 8)), dpm_vddc)
+                    StoreValue(Add(safe_buf, Add(off, 16)), di)
+                    safe_count = Add(safe_count, 1)
+                    PrintMessage(" — SAFE (step ")
+                    PrintNumber(safe_count)
+                    PrintMessage(")\n")
                 }
             }
 
             di = Add(di, 1)
         }
 
-        IfCondition EqualTo(best_sclk, 0) ThenBlock: {
+        IfCondition EqualTo(safe_count, 0) ThenBlock: {
             PrintMessage("\n  No boot-safe clock found. Aborting.\n")
+            Deallocate(safe_buf, 384)
             SystemCall(60, 1, 0, 0, 0, 0)
         }
 
-        PrintMessage("\n  Selected: DPM ")
+        PrintMessage("\n  Will step through ")
+        PrintNumber(safe_count)
+        PrintMessage(" DPM levels (lowest → highest)\n")
+
+        // ================================================================
+        // DPM STEPPING LOOP — reprogram at each level, verify, then step up
+        // ================================================================
+        step_idx = 0
+        WhileLoop LessThan(step_idx, safe_count) {
+        step_off = Multiply(step_idx, 24)
+        best_sclk = Dereference(Add(safe_buf, step_off))
+        best_vddc = Dereference(Add(safe_buf, Add(step_off, 8)))
+        best_idx = Dereference(Add(safe_buf, Add(step_off, 16)))
+
+        PrintMessage("\n####################################################################\n")
+        PrintMessage("  DPM STEP ")
+        PrintNumber(Add(step_idx, 1))
+        PrintMessage(" of ")
+        PrintNumber(safe_count)
+        PrintMessage(": DPM ")
         PrintNumber(best_idx)
         PrintMessage(" → ")
         PrintNumber(Divide(best_sclk, 1000))
         PrintMessage(" MHz @ ")
         PrintNumber(best_vddc)
         PrintMessage(" mV\n")
+        PrintMessage("####################################################################\n")
 
         // ================================================================
         // PHASE 2: COMPUTE PLL DIVIDERS
@@ -430,14 +514,14 @@ Function.Main {
         IfCondition LessThan(diff, 0) ThenBlock: { diff = Subtract(0, diff) }
         threshold = Divide(best_sclk, 100)
         IfCondition LessThan(diff, threshold) ThenBlock: {
-            PrintMessage("\n  Already within 1%% of target — no reprogram needed.\n")
+            PrintMessage("\n  Already within 1%% of target — skipping this DPM step.\n")
             PrintMessage("  current=")
             PrintNumber(Divide(cur_sclk, 1000))
             PrintMessage(" MHz, target=")
             PrintNumber(Divide(actual_khz, 1000))
             PrintMessage(" MHz\n")
-            PrintMessage("\n=== test_sclk_safe complete (no change needed) ===\n")
-            SystemCall(60, 0, 0, 0, 0, 0)
+            step_idx = Add(step_idx, 1)
+            ContinueLoop
         }
 
         PrintMessage("  Delta from target: ")
@@ -988,6 +1072,20 @@ Function.Main {
             PrintNumber(Divide(new_sclk, 1000))
             PrintMessage(" MHz\n")
         }
+        IfCondition GreaterThan(chk_fail, 0) ThenBlock: {
+            PrintMessage("\n  STEP FAILED — stopping DPM stepping at level ")
+            PrintNumber(best_idx)
+            PrintMessage("\n")
+            LogSync("DPM_STEP_FAILED")
+            ExitLoop
+        }
+
+        // Step succeeded — move to next DPM level
+        step_idx = Add(step_idx, 1)
+
+        } // end DPM stepping WhileLoop
+
+        Deallocate(safe_buf, 384)
 
         PrintMessage("\n=== test_sclk_safe complete ===\n")
         LogSync("COMPLETE_SUCCESS")

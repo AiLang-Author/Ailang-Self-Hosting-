@@ -1,0 +1,1190 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUPowerPlay.ailang
+//
+// Full PowerPlay table parser for AMD GPU VBIOS.
+// Parses the ATOM_PPLIB_POWERPLAYTABLE structure including:
+//   - PP header (revision, counts, offsets)
+//   - State Array (ATOM_PPLIB_STATE_V2 variable-length records)
+//   - Clock Info Array (generation-specific clock+voltage entries)
+//   - Non-Clock Info Array (classification flags per state)
+//   - Clock-Voltage Dependency tables (V4+: SCLK-VDDC, MCLK-VDDCI pairs)
+//   - Extended header (V5+: fan table, CACLeakage, etc.)
+//
+// The existing AtomBIOS library handles basic PP scanning (max SCLK for
+// boot voltage). This library provides full structured access for DPM
+// state table construction.
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUPowerPlay
+//
+// DEPENDS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+//   LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+//
+// PPLIB TABLE LAYOUT (reference):
+//
+// ATOM_PPLIB_POWERPLAYTABLE (packed):
+//   +0:  ATOM_COMMON_TABLE_HEADER (4 bytes: u16 size, u8 fmtRev, u8 cntRev)
+//   +4:  ucDataRevision       (u8)
+//   +5:  ucNumStates          (u8)    — legacy, use stateArray count
+//   +6:  ucStateEntrySize     (u8)    — legacy (V1 only)
+//   +7:  ucClockInfoSize      (u8)
+//   +8:  ucNonClockSize       (u8)
+//   +9:  usStateArrayOffset   (u16)   — relative to PP start
+//   +11: usClockInfoArrayOff  (u16)   — relative to PP start
+//   +13: usNonClockInfoArrayOff(u16)  — relative to PP start
+//   -- V3+ --
+//   +15: usBackbiasTime       (u16)
+//   +17: usVoltageTime        (u16)
+//   +19: usTableSize          (u16)
+//   +21: ulPlatformCaps       (u32)
+//   -- V4+ --
+//   +25: usMasterCmdTableOff  (u16)
+//   +27: usExtraDataOffset    (u16)   — ATOM_PPLIB_EXTENDEDHEADER
+//
+// ATOM_PPLIB_EXTENDEDHEADER (V5+):
+//   +0:  u16 usSize
+//   +2:  u32 ulMaxEngineClock
+//   +6:  u32 ulMaxMemoryClock
+//   +10: u16 usVCETableOffset
+//   +12: u16 usUVDTableOffset
+//   +14: u16 usSAMUTableOffset
+//   +16: u16 usPPMTableOffset
+//   +18: u16 usACPTableOffset
+//   +20: u16 usCACLeakageTableOff
+//   +22: u16 usSCLKVDDgfxTableOff
+//
+// STATE ARRAY (at stateArrayOffset):
+//   +0: ucNumEntries (u8)
+//   +1: first ATOM_PPLIB_STATE_V2 entry:
+//        +0: ucNumDPMLevels (u8) — variable length!
+//        +1: ucNonClockInfoIndex (u8)
+//        +2..(1+N): ucClockInfoIndex[N] (u8 each)
+//   next entry follows immediately (walk sequentially)
+//
+// NON-CLOCK INFO ARRAY:
+//   +0: ucNumEntries (u8)
+//   +1: ucEntrySize  (u8)
+//   +2: entries:
+//     ATOM_PPLIB_NONCLOCK_INFO (8 bytes):
+//       +0: usClassification (u16) — classification flags
+//       +2: ucMinTemp (u8)
+//       +3: ucMaxTemp (u8)
+//       +4: ulCapsAndSettings (u32)
+//
+// ATOM_PPLIB_NONCLOCK_INFO classification flags:
+//   bit 0:  BOOT        (0x0001) — boot state
+//   bit 1:  THERMAL     (0x0002)
+//   bit 2:  LIMITED_PS  (0x0004)
+//   bit 3:  REST        (0x0008)
+//   bit 4:  FORCED      (0x0010)
+//   bit 5:  3DPERF      (0x0020) — 3D performance state
+//   bit 6:  LIMIT_SCLK  (0x0040)
+//   bit 7:  ACPI        (0x0080)
+//   bit 8:  HD2         (0x0100)
+//   bit 9:  HD          (0x0200)
+//   bit 10: SDMA        (0x0400)
+//   bit 14: UVD         (0x4000)
+//   bits 11-13: UI mask  (0x3800) — user interface display class
+//   UI values: 0=None, 1=Battery, 2=Balanced, 3=Performance
+//
+// CLOCK_VOLTAGE_DEPENDENCY_TABLE (V4+, at extraDataOffset):
+//   +0: ucNumEntries (u8)
+//   +1: entries:
+//     SCLK_VDDC entry (5 bytes):
+//       +0: u32 ulSCLK (10kHz units)
+//       +4: u16 usVDDC (mV)
+//     MCLK_VDDCI entry (5 bytes):
+//       +0: u32 ulMCLK (10kHz units)
+//       +4: u16 usVDDCI (mV)
+//   Note: Some tables use 6-byte entries, check entrySize if provided
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+// PP header field offsets (within PP table)
+FixedPool.PPHdr {
+    "TBL_SIZE":            Initialize=0     // u16 — ATOM_COMMON_TABLE_HEADER.size
+    "FMT_REV":             Initialize=2     // u8
+    "CNT_REV":             Initialize=3     // u8
+    "DATA_REV":            Initialize=4     // u8
+    "NUM_STATES":          Initialize=5     // u8 (legacy)
+    "STATE_ENTRY_SIZE":    Initialize=6     // u8 (V1 only)
+    "CLOCK_INFO_SIZE":     Initialize=7     // u8
+    "NON_CLOCK_SIZE":      Initialize=8     // u8
+    "STATE_ARRAY_OFF":     Initialize=9     // u16, relative
+    "CLOCK_INFO_ARRAY_OFF": Initialize=11   // u16, relative
+    "NON_CLOCK_ARRAY_OFF": Initialize=13    // u16, relative
+    // V3+ fields
+    "BACKBIAS_TIME":       Initialize=15    // u16
+    "VOLTAGE_TIME":        Initialize=17    // u16
+    "V3_TABLE_SIZE":       Initialize=19    // u16
+    "PLATFORM_CAPS":       Initialize=21    // u32
+    // V4+ fields
+    "MASTER_CMD_OFF":      Initialize=25    // u16
+    "EXTRA_DATA_OFF":      Initialize=27    // u16
+}
+
+// Extended header offsets (at extraDataOffset, relative to PP start)
+FixedPool.PPExtHdr {
+    "SIZE":                Initialize=0     // u16
+    "MAX_ENGINE_CLK":      Initialize=2     // u32, 10kHz units
+    "MAX_MEMORY_CLK":      Initialize=6     // u32, 10kHz units
+    "VCE_TABLE_OFF":       Initialize=10    // u16
+    "UVD_TABLE_OFF":       Initialize=12    // u16
+    "SAMU_TABLE_OFF":      Initialize=14    // u16
+    "PPM_TABLE_OFF":       Initialize=16    // u16
+    "ACP_TABLE_OFF":       Initialize=18    // u16
+    "CAC_LEAKAGE_OFF":     Initialize=20    // u16
+    "SCLK_VDDGFX_OFF":    Initialize=22    // u16
+}
+
+// NonClockInfo classification flags
+FixedPool.PPClass {
+    "BOOT":                Initialize=1      // 0x0001
+    "THERMAL":             Initialize=2      // 0x0002
+    "LIMITED_PS":          Initialize=4      // 0x0004
+    "REST":                Initialize=8      // 0x0008
+    "FORCED":              Initialize=16     // 0x0010
+    "PERF_3D":             Initialize=32     // 0x0020
+    "LIMIT_SCLK":          Initialize=64     // 0x0040
+    "ACPI":                Initialize=128    // 0x0080
+    "HD2":                 Initialize=256    // 0x0100
+    "HD":                  Initialize=512    // 0x0200
+    "SDMA":                Initialize=1024   // 0x0400
+    "UI_MASK":             Initialize=14336  // 0x3800 (bits 11-13)
+    "UI_SHIFT":            Initialize=11
+    "UVD":                 Initialize=16384  // 0x4000
+    // UI values after shift:
+    "UI_NONE":             Initialize=0
+    "UI_BATTERY":          Initialize=1
+    "UI_BALANCED":         Initialize=2
+    "UI_PERFORMANCE":      Initialize=3
+}
+
+// =============================================================================
+// PER-GPU POWERPLAY STATE
+// =============================================================================
+// Parsed PP data stored per-GPU in a flat array.
+//
+// Clock entries are extracted into a uniform array (PPClockEntry format).
+// State records link indices into clock and non-clock arrays.
+
+FixedPool.PPField {
+    "PP_OFF":              Initialize=0     // ROM offset of PP table
+    "DATA_REV":            Initialize=8     // data revision
+    "FMT_REV":             Initialize=16    // format revision
+    "CNT_REV":             Initialize=24    // content revision
+    "TBL_SIZE":            Initialize=32    // table size from header
+    "CLOCK_INFO_SIZE":     Initialize=40    // per-entry size (16 for SI)
+    "NON_CLOCK_SIZE":      Initialize=48    // per-entry non-clock size
+
+    // State array
+    "NUM_STATES":          Initialize=56    // number of state entries
+    "STATE_ARRAY_PTR":     Initialize=64    // pointer to parsed state array
+
+    // Clock info array
+    "NUM_CLOCK_ENTRIES":   Initialize=72    // count of clock info entries
+    "CLOCK_ARRAY_PTR":     Initialize=80    // pointer to parsed clock entries (PPClockEntry[])
+
+    // Non-clock info array
+    "NUM_NONCLOCK":        Initialize=88    // count of non-clock entries
+    "NONCLOCK_ARRAY_PTR":  Initialize=96    // pointer to parsed non-clock entries
+
+    // Clock-voltage dependency tables (V4+)
+    "SCLK_DEP_COUNT":     Initialize=104   // number of SCLK-VDDC dependency entries
+    "SCLK_DEP_PTR":       Initialize=112   // pointer to dependency array
+    "MCLK_DEP_COUNT":     Initialize=120   // number of MCLK-VDDCI dependency entries
+    "MCLK_DEP_PTR":       Initialize=128   // pointer to dependency array
+
+    // Extended header data
+    "EXT_MAX_SCLK":       Initialize=136   // max engine clock from ext header (kHz)
+    "EXT_MAX_MCLK":       Initialize=144   // max memory clock from ext header (kHz)
+
+    // Boot / perf state indices
+    "BOOT_STATE_IDX":     Initialize=152   // index of boot state in state array
+    "PERF_STATE_IDX":     Initialize=160   // index of 3D performance state
+
+    // Platform capabilities
+    "PLATFORM_CAPS":      Initialize=168   // ulPlatformCaps (V3+)
+
+    // Parsed flag
+    "PARSED":             Initialize=176   // 1 if successfully parsed
+
+    "ENTRY_SIZE":         Initialize=192   // bytes per entry
+}
+
+// Uniform clock info entry (extracted from generation-specific format)
+// 48 bytes per entry — generation-independent representation
+FixedPool.PPClkEntry {
+    "SCLK":               Initialize=0     // engine clock in kHz
+    "MCLK":               Initialize=8     // memory clock in kHz
+    "VDDC":               Initialize=16    // core voltage in mV
+    "VDDCI":              Initialize=24    // I/O voltage in mV
+    "PCIE_GEN":           Initialize=32    // PCIe generation (1, 2, 3)
+    "FLAGS":              Initialize=40    // raw flags from VBIOS
+    "SIZE":               Initialize=48    // entry size
+}
+
+// Parsed state entry (from state array walk)
+// 32 bytes per entry — holds non-clock index + up to 8 DPM level indices
+FixedPool.PPStateEntry {
+    "NUM_DPM_LEVELS":     Initialize=0     // number of DPM levels in this state
+    "NONCLOCK_IDX":       Initialize=8     // index into non-clock info array
+    "DPM_IDX_0":          Initialize=16    // clock info index for DPM level 0
+    // Additional DPM indices at +17, +18, ... (u8 packed)
+    "CLASSIFICATION":     Initialize=24    // classification flags (copied from non-clock)
+    "SIZE":               Initialize=32    // entry size
+}
+
+// Non-clock info entry (parsed)
+FixedPool.PPNonClkEntry {
+    "CLASSIFICATION":     Initialize=0     // u16 classification flags
+    "MIN_TEMP":           Initialize=8     // u8
+    "MAX_TEMP":           Initialize=16    // u8
+    "CAPS_AND_SETTINGS":  Initialize=24    // u32
+    "SIZE":               Initialize=32    // entry size
+}
+
+// Clock-voltage dependency entry
+FixedPool.PPDepEntry {
+    "CLK":                Initialize=0     // clock in kHz
+    "VOLTAGE":            Initialize=8     // voltage in mV
+    "SIZE":               Initialize=16    // entry size
+}
+
+// =============================================================================
+// MODULE STATE
+// =============================================================================
+FixedPool.PPState {
+    "entries":            Initialize=0, CanChange=True   // ptr to allocated buffer
+    "initialized":        Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// PP_Init — allocate per-GPU state array
+// =============================================================================
+Function.PP_Init {
+    Body: {
+        IfCondition EqualTo(PPState.initialized, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        total = Multiply(GPUBarConst.MAX_GPUS, PPField.ENTRY_SIZE)
+        PPState.entries = Allocate(total)
+        MemorySet(PPState.entries, 0, total)
+        PPState.initialized = 1
+    }
+}
+
+// =============================================================================
+// PP_GetEntry — return pointer to PP state for GPU index
+// =============================================================================
+Function.PP_GetEntry {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(index, GPUBarConst.MAX_GPUS) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Add(PPState.entries, Multiply(index, PPField.ENTRY_SIZE)))
+    }
+}
+
+// =============================================================================
+// PP_Parse — full PowerPlay table parse
+//
+// Requires AtomBIOS to be loaded and parsed for this GPU.
+// Extracts state array, clock info, non-clock info, dependency tables.
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.PP_Parse {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        PP_Init()
+
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        // Already parsed?
+        IfCondition EqualTo(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // Get ROM buffer and PP table offset from AtomBIOS
+        rom = AtomBIOS_GetROMPtr(gpu)
+        IfCondition EqualTo(rom, 0) ThenBlock: {
+            PrintMessage("[PP] ROM not loaded for GPU ")
+            PrintNumber(gpu)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+        rom_size = AtomBIOS_GetROMSize(gpu)
+
+        pp_off = AtomBIOS_GetDataTableOffset(gpu, AtomDataIdx.POWERPLAY)
+        IfCondition EqualTo(pp_off, 0) ThenBlock: {
+            PrintMessage("[PP] No PowerPlay table in VBIOS\n")
+            ReturnValue(0)
+        }
+        StoreValue(Add(entry, PPField.PP_OFF), pp_off)
+
+        // ---- Parse PP header ----
+        tbl_size = AtomBIOS_ReadU16(rom, Add(pp_off, PPHdr.TBL_SIZE))
+        fmt_rev = GetByte(rom, Add(pp_off, PPHdr.FMT_REV))
+        cnt_rev = GetByte(rom, Add(pp_off, PPHdr.CNT_REV))
+        data_rev = GetByte(rom, Add(pp_off, PPHdr.DATA_REV))
+        ci_size = GetByte(rom, Add(pp_off, PPHdr.CLOCK_INFO_SIZE))
+        nc_size = GetByte(rom, Add(pp_off, PPHdr.NON_CLOCK_SIZE))
+
+        StoreValue(Add(entry, PPField.TBL_SIZE), tbl_size)
+        StoreValue(Add(entry, PPField.FMT_REV), fmt_rev)
+        StoreValue(Add(entry, PPField.CNT_REV), cnt_rev)
+        StoreValue(Add(entry, PPField.DATA_REV), data_rev)
+        StoreValue(Add(entry, PPField.CLOCK_INFO_SIZE), ci_size)
+        StoreValue(Add(entry, PPField.NON_CLOCK_SIZE), nc_size)
+
+        // Relative offsets (from PP table start)
+        sa_rel = AtomBIOS_ReadU16(rom, Add(pp_off, PPHdr.STATE_ARRAY_OFF))
+        ci_rel = AtomBIOS_ReadU16(rom, Add(pp_off, PPHdr.CLOCK_INFO_ARRAY_OFF))
+        nc_rel = AtomBIOS_ReadU16(rom, Add(pp_off, PPHdr.NON_CLOCK_ARRAY_OFF))
+
+        // Convert to absolute ROM offsets
+        sa_abs = Add(pp_off, sa_rel)
+        ci_abs = Add(pp_off, ci_rel)
+        nc_abs = Add(pp_off, nc_rel)
+
+        // Bounds checks
+        IfCondition GreaterEqual(sa_abs, rom_size) ThenBlock: {
+            PrintMessage("[PP] State array offset out of range\n")
+            ReturnValue(0)
+        }
+        IfCondition GreaterEqual(ci_abs, rom_size) ThenBlock: {
+            PrintMessage("[PP] Clock info array offset out of range\n")
+            ReturnValue(0)
+        }
+        IfCondition GreaterEqual(nc_abs, rom_size) ThenBlock: {
+            PrintMessage("[PP] Non-clock info array offset out of range\n")
+            ReturnValue(0)
+        }
+
+        // ---- Parse Clock Info Array ----
+        // Header: [0]=numEntries(u8) [1]=entrySize(u8) [2..]=entries
+        num_ci = GetByte(rom, ci_abs)
+        ci_esz = GetByte(rom, Add(ci_abs, 1))
+        IfCondition LessThan(ci_esz, 7) ThenBlock: {
+            PrintMessage("[PP] Clock info entry too small: ")
+            PrintNumber(ci_esz)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+        IfCondition GreaterThan(num_ci, 32) ThenBlock: { num_ci = 32 }
+
+        StoreValue(Add(entry, PPField.NUM_CLOCK_ENTRIES), num_ci)
+
+        // Allocate uniform clock entry array
+        ci_buf_size = Multiply(num_ci, PPClkEntry.SIZE)
+        ci_buf = Allocate(ci_buf_size)
+        MemorySet(ci_buf, 0, ci_buf_size)
+        StoreValue(Add(entry, PPField.CLOCK_ARRAY_PTR), ci_buf)
+
+        // Parse each clock info entry
+        ci_data = Add(ci_abs, 2)
+        j = 0
+        WhileLoop LessThan(j, num_ci) {
+            e_off = Add(ci_data, Multiply(j, ci_esz))
+            out = Add(ci_buf, Multiply(j, PPClkEntry.SIZE))
+
+            // SCLK = u16[+0] | (u8[+2] << 16), 10kHz units → kHz
+            sclk_lo = AtomBIOS_ReadU16(rom, e_off)
+            sclk_hi = GetByte(rom, Add(e_off, 2))
+            sclk_khz = Multiply(Add(sclk_lo, Multiply(sclk_hi, 65536)), 10)
+            StoreValue(Add(out, PPClkEntry.SCLK), sclk_khz)
+
+            // MCLK = u16[+3] | (u8[+5] << 16), 10kHz units → kHz
+            mclk_lo = AtomBIOS_ReadU16(rom, Add(e_off, 3))
+            mclk_hi = GetByte(rom, Add(e_off, 5))
+            mclk_khz = Multiply(Add(mclk_lo, Multiply(mclk_hi, 65536)), 10)
+            StoreValue(Add(out, PPClkEntry.MCLK), mclk_khz)
+
+            // VDDC = u16[+6] (mV)
+            vddc = AtomBIOS_ReadU16(rom, Add(e_off, 6))
+            StoreValue(Add(out, PPClkEntry.VDDC), vddc)
+
+            // VDDCI = u16[+8] (mV) — only if entry is large enough
+            IfCondition GreaterEqual(ci_esz, 10) ThenBlock: {
+                vddci = AtomBIOS_ReadU16(rom, Add(e_off, 8))
+                StoreValue(Add(out, PPClkEntry.VDDCI), vddci)
+            }
+
+            // PCIe Gen = u8[+10]
+            IfCondition GreaterEqual(ci_esz, 11) ThenBlock: {
+                pcie_gen = GetByte(rom, Add(e_off, 10))
+                StoreValue(Add(out, PPClkEntry.PCIE_GEN), pcie_gen)
+            }
+
+            // Flags = u32[+12]
+            IfCondition GreaterEqual(ci_esz, 16) ThenBlock: {
+                flags = AtomBIOS_ReadU32(rom, Add(e_off, 12))
+                StoreValue(Add(out, PPClkEntry.FLAGS), flags)
+            }
+
+            j = Add(j, 1)
+        }
+
+        // ---- Parse Non-Clock Info Array ----
+        // Header: [0]=numEntries(u8) [1]=entrySize(u8) [2..]=entries
+        num_nc = GetByte(rom, nc_abs)
+        nc_esz = GetByte(rom, Add(nc_abs, 1))
+        IfCondition GreaterThan(num_nc, 32) ThenBlock: { num_nc = 32 }
+
+        StoreValue(Add(entry, PPField.NUM_NONCLOCK), num_nc)
+
+        // Allocate non-clock entry array
+        nc_buf_size = Multiply(num_nc, PPNonClkEntry.SIZE)
+        nc_buf = Allocate(nc_buf_size)
+        MemorySet(nc_buf, 0, nc_buf_size)
+        StoreValue(Add(entry, PPField.NONCLOCK_ARRAY_PTR), nc_buf)
+
+        nc_data = Add(nc_abs, 2)
+        j = 0
+        WhileLoop LessThan(j, num_nc) {
+            e_off = Add(nc_data, Multiply(j, nc_esz))
+            out = Add(nc_buf, Multiply(j, PPNonClkEntry.SIZE))
+
+            // Classification = u16[+0]
+            cls = AtomBIOS_ReadU16(rom, e_off)
+            StoreValue(Add(out, PPNonClkEntry.CLASSIFICATION), cls)
+
+            // MinTemp = u8[+2], MaxTemp = u8[+3]
+            IfCondition GreaterEqual(nc_esz, 4) ThenBlock: {
+                StoreValue(Add(out, PPNonClkEntry.MIN_TEMP), GetByte(rom, Add(e_off, 2)))
+                StoreValue(Add(out, PPNonClkEntry.MAX_TEMP), GetByte(rom, Add(e_off, 3)))
+            }
+
+            // CapsAndSettings = u32[+4]
+            IfCondition GreaterEqual(nc_esz, 8) ThenBlock: {
+                caps = AtomBIOS_ReadU32(rom, Add(e_off, 4))
+                StoreValue(Add(out, PPNonClkEntry.CAPS_AND_SETTINGS), caps)
+            }
+
+            j = Add(j, 1)
+        }
+
+        // ---- Parse State Array ----
+        // V2 state array: variable-length records, must walk sequentially
+        // +0: ucNumEntries (u8)
+        // +1: first state entry
+        //   +0: ucNumDPMLevels (u8)
+        //   +1: ucNonClockInfoIndex (u8)
+        //   +2..(1+N): ucClockInfoIndex[N]
+        num_states = GetByte(rom, sa_abs)
+        IfCondition GreaterThan(num_states, 16) ThenBlock: { num_states = 16 }
+
+        StoreValue(Add(entry, PPField.NUM_STATES), num_states)
+
+        // Allocate state entry array
+        sa_buf_size = Multiply(num_states, PPStateEntry.SIZE)
+        sa_buf = Allocate(sa_buf_size)
+        MemorySet(sa_buf, 0, sa_buf_size)
+        StoreValue(Add(entry, PPField.STATE_ARRAY_PTR), sa_buf)
+
+        // Walk variable-length state entries
+        boot_idx = -1
+        perf_idx = -1
+        cursor = Add(sa_abs, 1)
+        j = 0
+        WhileLoop LessThan(j, num_states) {
+            IfCondition GreaterEqual(cursor, rom_size) ThenBlock: {
+                // Truncated, stop
+                StoreValue(Add(entry, PPField.NUM_STATES), j)
+                num_states = j
+            }
+            IfCondition LessThan(j, num_states) ThenBlock: {
+                out = Add(sa_buf, Multiply(j, PPStateEntry.SIZE))
+                ndpm = GetByte(rom, cursor)
+                nc_idx = GetByte(rom, Add(cursor, 1))
+
+                IfCondition GreaterThan(ndpm, 8) ThenBlock: { ndpm = 8 }
+                StoreValue(Add(out, PPStateEntry.NUM_DPM_LEVELS), ndpm)
+                StoreValue(Add(out, PPStateEntry.NONCLOCK_IDX), nc_idx)
+
+                // Copy DPM level indices (packed u8 starting at cursor+2)
+                k = 0
+                WhileLoop LessThan(k, ndpm) {
+                    dpm_ci = GetByte(rom, Add(cursor, Add(2, k)))
+                    // Store as packed bytes at DPM_IDX_0 offset
+                    SetByte(Add(out, PPStateEntry.DPM_IDX_0), k, dpm_ci)
+                    k = Add(k, 1)
+                }
+
+                // Look up classification from non-clock array
+                IfCondition LessThan(nc_idx, num_nc) ThenBlock: {
+                    nc_entry = Add(nc_buf, Multiply(nc_idx, PPNonClkEntry.SIZE))
+                    cls = Dereference(Add(nc_entry, PPNonClkEntry.CLASSIFICATION))
+                    StoreValue(Add(out, PPStateEntry.CLASSIFICATION), cls)
+
+                    // Identify boot and performance states
+                    IfCondition NotEqual(BitwiseAnd(cls, PPClass.BOOT), 0) ThenBlock: {
+                        boot_idx = j
+                    }
+                    IfCondition NotEqual(BitwiseAnd(cls, PPClass.PERF_3D), 0) ThenBlock: {
+                        perf_idx = j
+                    }
+                }
+
+                // Advance cursor: 2 bytes header + ndpm index bytes
+                // The actual entry uses the original ndpm from ROM, not our capped value
+                orig_ndpm = GetByte(rom, cursor)
+                cursor = Add(cursor, Add(2, orig_ndpm))
+            }
+            j = Add(j, 1)
+        }
+
+        StoreValue(Add(entry, PPField.BOOT_STATE_IDX), boot_idx)
+        StoreValue(Add(entry, PPField.PERF_STATE_IDX), perf_idx)
+
+        // ---- Parse V3+ Platform Capabilities ----
+        IfCondition GreaterEqual(data_rev, 3) ThenBlock: {
+            IfCondition GreaterEqual(tbl_size, 25) ThenBlock: {
+                plat_caps = AtomBIOS_ReadU32(rom, Add(pp_off, PPHdr.PLATFORM_CAPS))
+                StoreValue(Add(entry, PPField.PLATFORM_CAPS), plat_caps)
+            }
+        }
+
+        // ---- Parse V4+ Extended Header / Dependency Tables ----
+        IfCondition GreaterEqual(data_rev, 4) ThenBlock: {
+            IfCondition GreaterEqual(tbl_size, 29) ThenBlock: {
+                ext_rel = AtomBIOS_ReadU16(rom, Add(pp_off, PPHdr.EXTRA_DATA_OFF))
+                IfCondition NotEqual(ext_rel, 0) ThenBlock: {
+                    ext_abs = Add(pp_off, ext_rel)
+                    IfCondition LessThan(ext_abs, rom_size) ThenBlock: {
+                        // Extended header: max clocks
+                        ext_size = AtomBIOS_ReadU16(rom, ext_abs)
+                        IfCondition GreaterEqual(ext_size, 10) ThenBlock: {
+                            max_eng_10k = AtomBIOS_ReadU32(rom, Add(ext_abs, PPExtHdr.MAX_ENGINE_CLK))
+                            max_mem_10k = AtomBIOS_ReadU32(rom, Add(ext_abs, PPExtHdr.MAX_MEMORY_CLK))
+                            StoreValue(Add(entry, PPField.EXT_MAX_SCLK), Multiply(max_eng_10k, 10))
+                            StoreValue(Add(entry, PPField.EXT_MAX_MCLK), Multiply(max_mem_10k, 10))
+                        }
+                    }
+                }
+
+                // Clock-Voltage Dependency tables
+                // These are separate sub-tables pointed to by offsets in the extra data area.
+                // For SI, they're typically at PP+extraData+various offsets.
+                // The kernel uses usVddcDepTableOffset (offset 2 in ClockVoltDep table header)
+                //
+                // Look for SCLK-VDDC dependency table.
+                // In PPLIB V4, these are embedded after the extended header.
+                // The format is documented in pptable_v1_0.h / si_dpm.c
+                //
+                // The extra data block contains:
+                //   +0: u16 size
+                //   +2: u16 usVddcLookupTableOffset (relative to PP start)
+                //   +4: u16 usVddgfxLookupTableOffset (relative to PP start)
+                // But the actual layout varies by revision. For SI, the kernel
+                // reads the dependency tables from fixed offsets in the PP header:
+                //   PP+29: SCLK-VDDC dep table offset (u16, relative to PP start)
+                //   PP+31: MCLK-VDDCI dep table offset (u16, relative to PP start)
+                // These are present when tbl_size >= 33.
+                IfCondition GreaterEqual(tbl_size, 33) ThenBlock: {
+                    // SCLK-VDDC dependency table
+                    svd_rel = AtomBIOS_ReadU16(rom, Add(pp_off, 29))
+                    IfCondition NotEqual(svd_rel, 0) ThenBlock: {
+                        svd_abs = Add(pp_off, svd_rel)
+                        IfCondition LessThan(svd_abs, rom_size) ThenBlock: {
+                            svd_count = GetByte(rom, svd_abs)
+                            IfCondition GreaterThan(svd_count, 32) ThenBlock: { svd_count = 32 }
+
+                            StoreValue(Add(entry, PPField.SCLK_DEP_COUNT), svd_count)
+
+                            // Allocate and parse
+                            svd_buf = Allocate(Multiply(svd_count, PPDepEntry.SIZE))
+                            MemorySet(svd_buf, 0, Multiply(svd_count, PPDepEntry.SIZE))
+                            StoreValue(Add(entry, PPField.SCLK_DEP_PTR), svd_buf)
+
+                            k = 0
+                            WhileLoop LessThan(k, svd_count) {
+                                // Each entry: u32 SCLK (10kHz) + u16 VDDC (mV) = 6 bytes
+                                de_off = Add(svd_abs, Add(1, Multiply(k, 6)))
+                                dep_out = Add(svd_buf, Multiply(k, PPDepEntry.SIZE))
+
+                                dep_clk_10k = AtomBIOS_ReadU32(rom, de_off)
+                                dep_vddc = AtomBIOS_ReadU16(rom, Add(de_off, 4))
+                                StoreValue(Add(dep_out, PPDepEntry.CLK), Multiply(dep_clk_10k, 10))
+                                StoreValue(Add(dep_out, PPDepEntry.VOLTAGE), dep_vddc)
+
+                                k = Add(k, 1)
+                            }
+                        }
+                    }
+                }
+
+                IfCondition GreaterEqual(tbl_size, 35) ThenBlock: {
+                    // MCLK-VDDCI dependency table
+                    mvd_rel = AtomBIOS_ReadU16(rom, Add(pp_off, 31))
+                    IfCondition NotEqual(mvd_rel, 0) ThenBlock: {
+                        mvd_abs = Add(pp_off, mvd_rel)
+                        IfCondition LessThan(mvd_abs, rom_size) ThenBlock: {
+                            mvd_count = GetByte(rom, mvd_abs)
+                            IfCondition GreaterThan(mvd_count, 32) ThenBlock: { mvd_count = 32 }
+
+                            StoreValue(Add(entry, PPField.MCLK_DEP_COUNT), mvd_count)
+
+                            mvd_buf = Allocate(Multiply(mvd_count, PPDepEntry.SIZE))
+                            MemorySet(mvd_buf, 0, Multiply(mvd_count, PPDepEntry.SIZE))
+                            StoreValue(Add(entry, PPField.MCLK_DEP_PTR), mvd_buf)
+
+                            k = 0
+                            WhileLoop LessThan(k, mvd_count) {
+                                de_off = Add(mvd_abs, Add(1, Multiply(k, 6)))
+                                dep_out = Add(mvd_buf, Multiply(k, PPDepEntry.SIZE))
+
+                                dep_clk_10k = AtomBIOS_ReadU32(rom, de_off)
+                                dep_vddci = AtomBIOS_ReadU16(rom, Add(de_off, 4))
+                                StoreValue(Add(dep_out, PPDepEntry.CLK), Multiply(dep_clk_10k, 10))
+                                StoreValue(Add(dep_out, PPDepEntry.VOLTAGE), dep_vddci)
+
+                                k = Add(k, 1)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        StoreValue(Add(entry, PPField.PARSED), 1)
+        PrintMessage("[PP] PowerPlay table parsed: ")
+        PrintNumber(num_ci)
+        PrintMessage(" clock entries, ")
+        PrintNumber(num_states)
+        PrintMessage(" states, rev=")
+        PrintNumber(data_rev)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PP_GetNumClockEntries — return count of clock info entries
+// =============================================================================
+Function.PP_GetNumClockEntries {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, PPField.NUM_CLOCK_ENTRIES)))
+    }
+}
+
+// =============================================================================
+// PP_GetClockEntry — copy one clock entry to caller's buffer
+//
+// out_ptr: address of a PPClkEntry.SIZE buffer to receive the data
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.PP_GetClockEntry {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Input: out_ptr: Address
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+
+        num = Dereference(Add(entry, PPField.NUM_CLOCK_ENTRIES))
+        IfCondition GreaterEqual(idx, num) ThenBlock: { ReturnValue(0) }
+
+        src = Add(Dereference(Add(entry, PPField.CLOCK_ARRAY_PTR)), Multiply(idx, PPClkEntry.SIZE))
+        MemoryCopy(out_ptr, src, PPClkEntry.SIZE)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PP_GetNumStates — return number of parsed states
+// =============================================================================
+Function.PP_GetNumStates {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, PPField.NUM_STATES)))
+    }
+}
+
+// =============================================================================
+// PP_GetStateEntry — copy one state entry to caller's buffer
+// =============================================================================
+Function.PP_GetStateEntry {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Input: out_ptr: Address
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+
+        num = Dereference(Add(entry, PPField.NUM_STATES))
+        IfCondition GreaterEqual(idx, num) ThenBlock: { ReturnValue(0) }
+
+        src = Add(Dereference(Add(entry, PPField.STATE_ARRAY_PTR)), Multiply(idx, PPStateEntry.SIZE))
+        MemoryCopy(out_ptr, src, PPStateEntry.SIZE)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PP_GetSclkDepCount — return number of SCLK-VDDC dependency entries
+// =============================================================================
+Function.PP_GetSclkDepCount {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, PPField.SCLK_DEP_COUNT)))
+    }
+}
+
+// =============================================================================
+// PP_GetSclkDepEntry — copy one SCLK-VDDC dependency entry
+// =============================================================================
+Function.PP_GetSclkDepEntry {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Input: out_ptr: Address
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+
+        num = Dereference(Add(entry, PPField.SCLK_DEP_COUNT))
+        IfCondition GreaterEqual(idx, num) ThenBlock: { ReturnValue(0) }
+
+        ptr = Dereference(Add(entry, PPField.SCLK_DEP_PTR))
+        IfCondition EqualTo(ptr, 0) ThenBlock: { ReturnValue(0) }
+
+        src = Add(ptr, Multiply(idx, PPDepEntry.SIZE))
+        MemoryCopy(out_ptr, src, PPDepEntry.SIZE)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PP_GetMclkDepCount — return number of MCLK-VDDCI dependency entries
+// =============================================================================
+Function.PP_GetMclkDepCount {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, PPField.MCLK_DEP_COUNT)))
+    }
+}
+
+// =============================================================================
+// PP_GetMclkDepEntry — copy one MCLK-VDDCI dependency entry
+// =============================================================================
+Function.PP_GetMclkDepEntry {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Input: out_ptr: Address
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+
+        num = Dereference(Add(entry, PPField.MCLK_DEP_COUNT))
+        IfCondition GreaterEqual(idx, num) ThenBlock: { ReturnValue(0) }
+
+        ptr = Dereference(Add(entry, PPField.MCLK_DEP_PTR))
+        IfCondition EqualTo(ptr, 0) ThenBlock: { ReturnValue(0) }
+
+        src = Add(ptr, Multiply(idx, PPDepEntry.SIZE))
+        MemoryCopy(out_ptr, src, PPDepEntry.SIZE)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// PP_FindBootState — return index of boot state in state array
+// Returns -1 if not found.
+// =============================================================================
+Function.PP_FindBootState {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Dereference(Add(entry, PPField.BOOT_STATE_IDX)))
+    }
+}
+
+// =============================================================================
+// PP_FindPerformanceState — return index of 3D performance state
+// Returns -1 if not found.
+// =============================================================================
+Function.PP_FindPerformanceState {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Dereference(Add(entry, PPField.PERF_STATE_IDX)))
+    }
+}
+
+// =============================================================================
+// PP_GetMaxSCLK — return max engine clock from extended header (kHz)
+// Falls back to AtomBIOS MAX_ENGINE_CLK if no extended header.
+// =============================================================================
+Function.PP_GetMaxSCLK {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+
+        ext = Dereference(Add(entry, PPField.EXT_MAX_SCLK))
+        IfCondition GreaterThan(ext, 0) ThenBlock: { ReturnValue(ext) }
+
+        // Fallback to AtomBIOS parsed value
+        ReturnValue(AtomBIOS_GetField(gpu, AtomField.MAX_ENGINE_CLK))
+    }
+}
+
+// =============================================================================
+// PP_GetMaxMCLK — return max memory clock from extended header (kHz)
+// =============================================================================
+Function.PP_GetMaxMCLK {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+
+        ext = Dereference(Add(entry, PPField.EXT_MAX_MCLK))
+        IfCondition GreaterThan(ext, 0) ThenBlock: { ReturnValue(ext) }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// PP_GetStateDPMClockIdx — get clock info index for a DPM level in a state
+//
+// state_idx: index into state array
+// dpm_level: DPM level within that state (0-based)
+// Returns the clock info array index, or -1 on error.
+// =============================================================================
+Function.PP_GetStateDPMClockIdx {
+    Input: gpu: Integer
+    Input: state_idx: Integer
+    Input: dpm_level: Integer
+    Output: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: { ReturnValue(-1) }
+
+        num_states = Dereference(Add(entry, PPField.NUM_STATES))
+        IfCondition GreaterEqual(state_idx, num_states) ThenBlock: { ReturnValue(-1) }
+
+        sa_ptr = Dereference(Add(entry, PPField.STATE_ARRAY_PTR))
+        state = Add(sa_ptr, Multiply(state_idx, PPStateEntry.SIZE))
+
+        ndpm = Dereference(Add(state, PPStateEntry.NUM_DPM_LEVELS))
+        IfCondition GreaterEqual(dpm_level, ndpm) ThenBlock: { ReturnValue(-1) }
+
+        // DPM indices are packed as u8 bytes at DPM_IDX_0 offset
+        ci_idx = GetByte(Add(state, PPStateEntry.DPM_IDX_0), dpm_level)
+        ReturnValue(ci_idx)
+    }
+}
+
+// =============================================================================
+// PP_PrintInfo — print complete parsed PowerPlay information
+// =============================================================================
+Function.PP_PrintInfo {
+    Input: gpu: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, PPField.PARSED)), 1) ThenBlock: {
+            PrintMessage("[PP] Not parsed\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("--- PowerPlay Table Info ---\n")
+        PrintMessage("  PP offset:    0x")
+        PrintHex(Dereference(Add(entry, PPField.PP_OFF)))
+        PrintMessage("\n")
+        PrintMessage("  Revision:     fmt=")
+        PrintNumber(Dereference(Add(entry, PPField.FMT_REV)))
+        PrintMessage(" cnt=")
+        PrintNumber(Dereference(Add(entry, PPField.CNT_REV)))
+        PrintMessage(" data=")
+        PrintNumber(Dereference(Add(entry, PPField.DATA_REV)))
+        PrintMessage("\n")
+        PrintMessage("  Table size:   ")
+        PrintNumber(Dereference(Add(entry, PPField.TBL_SIZE)))
+        PrintMessage(" bytes\n")
+        PrintMessage("  ClockInfo sz: ")
+        PrintNumber(Dereference(Add(entry, PPField.CLOCK_INFO_SIZE)))
+        PrintMessage(" bytes/entry\n")
+        PrintMessage("  Platform:     0x")
+        PrintHex(Dereference(Add(entry, PPField.PLATFORM_CAPS)))
+        PrintMessage("\n\n")
+
+        // Print clock entries
+        num_ci = Dereference(Add(entry, PPField.NUM_CLOCK_ENTRIES))
+        PrintMessage("  Clock Info Entries: ")
+        PrintNumber(num_ci)
+        PrintMessage("\n")
+
+        ci_ptr = Dereference(Add(entry, PPField.CLOCK_ARRAY_PTR))
+        j = 0
+        WhileLoop LessThan(j, num_ci) {
+            ce = Add(ci_ptr, Multiply(j, PPClkEntry.SIZE))
+            PrintMessage("    [")
+            PrintNumber(j)
+            PrintMessage("] SCLK=")
+            sclk = Dereference(Add(ce, PPClkEntry.SCLK))
+            PrintNumber(Divide(sclk, 1000))
+            PrintMessage("MHz  MCLK=")
+            mclk = Dereference(Add(ce, PPClkEntry.MCLK))
+            PrintNumber(Divide(mclk, 1000))
+            PrintMessage("MHz  VDDC=")
+            PrintNumber(Dereference(Add(ce, PPClkEntry.VDDC)))
+            PrintMessage("mV  VDDCI=")
+            PrintNumber(Dereference(Add(ce, PPClkEntry.VDDCI)))
+            PrintMessage("mV  PCIe=Gen")
+            PrintNumber(Dereference(Add(ce, PPClkEntry.PCIE_GEN)))
+            PrintMessage("  flags=0x")
+            PrintHex(Dereference(Add(ce, PPClkEntry.FLAGS)))
+            PrintMessage("\n")
+            j = Add(j, 1)
+        }
+        PrintMessage("\n")
+
+        // Print states
+        num_states = Dereference(Add(entry, PPField.NUM_STATES))
+        boot_idx = Dereference(Add(entry, PPField.BOOT_STATE_IDX))
+        perf_idx = Dereference(Add(entry, PPField.PERF_STATE_IDX))
+
+        PrintMessage("  States: ")
+        PrintNumber(num_states)
+        PrintMessage("  (boot=")
+        PrintNumber(boot_idx)
+        PrintMessage(" perf=")
+        PrintNumber(perf_idx)
+        PrintMessage(")\n")
+
+        sa_ptr = Dereference(Add(entry, PPField.STATE_ARRAY_PTR))
+        j = 0
+        WhileLoop LessThan(j, num_states) {
+            se = Add(sa_ptr, Multiply(j, PPStateEntry.SIZE))
+            PrintMessage("    [")
+            PrintNumber(j)
+            PrintMessage("] ")
+
+            cls = Dereference(Add(se, PPStateEntry.CLASSIFICATION))
+            IfCondition NotEqual(BitwiseAnd(cls, PPClass.BOOT), 0) ThenBlock: {
+                PrintMessage("BOOT ")
+            }
+            IfCondition NotEqual(BitwiseAnd(cls, PPClass.PERF_3D), 0) ThenBlock: {
+                PrintMessage("3DPERF ")
+            }
+            IfCondition NotEqual(BitwiseAnd(cls, PPClass.ACPI), 0) ThenBlock: {
+                PrintMessage("ACPI ")
+            }
+            IfCondition NotEqual(BitwiseAnd(cls, PPClass.UVD), 0) ThenBlock: {
+                PrintMessage("UVD ")
+            }
+            IfCondition NotEqual(BitwiseAnd(cls, PPClass.HD), 0) ThenBlock: {
+                PrintMessage("HD ")
+            }
+
+            // UI class
+            ui = Divide(BitwiseAnd(cls, PPClass.UI_MASK), 2048)
+            IfCondition EqualTo(ui, PPClass.UI_PERFORMANCE) ThenBlock: {
+                PrintMessage("[Perf] ")
+            }
+            IfCondition EqualTo(ui, PPClass.UI_BALANCED) ThenBlock: {
+                PrintMessage("[Balanced] ")
+            }
+            IfCondition EqualTo(ui, PPClass.UI_BATTERY) ThenBlock: {
+                PrintMessage("[Battery] ")
+            }
+
+            PrintMessage("class=0x")
+            PrintHex(cls)
+            PrintMessage("  DPM levels: ")
+            ndpm = Dereference(Add(se, PPStateEntry.NUM_DPM_LEVELS))
+            PrintNumber(ndpm)
+            PrintMessage(" -> clk[")
+            k = 0
+            WhileLoop LessThan(k, ndpm) {
+                IfCondition GreaterThan(k, 0) ThenBlock: { PrintMessage(",") }
+                ci_idx = GetByte(Add(se, PPStateEntry.DPM_IDX_0), k)
+                PrintNumber(ci_idx)
+                k = Add(k, 1)
+            }
+            PrintMessage("]\n")
+            j = Add(j, 1)
+        }
+        PrintMessage("\n")
+
+        // Print non-clock info
+        num_nc = Dereference(Add(entry, PPField.NUM_NONCLOCK))
+        PrintMessage("  Non-Clock Info: ")
+        PrintNumber(num_nc)
+        PrintMessage(" entries\n")
+
+        nc_ptr = Dereference(Add(entry, PPField.NONCLOCK_ARRAY_PTR))
+        j = 0
+        WhileLoop LessThan(j, num_nc) {
+            nce = Add(nc_ptr, Multiply(j, PPNonClkEntry.SIZE))
+            PrintMessage("    [")
+            PrintNumber(j)
+            PrintMessage("] class=0x")
+            PrintHex(Dereference(Add(nce, PPNonClkEntry.CLASSIFICATION)))
+            PrintMessage("  temp=")
+            PrintNumber(Dereference(Add(nce, PPNonClkEntry.MIN_TEMP)))
+            PrintMessage("-")
+            PrintNumber(Dereference(Add(nce, PPNonClkEntry.MAX_TEMP)))
+            PrintMessage("  caps=0x")
+            PrintHex(Dereference(Add(nce, PPNonClkEntry.CAPS_AND_SETTINGS)))
+            PrintMessage("\n")
+            j = Add(j, 1)
+        }
+        PrintMessage("\n")
+
+        // Print SCLK-VDDC dependency table
+        svd_count = Dereference(Add(entry, PPField.SCLK_DEP_COUNT))
+        IfCondition GreaterThan(svd_count, 0) ThenBlock: {
+            PrintMessage("  SCLK-VDDC Dependency: ")
+            PrintNumber(svd_count)
+            PrintMessage(" entries\n")
+            svd_ptr = Dereference(Add(entry, PPField.SCLK_DEP_PTR))
+            j = 0
+            WhileLoop LessThan(j, svd_count) {
+                de = Add(svd_ptr, Multiply(j, PPDepEntry.SIZE))
+                PrintMessage("    [")
+                PrintNumber(j)
+                PrintMessage("] SCLK=")
+                PrintNumber(Divide(Dereference(Add(de, PPDepEntry.CLK)), 1000))
+                PrintMessage("MHz  VDDC=")
+                PrintNumber(Dereference(Add(de, PPDepEntry.VOLTAGE)))
+                PrintMessage("mV\n")
+                j = Add(j, 1)
+            }
+            PrintMessage("\n")
+        }
+
+        // Print MCLK-VDDCI dependency table
+        mvd_count = Dereference(Add(entry, PPField.MCLK_DEP_COUNT))
+        IfCondition GreaterThan(mvd_count, 0) ThenBlock: {
+            PrintMessage("  MCLK-VDDCI Dependency: ")
+            PrintNumber(mvd_count)
+            PrintMessage(" entries\n")
+            mvd_ptr = Dereference(Add(entry, PPField.MCLK_DEP_PTR))
+            j = 0
+            WhileLoop LessThan(j, mvd_count) {
+                de = Add(mvd_ptr, Multiply(j, PPDepEntry.SIZE))
+                PrintMessage("    [")
+                PrintNumber(j)
+                PrintMessage("] MCLK=")
+                PrintNumber(Divide(Dereference(Add(de, PPDepEntry.CLK)), 1000))
+                PrintMessage("MHz  VDDCI=")
+                PrintNumber(Dereference(Add(de, PPDepEntry.VOLTAGE)))
+                PrintMessage("mV\n")
+                j = Add(j, 1)
+            }
+            PrintMessage("\n")
+        }
+
+        // Extended header max clocks
+        ext_sclk = Dereference(Add(entry, PPField.EXT_MAX_SCLK))
+        ext_mclk = Dereference(Add(entry, PPField.EXT_MAX_MCLK))
+        IfCondition GreaterThan(ext_sclk, 0) ThenBlock: {
+            PrintMessage("  Extended Max SCLK: ")
+            PrintNumber(Divide(ext_sclk, 1000))
+            PrintMessage("MHz\n")
+        }
+        IfCondition GreaterThan(ext_mclk, 0) ThenBlock: {
+            PrintMessage("  Extended Max MCLK: ")
+            PrintNumber(Divide(ext_mclk, 1000))
+            PrintMessage("MHz\n")
+        }
+
+        PrintMessage("--- End PowerPlay Info ---\n")
+    }
+}
+
+// =============================================================================
+// PP_Free — deallocate all parsed PP data for a GPU
+// =============================================================================
+Function.PP_Free {
+    Input: gpu: Integer
+    Body: {
+        entry = PP_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        // Free clock array
+        ci_ptr = Dereference(Add(entry, PPField.CLOCK_ARRAY_PTR))
+        IfCondition NotEqual(ci_ptr, 0) ThenBlock: {
+            num = Dereference(Add(entry, PPField.NUM_CLOCK_ENTRIES))
+            Deallocate(ci_ptr, Multiply(num, PPClkEntry.SIZE))
+        }
+
+        // Free non-clock array
+        nc_ptr = Dereference(Add(entry, PPField.NONCLOCK_ARRAY_PTR))
+        IfCondition NotEqual(nc_ptr, 0) ThenBlock: {
+            num = Dereference(Add(entry, PPField.NUM_NONCLOCK))
+            Deallocate(nc_ptr, Multiply(num, PPNonClkEntry.SIZE))
+        }
+
+        // Free state array
+        sa_ptr = Dereference(Add(entry, PPField.STATE_ARRAY_PTR))
+        IfCondition NotEqual(sa_ptr, 0) ThenBlock: {
+            num = Dereference(Add(entry, PPField.NUM_STATES))
+            Deallocate(sa_ptr, Multiply(num, PPStateEntry.SIZE))
+        }
+
+        // Free dependency arrays
+        svd_ptr = Dereference(Add(entry, PPField.SCLK_DEP_PTR))
+        IfCondition NotEqual(svd_ptr, 0) ThenBlock: {
+            num = Dereference(Add(entry, PPField.SCLK_DEP_COUNT))
+            Deallocate(svd_ptr, Multiply(num, PPDepEntry.SIZE))
+        }
+
+        mvd_ptr = Dereference(Add(entry, PPField.MCLK_DEP_PTR))
+        IfCondition NotEqual(mvd_ptr, 0) ThenBlock: {
+            num = Dereference(Add(entry, PPField.MCLK_DEP_COUNT))
+            Deallocate(mvd_ptr, Multiply(num, PPDepEntry.SIZE))
+        }
+
+        // Zero the entry
+        MemorySet(entry, 0, PPField.ENTRY_SIZE)
+    }
+}

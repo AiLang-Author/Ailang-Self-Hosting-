@@ -1,0 +1,932 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUVoltage.ailang
+//
+// Voltage Object Table parser and voltage lookup for AMD GPUs.
+// Parses the ATOM_VOLTAGE_OBJECT_INFO_V3_1 table from VBIOS to extract:
+//   - Voltage control mode (GPIO LUT, SVID2, I2C, etc.)
+//   - GPIO voltage LUT entries (voltage_id → mV mapping)
+//   - Leakage voltage entries (leakage_id → mV mapping)
+//   - Phase shedding limits
+//
+// Used by DPM to convert millivolt values to voltage table indices
+// and populate SISLANDS_SMC_VOLTAGE_VALUE structures.
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUVoltage
+//
+// DEPENDS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+//   LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUPowerPlay
+//
+// VOLTAGE OBJECT TABLE LAYOUT:
+//
+// ATOM_VOLTAGE_OBJECT_INFO_V3_1:
+//   +0: ATOM_COMMON_TABLE_HEADER (4 bytes: u16 size, u8 fmtRev, u8 cntRev)
+//   +4: voltage objects (variable length, walk using usSize)
+//
+// Each voltage object starts with:
+// ATOM_VOLTAGE_OBJECT_HEADER_V3 (4 bytes):
+//   +0: ucVoltageType   (u8)   VDDC=1, MVDDC=2, MVDDQ=3, VDDCI=4
+//   +1: ucVoltageMode   (u8)   GPIO_LUT=0, VR_I2C=3, PHASE=4, SVID2=7
+//   +2: usSize          (u16)  size of entire object including header
+//
+// ATOM_GPIO_VOLTAGE_OBJECT_V3 (mode=0):
+//   +0:  header (4 bytes)
+//   +4:  ucVoltageGpioCntlId (u8)
+//   +5:  ucGpioEntryNum      (u8) — number of LUT entries
+//   +6:  ucPhaseDelay        (u8) — microseconds
+//   +7:  reserved            (u8)
+//   +8:  ulGpioMaskVal       (u32) — GPIO mask
+//   +12: VOLTAGE_LUT_ENTRY_V2[] — 6 bytes each:
+//        +0: ulVoltageId      (u32) — GPIO voltage ID
+//        +4: usVoltageValue   (u16) — mV
+//
+// ATOM_SVID2_VOLTAGE_OBJECT_V3 (mode=7):
+//   +0:  header (4 bytes)
+//   +4:  usLoadLine_PSI  (u16)
+//   +6:  ucSVDGpioId     (u8)
+//   +7:  ucSVCGpioId     (u8)
+//   +8:  reserved        (u32)
+//
+// ATOM_LEAKAGE_VOLTAGE_OBJECT_V3 (mode=0x10/0x11/0x12):
+//   +0:  header (4 bytes)
+//   +4:  ucLeakageCntlId    (u8)
+//   +5:  ucLeakageEntryNum  (u8)
+//   +6:  reserved           (u16)
+//   +8:  ulMaxVoltageLevel  (u32)
+//   +12: LEAKAGE_VOLTAGE_LUT_ENTRY_V2[] — 6 bytes each:
+//        +0: usVoltageLevel   (u16) — mV
+//        +2: usVoltageId      (u16) — voltage ID
+//        +4: usLeakageId      (u16) — leakage ID (e.g. 0xff01)
+//
+// SISLANDS_SMC_VOLTAGE_VALUE (4 bytes, uploaded to SMC):
+//   +0: u16 value           (mV, big-endian)
+//   +2: u8  index           (0-31, voltage table index)
+//   +3: u8  phase_settings  (phase shedding index)
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+// Voltage type codes
+FixedPool.VoltType {
+    "VDDC":               Initialize=1
+    "MVDDC":              Initialize=2
+    "MVDDQ":              Initialize=3
+    "VDDCI":              Initialize=4
+    "VDDGFX":             Initialize=5
+}
+
+// Voltage control mode codes
+FixedPool.VoltMode {
+    "GPIO_LUT":           Initialize=0      // GPIO lookup table
+    "VR_I2C_INIT":        Initialize=3      // I2C init sequence
+    "PHASE_LUT":          Initialize=4      // Phase lookup table
+    "SVID2":              Initialize=7      // Serial VID 2
+    "EVV":                Initialize=8      // Electronic VID
+    "LEAKAGE_LUT":        Initialize=16     // 0x10 — powerboost + leakage
+    "HIGH_LEAK_LUT":      Initialize=17     // 0x11 — high state leakage
+    "HIGH1_LEAK_LUT":     Initialize=18     // 0x12 — high1 state leakage
+}
+
+// Leakage index constants
+FixedPool.LeakConst {
+    "INDEX_BASE":         Initialize=65281  // 0xFF01 — first leakage index
+    "INDEX_MASK_HI":      Initialize=65280  // 0xFF00 — high byte mask
+    "MAX_COUNT":          Initialize=4      // max leakage entries
+}
+
+// GPIO voltage object field offsets (relative to object start)
+FixedPool.VoltGPIO {
+    "CNTL_ID":            Initialize=4      // u8
+    "ENTRY_NUM":          Initialize=5      // u8
+    "PHASE_DELAY":        Initialize=6      // u8
+    "GPIO_MASK":          Initialize=8      // u32
+    "LUT_START":          Initialize=12     // first VOLTAGE_LUT_ENTRY_V2
+    "LUT_ENTRY_SIZE":     Initialize=6      // 6 bytes per entry (u32 id + u16 mV)
+}
+
+// Leakage voltage object field offsets
+FixedPool.VoltLeak {
+    "CNTL_ID":            Initialize=4      // u8
+    "ENTRY_NUM":          Initialize=5      // u8
+    "MAX_VOLTAGE":        Initialize=8      // u32
+    "LUT_START":          Initialize=12     // first LEAKAGE_VOLTAGE_LUT_ENTRY_V2
+    "LUT_ENTRY_SIZE":     Initialize=6      // 6 bytes per entry (u16 mV + u16 vid + u16 leak_id)
+}
+
+// =============================================================================
+// PER-GPU VOLTAGE STATE
+// =============================================================================
+
+FixedPool.VoltField {
+    // VDDC GPIO LUT
+    "VDDC_MODE":          Initialize=0      // voltage mode (VoltMode.*)
+    "VDDC_COUNT":         Initialize=8      // number of GPIO LUT entries
+    "VDDC_PTR":           Initialize=16     // pointer to voltage entries array
+    "VDDC_MASK":          Initialize=24     // GPIO mask value
+    "VDDC_PHASE_DELAY":   Initialize=32     // phase delay (microseconds)
+
+    // VDDCI GPIO LUT
+    "VDDCI_MODE":         Initialize=40
+    "VDDCI_COUNT":        Initialize=48
+    "VDDCI_PTR":          Initialize=56
+    "VDDCI_MASK":         Initialize=64
+
+    // MVDD
+    "MVDD_MODE":          Initialize=72
+    "MVDD_COUNT":         Initialize=80
+    "MVDD_PTR":           Initialize=88
+    "MVDD_MASK":          Initialize=96
+
+    // Phase shedding LUT
+    "PHASE_COUNT":        Initialize=104
+    "PHASE_PTR":          Initialize=112
+    "PHASE_MASK":         Initialize=120
+
+    // Leakage voltage table (for 0xFF01+ indices)
+    "LEAK_COUNT":         Initialize=128    // number of leakage entries
+    "LEAK_PTR":           Initialize=136    // pointer to leakage entries
+
+    // Summary
+    "BOOT_VDDC":          Initialize=144    // boot voltage (mV) from AtomBIOS
+    "MAX_VDDC":           Initialize=152    // max VDDC from voltage table
+    "MIN_VDDC":           Initialize=160    // min VDDC from voltage table
+
+    // SVID2 fields (if mode=SVID2)
+    "SVID2_LOADLINE":     Initialize=168    // load line + PSI settings
+    "SVID2_SVD_GPIO":     Initialize=176    // SVD GPIO ID
+    "SVID2_SVC_GPIO":     Initialize=184    // SVC GPIO ID
+
+    "PARSED":             Initialize=192
+    "ENTRY_SIZE":         Initialize=208
+}
+
+// Voltage table entry (uniform format, 16 bytes)
+FixedPool.VoltEntry {
+    "VOLTAGE":            Initialize=0      // mV
+    "GPIO_ID":            Initialize=8      // GPIO voltage ID (u32)
+    "SIZE":               Initialize=16
+}
+
+// Leakage table entry (24 bytes)
+FixedPool.LeakEntry {
+    "VOLTAGE":            Initialize=0      // mV
+    "VOLTAGE_ID":         Initialize=8      // voltage ID
+    "LEAKAGE_ID":         Initialize=16     // leakage ID (e.g. 0xFF01)
+    "SIZE":               Initialize=24
+}
+
+// =============================================================================
+// MODULE STATE
+// =============================================================================
+FixedPool.VoltState {
+    "entries":            Initialize=0, CanChange=True
+    "initialized":        Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// Volt_Init — allocate per-GPU state
+// =============================================================================
+Function.Volt_Init {
+    Body: {
+        IfCondition EqualTo(VoltState.initialized, 1) ThenBlock: { ReturnValue(0) }
+        total = Multiply(GPUBarConst.MAX_GPUS, VoltField.ENTRY_SIZE)
+        VoltState.entries = Allocate(total)
+        MemorySet(VoltState.entries, 0, total)
+        VoltState.initialized = 1
+    }
+}
+
+// =============================================================================
+// Volt_GetEntry — return pointer to voltage state for GPU index
+// =============================================================================
+Function.Volt_GetEntry {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(index, GPUBarConst.MAX_GPUS) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Add(VoltState.entries, Multiply(index, VoltField.ENTRY_SIZE)))
+    }
+}
+
+// =============================================================================
+// Volt_ParseVoltageObject — parse one voltage object from ROM
+//
+// Extracts GPIO LUT, SVID2, or leakage entries depending on mode.
+// Called internally by Volt_Parse for each object found.
+// =============================================================================
+Function.Volt_ParseVoltageObject {
+    Input: gpu: Integer
+    Input: rom: Address
+    Input: obj_off: Integer
+    Input: vtype: Integer
+    Input: vmode: Integer
+    Input: obj_size: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+
+        // --- GPIO LUT mode ---
+        IfCondition EqualTo(vmode, VoltMode.GPIO_LUT) ThenBlock: {
+            num_entries = GetByte(rom, Add(obj_off, VoltGPIO.ENTRY_NUM))
+            phase_delay = GetByte(rom, Add(obj_off, VoltGPIO.PHASE_DELAY))
+            gpio_mask = AtomBIOS_ReadU32(rom, Add(obj_off, VoltGPIO.GPIO_MASK))
+
+            IfCondition GreaterThan(num_entries, 32) ThenBlock: { num_entries = 32 }
+
+            // Allocate entries
+            buf_size = Multiply(num_entries, VoltEntry.SIZE)
+            buf = Allocate(buf_size)
+            MemorySet(buf, 0, buf_size)
+
+            j = 0
+            WhileLoop LessThan(j, num_entries) {
+                lut_off = Add(obj_off, Add(VoltGPIO.LUT_START, Multiply(j, VoltGPIO.LUT_ENTRY_SIZE)))
+                out = Add(buf, Multiply(j, VoltEntry.SIZE))
+
+                gpio_id = AtomBIOS_ReadU32(rom, lut_off)
+                voltage = AtomBIOS_ReadU16(rom, Add(lut_off, 4))
+
+                StoreValue(Add(out, VoltEntry.GPIO_ID), gpio_id)
+                StoreValue(Add(out, VoltEntry.VOLTAGE), voltage)
+
+                j = Add(j, 1)
+            }
+
+            // Store based on voltage type
+            IfCondition EqualTo(vtype, VoltType.VDDC) ThenBlock: {
+                StoreValue(Add(entry, VoltField.VDDC_MODE), VoltMode.GPIO_LUT)
+                StoreValue(Add(entry, VoltField.VDDC_COUNT), num_entries)
+                StoreValue(Add(entry, VoltField.VDDC_PTR), buf)
+                StoreValue(Add(entry, VoltField.VDDC_MASK), gpio_mask)
+                StoreValue(Add(entry, VoltField.VDDC_PHASE_DELAY), phase_delay)
+            }
+            IfCondition EqualTo(vtype, VoltType.VDDCI) ThenBlock: {
+                StoreValue(Add(entry, VoltField.VDDCI_MODE), VoltMode.GPIO_LUT)
+                StoreValue(Add(entry, VoltField.VDDCI_COUNT), num_entries)
+                StoreValue(Add(entry, VoltField.VDDCI_PTR), buf)
+                StoreValue(Add(entry, VoltField.VDDCI_MASK), gpio_mask)
+            }
+            IfCondition EqualTo(vtype, VoltType.MVDDC) ThenBlock: {
+                StoreValue(Add(entry, VoltField.MVDD_MODE), VoltMode.GPIO_LUT)
+                StoreValue(Add(entry, VoltField.MVDD_COUNT), num_entries)
+                StoreValue(Add(entry, VoltField.MVDD_PTR), buf)
+                StoreValue(Add(entry, VoltField.MVDD_MASK), gpio_mask)
+            }
+        }
+
+        // --- SVID2 mode ---
+        IfCondition EqualTo(vmode, VoltMode.SVID2) ThenBlock: {
+            IfCondition EqualTo(vtype, VoltType.VDDC) ThenBlock: {
+                StoreValue(Add(entry, VoltField.VDDC_MODE), VoltMode.SVID2)
+                loadline = AtomBIOS_ReadU16(rom, Add(obj_off, 4))
+                svd_gpio = GetByte(rom, Add(obj_off, 6))
+                svc_gpio = GetByte(rom, Add(obj_off, 7))
+                StoreValue(Add(entry, VoltField.SVID2_LOADLINE), loadline)
+                StoreValue(Add(entry, VoltField.SVID2_SVD_GPIO), svd_gpio)
+                StoreValue(Add(entry, VoltField.SVID2_SVC_GPIO), svc_gpio)
+            }
+        }
+
+        // --- Phase shedding LUT ---
+        IfCondition EqualTo(vmode, VoltMode.PHASE_LUT) ThenBlock: {
+            num_entries = GetByte(rom, Add(obj_off, VoltGPIO.ENTRY_NUM))
+            gpio_mask = AtomBIOS_ReadU32(rom, Add(obj_off, VoltGPIO.GPIO_MASK))
+
+            IfCondition GreaterThan(num_entries, 32) ThenBlock: { num_entries = 32 }
+
+            buf_size = Multiply(num_entries, VoltEntry.SIZE)
+            buf = Allocate(buf_size)
+            MemorySet(buf, 0, buf_size)
+
+            j = 0
+            WhileLoop LessThan(j, num_entries) {
+                lut_off = Add(obj_off, Add(VoltGPIO.LUT_START, Multiply(j, VoltGPIO.LUT_ENTRY_SIZE)))
+                out = Add(buf, Multiply(j, VoltEntry.SIZE))
+
+                gpio_id = AtomBIOS_ReadU32(rom, lut_off)
+                voltage = AtomBIOS_ReadU16(rom, Add(lut_off, 4))
+
+                StoreValue(Add(out, VoltEntry.GPIO_ID), gpio_id)
+                StoreValue(Add(out, VoltEntry.VOLTAGE), voltage)
+
+                j = Add(j, 1)
+            }
+
+            StoreValue(Add(entry, VoltField.PHASE_COUNT), num_entries)
+            StoreValue(Add(entry, VoltField.PHASE_PTR), buf)
+            StoreValue(Add(entry, VoltField.PHASE_MASK), gpio_mask)
+        }
+
+        // --- Leakage LUT ---
+        IfCondition GreaterEqual(vmode, VoltMode.LEAKAGE_LUT) ThenBlock: {
+            IfCondition LessEqual(vmode, VoltMode.HIGH1_LEAK_LUT) ThenBlock: {
+                IfCondition EqualTo(vtype, VoltType.VDDC) ThenBlock: {
+                    num_entries = GetByte(rom, Add(obj_off, VoltLeak.ENTRY_NUM))
+                    IfCondition GreaterThan(num_entries, 8) ThenBlock: { num_entries = 8 }
+
+                    buf_size = Multiply(num_entries, LeakEntry.SIZE)
+                    buf = Allocate(buf_size)
+                    MemorySet(buf, 0, buf_size)
+
+                    j = 0
+                    WhileLoop LessThan(j, num_entries) {
+                        lut_off = Add(obj_off, Add(VoltLeak.LUT_START, Multiply(j, VoltLeak.LUT_ENTRY_SIZE)))
+                        out = Add(buf, Multiply(j, LeakEntry.SIZE))
+
+                        voltage = AtomBIOS_ReadU16(rom, lut_off)
+                        volt_id = AtomBIOS_ReadU16(rom, Add(lut_off, 2))
+                        leak_id = AtomBIOS_ReadU16(rom, Add(lut_off, 4))
+
+                        StoreValue(Add(out, LeakEntry.VOLTAGE), voltage)
+                        StoreValue(Add(out, LeakEntry.VOLTAGE_ID), volt_id)
+                        StoreValue(Add(out, LeakEntry.LEAKAGE_ID), leak_id)
+
+                        j = Add(j, 1)
+                    }
+
+                    StoreValue(Add(entry, VoltField.LEAK_COUNT), num_entries)
+                    StoreValue(Add(entry, VoltField.LEAK_PTR), buf)
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// Volt_Parse — parse voltage object table from VBIOS
+//
+// Requires AtomBIOS to be loaded and parsed.
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.Volt_Parse {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        Volt_Init()
+
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        IfCondition EqualTo(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        rom = AtomBIOS_GetROMPtr(gpu)
+        IfCondition EqualTo(rom, 0) ThenBlock: {
+            PrintMessage("[Volt] ROM not loaded for GPU ")
+            PrintNumber(gpu)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+        rom_size = AtomBIOS_GetROMSize(gpu)
+
+        // Store boot VDDC from AtomBIOS
+        boot_vddc = AtomBIOS_GetField(gpu, AtomField.BOOT_VDDC)
+        StoreValue(Add(entry, VoltField.BOOT_VDDC), boot_vddc)
+
+        // Get voltage object table offset (data table index 32)
+        vobj_off = AtomBIOS_GetDataTableOffset(gpu, AtomDataIdx.VOLTAGE_OBJECT)
+        IfCondition EqualTo(vobj_off, 0) ThenBlock: {
+            PrintMessage("[Volt] No Voltage Object table in VBIOS\n")
+            // Not fatal — card may use direct MMIO voltage control
+            StoreValue(Add(entry, VoltField.PARSED), 1)
+            ReturnValue(1)
+        }
+
+        // Parse table header (ATOM_COMMON_TABLE_HEADER = 4 bytes)
+        tbl_size = AtomBIOS_ReadU16(rom, vobj_off)
+        // fmt_rev = GetByte(rom, Add(vobj_off, 2))
+        // cnt_rev = GetByte(rom, Add(vobj_off, 3))
+
+        // Walk voltage objects starting at offset +4
+        cursor = Add(vobj_off, 4)
+        tbl_end = Add(vobj_off, tbl_size)
+        obj_count = 0
+
+        WhileLoop LessThan(cursor, tbl_end) {
+            IfCondition GreaterEqual(cursor, rom_size) ThenBlock: {
+                cursor = tbl_end
+            }
+            IfCondition LessThan(cursor, tbl_end) ThenBlock: {
+                // Read object header
+                vtype = GetByte(rom, cursor)
+                vmode = GetByte(rom, Add(cursor, 1))
+                obj_size = AtomBIOS_ReadU16(rom, Add(cursor, 2))
+
+                // Sanity check
+                IfCondition LessThan(obj_size, 4) ThenBlock: {
+                    cursor = tbl_end
+                }
+                IfCondition GreaterEqual(obj_size, 4) ThenBlock: {
+                    Volt_ParseVoltageObject(gpu, rom, cursor, vtype, vmode, obj_size)
+                    obj_count = Add(obj_count, 1)
+                    cursor = Add(cursor, obj_size)
+                }
+            }
+        }
+
+        // Compute min/max VDDC from the GPIO LUT
+        vddc_count = Dereference(Add(entry, VoltField.VDDC_COUNT))
+        IfCondition GreaterThan(vddc_count, 0) ThenBlock: {
+            vddc_ptr = Dereference(Add(entry, VoltField.VDDC_PTR))
+            min_v = 99999
+            max_v = 0
+            j = 0
+            WhileLoop LessThan(j, vddc_count) {
+                ve = Add(vddc_ptr, Multiply(j, VoltEntry.SIZE))
+                v = Dereference(Add(ve, VoltEntry.VOLTAGE))
+                IfCondition LessThan(v, min_v) ThenBlock: { min_v = v }
+                IfCondition GreaterThan(v, max_v) ThenBlock: { max_v = v }
+                j = Add(j, 1)
+            }
+            StoreValue(Add(entry, VoltField.MIN_VDDC), min_v)
+            StoreValue(Add(entry, VoltField.MAX_VDDC), max_v)
+        }
+
+        StoreValue(Add(entry, VoltField.PARSED), 1)
+        PrintMessage("[Volt] Voltage objects parsed: ")
+        PrintNumber(obj_count)
+        PrintMessage(" objects")
+
+        vddc_mode = Dereference(Add(entry, VoltField.VDDC_MODE))
+        IfCondition EqualTo(vddc_mode, VoltMode.GPIO_LUT) ThenBlock: {
+            PrintMessage(", VDDC=GPIO(")
+            PrintNumber(vddc_count)
+            PrintMessage(" entries)")
+        }
+        IfCondition EqualTo(vddc_mode, VoltMode.SVID2) ThenBlock: {
+            PrintMessage(", VDDC=SVID2")
+        }
+
+        leak_count = Dereference(Add(entry, VoltField.LEAK_COUNT))
+        IfCondition GreaterThan(leak_count, 0) ThenBlock: {
+            PrintMessage(", leakage=")
+            PrintNumber(leak_count)
+            PrintMessage(" entries")
+        }
+        PrintMessage("\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// Volt_GetMode — return VDDC control mode for this GPU
+// =============================================================================
+Function.Volt_GetMode {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition NotEqual(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Dereference(Add(entry, VoltField.VDDC_MODE)))
+    }
+}
+
+// =============================================================================
+// Volt_GetVDDCIndex — find voltage table index for a target voltage (mV)
+//
+// Searches the VDDC GPIO LUT for the first entry >= target_mv.
+// Returns the 0-based index, or -1 if not found.
+// =============================================================================
+Function.Volt_GetVDDCIndex {
+    Input: gpu: Integer
+    Input: target_mv: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition NotEqual(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: { ReturnValue(-1) }
+
+        count = Dereference(Add(entry, VoltField.VDDC_COUNT))
+        IfCondition EqualTo(count, 0) ThenBlock: { ReturnValue(-1) }
+
+        ptr = Dereference(Add(entry, VoltField.VDDC_PTR))
+        j = 0
+        WhileLoop LessThan(j, count) {
+            ve = Add(ptr, Multiply(j, VoltEntry.SIZE))
+            v = Dereference(Add(ve, VoltEntry.VOLTAGE))
+            IfCondition GreaterEqual(v, target_mv) ThenBlock: {
+                ReturnValue(j)
+            }
+            j = Add(j, 1)
+        }
+        // Not found — return last entry (highest voltage)
+        ReturnValue(Subtract(count, 1))
+    }
+}
+
+// =============================================================================
+// Volt_GetVDDCEntry — get voltage and GPIO ID for a given index
+//
+// Fills out_mv with the voltage in mV, out_gpio with the GPIO ID.
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.Volt_GetVDDCEntry {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Input: out_mv: Address
+    Input: out_gpio: Address
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+
+        count = Dereference(Add(entry, VoltField.VDDC_COUNT))
+        IfCondition GreaterEqual(idx, count) ThenBlock: { ReturnValue(0) }
+
+        ptr = Dereference(Add(entry, VoltField.VDDC_PTR))
+        ve = Add(ptr, Multiply(idx, VoltEntry.SIZE))
+
+        StoreValue(out_mv, Dereference(Add(ve, VoltEntry.VOLTAGE)))
+        StoreValue(out_gpio, Dereference(Add(ve, VoltEntry.GPIO_ID)))
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// Volt_ResolveLeakageVDDC — translate leakage index to actual voltage
+//
+// If vddc_mv is a leakage index (0xFF01-0xFF04), look up the actual
+// voltage from the leakage table. Otherwise return as-is.
+// Returns the resolved voltage in mV.
+// =============================================================================
+Function.Volt_ResolveLeakageVDDC {
+    Input: gpu: Integer
+    Input: vddc_mv: Integer
+    Output: Integer
+    Body: {
+        // Check if this is a leakage index (0xFF00 + 1..4)
+        hi = BitwiseAnd(vddc_mv, LeakConst.INDEX_MASK_HI)
+        IfCondition NotEqual(hi, LeakConst.INDEX_MASK_HI) ThenBlock: {
+            // Not a leakage index — return as-is
+            ReturnValue(vddc_mv)
+        }
+
+        // It's a leakage index — look up in leakage table
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(vddc_mv) }
+        IfCondition NotEqual(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: { ReturnValue(vddc_mv) }
+
+        leak_count = Dereference(Add(entry, VoltField.LEAK_COUNT))
+        IfCondition EqualTo(leak_count, 0) ThenBlock: {
+            // No leakage table — fall back to boot VDDC
+            ReturnValue(Dereference(Add(entry, VoltField.BOOT_VDDC)))
+        }
+
+        leak_ptr = Dereference(Add(entry, VoltField.LEAK_PTR))
+        j = 0
+        WhileLoop LessThan(j, leak_count) {
+            le = Add(leak_ptr, Multiply(j, LeakEntry.SIZE))
+            leak_id = Dereference(Add(le, LeakEntry.LEAKAGE_ID))
+            IfCondition EqualTo(leak_id, vddc_mv) ThenBlock: {
+                ReturnValue(Dereference(Add(le, LeakEntry.VOLTAGE)))
+            }
+            j = Add(j, 1)
+        }
+
+        // Index not found in leakage table — fall back to boot VDDC
+        ReturnValue(Dereference(Add(entry, VoltField.BOOT_VDDC)))
+    }
+}
+
+// =============================================================================
+// Volt_GetBootVDDC — return boot voltage in mV
+// =============================================================================
+Function.Volt_GetBootVDDC {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, VoltField.BOOT_VDDC)))
+    }
+}
+
+// =============================================================================
+// Volt_GetMaxVDDC — return max VDDC from voltage table (mV)
+// =============================================================================
+Function.Volt_GetMaxVDDC {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, VoltField.MAX_VDDC)))
+    }
+}
+
+// =============================================================================
+// Volt_GetMinVDDC — return min VDDC from voltage table (mV)
+// =============================================================================
+Function.Volt_GetMinVDDC {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, VoltField.MIN_VDDC)))
+    }
+}
+
+// =============================================================================
+// Volt_GetPhaseIndex — find phase shedding index for a target voltage
+//
+// Returns the 0-based phase shedding table index, or 0 if no phase table.
+// =============================================================================
+Function.Volt_GetPhaseIndex {
+    Input: gpu: Integer
+    Input: target_mv: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        count = Dereference(Add(entry, VoltField.PHASE_COUNT))
+        IfCondition EqualTo(count, 0) ThenBlock: { ReturnValue(0) }
+
+        ptr = Dereference(Add(entry, VoltField.PHASE_PTR))
+        j = 0
+        WhileLoop LessThan(j, count) {
+            ve = Add(ptr, Multiply(j, VoltEntry.SIZE))
+            v = Dereference(Add(ve, VoltEntry.VOLTAGE))
+            IfCondition GreaterEqual(v, target_mv) ThenBlock: {
+                ReturnValue(j)
+            }
+            j = Add(j, 1)
+        }
+        ReturnValue(Subtract(count, 1))
+    }
+}
+
+// =============================================================================
+// Volt_GetVDDCGPIOID — return GPIO voltage ID for a given VDDC index
+//
+// Used to populate SISLANDS_SMC_STATETABLE.lowSMIO array.
+// =============================================================================
+Function.Volt_GetVDDCGPIOID {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        count = Dereference(Add(entry, VoltField.VDDC_COUNT))
+        IfCondition GreaterEqual(idx, count) ThenBlock: { ReturnValue(0) }
+
+        ptr = Dereference(Add(entry, VoltField.VDDC_PTR))
+        ve = Add(ptr, Multiply(idx, VoltEntry.SIZE))
+        ReturnValue(Dereference(Add(ve, VoltEntry.GPIO_ID)))
+    }
+}
+
+// =============================================================================
+// Volt_GetVDDCMask — return GPIO mask for VDDC control
+// =============================================================================
+Function.Volt_GetVDDCMask {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, VoltField.VDDC_MASK)))
+    }
+}
+
+// =============================================================================
+// Volt_GetVDDCICount — return number of VDDCI voltage entries
+// =============================================================================
+Function.Volt_GetVDDCICount {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, VoltField.VDDCI_COUNT)))
+    }
+}
+
+// =============================================================================
+// Volt_GetVDDCIGPIOID — return GPIO ID for a VDDCI voltage step
+// =============================================================================
+Function.Volt_GetVDDCIGPIOID {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        count = Dereference(Add(entry, VoltField.VDDCI_COUNT))
+        IfCondition GreaterEqual(idx, count) ThenBlock: { ReturnValue(0) }
+
+        ptr = Dereference(Add(entry, VoltField.VDDCI_PTR))
+        ve = Add(ptr, Multiply(idx, VoltEntry.SIZE))
+        ReturnValue(Dereference(Add(ve, VoltEntry.GPIO_ID)))
+    }
+}
+
+// =============================================================================
+// Volt_GetVDDCIMask — return GPIO mask for VDDCI control
+// =============================================================================
+Function.Volt_GetVDDCIMask {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(entry, VoltField.VDDCI_MASK)))
+    }
+}
+
+// =============================================================================
+// Volt_PrintInfo — print voltage table information
+// =============================================================================
+Function.Volt_PrintInfo {
+    Input: gpu: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(Dereference(Add(entry, VoltField.PARSED)), 1) ThenBlock: {
+            PrintMessage("[Volt] Not parsed\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("--- Voltage Info ---\n")
+        PrintMessage("  Boot VDDC:    ")
+        PrintNumber(Dereference(Add(entry, VoltField.BOOT_VDDC)))
+        PrintMessage(" mV\n")
+
+        // VDDC info
+        vddc_mode = Dereference(Add(entry, VoltField.VDDC_MODE))
+        PrintMessage("  VDDC mode:    ")
+        IfCondition EqualTo(vddc_mode, VoltMode.GPIO_LUT) ThenBlock: {
+            PrintMessage("GPIO LUT\n")
+        }
+        IfCondition EqualTo(vddc_mode, VoltMode.SVID2) ThenBlock: {
+            PrintMessage("SVID2\n")
+            PrintMessage("  LoadLine/PSI: 0x")
+            PrintHex(Dereference(Add(entry, VoltField.SVID2_LOADLINE)))
+            PrintMessage("\n")
+            PrintMessage("  SVD GPIO:     ")
+            PrintNumber(Dereference(Add(entry, VoltField.SVID2_SVD_GPIO)))
+            PrintMessage("\n")
+            PrintMessage("  SVC GPIO:     ")
+            PrintNumber(Dereference(Add(entry, VoltField.SVID2_SVC_GPIO)))
+            PrintMessage("\n")
+        }
+        IfCondition EqualTo(vddc_mode, 0) ThenBlock: {
+            IfCondition NotEqual(vddc_mode, VoltMode.GPIO_LUT) ThenBlock: {
+                // Mode 0 but not GPIO (which is also 0) — only hit if no VDDC object found
+                PrintMessage("None\n")
+            }
+        }
+
+        // VDDC GPIO LUT entries
+        vddc_count = Dereference(Add(entry, VoltField.VDDC_COUNT))
+        IfCondition GreaterThan(vddc_count, 0) ThenBlock: {
+            PrintMessage("  VDDC entries: ")
+            PrintNumber(vddc_count)
+            PrintMessage("  mask=0x")
+            PrintHex(Dereference(Add(entry, VoltField.VDDC_MASK)))
+            PrintMessage("  delay=")
+            PrintNumber(Dereference(Add(entry, VoltField.VDDC_PHASE_DELAY)))
+            PrintMessage("us\n")
+
+            ptr = Dereference(Add(entry, VoltField.VDDC_PTR))
+            j = 0
+            WhileLoop LessThan(j, vddc_count) {
+                ve = Add(ptr, Multiply(j, VoltEntry.SIZE))
+                PrintMessage("    [")
+                PrintNumber(j)
+                PrintMessage("] ")
+                PrintNumber(Dereference(Add(ve, VoltEntry.VOLTAGE)))
+                PrintMessage("mV  gpio_id=0x")
+                PrintHex(Dereference(Add(ve, VoltEntry.GPIO_ID)))
+                PrintMessage("\n")
+                j = Add(j, 1)
+            }
+
+            PrintMessage("  Min VDDC:     ")
+            PrintNumber(Dereference(Add(entry, VoltField.MIN_VDDC)))
+            PrintMessage(" mV\n")
+            PrintMessage("  Max VDDC:     ")
+            PrintNumber(Dereference(Add(entry, VoltField.MAX_VDDC)))
+            PrintMessage(" mV\n")
+        }
+
+        // VDDCI info
+        vddci_count = Dereference(Add(entry, VoltField.VDDCI_COUNT))
+        IfCondition GreaterThan(vddci_count, 0) ThenBlock: {
+            PrintMessage("  VDDCI entries: ")
+            PrintNumber(vddci_count)
+            PrintMessage("  mask=0x")
+            PrintHex(Dereference(Add(entry, VoltField.VDDCI_MASK)))
+            PrintMessage("\n")
+        }
+
+        // Phase shedding
+        phase_count = Dereference(Add(entry, VoltField.PHASE_COUNT))
+        IfCondition GreaterThan(phase_count, 0) ThenBlock: {
+            PrintMessage("  Phase entries: ")
+            PrintNumber(phase_count)
+            PrintMessage("  mask=0x")
+            PrintHex(Dereference(Add(entry, VoltField.PHASE_MASK)))
+            PrintMessage("\n")
+
+            phase_ptr = Dereference(Add(entry, VoltField.PHASE_PTR))
+            j = 0
+            WhileLoop LessThan(j, phase_count) {
+                ve = Add(phase_ptr, Multiply(j, VoltEntry.SIZE))
+                PrintMessage("    [")
+                PrintNumber(j)
+                PrintMessage("] ")
+                PrintNumber(Dereference(Add(ve, VoltEntry.VOLTAGE)))
+                PrintMessage("mV  gpio_id=0x")
+                PrintHex(Dereference(Add(ve, VoltEntry.GPIO_ID)))
+                PrintMessage("\n")
+                j = Add(j, 1)
+            }
+        }
+
+        // Leakage table
+        leak_count = Dereference(Add(entry, VoltField.LEAK_COUNT))
+        IfCondition GreaterThan(leak_count, 0) ThenBlock: {
+            PrintMessage("  Leakage entries: ")
+            PrintNumber(leak_count)
+            PrintMessage("\n")
+
+            leak_ptr = Dereference(Add(entry, VoltField.LEAK_PTR))
+            j = 0
+            WhileLoop LessThan(j, leak_count) {
+                le = Add(leak_ptr, Multiply(j, LeakEntry.SIZE))
+                PrintMessage("    [")
+                PrintNumber(j)
+                PrintMessage("] ")
+                PrintNumber(Dereference(Add(le, LeakEntry.VOLTAGE)))
+                PrintMessage("mV  vid=0x")
+                PrintHex(Dereference(Add(le, LeakEntry.VOLTAGE_ID)))
+                PrintMessage("  leak_id=0x")
+                PrintHex(Dereference(Add(le, LeakEntry.LEAKAGE_ID)))
+                PrintMessage("\n")
+                j = Add(j, 1)
+            }
+        }
+
+        PrintMessage("--- End Voltage Info ---\n")
+    }
+}
+
+// =============================================================================
+// Volt_Free — deallocate voltage data for a GPU
+// =============================================================================
+Function.Volt_Free {
+    Input: gpu: Integer
+    Body: {
+        entry = Volt_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: { ReturnValue(0) }
+
+        // Free VDDC table
+        ptr = Dereference(Add(entry, VoltField.VDDC_PTR))
+        IfCondition NotEqual(ptr, 0) ThenBlock: {
+            Deallocate(ptr, Multiply(Dereference(Add(entry, VoltField.VDDC_COUNT)), VoltEntry.SIZE))
+        }
+
+        // Free VDDCI table
+        ptr = Dereference(Add(entry, VoltField.VDDCI_PTR))
+        IfCondition NotEqual(ptr, 0) ThenBlock: {
+            Deallocate(ptr, Multiply(Dereference(Add(entry, VoltField.VDDCI_COUNT)), VoltEntry.SIZE))
+        }
+
+        // Free MVDD table
+        ptr = Dereference(Add(entry, VoltField.MVDD_PTR))
+        IfCondition NotEqual(ptr, 0) ThenBlock: {
+            Deallocate(ptr, Multiply(Dereference(Add(entry, VoltField.MVDD_COUNT)), VoltEntry.SIZE))
+        }
+
+        // Free phase table
+        ptr = Dereference(Add(entry, VoltField.PHASE_PTR))
+        IfCondition NotEqual(ptr, 0) ThenBlock: {
+            Deallocate(ptr, Multiply(Dereference(Add(entry, VoltField.PHASE_COUNT)), VoltEntry.SIZE))
+        }
+
+        // Free leakage table
+        ptr = Dereference(Add(entry, VoltField.LEAK_PTR))
+        IfCondition NotEqual(ptr, 0) ThenBlock: {
+            Deallocate(ptr, Multiply(Dereference(Add(entry, VoltField.LEAK_COUNT)), LeakEntry.SIZE))
+        }
+
+        MemorySet(entry, 0, VoltField.ENTRY_SIZE)
+    }
+}

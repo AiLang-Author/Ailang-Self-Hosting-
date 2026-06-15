@@ -33,9 +33,9 @@ LibraryImport.Browser.JSVM.JSVMBuiltins
 FixedPool.JSVMConst {
     "MAX_STACK":     Initialize=16384
     "MAX_FRAMES":    Initialize=1024
-    "FRAME_SIZE":    Initialize=48
-    "MAX_CONSTS":    Initialize=4096
-    "MAX_GVARS":     Initialize=4096
+    "FRAME_SIZE":    Initialize=72
+    "MAX_CONSTS":    Initialize=65536
+    "MAX_GVARS":     Initialize=8192
     "MAX_CALL_ARGS": Initialize=32
 }
 
@@ -229,9 +229,10 @@ Function.JSVM__ReadByte {
 Function.JSVM__Read16 {
     Output: Integer
     Body: {
-        hi = JSVM__ReadByte()
-        lo = JSVM__ReadByte()
-        ReturnValue(Add(Multiply(hi, 256), lo))
+        b2 = JSVM__ReadByte()
+        b1 = JSVM__ReadByte()
+        b0 = JSVM__ReadByte()
+        ReturnValue(Add(Add(Multiply(b2, 65536), Multiply(b1, 256)), b0))
     }
 }
 
@@ -282,6 +283,10 @@ Function.JSVM__PushFrame {
         StoreValue(Add(faddr, 24), save_pc)
         StoreValue(Add(faddr, 32), save_lc)
         StoreValue(Add(faddr, 40), 0)
+        // Watermarks for scope-based reclamation (ping-pong head/tail)
+        StoreValue(Add(faddr, 48), JSRTState.val_count)
+        StoreValue(Add(faddr, 56), JSRTState.str_slab_pos)
+        StoreValue(Add(faddr, 64), JSRTState.func_slab_pos)
         JSVMState.fp = Add(JSVMState.fp, 1)
         ReturnValue(0)
     }
@@ -297,6 +302,74 @@ Function.JSVM__PopFrame {
         }
         JSVMState.fp = Subtract(JSVMState.fp, 1)
         ReturnValue(Add(JSVMState.frames, Multiply(JSVMState.fp, JSVMConst.FRAME_SIZE)))
+    }
+}
+
+// =============================================================================
+// SCOPE RECLAMATION — ping-pong head/tail watermark rollback
+// On function return, promotes the return value out of the callee's arena,
+// then snaps val_pool/str_slab/func_slab back to the watermarks saved at CALL.
+// O(1) — no scanning, no marking, just pointer arithmetic.
+// =============================================================================
+Function.JSVM__ReclaimScope {
+    Input: frame_ptr: Address
+    Input: ret_val: Address
+    Output: Address
+    Body: {
+        save_frame = frame_ptr
+        save_rv = ret_val
+        // Read watermarks saved by PushFrame
+        wm_val  = Dereference(Add(save_frame, 48))
+        wm_str  = Dereference(Add(save_frame, 56))
+        wm_func = Dereference(Add(save_frame, 64))
+
+        // Calculate the byte boundary for val_pool region owned by callee
+        wm_val_addr = Add(JSRTState.val_pool, Multiply(wm_val, JSRTConst.VAL_SIZE))
+
+        // Promote return value if it lives in callee's region
+        // (i.e., it was allocated after the watermark)
+        IfCondition NotEqual(save_rv, 0) ThenBlock: {
+            IfCondition GreaterEqual(save_rv, wm_val_addr) ThenBlock: {
+                // ret_val is in callee's arena — inline copy to watermark slot
+                // (avoids function call overhead of JSRT__AllocValue)
+                rv_type = Dereference(save_rv)
+                rv_payload = Dereference(Add(save_rv, 8))
+
+                // Write directly to the watermark position
+                new_val = wm_val_addr
+                StoreValue(new_val, rv_type)
+
+                // If STRING type, also promote the string data
+                IfCondition EqualTo(rv_type, JSType.STRING) ThenBlock: {
+                    // Check if string payload is in callee's str_slab region
+                    wm_str_addr = Add(JSRTState.str_slab, wm_str)
+                    IfCondition GreaterEqual(rv_payload, wm_str_addr) ThenBlock: {
+                        // Copy string to parent's slab region at watermark pos
+                        str_len = StringLength(rv_payload)
+                        buf_sz = Add(str_len, 1)
+                        new_buf = Add(JSRTState.str_slab, wm_str)
+                        new_end = Add(wm_str, buf_sz)
+                        IfCondition LessThan(new_end, JSRTState.str_slab_cap) ThenBlock: {
+                            MemoryCopy(new_buf, rv_payload, buf_sz)
+                            rv_payload = new_buf
+                            wm_str = new_end
+                        }
+                    }
+                }
+
+                StoreValue(Add(new_val, 8), rv_payload)
+                save_rv = new_val
+                // Advance watermark past the promoted value (1 slot)
+                wm_val = Add(wm_val, 1)
+            }
+        }
+
+        // Snap head back to tail — reclaim everything the callee allocated
+        JSRTState.val_count = wm_val
+        JSRTState.str_slab_pos = wm_str
+        JSRTState.func_slab_pos = wm_func
+
+        ReturnValue(save_rv)
     }
 }
 
@@ -453,6 +526,9 @@ Function.JSVM__SetGlobal {
         // const_pool where the original string lives).
         nlen = StringLength(save_name)
         stable_name = JSRT__StrSlabAlloc(Add(nlen, 1))
+        IfCondition EqualTo(stable_name, 0) ThenBlock: {
+            ReturnValue(-1)
+        }
         MemoryCopy(stable_name, save_name, nlen)
         SetByte(stable_name, nlen, 0)
         GlobalHash_Insert(stable_name, save_val)
@@ -471,7 +547,7 @@ Function.JSVM_Init {
         JSVMState.stack = Allocate(ssz)
         MemorySet(JSVMState.stack, 0, ssz)
 
-        // Call frame stack (256 x 40 bytes = 10240)
+        // Call frame stack (1024 x 72 bytes = 73728)
         fsz = Multiply(JSVMConst.MAX_FRAMES, JSVMConst.FRAME_SIZE)
         JSVMState.frames = Allocate(fsz)
         MemorySet(JSVMState.frames, 0, fsz)

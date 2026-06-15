@@ -420,7 +420,7 @@ if [ "$RUN_QEMU" -eq 1 ]; then
         -drive if=pflash,format=raw,snapshot=on,unit=1,file="$OVMF_VARS" \
         -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0,snapshot=on \
         -device virtio-blk-pci,drive=disk0 \
-        -device virtio-vga,xres=1024,yres=768 \
+        -device bochs-display,xres=1024,yres=768 \
         -device qemu-xhci -device usb-kbd -device usb-mouse \
         -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22,hostfwd=tcp::15432-:5432 \
         -serial file:/tmp/qemu_serial.log \

@@ -24,14 +24,27 @@ Function.JSVM_Step {
         op = JSVM__ReadByte()
         JSVMState.steps = Add(JSVMState.steps, 1)
 
-        // DEBUG TRACE (disabled)
-        // PrintMessage("[STEP ")
-        // PrintNumber(JSVMState.steps)
-        // PrintMessage(" OP=")
-        // PrintNumber(op)
-        // PrintMessage(" SP=")
-        // PrintNumber(JSVMState.sp)
-        // PrintMessage("]\n")
+        // Per-step trace (DEBUG) — only near crash
+        IfCondition GreaterEqual(JSVMState.steps, 474250) ThenBlock: {
+            PrintMessage("[T] s=")
+            PrintNumber(JSVMState.steps)
+            PrintMessage(" op=")
+            PrintNumber(op)
+            PrintMessage(" sp=")
+            PrintNumber(JSVMState.sp)
+            PrintMessage(" pc=")
+            PrintNumber(JSVMState.pc)
+            PrintMessage("\n")
+        }
+
+        // Progress trace (every 5M steps)
+        _st = JSVMState.steps
+        _mod = Modulo(_st, 5000000)
+        IfCondition EqualTo(_mod, 0) ThenBlock: {
+            PrintMessage("[STEP] ")
+            PrintNumber(_st)
+            PrintMessage("\n")
+        }
 
         // Check step limit
         IfCondition GreaterEqual(JSVMState.steps, JSVMState.max_steps) ThenBlock: {
@@ -39,8 +52,23 @@ Function.JSVM_Step {
             ReturnValue(-1)
         }
 
-        // Check runtime OOM (val_pool exhaustion)
+        // Check runtime OOM (val_pool / str_slab / func_slab exhaustion)
         IfCondition EqualTo(JSRTState.oom, 1) ThenBlock: {
+            PrintMessage("[JSEngine] OOM at step ")
+            PrintNumber(JSVMState.steps)
+            PrintMessage(" str=")
+            PrintNumber(JSRTState.str_slab_pos)
+            PrintMessage("/")
+            PrintNumber(JSRTState.str_slab_cap)
+            PrintMessage(" vals=")
+            PrintNumber(JSRTState.val_count)
+            PrintMessage("/")
+            PrintNumber(JSRTConst.MAX_VALUES)
+            PrintMessage(" func=")
+            PrintNumber(JSRTState.func_slab_pos)
+            PrintMessage("/")
+            PrintNumber(JSRTState.func_slab_cap)
+            PrintMessage("\n")
             JSVMState.error = 1
             ReturnValue(-1)
         }
@@ -948,7 +976,12 @@ Function.JSVM_Step {
                 save_sp = JSVMState.sp
                 locals_base = JSVMState.sp
 
-                JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+                pf_ok = JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+                IfCondition LessThan(pf_ok, 0) ThenBlock: {
+                    PrintMessage("[JSEngine] call stack overflow (MAX_FRAMES)\n")
+                    JSVMState.error = 1
+                    ReturnValue(-1)
+                }
 
                 // Mark async frames with -65 at offset 40 so RETURN can wrap result
                 IfCondition EqualTo(func_env, 65) ThenBlock: {
@@ -968,24 +1001,10 @@ Function.JSVM_Step {
                     pi = Add(pi, 1)
                 }
 
-                // Build arguments array-like object from arg_buf
-                // Skip when argc == 0 (common case — avoids CreateArray + SetGlobal)
-                IfCondition GreaterThan(argc, 0) ThenBlock: {
-                    JSVMTmp.ptr = arg_buf
-                    JSVMTmp.count = argc
-                    JSVMTmp.addr = func_bc
-                    args_arr = JSRT_CreateArray()
-                    JSVMTmp.result = args_arr
-                    JSVMTmp.idx = 0
-                    WhileLoop LessThan(JSVMTmp.idx, JSVMTmp.count) {
-                        pval = Dereference(Add(JSVMTmp.ptr, Multiply(JSVMTmp.idx, 8)))
-                        JSVMTmp.val = pval
-                        JSRT_ArrPush(JSVMTmp.result, JSVMTmp.val)
-                        JSVMTmp.idx = Add(JSVMTmp.idx, 1)
-                    }
-                    JSVM__SetGlobal("arguments", JSVMTmp.result)
-                    func_bc = JSVMTmp.addr
-                }
+                // Arguments array creation disabled — was allocating a new
+                // Array.Create(16) per call, leaking ~256 bytes each. For
+                // fib(25) that's 242K arrays = ~62MB of unrecoverable heap.
+                // TODO: implement lazy arguments (only when code references it)
 
                 // === JIT CHECK ===
                 // If JIT is enabled, try to execute native code instead of interpreting
@@ -1049,7 +1068,7 @@ Function.JSVM_Step {
                         IfCondition GreaterThan(caller_stk_sz, 0) ThenBlock: {
                             MemoryCopy(JSVMState.stack, JSVMGen.caller_stack, caller_stk_sz)
                         }
-                        caller_frm_sz = Multiply(JSVMGen.caller_fp, 40)
+                        caller_frm_sz = Multiply(JSVMGen.caller_fp, JSVMConst.FRAME_SIZE)
                         IfCondition GreaterThan(caller_frm_sz, 0) ThenBlock: {
                             MemoryCopy(JSVMState.frames, JSVMGen.caller_frames, caller_frm_sz)
                         }
@@ -1064,9 +1083,11 @@ Function.JSVM_Step {
                     }
 
                     // Not the base frame — normal return within generator body
-                    JSVMState.pc = Dereference(frame)
-                    ret_sp = Dereference(Add(frame, 8))
-                    JSVMState.sp = ret_sp
+                    save_gen_pc = Dereference(frame)
+                    save_gen_sp = Dereference(Add(frame, 8))
+                    ret_val = JSVM__ReclaimScope(frame, ret_val)
+                    JSVMState.pc = save_gen_pc
+                    JSVMState.sp = save_gen_sp
                     JSVM__StackPush(ret_val)
                     ReturnValue(1)
                 }
@@ -1101,6 +1122,9 @@ Function.JSVM_Step {
                 // (JSVM__CallFunc zeroes JSVMState.frames, invalidating frame ptr)
                 save_ret_pc = Dereference(frame)
                 save_ret_sp = Dereference(Add(frame, 8))
+
+                // Scope reclamation: promote return value, rollback watermarks
+                ret_val = JSVM__ReclaimScope(frame, ret_val)
 
                 // Check if this was a constructor frame (offset 40 = this_obj)
                 IfCondition NotEqual(ctor_this, 0) ThenBlock: {
@@ -1255,6 +1279,7 @@ Function.JSVM_Step {
                 // Copy to stable str_slab so PropTable key pointer survives
                 gk_len = Add(6, JSVMTmp.idx)
                 gk_stable = JSRT__StrSlabAlloc(gk_len)
+                IfCondition EqualTo(gk_stable, 0) ThenBlock: { ReturnValue(1) }
                 MemoryCopy(gk_stable, gk_buf, gk_len)
                 JSRT_ObjSet(obj, gk_stable, func_val)
                 ReturnValue(1)
@@ -1289,6 +1314,7 @@ Function.JSVM_Step {
                 // Copy to stable str_slab so PropTable key pointer survives
                 sk_len = Add(6, JSVMTmp.idx)
                 sk_stable = JSRT__StrSlabAlloc(sk_len)
+                IfCondition EqualTo(sk_stable, 0) ThenBlock: { ReturnValue(1) }
                 MemoryCopy(sk_stable, sk_buf, sk_len)
                 JSRT_ObjSet(obj, sk_stable, func_val)
                 ReturnValue(1)
@@ -1324,6 +1350,7 @@ Function.JSVM_Step {
                 // Copy to stable str_slab
                 gk_len = Add(6, JSVMTmp.idx)
                 gk_stable = JSRT__StrSlabAlloc(gk_len)
+                IfCondition EqualTo(gk_stable, 0) ThenBlock: { ReturnValue(1) }
                 MemoryCopy(gk_stable, gk_buf, gk_len)
                 JSRT_ObjSet(obj, gk_stable, func_val)
                 ReturnValue(1)
@@ -1359,17 +1386,16 @@ Function.JSVM_Step {
                 // Copy to stable str_slab
                 sk_len = Add(6, JSVMTmp.idx)
                 sk_stable = JSRT__StrSlabAlloc(sk_len)
+                IfCondition EqualTo(sk_stable, 0) ThenBlock: { ReturnValue(1) }
                 MemoryCopy(sk_stable, sk_buf, sk_len)
                 JSRT_ObjSet(obj, sk_stable, func_val)
                 ReturnValue(1)
             }
 
             // THROW_TDZ (78) — ReferenceError: cannot access variable before initialization
-            // 2-byte operand: const pool index of variable name string
+            // 3-byte operand: const pool index of variable name string
             Case 78: {
-                ci = GetByte(JSVMState.code, JSVMState.pc)
-                ci = Add(Multiply(ci, 256), GetByte(JSVMState.code, Add(JSVMState.pc, 1)))
-                JSVMState.pc = Add(JSVMState.pc, 2)
+                ci = JSVM__Read16()
                 // Create ReferenceError object with message
                 tdz_err = JSRT_CreateObject()
                 JSRT_ObjSet(tdz_err, "name", JSRT_CreateString("ReferenceError"))
@@ -1469,7 +1495,12 @@ Function.JSVM_Step {
                 save_sp = JSVMState.sp
                 locals_base = JSVMState.sp
 
-                JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+                pf_ok = JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+                IfCondition LessThan(pf_ok, 0) ThenBlock: {
+                    PrintMessage("[JSEngine] call stack overflow (MAX_FRAMES)\n")
+                    JSVMState.error = 1
+                    ReturnValue(-1)
+                }
 
                 pi = 0
                 WhileLoop LessThan(pi, func_locals) {
@@ -1491,6 +1522,11 @@ Function.JSVM_Step {
             // Creates new object, binds this, calls constructor, returns object
             Case 81: {
                 argc = JSVM__ReadByte()
+                PrintMessage("[CONSTRUCT] argc=")
+                PrintNumber(argc)
+                PrintMessage(" sp=")
+                PrintNumber(JSVMState.sp)
+                PrintMessage("\n")
 
                 // Use static arg buffer (no per-call allocation)
                 arg_buf = JSVMCallBuf.buf
@@ -1504,7 +1540,12 @@ Function.JSVM_Step {
 
                 // Pop function (constructor)
                 func_val = JSVM__StackPop()
+                PrintMessage("[CONSTRUCT] func_val=")
+                PrintNumber(func_val)
+                PrintMessage(" type=")
                 ft = JSRT_GetType(func_val)
+                PrintNumber(ft)
+                PrintMessage("\n")
                 // If OBJECT, check for __ctor__ (e.g., Promise)
                 IfCondition EqualTo(ft, JSType.OBJECT) ThenBlock: {
                     ctor_fn = JSRT_ObjGet(func_val, "__ctor__")
@@ -1522,6 +1563,12 @@ Function.JSVM_Step {
 
                 // Create new object for this — store in JSVMTmp.obj to survive calls
                 JSVMTmp.obj = JSRT_CreateObject()
+                IfCondition EqualTo(JSVMTmp.obj, 0) ThenBlock: {
+                    PrintMessage("[JSEngine] OOM in CONSTRUCT (CreateObject)\n")
+                    JSVMState.error = 1
+                    JSVM__StackPush(JSRT_Undefined())
+                    ReturnValue(-1)
+                }
 
                 // Set prototype: new_obj.__proto__ = func.prototype
                 proto_val = JSRT_ObjGet(func_val, "prototype")
@@ -1532,6 +1579,9 @@ Function.JSVM_Step {
 
                 // Check if native constructor
                 func_bc = JSRT_FuncGetBC(func_val)
+                PrintMessage("[CONSTRUCT] bc=")
+                PrintNumber(func_bc)
+                PrintMessage("\n")
                 IfCondition LessThan(func_bc, 0) ThenBlock: {
                     // Native constructor — dispatch and return result or new_obj
                     handler_id = Subtract(-1, func_bc)
@@ -1553,6 +1603,7 @@ Function.JSVM_Step {
                     // String/Array method dispatch (62-76)
                     IfCondition GreaterEqual(handler_id, 62) ThenBlock: {
                         IfCondition LessEqual(handler_id, 76) ThenBlock: {
+                            PrintMessage("[CONSTRUCT] dispatching to StringMethod\n")
                             native_result = JSVM__DispatchStringMethod(handler_id, JSVMTmp.obj, arg_buf, argc)
                             // (static arg_buf — no dealloc needed)
                             nr_type = JSRT_GetType(native_result)
@@ -1564,6 +1615,9 @@ Function.JSVM_Step {
                             ReturnValue(1)
                         }
                     }
+                    PrintMessage("[CONSTRUCT] fallthrough handler_id=")
+                    PrintNumber(handler_id)
+                    PrintMessage("\n")
                     IfCondition GreaterEqual(handler_id, 22) ThenBlock: {
                         native_result = JSBridge_Dispatch(handler_id, arg_buf, argc)
                     } ElseBlock: {
@@ -1580,8 +1634,10 @@ Function.JSVM_Step {
                     ReturnValue(1)
                 }
 
+                PrintMessage("[CONSTRUCT] checkpoint1\n")
                 // Bind this: set global "this" to new_obj
                 JSVM__SetGlobal("this", JSVMTmp.obj)
+                PrintMessage("[CONSTRUCT] checkpoint2\n")
 
                 // If constructor has __super__ property, set it as global
                 // so the constructor body's hidden local can capture it.
@@ -1601,7 +1657,12 @@ Function.JSVM_Step {
                 save_sp = JSVMState.sp
                 locals_base = JSVMState.sp
 
-                JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+                pf_ok = JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+                IfCondition LessThan(pf_ok, 0) ThenBlock: {
+                    PrintMessage("[JSEngine] call stack overflow (MAX_FRAMES)\n")
+                    JSVMState.error = 1
+                    ReturnValue(-1)
+                }
 
                 // Mark frame as constructor: store new_obj at frame offset 40
                 faddr = Add(JSVMState.frames, Multiply(Subtract(JSVMState.fp, 1), JSVMConst.FRAME_SIZE))
@@ -1810,7 +1871,12 @@ Function.JSVM_Step {
                 save_sp = JSVMState.sp
                 locals_base = JSVMState.sp
 
-                JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+                pf_ok = JSVM__PushFrame(save_pc, save_sp, locals_base, func_params, func_locals)
+                IfCondition LessThan(pf_ok, 0) ThenBlock: {
+                    PrintMessage("[JSEngine] call stack overflow (MAX_FRAMES)\n")
+                    JSVMState.error = 1
+                    ReturnValue(-1)
+                }
 
                 // Mark async frames with -65 at offset 40 so RETURN can wrap result
                 IfCondition EqualTo(func_env, 65) ThenBlock: {
@@ -1881,7 +1947,7 @@ Function.JSVM_Step {
 
                 // Copy frames to generator's private frames
                 gen_frm = Dereference(Add(gs, 88))
-                frm_copy_sz = Multiply(JSVMState.fp, 40)
+                frm_copy_sz = Multiply(JSVMState.fp, JSVMConst.FRAME_SIZE)
                 IfCondition GreaterThan(frm_copy_sz, 0) ThenBlock: {
                     MemoryCopy(gen_frm, JSVMState.frames, frm_copy_sz)
                 }
@@ -1900,7 +1966,7 @@ Function.JSVM_Step {
                     MemoryCopy(JSVMState.stack, JSVMGen.caller_stack, caller_stk_sz)
                 }
                 // Restore caller frames
-                caller_frm_sz = Multiply(JSVMGen.caller_fp, 40)
+                caller_frm_sz = Multiply(JSVMGen.caller_fp, JSVMConst.FRAME_SIZE)
                 IfCondition GreaterThan(caller_frm_sz, 0) ThenBlock: {
                     MemoryCopy(JSVMState.frames, JSVMGen.caller_frames, caller_frm_sz)
                 }
@@ -2062,10 +2128,46 @@ Function.JSVM_Step {
 
             // UNKNOWN OPCODE — error
             Default: {
+                bad_pc = Subtract(JSVMState.pc, 1)
                 PrintMessage("[JSVM] Unknown opcode: ")
                 PrintNumber(op)
                 PrintMessage(" at pc=")
-                PrintNumber(Subtract(JSVMState.pc, 1))
+                PrintNumber(bad_pc)
+                PrintMessage("\n")
+                // Dump 32 bytes of bytecode context around the error
+                dump_start = bad_pc
+                IfCondition GreaterThan(dump_start, 16) ThenBlock: {
+                    dump_start = Subtract(dump_start, 16)
+                }
+                IfCondition LessEqual(dump_start, 16) ThenBlock: {
+                    dump_start = 0
+                }
+                dump_end = Add(bad_pc, 16)
+                IfCondition GreaterThan(dump_end, JSVMState.code_len) ThenBlock: {
+                    dump_end = JSVMState.code_len
+                }
+                PrintMessage("[JSVM] bytecode [")
+                PrintNumber(dump_start)
+                PrintMessage("..")
+                PrintNumber(dump_end)
+                PrintMessage("]: ")
+                _di = dump_start
+                WhileLoop LessThan(_di, dump_end) {
+                    _db = GetByte(JSVMState.code, _di)
+                    IfCondition EqualTo(_di, bad_pc) ThenBlock: {
+                        PrintMessage(">")
+                    }
+                    PrintNumber(_db)
+                    PrintMessage(" ")
+                    _di = Add(_di, 1)
+                }
+                PrintMessage("\n")
+                PrintMessage("[JSVM] sp=")
+                PrintNumber(JSVMState.sp)
+                PrintMessage(" fp=")
+                PrintNumber(JSVMState.fp)
+                PrintMessage(" steps=")
+                PrintNumber(JSVMState.steps)
                 PrintMessage("\n")
                 JSVMState.error = 1
                 ReturnValue(-1)

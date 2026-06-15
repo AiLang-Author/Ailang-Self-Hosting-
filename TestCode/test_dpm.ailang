@@ -1,0 +1,458 @@
+// test_dpm.ailang — DPM (Dynamic Power Management) end-to-end test
+// Build: ./ailang.x TestCode/test_dpm.ailang test_dpm.x
+// Run:   sg video -c "./test_dpm.x"
+//
+// Tests:
+//   1. Discover GPUs, auto-select compute card (zero active CRTCs)
+//   2. Load and parse AtomBIOS ROM
+//   3. Parse PowerPlay + Voltage tables
+//   4. Load SMC firmware, start SMC
+//   5. Enable DPM (build state table, upload, enable sequence)
+//   6. Print DPM info
+//   7. Test level switching (force each level, read back SPLL)
+//   8. Disable DPM, shutdown cleanly
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+LibraryImport.Drivers.AMDGPU.AMDGPUSMCRegs
+LibraryImport.Drivers.AMDGPU.AMDGPUSMC_SI
+LibraryImport.Drivers.AMDGPU.AMDGPUSMC
+LibraryImport.Drivers.AMDGPU.AMDGPUPowerPlay
+LibraryImport.Drivers.AMDGPU.AMDGPUVoltage
+LibraryImport.Drivers.AMDGPU.AMDGPUDPM_SI
+LibraryImport.Drivers.AMDGPU.AMDGPUDPM
+LibraryImport.Drivers.AMDGPU.AMDGPUDisplay
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+
+SubRoutine.Main {
+    PrintMessage("=== DPM End-to-End Test ===\n\n")
+
+    // --- Discover GPUs ---
+    count = GPU_Discover()
+    IfCondition EqualTo(count, 0) ThenBlock: {
+        PrintMessage("No AMD GPUs found.\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    GPU_PrintAll()
+    PrintMessage("\n")
+
+    // --- Map MMIO BARs ---
+    GPU_BAR_Init()
+    gi = 0
+    WhileLoop LessThan(gi, count) {
+        GPU_BAR_MapMMIO(gi)
+        gi = Add(gi, 1)
+    }
+
+    // --- Auto-select compute GPU (zero active CRTCs) ---
+    gpu = -1
+    gi = 0
+    WhileLoop LessThan(gi, count) {
+        IfCondition EqualTo(GPU_BAR_IsMMIOMapped(gi), 1) ThenBlock: {
+            crtc_count = 0
+            pipe = 0
+            WhileLoop LessThan(pipe, 6) {
+                IfCondition EqualTo(DCE6_IsCRTCActive(gi, pipe), 1) ThenBlock: {
+                    crtc_count = Add(crtc_count, 1)
+                }
+                pipe = Add(pipe, 1)
+            }
+            PrintMessage("GPU ")
+            PrintNumber(gi)
+            PrintMessage(": active CRTCs = ")
+            PrintNumber(crtc_count)
+            PrintMessage("\n")
+
+            IfCondition EqualTo(crtc_count, 0) ThenBlock: {
+                gpu = gi
+            }
+        }
+        gi = Add(gi, 1)
+    }
+
+    IfCondition LessThan(gpu, 0) ThenBlock: {
+        IfCondition EqualTo(count, 1) ThenBlock: {
+            gpu = 0
+            PrintMessage("Single GPU — using GPU 0\n")
+        }
+        IfCondition GreaterThan(count, 1) ThenBlock: {
+            PrintMessage("No GPU with zero CRTCs — falling back to highest PCI bus\n")
+            best_bus = -1
+            gi = 0
+            WhileLoop LessThan(gi, count) {
+                bus = GPU_GetDeviceField(gi, GPUDevField.PCI_BUS)
+                IfCondition GreaterThan(bus, best_bus) ThenBlock: {
+                    best_bus = bus
+                    gpu = gi
+                }
+                gi = Add(gi, 1)
+            }
+        }
+    }
+
+    PrintMessage("\nSelected GPU ")
+    PrintNumber(gpu)
+    PrintMessage(" as compute card\n\n")
+
+    // --- MMIO health check ---
+    health = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+    PrintMessage("MMIO health check (IND_ACCESS_CNTL): 0x")
+    PrintHex(health)
+    PrintMessage("\n")
+    IfCondition EqualTo(health, 4294967295) ThenBlock: {
+        PrintMessage("FATAL: GPU MMIO returns 0xFFFFFFFF — card is dead.\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 1: Load and parse AtomBIOS
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 1: AtomBIOS ROM\n")
+    PrintMessage("========================================\n")
+    rom = AtomBIOS_LoadROM(gpu)
+    IfCondition EqualTo(rom, 0) ThenBlock: {
+        PrintMessage("FAIL: Could not load ROM\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    rc = AtomBIOS_Parse(gpu)
+    IfCondition EqualTo(rc, 0) ThenBlock: {
+        PrintMessage("FAIL: Could not parse AtomBIOS\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("AtomBIOS parsed OK\n")
+    PrintMessage("  Boot SCLK:  ")
+    PrintNumber(Divide(AtomBIOS_GetField(gpu, AtomField.DEF_ENGINE_CLK), 1000))
+    PrintMessage(" MHz\n")
+    PrintMessage("  Boot MCLK:  ")
+    PrintNumber(Divide(AtomBIOS_GetField(gpu, AtomField.DEF_MEMORY_CLK), 1000))
+    PrintMessage(" MHz\n")
+    PrintMessage("  Boot VDDC:  ")
+    PrintNumber(AtomBIOS_GetField(gpu, AtomField.BOOT_VDDC))
+    PrintMessage(" mV\n")
+    PrintMessage("  Ref clock:  ")
+    PrintNumber(Divide(AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK), 1000))
+    PrintMessage(" MHz\n\n")
+
+    // =============================================
+    // STEP 2: Parse PowerPlay
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 2: PowerPlay\n")
+    PrintMessage("========================================\n")
+    PP_Parse(gpu)
+    num_clocks = PP_GetNumClockEntries(gpu)
+    PrintMessage("PP clock entries: ")
+    PrintNumber(num_clocks)
+    PrintMessage("\n")
+    IfCondition EqualTo(num_clocks, 0) ThenBlock: {
+        PrintMessage("FAIL: No PP clock entries\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // Print clock entries
+    ci_buf = Allocate(PPClkEntry.SIZE)
+    k = 0
+    WhileLoop LessThan(k, num_clocks) {
+        PP_GetClockEntry(gpu, k, ci_buf)
+        PrintMessage("  [")
+        PrintNumber(k)
+        PrintMessage("] SCLK=")
+        PrintNumber(Divide(Dereference(Add(ci_buf, PPClkEntry.SCLK)), 1000))
+        PrintMessage("MHz  MCLK=")
+        PrintNumber(Divide(Dereference(Add(ci_buf, PPClkEntry.MCLK)), 1000))
+        PrintMessage("MHz  VDDC=")
+        PrintNumber(Dereference(Add(ci_buf, PPClkEntry.VDDC)))
+        PrintMessage("  VDDCI=")
+        PrintNumber(Dereference(Add(ci_buf, PPClkEntry.VDDCI)))
+        PrintMessage("\n")
+        k = Add(k, 1)
+    }
+    Deallocate(ci_buf, PPClkEntry.SIZE)
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 3: Parse Voltage
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 3: Voltage\n")
+    PrintMessage("========================================\n")
+    vrc = Volt_Parse(gpu)
+    IfCondition EqualTo(vrc, 0) ThenBlock: {
+        PrintMessage("WARNING: Voltage parse failed — DPM may use defaults\n")
+    }
+    IfCondition NotEqual(vrc, 0) ThenBlock: {
+        PrintMessage("Voltage parsed OK\n")
+        Volt_PrintInfo(gpu)
+    }
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 4: Load SMC Firmware
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 4: SMC Firmware\n")
+    PrintMessage("========================================\n")
+
+    // Register pre-conditioning is now done inside SMC_SI_LoadFirmware.
+    PrintMessage("SMC running (pre-load): ")
+    PrintNumber(SMC_SI_IsRunning(gpu))
+    PrintMessage("\n")
+
+    smc_rc = SMC_LoadFirmware(gpu)
+    PrintMessage("SMC load result: ")
+    PrintNumber(smc_rc)
+    PrintMessage("\n")
+    IfCondition LessThan(smc_rc, 0) ThenBlock: {
+        PrintMessage("FAIL: SMC firmware load failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    PrintMessage("SMC running (post-load): ")
+    PrintNumber(SMC_SI_IsRunning(gpu))
+    PrintMessage("\n")
+
+    // Verify SMC responds immediately after load
+    GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+    smc_test = SMC_SendMessage(gpu, SMCMsg.NO_DISPLAY)
+    PrintMessage("  NoDisplay after load: 0x")
+    PrintHex(smc_test)
+    IfCondition EqualTo(smc_test, SMCResp.OK) ThenBlock: {
+        PrintMessage(" (OK)\n")
+    }
+    ElseBlock: {
+        PrintMessage(" (FAILED — SMC not responding)\n")
+        PrintMessage("  RESP_0: 0x")
+        PrintHex(GPU_Rd32(gpu, SMCReg.RESP_0))
+        PrintMessage("  RST: 0x")
+        PrintHex(SMC_SI_IndRd32(gpu, SMCSyscon.RESET_CNTL))
+        PrintMessage("  CLK: 0x")
+        PrintHex(SMC_SI_IndRd32(gpu, SMCSyscon.CLOCK_CNTL_0))
+        PrintMessage("\n")
+    }
+
+    // Read firmware header to show SRAM layout
+    PrintMessage("  FW Header at 0x10000:\n")
+    PrintMessage("    softRegisters: 0x")
+    PrintHex(SMC_ReadSRAM(gpu, Add(65536, SMCFWHdr.SOFT_REGS)))
+    PrintMessage("\n    stateTable:    0x")
+    PrintHex(SMC_ReadSRAM(gpu, Add(65536, SMCFWHdr.STATE_TABLE)))
+    PrintMessage("\n    fanTable:      0x")
+    PrintHex(SMC_ReadSRAM(gpu, Add(65536, SMCFWHdr.FAN_TABLE)))
+    PrintMessage("\n    spllTable:     0x")
+    PrintHex(SMC_ReadSRAM(gpu, Add(65536, SMCFWHdr.SPLL_TABLE)))
+    PrintMessage("\n")
+    PrintMessage("  (DPM_SI_Enable will stop SMC, upload tables, then restart)\n\n")
+
+    // =============================================
+    // STEP 5: Read pre-DPM SPLL state
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 5: Pre-DPM SPLL State\n")
+    PrintMessage("========================================\n")
+    spll_0 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+    spll_2 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+    spll_3 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+    spll_4 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_4)
+    PrintMessage("  CG_SPLL_FUNC_CNTL:   0x")
+    PrintHex(spll_0)
+    PrintMessage("\n")
+    PrintMessage("  CG_SPLL_FUNC_CNTL_2: 0x")
+    PrintHex(spll_2)
+    PrintMessage("\n")
+    PrintMessage("  CG_SPLL_FUNC_CNTL_3: 0x")
+    PrintHex(spll_3)
+    PrintMessage("\n")
+    PrintMessage("  CG_SPLL_FUNC_CNTL_4: 0x")
+    PrintHex(spll_4)
+    PrintMessage("\n")
+
+    // Read power management registers
+    gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+    sclk_pwr = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
+    PrintMessage("  GENERAL_PWRMGT:      0x")
+    PrintHex(gen_pwrmgt)
+    PrintMessage("\n")
+    PrintMessage("  SCLK_PWRMGT_CNTL:   0x")
+    PrintHex(sclk_pwr)
+    PrintMessage("\n\n")
+
+    // =============================================
+    // STEP 6: Enable DPM
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 6: DPM Enable\n")
+    PrintMessage("========================================\n")
+    DPM_Init()
+    dpm_rc = DPM_Enable(gpu)
+    PrintMessage("\nDPM_Enable result: ")
+    PrintNumber(dpm_rc)
+    PrintMessage("\n\n")
+
+    IfCondition EqualTo(dpm_rc, 0) ThenBlock: {
+        PrintMessage("FAIL: DPM enable failed\n")
+        PrintMessage("Stopping SMC and cleaning up...\n")
+        SMC_StopSMC(gpu)
+        PP_Free(gpu)
+        Volt_Free(gpu)
+        AtomBIOS_FreeROM(gpu)
+        gi = 0
+        WhileLoop LessThan(gi, count) {
+            GPU_BAR_Unmap(gi)
+            gi = Add(gi, 1)
+        }
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // =============================================
+    // STEP 7: DPM Info
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 7: DPM Info\n")
+    PrintMessage("========================================\n")
+    DPM_PrintInfo(gpu)
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 8: Post-DPM register state
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 8: Post-DPM Register State\n")
+    PrintMessage("========================================\n")
+    spll_0 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+    spll_2 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+    spll_3 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+    PrintMessage("  CG_SPLL_FUNC_CNTL:   0x")
+    PrintHex(spll_0)
+    PrintMessage("\n")
+    PrintMessage("  CG_SPLL_FUNC_CNTL_2: 0x")
+    PrintHex(spll_2)
+    PrintMessage("\n")
+    PrintMessage("  CG_SPLL_FUNC_CNTL_3: 0x")
+    PrintHex(spll_3)
+    PrintMessage("\n")
+
+    gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+    sclk_pwr = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
+    PrintMessage("  GENERAL_PWRMGT:      0x")
+    PrintHex(gen_pwrmgt)
+    PrintMessage("\n")
+    PrintMessage("  SCLK_PWRMGT_CNTL:   0x")
+    PrintHex(sclk_pwr)
+    PrintMessage("\n\n")
+
+    // =============================================
+    // STEP 9: Test level switching
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 9: Level Switching Test\n")
+    PrintMessage("========================================\n")
+
+    // Get the DPM entry to read num_levels
+    dpm = DPM_SI_GetEntry(gpu)
+    num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
+    PrintMessage("Testing ")
+    PrintNumber(num_levels)
+    PrintMessage(" DPM levels\n\n")
+
+    lvl = 0
+    WhileLoop LessThan(lvl, num_levels) {
+        PrintMessage("--- Forcing level ")
+        PrintNumber(lvl)
+        PrintMessage(" ---\n")
+
+        frc_rc = DPM_SetLevel(gpu, lvl)
+        PrintMessage("  SetLevel result: ")
+        PrintNumber(frc_rc)
+        PrintMessage("\n")
+
+        // Small delay for clock transition (read a register a few times)
+        delay = 0
+        WhileLoop LessThan(delay, 1000) {
+            dummy = GPU_Rd32(gpu, SMCReg.CB_CGTT_SCLK_CTRL)
+            delay = Add(delay, 1)
+        }
+
+        // Read back SPLL registers
+        spll_0 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        spll_3 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+        PrintMessage("  SPLL_FUNC_CNTL:   0x")
+        PrintHex(spll_0)
+        PrintMessage("\n")
+        PrintMessage("  SPLL_FUNC_CNTL_3: 0x")
+        PrintHex(spll_3)
+        PrintMessage("  (FBDIV=0x")
+        fbdiv = BitwiseAnd(spll_3, SPLLBits.SPLL_FB_DIV_MASK)
+        PrintHex(fbdiv)
+        PrintMessage(")\n")
+
+        // Read current DPM level from SMC
+        cur = DPM_GetCurrentLevel(gpu)
+        PrintMessage("  Current level: ")
+        PrintNumber(cur)
+        PrintMessage("\n\n")
+
+        lvl = Add(lvl, 1)
+    }
+
+    // Unforce levels — use SetForcedLevels(0) then SetEnabledLevels(num_levels)
+    PrintMessage("--- Unforcing DPM levels ---\n")
+    SMC_SendMessageArg(gpu, SMCMsg.SET_FORCED_LEVELS, 0)
+    SMC_SendMessageArg(gpu, SMCMsg.SET_ENABLED_LEVELS, num_levels)
+    PrintMessage("Done\n\n")
+
+    // =============================================
+    // STEP 10: Disable DPM + Shutdown
+    // =============================================
+    PrintMessage("========================================\n")
+    PrintMessage("Step 10: DPM Disable + Shutdown\n")
+    PrintMessage("========================================\n")
+    DPM_Disable(gpu)
+    PrintMessage("DPM disabled\n")
+
+    DPM_Shutdown(gpu)
+    PrintMessage("DPM shutdown complete\n")
+
+    // NOTE: Do NOT call SMC_StopSMC here — stopping the SMC after DPM
+    // was active can brick the GPU's MMIO interface (all registers read 0).
+    // Leave the SMC running; it's harmless with DPM disabled.
+    PrintMessage("(SMC left running — stopping it would brick MMIO)\n")
+
+    // Post-shutdown register state
+    spll_0 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+    spll_3 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+    PrintMessage("  Post-shutdown SPLL_FUNC_CNTL:   0x")
+    PrintHex(spll_0)
+    PrintMessage("\n")
+    PrintMessage("  Post-shutdown SPLL_FUNC_CNTL_3: 0x")
+    PrintHex(spll_3)
+    PrintMessage("\n")
+    PrintMessage("  GENERAL_PWRMGT:    0x")
+    PrintHex(GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT))
+    PrintMessage("\n")
+    PrintMessage("  SCLK_PWRMGT_CNTL: 0x")
+    PrintHex(GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL))
+    PrintMessage("\n\n")
+
+    // =============================================
+    // Cleanup
+    // =============================================
+    PP_Free(gpu)
+    Volt_Free(gpu)
+    AtomBIOS_FreeROM(gpu)
+
+    gi = 0
+    WhileLoop LessThan(gi, count) {
+        GPU_BAR_Unmap(gi)
+        gi = Add(gi, 1)
+    }
+
+    PrintMessage("=== DPM Test Complete ===\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)

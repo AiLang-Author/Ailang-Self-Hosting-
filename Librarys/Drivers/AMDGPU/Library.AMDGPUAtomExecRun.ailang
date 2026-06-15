@@ -1,0 +1,407 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUAtomExecRun.ailang — ATOM BIOS main loop, dispatch, wrappers
+
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExec
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecIO
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecDecode
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecOps
+
+// =============================================================================
+// AE_RegArgToAtomArg — map regular opcode arg index to AtomArg value
+// Regular opcodes: 0=REG,1=PS,2=WS,3=FB,4=PLL,5=MC
+// =============================================================================
+Function.AE_RegArgToAtomArg {
+    Input: reg_arg: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(reg_arg, 3) ThenBlock: { ReturnValue(reg_arg) }
+        IfCondition EqualTo(reg_arg, 4) ThenBlock: { ReturnValue(AtomArg.PLL) }
+        ReturnValue(AtomArg.MC)
+    }
+}
+
+// =============================================================================
+// AE_RunTable — execute a single command table
+// =============================================================================
+Function.AE_RunTable {
+    Input: gpu: Integer
+    Input: table_idx: Integer
+    Input: params: Address
+    Input: params_size: Integer
+    Output: Integer
+    Body: {
+        ctx = AtomExec_GetCtx(gpu)
+        rom = Dereference(Add(ctx, AEField.ROM_PTR))
+        depth = Dereference(Add(ctx, AEField.CALL_DEPTH))
+
+        IfCondition GreaterEqual(depth, AtomVM.MAX_CALL) ThenBlock: {
+            PrintMessage("AtomExec: Call depth exceeded\n")
+            ReturnValue(-1)
+        }
+
+        cmd_tbl = Dereference(Add(ctx, AEField.CMD_TABLE))
+        tbl_base = AtomBIOS_ReadU16(rom, Add(cmd_tbl, Add(4, Multiply(table_idx, 2))))
+        IfCondition EqualTo(tbl_base, 0) ThenBlock: {
+            PrintMessage("AtomExec: Table ")
+            PrintNumber(table_idx)
+            PrintMessage(" not present\n")
+            ReturnValue(-1)
+        }
+
+        ws_count = GetByte(rom, Add(tbl_base, AtomCT.WS_PTR))
+        ps_header = BitwiseAnd(GetByte(rom, Add(tbl_base, AtomCT.PS_PTR)), AtomCT.PS_MASK)
+        code_start = Add(tbl_base, AtomCT.CODE_PTR)
+
+        frame = AtomExec_GetFrame(gpu, depth)
+        StoreValue(Add(frame, AEFrame.PS_PTR), params)
+        StoreValue(Add(frame, AEFrame.PS_SIZE), params_size)
+        // Kernel: ectx.ps_shift = ps / 4 (convert bytes to DWORDs)
+        StoreValue(Add(frame, AEFrame.PS_SHIFT), Divide(ps_header, 4))
+        StoreValue(Add(frame, AEFrame.START), tbl_base)
+        StoreValue(Add(frame, AEFrame.IP), code_start)
+        StoreValue(Add(frame, AEFrame.LAST_JUMP), 0)
+        StoreValue(Add(frame, AEFrame.JUMP_COUNT), 0)
+        StoreValue(Add(frame, AEFrame.ABORT), 0)
+
+        ws_ptr = 0
+        IfCondition GreaterThan(ws_count, 0) ThenBlock: {
+            ws_bytes = Multiply(ws_count, 4)
+            ws_ptr = Allocate(ws_bytes)
+            i = 0
+            WhileLoop LessThan(i, ws_bytes) {
+                SetByte(ws_ptr, i, 0)
+                i = Add(i, 1)
+            }
+        }
+        StoreValue(Add(frame, AEFrame.WS_PTR), ws_ptr)
+        StoreValue(Add(frame, AEFrame.WS_SIZE), ws_count)
+
+        ret = 0
+        done = 0
+        WhileLoop EqualTo(done, 0) {
+            ip = Dereference(Add(frame, AEFrame.IP))
+            op = GetByte(rom, ip)
+            StoreValue(Add(frame, AEFrame.IP), Add(ip, 1))
+
+            IfCondition EqualTo(op, 0) ThenBlock: { done = 1 }
+            ElseBlock: {
+            IfCondition EqualTo(op, AtomVM.OP_EOT) ThenBlock: { done = 1 }
+            ElseBlock: {
+            IfCondition LessThan(op, AtomVM.OP_CNT) ThenBlock: {
+                AE_Dispatch(gpu, op)
+                IfCondition EqualTo(Dereference(Add(frame, AEFrame.ABORT)), 1) ThenBlock: {
+                    ret = -1
+                    done = 1
+                }
+            }
+            ElseBlock: {
+                PrintMessage("AtomExec: Unknown opcode ")
+                PrintNumber(op)
+                PrintMessage("\n")
+                done = 1
+            }
+            }
+            }
+        }
+
+        ws_ptr = Dereference(Add(frame, AEFrame.WS_PTR))
+        IfCondition NotEqual(ws_ptr, 0) ThenBlock: {
+            ws_bytes = Multiply(Dereference(Add(frame, AEFrame.WS_SIZE)), 4)
+            Deallocate(ws_ptr, ws_bytes)
+            StoreValue(Add(frame, AEFrame.WS_PTR), 0)
+        }
+
+        ReturnValue(ret)
+    }
+}
+
+// =============================================================================
+// AE_Dispatch — dispatch a single opcode
+//
+// Opcodes 1-54: regular ops = (op-1)/6 selects operation, (op-1)%6 selects arg
+//   op_type 0=MOVE,1=AND,2=OR,3=SHL_OLD,4=SHR_OLD,5=MUL,6=DIV,7=ADD,8=SUB
+// Opcodes 55-122: special ops (ports, compare, jump, call, etc.)
+// =============================================================================
+Function.AE_Dispatch {
+    Input: gpu: Integer
+    Input: op: Integer
+    Body: {
+        // Regular opcodes 1-54
+        IfCondition GreaterEqual(op, 1) ThenBlock: {
+        IfCondition LessEqual(op, 54) ThenBlock: {
+            op_idx = Subtract(op, 1)
+            op_type = Divide(op_idx, 6)
+            reg_arg = Subtract(op_idx, Multiply(op_type, 6))
+            arg = AE_RegArgToAtomArg(reg_arg)
+
+            IfCondition EqualTo(op_type, 0) ThenBlock: { AE_OpMove(gpu, arg) }
+            IfCondition EqualTo(op_type, 1) ThenBlock: { AE_OpAnd(gpu, arg) }
+            IfCondition EqualTo(op_type, 2) ThenBlock: { AE_OpOr(gpu, arg) }
+            IfCondition EqualTo(op_type, 3) ThenBlock: { AE_OpShiftLeft(gpu, arg) }
+            IfCondition EqualTo(op_type, 4) ThenBlock: { AE_OpShiftRight(gpu, arg) }
+            IfCondition EqualTo(op_type, 5) ThenBlock: { AE_OpMul(gpu, arg) }
+            IfCondition EqualTo(op_type, 6) ThenBlock: { AE_OpDiv(gpu, arg) }
+            IfCondition EqualTo(op_type, 7) ThenBlock: { AE_OpAdd(gpu, arg) }
+            IfCondition EqualTo(op_type, 8) ThenBlock: { AE_OpSub(gpu, arg) }
+            ReturnValue(0)
+        }
+        }
+
+        // 55-57: SETPORT
+        IfCondition EqualTo(op, 55) ThenBlock: { AE_OpSetPort(gpu, AtomPort.ATI) ReturnValue(0) }
+        IfCondition EqualTo(op, 56) ThenBlock: { AE_OpSetPort(gpu, AtomPort.PCI) ReturnValue(0) }
+        IfCondition EqualTo(op, 57) ThenBlock: { AE_OpSetPort(gpu, AtomPort.SYSIO) ReturnValue(0) }
+        // 58: SETREGBLOCK
+        IfCondition EqualTo(op, 58) ThenBlock: { AE_OpSetRegBlock(gpu) ReturnValue(0) }
+        // 59: SETFBBASE
+        IfCondition EqualTo(op, 59) ThenBlock: { AE_OpSetFBBase(gpu) ReturnValue(0) }
+        // 60-65: COMPARE
+        IfCondition GreaterEqual(op, 60) ThenBlock: {
+        IfCondition LessEqual(op, 65) ThenBlock: {
+            AE_OpCompare(gpu, AE_RegArgToAtomArg(Subtract(op, 60)))
+            ReturnValue(0)
+        }
+        }
+        // 66: SWITCH
+        IfCondition EqualTo(op, 66) ThenBlock: { AE_OpSwitch(gpu) ReturnValue(0) }
+        // 67-73: JUMP (condition mapping)
+        IfCondition EqualTo(op, 67) ThenBlock: { AE_OpJump(gpu, AtomCond.ALWAYS) ReturnValue(0) }
+        IfCondition EqualTo(op, 68) ThenBlock: { AE_OpJump(gpu, AtomCond.EQUAL) ReturnValue(0) }
+        IfCondition EqualTo(op, 69) ThenBlock: { AE_OpJump(gpu, AtomCond.BELOW) ReturnValue(0) }
+        IfCondition EqualTo(op, 70) ThenBlock: { AE_OpJump(gpu, AtomCond.ABOVE) ReturnValue(0) }
+        IfCondition EqualTo(op, 71) ThenBlock: { AE_OpJump(gpu, AtomCond.BELOWOREQUAL) ReturnValue(0) }
+        IfCondition EqualTo(op, 72) ThenBlock: { AE_OpJump(gpu, AtomCond.ABOVEOREQUAL) ReturnValue(0) }
+        IfCondition EqualTo(op, 73) ThenBlock: { AE_OpJump(gpu, AtomCond.NOTEQUAL) ReturnValue(0) }
+        // 74-79: TEST
+        IfCondition GreaterEqual(op, 74) ThenBlock: {
+        IfCondition LessEqual(op, 79) ThenBlock: {
+            AE_OpTest(gpu, AE_RegArgToAtomArg(Subtract(op, 74)))
+            ReturnValue(0)
+        }
+        }
+        // 80: DELAY_MS, 81: DELAY_US
+        IfCondition EqualTo(op, 80) ThenBlock: { AE_OpDelay(gpu, AtomUnit.MILLISEC) ReturnValue(0) }
+        IfCondition EqualTo(op, 81) ThenBlock: { AE_OpDelay(gpu, AtomUnit.MICROSEC) ReturnValue(0) }
+        // 82: CALLTABLE
+        IfCondition EqualTo(op, 82) ThenBlock: { AE_OpCallTable(gpu) ReturnValue(0) }
+        // 83: REPEAT (stub)
+        IfCondition EqualTo(op, 83) ThenBlock: { ReturnValue(0) }
+        // 84-89: CLEAR
+        IfCondition GreaterEqual(op, 84) ThenBlock: {
+        IfCondition LessEqual(op, 89) ThenBlock: {
+            AE_OpClear(gpu, AE_RegArgToAtomArg(Subtract(op, 84)))
+            ReturnValue(0)
+        }
+        }
+        // 90: NOP, 91: EOT (already handled in main loop)
+        IfCondition EqualTo(op, 90) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(op, 91) ThenBlock: { ReturnValue(0) }
+        // 92-97: MASK
+        IfCondition GreaterEqual(op, 92) ThenBlock: {
+        IfCondition LessEqual(op, 97) ThenBlock: {
+            AE_OpMask(gpu, AE_RegArgToAtomArg(Subtract(op, 92)))
+            ReturnValue(0)
+        }
+        }
+        // 98: POSTCARD (skip 1 byte)
+        IfCondition EqualTo(op, 98) ThenBlock: {
+            ctx = AtomExec_GetCtx(gpu)
+            depth = Dereference(Add(ctx, AEField.CALL_DEPTH))
+            frame = AtomExec_GetFrame(gpu, depth)
+            ip_p = Add(frame, AEFrame.IP)
+            StoreValue(ip_p, Add(Dereference(ip_p), 1))
+            ReturnValue(0)
+        }
+        // 99-101: BEEP, SAVEREG, RESTOREREG (stubs)
+        IfCondition GreaterEqual(op, 99) ThenBlock: {
+        IfCondition LessEqual(op, 101) ThenBlock: { ReturnValue(0) }
+        }
+        // 102: SETDATABLOCK
+        IfCondition EqualTo(op, 102) ThenBlock: { AE_OpSetDataBlock(gpu) ReturnValue(0) }
+        // 103-108: XOR
+        IfCondition GreaterEqual(op, 103) ThenBlock: {
+        IfCondition LessEqual(op, 108) ThenBlock: {
+            AE_OpXor(gpu, AE_RegArgToAtomArg(Subtract(op, 103)))
+            ReturnValue(0)
+        }
+        }
+        // 109-114: SHL
+        IfCondition GreaterEqual(op, 109) ThenBlock: {
+        IfCondition LessEqual(op, 114) ThenBlock: {
+            AE_OpShl(gpu, AE_RegArgToAtomArg(Subtract(op, 109)))
+            ReturnValue(0)
+        }
+        }
+        // 115-120: SHR
+        IfCondition GreaterEqual(op, 115) ThenBlock: {
+        IfCondition LessEqual(op, 120) ThenBlock: {
+            AE_OpShr(gpu, AE_RegArgToAtomArg(Subtract(op, 115)))
+            ReturnValue(0)
+        }
+        }
+        // 121: DEBUG, 122: CTB_DS (stubs)
+        IfCondition GreaterEqual(op, 121) ThenBlock: {
+        IfCondition LessEqual(op, 122) ThenBlock: { ReturnValue(0) }
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// AtomExec_Execute — public entry point
+// =============================================================================
+Function.AtomExec_Execute {
+    Input: gpu: Integer
+    Input: table_idx: Integer
+    Input: params: Address
+    Input: params_size: Integer
+    Output: Integer
+    Body: {
+        ctx = AtomExec_GetCtx(gpu)
+        IfCondition EqualTo(ctx, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition NotEqual(Dereference(Add(ctx, AEField.INITIALIZED)), 1) ThenBlock: {
+            PrintMessage("AtomExec: Not initialized for GPU ")
+            PrintNumber(gpu)
+            PrintMessage("\n")
+            ReturnValue(-1)
+        }
+
+        StoreValue(Add(ctx, AEField.DATA_BLOCK), 0)
+        StoreValue(Add(ctx, AEField.REG_BLOCK), 0)
+        StoreValue(Add(ctx, AEField.FB_BASE), 0)
+        StoreValue(Add(ctx, AEField.IO_MODE), AtomIO.MM)
+        StoreValue(Add(ctx, AEField.DIVMUL_Q), 0)
+        StoreValue(Add(ctx, AEField.DIVMUL_R), 0)
+        StoreValue(Add(ctx, AEField.CALL_DEPTH), 0)
+
+        ReturnValue(AE_RunTable(gpu, table_idx, params, params_size))
+    }
+}
+
+// =============================================================================
+// CONVENIENCE WRAPPERS
+// =============================================================================
+
+// AtomExec_AsicInit — kernel atom_asic_init() equivalent
+Function.AtomExec_AsicInit {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        ctx = AtomExec_GetCtx(gpu)
+        IfCondition EqualTo(ctx, 0) ThenBlock: { ReturnValue(-1) }
+        rom = Dereference(Add(ctx, AEField.ROM_PTR))
+        data_tbl = Dereference(Add(ctx, AEField.DATA_TABLE))
+
+        // ATOM_DATA_FWI_PTR = 0xC = 12
+        hwi = AtomBIOS_ReadU16(rom, Add(data_tbl, 12))
+        IfCondition EqualTo(hwi, 0) ThenBlock: {
+            PrintMessage("AtomExec_AsicInit: No FirmwareInfo\n")
+            ReturnValue(1)
+        }
+
+        // ATOM_FWI_DEFSCLK_PTR=8, ATOM_FWI_DEFMCLK_PTR=0xC=12
+        def_sclk = AtomBIOS_ReadU32(rom, Add(hwi, 8))
+        def_mclk = AtomBIOS_ReadU32(rom, Add(hwi, 12))
+        IfCondition EqualTo(def_sclk, 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(def_mclk, 0) ThenBlock: { ReturnValue(1) }
+
+        ps = Allocate(64)
+        i = 0
+        WhileLoop LessThan(i, 64) {
+            SetByte(ps, i, 0)
+            i = Add(i, 1)
+        }
+        StoreValue(ps, def_sclk, "dword")
+        StoreValue(Add(ps, 4), def_mclk, "dword")
+
+        PrintMessage("AtomExec_AsicInit: SCLK=")
+        PrintNumber(def_sclk)
+        PrintMessage(" MCLK=")
+        PrintNumber(def_mclk)
+        PrintMessage(" (10kHz)\n")
+
+        cmd_tbl = Dereference(Add(ctx, AEField.CMD_TABLE))
+        cmd_off = AtomBIOS_ReadU16(rom, Add(cmd_tbl, 4))
+        IfCondition EqualTo(cmd_off, 0) ThenBlock: {
+            Deallocate(ps, 64)
+            ReturnValue(1)
+        }
+
+        ret = AtomExec_Execute(gpu, 0, ps, 16)
+        Deallocate(ps, 64)
+        ReturnValue(ret)
+    }
+}
+
+// AtomExec_SetEngineClock — table 0x0A
+Function.AtomExec_SetEngineClock {
+    Input: gpu: Integer
+    Input: sclk_10khz: Integer
+    Output: Integer
+    Body: {
+        ps = Allocate(64)
+        i = 0
+        WhileLoop LessThan(i, 64) {
+            SetByte(ps, i, 0)
+            i = Add(i, 1)
+        }
+        StoreValue(ps, sclk_10khz, "dword")
+        PrintMessage("AtomExec_SetEngineClock: ")
+        PrintNumber(sclk_10khz)
+        PrintMessage(" (10kHz)\n")
+        ret = AtomExec_Execute(gpu, 10, ps, 16)
+        Deallocate(ps, 64)
+        ReturnValue(ret)
+    }
+}
+
+// AtomExec_SetMemoryClock — table 0x0B
+Function.AtomExec_SetMemoryClock {
+    Input: gpu: Integer
+    Input: mclk_10khz: Integer
+    Output: Integer
+    Body: {
+        ps = Allocate(64)
+        i = 0
+        WhileLoop LessThan(i, 64) {
+            SetByte(ps, i, 0)
+            i = Add(i, 1)
+        }
+        StoreValue(ps, mclk_10khz, "dword")
+        ret = AtomExec_Execute(gpu, 11, ps, 16)
+        Deallocate(ps, 64)
+        ReturnValue(ret)
+    }
+}
+
+// AtomExec_SetVoltage — table 0x32 = 50
+Function.AtomExec_SetVoltage {
+    Input: gpu: Integer
+    Input: vtype: Integer
+    Input: mode: Integer
+    Input: level: Integer
+    Output: Integer
+    Body: {
+        ps = Allocate(64)
+        i = 0
+        WhileLoop LessThan(i, 64) {
+            SetByte(ps, i, 0)
+            i = Add(i, 1)
+        }
+        SetByte(ps, 0, vtype)
+        SetByte(ps, 1, mode)
+        SetByte(ps, 2, BitwiseAnd(level, 255))
+        SetByte(ps, 3, BitwiseAnd(ShiftRight(level, 8), 255))
+        ret = AtomExec_Execute(gpu, 50, ps, 16)
+        Deallocate(ps, 64)
+        ReturnValue(ret)
+    }
+}

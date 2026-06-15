@@ -1,0 +1,331 @@
+// test_smc_recover.ailang — Recover GPU SMC from bad state
+// Build: ./ailang.x TestCode/test_smc_recover.ailang test_smc_recover.x
+// Run:   sg video -c "./test_smc_recover.x"
+//
+// This script:
+//   1. Discovers GPUs, selects compute card
+//   2. Reads current DPM-related register state
+//   3. Resets GENERAL_PWRMGT and SCLK_PWRMGT_CNTL to safe POST defaults
+//   4. Does a full SMC stop (assert reset + disable clock)
+//   5. Loads firmware fresh
+//   6. Verifies SMC responds to messages
+//   7. Stops SMC cleanly
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+LibraryImport.Drivers.AMDGPU.AMDGPUSMCRegs
+LibraryImport.Drivers.AMDGPU.AMDGPUSMC_SI
+LibraryImport.Drivers.AMDGPU.AMDGPUSMC
+LibraryImport.Drivers.AMDGPU.AMDGPUDisplay
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+
+SubRoutine.Main {
+    PrintMessage("=== SMC Recovery Test ===\n\n")
+
+    // --- Discover GPUs ---
+    count = GPU_Discover()
+    IfCondition EqualTo(count, 0) ThenBlock: {
+        PrintMessage("No AMD GPUs found.\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    GPU_PrintAll()
+    PrintMessage("\n")
+
+    // --- Map MMIO BARs ---
+    GPU_BAR_Init()
+    gi = 0
+    WhileLoop LessThan(gi, count) {
+        GPU_BAR_MapMMIO(gi)
+        gi = Add(gi, 1)
+    }
+
+    // --- Auto-select compute GPU (zero active CRTCs) ---
+    gpu = -1
+    gi = 0
+    WhileLoop LessThan(gi, count) {
+        IfCondition EqualTo(GPU_BAR_IsMMIOMapped(gi), 1) ThenBlock: {
+            crtc_count = 0
+            pipe = 0
+            WhileLoop LessThan(pipe, 6) {
+                IfCondition EqualTo(DCE6_IsCRTCActive(gi, pipe), 1) ThenBlock: {
+                    crtc_count = Add(crtc_count, 1)
+                }
+                pipe = Add(pipe, 1)
+            }
+            PrintMessage("GPU ")
+            PrintNumber(gi)
+            PrintMessage(": active CRTCs = ")
+            PrintNumber(crtc_count)
+            PrintMessage("\n")
+
+            IfCondition EqualTo(crtc_count, 0) ThenBlock: {
+                gpu = gi
+            }
+        }
+        gi = Add(gi, 1)
+    }
+
+    IfCondition LessThan(gpu, 0) ThenBlock: {
+        IfCondition EqualTo(count, 1) ThenBlock: {
+            gpu = 0
+        }
+        IfCondition GreaterThan(count, 1) ThenBlock: {
+            best_bus = -1
+            gi = 0
+            WhileLoop LessThan(gi, count) {
+                bus = GPU_GetDeviceField(gi, GPUDevField.PCI_BUS)
+                IfCondition GreaterThan(bus, best_bus) ThenBlock: {
+                    best_bus = bus
+                    gpu = gi
+                }
+                gi = Add(gi, 1)
+            }
+        }
+    }
+
+    PrintMessage("\nSelected GPU ")
+    PrintNumber(gpu)
+    PrintMessage(" as compute card\n\n")
+
+    // --- MMIO health check ---
+    health = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+    PrintMessage("MMIO health check (IND_ACCESS_CNTL): 0x")
+    PrintHex(health)
+    PrintMessage("\n")
+    IfCondition EqualTo(health, 4294967295) ThenBlock: {
+        PrintMessage("FATAL: GPU MMIO returns 0xFFFFFFFF — card is dead.\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // =============================================
+    // STEP 1: Read current power management state
+    // =============================================
+    PrintMessage("\n========================================\n")
+    PrintMessage("Step 1: Current Power Management State\n")
+    PrintMessage("========================================\n")
+
+    gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+    sclk_pwr = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
+    PrintMessage("  GENERAL_PWRMGT:      0x")
+    PrintHex(gen_pwrmgt)
+    PrintMessage("\n")
+    PrintMessage("  SCLK_PWRMGT_CNTL:   0x")
+    PrintHex(sclk_pwr)
+    PrintMessage("\n")
+
+    // Read SMC syscon registers
+    rst = SMC_SI_IndRd32(gpu, SMCSyscon.RESET_CNTL)
+    clk = SMC_SI_IndRd32(gpu, SMCSyscon.CLOCK_CNTL_0)
+    PrintMessage("  SMC RESET_CNTL:      0x")
+    PrintHex(rst)
+    PrintMessage("\n")
+    PrintMessage("  SMC CLOCK_CNTL_0:    0x")
+    PrintHex(clk)
+    PrintMessage("\n")
+
+    // Read RESP_0 and MESSAGE_0
+    resp = GPU_Rd32(gpu, SMCReg.RESP_0)
+    msg = GPU_Rd32(gpu, SMCReg.MESSAGE_0)
+    PrintMessage("  SMC RESP_0:          0x")
+    PrintHex(resp)
+    PrintMessage("\n")
+    PrintMessage("  SMC MESSAGE_0:       0x")
+    PrintHex(msg)
+    PrintMessage("\n")
+
+    PrintMessage("  SMC_SI_IsRunning:    ")
+    PrintNumber(SMC_SI_IsRunning(gpu))
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 2: Reset DPM registers to POST defaults
+    // =============================================
+    PrintMessage("\n========================================\n")
+    PrintMessage("Step 2: Reset DPM Registers to Defaults\n")
+    PrintMessage("========================================\n")
+
+    // Clear GLOBAL_PWRMGT_EN (bit 0) and VOLT_PWRMGT_EN (bit 10)
+    // Keep other bits as-is to preserve safe defaults
+    gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+    gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.GLOBAL_PWRMGT_EN))
+    gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.VOLT_PWRMGT_EN))
+    GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
+    PrintMessage("  GENERAL_PWRMGT after clear: 0x")
+    PrintHex(GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT))
+    PrintMessage("\n")
+
+    // Set SCLK_PWRMGT_OFF (bit 0) to disable SCLK power management
+    sclk_pwr = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
+    sclk_pwr = BitwiseOr(sclk_pwr, SclkPwrBits.SCLK_PWRMGT_OFF)
+    GPU_Wr32(gpu, DPMReg.SCLK_PWRMGT_CNTL, sclk_pwr)
+    PrintMessage("  SCLK_PWRMGT_CNTL after set: 0x")
+    PrintHex(GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL))
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 3: Force stop the SMC
+    // =============================================
+    PrintMessage("\n========================================\n")
+    PrintMessage("Step 3: Force Stop SMC\n")
+    PrintMessage("========================================\n")
+
+    // Hard stop: disable clock + assert reset
+    SMC_SI_StopSMC(gpu)
+
+    rst = SMC_SI_IndRd32(gpu, SMCSyscon.RESET_CNTL)
+    clk = SMC_SI_IndRd32(gpu, SMCSyscon.CLOCK_CNTL_0)
+    PrintMessage("  After stop — RST: 0x")
+    PrintHex(rst)
+    PrintMessage("  CLK: 0x")
+    PrintHex(clk)
+    PrintMessage("\n")
+    PrintMessage("  IsRunning: ")
+    PrintNumber(SMC_SI_IsRunning(gpu))
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 4: Load firmware fresh
+    // =============================================
+    PrintMessage("\n========================================\n")
+    PrintMessage("Step 4: Load SMC Firmware\n")
+    PrintMessage("========================================\n")
+
+    // Clear RESP_0 before load
+    GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+
+    smc_rc = SMC_LoadFirmware(gpu)
+    PrintMessage("SMC load result: ")
+    PrintNumber(smc_rc)
+    PrintMessage("\n")
+    IfCondition LessThan(smc_rc, 0) ThenBlock: {
+        PrintMessage("FAIL: SMC firmware load failed\n")
+        gi = 0
+        WhileLoop LessThan(gi, count) {
+            GPU_BAR_Unmap(gi)
+            gi = Add(gi, 1)
+        }
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    PrintMessage("SMC running (post-load): ")
+    PrintNumber(SMC_SI_IsRunning(gpu))
+    PrintMessage("\n")
+
+    // Read back syscon state
+    rst = SMC_SI_IndRd32(gpu, SMCSyscon.RESET_CNTL)
+    clk = SMC_SI_IndRd32(gpu, SMCSyscon.CLOCK_CNTL_0)
+    PrintMessage("  RST: 0x")
+    PrintHex(rst)
+    PrintMessage("  CLK: 0x")
+    PrintHex(clk)
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 5: Verify SMC responds
+    // =============================================
+    PrintMessage("\n========================================\n")
+    PrintMessage("Step 5: Verify SMC Messages\n")
+    PrintMessage("========================================\n")
+
+    // Test 1: NoDisplay (0x5D)
+    PrintMessage("Test NoDisplay (0x5D): ")
+    GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+    resp = SMC_SendMessage(gpu, SMCMsg.NO_DISPLAY)
+    PrintMessage("resp=0x")
+    PrintHex(resp)
+    IfCondition EqualTo(resp, SMCResp.OK) ThenBlock: {
+        PrintMessage(" OK\n")
+    }
+    ElseBlock: {
+        PrintMessage(" FAILED\n")
+        PrintMessage("  RESP_0: 0x")
+        PrintHex(GPU_Rd32(gpu, SMCReg.RESP_0))
+        PrintMessage("\n")
+    }
+
+    // Test 2: TEST (0x01)
+    PrintMessage("Test TEST (0x01):      ")
+    GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+    resp = SMC_SendMessage(gpu, SMCMsg.TEST)
+    PrintMessage("resp=0x")
+    PrintHex(resp)
+    IfCondition EqualTo(resp, SMCResp.OK) ThenBlock: {
+        PrintMessage(" OK\n")
+    }
+    ElseBlock: {
+        PrintMessage(" FAILED\n")
+    }
+
+    // Test 3: HALT (0x10) then RESUME (0x11)
+    PrintMessage("Test HALT (0x10):      ")
+    GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+    resp = SMC_SendMessage(gpu, SMCMsg.HALT)
+    PrintMessage("resp=0x")
+    PrintHex(resp)
+    IfCondition EqualTo(resp, SMCResp.OK) ThenBlock: {
+        PrintMessage(" OK\n")
+        SMC_WaitInactive(gpu)
+        PrintMessage("Test RESUME (0x11):    ")
+        GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+        resp = SMC_SendMessage(gpu, SMCMsg.RESUME)
+        PrintMessage("resp=0x")
+        PrintHex(resp)
+        IfCondition EqualTo(resp, SMCResp.OK) ThenBlock: {
+            PrintMessage(" OK\n")
+        }
+        ElseBlock: {
+            PrintMessage(" FAILED\n")
+        }
+    }
+    ElseBlock: {
+        PrintMessage(" FAILED\n")
+    }
+
+    // =============================================
+    // STEP 6: Read firmware header
+    // =============================================
+    PrintMessage("\n========================================\n")
+    PrintMessage("Step 6: Firmware Header\n")
+    PrintMessage("========================================\n")
+    PrintMessage("  softRegisters: 0x")
+    PrintHex(SMC_ReadSRAM(gpu, Add(65536, SMCFWHdr.SOFT_REGS)))
+    PrintMessage("\n  stateTable:    0x")
+    PrintHex(SMC_ReadSRAM(gpu, Add(65536, SMCFWHdr.STATE_TABLE)))
+    PrintMessage("\n  fanTable:      0x")
+    PrintHex(SMC_ReadSRAM(gpu, Add(65536, SMCFWHdr.FAN_TABLE)))
+    PrintMessage("\n  spllTable:     0x")
+    PrintHex(SMC_ReadSRAM(gpu, Add(65536, SMCFWHdr.SPLL_TABLE)))
+    PrintMessage("\n")
+
+    // =============================================
+    // STEP 7: Clean stop
+    // =============================================
+    PrintMessage("\n========================================\n")
+    PrintMessage("Step 7: Clean Stop\n")
+    PrintMessage("========================================\n")
+    SMC_StopSMC(gpu)
+    PrintMessage("SMC stopped\n")
+
+    // Final register state
+    PrintMessage("  GENERAL_PWRMGT:    0x")
+    PrintHex(GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT))
+    PrintMessage("\n")
+    PrintMessage("  SCLK_PWRMGT_CNTL: 0x")
+    PrintHex(GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL))
+    PrintMessage("\n")
+
+    // --- Cleanup ---
+    gi = 0
+    WhileLoop LessThan(gi, count) {
+        GPU_BAR_Unmap(gi)
+        gi = Add(gi, 1)
+    }
+
+    PrintMessage("\n=== SMC Recovery Test Complete ===\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)
