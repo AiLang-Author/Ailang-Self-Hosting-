@@ -27,6 +27,19 @@ LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
 LibraryImport.Drivers.AMDGPU.AMDGPUBAR
 LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
 LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPowerPlay
+LibraryImport.Drivers.AMDGPU.AMDGPUVoltage
+LibraryImport.Drivers.AMDGPU.AMDGPUSMCRegs
+LibraryImport.Drivers.AMDGPU.AMDGPUSMC_SI
+LibraryImport.Drivers.AMDGPU.AMDGPUSMC
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExec
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecIO
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecDecode
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecOps
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecRun
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.AMDGPUDPM_SI
+LibraryImport.Drivers.AMDGPU.AMDGPUDPM
 LibraryImport.Accel.ComputeIR
 LibraryImport.Accel.ComputeIR_GCN
 LibraryImport.Drivers.AMDGPU.AMDGPUDisplay
@@ -127,10 +140,32 @@ Function.AccelGCN_Init {
             ReturnValue(-1)
         }
 
-        gpu = AccelGCNCfg.gpu_idx
-        //PrintMessage("[AccelGCN] using GPU ")
-        //PrintNumber(gpu)
-        //PrintMessage("\n")
+        // Select compute GPU by PCI bus.
+        // On dual-GPU systems (FX-8320 / RD990), bus 1 = display GPU (radeon
+        // bound, NEVER TOUCH), bus 2 = compute GPU (radeon unbound).
+        // On single-GPU systems, use whatever GPU is found.
+        gpu = 0
+        IfCondition GreaterThan(n_gpus, 1) ThenBlock: {
+            gi = 0
+            gpu = -1
+            WhileLoop LessThan(gi, n_gpus) {
+                bus = GPU_GetDeviceField(gi, GPUDevField.PCI_BUS)
+                IfCondition EqualTo(bus, 2) ThenBlock: {
+                    gpu = gi
+                }
+                gi = Add(gi, 1)
+            }
+            IfCondition LessThan(gpu, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] no GPU on PCI bus 02, using GPU 0\n")
+                gpu = 0
+            }
+        }
+        AccelGCNCfg.gpu_idx = gpu
+        PrintMessage("[AccelGCN] using GPU ")
+        PrintNumber(gpu)
+        PrintMessage(" (bus ")
+        PrintNumber(GPU_GetDeviceField(gpu, GPUDevField.PCI_BUS))
+        PrintMessage(")\n")
 
         // Map MMIO and VRAM BARs
         GPU_BAR_Init()
@@ -144,6 +179,23 @@ Function.AccelGCN_Init {
             PrintMessage("[AccelGCN] VRAM map failed\n")
             ReturnValue(-3)
         }
+
+        // ---------------------------------------------------------------
+        // SPLL / DPM init — MUST happen BEFORE any GRBM-domain writes.
+        // GRBM-routed registers (CP_ME_CNTL, GRBM_SOFT_RESET, firmware
+        // load regs, etc.) require the engine clock to complete PCI
+        // transactions.  On fresh boot with radeon unbound the SPLL is
+        // in reset/bypass — writing GRBM regs without clocks stalls
+        // the PCI bus and hard-locks the shared RD990 root complex.
+        // ---------------------------------------------------------------
+        rom = AtomBIOS_LoadROM(gpu)
+        IfCondition NotEqual(rom, 0) ThenBlock: {
+            ap_rc = AtomBIOS_Parse(gpu)
+        }
+        PP_Parse(gpu)
+        Volt_Parse(gpu)
+
+        spll_rc = DPM_SI_InitSPLL(gpu)
 
         // Set up PM4 ring (ring 0 = GFX)
         ring = AccelGCNCfg.ring_idx
@@ -301,415 +353,36 @@ Function.AccelGCN_Init {
         // Initialize kernel cache
         discard_kc = KCache_Init()
 
-        // Program SCLK to performance state.
-        // Try AtomBIOS first for clock data; fall back to hardcoded
-        // HD 7770 values if ROM is inaccessible (driver blacklisted).
-        // Non-fatal: if SCLK programming fails, we continue at boot clocks.
-        rom = AtomBIOS_LoadROM(gpu)
-        IfCondition NotEqual(rom, 0) ThenBlock: {
-            ap_rc = AtomBIOS_Parse(gpu)
-            IfCondition EqualTo(ap_rc, 1) ThenBlock: {
-                AtomBIOS_PrintInfo(gpu)
-            }
+        // Enable DPM for SMC-managed clock/voltage scaling.
+        // AtomBIOS/PP/Volt/SPLL already initialized above (before PM4_HaltCP).
+        smc_rc = SMC_LoadFirmware(gpu)
+        IfCondition EqualTo(smc_rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] SMC firmware load failed, continuing at boot clocks\n")
         }
-        sclk_rc = AccelGCN_SetSCLK(gpu)
-        IfCondition LessThan(sclk_rc, 0) ThenBlock: {
-            PrintMessage("[AccelGCN] SCLK programming failed (rc=")
-            PrintNumber(sclk_rc)
-            PrintMessage("), continuing at boot clocks\n")
+        ElseBlock: {
+            DPM_Init()
+            dpm_rc = DPM_Enable(gpu)
+            IfCondition EqualTo(dpm_rc, 1) ThenBlock: {
+                DPM_SI_UploadDriverState(gpu)
+                // Force HIGH for compute workload
+                dpm = DPM_SI_GetEntry(gpu)
+                num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
+                DPM_SetLevel(gpu, Subtract(num_levels, 1))
+                PrintMessage("[AccelGCN] DPM enabled, forced HIGH (")
+                PrintNumber(num_levels)
+                PrintMessage(" levels)\n")
+            }
+            ElseBlock: {
+                PrintMessage("[AccelGCN] DPM enable failed, continuing at boot clocks\n")
+            }
         }
 
         AccelGCNCfg.initialized = 1
-        //PrintMessage("[AccelGCN] ready\n")
         ReturnValue(0)
     }
 }
 
-// =============================================================================
-// SpinDelay — waste ~N microseconds by reading a harmless GPU register
-// Each MMIO read over PCIe takes ~200-500ns, so 200 reads ≈ 40-100 µs.
-// =============================================================================
-Function.SpinDelay {
-    Input: gpu: Integer
-    Input: iters: Integer
-    Body: {
-        di = 0
-        WhileLoop LessThan(di, iters) {
-            discard = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
-            di = Add(di, 1)
-        }
-    }
-}
 
-// =============================================================================
-// AccelGCN_SetSCLK — program SPLL to the highest boot-safe DPM clock
-//
-// Direct MMIO SPLL programming (no SMC firmware needed).
-// Selects the highest clock from the PowerPlay DPM table that fits
-// within the boot VDDC (no voltage reprogramming required).
-//
-// Uses correct 12.14 fixed-point FBDIV encoding and valid PDIV such that
-// VCO stays within the SI SPLL range [600, 1200] MHz.
-//
-// Full sequence: blank CRTCs → disable SS → bypass → powerdown →
-//   program dividers → powerup → poll lock → stabilize →
-//   unbypass → stabilize → unblank CRTCs
-//
-// Error recovery: on any failure, re-enables bypass (engine at 27 MHz ref)
-// and unblanks CRTCs before returning.
-//
-// Returns: 0=success, -1=no AtomBIOS data, -2=PLL lock/mux timeout,
-//          -3=no valid PDIV, -4=no safe DPM entry
-// =============================================================================
-Function.AccelGCN_SetSCLK {
-    Input: gpu: Integer
-    Output: Integer
-    Body: {
-        // Phase 0: Read reference data
-        ref_khz = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
-        IfCondition EqualTo(ref_khz, 0) ThenBlock: { ref_khz = 27000 }
-
-        boot_vddc = AtomBIOS_GetField(gpu, AtomField.BOOT_VDDC)
-
-        // Phase 1: DPM target selection — highest SCLK within boot voltage
-        num_dpm = AtomBIOS_GetDPMCount(gpu)
-        vid_threshold = 65280
-        best_sclk = 0
-        best_vddc = 0
-        di = 0
-        dpm_vddc = 0
-        dpm_mclk = 0
-
-        IfCondition GreaterThan(num_dpm, 0) ThenBlock: {
-            PrintMessage("[SCLK] DPM entries: ")
-            PrintNumber(num_dpm)
-            PrintMessage(", boot VDDC=")
-            PrintNumber(boot_vddc)
-            PrintMessage(" mV\n")
-
-            WhileLoop LessThan(di, num_dpm) {
-                dpm_sclk = AtomBIOS_GetDPMEntry(gpu, di, AddressOf(dpm_vddc), AddressOf(dpm_mclk))
-                // Skip SMC-only VID entries
-                IfCondition LessThan(dpm_vddc, vid_threshold) ThenBlock: {
-                    // Skip entries needing more voltage than boot
-                    IfCondition LessEqual(dpm_vddc, boot_vddc) ThenBlock: {
-                        IfCondition GreaterThan(dpm_sclk, best_sclk) ThenBlock: {
-                            best_sclk = dpm_sclk
-                            best_vddc = dpm_vddc
-                        }
-                    }
-                }
-                di = Add(di, 1)
-            }
-        }
-
-        // HD 7770 "GHz Edition" — every Cape Verde XT ships at 1 GHz reference.
-        // The PP DPM table only covers idle/2D states (up to 500 MHz).
-        // Use the card's rated 3D clock: 1000 MHz (within SPLL VCO range).
-        // Boot VDDC 950 mV is sufficient (reference VDDC ~1050 mV, OC to
-        // 1170 MHz reported stable at stock voltage).
-        target_khz = 1000000
-        IfCondition GreaterThan(best_sclk, 0) ThenBlock: {
-            PrintMessage("[SCLK] PP max=")
-            PrintNumber(Divide(best_sclk, 1000))
-            PrintMessage(" MHz (2D/idle), targeting rated 3D clock\n")
-        }
-        IfCondition EqualTo(target_khz, 0) ThenBlock: {
-            target_khz = AtomBIOS_GetField(gpu, AtomField.DEF_ENGINE_CLK)
-            IfCondition EqualTo(target_khz, 0) ThenBlock: {
-                PrintMessage("[SCLK] no AtomBIOS engine clock data\n")
-                ReturnValue(-1)
-            }
-            PrintMessage("[SCLK] no safe DPM entry, using DEF_ENGINE_CLK=")
-            PrintNumber(Divide(target_khz, 1000))
-            PrintMessage(" MHz\n")
-        }
-        IfCondition GreaterThan(best_sclk, 0) ThenBlock: {
-            PrintMessage("[SCLK] best DPM: ")
-            PrintNumber(Divide(best_sclk, 1000))
-            PrintMessage(" MHz @ ")
-            PrintNumber(best_vddc)
-            PrintMessage(" mV\n")
-        }
-
-        // Phase 2: Compute PDIV — keep VCO in [600, 1200] MHz
-        vco_min = 600000
-        vco_max = 1200000
-        use_refdiv = 1
-        use_pdiv = 0
-        try_pdiv = 1
-        WhileLoop LessEqual(try_pdiv, 127) {
-            vco_try = Multiply(target_khz, try_pdiv)
-            IfCondition GreaterEqual(vco_try, vco_min) ThenBlock: {
-                IfCondition LessEqual(vco_try, vco_max) ThenBlock: {
-                    use_pdiv = try_pdiv
-                    ExitLoop
-                }
-            }
-            IfCondition GreaterThan(vco_try, vco_max) ThenBlock: { ExitLoop }
-            try_pdiv = Add(try_pdiv, 1)
-        }
-
-        IfCondition EqualTo(use_pdiv, 0) ThenBlock: {
-            PrintMessage("[SCLK] no valid PDIV for target ")
-            PrintNumber(Divide(target_khz, 1000))
-            PrintMessage(" MHz\n")
-            ReturnValue(-3)
-        }
-
-        vco_khz = Multiply(target_khz, use_pdiv)
-
-        // Phase 3: Compute FBDIV in 12.14 fixed-point
-        // FBDIV_12_14 = (VCO * REFDIV * 16384) / ref_khz
-        fbdiv_fixed = Divide(Multiply(vco_khz, Multiply(use_refdiv, 16384)), ref_khz)
-        fbdiv_int = ShiftRight(fbdiv_fixed, 14)
-        fbdiv_frac = BitwiseAnd(fbdiv_fixed, 16383)
-
-        // Compute achieved SCLK from fixed-point dividers
-        denom = Multiply(use_refdiv, use_pdiv)
-        actual_int = Divide(Multiply(ref_khz, fbdiv_int), denom)
-        actual_frac = Divide(Multiply(ref_khz, fbdiv_frac), Multiply(denom, 16384))
-        actual_khz = Add(actual_int, actual_frac)
-
-        // Phase 4: Decode current SCLK (proper 12.14 fixed-point)
-        cntl   = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
-        cntl3  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
-
-        cur_refdiv = BitwiseAnd(ShiftRight(cntl, 4), 63)
-        cur_pdiv   = BitwiseAnd(ShiftRight(cntl, 20), 127)
-        cur_fbdiv_raw = BitwiseAnd(cntl3, 67108863)
-        IfCondition EqualTo(cur_refdiv, 0) ThenBlock: { cur_refdiv = 1 }
-        IfCondition EqualTo(cur_pdiv, 0) ThenBlock: { cur_pdiv = 1 }
-
-        cur_fbdiv_int = ShiftRight(cur_fbdiv_raw, 14)
-        cur_fbdiv_frac = BitwiseAnd(cur_fbdiv_raw, 16383)
-        cur_denom = Multiply(cur_refdiv, cur_pdiv)
-        cur_sclk_int = Divide(Multiply(ref_khz, cur_fbdiv_int), cur_denom)
-        cur_sclk_frac = Divide(Multiply(ref_khz, cur_fbdiv_frac), Multiply(cur_denom, 16384))
-        cur_sclk = Add(cur_sclk_int, cur_sclk_frac)
-
-        PrintMessage("[SCLK] current=")
-        PrintNumber(Divide(cur_sclk, 1000))
-        PrintMessage(" MHz, target=")
-        PrintNumber(Divide(actual_khz, 1000))
-        PrintMessage(" MHz (PDIV=")
-        PrintNumber(use_pdiv)
-        PrintMessage(" VCO=")
-        PrintNumber(Divide(vco_khz, 1000))
-        PrintMessage(" FBDIV=0x")
-        PrintHex(fbdiv_fixed)
-        PrintMessage(")\n")
-
-        // Already at target? (within 1%)
-        diff = Subtract(actual_khz, cur_sclk)
-        IfCondition LessThan(diff, 0) ThenBlock: { diff = Subtract(0, diff) }
-        threshold = Divide(target_khz, 100)
-        IfCondition LessThan(diff, threshold) ThenBlock: {
-            PrintMessage("[SCLK] already at target, skipping reprogram\n")
-            ReturnValue(0)
-        }
-
-        // Phase 5: Blank all active CRTCs before SPLL reprogram
-        blanked = DCE6_BlankAllActive(gpu)
-        PrintMessage("[SCLK] blanked ")
-        PrintNumber(blanked)
-        PrintMessage(" CRTCs\n")
-
-        // Phase 6: SPLL Reprogram Sequence
-        // Matches the Linux kernel radeon/amdgpu driver:
-        //   si_set_clk_bypass_mode → si_spll_powerdown → program →
-        //   si_spll_powerup → poll lock → stabilize → unbypass → stabilize
-
-        // Re-read registers (fresh after blank)
-        cntl   = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
-        cntl2  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-        cntl3  = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
-        ss_reg = GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM)
-
-        // Step 1: Disable spread spectrum
-        ss_new = BitwiseAnd(ss_reg, Subtract(4294967295, SPLLBits.SSEN))
-        GPU_Wr32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM, ss_new)
-        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM)
-
-        // Step 2: Enable bypass via HW handshake
-        // 2a: Set SPLL_BYPASS_EN
-        cntl_new = BitwiseOr(cntl, SPLLBits.SPLL_BYPASS_EN)
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
-        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
-
-        // 2b: Request clock change
-        cntl2_new = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-        cntl2_new = BitwiseOr(cntl2_new, SPLLBits.SPLL_CTLREQ_CHG)
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_new)
-        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-
-        // 2c: Poll SPLL_STATUS for mux switch confirmation
-        mux_count = 0
-        mux_ok = 0
-        WhileLoop LessThan(mux_count, 100000) {
-            mux_st = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
-            IfCondition NotEqual(BitwiseAnd(mux_st, SPLLBits.SPLL_CHG_STATUS), 0) ThenBlock: {
-                mux_ok = 1
-                ExitLoop
-            }
-            mux_count = Add(mux_count, 1)
-        }
-
-        IfCondition EqualTo(mux_ok, 0) ThenBlock: {
-            PrintMessage("[SCLK] bypass mux handshake timeout\n")
-            cntl2_clr = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-            cntl2_clr = BitwiseAnd(cntl2_clr, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
-            cntl2_clr = BitwiseAnd(cntl2_clr, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
-            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_clr)
-            cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_BYPASS_EN))
-            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
-            DCE6_UnblankAllActive(gpu)
-            ReturnValue(-2)
-        }
-
-        // 2d: Clear CTLREQ_CHG + SCLK_MUX_UPDATE
-        cntl2_new = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-        cntl2_new = BitwiseAnd(cntl2_new, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
-        cntl2_new = BitwiseAnd(cntl2_new, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_new)
-
-        // Step 3: SPLL powerdown (si_spll_powerdown)
-        // 3a: Set SW direct control
-        cntl_mode_new = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
-        cntl_mode_new = BitwiseOr(cntl_mode_new, SPLLBits.SPLL_SW_DIR_CONTROL)
-        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, cntl_mode_new)
-
-        // 3b: Assert SPLL_RESET
-        cntl_new = BitwiseOr(cntl_new, SPLLBits.SPLL_RESET)
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
-
-        // 3c: Assert SPLL_SLEEP
-        cntl_new = BitwiseOr(cntl_new, SPLLBits.SPLL_SLEEP)
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
-
-        // 3d: Release SW direct control
-        cntl_mode_new = BitwiseAnd(cntl_mode_new, Subtract(4294967295, SPLLBits.SPLL_SW_DIR_CONTROL))
-        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, cntl_mode_new)
-
-        // Step 4: Program new dividers (PLL is reset+sleeping, safe to modify)
-        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_REF_DIV_MASK))
-        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_PDIV_A_MASK))
-        cntl_new = BitwiseOr(cntl_new, Multiply(use_refdiv, 16))
-        cntl_new = BitwiseOr(cntl_new, Multiply(use_pdiv, 1048576))
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
-
-        // Program FBDIV as 12.14 fixed-point in CNTL_3
-        cntl3_new = BitwiseAnd(cntl3, Subtract(4294967295, SPLLBits.SPLL_FB_DIV_MASK))
-        cntl3_new = BitwiseOr(cntl3_new, fbdiv_fixed)
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3, cntl3_new)
-
-        // Step 5: SPLL powerup (si_spll_powerup — reverse of powerdown)
-        cntl_mode_new = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
-        cntl_mode_new = BitwiseOr(cntl_mode_new, SPLLBits.SPLL_SW_DIR_CONTROL)
-        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, cntl_mode_new)
-
-        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_SLEEP))
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
-
-        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_RESET))
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
-
-        cntl_mode_new = BitwiseAnd(cntl_mode_new, Subtract(4294967295, SPLLBits.SPLL_SW_DIR_CONTROL))
-        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, cntl_mode_new)
-
-        // Step 6: Poll for PLL lock
-        lock_count = 0
-        lock_ok = 0
-        WhileLoop LessThan(lock_count, 100000) {
-            st = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
-            IfCondition NotEqual(BitwiseAnd(st, SPLLBits.SPLL_CHG_STATUS), 0) ThenBlock: {
-                lock_ok = 1
-                ExitLoop
-            }
-            lock_count = Add(lock_count, 1)
-        }
-
-        IfCondition EqualTo(lock_ok, 0) ThenBlock: {
-            PrintMessage("[SCLK] PLL lock timeout — engine at 27 MHz ref\n")
-            DCE6_UnblankAllActive(gpu)
-            ReturnValue(-2)
-        }
-
-        PrintMessage("[SCLK] PLL locked after ")
-        PrintNumber(lock_count)
-        PrintMessage(" polls\n")
-
-        // Stabilization delay (~40-100 us)
-        SpinDelay(gpu, 200)
-
-        // Re-verify lock after stabilization
-        recheck_st = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
-        recheck_locked = BitwiseAnd(recheck_st, SPLLBits.SPLL_CHG_STATUS)
-        IfCondition EqualTo(recheck_locked, 0) ThenBlock: {
-            PrintMessage("[SCLK] PLL lost lock after stabilization — engine at 27 MHz ref\n")
-            DCE6_UnblankAllActive(gpu)
-            ReturnValue(-2)
-        }
-
-        // Step 7: Disable bypass via HW handshake (reverse of step 2)
-        // 7a: Clear SPLL_BYPASS_EN
-        cntl_new = BitwiseAnd(cntl_new, Subtract(4294967295, SPLLBits.SPLL_BYPASS_EN))
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, cntl_new)
-        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
-
-        // 7b: Request clock change
-        cntl2_new = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-        cntl2_new = BitwiseOr(cntl2_new, SPLLBits.SPLL_CTLREQ_CHG)
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_new)
-        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-
-        // 7c: Poll for mux switch confirmation
-        mux_count2 = 0
-        mux_ok2 = 0
-        WhileLoop LessThan(mux_count2, 100000) {
-            mux_st2 = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
-            IfCondition NotEqual(BitwiseAnd(mux_st2, SPLLBits.SPLL_CHG_STATUS), 0) ThenBlock: {
-                mux_ok2 = 1
-                ExitLoop
-            }
-            mux_count2 = Add(mux_count2, 1)
-        }
-
-        IfCondition EqualTo(mux_ok2, 0) ThenBlock: {
-            PrintMessage("[SCLK] bypass-disable mux timeout\n")
-            cntl2_clr2 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-            cntl2_clr2 = BitwiseAnd(cntl2_clr2, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
-            cntl2_clr2 = BitwiseAnd(cntl2_clr2, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
-            GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_clr2)
-            DCE6_UnblankAllActive(gpu)
-            ReturnValue(-2)
-        }
-
-        // 7d: Clear CTLREQ_CHG + SCLK_MUX_UPDATE
-        cntl2_new = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
-        cntl2_new = BitwiseAnd(cntl2_new, Subtract(4294967295, SPLLBits.SPLL_CTLREQ_CHG))
-        cntl2_new = BitwiseAnd(cntl2_new, Subtract(4294967295, SPLLBits.SCLK_MUX_UPDATE))
-        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2, cntl2_new)
-
-        // Post-bypass stabilization delay
-        SpinDelay(gpu, 200)
-
-        // Phase 7: Unblank CRTCs
-        unblanked = DCE6_UnblankAllActive(gpu)
-
-        PrintMessage("[SCLK] engine clock now ~")
-        PrintNumber(Divide(actual_khz, 1000))
-        PrintMessage(" MHz (PDIV=")
-        PrintNumber(use_pdiv)
-        PrintMessage(" blanked/unblanked=")
-        PrintNumber(blanked)
-        PrintMessage("/")
-        PrintNumber(unblanked)
-        PrintMessage(")\n")
-
-        ReturnValue(0)
-    }
-}
 
 // =============================================================================
 // AccelGCN_Shutdown — release all resources
@@ -725,6 +398,11 @@ Function.AccelGCN_Shutdown {
         PM4_Destroy(ring)
 
         gpu = AccelGCNCfg.gpu_idx
+
+        // Disable DPM before releasing BARs
+        DPM_Disable(gpu)
+        DPM_Shutdown(gpu)
+
         GPU_BAR_Unmap(gpu)
 
         discard_cir = CIR_Shutdown()
@@ -908,6 +586,11 @@ Function.AccelGCN_Upload {
 
         // Flush CPU WC buffer to ensure shader code is visible in VRAM
         InlineAsm["0f ae f8"]
+
+        // Flush HDP write cache so GPU fetches actual shader bytes from VRAM
+        GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+        // PCIe barrier — read back a register to ensure flush completes
+        discard_barrier = GPU_Rd32(gpu, SIReg.SCRATCH_REG0)
 
         // Return GPU-side VRAM address (same as offset for aperture-mapped VRAM)
         ReturnValue(aligned_off)
@@ -2323,19 +2006,33 @@ Function.AccelGCN_VramWrite {
         vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
         dst = Add(vram_ptr, Add(AccelGCNCfg.data_vram, offset))
 
+        // Fault in BAR0 pages before bulk copy.  The first CPU store to
+        // a not-yet-faulted BAR page can be silently lost (the page fault
+        // handler maps the physical page but the triggering store is not
+        // replayed).  A dummy DWORD read per 4KB page forces the MMU to
+        // set up the mapping so the subsequent MemoryCopy lands safely.
+        _wp = 0
+        WhileLoop LessThan(_wp, nbytes) {
+            _discard_w = Dereference(Add(dst, _wp), "dword")
+            _wp = Add(_wp, 4096)
+        }
+
         MemoryCopy(dst, src, nbytes)
         // Flush CPU WC (write-combine) buffer so data is visible in VRAM
         // before GPU reads it.  Without this, the shader may read stale/zero
         // data from VRAM while CPU writes still sit in the WC buffer.
         InlineAsm["0f ae f8"]
 
-        // PCIe write-posting barrier: SFENCE only orders CPU stores — it does
-        // NOT wait for posted writes to cross the PCIe bus and reach VRAM.
-        // An MMIO register read forces the CPU to wait for all pending PCIe
-        // posted writes to complete (PCIe ordering rules: a read completion
-        // cannot pass prior posted writes).  Without this, large VRAM uploads
-        // (512KB+) may still be in-flight when the GPU shader starts reading.
-        // This is the standard technique used by every GPU kernel driver.
+        // Flush HDP write cache so GPU sees our data in actual VRAM.
+        // CPU writes go: CPU → WC buffer → (SFENCE) → PCI bus → HDP → VRAM.
+        // The HDP may hold writes in its cache; the GPU reads VRAM directly,
+        // bypassing HDP.  Writing 1 to HDP_MEM_COHERENCY_FLUSH_CNTL drains
+        // the HDP cache to VRAM.  This matches radeon_flush_hdp() in the
+        // Linux kernel driver.
+        GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+
+        // PCIe write-posting barrier: an MMIO read forces all pending PCIe
+        // posted writes to complete before returning.
         discard_barrier = GPU_Rd32(gpu, SIReg.SCRATCH_REG0)
 
         ReturnValue(nbytes)
@@ -2358,6 +2055,16 @@ Function.AccelGCN_VramRead {
         vram_state = GPU_BAR_GetState(gpu)
         vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
         src = Add(vram_ptr, Add(AccelGCNCfg.data_vram, offset))
+
+        // Flush HDP so CPU reads see GPU-written VRAM, not stale HDP cache
+        GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+
+        // Fault in BAR0 pages (same rationale as VramWrite)
+        _wp = 0
+        WhileLoop LessThan(_wp, nbytes) {
+            _discard_w = Dereference(Add(src, _wp), "dword")
+            _wp = Add(_wp, 4096)
+        }
 
         MemoryCopy(dst, src, nbytes)
         ReturnValue(nbytes)

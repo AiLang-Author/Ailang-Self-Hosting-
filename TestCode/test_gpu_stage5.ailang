@@ -1,0 +1,171 @@
+// test_gpu_stage5.ailang — ISOLATION TEST: Full compute dispatch (the crasher)
+// Build: ./ailang.x TestCode/test_gpu_stage5.ailang test_gpu_stage5.x
+// Run:   sudo ./test_gpu_stage5.x
+//
+// This is identical to test_accel_gcn.ailang but uses AccelGCN_Init directly
+// (same as the original) and prints markers before/after each dispatch phase.
+//
+// The dispatch (AccelGCN_Dispatch → PM4_SubmitCompute) does:
+//   A. Upload shader bytes to VRAM
+//   B. Build V# descriptor + program USER_DATA SGPRs
+//   C. PM4_SubmitCompute:
+//      - SURFACE_SYNC (I$/K$ invalidate)
+//      - SET_SH_REG: PGM_LO/HI, PGM_RSRC1/2, VMID, RESOURCE_LIMITS
+//      - SET_SH_REG: STATIC_THREAD_MGMT, TMPRING_SIZE, START_X/Y/Z
+//      - SET_SH_REG: NUM_THREAD_X/Y/Z
+//      - IB: DISPATCH_DIRECT + CS_PARTIAL_FLUSH (written to VRAM)
+//      - INDIRECT_BUFFER (ring points to IB in VRAM)
+//      - SURFACE_SYNC (all caches)
+//      - Double EVENT_WRITE_EOP (fence)
+//      - PM4_Commit (doorbell write)
+//   D. PM4_WaitFenceVRAM
+//   E. PM4_DrainIH + post-fence NOP + WaitIdle
+//   F. HDP flush
+//
+// If this locks up: the dispatch is the problem. Check breadcrumbs BC0-BC4
+// in the VRAM fence dump to see HOW FAR the CP got before hanging.
+// BC0=entry, BC1=after I$/K$, BC2=after dispatch, BC3=after IB return, BC4=after TC flush.
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.GCNEnc
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+LibraryImport.Accel.HAL
+LibraryImport.Accel.AccelGCN
+
+SubRoutine.Main {
+    PrintMessage("=== GPU STAGE 5: Full Compute Dispatch ===\n\n")
+
+    // --- Full AccelGCN_Init (same as test_accel_gcn) ---
+    PrintMessage("[S5] AccelGCN_Init...\n")
+    rc = AccelGCN_Init()
+    PrintMessage("[S5] AccelGCN_Init result: ")
+    PrintNumber(rc)
+    PrintMessage("\n")
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[S5] FATAL: AccelGCN init failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[S5] Init OK\n\n")
+
+    // --- Build CIR kernel: dst[gid] = src[gid] + 42 ---
+    PrintMessage("[S5] Building CIR kernel...\n")
+    rc = CIR_Begin()
+    rc = CIR_SetGroupSize(64, 1, 1)
+    rc = CIR_SetGrid(1, 1, 1)
+    rc = CIR_BindBuffer(0, 0, 256, 4, 1)
+    rc = CIR_BindBuffer(1, 256, 256, 4, 2)
+
+    v_gid   = CIR_AllocVReg()
+    v_val   = CIR_AllocVReg()
+    v_const = CIR_AllocVReg()
+    v_sum   = CIR_AllocVReg()
+
+    rc = CIR_Op_GlobalIdX(v_gid)
+    rc = CIR_Op_LoadBuf(v_val, 0, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_LoadConst(v_const, 42)
+    rc = CIR_Op_AddU32(v_sum, v_val, v_const)
+    rc = CIR_Op_StoreBuf(v_sum, 1, v_gid)
+    rc = CIR_Op_WaitCnt(0, 0, 0)
+    rc = CIR_Op_EndPgm()
+    n_insns = CIR_End()
+    PrintMessage("[S5] Instructions: ")
+    PrintNumber(n_insns)
+    PrintMessage("\n")
+
+    // --- Lower to GCN ---
+    PrintMessage("[S5] Lowering to GCN...\n")
+    mc_bytes = CIR_Lower_GCN()
+    PrintMessage("[S5] Machine code: ")
+    PrintNumber(mc_bytes)
+    PrintMessage(" bytes\n")
+
+    // --- Write test data ---
+    PrintMessage("[S5] Writing test data to VRAM...\n")
+    host_src = Allocate(256)
+    i = 0
+    WhileLoop LessThan(i, 64) {
+        off = Multiply(i, 4)
+        SetByte(host_src, off, BitwiseAnd(i, 255))
+        SetByte(host_src, Add(off, 1), BitwiseAnd(RightShift(i, 8), 255))
+        SetByte(host_src, Add(off, 2), 0)
+        SetByte(host_src, Add(off, 3), 0)
+        i = Add(i, 1)
+    }
+    discard_wr = AccelGCN_VramWrite(0, host_src, 256)
+
+    host_dst = Allocate(256)
+    MemorySet(host_dst, 0, 256)
+    discard_wr2 = AccelGCN_VramWrite(256, host_dst, 256)
+    PrintMessage("[S5] Test data written\n\n")
+
+    // --- DISPATCH (the danger zone) ---
+    PrintMessage("[S5] >>> DISPATCHING — if system freezes here, dispatch is the crash <<<\n")
+    PrintMessage("[S5] Calling AccelGCN_Dispatch...\n")
+    rc = AccelGCN_Dispatch()
+    PrintMessage("[S5] AccelGCN_Dispatch result: ")
+    PrintNumber(rc)
+    PrintMessage("\n")
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[S5] FAIL: Dispatch returned error ")
+        PrintNumber(rc)
+        PrintMessage("\n")
+    }
+
+    // --- Read back and verify ---
+    PrintMessage("[S5] Reading back results...\n")
+    discard_rd = AccelGCN_VramRead(256, host_dst, 256)
+
+    errors = 0
+    i = 0
+    WhileLoop LessThan(i, 64) {
+        off = Multiply(i, 4)
+        b0 = GetByte(host_dst, off)
+        b1 = GetByte(host_dst, Add(off, 1))
+        b2 = GetByte(host_dst, Add(off, 2))
+        b3 = GetByte(host_dst, Add(off, 3))
+        got = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+        expected = Add(i, 42)
+
+        IfCondition LessThan(i, 4) ThenBlock: {
+            PrintMessage("  dst[")
+            PrintNumber(i)
+            PrintMessage("] = ")
+            PrintNumber(got)
+            PrintMessage(" (expect ")
+            PrintNumber(expected)
+            PrintMessage(")\n")
+        }
+
+        IfCondition NotEqual(got, expected) ThenBlock: {
+            errors = Add(errors, 1)
+        }
+        i = Add(i, 1)
+    }
+
+    PrintMessage("[S5] Results: ")
+    PrintNumber(Subtract(64, errors))
+    PrintMessage("/64 correct\n")
+
+    // --- Cleanup ---
+    Deallocate(host_src, 256)
+    Deallocate(host_dst, 256)
+    discard_shut = AccelGCN_Shutdown()
+
+    IfCondition EqualTo(errors, 0) ThenBlock: {
+        PrintMessage("\n=== STAGE 5 PASS ===\n")
+        SystemCall(60, 0, 0, 0, 0, 0)
+    }
+    PrintMessage("\n=== STAGE 5 FAIL (")
+    PrintNumber(errors)
+    PrintMessage(" errors) ===\n")
+    SystemCall(60, 1, 0, 0, 0, 0)
+}
+
+RunTask(Main)

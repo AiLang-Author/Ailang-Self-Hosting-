@@ -4,7 +4,7 @@
 # Measures total wall-clock time (startup + parse + compile + execute).
 # Each benchmark is run RUNS times, median reported.
 #
-# Usage: ./tools/bench_vs_v8.sh [sunspider|octane|all]
+# Usage: ./JS-tests/bench_vs_v8.sh [sunspider|octane|all]
 #
 # Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
 

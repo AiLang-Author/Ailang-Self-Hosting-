@@ -166,7 +166,12 @@ FixedPool.DPMField {
     "PSP":                 Initialize=136    // computed psp (BSP|BSU for last level)
     "SPLL_TABLE_ADDR":     Initialize=144    // SRAM address of SPLL div table
     "MC_REG_TABLE_ADDR":   Initialize=152    // SRAM address of MC reg table
-    "ENTRY_SIZE":          Initialize=160
+    "LEVELS_SCLK":         Initialize=160    // ptr to level SCLK array (kHz)
+    "LEVELS_MCLK":         Initialize=168    // ptr to level MCLK array (kHz)
+    "LEVELS_VDDC":         Initialize=176    // ptr to level VDDC array (mV)
+    "LEVELS_VDDCI":        Initialize=184    // ptr to level VDDCI array (mV)
+    "BOOT_VDDCI":          Initialize=192    // boot VDDCI in mV
+    "ENTRY_SIZE":          Initialize=200
 }
 
 FixedPool.DPMConst {
@@ -338,6 +343,12 @@ Function.DPM_SI_ComputeSPLL {
     Input: sclk_khz: Integer
     Input: out: Address
     Body: {
+        // Round sclk_khz to nearest multiple of 5120 kHz (= 512 × 10kHz)
+        // so SCLK_VALUE lands on an exact SPLL div table index.
+        // Without this, the SMC looks up a truncated index whose dividers
+        // don't match the FBDIV we compute here → SPLL can't lock → hang.
+        sclk_khz = Multiply(Divide(Add(sclk_khz, 2560), 5120), 5120)
+
         // Read SPLL register values as base template from BOOT HW registers
         // This matches the kernel's si_read_clock_registers() approach:
         // boot-time values are cached and used as template for all DPM levels.
@@ -842,6 +853,7 @@ Function.DPM_SI_BuildStateTable {
         StoreValue(Add(dpm, DPMField.BOOT_SCLK), boot_sclk)
         StoreValue(Add(dpm, DPMField.BOOT_MCLK), boot_mclk)
         StoreValue(Add(dpm, DPMField.BOOT_VDDC), boot_vddc)
+        StoreValue(Add(dpm, DPMField.BOOT_VDDCI), boot_vddci)
         StoreValue(Add(dpm, DPMField.REF_CLK), ref_clk)
 
         // Determine DPM levels from PP clock entries
@@ -886,14 +898,27 @@ Function.DPM_SI_BuildStateTable {
                 pp_vddc = Dereference(Add(pp_buf, PPClkEntry.VDDC))
                 pp_vddci = Dereference(Add(pp_buf, PPClkEntry.VDDCI))
 
+                // Resolve leakage voltage IDs (0xFFxx format) to real mV values
+                pp_vddc = Volt_ResolveLeakageVDDC(gpu, pp_vddc)
+
                 // Only add levels with:
                 //   - SCLK higher than boot (useful DPM level)
-                //   - VDDC > 0 and < 2000 (sane value, skip leakage IDs)
+                //   - VDDC > 0 and < 2000 (sane resolved voltage)
                 IfCondition GreaterThan(pp_sclk, boot_sclk) ThenBlock: {
                     IfCondition GreaterThan(pp_vddc, 0) ThenBlock: {
                         IfCondition LessThan(pp_vddc, 2000) ThenBlock: {
+                            // Enforce monotonic voltage: each level >= previous level's VDDC
+                            IfCondition GreaterThan(num_levels, 0) ThenBlock: {
+                                prev_vddc = Dereference(Add(levels_vddc, Multiply(Subtract(num_levels, 1), 8)))
+                                IfCondition LessThan(pp_vddc, prev_vddc) ThenBlock: {
+                                    pp_vddc = prev_vddc
+                                }
+                            }
                             StoreValue(Add(levels_sclk, Multiply(num_levels, 8)), pp_sclk)
-                            StoreValue(Add(levels_mclk, Multiply(num_levels, 8)), pp_mclk)
+                            // Use boot_mclk for all levels — we don't do MCLK DPM,
+                            // and MPLL shadow registers are not populated, so any MCLK
+                            // change would hang the SMC trying to reprogram MPLL with zeros.
+                            StoreValue(Add(levels_mclk, Multiply(num_levels, 8)), boot_mclk)
                             StoreValue(Add(levels_vddc, Multiply(num_levels, 8)), pp_vddc)
                             IfCondition EqualTo(pp_vddci, 0) ThenBlock: { pp_vddci = boot_vddci }
                             StoreValue(Add(levels_vddci, Multiply(num_levels, 8)), pp_vddci)
@@ -906,6 +931,39 @@ Function.DPM_SI_BuildStateTable {
         }
         Deallocate(pp_buf, PPClkEntry.SIZE)
 
+        // Sort levels 1..N-1 by ascending SCLK (bubble sort on parallel arrays).
+        // Level 0 (boot) stays fixed. SMC auto-throttle and Force HIGH/LOW
+        // require monotonically increasing SCLK across level indices.
+        sort_end = Subtract(num_levels, 1)
+        WhileLoop GreaterThan(sort_end, 1) {
+            si = 1
+            WhileLoop LessThan(si, sort_end) {
+                sj = Add(si, 1)
+                si_off = Multiply(si, 8)
+                sj_off = Multiply(sj, 8)
+                IfCondition GreaterThan(Dereference(Add(levels_sclk, si_off)), Dereference(Add(levels_sclk, sj_off))) ThenBlock: {
+                    // Swap sclk
+                    tmp = Dereference(Add(levels_sclk, si_off))
+                    StoreValue(Add(levels_sclk, si_off), Dereference(Add(levels_sclk, sj_off)))
+                    StoreValue(Add(levels_sclk, sj_off), tmp)
+                    // Swap mclk
+                    tmp = Dereference(Add(levels_mclk, si_off))
+                    StoreValue(Add(levels_mclk, si_off), Dereference(Add(levels_mclk, sj_off)))
+                    StoreValue(Add(levels_mclk, sj_off), tmp)
+                    // Swap vddc
+                    tmp = Dereference(Add(levels_vddc, si_off))
+                    StoreValue(Add(levels_vddc, si_off), Dereference(Add(levels_vddc, sj_off)))
+                    StoreValue(Add(levels_vddc, sj_off), tmp)
+                    // Swap vddci
+                    tmp = Dereference(Add(levels_vddci, si_off))
+                    StoreValue(Add(levels_vddci, si_off), Dereference(Add(levels_vddci, sj_off)))
+                    StoreValue(Add(levels_vddci, sj_off), tmp)
+                }
+                si = Add(si, 1)
+            }
+            sort_end = Subtract(sort_end, 1)
+        }
+
         PrintMessage("[DPM_SI] Built ")
         PrintNumber(num_levels)
         PrintMessage(" DPM levels:\n")
@@ -915,7 +973,9 @@ Function.DPM_SI_BuildStateTable {
             PrintNumber(li)
             PrintMessage("] SCLK=")
             PrintNumber(Divide(Dereference(Add(levels_sclk, Multiply(li, 8))), 1000))
-            PrintMessage("MHz  VDDC=")
+            PrintMessage("MHz  MCLK=")
+            PrintNumber(Dereference(Add(levels_mclk, Multiply(li, 8))))
+            PrintMessage("  VDDC=")
             PrintNumber(Dereference(Add(levels_vddc, Multiply(li, 8))))
             PrintMessage("mV\n")
             li = Add(li, 1)
@@ -946,8 +1006,9 @@ Function.DPM_SI_BuildStateTable {
 
         // Calculate state table buffer size
         // Fixed part: 640 bytes (up to driver state header)
-        // Driver state: 4 bytes header + num_levels * 148 bytes
-        tbl_size = Add(644, Multiply(num_levels, HWLevel.SIZE))
+        // Driver state at init: 4 bytes header + 1 level * 148 bytes
+        // (multi-level driverState is uploaded at runtime)
+        tbl_size = Add(644, HWLevel.SIZE)
         // Round up to 4-byte alignment
         tbl_size = Multiply(Divide(Add(tbl_size, 3), 4), 4)
 
@@ -1082,49 +1143,42 @@ Function.DPM_SI_BuildStateTable {
         StoreValue(Add(ulv_level, HWLevel.BSP), bsp_dsp, "dword")
 
         // --- Populate driverState (at offset 0x280) ---
+        // Match kernel's si_init_smc_table() lines 4694-4696:
+        //   table->driverState.flags = table->initialState.flags;
+        //   table->driverState.levelCount = table->initialState.levelCount;
+        //   table->driverState.levels[0] = table->initialState.level;
+        //
+        // The kernel ALWAYS initializes driverState with exactly 1 level
+        // (a copy of initialState). Multi-level driverState is ONLY uploaded
+        // at runtime via si_upload_sw_state() during si_dpm_set_power_state().
         drv_ptr = Add(tbl_buf, SMCTbl.DRIVER_STATE)
-        // SWSHdr BE DWORD: (flags<<24) | (levelCount<<16)
-        // flags: PPSMC_SWSTATE_FLAG_DC = 0x01
-        StoreValue(drv_ptr, Add(LeftShift(1, 24), LeftShift(num_levels, 16)))
-
-        j = 0
-        WhileLoop LessThan(j, num_levels) {
-            lvl_sclk = Dereference(Add(levels_sclk, Multiply(j, 8)))
-            lvl_mclk = Dereference(Add(levels_mclk, Multiply(j, 8)))
-            lvl_vddc = Dereference(Add(levels_vddc, Multiply(j, 8)))
-            lvl_vddci = Dereference(Add(levels_vddci, Multiply(j, 8)))
-
-            lvl_ptr = Add(drv_ptr, Add(4, Multiply(j, HWLevel.SIZE)))
-            arb_idx = Add(DPMConst.DRIVER_STATE_ARB, j)
-            // extra = (vddci << 16) | (pcie_gen << 8) | arb_idx
-            // pcie_gen=0 for now (match firmware's initialState default)
-            lvl_extra = Add(LeftShift(lvl_vddci, 16), arb_idx)
-            DPM_SI_PopulateLevel(gpu, lvl_ptr, lvl_sclk, lvl_mclk, lvl_vddc, lvl_extra)
-
-            // bSP: dsp for all levels except last, psp for last (si_populate_smc_sp)
-            IfCondition EqualTo(j, Subtract(num_levels, 1)) ThenBlock: {
-                StoreValue(Add(lvl_ptr, HWLevel.BSP), bsp_psp, "dword")
-            } ElseBlock: {
-                StoreValue(Add(lvl_ptr, HWLevel.BSP), bsp_dsp, "dword")
-            }
-
-            j = Add(j, 1)
+        // Copy initialState header (1 level, flags=DC)
+        init_hdr_val = Dereference(init_ptr, "dword")
+        StoreValue(drv_ptr, init_hdr_val, "dword")
+        // Copy initialState level into driverState level 0
+        drv_level = Add(drv_ptr, 4)
+        ci = 0
+        WhileLoop LessThan(ci, HWLevel.SIZE) {
+            bval = GetByte(init_level, ci)
+            SetByte(drv_level, ci, bval)
+            ci = Add(ci, 1)
         }
 
-        // Cleanup level arrays
-        Deallocate(levels_sclk, 40)
-        Deallocate(levels_mclk, 40)
-        Deallocate(levels_vddc, 40)
-        Deallocate(levels_vddci, 40)
+        // Save level arrays in DPM state for runtime upload via DPM_SI_UploadDriverState
+        StoreValue(Add(dpm, DPMField.LEVELS_SCLK), levels_sclk)
+        StoreValue(Add(dpm, DPMField.LEVELS_MCLK), levels_mclk)
+        StoreValue(Add(dpm, DPMField.LEVELS_VDDC), levels_vddc)
+        StoreValue(Add(dpm, DPMField.LEVELS_VDDCI), levels_vddci)
+        // NOTE: Do NOT deallocate level arrays — they're owned by DPM state now
 
         // --- Upload state table to SMC SRAM ---
         PrintMessage("[DPM_SI] Uploading state table to SRAM at 0x")
         PrintHex(smc_state_addr)
         PrintMessage(" (")
         PrintNumber(tbl_size)
-        PrintMessage(" bytes, ")
+        PrintMessage(" bytes, driverState=1 level, ")
         PrintNumber(num_levels)
-        PrintMessage(" DPM levels)\n")
+        PrintMessage(" levels available for runtime)\n")
 
         num_dwords = Divide(tbl_size, 4)
         SMC_WriteSRAMBlock(gpu, smc_state_addr, tbl_buf, num_dwords)
@@ -1190,6 +1244,95 @@ Function.DPM_SI_BuildStateTable {
             PrintMessage("\n")
         }
 
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_UploadDriverState — build and upload multi-level driverState to SRAM
+//
+// This is the runtime equivalent of the kernel's si_upload_sw_state().
+// Called AFTER DPM is enabled and SMC is halted. Builds a multi-level
+// driverState from the saved level arrays and uploads it to SRAM at the
+// driverState offset. The caller must then Resume + SwitchToSwState.
+//
+// Must be called with SMC halted (after HALT message + WaitInactive).
+//
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.DPM_SI_UploadDriverState {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
+        IfCondition LessThan(num_levels, 1) ThenBlock: { ReturnValue(0) }
+
+        levels_sclk = Dereference(Add(dpm, DPMField.LEVELS_SCLK))
+        levels_mclk = Dereference(Add(dpm, DPMField.LEVELS_MCLK))
+        levels_vddc = Dereference(Add(dpm, DPMField.LEVELS_VDDC))
+        levels_vddci = Dereference(Add(dpm, DPMField.LEVELS_VDDCI))
+        IfCondition EqualTo(levels_sclk, 0) ThenBlock: {
+            PrintMessage("[DPM_SI] ERROR: No saved level data\n")
+            ReturnValue(0)
+        }
+
+        smc_state_addr = Dereference(Add(dpm, DPMField.SMC_STATE_ADDR))
+        drv_sram_addr = Add(smc_state_addr, SMCTbl.DRIVER_STATE)
+
+        bsp_dsp = Dereference(Add(dpm, DPMField.DSP), "dword")
+        bsp_psp = Dereference(Add(dpm, DPMField.PSP), "dword")
+
+        // Allocate buffer for driverState: 4-byte header + num_levels * 148 bytes
+        drv_size = Add(4, Multiply(num_levels, HWLevel.SIZE))
+        drv_buf = Allocate(drv_size)
+        MemorySet(drv_buf, 0, drv_size)
+
+        // SWSHdr BE DWORD: (flags<<24) | (levelCount<<16)
+        // flags: PPSMC_SWSTATE_FLAG_DC = 0x01
+        StoreValue(drv_buf, Add(LeftShift(1, 24), LeftShift(num_levels, 16)), "dword")
+
+        j = 0
+        WhileLoop LessThan(j, num_levels) {
+            lvl_sclk = Dereference(Add(levels_sclk, Multiply(j, 8)))
+            lvl_mclk = Dereference(Add(levels_mclk, Multiply(j, 8)))
+            lvl_vddc = Dereference(Add(levels_vddc, Multiply(j, 8)))
+            lvl_vddci = Dereference(Add(levels_vddci, Multiply(j, 8)))
+
+            lvl_ptr = Add(drv_buf, Add(4, Multiply(j, HWLevel.SIZE)))
+            arb_idx = Add(DPMConst.DRIVER_STATE_ARB, j)
+            lvl_extra = Add(LeftShift(lvl_vddci, 16), arb_idx)
+            DPM_SI_PopulateLevel(gpu, lvl_ptr, lvl_sclk, lvl_mclk, lvl_vddc, lvl_extra)
+
+            // bSP: dsp for all levels except last, psp for last
+            IfCondition EqualTo(j, Subtract(num_levels, 1)) ThenBlock: {
+                StoreValue(Add(lvl_ptr, HWLevel.BSP), bsp_psp, "dword")
+            } ElseBlock: {
+                StoreValue(Add(lvl_ptr, HWLevel.BSP), bsp_dsp, "dword")
+            }
+
+            // aT: level 0 = 0, others = 0x0000FFFF
+            // (simplified — kernel computes precise values via r600_calculate_at)
+            IfCondition EqualTo(j, 0) ThenBlock: {
+                StoreValue(Add(lvl_ptr, HWLevel.AT), 0)
+            }
+
+            j = Add(j, 1)
+        }
+
+        // Upload to SRAM
+        num_dwords = Divide(Add(drv_size, 3), 4)
+        SMC_WriteSRAMBlock(gpu, drv_sram_addr, drv_buf, num_dwords)
+
+        PrintMessage("[DPM_SI] Uploaded driverState: ")
+        PrintNumber(num_levels)
+        PrintMessage(" levels to SRAM 0x")
+        PrintHex(drv_sram_addr)
+        PrintMessage("\n")
+
+        Deallocate(drv_buf, drv_size)
         ReturnValue(1)
     }
 }
@@ -1844,7 +1987,16 @@ Function.DPM_SI_Enable {
 }
 
 // =============================================================================
-// DPM_SI_Disable — disable DPM and return to boot clocks
+// DPM_SI_Disable — full DPM teardown matching kernel si_dpm_disable()
+//
+// Sequence (must match kernel order):
+//   1. Disable auto throttle source (set THERMAL_PROTECTION_DIS)
+//   2. Stop DPM (clear GLOBAL_PWRMGT_EN)
+//   3. Disable SCLK control (set SCLK_PWRMGT_OFF)
+//   4. Disable voltage management (clear VOLT_PWRMGT_EN)
+//   5. Send ResetToDefaults to SMC (returns to initial state)
+//   6. Stop SMC (reset + stop clock)
+//   7. Switch MC ARB back to F0
 // =============================================================================
 Function.DPM_SI_Disable {
     Input: gpu: Integer
@@ -1854,26 +2006,50 @@ Function.DPM_SI_Disable {
         IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
 
         IfCondition NotEqual(Dereference(Add(dpm, DPMField.ENABLED)), 1) ThenBlock: {
+            // Even if DPM wasn't enabled, still stop the SMC if it's running
+            // to ensure clean state for next enable cycle
+            SMC_SI_StopSMC(gpu)
             ReturnValue(1)
         }
 
-        // Disable DPM: clear GLOBAL_PWRMGT_EN
+        // Step 1: Disable auto throttle source
+        // Set THERMAL_PROTECTION_DIS in GENERAL_PWRMGT
+        gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+        gen_pwrmgt = BitwiseOr(gen_pwrmgt, PwrMgtBits.THERMAL_PROTECTION_DIS)
+        GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
+
+        // Step 2: Stop DPM — clear GLOBAL_PWRMGT_EN
         gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
         gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.GLOBAL_PWRMGT_EN))
         GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
 
-        // Set SCLK_PWRMGT_OFF to disable SCLK power management
+        // Step 3: Disable SCLK control — set SCLK_PWRMGT_OFF
         sclk_pwr = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
         sclk_pwr = BitwiseOr(sclk_pwr, SclkPwrBits.SCLK_PWRMGT_OFF)
         GPU_Wr32(gpu, DPMReg.SCLK_PWRMGT_CNTL, sclk_pwr)
 
-        // Disable voltage management
+        // Step 4: Disable voltage management — clear VOLT_PWRMGT_EN
         gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
         gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.VOLT_PWRMGT_EN))
         GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
 
+        // Step 5: Tell SMC to reset to initial state
+        // This must happen while SMC is still running
+        GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+        SMC_SendMessage(gpu, SMCMsg.RESET_TO_DEFAULTS)
+
+        // Step 6: Stop SMC (reset + stop clock)
+        SMC_SI_StopSMC(gpu)
+
+        // Step 7: Switch MC ARB back to F0
+        // Write MC_CG_ARB_FREQ_F0 (0x0A) to CG_ARB_REQ field of MC_ARB_CG
+        arb_cg = GPU_Rd32(gpu, DPMReg.MC_ARB_CG)
+        arb_cg = BitwiseAnd(arb_cg, BitwiseNot(255))  // clear CG_ARB_REQ_MASK
+        arb_cg = BitwiseOr(arb_cg, 10)  // MC_CG_ARB_FREQ_F0 = 0x0A
+        GPU_Wr32(gpu, DPMReg.MC_ARB_CG, arb_cg)
+
         StoreValue(Add(dpm, DPMField.ENABLED), 0)
-        PrintMessage("[DPM_SI] DPM disabled\n")
+        PrintMessage("[DPM_SI] DPM disabled (full teardown)\n")
         ReturnValue(1)
     }
 }

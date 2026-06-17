@@ -138,14 +138,24 @@ _UNSUPPORTED_RE = None
 
 POLYFILL = """\
 var __test262_failed = 0;
-function Test262Error(m) { __test262_failed = 1; }
+function Test262Error(m) { this.message = m; this.name = "Test262Error"; }
 function $ERROR(m) { __test262_failed = 1; }
 function $DONOTEVALUATE() { __test262_failed = 1; }
 var assert = {};
-assert.sameValue = function(a, e, m) { if (a !== e) { __test262_failed = 1; } };
-assert.notSameValue = function(a, u, m) { if (a === u) { __test262_failed = 1; } };
-assert.throws = function(E, fn, m) { try { fn(); __test262_failed = 1; } catch (e) { } };
+assert._isSameValue = function(a, b) {
+  if (a !== a && b !== b) return true;
+  if (a === 0 && b === 0) return (1/a === 1/b);
+  return a === b;
+};
+assert.sameValue = function(a, e, m) { if (!assert._isSameValue(a, e)) { __test262_failed = 1; } };
+assert.notSameValue = function(a, u, m) { if (assert._isSameValue(a, u)) { __test262_failed = 1; } };
+assert.throws = function(E, fn, m) {
+  var threw = false;
+  try { fn(); } catch (e) { threw = true; }
+  if (!threw) { __test262_failed = 1; }
+};
 function $DONE(err) { if (err) { __test262_failed = 1; } }
+var $MAX_ITERATIONS = 100000;
 function verifyProperty(obj, name, desc) {
   if (desc === undefined) return;
   var actual = obj[name];
@@ -306,15 +316,9 @@ def parse_frontmatter(source):
 # PREPROCESSOR
 # =============================================================================
 
-_THROW_TEST262_RE = re.compile(r'throw\s+new\s+Test262Error\(([^)]*)\)')
-_THROW_ANY_RE = re.compile(r'throw\s+new\s+\w+Error\(([^)]*)\)')
-
-
 def preprocess(source):
     """Clean up test source for the Ailang JS engine."""
     source = _FRONTMATTER_RE.sub("", source)
-    source = _THROW_TEST262_RE.sub(r'$ERROR(\1)', source)
-    source = _THROW_ANY_RE.sub(r'$ERROR(\1)', source)
     return source
 
 
