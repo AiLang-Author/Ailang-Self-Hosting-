@@ -196,14 +196,168 @@ returning stale data rather than actual VRAM corruption.
   the HDP cache. The second access (adjacent DWORD) works because the cache
   line was refreshed by the first read.
 
-### Fix Plan
-1. Add `HDP_MEM_COHERENCY_FLUSH_CNTL=1` inside `GPU_VramRd32` before every
-   VRAM read. If this fixes it, the problem is confirmed as HDP read cache.
-2. If that doesn't work: try read-modify-write on `HDP_HOST_PATH_CNTL`
-   (specific bits only, not zeroing the whole register).
-3. If that doesn't work: try WC mapping without HDP_HOST_PATH_CNTL changes.
+### Fix Plan (SUPERSEDED — see Fix #3 below)
+1. ~~Add `HDP_MEM_COHERENCY_FLUSH_CNTL=1` inside `GPU_VramRd32`~~ — only flushes write cache, not read cache
+2. ~~CPU-side read-modify-write on `HDP_HOST_PATH_CNTL`~~ — DEADLOCKS PCI bus every time
+3. ~~WC mapping without HDP_HOST_PATH_CNTL changes~~ — not attempted, WC causes other issues
 
-### Status: INVESTIGATING — next step is HDP flush in GPU_VramRd32
+### Status: FIX #3 APPLIED — extended by Fix #4 (PFP ENGINE_SEL + HDP_MISC_CNTL) — TESTING
+
+---
+
+## Fix #3: GPU-Side HDP Read-Cache Invalidation — Jun 16, 2026
+
+### Problem
+CPU-side writes to `HDP_HOST_PATH_CNTL` (the documented way to invalidate the HDP
+read cache on SI) deadlock the PCI bus when done post-dispatch.  Every variation
+tried (zeroing, read-modify-write, immediate, delayed) caused a hard system lockup
+requiring power cycle.  The HDP read cache holds stale VRAM values from pre-dispatch
+reads, causing all post-dispatch VRAM reads through BAR0 to return 0xFFFFFFFF.
+
+### Root Cause (WHY CPU-side deadlocks)
+After compute dispatch + fence, the HDP is in a state where a CPU-initiated write
+to `HDP_HOST_PATH_CNTL` stalls the PCI fabric.  Likely cause: the HDP read cache
+is trying to drain/invalidate entries that reference in-flight or recently-completed
+MC transactions, and the CPU write creates a circular dependency on the PCI bus
+that the shared RD990 root complex cannot resolve.
+
+### Fix (APPLIED)
+Do the `HDP_HOST_PATH_CNTL` write-back from the **GPU side** via a PM4 `WRITE_DATA`
+packet (DST_SEL=0, register target).  This is emitted as part of the PM4 command
+stream, AFTER `SURFACE_SYNC` flushes GPU L2/K$/I$ to VRAM, but BEFORE the EOP
+fence write.  The GPU's ME engine performs the register write while the CP is still
+active (clocks running, no idle-state race).  By the time the CPU sees the fence
+fire, the HDP read cache is already invalidated.
+
+### Sequence in PM4_SubmitCompute (after this fix):
+```
+1. Cache invalidation (I$/K$)
+2. Shader program setup (PGM_LO/HI, RSRC1/2, thread counts)
+3. DISPATCH_DIRECT via IB
+4. SURFACE_SYNC (all caches, full range) — GPU writes reach VRAM
+5. WRITE_DATA → HDP_MEM_COHERENCY_FLUSH_CNTL = 1   ← HDP write cache flush
+6. WRITE_DATA → HDP_HOST_PATH_CNTL = <BIOS value>  ← HDP read cache invalidate
+7. Double EVENT_WRITE_EOP (dummy + real fence)
+--- CPU sees fence here, BAR0 reads now return correct VRAM data ---
+```
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Ring.ailang`
+  - Added `hdp_hpc_val` field to `PM4State`
+  - `PM4_InitMCBase` now snapshots `HDP_HOST_PATH_CNTL` BIOS value at init
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Pkt.ailang`
+  - Added `PM4_EmitWriteDataReg` function (WRITE_DATA DST_SEL=0 for MMIO register)
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Dispatch.ailang`
+  - `PM4_SubmitCompute`: emit HDP flush + invalidate after SURFACE_SYNC, before EOP
+  - Bumped `needed` ring space from 140 → 150 DWORDs
+
+### If This Still Deadlocks
+The GPU-side WRITE_DATA to a register should NOT deadlock because:
+- The ME engine does the write, not the CPU
+- The CP is still active (not idle/gated)
+- SURFACE_SYNC has already drained all GPU→VRAM traffic
+
+If it DOES deadlock, the problem is deeper than HDP timing:
+1. Check if `PM4State.hdp_hpc_val` is 0 (meaning the read at init failed)
+2. Try removing ONLY the `HDP_HOST_PATH_CNTL` WRITE_DATA, keep the flush
+3. Try moving both WRITE_DATA packets to BEFORE the SURFACE_SYNC
+4. Nuclear option: disable HDP read caching entirely at init by setting
+   bit 25 (HDP_READ_CACHE_DISABLE) in `HDP_HOST_PATH_CNTL` via CPU at
+   init time (before any GRBM/dispatch activity)
+
+### How to Revert If Broken
+```bash
+cd ~/Ailang-Self-Hosting-
+git checkout -- Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Ring.ailang
+git checkout -- Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Pkt.ailang
+git checkout -- Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Dispatch.ailang
+```
+This reverts to the last committed state (pre-fix, no HDP invalidation, trash values
+but no deadlock).
+
+---
+
+## Fix #4: PFP ENGINE_SEL + HDP_MISC_CNTL GPU-Side Flush — Jun 16, 2026 ~22:23 EDT
+
+### Context
+Fix #3 stopped the hard lockups from **CPU-side** `HDP_HOST_PATH_CNTL` writes, but
+`test_accel_gcn.x` still returned 0xFFFFFFFF for all post-dispatch BAR0 reads (src and
+dst both wrong — classic HDP read-cache staleness, not shader corruption).
+
+Deep dive against local kernel tree (`~/linux`):
+- Legacy **radeon** `si_fence_ring_emit`: SURFACE_SYNC + EOP only — no per-fence HDP
+  invalidate in the PM4 stream.
+- **`r600_mmio_hdp_flush`**: only `HDP_MEM_COHERENCY_FLUSH_CNTL` (write cache).
+- **Evergreen init** (`si.c` ~3323): `HDP_MISC_CNTL |= HDP_FLUSH_INVALIDATE_CACHE` then
+  read-modify-write `HDP_HOST_PATH_CNTL`.
+- **`radeon` WRITE_DATA for HDP regs**: `ENGINE_SEL(1)` = **PFP**, not ME (`si.c` ~5076).
+- **amdgpu SI** goes further: per-IB `si_flush_hdp` + `si_invalidate_hdp` via
+  **`HDP_DEBUG0 = 1`** at offset `0x2F30` — **not yet implemented** in AILang.
+
+### What Changed (Fix #4 on top of Fix #3)
+
+1. **`PM4_EmitWriteDataReg` ENGINE_SEL → PFP (1)**
+   - Was ME (0). Kernel radeon uses PFP for HDP register targets via WRITE_DATA;
+     ME may not route to HDP registers correctly.
+
+2. **Added `HDP_MISC_CNTL` (0x2F4C / byte offset 12108)**
+   - New `SIReg.HDP_MISC_CNTL` in `Library.AMDGPUPM4Regs.ailang`.
+   - `PM4_InitMCBase` snapshots BIOS value into `PM4State.hdp_misc_val` (alongside
+     existing `hdp_hpc_val` snapshot).
+
+3. **Three GPU-side WRITE_DATA packets after SURFACE_SYNC (before EOP)**
+   ```
+   WRITE_DATA → HDP_MEM_COHERENCY_FLUSH_CNTL = 1        (drain HDP write cache)
+   WRITE_DATA → HDP_MISC_CNTL = hdp_misc_val | 1       (FLUSH_INVALIDATE_CACHE)
+   WRITE_DATA → HDP_HOST_PATH_CNTL = hdp_hpc_val         (read-modify-write back to BIOS value)
+   ```
+   Ring space `needed` bumped 150 → **155** DWORDs.
+
+### How This Differs From the Deadlocking CPU-Side Flushes
+
+| Approach | Who writes HDP regs | When | Result |
+|----------|---------------------|------|--------|
+| CPU `HDP_HOST_PATH_CNTL` post-dispatch | CPU via BAR0 MMIO | After fence, CP idle-ish | **Hard PCI deadlock** (Crash #2 / Fix #3 analysis) |
+| CPU `HDP_MEM_COHERENCY_FLUSH_CNTL` in VramRead | CPU via BAR0 | Every BAR0 read | Safe but only flushes **write** cache |
+| GPU WRITE_DATA in PM4 stream (Fix #3/#4) | PFP via CP command | After SURFACE_SYNC, **before** EOP fence | Should not stall PCI — ME/PFP does write while CP active |
+
+Key distinction: we never touch HDP routing registers from the CPU after dispatch.
+Init still only **reads** HDP regs (snapshot BIOS values). All post-dispatch HDP
+work is three DWORDs in the PM4 IB, executed by the GPU before the fence signals
+the CPU.
+
+### Files Modified (Fix #4)
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Pkt.ailang` — `ENGINE_SEL=1` (PFP) in `PM4_EmitWriteDataReg`
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Regs.ailang` — `HDP_MISC_CNTL` register constant
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Ring.ailang` — `hdp_misc_val` field + init snapshot
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Dispatch.ailang` — third WRITE_DATA for `HDP_MISC_CNTL`; `needed=155`
+
+### Test
+```bash
+cd ~/Ailang-Self-Hosting-
+sudo ./test_accel_gcn.x
+```
+Expect: `Results: 64/64 correct` with dst[i] = src[i]+42. If still 0xFFFFFFFF but no
+lockup, HDP read cache is still stale — next try is amdgpu-style **`HDP_DEBUG0=1`**
+(`0x2F30`) as a fourth GPU-side WRITE_DATA after the misc flush.
+
+### If This Deadlocks
+Unlikely (same GPU-side mechanism as Fix #3, one extra register write). If it does:
+1. Remove only the `HDP_MISC_CNTL` WRITE_DATA (keep flush + HOST_PATH_CNTL)
+2. Verify `hdp_misc_val` and `hdp_hpc_val` are non-zero at init (BC0–BC4 breadcrumbs)
+3. Revert Fix #4 entirely (see below) — returns to Fix #3 behavior (trash values, no deadlock)
+
+### How to Revert Fix #4 Only
+```bash
+cd ~/Ailang-Self-Hosting-
+git checkout -- Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Pkt.ailang
+git checkout -- Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Regs.ailang
+git checkout -- Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Ring.ailang
+git checkout -- Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Dispatch.ailang
+./ailang.x TestCode/test_accel_gcn.ailang test_accel_gcn.x
+```
+
+### Status: APPLIED — AWAITING TEST (binary rebuilt Jun 16 22:23)
 
 ---
 
