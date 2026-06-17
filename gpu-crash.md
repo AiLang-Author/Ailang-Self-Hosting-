@@ -361,6 +361,108 @@ git checkout -- Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Dispatch.ailang
 
 ---
 
+## Issue #5: Compute GPU (bus 2) Not VBIOS POSTed — VRAM Uninitialized — Jun 17, 2026
+
+### Symptom
+GPU 0 (display GPU, bus 1:0.0) passes all compute tests — `test_accel_gcn` returns
+64/64 correct when targeting bus 1. GPU 1 (compute GPU, bus 2:0.0) returns
+0xFFFFFFFF / 0xFFDFFF7F alternating for all post-dispatch VRAM reads. Pre-dispatch
+writes appear to land (verified via BAR0 readback) but GPU-side reads see garbage.
+
+PCI COMMAND register starts at 0x0 on bus 2 (driver enables it to 0x6), confirming
+the system BIOS never POSTed the second GPU.
+
+### Root Cause (CONFIRMED)
+The compute GPU on bus 2 was **never VBIOS POSTed by the system BIOS**. The system
+BIOS only POSTs the primary/display GPU (bus 1). An un-POSTed GPU has:
+
+- **No VRAM training** — the DDR PHY hasn't been calibrated, MC doesn't know
+  timing parameters. VRAM reads return 0xFF / garbage.
+- **No MC firmware** — the memory controller sequencer microcode hasn't been loaded.
+- **MC_VM_FB_LOCATION = 0** — the VRAM aperture mapping is wrong.
+- **CONFIG_MEMSIZE = 0** — no VRAM size detected.
+
+`AtomExec_AsicInit` (table 0) brings up the SPLL and engine clocks, but does NOT
+perform full MC initialization or VRAM training. The 0xFFFFFFFF reads are NOT an
+HDP cache staleness issue (Fixes #3/#4 were chasing a red herring for this GPU) —
+the memory controller itself isn't functional.
+
+**Evidence:** The display GPU (bus 1) works perfectly because the system BIOS already
+ran the full VBIOS POST sequence including MC firmware load and VRAM training.
+
+### What the Linux Kernel Does (that we don't)
+Compared `si_init()` / `si_startup()` in `~/linux/drivers/gpu/drm/radeon/si.c`:
+
+1. **`atom_asic_init()`** — table 0, same as our `AtomExec_AsicInit`. ✅ We do this.
+2. **`si_mc_load_microcode()`** — Loads MC firmware (`VERDE_mc2.bin`) via:
+   - `MC_SEQ_IO_DEBUG_INDEX/DATA` — 36 IO MC register pairs (verde_io_mc_regs)
+   - `MC_SEQ_SUP_PGM` — MC sequencer microcode words
+   - `MC_SEQ_SUP_CNTL` — reset(0x08) → write(0x10) → load → reset(0x08) → run(0x04) → start(0x01)
+   - Polls `MC_SEQ_TRAIN_WAKEUP_CNTL` for `TRAIN_DONE_D0` (bit 30) and `TRAIN_DONE_D1` (bit 31)
+   - ❌ **MISSING — this is the critical step**
+3. **`si_mc_program()`** — Programs MC aperture:
+   - `MC_VM_FB_LOCATION`, `MC_VM_SYSTEM_APERTURE_*`, `MC_VM_AGP_*`
+   - `HDP_NONSURFACE_BASE/INFO/SIZE`
+   - `VGA_HDP_CONTROL = VGA_MEMORY_DISABLE`
+   - Wrapped in `evergreen_mc_stop()` / `evergreen_mc_resume()` (BIF_FB_EN blackout)
+   - ❌ **MISSING — we only READ MC_VM_FB_LOCATION, never WRITE it**
+4. **`si_gpu_init()`** — Engine config:
+   - `BIF_FB_EN = FB_READ_EN | FB_WRITE_EN`
+   - `GB_ADDR_CONFIG` (Verde golden = 0x12010002)
+   - `HDP_MISC_CNTL |= HDP_FLUSH_INVALIDATE_CACHE`
+   - `HDP_HOST_PATH_CNTL` read-modify-write
+   - ❌ **PARTIALLY MISSING**
+
+### Fix Plan (IN PROGRESS)
+
+New init order (additions marked with **NEW**):
+```
+1. GPU_Discover -> BAR map
+2. AtomBIOS -> PP -> Volt -> DPM_SI_InitSPLL         (engine clocks)
+3. **NEW** MC_LoadMicrocode -> MC VRAM training        (DRAM PHY calibration)
+4. **NEW** MC_Program -> FB_LOCATION, aperture, HDP    (VRAM aperture setup)
+5. **NEW** GPU_InitEngine -> BIF_FB_EN, GB_ADDR_CONFIG (engine config)
+6. PM4_HaltCP -> PM4_InitMCBase -> PM4_SoftResetCP
+7. CP/RLC firmware -> IH ring -> ring setup -> CP start
+8. SMC -> DPM_Init -> DPM_Enable -> Force HIGH
+9. Compute dispatch
+```
+
+### Implementation Steps
+- [x] Add MC register constants to PM4Regs (MC_SEQ_*, CONFIG_MEMSIZE, MC_VM_AGP_*, etc.)
+- [ ] New file: `Library.AMDGPUMC_SI.ailang` — MC firmware load + VRAM training
+- [ ] New function: `MC_SI_Program` — write MC_VM_FB_LOCATION, aperture, HDP, AGP
+- [ ] New function: `MC_SI_InitEngine` — BIF_FB_EN, GB_ADDR_CONFIG, HDP init
+- [ ] Wire into AccelGCN_Init between DPM_SI_InitSPLL and PM4_HaltCP
+- [ ] Test on bus 2 compute GPU
+
+### Key Files
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Regs.ailang` — register constants (done)
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUMC_SI.ailang` — new MC init module
+- `Librarys/Accel/Library.AccelGCN.ailang` — init sequence wiring
+
+### Verde IO MC Register Table (36 pairs for MC_SEQ_IO_DEBUG)
+```
+{0x6f,0x03044000} {0x70,0x0480c018} {0x71,0x00000040} {0x72,0x01000000}
+{0x74,0x000000ff} {0x75,0x00143400} {0x76,0x08ec0800} {0x77,0x040000cc}
+{0x79,0x00000000} {0x7a,0x21000409} {0x7c,0x00000000} {0x7d,0xe8000000}
+{0x7e,0x044408a8} {0x7f,0x00000003} {0x80,0x00000000} {0x81,0x01000000}
+{0x82,0x02000000} {0x83,0x00000000} {0x84,0xe3f3e4f4} {0x85,0x00052024}
+{0x87,0x00000000} {0x88,0x66036603} {0x89,0x01000000} {0x8b,0x1c0a0000}
+{0x8c,0xff010000} {0x8e,0xffffefff} {0x8f,0xfff3efff} {0x90,0xfff3efbf}
+{0x94,0x00101101} {0x95,0x00000fff} {0x96,0x00116fff} {0x97,0x60010000}
+{0x98,0x10010000} {0x99,0x00006000} {0x9a,0x00001000} {0x9f,0x00a37400}
+```
+
+### MC Firmware
+- File: `/lib/firmware/radeon/VERDE_mc2.bin` (31500 bytes)
+- Format: raw 32-bit words, `size / 4 = 7875` DWORDs loaded via MC_SEQ_SUP_PGM
+- Also available: `verde_mc.bin` (symlink to amdgpu), `VERDE_mc.bin` (symlink to PITCAIRN)
+
+### Status: STEP 1 DONE (registers added), IMPLEMENTING MC FIRMWARE LOAD
+
+---
+
 ## Full Dispatch Trace (AccelGCN_Init)
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
