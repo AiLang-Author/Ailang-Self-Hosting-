@@ -399,19 +399,28 @@ Compared `si_init()` / `si_startup()` in `~/linux/drivers/gpu/drm/radeon/si.c`:
    - `MC_SEQ_SUP_PGM` — MC sequencer microcode words
    - `MC_SEQ_SUP_CNTL` — reset(0x08) → write(0x10) → load → reset(0x08) → run(0x04) → start(0x01)
    - Polls `MC_SEQ_TRAIN_WAKEUP_CNTL` for `TRAIN_DONE_D0` (bit 30) and `TRAIN_DONE_D1` (bit 31)
-   - ❌ **MISSING — this is the critical step**
+   - ✅ **DONE** (Step 2, commit f3abda25) — `MC_SI_LoadMicrocode()` in `Library.AMDGPUMC_SI.ailang`
+   - Skips if MC sequencer already running (POSTed GPU)
+   - VRAM training: TRAIN_DONE_D0 + TRAIN_DONE_D1 both pass, CONFIG_MEMSIZE=1024MB
 3. **`si_mc_program()`** — Programs MC aperture:
    - `MC_VM_FB_LOCATION`, `MC_VM_SYSTEM_APERTURE_*`, `MC_VM_AGP_*`
    - `HDP_NONSURFACE_BASE/INFO/SIZE`
    - `VGA_HDP_CONTROL = VGA_MEMORY_DISABLE`
    - Wrapped in `evergreen_mc_stop()` / `evergreen_mc_resume()` (BIF_FB_EN blackout)
-   - ❌ **MISSING — we only READ MC_VM_FB_LOCATION, never WRITE it**
+   - ✅ **DONE** (Step 3, commit fabcc45c) — `MC_SI_Program()` in `Library.AMDGPUMC_SI.ailang`
+   - Uses `vram_start=0` (kernel default for SI via `radeon_vram_location(rdev, mc, 0)`)
+   - Simplified blackout: no CRTC blanking (headless compute GPU, no display engine)
+   - Runs unconditionally — normalizes FB_LOCATION to base=0 on every init
+   - Result: `MC_VM_FB_LOCATION=0x003F0000`, `mc_fb_base=0x0`, aperture low=0x0 high=0x3FFFF
+   - Garbage pattern changed post-dispatch (MC aperture affecting address routing)
+   - Still 0/64 correct — need GB_ADDR_CONFIG next
 4. **`si_gpu_init()`** — Engine config:
-   - `BIF_FB_EN = FB_READ_EN | FB_WRITE_EN`
-   - `GB_ADDR_CONFIG` (Verde golden = 0x12010002)
-   - `HDP_MISC_CNTL |= HDP_FLUSH_INVALIDATE_CACHE`
-   - `HDP_HOST_PATH_CNTL` read-modify-write
-   - ❌ **PARTIALLY MISSING**
+   - `BIF_FB_EN = FB_READ_EN | FB_WRITE_EN` — already done in MC_SI_Program un-blackout
+   - `GB_ADDR_CONFIG` (Verde golden = 0x12010002) — ❌ **NOT YET DONE**
+   - `GRBM_CNTL = GRBM_READ_TIMEOUT(0xFF)` — ❌ **NOT YET DONE**
+   - `HDP_MISC_CNTL |= HDP_FLUSH_INVALIDATE_CACHE` — ⚠️ **SKIP: CPU-side HDP MMIO writes deadlock PCI bus on RD990 + WC BAR0** (see Fix #2)
+   - `HDP_HOST_PATH_CNTL` read-modify-write — ⚠️ **SKIP: same deadlock risk** (see Fix #2)
+   - ❌ **IN PROGRESS — Step 4**
 
 ### Fix Plan (IN PROGRESS)
 
@@ -430,11 +439,11 @@ New init order (additions marked with **NEW**):
 
 ### Implementation Steps
 - [x] Add MC register constants to PM4Regs (MC_SEQ_*, CONFIG_MEMSIZE, MC_VM_AGP_*, etc.)
-- [ ] New file: `Library.AMDGPUMC_SI.ailang` — MC firmware load + VRAM training
-- [ ] New function: `MC_SI_Program` — write MC_VM_FB_LOCATION, aperture, HDP, AGP
-- [ ] New function: `MC_SI_InitEngine` — BIF_FB_EN, GB_ADDR_CONFIG, HDP init
-- [ ] Wire into AccelGCN_Init between DPM_SI_InitSPLL and PM4_HaltCP
-- [ ] Test on bus 2 compute GPU
+- [x] New file: `Library.AMDGPUMC_SI.ailang` — MC firmware load + VRAM training
+- [x] New function: `MC_SI_Program` — write MC_VM_FB_LOCATION, aperture, HDP, AGP
+- [ ] New function: `MC_SI_GpuInit` — GRBM_CNTL, GB_ADDR_CONFIG (skip HDP MMIO — deadlock risk)
+- [x] Wire into AccelGCN_Init between DPM_SI_InitSPLL and PM4_HaltCP
+- [ ] Test on bus 2 compute GPU — verify 64/64 correct
 
 ### Key Files
 - `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Regs.ailang` — register constants (done)
@@ -459,7 +468,31 @@ New init order (additions marked with **NEW**):
 - Format: raw 32-bit words, `size / 4 = 7875` DWORDs loaded via MC_SEQ_SUP_PGM
 - Also available: `verde_mc.bin` (symlink to amdgpu), `VERDE_mc.bin` (symlink to PITCAIRN)
 
-### Status: STEP 1 DONE (registers added), IMPLEMENTING MC FIRMWARE LOAD
+### Step 3 Test Results (bus 2 un-POSTed compute GPU)
+```
+MC_SI_Program ran unconditionally:
+  MC_VM_FB_LOCATION = 0x003F0000  (base=0, top=63, 1024MB)
+  SYSTEM_APERTURE: low=0x0 high=0x3FFFF
+  mc_fb_base = 0x0  (was 0xF400000000 from stale MC firmware state)
+  gpu_data_addr = 0x4082000  (direct VRAM offset, correct for base=0)
+
+Pre-dispatch VRAM verify:  src[0]=0 src[1]=1 src[2]=2, dst all zero  ✅
+Post-dispatch: dst[0]=0xFF000100  (garbage, not 42)  ❌
+Wr32/Rd32 BAR test:  first DWORD returns 0xFFFFFFFF, second works  ⚠️
+
+Key observation: MC_SI_LoadMicrocode returned 0 (already running from
+previous test run). The MC firmware persists across process invocations
+because MC_SEQ_SUP_CNTL RUN bit stays set. MC_VM_FB_LOCATION had stale
+0xF43FF400 from the MC firmware's internal init. MC_SI_Program overwrites
+it to base=0 which is correct per kernel si_mc_program + radeon_vram_location(0).
+
+Still 0/64 — likely need GB_ADDR_CONFIG (address decode mismatch between
+GPU shader engines and MC). Without correct GB_ADDR_CONFIG, the GPU's
+address interleaving doesn't match what the MC expects, causing scattered
+reads/writes to wrong VRAM locations.
+```
+
+### Status: STEPS 1-3 DONE, IMPLEMENTING STEP 4 (GB_ADDR_CONFIG)
 
 ---
 
@@ -467,12 +500,13 @@ New init order (additions marked with **NEW**):
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
 2. AtomBIOS_LoadROM -> Parse -> PP_Parse -> Volt_Parse -> DPM_SI_InitSPLL
-3. PM4_HaltCP -> PM4_InitMCBase -> PM4_SoftResetCP -> PM4_HaltCP
-4. PM4_LoadCPFirmware -> PM4_LoadRLCFirmware -> PM4_SetupIHRing
-5. PM4_SetupRing(0) -> PM4_CPStart (unhalt) -> PM4_RingTest(0)
-6. PM4_SetupRing(1) -> PM4_RingTest(1)
-7. PM4_SetupRing(2) -> PM4_RingTest(2)
-8. SCRATCH_UMSK=0xFF, roundtrip check
-9. SMC_LoadFirmware -> DPM_Init -> DPM_Enable -> Force HIGH
-10. CIR_Begin -> build kernel -> CIR_Lower_GCN -> upload to VRAM
-11. AccelGCN_Dispatch (PM4_SubmitCompute + fence wait + readback)
+3. **MC_SI_LoadMicrocode** (VRAM training) -> **MC_SI_Program** (FB_LOCATION, aperture)
+4. PM4_HaltCP -> PM4_InitMCBase -> PM4_SoftResetCP -> PM4_HaltCP
+5. PM4_LoadCPFirmware -> PM4_LoadRLCFirmware -> PM4_SetupIHRing
+6. PM4_SetupRing(0) -> PM4_CPStart (unhalt) -> PM4_RingTest(0)
+7. PM4_SetupRing(1) -> PM4_RingTest(1)
+8. PM4_SetupRing(2) -> PM4_RingTest(2)
+9. SCRATCH_UMSK=0xFF, roundtrip check
+10. SMC_LoadFirmware -> DPM_Init -> DPM_Enable -> Force HIGH
+11. CIR_Begin -> build kernel -> CIR_Lower_GCN -> upload to VRAM
+12. AccelGCN_Dispatch (PM4_SubmitCompute + fence wait + readback)
