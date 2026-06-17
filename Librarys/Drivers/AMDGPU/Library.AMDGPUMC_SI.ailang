@@ -330,3 +330,141 @@ Function.MC_SI_LoadMicrocode {
         ReturnValue(-3)
     }
 }
+
+// =============================================================================
+// MC_SI_Program — program MC aperture for un-POSTed GPU
+//
+// Follows kernel si_mc_program():
+//   1. Zero 32 HDP protection buffer entries
+//   2. Flush HDP coherency
+//   3. Blackout MC: BIF_FB_EN=0, MC_SHARED_BLACKOUT_CNTL|=1
+//   4. Lock out VGA aperture
+//   5. Program MC_VM_FB_LOCATION, system aperture, HDP nonsurface, AGP
+//   6. Unblackout: clear BLACKOUT_MODE, BIF_FB_EN = RW
+//
+// For un-POSTed headless compute GPUs there are no CRTCs to blank, so we skip
+// the full evergreen_mc_stop/resume CRTC blanking sequence.
+//
+// Uses vram_start=0 (kernel default for SI).
+// CONFIG_MEMSIZE must be valid (MC firmware must be loaded first).
+//
+// Returns 1 on success, negative on error.
+// =============================================================================
+Function.MC_SI_Program {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[MC_SI] Programming MC aperture...\n")
+
+        // Read VRAM size from CONFIG_MEMSIZE (set by MC firmware training)
+        memsize_mb = GPU_Rd32(gpu, SIReg.CONFIG_MEMSIZE)
+        IfCondition EqualTo(memsize_mb, 0) ThenBlock: {
+            PrintMessage("[MC_SI] ERROR: CONFIG_MEMSIZE = 0 (MC firmware not loaded?)\n")
+            ReturnValue(-1)
+        }
+        // Also handle garbage in upper 16 bits (kernel si_mc_init check)
+        IfCondition NotEqual(BitwiseAnd(memsize_mb, 4294901760), 0) ThenBlock: {
+            // 0xFFFF0000 = 4294901760
+            IfCondition NotEqual(BitwiseAnd(memsize_mb, 65535), 0) ThenBlock: {
+                memsize_mb = BitwiseAnd(memsize_mb, 65535)
+            }
+        }
+        PrintMessage("[MC_SI] CONFIG_MEMSIZE = ")
+        PrintNumber(memsize_mb)
+        PrintMessage(" MB\n")
+
+        // Compute vram_end: vram_start=0, vram_end = (memsize_mb * 1024 * 1024) - 1
+        // But we need the value in 16MB units for FB_LOCATION, and in 4KB pages
+        // for aperture registers.
+        // top_16mb = (memsize_mb / 16) - 1  (in 16MB units)
+        top_16mb = Subtract(Divide(memsize_mb, 16), 1)
+
+        // vram_end_bytes = (memsize_mb << 20) - 1
+        // vram_end_page  = vram_end_bytes >> 12 = (memsize_mb << 8) - 1
+        vram_end_page = Subtract(LeftShift(memsize_mb, 8), 1)
+
+        // --- Step 1: Initialize HDP protection registers ---
+        // Zero 32 entries * 5 regs each, at 0x18 stride from base 0x2C14
+        hdp_j = 0
+        WhileLoop LessThan(hdp_j, 32) {
+            hdp_base = Add(11284, Multiply(hdp_j, 24))  // 0x2C14 = 11284, stride 0x18 = 24
+            GPU_Wr32(gpu, hdp_base, 0)                   // +0x00
+            GPU_Wr32(gpu, Add(hdp_base, 4), 0)           // +0x04
+            GPU_Wr32(gpu, Add(hdp_base, 8), 0)           // +0x08
+            GPU_Wr32(gpu, Add(hdp_base, 12), 0)          // +0x0C
+            GPU_Wr32(gpu, Add(hdp_base, 16), 0)          // +0x10
+            hdp_j = Add(hdp_j, 1)
+        }
+        GPU_Wr32(gpu, SIReg.HDP_REG_COHERENCY_FLUSH_CNTL, 0)
+
+        // --- Step 2: MC blackout (simplified — no CRTCs on headless compute GPU) ---
+        // Block CPU access to framebuffer
+        GPU_Wr32(gpu, SIReg.BIF_FB_EN, 0)
+        // Blackout MC
+        blackout = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+        blackout = BitwiseAnd(blackout, 4294967294)  // clear bit 0 (BLACKOUT_MODE_MASK)
+        GPU_Wr32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL, BitwiseOr(blackout, 1))
+
+        // Brief delay for MC to settle (kernel does udelay(100))
+        settle_i = 0
+        WhileLoop LessThan(settle_i, 100000) {
+            settle_i = Add(settle_i, 1)
+        }
+
+        // --- Step 3: Lock out VGA aperture ---
+        GPU_Wr32(gpu, SIReg.VGA_HDP_CONTROL, MCSeqBits.VGA_MEMORY_DISABLE)
+
+        // --- Step 4: Program MC aperture ---
+        // vram_start = 0, so:
+        //   MC_VM_SYSTEM_APERTURE_LOW_ADDR  = 0
+        //   MC_VM_SYSTEM_APERTURE_HIGH_ADDR = vram_end >> 12
+        //   MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR = 0  (vram_scratch page)
+        GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR, 0)
+        GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR, vram_end_page)
+        GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, 0)
+
+        // MC_VM_FB_LOCATION = (top << 16) | base
+        // top = top_16mb, base = 0 (vram_start >> 24 = 0)
+        fb_loc = LeftShift(top_16mb, 16)
+        GPU_Wr32(gpu, SIReg.MC_VM_FB_LOCATION, fb_loc)
+
+        // HDP nonsurface: base = vram_start >> 8 = 0
+        //   INFO = (2 << 7) | (1 << 30) = 256 | 1073741824 = 1073742080
+        //   SIZE = 0x3FFFFFFF = 1073741823
+        GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_BASE, 0)
+        GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_INFO, 1073742080)
+        GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_SIZE, 1073741823)
+
+        // AGP aperture: disabled (base=0, both top and bot = 0x0FFFFFFF)
+        GPU_Wr32(gpu, SIReg.MC_VM_AGP_BASE, 0)
+        GPU_Wr32(gpu, SIReg.MC_VM_AGP_TOP, 268435455)
+        GPU_Wr32(gpu, SIReg.MC_VM_AGP_BOT, 268435455)
+
+        PrintMessage("[MC_SI] MC_VM_FB_LOCATION = 0x")
+        PrintHex(fb_loc)
+        PrintMessage("  (top_16mb=")
+        PrintNumber(top_16mb)
+        PrintMessage(")\n")
+
+        // --- Step 5: Un-blackout MC ---
+        // Clear blackout mode
+        blackout2 = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+        blackout2 = BitwiseAnd(blackout2, 4294967294)  // clear bit 0
+        GPU_Wr32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL, blackout2)
+        // Re-enable CPU access: FB_READ_EN | FB_WRITE_EN = 1 | 2 = 3
+        GPU_Wr32(gpu, SIReg.BIF_FB_EN, 3)
+
+        // --- Step 6: Verify ---
+        PrintMessage("[MC_SI] Post-program: MC_VM_FB_LOCATION=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_FB_LOCATION))
+        PrintMessage("\n")
+        PrintMessage("[MC_SI] SYSTEM_APERTURE: low=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR))
+        PrintMessage(" high=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR))
+        PrintMessage("\n")
+
+        PrintMessage("[MC_SI] MC aperture programmed OK\n")
+        ReturnValue(1)
+    }
+}
