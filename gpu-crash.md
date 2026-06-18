@@ -790,6 +790,31 @@ Also added register constants to PM4Regs: `TA_CNTL_AUX`, `TCP_CHAN_STEER_LO`,
 
 ---
 
+## Fix #9: MC_VM_MX_L1_TLB_CNTL Wrong Bit (0x38 → 0x18) — Jun 18, 2026
+
+### Problem
+`PM4_InitMCBase` wrote `MC_VM_MX_L1_TLB_CNTL = 0x38` (56 decimal).  Bit 5
+was set, meaning `SYSTEM_APERTURE_UNMAPPED_ACCESS_DEFAULT_PAGE` — addresses
+outside the system aperture get redirected to `DEFAULT_ADDR`.
+
+The kernel's `si_pcie_gart_disable()` writes `0x18` (24 decimal) — bit 5 clear,
+meaning `PASS_THRU`: unmapped addresses pass through as physical MC addresses.
+`PASS_THRU` is `(0 << 5)`, not `(1 << 5)`.
+
+### Impact
+Not the primary root cause (same value was used on both GPUs and bus 1 worked),
+but incorrect behavior for addresses outside the system aperture.
+
+### Fix
+Changed value from 56 (0x38) to 24 (0x18).  Matches kernel.
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Ring.ailang` — PM4_InitMCBase
+
+### Status: APPLIED — TESTING
+
+---
+
 ## Full Dispatch Trace (AccelGCN_Init)
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
