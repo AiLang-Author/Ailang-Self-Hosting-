@@ -595,12 +595,147 @@ gate in `AccelGCN_Init`, there are now two layers of protection.
 
 ---
 
+## Crash #4: Display Kill from PM4_SoftResetCP on Bus 1 — Jun 18, 2026
+
+### Symptom
+Running `test_accel_gcn` (dual-GPU test) killed the display during bus 1
+(display GPU) init.  Hard reboot required.  Test results for bus 2 lost.
+
+### Root Cause
+`PM4_SoftResetCP` and `PM4_HaltCP` ran unconditionally on both GPUs.
+On the display GPU (bus 1, radeon driver, VESA framebuffer active),
+`PM4_SoftResetCP` does:
+
+1. `BIF_FB_EN = 0` — kills CPU access to VRAM / framebuffer
+2. `MC_SHARED_BLACKOUT_CNTL |= 1` — blackouts memory controller
+3. `VGA_RENDER_CONTROL = 0` — disables VGA rendering
+4. `GRBM_SOFT_RESET` full pipeline (CP, CB, DB, PA, SC, SPI, SX, etc.)
+5. `SRBM_SOFT_RESET` (HDP + GRBM)
+
+Even though BIF_FB_EN and MC blackout are saved/restored, the
+GRBM_SOFT_RESET wipes the display engine's pipeline state.  The VESA
+framebuffer never recovers.
+
+The MC_SI functions (Fix #5) were properly gated, but these PM4
+functions predated the dual-GPU test and had no display GPU guards.
+
+### Fix (APPLIED)
+Added `GPU_BAR_IsDisplayGPU(gpu)` guard at the top of both functions:
+
+- **`PM4_SoftResetCP`** — returns immediately with `REFUSED` message
+- **`PM4_HaltCP`** — returns immediately with `REFUSED` message
+
+With these guards, `AccelGCN_Init` on bus 1 will fail cleanly downstream
+(can't set up rings without halting CP first) instead of killing the
+display.  Bus 2 init proceeds normally.
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4FW.ailang` — PM4_SoftResetCP guard
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Ring.ailang` — PM4_HaltCP guard
+
+### Status: APPLIED — TESTING
+
+### Fix #2: Removed display GPU from test_accel_gcn entirely
+`test_accel_gcn.ailang` Main now only calls `RunOnGPU(2)` (compute GPU).
+Bus 1 (display GPU) is never touched.  If the display still dies, the
+problem is in a shared path that doesn't check GPU index, or the bus 2
+init is somehow stomping bus 1 via the shared RD990 root complex.
+
+**If display dies after this change, check:**
+1. `GPU_Discover` — does it write to bus 1 MMIO during enumeration?
+2. `AtomBIOS_LoadROM` — does it read the wrong ROM (bus 1 instead of bus 2)?
+3. Any PCI config space write that hits both buses
+4. RD990 root complex lockup from bus 2 stall (same as original crash #1)
+
+---
+
+## Investigation #5: GRBM_GFX_INDEX / GB_ADDR_CONFIG "MISMATCH" — Jun 18, 2026
+
+### Symptom
+`MC_SI_GpuInit` reported `GB_ADDR_CONFIG readback = 0x10000000 MISMATCH!`
+and `GRBM_GFX_INDEX = 0x0 (expect 0xE0000000)`.  Appeared to be a total
+init failure — GRBM-domain register writes not sticking.
+
+### Root Cause: FALSE ALARM — Write-Only Registers
+Both `GB_ADDR_CONFIG` and `GRBM_GFX_INDEX` are **write-only** on SI.
+Readback returns power-on defaults (0x10000000 / 0x0), NOT the value
+written.  The Linux kernel (si.c:si_gpu_init) **never reads either
+register back** — it writes and trusts.
+
+Evidence: CP ring tests pass (require working GRBM), all 3 ring NOP
+tests succeed, and the CP processes ME_INITIALIZE + CLEAR_STATE correctly.
+The writes are landing; the readback is just misleading.
+
+### Fixes Applied
+1. **Removed readback MISMATCH check** for GB_ADDR_CONFIG
+2. **Removed readback check** for GRBM_GFX_INDEX
+3. **Fixed false PM4 aperture warning** — `aperture LOW=0` is correct
+   when VRAM starts at MC address 0 (MC_VM_FB_LOCATION BASE=0x0000)
+
+### Init Ordering Fixes (defense-in-depth, matches kernel si_gpu_init)
+Even though writes were landing, the ordering was wrong vs kernel:
+
+**Before (our code):**
+```
+MGCG_OVERRIDE → GRBM_GFX_INDEX → GRBM_CNTL → BIF_FB_EN → GB_ADDR_CONFIG
+```
+
+**After (matches kernel si_gpu_init):**
+```
+MGCG_OVERRIDE + CGCG_CGLS + CGTS_SM → HDP zero → GRBM_CNTL → BIF_FB_EN → GB_ADDR_CONFIG → GRBM_GFX_INDEX
+```
+
+Changes:
+- **Added CGCG/CGLS disable** (RLC_CGCG_CGLS_CTRL=0)
+- **Added CGTS_SM_CTRL_REG** override (0x600000)
+- **Added HDP protection buffer zeroing** (32 entries × 5 regs)
+- **Moved GRBM_GFX_INDEX** to AFTER GRBM_CNTL, BIF_FB_EN, GB_ADDR_CONFIG
+
+### Remaining Issue
+Compute dispatch still returns 0xFFFFFFFF for all outputs.  Init is clean,
+ring tests pass, but shader execution produces garbage.  Separate issue
+from register initialization.
+
+### Status: RESOLVED (false alarm) + init ordering improved
+
+---
+
+## Fix #6: AtomBIOS IIO Opcode Swap (MOVE_ATTR/MOVE_DATA) — Jun 18, 2026
+
+### Problem
+`AE_IIO_Execute` in `Library.AMDGPUAtomExecIO.ailang` had **IIO opcodes 7 and 8
+swapped**. The kernel defines `ATOM_IIO_MOVE_ATTR=7` (uses `io_attr`) and
+`ATOM_IIO_MOVE_DATA=8` (uses `data` parameter). Our code had opcode 7 using
+`data` and opcode 8 using `io_attr` — exactly backwards.
+
+The comment (line 135) correctly listed `7=MOVE_ATTR, 8=MOVE_DATA`, but the
+implementation bodies were swapped.
+
+### Impact
+IIO programs are used for indirect register access during ASIC_INIT (VBIOS POST).
+When the IIO program uses opcode 7 to inject `io_attr` bits into a register value,
+our code was injecting `data` bits instead (and vice versa). This corrupts indirect
+register programming during MC sequencer training, PLL configuration, and any
+IIO-routed register writes — potentially leaving the GPU memory controller in an
+incorrect state after POST.
+
+### Fix
+Swapped the bodies: opcode 7 now reads from `io_attr` (MOVE_ATTR), opcode 8 now
+reads from `data` (MOVE_DATA). Matches kernel `atom_iio_execute()` in `atom.c`.
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUAtomExecIO.ailang` — lines 196-218
+
+### Status: APPLIED — TESTING
+
+---
+
 ## Full Dispatch Trace (AccelGCN_Init)
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
 2. AtomBIOS_LoadROM -> Parse -> PP_Parse -> Volt_Parse -> DPM_SI_InitSPLL
 3. **MC_SI_LoadMicrocode** -> **MC_SI_Program** -> **MC_SI_GpuInit** *(un-POSTed GPUs only; SKIPPED on display GPU)*
-4. PM4_HaltCP -> PM4_InitMCBase -> PM4_SoftResetCP -> PM4_HaltCP
+4. **PM4_HaltCP** -> PM4_InitMCBase -> **PM4_SoftResetCP** -> **PM4_HaltCP** *(SKIPPED on display GPU)*
 5. PM4_LoadCPFirmware -> PM4_LoadRLCFirmware -> PM4_SetupIHRing
 6. PM4_SetupRing(0) -> PM4_CPStart (unhalt) -> PM4_RingTest(0)
 7. PM4_SetupRing(1) -> PM4_RingTest(1)
