@@ -849,6 +849,34 @@ existing SPI_CONFIG_CNTL reprogramming and before clock gating disable:
 
 ---
 
+## Fix #11: Always Run AtomExec_AsicInit (Don't Skip on SPLL Up) — Jun 18, 2026
+
+### Problem
+`DPM_SI_InitSPLL` had an early-return that skipped `AtomExec_AsicInit` when
+the SPLL was already running.  ASIC_INIT is the VBIOS master initialization
+command table — the same table the BIOS/EFI executes during POST to bring the
+entire chip up.  It programs hundreds of registers, not just the PLL.
+
+On the first run, ASIC_INIT did execute but with **broken IIO opcodes** (Fix #6),
+so every indirect register write was corrupted.  On subsequent re-runs, SPLL
+was still up from the previous run, so ASIC_INIT was skipped entirely — the
+card never got a clean initialization with the corrected interpreter.
+
+The BIOS just provides PCIe power.  The card initializes **itself** via its own
+VBIOS ROM.  The kernel calls `atom_asic_init()` unconditionally on every driver
+load, not just on cold boot.
+
+### Fix
+Removed the SPLL-already-running early return.  `AtomExec_AsicInit` now runs
+unconditionally every time, matching kernel behavior.
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUDPM_SI.ailang` — DPM_SI_InitSPLL
+
+### Status: APPLIED — TESTING
+
+---
+
 ## Full Dispatch Trace (AccelGCN_Init)
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
