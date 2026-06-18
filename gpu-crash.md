@@ -563,6 +563,38 @@ git checkout -- TestCode/test_accel_gcn.ailang
 
 ---
 
+## Fix #5: Defense-in-Depth Display GPU Guards in MC_SI Functions — Jun 17, 2026
+
+### Problem
+Crash #3 fix gated MC init at the caller level (`AccelGCN_Init`), but the three
+MC functions themselves (`MC_SI_LoadMicrocode`, `MC_SI_Program`, `MC_SI_GpuInit`)
+had no internal display GPU check. Any new caller or test that invoked them
+directly without checking `GPU_BAR_IsDisplayGPU()` would kill the VESA
+framebuffer and blank the screen — same as Crash #3.
+
+Other BAR-layer functions (`GPU_BAR_MapMMIO`, `GPU_BAR_Reset`, `GPU_BAR_Unbind`,
+etc.) already follow a defense-in-depth pattern with internal display GPU guards.
+The MC functions did not.
+
+### Fix (APPLIED)
+Added `GPU_BAR_IsDisplayGPU(gpu)` guard at the top of all three functions in
+`Library.AMDGPUMC_SI.ailang`:
+
+- **`MC_SI_LoadMicrocode`** — returns 0 with `REFUSED` message
+- **`MC_SI_Program`** — returns 0 with `REFUSED` message
+- **`MC_SI_GpuInit`** — returns 0 with `REFUSED` message
+
+Each prints `[MC_SI] <func>: REFUSED — display GPU (BIOS already configured)`
+so the refusal is visible in test output.  Combined with the existing caller-side
+gate in `AccelGCN_Init`, there are now two layers of protection.
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUMC_SI.ailang` — internal guards added
+
+### Status: APPLIED — TESTING
+
+---
+
 ## Full Dispatch Trace (AccelGCN_Init)
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM

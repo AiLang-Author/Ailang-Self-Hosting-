@@ -149,6 +149,14 @@ Function.MC_SI_LoadMicrocode {
     Input: gpu: Integer
     Output: Integer
     Body: {
+        // DISPLAY GPU GUARD — never touch MC firmware on the display GPU.
+        // The BIOS already loaded MC firmware and trained VRAM.  Reloading
+        // resets the MC sequencer which kills the VESA framebuffer.
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(gpu), 1) ThenBlock: {
+            PrintMessage("[MC_SI] LoadMicrocode: REFUSED — display GPU (BIOS already configured)\n")
+            ReturnValue(0)
+        }
+
         // Check if MC sequencer is already running
         running = BitwiseAnd(GPU_Rd32(gpu, SIReg.MC_SEQ_SUP_CNTL), MCSeqBits.RUN_MASK)
         IfCondition NotEqual(running, 0) ThenBlock: {
@@ -354,6 +362,16 @@ Function.MC_SI_Program {
     Input: gpu: Integer
     Output: Integer
     Body: {
+        // DISPLAY GPU GUARD — never reprogram MC aperture on the display GPU.
+        // BIF_FB_EN=0 kills CPU VRAM access (VESA framebuffer goes black),
+        // MC_VM_FB_LOCATION reprogram stomps the BIOS-configured aperture,
+        // and MC blackout blocks all memory ops.  The display GPU is already
+        // fully configured by the BIOS.
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(gpu), 1) ThenBlock: {
+            PrintMessage("[MC_SI] Program: REFUSED — display GPU (BIOS already configured)\n")
+            ReturnValue(0)
+        }
+
         PrintMessage("[MC_SI] Programming MC aperture...\n")
 
         // Read VRAM size from CONFIG_MEMSIZE (set by MC firmware training)
@@ -470,22 +488,28 @@ Function.MC_SI_Program {
 }
 
 // =============================================================================
-// MC_SI_GpuInit — GPU engine init subset from si_gpu_init()
+// MC_SI_GpuInit — full si_gpu_init() equivalent for Cape Verde
 //
-// Programs address decode config so GPU shader engines, HDP, DMIF, and DMA
-// all agree on how VRAM addresses are interleaved across pipes/banks/rows.
-// Without this, GPU-side memory accesses scatter to wrong VRAM locations.
+// Programs the GPU engine configuration after MC firmware + aperture setup.
+// This is a reimplementation of the kernel's si_gpu_init() from si.c.
 //
-// From kernel si_gpu_init():
-//   - GRBM_CNTL = GRBM_READ_TIMEOUT(0xFF) — prevent infinite GRBM stalls
-//   - GB_ADDR_CONFIG = VERDE golden (0x12010002)
-//   - Broadcast to DMIF_ADDR_CONFIG, DMIF_ADDR_CALC, HDP_ADDR_CONFIG
-//   - BIF_FB_EN = FB_READ_EN | FB_WRITE_EN (already done in MC_SI_Program)
+// Includes:
+//   1. GRBM_GFX_INDEX broadcast mode (CRITICAL — per-pipe regs need this)
+//   2. GRBM_CNTL read timeout
+//   3. SRBM interrupt init
+//   4. BIF_FB_EN
+//   5. MC_ARB_RAMCFG → ROW_SIZE adjustment for GB_ADDR_CONFIG
+//   6. Address config broadcast (GB, DMIF, HDP, DMA)
+//   7. Tiling mode table (GB_TILE_MODE0-31, Verde values)
+//   8. Per-SE render backend setup (si_setup_rb)
+//   9. Per-SE/SH SPI thread management (si_setup_spi)
+//  10. 3D engine defaults
+//  11. PA_CL_ENHANCE
 //
-// SKIPPED (deadlock risk on RD990 + WC BAR0):
-//   - HDP_MISC_CNTL |= HDP_FLUSH_INVALIDATE_CACHE
-//   - HDP_HOST_PATH_CNTL read-modify-write
-//   See gpu-crash.md Fix #2 for details.
+// SKIPPED (deadlock risk on RD990 — see gpu-crash.md Fix #2):
+//   - HDP_MISC_CNTL |= HDP_FLUSH_INVALIDATE_CACHE (CPU-side)
+//   - HDP_HOST_PATH_CNTL read-modify-write (CPU-side)
+//   These are done GPU-side via PM4 WRITE_DATA in the dispatch path.
 //
 // Returns 1 on success.
 // =============================================================================
@@ -493,33 +517,342 @@ Function.MC_SI_GpuInit {
     Input: gpu: Integer
     Output: Integer
     Body: {
-        PrintMessage("[MC_SI] GPU engine init (si_gpu_init subset)...\n")
+        // DISPLAY GPU GUARD — never run si_gpu_init on the display GPU.
+        // Overwrites DMIF_ADDR_CONFIG (corrupts scanout address decode),
+        // writes GRBM_GFX_INDEX broadcast mode, reprograms GB_TILE_MODE
+        // table, PA_SC_RASTER_CONFIG, SPI thread mgmt, and 3D engine
+        // defaults — all of which stomp the BIOS-configured display engine.
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(gpu), 1) ThenBlock: {
+            PrintMessage("[MC_SI] GpuInit: REFUSED — display GPU (BIOS already configured)\n")
+            ReturnValue(0)
+        }
 
-        // GRBM read timeout — prevents infinite stalls on GRBM-routed reads
-        // when a block is clock-gated or non-responsive.  Value 0xFF = max timeout.
-        GPU_Wr32(gpu, SIReg.GRBM_CNTL, 255)
+        PrintMessage("[MC_SI] GPU engine init (si_gpu_init)...\n")
 
-        // GB_ADDR_CONFIG — Verde golden value
-        // Encodes pipe count, bank count, pipe interleave size, row size, etc.
-        // All address-decoding hardware must agree on this value.
-        // 0x12010002 = VERDE_GB_ADDR_CONFIG_GOLDEN from sid.h
-        gb_addr = 302055426
+        // ---------------------------------------------------------------
+        // Step 1: Set GRBM_GFX_INDEX to broadcast mode
+        // CRITICAL: GB_ADDR_CONFIG and other per-pipe registers require
+        // broadcast writes to reach all shader engines/SH/instances.
+        // Without this, writes only hit one pipe and reads from other
+        // pipes return power-on defaults (0x10000000).
+        // ---------------------------------------------------------------
+        // INSTANCE_BROADCAST_WRITES(1<<30) | SH_BROADCAST_WRITES(1<<29) | SE_BROADCAST_WRITES(1<<31)
+        gfx_broadcast = BitwiseOr(GFXIndexBits.INSTANCE_BROADCAST_WRITES, BitwiseOr(GFXIndexBits.SH_BROADCAST_WRITES, GFXIndexBits.SE_BROADCAST_WRITES))
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, gfx_broadcast)
+
+        PrintMessage("[MC_SI] GRBM_GFX_INDEX = 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_GFX_INDEX))
+        PrintMessage(" (expect 0xE0000000)\n")
+
+        // ---------------------------------------------------------------
+        // Step 2: GRBM read timeout + SRBM interrupts
+        // ---------------------------------------------------------------
+        GPU_Wr32(gpu, SIReg.GRBM_CNTL, 255)           // GRBM_READ_TIMEOUT(0xFF)
+        GPU_Wr32(gpu, SIReg.SRBM_INT_CNTL, 1)
+        GPU_Wr32(gpu, SIReg.SRBM_INT_ACK, 1)
+
+        // BIF_FB_EN — enable CPU read/write to framebuffer
+        GPU_Wr32(gpu, SIReg.BIF_FB_EN, 3)              // FB_READ_EN | FB_WRITE_EN
+
+        // ---------------------------------------------------------------
+        // Step 3: Read MC_ARB_RAMCFG, compute ROW_SIZE, adjust GB_ADDR_CONFIG
+        // ---------------------------------------------------------------
+        discard_chmap = GPU_Rd32(gpu, SIReg.MC_SHARED_CHMAP)
+        ramcfg = GPU_Rd32(gpu, SIReg.MC_ARB_RAMCFG)
+
+        PrintMessage("[MC_SI] MC_ARB_RAMCFG = 0x")
+        PrintHex(ramcfg)
+
+        // mem_row_size_in_kb = (4 * (1 << (8 + noofcols))) / 1024
+        // NOOFCOLS = (ramcfg >> 6) & 0x3
+        noofcols = BitwiseAnd(RightShift(ramcfg, 6), 3)
+        // For noofcols=0: 1KB, =1: 2KB, =2: 4KB, =3: 8KB (clamped to 4KB)
+        row_size_code = noofcols
+        IfCondition GreaterThan(row_size_code, 2) ThenBlock: {
+            row_size_code = 2       // clamp: max 4KB = ROW_SIZE(2)
+        }
+
+        PrintMessage(" NOOFCOLS=")
+        PrintNumber(noofcols)
+        PrintMessage(" ROW_SIZE=")
+        PrintNumber(row_size_code)
+        PrintMessage("\n")
+
+        // Start with VERDE_GB_ADDR_CONFIG_GOLDEN = 0x12010002
+        // Clear ROW_SIZE field (bits [29:28]) then set from ramcfg
+        // ROW_SIZE_MASK = 0x30000000
+        gb_addr = BitwiseAnd(302055426, 3489660927)     // 0x12010002 & ~0x30000000 = 0x12010002 & 0xCFFFFFFF
+        gb_addr = BitwiseOr(gb_addr, LeftShift(row_size_code, 28))
+
+        PrintMessage("[MC_SI] GB_ADDR_CONFIG = 0x")
+        PrintHex(gb_addr)
+        PrintMessage("\n")
+
+        // ---------------------------------------------------------------
+        // Step 4: Broadcast address config to all decode hardware
+        // ---------------------------------------------------------------
         GPU_Wr32(gpu, SIReg.GB_ADDR_CONFIG, gb_addr)
         GPU_Wr32(gpu, SIReg.DMIF_ADDR_CONFIG, gb_addr)
         GPU_Wr32(gpu, SIReg.DMIF_ADDR_CALC, gb_addr)
         GPU_Wr32(gpu, SIReg.HDP_ADDR_CONFIG, gb_addr)
+        GPU_Wr32(gpu, SIReg.DMA_TILING_CONFIG, gb_addr)                    // DMA0
+        GPU_Wr32(gpu, Add(SIReg.DMA_TILING_CONFIG, 2048), gb_addr)         // DMA1 (+0x800)
 
-        PrintMessage("[MC_SI] GB_ADDR_CONFIG = 0x")
-        PrintHex(GPU_Rd32(gpu, SIReg.GB_ADDR_CONFIG))
-        PrintMessage(" (expect 0x12010002)\n")
+        // Verify GB_ADDR_CONFIG readback
+        gb_readback = GPU_Rd32(gpu, SIReg.GB_ADDR_CONFIG)
+        PrintMessage("[MC_SI] GB_ADDR_CONFIG readback = 0x")
+        PrintHex(gb_readback)
+        IfCondition EqualTo(gb_readback, gb_addr) ThenBlock: {
+            PrintMessage(" OK\n")
+        }
+        IfCondition NotEqual(gb_readback, gb_addr) ThenBlock: {
+            PrintMessage(" MISMATCH!\n")
+        }
 
-        // Verify readback
-        PrintMessage("[MC_SI] DMIF_ADDR_CONFIG = 0x")
-        PrintHex(GPU_Rd32(gpu, SIReg.DMIF_ADDR_CONFIG))
-        PrintMessage("  HDP_ADDR_CONFIG = 0x")
-        PrintHex(GPU_Rd32(gpu, SIReg.HDP_ADDR_CONFIG))
+        // ---------------------------------------------------------------
+        // Step 5: Tiling mode table — GB_TILE_MODE0 through GB_TILE_MODE31
+        // Verde-specific values from kernel si_tiling_mode_table_init().
+        // split_equal_to_row_size is determined at runtime from row_size_code.
+        // ---------------------------------------------------------------
+        // Compute split_equal_to_row_size: ROW_SIZE 0=1KB→4, 1=2KB→5, 2=4KB→6
+        split_row = Add(row_size_code, 4)
+
+        // Precompute the split_row contribution shifted into TILE_SPLIT position (bits [13:11])
+        split_row_shifted = LeftShift(split_row, 11)
+
+        // Base tile values without TILE_SPLIT (for entries using split_equal_to_row_size)
+        // These have TILE_SPLIT=0 in the base; we OR in split_row_shifted
+        // tile[0]: 2D_THIN1, DEPTH, P4_8x16, SPLIT_64B, 16BANK, W1, H4, ASPECT4
+        GPU_Wr32(gpu, SIReg.GB_TILE_MODE0, 3801362)                          // 0x003A0112
+        // tile[1]: same, SPLIT_128B
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 4), 3803410)                  // 0x003A0912
+        // tile[2]: same, SPLIT_256B
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 8), 3805458)                  // 0x003A1112
+        // tile[3]: same as [1]
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 12), 3803410)                 // 0x003A0912
+        // tile[4]: 1D_THIN1, DEPTH, P4_8x16, SPLIT_64B, 16BANK, W1, H2, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 16), 3473674)                 // 0x0035010A
+        // tile[5]: 2D_THIN1, DEPTH, P4_8x16, split_row, 16BANK, W1, H2, ASPECT2
+        //   base without split = 0x00350112, OR in split_row_shifted
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 20), BitwiseOr(3473682, split_row_shifted))
+        // tile[6]: 2D_THIN1, DEPTH, P4_8x16, split_row, 16BANK, W1, H1, ASPECT2
+        //   base without split = 0x00340112
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 24), BitwiseOr(3408146, split_row_shifted))
+        // tile[7]: 2D_THIN1, DEPTH, P4_8x16, split_row, 16BANK, W1, H4, ASPECT4
+        //   base without split = 0x003A0112
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 28), BitwiseOr(3801362, split_row_shifted))
+        // tile[8]: LINEAR_ALIGNED, DISPLAY, P4_8x16, SPLIT_64B, 16BANK, W1, H2, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 32), 3473668)                 // 0x00350104
+        // tile[9]: 1D_THIN1, DISPLAY, P4_8x16, SPLIT_64B, 16BANK, W1, H2, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 36), 3473672)                 // 0x00350108
+        // tile[10]: 2D_THIN1, DISPLAY, P4_8x16, SPLIT_256B, 16BANK, W1, H4, ASPECT4
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 40), 3805456)                 // 0x003A1110
+        // tile[11]: 2D_THIN1, DISPLAY, P4_8x16, SPLIT_256B, 16BANK, W1, H2, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 44), 3477776)                 // 0x00351110
+        // tile[12]: 2D_THIN1, DISPLAY, P4_8x16, SPLIT_512B, 16BANK, W1, H1, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 48), 3414288)                 // 0x00341910
+        // tile[13]: 1D_THIN1, THIN, P4_8x16, SPLIT_64B, 16BANK, W1, H2, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 52), 3473673)                 // 0x00350109
+        // tile[14]: 2D_THIN1, THIN, P4_8x16, SPLIT_256B, 16BANK, W1, H4, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 56), 3543313)                 // 0x00361111
+        // tile[15]: 2D_THIN1, THIN, P4_8x16, SPLIT_256B, 16BANK, W1, H2, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 60), 3477777)                 // 0x00351111
+        // tile[16]: 2D_THIN1, THIN, P4_8x16, SPLIT_512B, 16BANK, W1, H1, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 64), 3414289)                 // 0x00341911
+        // tile[17]: 2D_THIN1, THIN, P4_8x16, split_row, 16BANK, W1, H1, ASPECT2
+        //   base without split = 0x00340111
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 68), BitwiseOr(3408145, split_row_shifted))
+        // tile[18-20]: unused (0)
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 72), 0)
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 76), 0)
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 80), 0)
+        // tile[21]: 2D_THIN1, THIN, P8_32x32_8x16, SPLIT_256B, 16BANK, W2, H4, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 84), 3560081)                 // 0x00365291
+        // tile[22]: 2D_THIN1, THIN, P8_32x32_8x16, SPLIT_256B, 16BANK, W1, H4, ASPECT4
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 88), 3805841)                 // 0x003A1291
+        // tile[23]: 2D_THIN1, THIN, P8_32x32_8x16, SPLIT_256B, 16BANK, W1, H2, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 92), 3478161)                 // 0x00351291
+        // tile[24]: 2D_THIN1, THIN, P8_32x32_8x16, SPLIT_512B, 16BANK, W1, H1, ASPECT2
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 96), 3414673)                 // 0x00341A91
+        // tile[25]: 2D_THIN1, THIN, P8_32x32_8x16, SPLIT_1KB, 8BANK, W1, H1, ASPECT1
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 100), 2106001)                // 0x00202291
+        // tile[26-31]: unused
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 104), 0)
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 108), 0)
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 112), 0)
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 116), 0)
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 120), 0)
+        GPU_Wr32(gpu, Add(SIReg.GB_TILE_MODE0, 124), 0)
+
+        PrintMessage("[MC_SI] Tile mode table programmed (32 entries)\n")
+
+        // ---------------------------------------------------------------
+        // Step 6: si_setup_rb — render backend setup for Verde
+        // Verde: 1 SE, 2 SH/SE, 4 backends/SE (2 per SH)
+        //
+        // Read disabled RB mask, compute enabled RBs, program PA_SC_RASTER_CONFIG
+        // ---------------------------------------------------------------
+
+        // Select SE 0, broadcast to all SH to read disabled RBs
+        // INSTANCE_BROADCAST | SH_BROADCAST | SE_INDEX(0)
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, BitwiseOr(GFXIndexBits.INSTANCE_BROADCAST_WRITES, GFXIndexBits.SH_BROADCAST_WRITES))
+
+        // Read disabled RBs from fuse registers
+        rb_disable = GPU_Rd32(gpu, SIReg.CC_RB_BACKEND_DISABLE)
+        IfCondition NotEqual(BitwiseAnd(rb_disable, 1), 0) ThenBlock: {
+            // Bit 0 set means fuse data is valid, use BACKEND_DISABLE field
+            rb_disable = BitwiseAnd(rb_disable, 16711680)    // BACKEND_DISABLE_MASK = 0x00FF0000
+        }
+        IfCondition EqualTo(BitwiseAnd(rb_disable, 1), 0) ThenBlock: {
+            rb_disable = 0
+        }
+        rb_disable = BitwiseOr(rb_disable, GPU_Rd32(gpu, SIReg.GC_USER_RB_BACKEND_DISABLE))
+        rb_disable = RightShift(BitwiseAnd(rb_disable, 16711680), 16)  // BACKEND_DISABLE_SHIFT = 16
+
+        // Build enabled_rbs bitmask (4 backends for Verde, 2 per SH)
+        enabled_rbs = BitwiseAnd(BitwiseNot(rb_disable), 15)   // mask to 4 bits
+
+        PrintMessage("[MC_SI] RB enabled mask = 0x")
+        PrintHex(enabled_rbs)
         PrintMessage("\n")
 
+        // Compute PA_SC_RASTER_CONFIG for SE 0
+        // Process 2 SH groups of 2 RBs each
+        // RASTER_CONFIG_RB_MAP: 0=MAP_0, 2=MAP_2(both), 3=MAP_3
+        raster_data = 0
+        // SH 0: RBs [1:0]
+        sh0_rbs = BitwiseAnd(enabled_rbs, 3)
+        IfCondition EqualTo(sh0_rbs, 1) ThenBlock: { raster_data = BitwiseOr(raster_data, 0) }     // RB_MAP_0
+        IfCondition EqualTo(sh0_rbs, 2) ThenBlock: { raster_data = BitwiseOr(raster_data, 3) }     // RB_MAP_3
+        IfCondition EqualTo(sh0_rbs, 3) ThenBlock: { raster_data = BitwiseOr(raster_data, 2) }     // RB_MAP_2
+        // SH 1: RBs [3:2]
+        sh1_rbs = BitwiseAnd(RightShift(enabled_rbs, 2), 3)
+        IfCondition EqualTo(sh1_rbs, 1) ThenBlock: { raster_data = BitwiseOr(raster_data, 0) }     // RB_MAP_0 << 2
+        IfCondition EqualTo(sh1_rbs, 2) ThenBlock: { raster_data = BitwiseOr(raster_data, 12) }    // RB_MAP_3 << 2
+        IfCondition EqualTo(sh1_rbs, 3) ThenBlock: { raster_data = BitwiseOr(raster_data, 8) }     // RB_MAP_2 << 2
+
+        // Write raster config for SE 0
+        // Select SE 0, all SH
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, BitwiseOr(GFXIndexBits.INSTANCE_BROADCAST_WRITES, BitwiseOr(GFXIndexBits.SH_BROADCAST_WRITES, 0)))
+        GPU_Wr32(gpu, SIReg.PA_SC_RASTER_CONFIG, raster_data)
+
+        PrintMessage("[MC_SI] PA_SC_RASTER_CONFIG = 0x")
+        PrintHex(raster_data)
+        PrintMessage("\n")
+
+        // Restore broadcast mode
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, gfx_broadcast)
+
+        // ---------------------------------------------------------------
+        // Step 7: si_setup_spi — SPI thread management for Verde
+        // Verde: 1 SE, 2 SH/SE, 5 CU/SH
+        // For each (SE, SH): read active CU mask, update SPI_STATIC_THREAD_MGMT_3
+        // ---------------------------------------------------------------
+        // SE 0, SH 0
+        // INSTANCE_BROADCAST | SH_INDEX(0) | SE_INDEX(0)
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, GFXIndexBits.INSTANCE_BROADCAST_WRITES)
+        spi_data = GPU_Rd32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3)
+        // Read active CU bitmap
+        cu_cfg0 = GPU_Rd32(gpu, SIReg.CC_GC_SHADER_ARRAY_CONFIG)
+        IfCondition NotEqual(BitwiseAnd(cu_cfg0, 1), 0) ThenBlock: {
+            cu_cfg0 = BitwiseAnd(cu_cfg0, 4294901760)   // INACTIVE_CUS_MASK = 0xFFFF0000
+        }
+        IfCondition EqualTo(BitwiseAnd(cu_cfg0, 1), 0) ThenBlock: {
+            cu_cfg0 = 0
+        }
+        cu_cfg0 = BitwiseOr(cu_cfg0, GPU_Rd32(gpu, SIReg.GC_USER_SHADER_ARRAY_CONFIG))
+        cu_inactive0 = RightShift(cu_cfg0, 16)          // INACTIVE_CUS_SHIFT = 16
+        cu_active0 = BitwiseAnd(BitwiseNot(cu_inactive0), 31)  // 5 CUs = mask 0x1F
+        // Find first active CU and clear its bit in SPI_STATIC_THREAD_MGMT_3
+        spi_k = 0
+        spi_mask = 1
+        WhileLoop LessThan(spi_k, 16) {
+            spi_mask = LeftShift(1, spi_k)
+            IfCondition NotEqual(BitwiseAnd(cu_active0, spi_mask), 0) ThenBlock: {
+                spi_data = BitwiseAnd(spi_data, BitwiseNot(spi_mask))
+                GPU_Wr32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3, spi_data)
+                spi_k = 16  // break
+            }
+            spi_k = Add(spi_k, 1)
+        }
+
+        // SE 0, SH 1
+        // INSTANCE_BROADCAST | SH_INDEX(1) | SE_INDEX(0)
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, BitwiseOr(GFXIndexBits.INSTANCE_BROADCAST_WRITES, 256))  // SH_INDEX(1) = 1<<8 = 256
+        spi_data2 = GPU_Rd32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3)
+        cu_cfg1 = GPU_Rd32(gpu, SIReg.CC_GC_SHADER_ARRAY_CONFIG)
+        IfCondition NotEqual(BitwiseAnd(cu_cfg1, 1), 0) ThenBlock: {
+            cu_cfg1 = BitwiseAnd(cu_cfg1, 4294901760)
+        }
+        IfCondition EqualTo(BitwiseAnd(cu_cfg1, 1), 0) ThenBlock: {
+            cu_cfg1 = 0
+        }
+        cu_cfg1 = BitwiseOr(cu_cfg1, GPU_Rd32(gpu, SIReg.GC_USER_SHADER_ARRAY_CONFIG))
+        cu_inactive1 = RightShift(cu_cfg1, 16)
+        cu_active1 = BitwiseAnd(BitwiseNot(cu_inactive1), 31)
+        spi_k2 = 0
+        WhileLoop LessThan(spi_k2, 16) {
+            spi_mask2 = LeftShift(1, spi_k2)
+            IfCondition NotEqual(BitwiseAnd(cu_active1, spi_mask2), 0) ThenBlock: {
+                spi_data2 = BitwiseAnd(spi_data2, BitwiseNot(spi_mask2))
+                GPU_Wr32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3, spi_data2)
+                spi_k2 = 16  // break
+            }
+            spi_k2 = Add(spi_k2, 1)
+        }
+
+        // Restore broadcast mode
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, gfx_broadcast)
+
+        PrintMessage("[MC_SI] SPI thread mgmt programmed (1 SE, 2 SH)\n")
+
+        // ---------------------------------------------------------------
+        // Step 8: 3D engine defaults from si_gpu_init()
+        // ---------------------------------------------------------------
+        // CP queue thresholds: ROQ_IB1_START(0x16) | ROQ_IB2_START(0x2B)
+        GPU_Wr32(gpu, SIReg.CP_QUEUE_THRESHOLDS, 11030)                      // 0x2B16
+        // CP MEQ thresholds: MEQ1_START(0x30) | MEQ2_START(0x60)
+        GPU_Wr32(gpu, SIReg.CP_MEQ_THRESHOLDS, 24624)                        // 0x6030
+
+        // SX_DEBUG_1: read-modify-write (kernel just reads and writes back)
+        sx_dbg = GPU_Rd32(gpu, SIReg.SX_DEBUG_1)
+        GPU_Wr32(gpu, SIReg.SX_DEBUG_1, sx_dbg)
+
+        // SPI_CONFIG_CNTL_1 = VTX_DONE_DELAY(4)
+        GPU_Wr32(gpu, SIReg.SPI_CONFIG_CNTL_1, 4)
+
+        // PA_SC_FIFO_SIZE — Verde values:
+        //   frontend=0x20, backend=0x40, hiz=0x30, earlyz=0x130
+        //   = (0x20) | (0x40 << 6) | (0x30 << 15) | (0x130 << 23) = 0x98181020
+        GPU_Wr32(gpu, SIReg.PA_SC_FIFO_SIZE, 2551713824)                     // 0x98181020
+
+        GPU_Wr32(gpu, SIReg.VGT_NUM_INSTANCES, 1)
+        GPU_Wr32(gpu, SIReg.CP_PERFMON_CNTL, 0)
+        GPU_Wr32(gpu, SIReg.SQ_CONFIG, 0)
+
+        // PA_SC_FORCE_EOV_MAX_CNTS = CLK_CNT(0xFFF) | REZ_CNT(0xFF)
+        GPU_Wr32(gpu, SIReg.PA_SC_FORCE_EOV_MAX_CNTS, 16715775)              // 0x00FF0FFF
+
+        // VGT_CACHE_INVALIDATION = CACHE_INVALIDATION(VC_AND_TC=2) | AUTO_INVLD_EN(ES_AND_GS_AUTO=3)
+        GPU_Wr32(gpu, SIReg.VGT_CACHE_INVALIDATION, 194)                     // 0xC2
+
+        GPU_Wr32(gpu, SIReg.VGT_GS_VERTEX_REUSE, 16)
+        GPU_Wr32(gpu, SIReg.PA_SC_LINE_STIPPLE_STATE, 0)
+
+        // Zero CB performance counters
+        GPU_Wr32(gpu, SIReg.CB_PERFCOUNTER0_SELECT0, 0)
+        GPU_Wr32(gpu, SIReg.CB_PERFCOUNTER0_SELECT1, 0)
+        GPU_Wr32(gpu, SIReg.CB_PERFCOUNTER1_SELECT0, 0)
+        GPU_Wr32(gpu, SIReg.CB_PERFCOUNTER1_SELECT1, 0)
+        GPU_Wr32(gpu, SIReg.CB_PERFCOUNTER2_SELECT0, 0)
+        GPU_Wr32(gpu, SIReg.CB_PERFCOUNTER2_SELECT1, 0)
+        GPU_Wr32(gpu, SIReg.CB_PERFCOUNTER3_SELECT0, 0)
+        GPU_Wr32(gpu, SIReg.CB_PERFCOUNTER3_SELECT1, 0)
+
+        // PA_CL_ENHANCE = CLIP_VTX_REORDER_ENA | NUM_CLIP_SEQ(3)
+        GPU_Wr32(gpu, SIReg.PA_CL_ENHANCE, 7)
+
+        PrintMessage("[MC_SI] 3D engine defaults programmed\n")
         PrintMessage("[MC_SI] GPU engine init OK\n")
         ReturnValue(1)
     }
