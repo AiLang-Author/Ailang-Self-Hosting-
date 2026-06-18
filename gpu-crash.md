@@ -730,6 +730,30 @@ reads from `data` (MOVE_DATA). Matches kernel `atom_iio_execute()` in `atom.c`.
 
 ---
 
+## Fix #7: AtomBIOS Delay Timing Too Short — Jun 18, 2026
+
+### Problem
+`AE_OpDelay` busy-wait loop was too fast. Microsecond path did 1 MMIO read per
+count unit (~200-500ns actual vs 1µs requested). Millisecond path did `count*1000`
+reads (~0.2-0.5ms actual vs 1ms requested) — **2-5x too short**.
+
+POST relies on precise delays for PLL lock times and MC VRAM training. If the
+VBIOS requests 5ms for PLL stabilization and we only wait ~1ms, PLLs may not lock
+and subsequent register reads return garbage.
+
+### Fix
+- Microsecond path: 5 MMIO reads per count unit (≈1-2.5µs, conservative overshoot)
+- Millisecond path: 5000 MMIO reads per count unit (≈1-2.5ms, conservative overshoot)
+
+Overshooting is safe for POST (just slower init). Undershooting causes failures.
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUAtomExecOps.ailang` — AE_OpDelay
+
+### Status: APPLIED — TESTING
+
+---
+
 ## Full Dispatch Trace (AccelGCN_Init)
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
