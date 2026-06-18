@@ -221,12 +221,12 @@ Function.PM4_InitMCBase {
         // GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_INFO, ...)
         // GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_SIZE, ...)
 
-        // Snapshot BIOS-configured HDP_HOST_PATH_CNTL for GPU-side read-cache
-        // invalidation in PM4_SubmitCompute.  CPU-side writes to this register
-        // deadlock the PCI bus post-dispatch; the GPU can safely write it back
-        // via WRITE_DATA while the CP is still active.
-        PM4State.hdp_hpc_val = GPU_Rd32(gpu, SIReg.HDP_HOST_PATH_CNTL)
-        PM4State.hdp_misc_val = GPU_Rd32(gpu, SIReg.HDP_MISC_CNTL)
+        // HDP snapshots REMOVED — no longer writing HDP regs from dispatch path.
+        // All HDP register writes (CPU or GPU-side) crash the RD990 PCI fabric.
+
+        PrintMessage("[PM4] mc_fb_base=0x")
+        PrintHex(PM4State.mc_fb_base)
+        PrintMessage("\n")
 
         //PrintMessage("[PM4] MC_VM_FB_LOCATION = 0x")
         //PrintHex(mc_raw)
@@ -234,67 +234,63 @@ Function.PM4_InitMCBase {
         //PrintHex(PM4State.mc_fb_base)
         //PrintMessage("\n")
 
-        // --- VM setup: configure system aperture so compute shaders can access VRAM ---
-        // Without this, buffer loads/stores go through VM translation and fault.
-        // System aperture defines a GPU address range that bypasses VM page tables.
-        // Addresses are in 4KB pages (addr >> 12).
-        vram_start_page = RightShift(PM4State.mc_fb_base, 12)
-        vram_end_page = RightShift(LeftShift(mc_top_units, 24), 12)
+        // VM/TLB setup moved to PM4_ConfigureVM — must be called AFTER
+        // PM4_SoftResetCP, which wipes VM registers via GRBM/SRBM reset.
+    }
+}
 
-        // Debug: read current VM state
-        //PrintMessage("[PM4] VM_CONTEXT0_CNTL = 0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.VM_CONTEXT0_CNTL))
-        //PrintMessage("\n")
-        //PrintMessage("[PM4] SYSTEM_APERTURE: low=0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR))
-        //PrintMessage(" high=0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR))
-        //PrintMessage(" default=0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR))
-        //PrintMessage("\n")
+// =============================================================================
+// PM4_ConfigureVM — program VM/TLB registers and system aperture
+//
+// MUST be called AFTER PM4_SoftResetCP and MC_SI_GpuInit.
+// GRBM_SOFT_RESET and SRBM_SOFT_RESET wipe VM_CONTEXT0_CNTL, VM_L2_CNTL,
+// and MC_VM_MX_L1_TLB_CNTL back to power-on defaults.  Previously this code
+// lived in PM4_InitMCBase and ran BEFORE the soft reset — the registers were
+// programmed then immediately destroyed, leaving the TLB misconfigured.
+// That caused TA_BUSY hangs on buffer_load_dword (TA sends address through
+// dead TLB, never gets response).
+//
+// Requires PM4_InitMCBase to have been called first (needs mc_fb_base).
+// =============================================================================
+Function.PM4_ConfigureVM {
+    Input: gpu: Integer
+    Body: {
+        // Re-read MC_VM_FB_LOCATION for aperture bounds
+        mc_raw = GPU_Rd32(gpu, SIReg.MC_VM_FB_LOCATION)
+        mc_base_units = BitwiseAnd(mc_raw, 65535)
+        mc_top_units = BitwiseAnd(RightShift(mc_raw, 16), 65535)
 
-        // Disable VM page table for VMID 0 — use physical addressing
-        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_CNTL, 0)
+        vram_start_page = RightShift(LeftShift(mc_base_units, 24), 12)
+        // mc_top_units is the top 16MB block index.  Aperture HIGH must be the
+        // LAST page, not the start of the last block.
+        // (mc_top_units + 1) << 12 gives the first page PAST the end; subtract 1.
+        // e.g. mc_top_units=0x3F -> (0x40 << 12) - 1 = 0x3FFFF (matches radeon)
+        vram_end_page = Subtract(LeftShift(Add(mc_top_units, 1), 12), 1)
 
-        // --- MC_VM_MX_L1_TLB_CNTL — CRITICAL for compute buffer access ---
-        // This register controls how the L1 TLB routes GPU memory requests.
-        // Without this, the inherited kernel config may have ENABLE_L1_TLB +
-        // ENABLE_ADVANCED_DRIVER_MODEL set, which routes addresses outside the
-        // system aperture through VM page tables — and with VM_CONTEXT0_CNTL=0
-        // (no page table), those accesses silently fault, killing the wavefront.
-        //
-        // si_pcie_gart_disable() pattern from Linux radeon si.c:
-        //   SYSTEM_ACCESS_MODE_NOT_IN_SYS (3 << 3 = 0x18)
-        //     + SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU (0 << 5 = 0x00)
-        //   = 0x18
-        // L1 TLB disabled, no advanced driver model, aperture routing only.
-        // Note: PASS_THRU is (0<<5), not (1<<5). Bit 5 set means
-        // UNMAPPED_ACCESS_DEFAULT_PAGE which redirects to DEFAULT_ADDR.
-        // Matches kernel si_pcie_gart_disable() value of 0x18.
-        //PrintMessage("[PM4] MC_VM_MX_L1_TLB_CNTL before=0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL))
-        //PrintMessage("\n")
-        // bits: [4:3]=3 (NOT_IN_SYS), [5]=0 (PASS_THRU) = 0x18
-        GPU_Wr32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL, 24)
+        // --- VM/TLB config — match BIOS POST / kernel gart_enable values ---
+        // VM_CONTEXT0_CNTL = 0x11: ENABLE_CONTEXT | RANGE_PROTECTION_FAULT_ENABLE
+        //   PAGE_TABLE_DEPTH=0 (flat/passthrough, no page walk for VMID 0)
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_CNTL, 17)                    // 0x00000011
 
-        // --- VM L2 cache — disable to avoid stale cached translations ---
-        // si_pcie_gart_disable() pattern: L2 cache OFF, PTE/PDE0 LRU update on,
-        // queue size 7, context1 identity access mode 1.
-        // = ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE (1<<9)    = 512
-        //   + ENABLE_L2_PDE0_CACHE_LRU_UPDATE_BY_WRITE (1<<10) = 1024
-        //   + EFFECTIVE_L2_QUEUE_SIZE(7) = (7<<15)              = 229376
-        //   + CONTEXT1_IDENTITY_ACCESS_MODE(1) = (1<<19)        = 524288
-        //   Total = 755200
-        GPU_Wr32(gpu, SIReg.VM_L2_CNTL, 755200)
-        // L2_CNTL2: clear invalidation bits (no ongoing invalidation)
+        // MC_VM_MX_L1_TLB_CNTL = 0x055B:
+        //   ENABLE_L1_TLB | ENABLE_L1_FRAGMENT_PROCESSING |
+        //   SYSTEM_ACCESS_MODE=NOT_IN_SYS(3) | ENABLE_ADVANCED_DRIVER_MODEL |
+        //   (0xA << 7)
+        // CRITICAL: SYSTEM_ACCESS_MODE=3 means addresses within the system
+        // aperture (VRAM) bypass VM translation entirely -> direct to MC.
+        // Old value 0x0503 used PA_ONLY(0) which sent everything through
+        // VM page-table translation, but VMID 0 has no page tables -> TA_BUSY hang.
+        GPU_Wr32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL, 1371)             // 0x055B
+
+        // VM_L2_CNTL = 0x000B8603: L2 cache enabled, fragment processing,
+        //   PTE/PDE cache LRU, queue size, context1 identity access mode
+        GPU_Wr32(gpu, SIReg.VM_L2_CNTL, 755203)                      // 0x000B8603
         GPU_Wr32(gpu, SIReg.VM_L2_CNTL2, 0)
-        // L2_CNTL3: BIGK associativity + fragment size 0
-        // = L2_CACHE_BIGK_ASSOCIATIVITY (1 << 20) = 1048576
-        GPU_Wr32(gpu, SIReg.VM_L2_CNTL3, 1048576)
+        // VM_L2_CNTL3 = 0x00120004: BANK_SELECT and L2_CACHE_BIGK_FRAGMENT_SIZE
+        GPU_Wr32(gpu, SIReg.VM_L2_CNTL3, 1179652)                    // 0x00120004
 
-        // --- Invalidate all TLB entries to clear stale kernel translations ---
+        // Invalidate all TLB entries
         GPU_Wr32(gpu, SIReg.VM_INVALIDATE_REQUEST, 1)
-        // Poll for invalidation to complete (bit 0 of RESPONSE = VMID 0)
         vm_inv_poll = 0
         WhileLoop LessThan(vm_inv_poll, 1000) {
             vm_inv_resp = GPU_Rd32(gpu, SIReg.VM_INVALIDATE_RESPONSE)
@@ -309,31 +305,8 @@ Function.PM4_InitMCBase {
         GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR, vram_end_page)
         GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, vram_start_page)
 
-        // Readback verify all writes took effect
-        rb_ctx = GPU_Rd32(gpu, SIReg.VM_CONTEXT0_CNTL)
-        rb_l1  = GPU_Rd32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL)
-        rb_lo  = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR)
-        rb_hi  = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR)
-        rb_def = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR)
-        //PrintMessage("[PM4] VM configured: aperture 0x")
-        //PrintHex(PM4State.mc_fb_base)
-        //PrintMessage(" - 0x")
-        //PrintHex(LeftShift(mc_top_units, 24))
-        //PrintMessage(", VM_CONTEXT0_CNTL=")
-        //PrintNumber(rb_ctx)
-        //PrintMessage("\n")
-        //PrintMessage("[PM4] MC_VM_MX_L1_TLB_CNTL=0x")
-        //PrintHex(rb_l1)
-        //PrintMessage("\n")
-        //PrintMessage("[PM4] APERTURE readback: low=0x")
-        //PrintHex(rb_lo)
-        //PrintMessage(" high=0x")
-        //PrintHex(rb_hi)
-        //PrintMessage(" default=0x")
-        //PrintHex(rb_def)
-        //PrintMessage("\n")
-        // NOTE: rb_lo==0 is valid when VRAM starts at MC address 0
-        // (MC_VM_FB_LOCATION BASE=0).  Only warn if HIGH is also 0.
+        // Readback verify
+        rb_hi = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR)
         IfCondition EqualTo(rb_hi, 0) ThenBlock: {
             PrintMessage("[PM4] WARNING: aperture HIGH readback is 0 — MC register write may have failed!\n")
         }
