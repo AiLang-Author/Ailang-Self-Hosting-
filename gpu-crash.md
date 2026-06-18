@@ -492,7 +492,74 @@ address interleaving doesn't match what the MC expects, causing scattered
 reads/writes to wrong VRAM locations.
 ```
 
-### Status: STEPS 1-3 DONE, IMPLEMENTING STEP 4 (GB_ADDR_CONFIG)
+### Status: STEPS 1-4 DONE, TESTING DUAL-GPU COMPARISON
+
+---
+
+## Crash #3: Display Blanking on Bus 1 (MC_SI_Program) — Jun 17, 2026
+
+### Symptom
+Running `test_accel_gcn` (dual-GPU comparison test) blanked the display and
+forced a hard reboot. The test runs `RunOnGPU(1)` first (display GPU), then
+`RunOnGPU(2)` (compute GPU). The display died during bus 1 init.
+
+### Root Cause (CONFIRMED)
+`MC_SI_Program()` was running unconditionally on BOTH GPUs. On the display GPU
+(bus 1, POSTed, VESA framebuffer active), this function:
+
+1. **`BIF_FB_EN = 0`** — kills CPU access to VRAM. VESA can no longer read or
+   write the framebuffer. Screen goes black immediately.
+2. **`MC_SHARED_BLACKOUT_CNTL |= 1`** — MC blackout, blocks all memory ops.
+3. **`VGA_HDP_CONTROL = VGA_MEMORY_DISABLE`** — disables VGA memory aperture.
+4. **Reprograms `MC_VM_FB_LOCATION`** to `vram_start=0` — stomps the BIOS-
+   configured aperture that the VESA driver depends on.
+
+Even after un-blackout (`BIF_FB_EN = 3`), the aperture addresses are wrong
+relative to what VESA expects, so the display stays dead.
+
+Additionally, `MC_SI_GpuInit()` overwrites `DMIF_ADDR_CONFIG` (Display Memory
+Interface address decode), which corrupts the scanout engine's address mapping.
+
+None of these functions existed in the old working code (commit `ed2fbcce` and
+earlier). They were added for Issue #5 (un-POSTed bus 2 GPU), but applied
+unconditionally to both GPUs.
+
+### Fix (APPLIED)
+Gate all three MC functions behind `GPU_BAR_IsDisplayGPU()` in `AccelGCN_Init`:
+
+```ailang
+is_display = GPU_BAR_IsDisplayGPU(gpu)
+IfCondition EqualTo(is_display, 0) ThenBlock: {
+    mc_rc = MC_SI_LoadMicrocode(gpu)
+    mc_prog_rc = MC_SI_Program(gpu)
+    mc_gpu_rc = MC_SI_GpuInit(gpu)
+}
+IfCondition EqualTo(is_display, 1) ThenBlock: {
+    PrintMessage("[AccelGCN] display GPU — skipping MC init (BIOS already configured)\n")
+}
+```
+
+The display GPU is already fully POSTed by the BIOS — MC firmware loaded,
+VRAM trained, aperture configured, `GB_ADDR_CONFIG` set. Running these
+functions on it is unnecessary and destructive.
+
+### Files Modified
+- `Librarys/Accel/Library.AccelGCN.ailang` — MC init gated by `is_display` check
+- `TestCode/test_accel_gcn.ailang` — header comments updated with safety note
+
+### If Display Still Blanks
+If the screen still dies after this fix, the remaining suspects are:
+1. `DPM_SI_InitSPLL` — touches SPLL/engine clocks, could disrupt display PLL
+2. `PM4_SoftResetCP` — GRBM_SOFT_RESET might reset display-related blocks
+3. `PM4_HaltCP` — halting the CP shouldn't affect display, but worth checking
+
+To revert:
+```bash
+git checkout -- Librarys/Accel/Library.AccelGCN.ailang
+git checkout -- TestCode/test_accel_gcn.ailang
+```
+
+### Status: FIX APPLIED — AWAITING TEST
 
 ---
 
@@ -500,7 +567,7 @@ reads/writes to wrong VRAM locations.
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
 2. AtomBIOS_LoadROM -> Parse -> PP_Parse -> Volt_Parse -> DPM_SI_InitSPLL
-3. **MC_SI_LoadMicrocode** (VRAM training) -> **MC_SI_Program** (FB_LOCATION, aperture)
+3. **MC_SI_LoadMicrocode** -> **MC_SI_Program** -> **MC_SI_GpuInit** *(un-POSTed GPUs only; SKIPPED on display GPU)*
 4. PM4_HaltCP -> PM4_InitMCBase -> PM4_SoftResetCP -> PM4_HaltCP
 5. PM4_LoadCPFirmware -> PM4_LoadRLCFirmware -> PM4_SetupIHRing
 6. PM4_SetupRing(0) -> PM4_CPStart (unhalt) -> PM4_RingTest(0)
