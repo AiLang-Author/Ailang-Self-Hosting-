@@ -754,6 +754,42 @@ Overshooting is safe for POST (just slower init). Undershooting causes failures.
 
 ---
 
+## Fix #8: Missing Verde Golden Registers (TC Pipeline) — Jun 18, 2026
+
+### Problem
+The BIOS programs chip-specific "golden registers" during POST via
+`si_init_golden_registers()` in the kernel. Our code never programmed these for
+the un-POSTed compute GPU (bus 2). The critical missing registers control the
+**texture cache (TC) pipeline** that `buffer_load_dword` uses on GCN:
+
+| Register | Address | Value | Purpose |
+|---|---|---|---|
+| `TA_CNTL_AUX` | 0x9508 | bit 16 | TA unit control for buffer ops |
+| `TCP_ADDR_CONFIG` | 0xAC14 | 0x3 | 4 TCC blocks (matches Verde channels) |
+| `TCP_CHAN_STEER_LO` | 0xAC0C | 0x1032 | Channel steering |
+| `TCP_CHAN_STEER_HI` | 0xAC10 | 0x0 | Upper steering (2 pipes) |
+| `SPI_CONFIG_CNTL` | 0x9100 | 0x03000000 | GPR_WRITE_PRIORITY for wave dispatch |
+| `SX_DEBUG_1` | 0x9060 | 0x20 | Shader export debug bit 5 |
+
+Without `TCP_ADDR_CONFIG` matching the memory channel config, the TC pipeline
+misroutes requests to non-existent channels → 0xFFFFFFFF returns.
+
+### Fix
+Added golden register programming as Step 0b in `MC_SI_GpuInit`, right after
+clock gating disable. Uses read-modify-write with masks matching the kernel's
+`radeon_program_register_sequence()` pattern.
+
+Also added register constants to PM4Regs: `TA_CNTL_AUX`, `TCP_CHAN_STEER_LO`,
+`TCP_CHAN_STEER_HI`, `TCP_ADDR_CONFIG`.
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUMC_SI.ailang` — golden regs in GpuInit
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Regs.ailang` — new register constants
+
+### Status: APPLIED — TESTING
+
+---
+
 ## Full Dispatch Trace (AccelGCN_Init)
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
