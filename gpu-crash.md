@@ -815,6 +815,40 @@ Changed value from 56 (0x38) to 24 (0x18).  Matches kernel.
 
 ---
 
+## Fix #10: TC Golden Registers Wiped by GRBM_SOFT_RESET — Jun 18, 2026
+
+### Problem
+Fix #8 programmed TC pipeline golden registers (TA_CNTL_AUX, TCP_ADDR_CONFIG,
+TCP_CHAN_STEER_LO/HI, SX_DEBUG_1) in `MC_SI_GpuInit`.  But `PM4_SoftResetCP`
+runs AFTER `MC_SI_GpuInit` in the init sequence and performs `GRBM_SOFT_RESET`
+with `SOFT_RESET_TA` (bit 12) and `SOFT_RESET_TC` (bit 11) set.  This wipes
+TA_CNTL_AUX, TCP_ADDR_CONFIG, and TCP_CHAN_STEER back to power-on defaults.
+
+The existing Step 7 in `PM4_SoftResetCP` already reprogrammed `SPI_CONFIG_CNTL`
+after the soft reset, but did NOT reprogram the TC pipeline registers.
+
+Result: `buffer_load_dword` misroutes through TC → returns 0xFFFFFFFF.
+
+### Impact
+Direct cause of continued 0xFFFFFFFF after Fix #8.  The golden registers were
+being programmed correctly but then immediately destroyed by the soft reset.
+
+### Fix
+Added TC golden register reprogramming to `PM4_SoftResetCP` Step 7, after the
+existing SPI_CONFIG_CNTL reprogramming and before clock gating disable:
+- `TA_CNTL_AUX`: set bit 16
+- `TCP_ADDR_CONFIG`: low 10 bits = 3 (NUM_TCC_BLOCKS - 1 = 3 for Verde)
+- `TCP_CHAN_STEER_HI`: 0
+- `TCP_CHAN_STEER_LO`: 0x1032 (4146 decimal)
+- `SX_DEBUG_1`: low 7 bits = 0x20 (bit 5)
+
+### Files Modified
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4FW.ailang` — PM4_SoftResetCP Step 7
+
+### Status: APPLIED — TESTING
+
+---
+
 ## Full Dispatch Trace (AccelGCN_Init)
 
 1. GPU_Discover -> GPU_BAR_MapMMIO -> GPU_BAR_MapVRAM
