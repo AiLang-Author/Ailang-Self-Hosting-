@@ -1,0 +1,842 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AccelGCNInit.ailang
+//
+// AccelGCN state (FixedPools) + Init + Shutdown + ComputeReset.
+// Split from Library.AccelGCN.ailang for maintainability.
+//
+// USAGE
+//   LibraryImport.Accel.AccelGCNInit
+
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUGART
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPowerPlay
+LibraryImport.Drivers.AMDGPU.AMDGPUVoltage
+LibraryImport.Drivers.AMDGPU.AMDGPUSMCRegs
+LibraryImport.Drivers.AMDGPU.AMDGPUSMC_SI
+LibraryImport.Drivers.AMDGPU.AMDGPUSMC
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExec
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecIO
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecDecode
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecOps
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExecRun
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.AMDGPUDPM_SI
+LibraryImport.Drivers.AMDGPU.AMDGPUDPM
+LibraryImport.Drivers.AMDGPU.AMDGPUMC_SI
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+LibraryImport.Drivers.AMDGPU.AMDGPUDisplay
+
+// =============================================================================
+// ACCELGCN STATE
+// =============================================================================
+FixedPool.AccelGCNCfg {
+    "prefer_bus":     Initialize=-1, CanChange=True  // preferred PCI bus (-1 = auto: bus 2)
+    "gpu_idx":        Initialize=0, CanChange=True   // which GPU (0 = first)
+    "ring_idx":       Initialize=0, CanChange=True   // which ring (0 = GFX)
+    "initialized":    Initialize=0, CanChange=True   // 1 after init
+    "shader_vram":    Initialize=0, CanChange=True   // VRAM offset for shader code (legacy)
+    "shader_host_ptr": Initialize=0, CanChange=True  // host pointer to GART-backed shader buffer
+    "shader_gart_va":  Initialize=0, CanChange=True   // GPU GART VA of shader buffer
+    "buf_desc_vram":  Initialize=0, CanChange=True   // VRAM offset for buffer descriptors
+    "data_vram":      Initialize=0, CanChange=True   // VRAM offset for data buffers
+    "data_host_ptr":  Initialize=0, CanChange=True   // host pointer to GART-backed data buffer
+    "data_gart_va":   Initialize=0, CanChange=True   // GPU GART VA of data buffer (for V#)
+    "dispatch_count": Initialize=0, CanChange=True   // dispatches on current ring (for rotation)
+    "ib_vram":        Initialize=0, CanChange=True   // VRAM offset for IB scratch buffer (legacy, unused)
+    "ib_host_ptr":    Initialize=0, CanChange=True   // host pointer to GART-backed IB page
+    "ib_gart_va":     Initialize=0, CanChange=True   // GPU GART VA of IB page (for INDIRECT_BUFFER)
+    "skip_hw_init":   Initialize=0, CanChange=True   // 1 = warm boot: skip SPLL, soft reset, MC_SI_GpuInit
+}
+
+// =============================================================================
+// KERNEL CACHE — avoid per-dispatch CIR rebuild + GCN lowering
+//
+// For a given (op, rows, cols) the generated machine code is identical.
+// We cache up to 3 kernels (one per op type: MatVecMul, MatTVecMul, OuterAccum).
+// On cache hit we skip CIR_Begin/End/Lower_GCN entirely and restore the
+// machine code + metadata from cache, going straight to upload + dispatch.
+//
+// Each slot stores a copy of the machine code bytes plus CIR/GCN metadata
+// needed by AccelGCN_Dispatch.
+// =============================================================================
+FixedPool.KCache {
+    "NUM_SLOTS":    Initialize=3,  CanChange=False
+    "SLOT_SIZE":    Initialize=80, CanChange=False  // bytes of metadata per slot
+    // Metadata offsets within each slot (8 bytes each):
+    "OFF_VALID":    Initialize=0,  CanChange=False  // 1 if slot is populated
+    "OFF_OP":       Initialize=8,  CanChange=False  // HALOp.op
+    "OFF_ROWS":     Initialize=16, CanChange=False  // HALOp.rows
+    "OFF_COLS":     Initialize=24, CanChange=False  // HALOp.cols
+    "OFF_MC_SIZE":  Initialize=32, CanChange=False  // CIRProg.mc_size
+    "OFF_VGPRS":    Initialize=40, CanChange=False  // CIRGcn.num_vgprs
+    "OFF_SGPRS":    Initialize=48, CanChange=False  // CIRGcn.num_sgprs
+    "OFF_GRP_SZ":   Initialize=56, CanChange=False  // CIRProg.group_size_x
+    "OFF_GRID_X":   Initialize=64, CanChange=False  // CIRProg.grid_x
+    "OFF_MC_PTR":   Initialize=72, CanChange=False  // pointer to cached mc bytes
+}
+
+FixedPool.KCacheState {
+    "meta_buf":     Initialize=0,  CanChange=True   // mmap'd metadata array (3*80=240 bytes)
+    "initialized":  Initialize=0,  CanChange=True
+}
+
+// VRAM layout — all offsets from 96MB base (0x6000000).
+// First 90MB (0x0-0x59FFFFF) reserved for GART page table.
+// IH ring, WPTR writeback, and dummy page are in system RAM (mapped via GART).
+// Regions are packed with NO overlap.
+//
+//   [0x0000000 .. 0x59FFFFF]  GART page table (90MB)
+//   [0x5A00000 .. 0x5FFFFFF]  Padding (6MB alignment)
+//   +0x000000  Ring 0       68KB     0x6000000 .. 0x6010FFF
+//   +0x011000  Ring 1       68KB     0x6011000 .. 0x6021FFF
+//   +0x022000  Ring 2       68KB     0x6022000 .. 0x6032FFF
+//   +0x034000  RLC SR       16KB     0x6034000 .. 0x6037FFF
+//   +0x038000  RLC CS       16KB     0x6038000 .. 0x603BFFF
+//   +0x03C000  Shader       256KB    0x603C000 .. 0x607BFFF
+//   +0x07C000  Buf desc       4KB    0x607C000 .. 0x607CFFF
+//   +0x07D000  IB scratch     4KB    0x607D000 .. 0x607DFFF
+//   +0x07E000  DATA         (rest)   0x607E000 .. end
+//
+FixedPool.AccelGCNLayout {
+    // All offsets are absolute VRAM BAR offsets (96MB base + region offset).
+    "RING1_OFFSET":     Initialize=100732928, CanChange=False   // 0x6011000
+    "RING2_OFFSET":     Initialize=100802560, CanChange=False   // 0x6022000
+    "RLC_SR_OFFSET":    Initialize=100876288, CanChange=False   // 0x6034000
+    "RLC_CS_OFFSET":    Initialize=100892672, CanChange=False   // 0x6038000
+    "SHADER_OFFSET":    Initialize=100909056, CanChange=False   // 0x603C000
+    "SHADER_SIZE":      Initialize=262144,    CanChange=False   // 256KB for shader code
+    "BUF_DESC_OFFSET":  Initialize=101171200, CanChange=False   // 0x607C000
+    "BUF_DESC_SIZE":    Initialize=4096,      CanChange=False   // 4KB for V# entries
+    "IB_OFFSET":        Initialize=101175296, CanChange=False   // 0x607D000
+    "DATA_OFFSET":      Initialize=101179392, CanChange=False   // 0x607E000
+}
+
+// =============================================================================
+// AccelGCN_Init — discover GPU, map BARs, set up ring, init CIR
+// =============================================================================
+Function.AccelGCN_Init {
+    Output: Integer
+    Body: {
+        //PrintMessage("[AccelGCN] initializing...\n")
+
+        // Discover AMD GPUs
+        n_gpus = GPU_Discover()
+        IfCondition EqualTo(n_gpus, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] no AMD GPU found\n")
+            ReturnValue(-1)
+        }
+
+        // Select GPU by PCI bus.
+        // If prefer_bus is set (>= 0), use that bus. Otherwise default to bus 2
+        // (compute GPU on dual-GPU FX-8320 / RD990 systems).
+        target_bus = AccelGCNCfg.prefer_bus
+        IfCondition LessThan(target_bus, 0) ThenBlock: {
+            target_bus = 2
+        }
+        gpu = 0
+        IfCondition GreaterThan(n_gpus, 1) ThenBlock: {
+            gi = 0
+            gpu = -1
+            WhileLoop LessThan(gi, n_gpus) {
+                bus = GPU_GetDeviceField(gi, GPUDevField.PCI_BUS)
+                IfCondition EqualTo(bus, target_bus) ThenBlock: {
+                    gpu = gi
+                }
+                gi = Add(gi, 1)
+            }
+            IfCondition LessThan(gpu, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] preferred bus not found, using GPU 0\n")
+                gpu = 0
+            }
+        }
+        AccelGCNCfg.gpu_idx = gpu
+        PrintMessage("[AccelGCN] using GPU ")
+        PrintNumber(gpu)
+        PrintMessage(" (bus ")
+        PrintNumber(GPU_GetDeviceField(gpu, GPUDevField.PCI_BUS))
+        PrintMessage(")\n")
+
+        // If targeting the display GPU, allow BAR mapping (lockout override)
+        IfCondition EqualTo(GPU_GetDeviceField(gpu, GPUDevField.PCI_BUS), GPUBarLockout.DISPLAY_BUS) ThenBlock: {
+            // SAFETY GUARD: only touch the display GPU if EXPLICITLY requested.
+            // If selection fell back here (bus 2 not discovered), abort BEFORE any
+            // mapping/DPM — DPM_SI sends NoDisplay which blanks the monitor and
+            // hangs the RD990 fabric.
+            IfCondition NotEqual(AccelGCNCfg.prefer_bus, GPUBarLockout.DISPLAY_BUS) ThenBlock: {
+                PrintMessage("[AccelGCN] ABORT: selection fell back to DISPLAY GPU (bus 1) but prefer_bus is not the display bus — refusing to init display GPU\n")
+                ReturnValue(-99)
+            }
+            GPUBarLockout.allow_display = 1
+            PrintMessage("[AccelGCN] display GPU selected — BAR lockout overridden for mapping\n")
+        }
+
+        // Map MMIO and VRAM BARs
+        GPU_BAR_Init()
+        rc = GPU_BAR_MapMMIO(gpu)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] MMIO map failed\n")
+            ReturnValue(-2)
+        }
+        rc = GPU_BAR_MapVRAM(gpu)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] VRAM map failed\n")
+            ReturnValue(-3)
+        }
+
+        // ---------------------------------------------------------------
+        // SPLL / DPM init — MUST happen BEFORE any GRBM-domain writes.
+        // GRBM-routed registers (CP_ME_CNTL, GRBM_SOFT_RESET, firmware
+        // load regs, etc.) require the engine clock to complete PCI
+        // transactions.  On fresh boot with radeon unbound the SPLL is
+        // in reset/bypass — writing GRBM regs without clocks stalls
+        // the PCI bus and hard-locks the shared RD990 root complex.
+        //
+        // skip_hw_init=1: card already initialized (e.g. by amdgpu), skip
+        // SPLL, soft reset, and golden regs — just set up VM, CP, and rings.
+        // ---------------------------------------------------------------
+        warm_boot = AccelGCNCfg.skip_hw_init
+
+        IfCondition EqualTo(warm_boot, 0) ThenBlock: {
+            rom = AtomBIOS_LoadROM(gpu)
+            IfCondition NotEqual(rom, 0) ThenBlock: {
+                ap_rc = AtomBIOS_Parse(gpu)
+            }
+            PP_Parse(gpu)
+            Volt_Parse(gpu)
+
+            // Very early init (kernel Phase 1, seq 15-16; Phase 3, seq 145)
+            // Clock gating control — must happen before SPLL and MC training
+            GPU_Wr32(gpu, 5932, 0)                                // 0x172C = 0 (CG clock gating)
+            GPU_Wr32(gpu, 5948, 536870912)                        // 0x173C = 0x20000000 (CG control)
+            GPU_Wr32(gpu, 23580, 2051)                            // 0x5C1C = 0x00000803 (HDP_MISC_CNTL, seq 145)
+
+            // Zero MC_VM_FB_LOCATION before AtomBIOS ASIC_INIT.
+            // On a truly unposted card (kernel cold boot), this register is 0.
+            // Our card may retain a stale value from a previous run, which causes
+            // AtomBIOS to produce a different MC program 3-step sequence.
+            GPU_Wr32(gpu, SIReg.MC_VM_FB_LOCATION, 0)
+
+            spll_rc = DPM_SI_InitSPLL(gpu)
+            IfCondition EqualTo(spll_rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] FATAL: SPLL init failed — aborting before GRBM writes\n")
+                PrintMessage("[AccelGCN] GPU may be wedged. Run: sudo ~/Ailang-Self-Hosting-/gpu_reset.sh\n")
+                ReturnValue(-30)
+            }
+
+            // HDP + DMIF init (kernel Phase 3, seq 130-145)
+            // AtomBIOS ASIC_INIT writes HDP_HOST_PATH_CNTL=0x0F200029 and
+            // HDP_MISC_CNTL=0x00121FE0 internally.  Do NOT duplicate here —
+            // the kernel trace shows exactly one occurrence from AtomBIOS.
+
+            // Golden regs + GPU init (kernel si_gpu_init, seq 3641-3760)
+            // The kernel writes these IMMEDIATELY after ASIC_INIT returns
+            // (BIF_FB_EN=3 is the last thing AtomBIOS does). Must happen
+            // BEFORE MC firmware load (which is kernel Phase 7, seq 4119+).
+            // DISPLAY SAFETY: skip on display GPU — screen would blank.
+            is_display = GPU_BAR_IsDisplayGPU(gpu)
+            IfCondition EqualTo(is_display, 0) ThenBlock: {
+                mc_gpu_rc = MC_SI_GpuInit(gpu)
+            }
+
+            // Load MC sequencer firmware (kernel Phase 7)
+            // This uploads verde_mc.bin, trains VRAM, and starts the MC sequencer.
+            // Must happen AFTER AtomBIOS ASIC_INIT (which sets up SPLL/clocks)
+            // and golden regs (kernel si_gpu_init), BEFORE VM aperture setup.
+            mc_rc = MC_SI_LoadMicrocode(gpu)
+            PrintMessage("[AccelGCN] MC_SI_LoadMicrocode rc=")
+            PrintNumber(mc_rc)
+            PrintMessage("\n")
+        }
+        IfCondition EqualTo(warm_boot, 1) ThenBlock: {
+            PrintMessage("[AccelGCN] warm boot — skipping SPLL/ASIC_INIT\n")
+        }
+
+        // MC aperture — AtomBIOS ASIC_INIT already programs MC_VM_FB_LOCATION
+        // with the 3-step sequence during its internal blackout.
+        // System aperture + AGP writes happen later in PM4_ConfigureVM (Phase 7).
+        // No separate MC_SI_Program blackout needed — kernel doesn't do one either.
+        is_display = GPU_BAR_IsDisplayGPU(gpu)
+
+        // Set up PM4 ring (ring 0 = GFX)
+        ring = AccelGCNCfg.ring_idx
+        PM4_HaltCP(gpu)
+
+        // Read MC base address — GPU sees VRAM at this address, not at 0
+        PM4_InitMCBase(gpu)
+
+        // NOTE: GFX pipeline reset now done above (before MC_SI_GpuInit) to clear
+        // stuck TA/DB/CB from power-on state. PM4_SoftResetCP later does RLC-only reset.
+
+        // ---------------------------------------------------------------
+        // Cold boot init — remaining phases after golden regs + MC FW:
+        //   Phase 7:  gmc_v6_0_mc_program  (VM/MC aperture)
+        //   Phase 8:  gmc_v6_0_gart_enable (VM/TLB setup)
+        //   Phase 10: si_ih_hw_init        (IH ring)
+        //   Phase 13: gfx_v6_0_rlc_resume  (RLC halt + RLC-only reset + RLC FW)
+        //   Phase 14: RLC start
+        //   Phase 15: gfx_v6_0_cp_resume   (CP halt + CP FW)
+        //   Phase 16: ring setup + CP start
+        //
+        // NOTE: Golden regs (si_gpu_init) are now done earlier, right after
+        // ASIC_INIT returns (matching kernel seq 3641-3760 position).
+        // The RLC reset (phase 13) only does SOFT_RESET_RLC (bit 2 = 0x4),
+        // NOT GFX or CP reset, so golden regs survive.
+        // ---------------------------------------------------------------
+
+        IfCondition EqualTo(warm_boot, 0) ThenBlock: {
+            // Step 0a: Enable BAR0 framebuffer read/write BEFORE any VRAM writes.
+            // BIF_FB_EN must be set before GART_Init — otherwise BAR0 writes
+            // during the 90MB PTE fill silently fail to reach VRAM.
+            // Moved from after PM4_ConfigureVM to here.
+            GPU_Wr32(gpu, SIReg.BIF_FB_EN, 3)              // FB_READ_EN | FB_WRITE_EN
+            PrintMessage("[AccelGCN] BIF_FB_EN=3 set (FB read/write enabled)\n")
+
+            // Extra drain for cold BAR0/VRAM coherency (PTE table lives in 0-90MB VRAM)
+            GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+            InlineAsm["0f ae f8"]
+            InlineAsm["0f ae f0"]
+            PrintMessage("[AccelGCN] Extra HDP drain before VRAM diagnostic/GART PTE fill\n")
+
+            // Step 0a2: VRAM write/readback diagnostic at multiple offsets.
+            // Tests whether BAR0 writes land in VRAM after MC training + BIF_FB_EN.
+            // Write pattern to 4 offsets, mfence, then read all back.
+            // This also faults in the kernel MMU pages for these offsets.
+            PrintMessage("[AccelGCN] VRAM write diagnostic...\n")
+            GPU_VramWr32(gpu, 0, 3735928559)          // offset 0: 0xDEADBEEF
+            GPU_VramWr32(gpu, 4096, 3405691582)        // offset 4096: 0xCAFEBEBE
+            GPU_VramWr32(gpu, 8192, 3131961357)        // offset 8192: 0xBADC0D0D
+            GPU_VramWr32(gpu, 94371832, 305419896)     // last GART page: 0x12345678
+            // Full serialization: sfence (drain stores) + mfence (serialize all)
+            InlineAsm["0f ae f8"]
+            InlineAsm["0f ae f0"]
+            vt0 = GPU_VramRd32(gpu, 0)
+            vt1 = GPU_VramRd32(gpu, 4096)
+            vt2 = GPU_VramRd32(gpu, 8192)
+            vt3 = GPU_VramRd32(gpu, 94371832)
+            PrintMessage("[AccelGCN] VRAM[0x0]=0x")
+            PrintHex(vt0)
+            PrintMessage(" (exp 0xDEADBEEF)  [0x1000]=0x")
+            PrintHex(vt1)
+            PrintMessage(" (exp 0xCAFEBEBE)\n")
+            PrintMessage("[AccelGCN] VRAM[0x2000]=0x")
+            PrintHex(vt2)
+            PrintMessage(" (exp 0xBADC0D0D)  [0x59FFFF8]=0x")
+            PrintHex(vt3)
+            PrintMessage(" (exp 0x12345678)\n")
+            vram_ok = 1
+            IfCondition NotEqual(vt0, 3735928559) ThenBlock: { vram_ok = 0 }
+            IfCondition NotEqual(vt1, 3405691582) ThenBlock: { vram_ok = 0 }
+            IfCondition NotEqual(vt2, 3131961357) ThenBlock: { vram_ok = 0 }
+            IfCondition NotEqual(vt3, 305419896) ThenBlock: { vram_ok = 0 }
+            IfCondition EqualTo(vram_ok, 1) ThenBlock: {
+                PrintMessage("[AccelGCN] VRAM write test PASSED\n")
+            }
+            IfCondition EqualTo(vram_ok, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] *** VRAM write test FAILED — trying HDP flush + re-read...\n")
+                GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+                InlineAsm["0f ae f0"]
+                vt0 = GPU_VramRd32(gpu, 0)
+                vt1 = GPU_VramRd32(gpu, 4096)
+                vt2 = GPU_VramRd32(gpu, 8192)
+                vt3 = GPU_VramRd32(gpu, 94371832)
+                PrintMessage("[AccelGCN] After HDP flush: [0x0]=0x")
+                PrintHex(vt0)
+                PrintMessage(" [0x1000]=0x")
+                PrintHex(vt1)
+                PrintMessage(" [0x2000]=0x")
+                PrintHex(vt2)
+                PrintMessage(" [0x59FFFF8]=0x")
+                PrintHex(vt3)
+                PrintMessage("\n")
+            }
+
+            // Step 0b: GART page table setup (must precede VM enable)
+            // Allocates system RAM for IH ring/writeback/dummy, writes PTEs into VRAM
+            gart_rc = GART_Init(gpu)
+            IfCondition LessThan(gart_rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] GART_Init failed rc=")
+                PrintNumber(gart_rc)
+                PrintMessage("\n")
+                ReturnValue(-20)
+            }
+
+            // Step 0c: HDP flush + VM invalidate immediately after GART_Init.
+            // Ensures all PTE writes have been flushed through the HDP to VRAM
+            // and the GPU's TLB caches are invalidated before VM enable.
+            GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+            GPU_Wr32(gpu, SIReg.VM_INVALIDATE_REQUEST, 1)
+            PrintMessage("[AccelGCN] Post-GART HDP flush + VM invalidate done\n")
+
+            // Step 1: VM/MC aperture + TLB (phases 7-9)
+            PM4_ConfigureVM(gpu)
+
+            // Step 2: GRBM_CNTL + SRBM_INT (phase 10, seq 329273-329276)
+            // Kernel writes these at gfx_v6_0_gpu_init late path.
+            // NOTE: BIF_FB_EN moved to Step 0a above.
+            GPU_Wr32(gpu, SIReg.GRBM_CNTL, 255)           // 0xFF = GRBM_READ_TIMEOUT
+            GPU_Wr32(gpu, SIReg.SRBM_INT_CNTL, 1)
+            GPU_Wr32(gpu, SIReg.SRBM_INT_ACK, 1)
+
+            // IH ring (phase 10)
+            rc = PM4_SetupIHRing(gpu)
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] IH ring setup failed\n")
+                ReturnValue(-15)
+            }
+
+            // Step 3: RLC halt + RLC-only reset (phase 13)
+            // GRBM_SOFT_RESET = 0x4 (RLC only). Golden regs survive.
+            PM4_SoftResetCP(gpu)
+
+            // Step 4: SH_MEM init — REMOVED (FIX 6)
+            // SH_MEM_CONFIG/BASES/APE1 registers do NOT exist on SI/GFX6.
+            // gfx_6_0_d.h has no SH_MEM definitions; they first appear in gfx_7_0_d.h (CIK).
+            // Kernel gfx_v6_0.c has zero SH_MEM references. Writing undefined register
+            // addresses (0x8C28-0x8C34) through SRBM VMID switching risked corrupting
+            // SRBM routing state.
+
+            // Step 4b: Populate RLC Clear State Block in VRAM
+            // Must happen BEFORE RLC start — the ME replays this data on CLEAR_STATE.
+            // Without it, CLEAR_STATE replays garbage → ME context corruption → dispatch fails.
+            rc = PM4_PopulateCSB(gpu)
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] CSB population failed\n")
+                ReturnValue(-16)
+            }
+
+            // Step 5: RLC firmware load + start (phases 13-14)
+            rc = PM4_LoadRLCFirmware(gpu)
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] RLC firmware load failed\n")
+                ReturnValue(-11)
+            }
+        }
+        IfCondition EqualTo(warm_boot, 1) ThenBlock: {
+            PrintMessage("[AccelGCN] warm boot — skipping init phases 7-14\n")
+        }
+
+        // Step 6: CP halt (phase 15 — re-assert halt before firmware load)
+        PM4_HaltCP(gpu)
+
+        // Step 8: Load CP microcode firmware (PFP, ME, CE)
+        // Must happen AFTER RLC is running (mmiotrace: RLC start at seq 333499,
+        // CP firmware at seq 433505)
+        PrintMessage("[AccelGCN] Pre-CP-FW: GRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_STATUS))
+        PrintMessage(" CP_ME_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CP_ME_CNTL))
+        PrintMessage(" SRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SRBM_STATUS))
+        PrintMessage("\n")
+
+        // enable_gui_idle_interrupt(false) — matches kernel cp_resume
+        gi_int = GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING0)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING0, BitwiseAnd(gi_int, 4293394431))  // ~0x180000 = 0xFFE7FFFF
+
+        rc = PM4_LoadCPFirmware(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] CP firmware load failed\n")
+            ReturnValue(-10)
+        }
+
+        PrintMessage("[AccelGCN] Post-CP-FW: GRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.GRBM_STATUS))
+        PrintMessage(" CP_ME_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CP_ME_CNTL))
+        PrintMessage("\n")
+
+        // CP misc registers the kernel sets after reset, before ring setup
+        GPU_Wr32(gpu, SIReg.CP_SEM_WAIT_TIMER, 0)
+        GPU_Wr32(gpu, SIReg.CP_SEM_INCOMPLETE_TIMER, 0)
+        GPU_Wr32(gpu, SIReg.CP_RB_WPTR_DELAY, 0)
+        GPU_Wr32(gpu, SIReg.CP_DEBUG, 0)
+        GPU_Wr32(gpu, SIReg.SCRATCH_ADDR, 0)
+        // SCRATCH_UMSK moved to after PM4_CPStart — CLEAR_STATE resets it to 0
+
+        // CP control registers (working era had these before ring setup;
+        // currently only in ComputeReset — cold init needs them too)
+        GPU_Wr32(gpu, SIReg.CP_MAX_CONTEXT, 7)
+        GPU_Wr32(gpu, SIReg.CP_ENDIAN_SWAP, 0)
+        GPU_Wr32(gpu, SIReg.CP_DEVICE_ID, 1)
+
+        // --- TLB flush before ring setup ---
+        // The RLC reset (GRBM_SOFT_RESET=0x4) and CP firmware load may have
+        // invalidated cached TLB entries.  Flush L1+L2 TLBs and re-verify
+        // VM context 0 is still intact before configuring CP ring buffers.
+        GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+        GPU_Wr32(gpu, SIReg.VM_INVALIDATE_REQUEST, 1)
+
+        // Verify VM context 0 survived RLC reset + CP FW load
+        vm_ctx0_cntl = GPU_Rd32(gpu, SIReg.VM_CONTEXT0_CNTL)
+        vm_ctx0_base = GPU_Rd32(gpu, SIReg.VM_CONTEXT0_PAGE_TABLE_BASE_ADDR)
+        vm_l1_tlb = GPU_Rd32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL)
+        PrintMessage("[AccelGCN] Pre-ring VM check: CTX0_CNTL=0x")
+        PrintHex(vm_ctx0_cntl)
+        PrintMessage(" CTX0_BASE=0x")
+        PrintHex(vm_ctx0_base)
+        PrintMessage(" L1_TLB=0x")
+        PrintHex(vm_l1_tlb)
+        PrintMessage("\n")
+
+        // --- All 3 rings configured BEFORE CP unhalt (kernel si_cp_resume order) ---
+        // The CP firmware latches ring configs at unhalt time. All ring BASE,
+        // CNTL, RPTR_ADDR registers must be programmed before CP_ME_CNTL=0.
+        rc = PM4_SetupRing(gpu, 0, RingConf.VRAM_RING_OFFSET)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 0 setup failed\n")
+            ReturnValue(-4)
+        }
+
+        // --- PTE readback diagnostic for RB0 first 2 pages ---
+        pte0_off = Multiply(262256, 8)    // CPRB0_PTE_IDX * 8
+        pte0_lo = GPU_VramRd32(gpu, pte0_off)
+        pte0_hi = GPU_VramRd32(gpu, Add(pte0_off, 4))
+        pte1_off = Multiply(262257, 8)
+        pte1_lo = GPU_VramRd32(gpu, pte1_off)
+        pte1_hi = GPU_VramRd32(gpu, Add(pte1_off, 4))
+        PrintMessage("[PTE-DBG] RB0 PTE[0]: lo=0x")
+        PrintHex(pte0_lo)
+        PrintMessage(" hi=0x")
+        PrintHex(pte0_hi)
+        PrintMessage(" | PTE[1]: lo=0x")
+        PrintHex(pte1_lo)
+        PrintMessage(" hi=0x")
+        PrintHex(pte1_hi)
+        PrintMessage("\n")
+
+        // Check dummy page PTE for reference
+        dummy_pte_lo = GPU_VramRd32(gpu, 0)    // PTE index 0 = dummy
+        dummy_pte_hi = GPU_VramRd32(gpu, 4)
+        PrintMessage("[PTE-DBG] Dummy PTE[0]: lo=0x")
+        PrintHex(dummy_pte_lo)
+        PrintMessage(" hi=0x")
+        PrintHex(dummy_pte_hi)
+        PrintMessage("\n")
+
+        // Verify ring buffer host content (first 4 DWORDs after CPStart writes)
+        rb0_host = GARTState.cprb0_host_ptr
+        PrintMessage("[RING-DBG] RB0 host DW[0..3]: 0x")
+        PrintHex(Dereference(rb0_host, "dword"))
+        PrintMessage(" 0x")
+        PrintHex(Dereference(Add(rb0_host, 4), "dword"))
+        PrintMessage(" 0x")
+        PrintHex(Dereference(Add(rb0_host, 8), "dword"))
+        PrintMessage(" 0x")
+        PrintHex(Dereference(Add(rb0_host, 12), "dword"))
+        PrintMessage("\n")
+
+        rc = PM4_SetupRing(gpu, 1, AccelGCNLayout.RING1_OFFSET)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 1 setup failed\n")
+            ReturnValue(-11)
+        }
+
+        rc = PM4_SetupRing(gpu, 2, AccelGCNLayout.RING2_OFFSET)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 2 setup failed\n")
+            ReturnValue(-13)
+        }
+
+        // --- CPStart: ME_INITIALIZE + unhalt + CLEAR_STATE on all 3 rings ---
+        rc = PM4_CPStart(gpu, 0)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] CP start failed\n")
+            ReturnValue(-6)
+        }
+
+        // --- Ring tests (sequential, all rings already configured and CP running) ---
+        rc = PM4_RingTest(0)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 0 test failed\n")
+            ReturnValue(-5)
+        }
+
+        rc = PM4_RingTest(1)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 1 test failed\n")
+            // ReturnValue(-12)  -- non-fatal: SI CP services RB0 only; ring1 fail expected, continue init
+        }
+
+        rc = PM4_RingTest(2)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] ring 2 test failed\n")
+            // ReturnValue(-14)  -- non-fatal: SI CP services RB0 only; ring2 fail expected, continue init
+        }
+
+        // enable_gui_idle_interrupt(true) — matches kernel cp_resume end
+        gi_int2 = GPU_Rd32(gpu, SIReg.CP_INT_CNTL_RING0)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING0, BitwiseOr(gi_int2, 1572864))
+
+        // Base SPI static thread mgmt for compute pipe (per KERNEL gfx_v6_0 / handoff §11/14).
+        // CS in CPStart leaves 0; dispatch SETs should override, but cold may need MMIO base first
+        // so compute SET_SH_REGs land and DISPATCH launches. (SRBM set experiments caused FFFF stall.)
+        // These are the MMIO versions of what SET_SH for STATIC_THREAD_MGMT sets in dispatch.
+        GPU_Wr32(gpu, 0xB858, 0xFFFFFFFF)  // SPI_STATIC_THREAD_MGMT_SE0
+        GPU_Wr32(gpu, 0xB85C, 0xFFFFFFFF)  // SE1
+        PrintMessage("[AccelGCN] SPI_STATIC_THREAD_MGMT_SE0/SE1 set via MMIO for compute pipe base\n")
+
+        // ---------------------------------------------------------------
+        // DMA engine init (kernel Phase 9 — cayman_dma_resume)
+        // Both DMA0 and DMA1 ring buffers in GART-mapped system RAM.
+        // Kernel does this immediately after CP ring tests.
+        // ---------------------------------------------------------------
+        rc = PM4_DMAResume(gpu)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] DMA engine init failed\n")
+        }
+
+        // Use ring 0 (GFX/ME) for compute — SI MEC (rings 1/2) can't process SET_SH_REG
+        AccelGCNCfg.ring_idx = 0
+        AccelGCNCfg.dispatch_count = 0
+
+        // SH_MEM re-init — REMOVED (FIX 6)
+        // SH_MEM_CONFIG/BASES/APE1 do not exist on SI/GFX6 (first appear in CIK/gfx_7_0_d.h).
+        // Kernel gfx_v6_0.c never writes these. Removed all 3 VMID-loop instances.
+        // Verify SPI CU masks survived CLEAR_STATE (should be non-zero from MC_SI_GpuInit)
+        // Read via broadcast (all SE/SH)
+        GPU_Wr32(gpu, SIReg.GRBM_GFX_INDEX, BitwiseOr(BitwiseOr(GFXIndexBits.SE_BROADCAST_WRITES, GFXIndexBits.SH_BROADCAST_WRITES), GFXIndexBits.INSTANCE_BROADCAST_WRITES))
+        PrintMessage("[AccelGCN] SPI_STATIC_THREAD_MGMT_3=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPI_STATIC_THREAD_MGMT_3))
+        PrintMessage(" SPI_CONFIG_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPI_CONFIG_CNTL))
+        PrintMessage(" SPI_CONFIG_CNTL_1=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPI_CONFIG_CNTL_1))
+        PrintMessage("\n")
+
+        // Re-enable scratch regs via MMIO AFTER ring test.
+        // CLEAR_STATE resets SCRATCH_UMSK to 0.  Ring test does PM4_WaitIdle,
+        // guaranteeing ME has finished processing CLEAR_STATE.
+        // SET_CONFIG_REG cannot write SCRATCH_UMSK on SI (outside writable range),
+        // so MMIO is the only option.
+        GPU_Wr32(gpu, SIReg.SCRATCH_UMSK, 255)
+
+        // MMIO roundtrip sanity check
+        GPU_Wr32(gpu, SIReg.SCRATCH_REG0, 3405691582)
+        GPU_Wr32(gpu, SIReg.SCRATCH_REG0, 0)
+
+        // Store VRAM layout offsets
+        AccelGCNCfg.shader_vram = AccelGCNLayout.SHADER_OFFSET
+        AccelGCNCfg.shader_host_ptr = GARTState.shader_host_ptr
+        AccelGCNCfg.shader_gart_va = GARTState.shader_gart_va
+        AccelGCNCfg.buf_desc_vram = AccelGCNLayout.BUF_DESC_OFFSET
+        AccelGCNCfg.data_vram = AccelGCNLayout.DATA_OFFSET
+        AccelGCNCfg.data_host_ptr = GARTState.data_buf_host_ptr
+        AccelGCNCfg.data_gart_va = GARTState.data_buf_gart_va
+
+        // IB scratch area: now in GART (coherent system RAM), not VRAM.
+        // VRAM has cold-boot write coherency issues that cause the CP to
+        // read zeroed IB content — DISPATCH_DIRECT with initiator=0 is a no-op.
+        AccelGCNCfg.ib_vram = AccelGCNLayout.IB_OFFSET
+        AccelGCNCfg.ib_host_ptr = GARTState.ib_host_ptr
+        AccelGCNCfg.ib_gart_va = GARTState.ib_gart_va
+
+        // Initialize Compute IR
+        rc = CIR_Init()
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] CIR init failed\n")
+            ReturnValue(-6)
+        }
+
+        // Initialize kernel cache
+        discard_kc = KCache_Init()
+
+        smc_rc = SMC_LoadFirmware(gpu)
+        IfCondition EqualTo(smc_rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] SMC firmware load failed, continuing at boot clocks\n")
+        }
+        ElseBlock: {
+            DPM_Init()
+            dpm_rc = DPM_Enable(gpu)
+            IfCondition EqualTo(dpm_rc, 1) ThenBlock: {
+                DPM_SI_UploadDriverState(gpu)
+                // Force HIGH for compute workload
+                dpm = DPM_SI_GetEntry(gpu)
+                num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
+                DPM_SetLevel(gpu, Subtract(num_levels, 1))
+                PrintMessage("[AccelGCN] DPM enabled, forced HIGH (")
+                PrintNumber(num_levels)
+                PrintMessage(" levels)\n")
+            }
+            ElseBlock: {
+                PrintMessage("[AccelGCN] DPM enable failed, continuing at boot clocks\n")
+            }
+        }
+
+        // ---------------------------------------------------------------
+        // DCE / Display controller full init (kernel Phase 14 — dce6_resume)
+        // Kernel initializes ALL 6 CRTCs, HPD, AFMT even on headless cards.
+        // Must happen AFTER DPM is enabled (kernel order).
+        // ---------------------------------------------------------------
+        DCE6_FullInit(gpu)
+
+        // BAR0 prime SKIPPED — all compute memory (rings, IB, data, shader) is now
+        // in GART system RAM. The 65536-read BAR0 prime was a VRAM write-coherency
+        // workaround that no longer applies and caused the ring-0 stall.
+        // GPU_BAR_PrimeVRAM(gpu)
+
+        AccelGCNCfg.initialized = 1
+        ReturnValue(0)
+    }
+}
+
+
+
+// =============================================================================
+// AccelGCN_Shutdown — release all resources
+// =============================================================================
+Function.AccelGCN_Shutdown {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(AccelGCNCfg.initialized, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        ring = AccelGCNCfg.ring_idx
+        PM4_Destroy(ring)
+
+        gpu = AccelGCNCfg.gpu_idx
+
+        DPM_Disable(gpu)
+        DPM_Shutdown(gpu)
+
+        GPU_BAR_Unmap(gpu)
+
+        discard_cir = CIR_Shutdown()
+
+        // Restore lockout
+        GPUBarLockout.allow_display = 0
+
+        AccelGCNCfg.initialized = 0
+        //PrintMessage("[AccelGCN] shutdown\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// AccelGCN_ComputeReset — full CP soft reset + firmware reload + ring setup
+//
+// HD 7770 (Cape Verde) has a silicon bug: the compute dispatch path leaks
+// internal event engine slots that cannot be reclaimed by software.  After
+// ~36 dispatches the EVENT_WRITE_EOP fence silently fails.  The GFX event
+// engine is NOT affected (proven by test_gfx_fence: 100/100 PASS).
+//
+// Workaround: every N dispatches, replay the exact cold-boot init sequence:
+//   1. CP halt
+//   2. GRBM soft reset (clears CP microcode + internal FIFOs)
+//   3. Reload CP firmware (PFP/ME/CE)
+//   4. Reload RLC firmware
+//   5. Re-setup IH ring
+//   6. Re-setup all 3 rings
+//   7. CPStart (ME_INITIALIZE + CLEAR_STATE)
+//   8. Re-program SH_MEM, SCRATCH_UMSK, GB_ADDR_CONFIG
+//
+// This is expensive (~50-100ms) but only happens every 30 dispatches.
+// =============================================================================
+Function.AccelGCN_ComputeReset {
+    Output: Integer
+    Body: {
+        gpu = AccelGCNCfg.gpu_idx
+
+        // 1. Halt CP
+        PM4_HaltCP(gpu)
+
+        // 2. Soft reset — wipes CP microcode, clears ALL internal FIFOs/state
+        PM4_SoftResetCP(gpu)
+
+        // 3. Re-halt after soft reset (reset clears CP_ME_CNTL)
+        PM4_HaltCP(gpu)
+
+        // 4. Reload CP firmware (PFP, ME, CE)
+        rc = PM4_LoadCPFirmware(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: CP firmware reload failed\n")
+            ReturnValue(-1)
+        }
+
+        // 5. Reload RLC firmware
+        rc = PM4_LoadRLCFirmware(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: RLC firmware reload failed\n")
+            ReturnValue(-2)
+        }
+
+        // 6. Re-setup IH ring
+        rc = PM4_SetupIHRing(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: IH ring setup failed\n")
+            ReturnValue(-3)
+        }
+
+        // 7. CP misc registers
+        GPU_Wr32(gpu, SIReg.CP_SEM_WAIT_TIMER, 0)
+        GPU_Wr32(gpu, SIReg.CP_SEM_INCOMPLETE_TIMER, 0)
+        GPU_Wr32(gpu, SIReg.CP_RB_WPTR_DELAY, 0)
+        GPU_Wr32(gpu, SIReg.CP_DEBUG, 0)
+
+        // 8. Re-setup ALL 3 rings BEFORE CP unhalt (kernel si_cp_resume order)
+        rc = PM4_SetupRing(gpu, 0, RingConf.VRAM_RING_OFFSET)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 0 setup failed\n")
+            ReturnValue(-4)
+        }
+        rc = PM4_SetupRing(gpu, 1, AccelGCNLayout.RING1_OFFSET)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 1 setup failed\n")
+            ReturnValue(-7)
+        }
+        rc = PM4_SetupRing(gpu, 2, AccelGCNLayout.RING2_OFFSET)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 2 setup failed\n")
+            ReturnValue(-9)
+        }
+
+        // CP control registers
+        GPU_Wr32(gpu, SIReg.CP_MAX_CONTEXT, 7)
+        GPU_Wr32(gpu, SIReg.CP_ENDIAN_SWAP, 0)
+        GPU_Wr32(gpu, SIReg.CP_DEVICE_ID, 1)
+
+        // 9. CPStart — ME_INITIALIZE + unhalt + CLEAR_STATE on all 3 rings
+        rc = PM4_CPStart(gpu, 0)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: CPStart failed\n")
+            ReturnValue(-5)
+        }
+
+        // 10. Ring tests (sequential, all rings already configured and CP running)
+        rc = PM4_RingTest(0)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 0 test failed\n")
+            ReturnValue(-6)
+        }
+        rc = PM4_RingTest(1)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 1 test failed\n")
+            ReturnValue(-8)
+        }
+        rc = PM4_RingTest(2)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] RESET: ring 2 test failed\n")
+            ReturnValue(-10)
+        }
+
+        // 11. SH_MEM re-program — REMOVED (FIX 6, see Step 4 comment)
+
+        // 12. SCRATCH_UMSK (CLEAR_STATE resets to 0)
+        GPU_Wr32(gpu, SIReg.SCRATCH_UMSK, 255)
+
+        // 13. GB_ADDR_CONFIG — Cape Verde golden value
+        GPU_Wr32(gpu, SIReg.GB_ADDR_CONFIG, 302186498)
+
+        // Reset dispatch counter
+        AccelGCNCfg.dispatch_count = 0
+
+        ReturnValue(1)
+    }
+}

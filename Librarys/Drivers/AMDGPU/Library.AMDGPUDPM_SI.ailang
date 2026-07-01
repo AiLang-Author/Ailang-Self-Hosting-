@@ -616,6 +616,56 @@ Function.DPM_SI_InitSPLL {
         // the VBIOS command table (the same table the BIOS executes during POST).
         // On re-runs the SPLL may still be up from a previous execution, but
         // the rest of the chip state may be stale or corrupted.
+
+        // ---------------------------------------------------------------
+        // MMIO LIVENESS CHECK — if ALL reads return 0xFFFFFFFF the GPU's
+        // BAR is dead (PCI config reset still in flight, or GPU wedged).
+        // Running AtomExec_AsicInit against a dead bus will freeze the
+        // system: the ATOM interpreter writes to PCIe indirect ports
+        // (0x30/0x34) and MC regs, which deadlock the RD990 fabric when
+        // the GPU can't service them.
+        //
+        // The kernel's si_gpu_pci_config_reset polls CONFIG_MEMSIZE via
+        // MMIO until it returns non-0xFFFFFFFF.  We do the same: poll
+        // CONFIG_MEMSIZE (MMIO 0x5428) up to 2 seconds before proceeding.
+        // ---------------------------------------------------------------
+        IfCondition EqualTo(cntl, 4294967295) ThenBlock: {
+            IfCondition EqualTo(spll_status, 4294967295) ThenBlock: {
+                PrintMessage("[DPM_SI] MMIO returning 0xFFFFFFFF — GPU not responsive yet\n")
+                PrintMessage("[DPM_SI] Polling CONFIG_MEMSIZE for GPU recovery (up to 2s)...\n")
+                mmio_poll = 0
+                mmio_alive = 0
+                WhileLoop LessThan(mmio_poll, 20000) {
+                    memsize = GPU_Rd32(gpu, SIReg.CONFIG_MEMSIZE)
+                    IfCondition NotEqual(memsize, 4294967295) ThenBlock: {
+                        IfCondition NotEqual(memsize, 0) ThenBlock: {
+                            PrintMessage("[DPM_SI] GPU alive: CONFIG_MEMSIZE=0x")
+                            PrintHex(memsize)
+                            PrintMessage(" after ")
+                            PrintNumber(mmio_poll)
+                            PrintMessage(" polls\n")
+                            mmio_alive = 1
+                            mmio_poll = 20000
+                        }
+                    }
+                    mmio_poll = Add(mmio_poll, 1)
+                }
+                IfCondition EqualTo(mmio_alive, 0) ThenBlock: {
+                    PrintMessage("[DPM_SI] FATAL: GPU MMIO dead after 2s — cannot run AtomExec_AsicInit\n")
+                    PrintMessage("[DPM_SI] CONFIG_MEMSIZE=0x")
+                    PrintHex(GPU_Rd32(gpu, SIReg.CONFIG_MEMSIZE))
+                    PrintMessage(" SPLL_STATUS=0x")
+                    PrintHex(GPU_Rd32(gpu, SIReg.SPLL_STATUS))
+                    PrintMessage("\n")
+                    PrintMessage("[DPM_SI] Run: sudo ~/Ailang-Self-Hosting-/gpu_reset.sh   (or reboot)\n")
+                    ReturnValue(0)
+                }
+                // Re-read SPLL state now that MMIO is alive
+                cntl = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+                spll_status = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+            }
+        }
+
         PrintMessage("[DPM_SI] Running AtomExec_AsicInit (SPLL_STATUS=0x")
         PrintHex(spll_status)
         PrintMessage(")\n")
@@ -647,8 +697,14 @@ Function.DPM_SI_InitSPLL {
 
         rc = AtomExec_AsicInit(gpu)
         IfCondition LessThan(rc, 0) ThenBlock: {
-            PrintMessage("[DPM_SI] ERROR: AtomExec_AsicInit failed\n")
-            ReturnValue(0)
+            // AsicInit may abort due to display power gating poll timeout
+            // (register 0x5DF8 in EnableDispPowerGating sub-table).
+            // This is expected on un-POSTed cards after PCI config reset —
+            // the DCE clock domain is dead. However, the SPLL configuration
+            // happens BEFORE the display block init, so it may already be
+            // locked. Continue to SPLL check instead of aborting immediately.
+            PrintMessage("[DPM_SI] WARNING: AtomExec_AsicInit aborted (display block timeout)\n")
+            PrintMessage("[DPM_SI] Checking if SPLL came up despite abort...\n")
         }
 
         // Verify PLL is now running
@@ -672,15 +728,21 @@ Function.DPM_SI_InitSPLL {
 
         // Check SPLL_STATUS for lock (bit pattern 0x700202 = locked)
         // Bits [9:8] = 2 means PLL locked and stable
+        // 0xFFFFFFFF = BAR0 not responding — GPU is dead/wedged
+        IfCondition EqualTo(final_status, 4294967295) ThenBlock: {
+            PrintMessage("[DPM_SI] FATAL: SPLL_STATUS=0xFFFFFFFF — GPU not responding\n")
+            ReturnValue(0)
+        }
         lock_bits = BitwiseAnd(final_status, 768)
         IfCondition NotEqual(lock_bits, 512) ThenBlock: {
-            PrintMessage("[DPM_SI] WARNING: SPLL_STATUS lock bits unexpected: 0x")
+            PrintMessage("[DPM_SI] FATAL: SPLL not locked — lock_bits=0x")
+            PrintHex(lock_bits)
+            PrintMessage(" SPLL_STATUS=0x")
             PrintHex(final_status)
             PrintMessage("\n")
+            ReturnValue(0)
         }
-        ElseBlock: {
-            PrintMessage("[DPM_SI] SPLL locked successfully\n")
-        }
+        PrintMessage("[DPM_SI] SPLL locked successfully\n")
 
         ReturnValue(1)
     }
@@ -1786,12 +1848,11 @@ Function.DPM_SI_Enable {
         gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.THERMAL_PROTECTION_DIS))
         GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
 
-        // CG_DISPLAY_GAP_CNTL (0x828): Set display gaps to IGNORE for compute card
-        // DISP1_GAP = IGNORE(3) at bits[1:0], DISP2_GAP = IGNORE(3) at bits[3:2]
-        // DISP1_GAP_MCHG = VBLANK(1) at bits[25:24], DISP2_GAP_MCHG = IGNORE(3) at bits[27:26]
+        // CG_DISPLAY_GAP_CNTL (0x828): Match kernel mmiotrace value
+        // Kernel init writes 0x1D20D320 — bits [3:0] = 0 (VBLANK mode, not IGNORE)
+        // bits [27:24] = 0x0D = VBLANK(1)|(IGNORE(3)<<2)
         disp_gap = GPU_Rd32(gpu, DPMReg.CG_DISPLAY_GAP_CNTL)
-        disp_gap = BitwiseAnd(disp_gap, BitwiseNot(15))     // clear bits [3:0]
-        disp_gap = BitwiseOr(disp_gap, 15)                  // IGNORE(3) | (IGNORE(3) << 2)
+        disp_gap = BitwiseAnd(disp_gap, BitwiseNot(15))     // clear bits [3:0], leave as 0
         disp_gap = BitwiseAnd(disp_gap, BitwiseNot(LeftShift(15, 24)))  // clear bits [27:24]
         disp_gap = BitwiseOr(disp_gap, LeftShift(13, 24))   // VBLANK(1)|(IGNORE(3)<<2) at [27:24]
         GPU_Wr32(gpu, DPMReg.CG_DISPLAY_GAP_CNTL, disp_gap)

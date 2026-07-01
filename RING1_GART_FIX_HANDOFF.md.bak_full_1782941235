@@ -1,0 +1,456 @@
+# AILang AMD GPU Compute — Handoff (consolidated 2026-06-23)
+
+**Target:** Cape Verde (GCN1 / Southern Islands), bus 2 = compute GPU on `bob@pop-os`.
+**Goal:** get a compute dispatch to produce correct output (`dst[i]=src[i]+42`).
+**Read this + `gpu-crash.md` (RULES) before editing.**
+
+---
+
+## 0. HARD SAFETY RULES (a violation blanks the monitor and/or hard-hangs the box)
+1. **NEVER run full init on the DISPLAY GPU (bus 1 / 01:00.0).** `DPM_SI` sends SMC "NoDisplay" →
+   screen blanks → RD990 fabric hang (no logs survive). The guard in `AccelGCN_Init`
+   (`ABORT: selection fell back to DISPLAY GPU`) must stay. Every run must log `using GPU N (bus 2)`.
+2. **Do NOT unbind the `radeon` driver** — it resets the desktop. Use the PCI bus-2 reset only.
+3. Keep the **30-dispatch `AccelGCN_ComputeReset`** (Cape Verde dispatch-FIFO-leak erratum workaround).
+4. Obey all `gpu-crash.md` RULES (HDP regs, no MC/reset/ASIC_INIT on bus 1, kernel register values).
+5. You cannot `sudo` non-interactively — the human runs the test; you edit + build + read the log.
+
+## 1. ITERATION LOOP (reboot-free)
+```
+sudo ~/Ailang-Self-Hosting-/gpu_reset.sh             # PCI config ASIC reset (see §12 note)
+cd ~/Ailang-Self-Hosting- && ./ailang.x TestCode/test_accel_gcn.ailang test_accel_gcn   # build
+sudo ./test_accel_gcn 2>&1 | tee our_mmiotrace.txt  # human runs
+```
+**RESET BEFORE EVERY RUN.** The SPLL guard (§12) prevents wedges now, but a stale GPU state
+can confuse the init path. `gpu_reset.sh` does a PCI config ASIC reset (writes 0x39d5e86b to
+config offset 0x7c — the kernel's `si_gpu_pci_config_reset` method). FLR is NOT supported on
+Cape Verde (`echo 1 > .../reset` → "Inappropriate ioctl for device").
+
+**NOTE on wedging:** If the GPU gets hard-wedged (all MMIO reads return 0xFFFFFFFF) and
+`gpu_reset.sh` cannot recover it, a reboot is needed. This should no longer happen in normal
+operation — the SPLL guard aborts init before dangerous GRBM writes can wedge the card. See §12.
+
+---
+
+## 2. STATE — what is DONE and SOLID
+- **All compute memory is in GART** (coherent system RAM via PTEs), kernel-matching:
+  CP rings 0/1/2 (BASE `0xF44005/07/09 0000`, CNTL `0x90B/0x90A/0x90A`), IB (`0xF4400E0000`),
+  data buffer (`0xF44A...`, src/dst), shader code (`0xF44A072000`). `GART_Init` mmaps+mlocks+writes a
+  PTE per page for each; consumers build addresses from the GART VA.
+- **Init runs to completion** from a clean GPU (ring tests non-fatal, display guard active,
+  `GPU_BAR_PrimeVRAM` skipped — nothing in the compute path is in VRAM anymore).
+- **src reads back correctly** (host writes land in GART). The cold-VRAM-coherency class of bugs is gone.
+
+## 3. RULED OUT (do not re-investigate — each was verified)
+- Dispatch payload (shader VA, V#, PGM_LO/HI, rsrc1/2) — correct.
+- VM aperture / `VM_CONTEXT0` — covers shader+data; correct.
+- Shader machine code — clean `dst=src+42` (and a `dst=42` constant kernel), valid `s_endpgm`, regs
+  within `rsrc1`.
+- Readback location / GART mapping / read-coherency — all consistent, page 0 mapped, SNOOPED PTEs.
+- VM fault — `VM_CONTEXT1_PROTECTION_FAULT_STATUS=0` (no fault).
+- **Ring choice** — ring 0 fails IDENTICALLY to ring 1 (same stall at RPTR=64, same all-zero regs).
+  The "ring 1 = MEC can't do compute" theory is DISPROVEN.
+- **`SET_SH_REG` packet code** — unchanged since the compute-working era (file last committed
+  `e06d50e5`, the same builder that drove 36 working dispatches at `9d32199b`). NOT a packet-encoding bug.
+
+## 4. CURRENT ROOT-CAUSE LEAD — CP/RLC/CLEAR_STATE cold-bringup
+**Symptom:** the CP stalls on the first compute `SET_SH_REG` (deterministically at ring dword 64, on
+*either* ring); `WaitIdle` times out; **every compute register reads back 0** — `PGM_LO`, `RSRC1/2`,
+`STATIC_THREAD_MGMT`, `NUM_THREAD`, `DISPATCH_INITIATOR`, **and `SH_MEM_CONFIG`/`SH_MEM_BASES`**. No VM
+fault, SQ/SPI idle → **the wavefront never launches** because the compute state is never programmed →
+`dst=0`.
+
+**Why this is a bringup problem, not a packet/ring problem:** the same `SET_SH_REG` code worked on a
+**kernel-POSTed** card (commits `17b1457a`→`9d32199b`). Back then the AILang driver loaded its own CP +
+RLC firmware and did `CPStart` (ME_INITIALIZE + `CLEAR_STATE`), but ran on top of the kernel's MC / PLL
+/ memory POST. The cold-init work later made the driver do its *own* AtomBIOS POST + MC + DPM + clocks.
+On GCN, `SET_SH_REG` writes **RLC-managed persistent registers** — the CP can only process them once
+the RLC + `CLEAR_STATE` context is correctly live. `SH_MEM_CONFIG=0` fits: `CLEAR_STATE` zeroes the
+compute regs and the restoring `SET_SH_REG`s stall, so they stay 0. The cold path is not establishing
+the RLC/clear-state context (or the underlying MC/clock state) that the kernel POST used to provide.
+
+Relevant log lines (`our_mmiotrace.txt`):
+```
+[PM4] RLC reset complete (SOFT_RESET_RLC=0x4)
+Post-CP-FW: GRBM_STATUS=0x3028 CP_ME_CNTL=0x15000000      (CP firmware loaded, halted)
+SH_MEM_CONFIG=0x0 SH_MEM_BASES=0x0 GRBM_STATUS=0xA0003028
+WaitIdle timeout: ring=0 RPTR=64 WPTR=88
+[PROBE] PGM_LO=0 ... DISPATCH_INITIATOR=0   CP_BUSY_STAT=0x800001E3 SQ/SPI idle
+```
+
+## 5. NEXT TASKS (in order)
+1. **Diff the CP/RLC/CLEAR_STATE bringup against the last-working commit.**
+   ```
+   git show 7fbe1467:Librarys/Drivers/AMDGPU/Library.AMDGPUPM4.ailang   # pre-split; find PM4_CPStart,
+   git show 9d32199b:...                                                #  RLC load, CLEAR_STATE, SH_MEM
+   ```
+   Compare ME_INITIALIZE, `CLEAR_STATE` (now ring-0-only — `PM4Dispatch.ailang:~691`), the RLC
+   clear-state/CSIB setup, and SH_MEM init against current. Look for a sequence/ordering regression
+   introduced by the cold-init work. (`PM4_CPStart` in `AMDGPUPM4Dispatch.ailang`; RLC FW in
+   `AMDGPUPM4FW.ailang`; `SET_SH_REG`/`PM4_BuildHeader` in `AMDGPUPM4Pkt.ailang`.)
+2. **Verify `CLEAR_STATE` actually completes and the RLC is running** before the dispatch — instrument
+   around the `CLEAR_STATE` emit (`PM4Dispatch.ailang:~691`): commit it, WaitIdle, read `RLC_CNTL` and
+   `GRBM_STATUS` RLC-busy bits. If `CLEAR_STATE` itself stalls, the whole compute context is dead.
+3. **Restore SH_MEM init.** `SH_MEM_CONFIG`/`SH_MEM_BASES` are 0; commit `1f3a5495` ("SH_MEM init") added
+   this in the working era. Confirm it still runs / set it via MMIO during init if `CLEAR_STATE` clears it.
+4. **If bringup looks identical to the working commit**, the gap is the underlying cold POST state
+   (MC / SCLK / memory-controller) that the kernel used to provide — diff the MC/clock setup vs a warm
+   `bus2_all.txt` capture and against the working-commit assumptions.
+
+## 6. REFERENCE
+- **`KERNEL_INIT_SEQUENCE.md`** — comprehensive kernel SI (Cape Verde) GPU init sequence document with
+  exact line-number cross-references to `/home/bob/linux/drivers/gpu/drm/amd/amdgpu/{si.c,gmc_v6_0.c,gfx_v6_0.c}`.
+  Covers ALL init phases: IP block ordering, common HW init (golden regs), GMC (MC program, MC microcode,
+  GART enable), GFX (constants_init, RLC resume, CP resume). Includes confirmed-missing items vs our driver,
+  confirmed-correct items, full call graph, register byte offsets, and mmiotrace cross-validation appendix.
+  **Read this before making any init-sequence changes.**
+- **`kernel_diff_fixes.md`** — older targeted fix list (6 specific items). Superseded by KERNEL_INIT_SEQUENCE.md
+  but kept for context. All items are covered in the comprehensive doc.
+- **GART VA layout** (HI=0xF4): IH `0x40000000`, IH-WB `0x40010000`, DMA0/1 `0x40020000`/`0x40040000`,
+  CP RB0/1/2 `0x40050000`/`0x40070000`/`0x40090000`, CP-WB `0x400B0000`, IB `0x400E0000`,
+  data `0x40100000`-ish (huge, BAR0-sized), shader `0x4A072000`. PTE index = `VA_LO / 4096`.
+- **Fault regs** (from box `sid.h`): `VM_CONTEXT1_PROTECTION_FAULT_STATUS=0x14DC`, `_ADDR=0x14FC`.
+- **Register-def bug to fix:** `GRBM_STATUS2` is defined `0x8014` but `sid.h` says **`0x8008`**
+  (`0x8014` = `GRBM_STATUS_SE0`). Fix the const in `AMDGPUPM4Regs.ailang`.
+- **Key files:** dispatch/CPStart `AMDGPUPM4Dispatch.ailang`; packet builder `AMDGPUPM4Pkt.ailang`;
+  CP/RLC firmware `AMDGPUPM4FW.ailang`; ring setup + VM `AMDGPUPM4Ring.ailang`; GART `AMDGPUGART.ailang`;
+  HAL/upload/dispatch `Accel/Library.AccelGCN.ailang`; test harness `TestCode/test_accel_gcn.ailang`.
+- **Backups:** `*.bak_*` beside every edited lib. Working compute commits: `17b1457a`, `1f3a5495`,
+  `7fbe1467`, `9d32199b` (ran 36 dispatches on a kernel-POSTed card).
+
+## 7. CHANGELOG (compressed — full detail in git + gpu-crash.md)
+- Fixed the regression that aborted init at ~19k/36k (ring tests made non-fatal).
+- Added display-GPU safety guard (abort if selection falls back to bus 1).
+- Relocated CP rings → GART (fixed ring-1 fetch); then IB, data buffer, shader → GART.
+- Established PCI bus-2 reset as the reboot-free iteration mechanism.
+- Verified payload / VM / shader / readback all correct; isolated failure to wavefront-never-launches.
+- Disproved the ring-1-vs-ring-0 theory (both stall identically) and the packet-corruption theory
+  (debug-readback artifact; IB packet is clean).
+- Current lead: CP/RLC/CLEAR_STATE cold-bringup leaves compute SH registers unprogrammable.
+
+---
+
+## 8. LATEST (2026-06-24) — AtomBIOS POST is intermittently failing (AtomExec stuck loop)
+A run failed earlier/harder than the SET_SH_REG stall — same root seam (cold POST), now overt:
+```
+[DPM_SI] Running AtomExec_AsicInit (SPLL_STATUS=0x700202)
+[ATOM] CALLTABLE idx=11  →  [ATOM-WR] reg=0x2898 val=0x111300FD
+AtomExec: Stuck in loop, aborting
+[DPM_SI] ERROR: AtomExec_AsicInit failed
+... CPStart: ME_INITIALIZE not consumed (RPTR=0/WPTR=11) → CP start failed → FATAL
+```
+The AILang AtomBIOS interpreter (`AtomExec`) hung on a poll/delay opcode in the AsicInit table (right
+after CALLTABLE idx 11 wrote MC reg `0x2898=0x111300FD`) and bailed via its iteration guard. No POST →
+SPLL/engine clock not locked → CP/ME (GRBM-routed, needs engine clock) can't run → `ME_INITIALIZE`
+unconsumed.
+
+**Key:** this is INTERMITTENT — prior runs' AsicInit succeeded (CP ran, stalled later at SET_SH_REG).
+So the cold AtomBIOS POST is fragile; `AtomExec`'s poll-loop handling is the fragile part. `SPLL_STATUS
+=0x700202` at AsicInit start (already in some state) suggests the PCI bus reset may leave SPLL/clocks
+half-initialized so the poll never completes.
+
+### Tasks
+1. **Instrument `AtomExec`'s loop guard** to print the exact register offset + expected value/mask it's
+   polling when it gives up (the guard already fires "Stuck in loop, aborting" — just log what it was
+   waiting on). That pinpoints the failing POST step.
+2. **Cold-boot vs reset test:** run once from a fresh cold boot (no PCI reset) and once after a bus
+   reset. If AsicInit succeeds cold but hangs post-reset, the reset is the trigger — then either
+   pre-condition the SPLL/clock before AsicInit, or make `AtomExec`'s poll opcode tolerate this state.
+3. This is upstream of the SET_SH_REG/RLC lead (§4). A reliable POST is the prerequisite — fix this
+   first; with AsicInit succeeding, the CP runs and we're back to the §4/§5 RLC/CLEAR_STATE work.
+
+---
+
+## 9. UPDATE (2026-06-24) — SET_SH_REG stall FIXED (stage-9 RLC/CLEAR_STATE work); now wave-launch
+**The §4 stall is resolved.** Probe now reports `SET_SH_REG consumed (idle=1)` (was `idle=0`/timeout),
+and there is NO `WaitIdle timeout` in the run. The CP processes the compute `SET_SH_REG` packets
+without stalling — the stage-9 RLC/CLEAR_STATE bringup work fixed it. Full init completes (AsicInit
+succeeded; the earlier early-BAR0-prime hang was a WEDGED CARD from a prior failed run, NOT the stage-9
+changes — a reboot/PCI-reset clears it. Confirmed by a clean rerun).
+
+**Remaining:** `dst=0`, and the compute registers still read back 0 via MMIO
+(`PGM_LO=0 ... SH_MEM_CONFIG=0`). Two possibilities:
+- (a) the `SET_SH_REG` writes still aren't taking effect, OR
+- (b) **MMIO readback is a red herring** — on SI, SH registers set via `SET_SH_REG` go through the
+  CP/RLC context shadow and may not be MMIO-visible until a wave loads them. Since the CP now *consumes*
+  them cleanly (idle=1), (b) is plausible.
+
+### Next (the question is now wave-launch, not SET_SH_REG)
+1. Instrument DURING/AFTER `DISPATCH_DIRECT` (not the pre-dispatch readback): read SQ wave-occupancy /
+   `SPI_DEBUG_BUSY` / `SQ_DEBUG_STS_GLOBAL` right after committing the dispatch, and re-check `dst`
+   post-fence. Determine if a wavefront actually launches.
+2. If no wave launches: re-check `COMPUTE_DISPATCH_INITIATOR` (COMPUTE_SHADER_EN bit 0) and
+   `COMPUTE_STATIC_THREAD_MGMT_SE0/SE1` (CU mask) as the wave actually sees them, and `SH_MEM_CONFIG`
+   (still 0 — if it's genuinely unset, the shader's memory model is broken; commit `1f3a5495` SH_MEM
+   init may still need restoring via MMIO during init rather than relying on SET_SH_REG).
+3. Stop trusting the pre-dispatch MMIO readback of SH regs (likely shadowed). Verify via behavior
+   (does `dst` change) and wave-occupancy counters.
+
+NOTE: earlier-run hangs at "[AMDGPU BAR] Priming BAR0 pages (65536 pages)..." were a wedged GPU, not a
+code bug — always PCI-reset (or reboot) before a run; a wedged card hangs early in BAR init.
+
+---
+
+## 10. UPDATE (2026-06-24) — wavefront never launches; compute SH context not committed to live pipe
+WAVE-PROBE added (post-IB pre-fence + post-fence). Definitive:
+```
+SPI_DEBUG_BUSY=0  SQ_DEBUG_STS_GLOBAL=0   (both samples, pre- AND post-fence) -> NO wave ever runs
+VM_FAULT_STATUS=0  COMPUTE_DISPATCH_ID=0
+DISPATCH_INITIATOR=0  PGM_LO=0  STATIC_THREAD_MGMT=0  NUM_THREAD=0  SH_MEM_CONFIG=0   (post-fence too)
+GART dst[0..3]=0   Dispatch rc=0
+CP_STAT=0xFFFFFFFF   CP_BUSY_STAT=0x84038042
+```
+So the readback is NOT a shadow red-herring — the compute registers are genuinely 0 *after* the fence,
+and no wavefront launches (no fault). SET_SH_REG is consumed without stalling (stage-9 fix holds), but
+**its writes never reach the LIVE compute registers**, so DISPATCH_DIRECT has no valid state -> no wave
+-> dst=0.
+
+### Leads (cold-bringup, one layer below the SET_SH_REG stall)
+1. **`SRBM_GFX_CNTL=0`** selects the (ME, pipe, queue) that register access targets. If compute
+   `SET_SH_REG` writes land on a pipe/queue context the dispatch never runs, the live regs stay 0.
+   The kernel programs SRBM_GFX_CNTL / the compute pipe-queue mapping during bringup; the cold path
+   may not. Check what pipe/queue the dispatch uses vs what SET_SH_REG targets, and whether
+   SRBM_GFX_CNTL needs setting before the compute SET_SH_REGs.
+2. **`CP_STAT=0xFFFFFFFF`** (all bits set) looks like an MMIO read returning no-response (all-1s)
+   rather than a real value -> the CP/compute register block may not be fully clocked/accessible.
+   Confirm that read is valid (read a known register for sanity); if it's no-response, the compute
+   pipe isn't powered/clocked.
+3. The compute SH register *context* isn't being committed to the live SPI/SQ. On GCN these are
+   per-pipe; verify the compute pipe is selected + enabled (SPI compute enable, CU mask reaching the
+   pipe) so SET_SH_REG writes apply to the pipe that dispatches. Compare against the kernel's
+   `si_compute`/MEC pipe setup and the working-commit assumptions (it ran on a kernel-set-up pipe).
+
+### Next probe
+Read SRBM_GFX_CNTL + a sanity register (e.g. GRBM_STATUS, known-good) to validate CP_STAT; try setting
+SRBM_GFX_CNTL to select the dispatch's pipe/queue BEFORE the compute SET_SH_REGs; re-read the compute
+regs after. If they then read non-zero and a wave launches, that's it.
+
+---
+
+## 11. UPDATE (2026-06-25) — compute pipe never brought up cold; fix SH_MEM/SPI init (STANDALONE, no kernel driver)
+
+**Decision (do not relitigate):** the driver is STANDALONE. Do NOT use radeon/amdgpu to POST the card —
+the goal is to remove kernel GPU drivers entirely (AILang OS). The cold-init must be done properly.
+
+**State (06-25 run, unchanged from §10 except a clarification):** no wavefront launches
+(`SPI_DEBUG_BUSY=0`, `SQ_DEBUG_STS_GLOBAL=0` pre- and post-fence), all compute regs read 0 post-fence,
+`SRBM_GFX_CNTL=0`, no VM fault, `dst=0`. `SET_SH_REG` is consumed without stalling (stage-9 fix holds).
+`CP_STAT=0xC0044700` is a REAL value this run (last run's `0xFFFFFFFF` was a transient bad read) →
+**the compute register block IS accessible. Lead #2 (dead/unclocked reg block) is CLOSED.**
+
+**Root-cause focus: the cold path never brings up the compute pipe.** `SH_MEM_CONFIG=0` /
+`SH_MEM_BASES=0` is the tell. On SI these (and the SPI compute config + pipe enable) are programmed by
+the kernel's `gfx_v6_0` init via **MMIO during bringup** — they are NOT set by the dispatch's
+`SET_SH_REG`s. Without that compute-pipe context established, the compute `SET_SH_REG` writes have no
+live pipe to land in (all read 0) and `DISPATCH_DIRECT` has no valid state → no wave → `dst=0`. The
+register block is fine; the pipe it targets was never initialized.
+
+### TASK — bring up the compute pipe in the cold path (vs kernel `gfx_v6_0` + own commit `1f3a5495`)
+1. **Program `SH_MEM_CONFIG` and `SH_MEM_BASES` via MMIO during init** (not via dispatch SET_SH_REG).
+   Commit `1f3a5495` ("SH_MEM init") added this in the working era — it is clearly NOT taking effect now
+   (`SH_MEM_CONFIG=0`). Find where it went / why it's skipped or zeroed (CLEAR_STATE may clear it — if
+   so, set it AFTER clear-state, or restore it each dispatch). Match the kernel's `gfx_v6_0` SH_MEM
+   values for the compute aperture.
+2. **Verify the SPI / compute-pipe enable** so COMPUTE_* SH writes commit to the live pipe: check the
+   kernel `gfx_v6_0` compute path for SPI config, `COMPUTE_STATIC_THREAD_MGMT` reaching the pipe, and
+   any pipe/queue select needed before the compute SET_SH_REGs. (`SRBM_GFX_CNTL=0` — confirm whether
+   the gfx-ring DISPATCH_DIRECT path needs a specific pipe selected, or if that's MEC-only and a
+   red herring for this path.)
+3. Re-run: after pipe bringup, the compute SET_SH_REGs should land (regs read non-zero) and a wave
+   should launch (`SPI_DEBUG_BUSY`/`SQ_DEBUG_STS_GLOBAL` go non-zero) → `dst=42`.
+
+This is the same "what did the kernel POST provide" seam, now narrowed to the **compute/SPI pipe
+config** specifically — fixable cold, no kernel-driver dependency.
+
+### Iteration reminder
+PCI-reset (or `gpu_reset.sh`) before EVERY run.
+
+---
+
+## 12. SPLL guard, GPU wedge prevention, AsicInit display-block timeout (2026-06-26)
+
+### Problem chain identified and fixed
+1. **AtomExec_AsicInit fails** — the ATOM BIOS AsicInit table calls `EnableDispPowerGating`
+   (CALLTABLE idx=13) which polls register **0x5DF8** (undocumented DCE chip-config register,
+   adjacent to `CC_DC_PIPE_DIS` at 0x5DFC). After PCI config reset, the DCE clock domain is
+   dead and 0x5DF8 reads 0xFFFFFFFF. The poll waits for bit 0 to clear (cond=NOTEQUAL) — it
+   never does.
+
+2. **Old code continued past failure** — `DPM_SI_InitSPLL` returned success even when SPLL
+   wasn't locked. `AccelGCN_Init` didn't check the return code. Init continued into
+   `PM4_HaltCP` which writes `CP_ME_CNTL` (GRBM-routed register). With SPLL not running,
+   GRBM register writes cause a **PCI fabric deadlock** — all subsequent MMIO returns
+   0xFFFFFFFF, the GPU is wedged.
+
+3. **Wedge required reboot** — FLR not supported on Cape Verde. SBR alone insufficient.
+   PCI config ASIC reset (0x39d5e86b to config 0x7c) recovers the card IF the PCI link is
+   still up — created `gpu_reset.sh` implementing the kernel's `si_gpu_pci_config_reset`.
+
+### Fixes applied
+- **SPLL guard** (`Library.AccelGCN.ailang`): checks `DPM_SI_InitSPLL` return, aborts with
+  rc=-30 before any GRBM writes if SPLL isn't locked. Prevents wedge entirely.
+- **SPLL lock check** (`Library.AMDGPUDPM_SI.ailang`): `DPM_SI_InitSPLL` now returns 0
+  (failure) when SPLL_STATUS=0xFFFFFFFF or lock bits != 0x200.
+- **AsicInit abort is now non-fatal**: the display-block timeout (0x5DF8 poll) aborts the
+  ATOM table, but SPLL configuration happens BEFORE the display block init in the ATOM
+  bytecode. Changed to WARNING + fall-through to SPLL_STATUS check. If SPLL locked despite
+  abort → continue init. If not → fail cleanly.
+- **ATOM read tracing**: stuck-loop abort message now prints `polling reg=0xNNNN raw_val=0xNNNN`
+  (stored via `AEField.LAST_REG_READ` / `LAST_REG_READ_VAL` in `AE_RegRead`).
+- **`gpu_reset.sh`**: 4-method recovery script (config reset → SBR → post-SBR config reset →
+  D3hot cycle).
+
+### Open question — wedge severity
+The PCI config ASIC reset (`gpu_reset.sh` method 1) has been confirmed working to recover a
+wedged Cape Verde after GRBM deadlock. However, there may be edge cases where the GPU gets
+so deeply wedged that even config reset cannot recover it (e.g., if the PCI link itself drops).
+In that scenario a reboot would be required. The SPLL guard should prevent reaching this state
+in normal operation — the guard aborts before any GRBM writes can trigger the deadlock.
+**Investigation needed**: is a reboot-requiring wedge actually possible on this hardware, or
+does the PCI config reset always recover? The kernel's `si_asic_reset` uses the same method
+and seems to consider it reliable.
+
+### Current state (UNTESTED — needs reboot + fresh run)
+The AsicInit non-fatal fix has been built but not tested. Expected outcome:
+- AsicInit will still abort on the 0x5DF8 poll (WARNING printed)
+- SPLL_STATUS check will determine if SPLL actually locked despite abort
+- If SPLL locked → init continues past the guard → CP firmware load → compute dispatch
+- If SPLL NOT locked → clean failure (rc=-30), no wedge
+
+### Test command (after reboot)
+```
+sudo ~/Ailang-Self-Hosting-/gpu_reset.sh
+cd ~/Ailang-Self-Hosting- && ./ailang.x TestCode/test_accel_gcn.ailang test_accel_gcn
+sudo ./test_accel_gcn 2>&1 | tee our_mmiotrace.txt
+```
+
+---
+
+## 13. (2026-06-26) §12 VALIDATED (init reaches dispatch, no wedge); §11 is the confirmed finish line
+The 06-26 06:24 run validates §12 (its "UNTESTED" note is now outdated): init reaches the compute
+dispatch — SPLL locks despite the AsicInit 0x5DF8 display-block abort, the SPLL guard holds, and there
+is NO GRBM-without-SPLL fabric wedge. §12's root cause (GRBM register write while SPLL unlocked -> PCI
+deadlock -> 0xFFFFFFFF MMIO -> wedge) explains the ENTIRE prior hang history.
+
+REMAINING (unchanged from §11): `SH_MEM_CONFIG=0`, no wave (`SPI_DEBUG_BUSY=0` / `SQ_DEBUG_STS_GLOBAL=0`),
+all compute regs 0, `dst=0`. The compute pipe is still not brought up cold. §11's task — program
+`SH_MEM_CONFIG`/`SH_MEM_BASES` + SPI/compute-pipe enable via MMIO during init (per kernel `gfx_v6_0` +
+own commit `1f3a5495`), set AFTER any CLEAR_STATE that zeroes them — is THE finish line. It can now be
+iterated safely (the SPLL guard + gpu_reset.sh prevent/recover wedges).
+
+---
+
+## 14. (2026-06-26) FOR OPUS — it's an init-setup issue: find WHERE the compute SET_SH_REG writes go
+**Framing (confirmed): this is an INIT/SETUP problem, not a dispatch/packet bug.** The compute
+`SET_SH_REG` packets are consumed by the CP (idle=1, no stall — §9), but every compute register reads
+back 0 *after* the dispatch (`PGM_LO/RSRC/STATIC_THREAD_MGMT/NUM_THREAD/DISPATCH_INITIATOR = 0`), no
+wave launches, `dst=0`. The reg block is accessible (`CP_STAT` reads real values — §10/§13). So the
+writes are issued but never reach the live registers → the compute pipe context set up during init is
+wrong/incomplete.
+
+**Correction — drop the SH_MEM lead until proven:** the kernel does NOT do SH_MEM per-VMID init on SI.
+`amdgpu/gfx_v6_0.c` has no `init_compute_vmid`/`SH_MEM_CONFIG` write; `radeon/si.c` only flushes cache
+per VMID. SH_MEM per-VMID setup is CIK+ (GCN2). So `SH_MEM_CONFIG=0` is likely NORMAL on SI — do not
+chase it as the bug. (The PM4Regs comment "si_init_compute() per VMID" looks mis-attributed from CIK.)
+
+### WHAT TO LOG (one run pinpoints it)
+1. **Interleaved readback — THE key probe.** After EACH compute `SET_SH_REG` in `PM4_SubmitCompute`,
+   immediately MMIO-read that exact register and print `<name> wrote=0xWW readback=0xRR`. Do NOT wait
+   until the end. Three outcomes, each diagnostic:
+   - readback == wrote, for each → writes DO land; something LATER clears them → go to #2.
+   - readback == 0 right after its own write → the write never reaches the reg → reg-offset / SH_REG_BASE
+     / SHADER_TYPE routing bug in the SET_SH_REG path (compare offset math vs a known-good value).
+   - some land, some don't → offset range / pipe-context boundary.
+2. **CLEAR_STATE bracket.** Read the compute regs right BEFORE and right AFTER the `CPStart`
+   `CLEAR_STATE` (PM4Dispatch ~line 691). If they're nonzero before and 0 after, CLEAR_STATE is wiping
+   them — the SET_SH_REGs must be emitted AFTER clear-state, or clear-state must not run on the compute
+   context. (Order bug, very plausible given the dispatch flow.)
+3. **Cold-vs-warm init diff for the compute/SPI/CP range.** Reuse the trace-diff approach: parse warm
+   `bus2_all.txt` (`WR REG_0xNNNN = 0xVVVV`) and our cold `our_mmiotrace.txt` (`MMIO_WR n 0x0xNNNN 0x0xVVVV`)
+   filtered to offsets 0x8C00-0x9FFF (SPI/SH) and 0xB800-0xB900 (COMPUTE_*) and 0xC100-0xC4FF (CP/RLC).
+   What does the kernel write during init that we don't? That's the missing pipe setup.
+4. **SRBM_GFX_CNTL at SET_SH_REG time** (read + print) — confirm which ME/pipe/queue/VMID the writes
+   target vs what the dispatch runs.
+
+### Most likely root (rank)
+(a) **Ordering**: CLEAR_STATE (or a soft reset) zeroes the compute regs AFTER the SET_SH_REGs set them
+→ fix emit order. (b) **SET_SH_REG offset/routing** for the COMPUTE_* block specifically. (c) a missing
+init-time SPI/compute-pipe enable the kernel does and we don't (the #3 diff finds it).
+
+The interleaved readback (#1) + CLEAR_STATE bracket (#2) together resolve (a) vs (b) in a single
+reset+run. Start there.
+
+---
+
+## 15. (2026-07-01) GART plumbing fixes landed + fresh sudo run on rebuilt binary (test_accel_gcn.x); §14 probes now producing data
+
+**Run command (as provided):** `sudo ./test_accel_gcn.x 2>&1 | tee our_mmiotrace.txt`
+
+**Context:** This run used the fresh build after GART source fixes (PFN mask corrected to full 0x7FFFFFFFFFFFFF / GARTConf.PFN_MASK for bits 0-54; all 14 mmap calls now correctly pass the final `, 0` offset argument per the function comments and handoff spec; rebuilt main binary + _fixed variant). Run under sudo as required for pagemap. Prior state had caused a lockup on a follow-up run (stale CP/RLC/SPLL after failure — always PCI-reset or reboot before retry).
+
+### Results — GART side of the handoff now working
+- GART_Init no longer aborts on phys addr.
+- Real PFNs now visible under sudo (examples):
+  - PFN=0x1E9699 phys=0x1E9699000
+  - PFN=0x1A0FF7 phys=0x1A0FF7000
+  - Many others for IH, CP rings, data, shader, etc.
+- Log lines: "[PM4] IH ring: GART VA=0xF440000000, dummy_phys=0x0x1A10DC000"
+- PTE fill proceeded (thousands of MMIO_WR during GART phase).
+- This directly addresses the "per-page GART_GetPhysAddr + GART_WritePTE" requirement in §2/§6/§14 and the mmap+mlock pattern described throughout.
+
+### The persistent blockers (exactly as the prior §§ diagnosed)
+**VRAM / BAR0 write coherency after cold POST is still broken** (the "what the kernel POST provided" seam):
+- VRAM write diagnostic (right after BIF_FB_EN=3 + MC training):
+  ```
+  VRAM[0x0]=0x0xA39C4A7 (exp 0xDEADBEEF)  [0x1000]=0x0xA3984A7 ...
+  [0x2000]=0x0xFFFFFFFF ...
+  After HDP flush: still wrong/garbage values (some A39C..., some FFFF).
+  ```
+- This path is used for the 90MB+ PTE table writes in GART (GPU_VramWr32 to VRAM page table area). Even with correct phys addrs, if PTEs don't land, all GART VAs (rings, IB, data, shader) are broken for the GPU.
+- Matches historical "cold-VRAM-coherency class of bugs", "first VRAM write reads back 0/FFFF after full init", and the prime + HDP attempts in gpu-crash.md and earlier sections. GART move helped *host-side* src/dst (via host_ptr) and runtime, but the *table itself* + setup writes still depend on this.
+
+**§14 probe data (the experiment the doc said would pinpoint it — now we have it):**
+- **Interleaved readback ([§14-ILR])** (after each SET_SH_REG group + commit/WaitIdle):
+  ```
+  [§14-ILR] SRBM_GFX_CNTL=0x0x0 CP_STALLED_STAT3=0x0x0
+  [§14-ILR] PGM_LO  wrote=0x0xF44A0720 readback=0x0x0
+  ... RSRC1/2, VMID, RES_LIM, TMGMT0/1 (0xFFFFFFFF written), NUM_X/Y/Z all readback=0x0
+  ```
+- **CLEAR_STATE bracket ([§14-CS])**:
+  ```
+  BEFORE: all 0
+  AFTER GFX CLEAR_STATE, BEFORE Compute: all 0
+  AFTER BOTH: all 0 (no change from CLEAR_STATE)
+  ```
+- Later [PROBE] SET_SH_REG consumed (idle=0) — MMIO readback all 0.
+- [WAVE-PROBE] and [POST-FENCE]: SPI_DEBUG_BUSY=0, SQ_DEBUG_STS_GLOBAL=0 (no wave ever), SRBM_GFX_CNTL=0x0, all COMPUTE/SH regs 0, VM_FAULT=0, dst[0..3]=0 (src partially visible from host GART writes but not reliable), GRBM_STATUS=0xA0003028 (GUI_ACTIVE/CP_BUSY but no real progress).
+- CP level: Multiple "WaitIdle timeout: ring=0 RPTR=62 WPTR=..." (RPTR stuck while WPTR advances; packets issued but not consumed/processed fully). idle=0 on SET_SH_REG waits. Eventual "Dispatch rc=0" but all dst=0, 64 errors, "*** FAIL ***".
+
+**CP/ring symptoms:** Reaches dispatch (on ring 0), IB-GART content looks correct, fence emitted, but no execution. Timeouts, no wave launch, regs never take the SET_SH_REG values.
+
+### Updated root cause (per §4/§10/§11/§14 + this data + KERNEL_INIT_SEQUENCE.md cross-refs)
+GART plumbing (the "handoff gart ring1" title) is no longer the blocker — thanks to the targeted fixes matching the documented requirements.
+
+The cold POST/MC/GMC bringup still does not establish:
+- Reliable CPU BAR0 writes into VRAM (PTE table + any fallback paths).
+- The compute pipe/context (SRBM_GFX_CNTL remains 0; SPI/compute enables, STATIC_THREAD_MGMT reaching the pipe, etc. that gfx_v6_0 / si_compute paths do via MMIO during init — see KERNEL §4c, cp_compute_resume, setup_spi, etc.).
+- Proper ordering/context so that compute SET_SH_REG (with SHADER_TYPE_COMPUTE) actually commits to live regs (CLEAR_STATE bracket shows no effect; writes read back 0 immediately; idle=0 stalls).
+
+This is why "despite thousands of fix attempts" (golden regs, order, CSB, ring relocation, SPLL guard, non-fatal rings, probes, etc.): they were either pre-GART or downstream of a still-broken setup layer. The §14 experiment now gives the exact smoking gun (writes never land, SRBM=0, CS ineffective, no SPI activity).
+
+The second-run lockup is the known fabric/SPLL/GRBM-without-clocks wedge path (see §12); stale state after a failed dispatch leaves the GPU unhappy for the next cold init.
+
+### Recommended immediate actions (closing the loop the docs described)
+1. **Address VRAM/BAR0 write path for PTEs** (highest priority now that GART gets this far): Compare post-MC writes in this log vs. bus2_all.txt / mmiotrace_boot for HDP/MC/VM aperture/BIF that affect CPU direct access. Enhance priming (before GART fill), add more drains, or write PTEs via a different path (e.g., ring PM4 writes once CP is up, or CPU-side if possible). The diagnostic + GART fill both use the same broken path.
+2. **Implement the §14 leads in code** (using the evidence above):
+   - Set SRBM_GFX_CNTL to select the correct ME/pipe/queue/VMID *before* any compute SET_SH_REG (currently only read in probes; kernel does pipe selection).
+   - Reorder/ensure all compute SET_SH_REG + DISPATCH after the *compute* CLEAR_STATE + CONTEXT_CONTROL (bracket shows CS has no effect on the zero state).
+   - Add the missing cold init MMIO for compute pipe/SPI (cross-ref gfx_v6_0_rlc_resume, cp_resume, setup_spi, SPI_STATIC_THREAD_MGMT_3, etc. in KERNEL; some already in MC_SI golden but not the full compute path).
+3. **Stall / consume issues:** The repeated RPTR=62 stalls + idle=0 suggest CP is not fully unhalted, context not live, or needs extra SURFACE_SYNC / flushes / PFP-ME sync before/after SET_SH_REGs for compute. Instrument more or match kernel emit order exactly.
+4. **Iteration safety:** Before *every* run (especially after FAIL), run full reset (gpu_reset.sh or the 4-method script). Enhance SPLL guard if needed. Consider a "full reset + verify" wrapper.
+5. **Rebuild + rerun** with these, capture fresh our_mmiotrace.txt, and feed the new [§14-...] + any remaining probe output back here. The data will now tell us precisely which of (a/b/c) is dominant.
+
+GART side of the "handoff" is closed. The rest is the cold bringup seam the docs have been pointing at since §4. This run with the probes + fixes gives us the cleanest signal yet. Update the "CURRENT ROOT-CAUSE LEAD" in §4 and "NEXT TASKS" accordingly.
+
+(End of consolidated handoff update. Prior sections remain for reference.)
+

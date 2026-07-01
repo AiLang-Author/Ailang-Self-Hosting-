@@ -1,0 +1,642 @@
+# TASK: Relocate CP rings to GART (fix ring-1 cold-init dispatch)
+
+**Audience:** an AI coding agent (Opus 4.6) with shell + edit access to this repo
+(`~/Ailang-Self-Hosting-`) on the Pop!_OS box `bob@pop-os` (bus 2 = compute GPU, Cape Verde GCN1).
+**Goal:** make CP ring 1 work on cold init so compute dispatch runs, by moving the CP ring buffers
+(and RPTR writeback) from VRAM into GART, matching what the kernel/radeon driver does.
+
+Read this whole doc, then `gpu-crash.md` (authoritative state + RULES), before editing anything.
+
+---
+
+## 0. HARD SAFETY RULES — violating these blanks the monitor and/or hard-hangs the box (needs a physical reboot in another building)
+
+1. **NEVER run the full init on the DISPLAY GPU (bus 1 / PCI 01:00.0).** It drives the monitor via
+   VESA. `DPM_SI` sends an SMC "NoDisplay" message that blanks the screen and cascades into an
+   RD990 PCIe fabric hang (no kernel log survives). A guard already exists in `AccelGCN_Init`
+   (`ABORT: selection fell back to DISPLAY GPU`) — **do not remove or weaken it.** Always confirm
+   the run log shows `[AccelGCN] using GPU N (bus 2)`, never `display GPU selected`.
+2. **Test ONLY with `AccelGCNCfg.ring_idx = 1`** (line ~438 of `Librarys/Accel/Library.AccelGCN.ailang`).
+   This builds the dispatch but never executes the compute shader. Executing a real compute dispatch
+   (ring 0) currently hard-hangs the fabric — DO NOT change `ring_idx` to 0 to "test".
+3. The ring *test* (`PM4_RingTest`) emits **NOPs only** — safe, cannot hang. That is your success
+   signal (see §6). Do not add compute dispatches to the test loop.
+4. Obey all RULES in `gpu-crash.md` (HDP registers, no MC/reset/ASIC_INIT on bus 1, kernel register
+   values only).
+5. After every edit, rebuild and confirm `ring_idx` is still `1` before handing back a run command.
+6. You cannot run `sudo` non-interactively — the human runs `sudo ./test_accel_gcn`. You edit + build
+   (`./ailang.x TestCode/test_accel_gcn.ailang test_accel_gcn`), they run, you read `our_mmiotrace.txt`.
+
+---
+
+## 1. Diagnosis (PROVEN — do not re-derive)
+
+Cold-vs-warm MMIO trace diff (`our_mmiotrace.txt` cold vs `bus2_all.txt` warm/kernel) showed all of
+these are ALREADY CORRECT and are NOT the bug:
+- Dispatch payload: shader VA `0xF40603C000`, V# base `0xF40607E000`, `PGM_LO/HI`, `rsrc1=0x41`,
+  `rsrc2=0x88` — all correct.
+- VM: system aperture `[0xF400000..0xF43FFFF]` (pages) covers shader+data; `CTX0 START/END/BASE` per
+  RULE #4 — correct.
+- Shader machine code: a clean `dst[i] = src[i] + 42`, proper `S_ENDPGM`, 5 VGPR / 9 SGPR within the
+  `rsrc1` reservation — correct.
+
+**The ONE divergence** (trace formats: warm `WR REG_0x<off> = 0x<val>`, cold `MMIO_WR <n> 0x0x<off> 0x0x<val>`):
+
+| Register | Warm (kernel — ring 1 WORKS) | Cold (ours — ring 1 DEAD) |
+|---|---|---|
+| `CP_RB0/1/2_BASE` | `0xFF00xxxx` → **GART** | `0xF406xxxx` → **VRAM** |
+| `CP_RB0/1/2_RPTR_ADDR` (+`_HI`) | `0xFF_004010xx` → **GART** | `0xF4_06xxxxxx` → **VRAM** |
+| `CP_RB0_CNTL` | `0x90B` | `0x90D` |
+| `CP_RB1/2_CNTL` | `0x90A` | `0x90D` |
+
+The kernel puts all CP rings + RPTR writeback in **GART** (system RAM, accessed by the GPU through
+GART page-table entries). Our cold path puts them in **VRAM**. Ring 0 tolerates VRAM; the CP's fetch
+path for rings 1/2 does not — `CP_RB1_RPTR` (the hardware register, not just the writeback) never
+advances cold, but works warm. This is a RULE-#3 (match-the-kernel) violation. Fixing it is the task.
+
+---
+
+## 2. Key code locations (verify by reading before editing)
+
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUGART.ailang`
+  - `FixedPool.GARTConf` (~line 32): per-resource GART VAs as HI/LO pairs (HI=`244`=`0xF4`) and PTE
+    indices. GART VA = `(HI << 32) | LO`. **PTE index = `VA_LO / 4096`.** Existing: IH ring
+    `VA_LO=0x40000000` (PTE idx `262144`), IH WB `0x40010000`, DMA0 ring `0x40020000`, DMA1 ring
+    `0x40040000`, DMA0 WB `0x40060000`, DMA1 WB `0x40061000`. **Free space starts at `0x40070000`.**
+  - `FixedPool.GARTState` (~line 80): `*_host_ptr`, `*_phys` fields. Add CP-ring fields here.
+  - `GART_GetPhysAddr(host_ptr)` (~line 106): host VA → physical addr (per 4KB page, via pagemap).
+  - `GART_WritePTE(gpu, pte_idx, phys)` (~line 210): writes one GART PTE.
+  - `GART_Init(gpu)` (~line 236): mmap → mlock → MemorySet(touch) → `GART_GetPhysAddr` → `GART_WritePTE`
+    → store in GARTState. **The IH-ring block (64KB = 16 pages) is the exact pattern to copy.**
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Ring.ailang`
+  - `FixedPool.RingConf` (~line 66): `RING_SIZE_DWORDS=16384`, `RING_SIZE_BYTES=65536`,
+    `RPTR_WB_OFFSET`, `VRAM_TOTAL_ALLOC`, `RING_LOG2`, `PAGE_LOG2`. (CNTL = `RING_LOG2 + PAGE_LOG2*256`.)
+  - `FixedPool.RingField` (find it): per-ring struct offsets (`VRAM_BASE`, `RPTR_WB_ADDR`,
+    `FENCE_WB_OFF`, `RING_SIZE`, `WPTR`, `GPU_INDEX`, `RING_ID`, `INITIALIZED`, `PKT_BUF`, `PKT_POS`,
+    `FENCE_VAL`, etc.). **Add `HOST_PTR` and `GART_VA`.**
+  - `PM4_SetupRing(gpu, ring_idx, vram_offset)` (~line 506): the main rewrite target. Currently zeroes
+    `vram_ptr+vram_offset`, sets `CP_RB*_BASE = PM4_VramToGPU(vram_offset) >> 8`,
+    `RPTR_ADDR = PM4_VramToGPU(rptr_wb)`.
+  - `PM4_EmitDWord` (~line 791): writes ring data to `vram_ptr + VRAM_BASE + pos`. Change to use
+    `HOST_PTR + pos` when set.
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Pkt.ailang`
+  - Packet write path (~lines 173–191) uses `VRAM_BASE + vram_ptr` — same change as `PM4_EmitDWord`.
+  - `PM4_WaitIdle`, `PM4_ReadRPTR` (reads RPTR writeback), `PM4_WaitFenceVRAM` (reads fence). **If you
+    move the RPTR/fence writeback into GART, these readers must read the GART writeback HOST pointer,
+    not VRAM.** Read them and update accordingly.
+
+Call site: `PM4_SetupRing(...)` is invoked from `AccelGCN_Init` (`Librarys/Accel/Library.AccelGCN.ailang`,
+~line 388 area, "ring init order: all 3 rings before CP unhalt"). `GART_Init` is called earlier in the
+init sequence (step 7).
+
+---
+
+## 3. Implementation steps
+
+### Step A — GART allocation for CP rings (`GART_Init` + GARTConf + GARTState)
+Mirror the IH-ring 64KB allocation **three times** (RB0/RB1/RB2) plus one 4KB writeback page:
+- Add `GARTConf` VAs (HI=`244`): `CPRB0_GPU_VA_LO=0x40070000`, `CPRB1=0x40090000`, `CPRB2=0x400B0000`,
+  `CPRB_WB=0x400D0000`; and PTE indices = `VA_LO/4096` (`262256`, `262288`, `262320`, `262352`).
+  (Spacing 0x20000 leaves headroom; each ring uses 16 PTEs.)
+- Add `GARTState` fields: `cprb0_host_ptr/phys`, `cprb1_host_ptr/phys`, `cprb2_host_ptr/phys`,
+  `cprb_wb_host_ptr/phys`.
+- In `GART_Init`: for each CP ring, `mmap` 64KB (`MAP_ANON_PRIV`, `PROT_READ|WRITE`), `mlock`,
+  `MemorySet(...,0,65536)` to fault pages in, then **loop 16 pages**:
+  `phys = GART_GetPhysAddr(host_ptr + page*4096)`; `GART_WritePTE(gpu, CPRBn_PTE_IDX + page, phys)`.
+  Allocate the WB page (4KB, 1 PTE) the same way. Store all host_ptr/phys in GARTState.
+  **The 16-PTE-per-ring loop is essential** — anonymous mmap is not physically contiguous, but mapping
+  16 consecutive GART-VA pages to the 16 (scattered) physical pages makes the ring linear in GART VA.
+- Add a `[GART] CP rings: RB0=0x..` log line.
+
+### Step B — `RingField` additions
+Add `HOST_PTR` (host pointer to the ring's GART-backed buffer) and `GART_VA` (the ring's GART VA byte
+address) to the `RingField` FixedPool (extend the struct size accordingly).
+
+### Step C — `PM4_SetupRing` rewrite
+For `ring_idx` 0/1/2, pull the GART buffer for that ring from GARTState:
+- `host_ptr = GARTState.cprbN_host_ptr`; `gart_va = (0xF4 << 32) | CPRBn_GPU_VA_LO`.
+- Store `RingField.HOST_PTR = host_ptr`, `RingField.GART_VA = gart_va`.
+- Zero the ring via `MemorySet(host_ptr, 0, RING_SIZE_BYTES)` (NOT the VRAM pointer).
+- RPTR writeback: pick a 256-byte slot in the WB page for this ring:
+  `wb_va = (0xF4<<32) | (CPRB_WB_GPU_VA_LO + ring_idx*256)`;
+  `wb_host = GARTState.cprb_wb_host_ptr + ring_idx*256`.
+  Store `RPTR_WB_ADDR`/`FENCE_WB_OFF` as the **host** locations the readers will use; set the
+  hardware regs from the **GART VA**: `RPTR_ADDR = wb_va & 0xFFFFFFFC`, `RPTR_ADDR_HI = (wb_va>>32)&0xFF`.
+- `CP_RB*_BASE = gart_va >> 8`.
+- Per-ring CNTL to match kernel: ring 0 BUFSZ→`0x90B`, rings 1/2 →`0x90A` (BLKSZ stays `0x9`). Keep
+  the existing 3-write sequence (CNTL, CNTL|RB_RPTR_WR_ENA, …, CNTL) and the 1ms delay.
+
+### Step D — emit/read path
+- `PM4_EmitDWord` and the `PM4_Pkt` write path: if `RingField.HOST_PTR != 0`, write to `HOST_PTR + pos`
+  instead of `vram_ptr + VRAM_BASE + pos`.
+- `PM4_ReadRPTR` / `PM4_WaitFenceVRAM`: read from the stored writeback **host** pointer
+  (`RPTR_WB_ADDR` / `FENCE_WB_OFF`), which now point into the GART WB page's host memory.
+
+---
+
+## 4. GART VA / PTE layout (target)
+
+| Resource | GART VA | size | PTE idx (VA_LO/4096) |
+|---|---|---|---|
+| (existing IH/DMA) | 0xF44000_0000 … 0xF4400620_00 | — | 262144 … |
+| CP RB0 | 0xF440070000 | 64KB / 16pg | 262256–262271 |
+| CP RB1 | 0xF440090000 | 64KB / 16pg | 262288–262303 |
+| CP RB2 | 0xF4400B0000 | 64KB / 16pg | 262320–262335 |
+| CP ring WB | 0xF4400D0000 | 4KB / 1pg | 262352 |
+
+All within `VM_CONTEXT0` range (START `0xF400000` … END `0xFF3FFFF` pages) and ABOVE the VRAM system
+aperture (HIGH `0xF43FFFF`), so they resolve via GART PTEs, not the VRAM aperture. Correct by design.
+
+---
+
+## 5. Build
+
+```
+cd ~/Ailang-Self-Hosting-
+./ailang.x TestCode/test_accel_gcn.ailang test_accel_gcn       # must print "Success."
+```
+Confirm `grep -n "AccelGCNCfg.ring_idx" Librarys/Accel/Library.AccelGCN.ailang` shows `= 1`.
+
+## 6. Test (human runs; you read the result)
+
+Human runs: `sudo ./test_accel_gcn 2>&1 | tee our_mmiotrace.txt`
+Then check:
+- `grep "using GPU" our_mmiotrace.txt` → must be **bus 2** (never "display GPU selected").
+- `grep -iE "ring 1 test|RB1_RPTR|RPTR=" our_mmiotrace.txt`
+- **SUCCESS = ring 1's RPTR advances to match WPTR** (no `WaitIdle timeout: RPTR=0` for ring 1).
+  Add a debug print of `CP_RB1_RPTR` (reg `SIReg.CP_RB1_RPTR`) in the ring-1 path if needed to confirm
+  the hardware register (not just the writeback) advances.
+- Verify the new `CP_RB*_BASE` / `RPTR_ADDR` values in the trace are now `0xF44007/09/0B...` (GART),
+  matching the GART region, not `0xF406...` (VRAM).
+
+If ring 1 still stalls after rings are confirmed in GART, the next suspects (in order): per-ring CNTL
+size mismatch, the `0xC1E4` enable-sequence delta (warm writes `0x20200`→`0x20201`, cold writes only
+`0x20201`), and CP/ME firmware ring-enable. Diff those against `bus2_all.txt` next.
+
+## 7. Rollback
+Every file edited this session has a `*.bak_*` backup beside it. To revert a file:
+`cp Library.X.ailang.bak_NAME Library.X.ailang` then rebuild. Do not delete backups.
+
+## 8. Do NOT touch
+- The display guard in `AccelGCN_Init`.
+- The 30-dispatch `AccelGCN_ComputeReset` (Cape Verde dispatch-slot-leak erratum workaround).
+- Anything on bus 1 / the display GPU.
+- `ring_idx` (leave at 1 for all testing).
+
+
+---
+
+# STATUS UPDATE — 2026-06-23 (GART relocation DONE; new blocker: dispatch stalls at RPTR=96)
+
+## What was completed (verified in `our_mmiotrace.txt`)
+The GART-rings relocation from §3 of this doc is **implemented and working**:
+- All 3 CP rings now live in GART, kernel-matching:
+  - `Ring 0 GART: BASE=0xF4400500 RPTR_ADDR=0x400B0000 HI=0xF4 CNTL=0x90B`
+  - `Ring 1 GART: BASE=0xF4400700 RPTR_ADDR=0x400B0100 HI=0xF4 CNTL=0x90A`
+  - `Ring 2 GART: BASE=0xF4400900 RPTR_ADDR=0x400B0200 HI=0xF4 CNTL=0x90A`
+  (CNTL now matches warm: 0x90B / 0x90A / 0x90A. Ring VAs differ slightly from the spec's
+  0x40070000 base — Opus used 0x40050000 — that's fine, PTEs are correct and both rings advance.)
+- **Ring 1 RPTR now advances (0 → 96).** The dead-ring problem is FIXED — moving the rings into GART
+  was the correct fix. The CP fetches and processes ring 1 packets.
+- **No fabric hang.** Init runs to completion and tears down (`DPM disabled`, summary printed).
+  Compute-on-ring-1 now fails *gracefully* (WaitIdle timeout), unlike the old ring-0 fabric hang.
+  → **You can now iterate on compute freely; failures no longer brick the box.** Keep `ring_idx=1`.
+
+## New blocker
+```
+=== [DISPATCH DRYRUN] ring=1 ===
+[PM4] WaitIdle timeout: RPTR=96 WPTR=123
+[PM4:DBG] GRBM_STATUS=0xA0003028 CP_ME_CNTL=0x0
+[PM4:DBG] CP_RB0_CNTL=0x90B ... CP_RB0_RPTR=15 CP_RB0_WPTR=15   <-- ring-0 regs (debug bug, see #4)
+dst[0]=0xFFFFFFFF (exp 42) FAIL ... Results: 0/64 correct
+```
+The CP consumed **96 of 123 dwords** of the compute dispatch, then stalled. `dst` is garbage
+(uninitialized 0xFFFF pattern) → the shader's stores never landed. The stall is in the **tail** of the
+dispatch — almost certainly at/after `DISPATCH_DIRECT` + `CS_PARTIAL_FLUSH`, i.e. the CP launched the
+compute wavefront and is waiting for it to retire (and it never does), or the `EVENT_WRITE_EOP` fence
+path stalls. NOTE: the shader machine code itself is already verified correct (clean
+`dst[i]=src[i]+42`, proper `s_endpgm`) — so this is an *execution/launch* problem, not a code bug.
+
+## Next steps (in order)
+1. **Pin the stall to a packet.** Instrument `PM4_SubmitCompute`
+   (`Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Dispatch.ailang`) to log the ring dword offset
+   (`ring PKT_POS`) right before each major packet: the `SET_SH_REG` group, `DISPATCH_DIRECT`,
+   `CS_PARTIAL_FLUSH`/`EVENT_WRITE` and `EVENT_WRITE_EOP`. Re-run; see which packet's offset straddles
+   dword 96. That tells you whether the CP stalled **before** the dispatch (packet/CP issue) or **after**
+   (wavefront didn't retire / fence). This is the single most important next data point.
+2. **Read compute/wavefront status at the stall.** In `PM4_WaitIdle`'s timeout dump, also read and print
+   `GRBM_STATUS2`, `SPI_CSQ_*` / compute-queue status, and SQ wave-occupancy regs (see
+   `amd-southern-islands-isa.txt` / `sid.h`). Determine whether a wavefront actually launched and is
+   stuck, vs. never launched.
+3. **Confirm the V# reached `s[0:3]` on ring 1.** The shader does BUFFER_LOAD/STORE with `srsrc=0`
+   (reads `s[0:3]`). Verify the `SET_SH_REG USER_DATA_0..3` writes are on ring 1 and consumed before
+   the dispatch. If the V# is stale/zero at launch, the buffer access faults and the wavefront hangs.
+4. **Fix the misleading debug (do this regardless).** `PM4_WaitIdle`'s timeout dump hard-codes
+   `CP_RB0_*` — it printed ring-0 (RPTR=15) while ring 1 (RPTR=96) is the one stalling. Make it print
+   the failing `ring_idx`'s registers (`CP_RB1_RPTR` etc.). Half the confusion comes from this.
+5. **Consider the data buffer location.** `gpu_data_base` is still VRAM (`0xF40607E000`). The shader's
+   buffer loads/stores hit VRAM via the V#. If the wavefront's VRAM access is what stalls, try placing
+   the compute data buffer in GART too (same pattern as the rings) and compare. Lower priority — check
+   #1–#3 first.
+
+## Still in force (do NOT change)
+- `ring_idx = 1`, display guard, 30-dispatch erratum reset, all bus-1 protections, RULES in this file
+  and `gpu-crash.md`.
+- Backups `*.bak_*` beside every edited lib.
+
+
+---
+
+# STATUS UPDATE 3 — 2026-06-23 16:21 (RING 1 WORKS end-to-end; blocker moved to DATA buffer)
+
+## MILESTONE: ring 1 + compute dispatch complete cleanly (from a clean GPU)
+Run on a freshly cold-booted GPU:
+- **0 WaitIdle timeouts, no ring-test failures, `Dispatch rc=0`** (fence signaled).
+- Rings in GART, kernel CNTL (RB0 `0x90B`, RB1/2 `0x90A`). PKT-MAP: dispatch built to wptr 121,
+  `RB1_WPTR` driven to 123, CP consumed all of it.
+
+=> The GART relocation FIXED ring 1. The CP now fetches + executes the full compute dispatch on ring 1.
+   This works only from a CLEAN GPU state (cold boot or PCI reset). A wedged GPU from a prior failed
+   run still fabric-hangs on re-init — see iteration rule below.
+
+## Clean-iteration: PCI secondary-bus reset between runs (NO reboot)
+Bus 2 (compute GPU) is behind bridge `00:03.0` and exposes a writable reset node; `reset_method = bus`
+(secondary bus reset; FLR unsupported). Bus 1 (display) is behind a DIFFERENT bridge (`00:02.0`), so
+this does NOT touch the display. `bob` is in group `video`, so **no sudo** is needed for the reset:
+
+```
+# Reset the compute GPU to a clean state BEFORE each run (works even on a wedged GPU):
+echo 1 > /sys/bus/pci/devices/0000:02:00.0/reset
+sleep 1
+sudo ./test_accel_gcn 2>&1 | tee our_mmiotrace.txt
+```
+
+ITERATION RULES:
+- ALWAYS reset (or reboot) BEFORE a run. **NEVER run the driver twice without a reset in between** —
+  a wedged GPU + re-init hard-hangs the box (confirmed: a 2nd back-to-back run hung it, needed a cold
+  reboot, left a 0-byte trace).
+- The reset is the recommended unblock but is **UNVALIDATED** so far (this milestone run was a cold
+  boot, not a reset). First use: run JUST the reset on a clean GPU, then confirm the box stays
+  responsive and `lspci -s 02:00.0` still enumerates, before trusting it in the loop. If the SBR itself
+  perturbs the RD990 fabric, fall back to reboot-between-runs or build a software teardown
+  (halt CP + GRBM soft-reset of the compute blocks on driver exit).
+
+## NEW BLOCKER: compute results wrong (0/64) — DATA buffer coherency, not ring/dispatch
+```
+Pre-dispatch: src[0]=0xD1EB4007 src[1]=0xFF000001     <- SRC is GARBAGE (test expects 0,1,2,..)
+post:         dst[0]=0xD1EB4007 (== src[0], unchanged)  dst[2]=58  dst[3]=59
+Results: 0/64 correct
+```
+The src buffer holds garbage, not the test's input pattern — the host's writes to the VRAM data buffer
+aren't landing (gpu-crash.md Known Issue #2: cold-boot VRAM first-write reads back 0 / WC+HDP
+coherency). The compute data buffer (src/dst) is still in VRAM (`gpu_data_base = 0xF40607E000`).
+
+### Fix (next task)
+Move the compute DATA buffer (src/dst region) into GART — same pattern as the CP rings: mmap+mlock a
+buffer, map it with GART PTEs, and build the V# (`vdesc_dw0..3` in `AccelGCN_Dispatch`) from its GART
+VA instead of `PM4_VramToGPU(AccelGCNCfg.data_vram)`. Then the host writes src to coherent system RAM
+and the shader's BUFFER_LOAD/STORE (via `s[0:3]`) hit GART, bypassing the VRAM cold-coherency bug.
+Verify: `Pre-dispatch: src[0]` reads back what the test wrote (e.g. 0), and `dst[i] == src[i]+42`.
+(Alternative if you keep the buffer in VRAM: fix VRAM write coherency — WC flush + HDP flush + a dummy
+read-back before dispatch. GART is the lower-risk path and matches what already works for the rings.)
+
+
+---
+
+# STATUS UPDATE 4 — 2026-06-23 (data buffer in GART works; dst=0 = wavefront store/launch)
+
+## Where we are
+- Ring 1 + dispatch complete end-to-end (rc=0, fence signals, 0 timeouts) from a clean GPU. SOLVED.
+- Data buffer moved to GART (`gpu_data_base=0xF440120000`). **src now reads back correct** (host writes
+  land in coherent GART system RAM). The VRAM cold-coherency garbage is gone.
+- REMAINING: compute output wrong — `dst` reads all 0 (expected `src[i]+42` = 42,43,44,..).
+
+## What is RULED OUT (verified by reading the code, do not re-investigate)
+- **Readback location:** `AccelGCN_VramWrite`/`VramRead` (AccelGCN.ailang ~2201/2225) BOTH target
+  `AccelGCNCfg.data_host_ptr` (GART). src write, dst zero, and dst read all use the same GART buffer.
+- **Data-buffer GART mapping:** GART_Init (~step 5d) mmaps coherent system RAM, mlocks, zeroes, and
+  writes a PTE for EVERY page including page 0 (the only page the shader touches, offset 0–511), with
+  SNOOPED (cache-coherent) PTEs, same index scheme as the working rings. Page 0 IS mapped.
+- So `dst=0` is NOT a wrong-pointer, NOT a mapping fault, NOT a read-coherency issue. The shader's
+  store simply isn't landing → the wavefront either didn't launch, faulted, or stored nothing.
+  (The EOP fence fires from the CP regardless of whether the wavefront did real work, so rc=0 does
+  not prove the shader ran.)
+
+## BUG to fix (register offset wrong)
+In `Library.AMDGPUPM4Regs.ailang`: `GRBM_STATUS2` is defined as `0x8014` (32788). Per radeon
+`sid.h`, `GRBM_STATUS2 = 0x8008` (32776); `0x8014` is actually `GRBM_STATUS_SE0`. Fix the constant to
+`0x8008`. (All prior `GRBM_STATUS2=...` debug prints were reading the wrong register.)
+
+## TASK A — constant-store isolation kernel (DO THIS FIRST; one run bisects everything)
+Temporarily build the CIR test kernel in `TestCode/test_accel_gcn.ailang` as `dst[gid] = 42` —
+i.e. drop the `src` BUFFER_LOAD entirely: just `V_MOV_B32 v, 42` then BUFFER_STORE to dst (offset 256).
+Reset + run.
+- **dst[0]=42** → launch + store + V# + readback ALL work. The bug is isolated to the `src` LOAD path
+  (V# load addressing, or the load's offset/`num_records`). Pursue that next.
+- **dst[0]=0** → the store path or the wavefront launch is broken. Go to TASK B.
+This is the cheapest, highest-information experiment — it separates load vs store vs launch in a
+single dispatch. Restore the real `dst=src+42` kernel afterward.
+
+## TASK B — fault / wavefront-launch probe (only if TASK A gives dst=0)
+After the dispatch fence in `AccelGCN_Dispatch` (or end of `PM4_SubmitCompute`), read + print:
+- `VM_CONTEXT1_PROTECTION_FAULT_STATUS` = `0x14DC` (5340)
+- `VM_CONTEXT1_PROTECTION_FAULT_ADDR`   = `0x14FC` (5372)
+- `GRBM_STATUS2` at the CORRECTED `0x8008`, and `SQ_DEBUG_STS_GLOBAL` (already defined).
+(Offsets confirmed from `~/buildroot/output/build/linux-6.6.18/drivers/gpu/drm/radeon/sid.h`. gmc_v6
+reports VMID0 faults via the CONTEXT1 fault regs.)
+Interpretation:
+- FAULT_STATUS != 0 → the shader faulted; FAULT_ADDR is the faulting page. If it points into
+  `0xF44012xxxx`, the data-buffer access faulted despite the mapping looking right (re-check
+  DATA_BUF_PTE_IDX vs the VA the hardware computes). If elsewhere, that VA is the culprit.
+- FAULT_STATUS == 0 but no store → wavefront never launched: check `COMPUTE_STATIC_THREAD_MGMT_SE0/SE1`
+  (CU mask, should be 0xFFFFFFFF), `DISPATCH_DIRECT` dims, and that the V# reached `s[0:3]`
+  (USER_DATA_0..3 SET_SH_REG consumed before the dispatch).
+
+## Iteration / safety (unchanged)
+- Reset bus 2 BEFORE every run: `echo 1 > /sys/bus/pci/devices/0000:02:00.0/reset; sleep 1`
+  (bob ∈ video, no sudo). NEVER run twice without a reset (wedged GPU + re-init = hard hang).
+- Keep `ring_idx=1`-era safety, the display guard, the 30-dispatch erratum reset, all bus-1 RULES.
+- Backups `*.bak_*` beside every edited lib.
+
+
+---
+
+# STATUS UPDATE 5 — 2026-06-23 18:26 (TASK A result: wavefront NEVER LAUNCHES)
+
+## TASK A result — decisive
+Constant-store kernel (`dst[gid]=42`, no src load, `mc_size=48`, 3 VGPR) STILL produces `dst=0`. Probe:
+```
+[VMFAULT] STATUS=0x0 ADDR=0x0                                   <- NO VM fault
+CP_BUSY_STAT=0x800001E3  SPI_DEBUG_BUSY=0x0  SQ_DEBUG_STS_GLOBAL=0x0   <- SPI + SQ IDLE
+GRBM_STATUS2=0x100   (correct 0x8008 reg now)
+Dispatch rc=0   (EOP fence fires regardless of whether a wave ran)
+```
+**No fault + SQ/SPI idle = the compute wavefront never launched.** The CP consumes `DISPATCH_DIRECT`
+(RPTR advances, fence fires) but no wave is ever spawned on the CUs. This rules out, definitively:
+shader code, src-load path, buffers, V#, readback, mapping, and VM faults. The bug is entirely in the
+**CP→SPI→SQ→CU dispatch-launch path** on SI compute-via-gfx-ring.
+
+## TASK C — fix the dispatch launch (next work)
+Investigate why `DISPATCH_DIRECT` spawns no wave. Probes + suspects, in priority order:
+
+1. **`COMPUTE_DISPATCH_INITIATOR` (reg 0xB800), bit 0 = `COMPUTE_SHADER_EN`.**
+   The `DISPATCH_DIRECT` PM4 packet (PACKET3_DISPATCH_DIRECT = 0x15) body is `dim_x, dim_y, dim_z,
+   dispatch_initiator`. The 4th dword (initiator) MUST have bit 0 set, or the dispatch is a silent
+   no-op. In `PM4_SubmitCompute` (Library.AMDGPUPM4Dispatch.ailang), find the `DISPATCH_DIRECT` emit
+   and PRINT the 4 dwords. If the initiator's bit 0 is 0 (or it's writing dims `1,1,1` but initiator
+   `0`), that is the bug — set `COMPUTE_SHADER_EN`. THIS IS THE #1 SUSPECT.
+
+2. **`COMPUTE_STATIC_THREAD_MGMT_SE0/SE1` (SICompute consts) must = 0xFFFFFFFF and stick.**
+   Read them back via MMIO right before the dispatch and print. If 0, no CUs are enabled → no waves.
+   Confirm they're written with SET_SH_REG + SHADER_TYPE_COMPUTE and not clobbered by a later
+   CLEAR_STATE.
+
+3. **Dims actually nonzero at the hardware.** Print `COMPUTE_NUM_THREAD_X/Y/Z` and the DISPATCH_DIRECT
+   `dim_x/y/z` — confirm grid 1x1x1 / tg 64x1x1 reach the registers (not 0).
+
+4. **SI compute-pipe routing.** On SI a compute `DISPATCH_DIRECT` on the GFX ring still needs the
+   compute pipeline enabled. Compare the full dispatch register write sequence against a known-good SI
+   compute launch (mesa/clover, or radeon's `si_compute`/`evergreen_cs` path) — `GRBM_STATUS2=0x100`
+   + `CP_BUSY_STAT=0x800001E3` with SQ idle means the CP believes it dispatched but SPI never spawned.
+
+### Recommended single probe to add first
+In `PM4_SubmitCompute`, right where `DISPATCH_DIRECT` is emitted, log: the 4 packet dwords
+(dim_x/y/z + initiator), and a read-back of `COMPUTE_STATIC_THREAD_MGMT_SE0/SE1`,
+`COMPUTE_DISPATCH_INITIATOR` (0xB800), `COMPUTE_PGM_RSRC2`. One reset+run then shows whether
+`COMPUTE_SHADER_EN` is set and CUs are enabled — that alone likely pinpoints it.
+
+## Register note
+`COMPUTE_DISPATCH_INITIATOR = 0xB800` (already in AILang as `SICompute.DISPATCH_INITIATOR` / `0xB800`).
+`COMPUTE_SHADER_EN` = bit 0. radeon `sid.h` doesn't name the COMPUTE_* block (it's in the AILang
+SICompute pool already); offsets there are correct (PGM_LO/RSRC/THREAD_MGMT all used in
+PM4_SubmitCompute).
+
+## Iteration / safety (unchanged)
+Reset bus 2 before EVERY run (`echo 1 > /sys/bus/pci/devices/0000:02:00.0/reset; sleep 1`, bob ∈ video,
+no sudo). Never run twice without a reset. Keep display guard, erratum reset, bus-1 RULES, backups.
+
+
+---
+
+# STATUS UPDATE 6 — 2026-06-23 18:56 (IB now in GART; suspect = corrupt DISPATCH_DIRECT dwords)
+
+## Changes since UPDATE 5
+- IB (indirect buffer) moved to GART: `[GART] IB: host=... GART_VA=0xF4400E0000`. So IB + data buffer +
+  CP rings are all GART-backed now.
+- `COMPUTE_DISPATCH_INITIATOR` low bit (`COMPUTE_SHADER_EN`, bit 0) IS set — so a missing SHADER_EN is
+  NOT the blocker.
+- Still `dst=0`, `VMFAULT STATUS=0`, SQ/SPI idle → wavefront still never launches.
+
+## NEW PRIME SUSPECT: DISPATCH_DIRECT packet dwords are corrupt (garbage upper 32 bits)
+The `[IB-GART]` dump shows:
+```
+disp_hdr=0x1C0031502   grid=4294967297,4294967297,4294967297   initiator=0xC000460000000001
+```
+- `grid_x/y/z = 0x1_00000001` (should be `0x1`)
+- `initiator = 0xC0004600_00000001` (low 32 = `0x1` = SHADER_EN ok, but upper 32 = garbage)
+- `disp_hdr = 0x1_C0031502` (should be the 32-bit PM4 header `0xC0031502`)
+
+Every dword has junk in bits [63:32]. If the IB/packet emit writes these as **64-bit (8 bytes)** instead
+of clean **32-bit dwords**, the DISPATCH_DIRECT packet in the IB is misaligned/corrupt — the CP reads
+garbage and silently launches no wavefront. This matches the symptom exactly (no fault, SQ idle, dst=0).
+
+## TASK D — verify + fix the IB packet emit (next work)
+1. **Dump the RAW IB bytes** where the DISPATCH_DIRECT packet lives (read the GART IB host pointer at the
+   packet offset, print 4-byte dwords). Confirm each dword is a clean 32-bit value:
+   `hdr=0xC0031502`, `dim_x=1`, `dim_y=1`, `dim_z=1`, `initiator=0x00000001`.
+2. If the bytes are 8-wide / shifted / carry the upper garbage → the IB-build path is emitting 64-bit.
+   Fix it to write 32-bit dwords (mask `& 0xFFFFFFFF`, write 4 bytes LE — same as `CIRGcn_McEmit32`
+   does for shader code, or `PM4_EmitDWord` for ring packets). Check the function that fills the IB
+   (the `INDIRECT_BUFFER` target) specifically — the ring-side PM4_EmitDWord may already be 32-bit while
+   the IB builder is not.
+3. Re-run (reset first). A correctly-emitted DISPATCH_DIRECT should finally spawn a wave:
+   `SQ_DEBUG_STS_GLOBAL` / `SPI_DEBUG_BUSY` go non-zero during dispatch, and `dst[0]` becomes 42
+   (constant kernel) — then restore the `dst=src+42` kernel and expect 42,43,44,...
+
+Also still confirm `COMPUTE_STATIC_THREAD_MGMT_SE0/SE1` read back `0xFFFFFFFF` (CU enable) — secondary
+suspect if the packet bytes turn out clean.
+
+## Iteration / safety (unchanged)
+Reset bus 2 before EVERY run (`echo 1 > /sys/bus/pci/devices/0000:02:00.0/reset; sleep 1`, bob ∈ video,
+no sudo). Never run twice without a reset. Keep display guard, erratum reset, bus-1 RULES, backups.
+
+
+---
+
+# STATUS UPDATE 7 — 2026-06-23 (TASK D resolved as false alarm; ROOT CAUSE FOUND: SET_SH_REG dies on ring 1)
+
+**Audience for this update:** Opus 4.8 (or whatever agent evaluates next). Read the full log
+`our_mmiotrace.txt` and this doc before making changes. The human will give you next steps after
+you evaluate.
+
+## What happened this session (Opus 4.6)
+
+### Fix 1: IB "corruption" was a debug readback bug (TASK D CLOSED)
+The `[IB-GART]` debug dump in `PM4_SubmitCompute` used bare `Dereference()` (64-bit reads) on
+32-bit GART host memory. This merged adjacent dwords:
+- `grid_x = 0x1_00000001` was actually dword[1]=1 merged with dword[2]=1 (grid_y)
+- `initiator = 0xC0004600_00000001` was dword[4]=1 merged with dword[5]=flush_hdr
+
+**The IB was never corrupt.** Fixed all `Dereference()` calls on host/GART pointers to use
+`Dereference(..., "dword")` — 7 instances in `test_accel_gcn.ailang` + 7 in
+`PM4Dispatch.ailang`. Clean readback now confirms:
+```
+[IB-GART] disp_hdr=0xC0031502 grid=1,1,1 initiator=0x1 flush_hdr=0xC0004600 flush_body=0x407
+```
+All correct. TASK D from UPDATE 6 is resolved — the IB emit path (`StoreValue(..., "dword")`)
+was always writing clean 32-bit values.
+
+### Fix 2: Added compute register MMIO probe (TASK C investigation)
+Added a probe in `PM4_SubmitCompute` that commits the SET_SH_REG packets, waits for CP to
+consume them, then reads back all compute registers via MMIO before emitting the IB. This is
+the decisive finding:
+
+### ROOT CAUSE: CP ring 1 does NOT process SET_SH_REG with SHADER_TYPE_COMPUTE
+
+Probe output:
+```
+MMIO_WR 35596 0xC190 0x4B                              <- CP_RB1_WPTR commit (wptr=75)
+[PROBE] SET_SH_REG consumed (idle=0) — MMIO readback:  <- WaitIdle TIMED OUT (idle=0)
+[PROBE] PGM_LO=0x0 PGM_HI=0x0 RSRC1=0x0 RSRC2=0x0
+[PROBE] THREAD_MGMT_SE0=0x0 SE1=0x0 RESOURCE_LIMITS=0x0
+[PROBE] NUM_THREAD_X=0 Y=0 Z=0 VMID=0
+[PROBE] TMPRING=0x0 DISPATCH_INITIATOR=0x0 START_X=0
+```
+
+Ring 1 stall details:
+```
+[PM4] WaitIdle timeout: ring=1 RPTR=64 WPTR=75
+[PM4:DBG] CP_RB1: CNTL=0x90A BASE=0xF4400700 RPTR=64 WPTR=75
+```
+
+**Every compute register is zero.** The CP consumed 64 of 75 dwords on ring 1 and then
+**stalled** on one of the SET_SH_REG packets. It never reached the IB/dispatch. This is why:
+- Previous runs showed `Dispatch rc=0` — that was because the probe's mid-dispatch
+  commit+wait exposed the stall that was previously masked by the full-batch commit.
+  Without the probe, the CP would eventually time out on WaitFenceVRAM, but the fence
+  on some runs DID fire (the CP consumed past the stall point on full-batch runs where
+  the ring wrapped or the IB path didn't block).
+- All previous `dst=0` results: the wavefront never launched because the compute state was
+  never programmed — all registers stayed at zero.
+
+**The SET_SH_REG packets with `SHADER_TYPE_COMPUTE` (bit 1 of PM4 header) are not supported on
+SI ring 1 (MEC).** On Southern Islands, rings 1/2 are handled by the MEC (Micro Engine Compute),
+which has a LIMITED packet set compared to the ME (ring 0). The Linux kernel `radeon` driver
+(si.c / `si_ring_test_compute()`) only does compute dispatch on ring 0 (the GFX ring) via
+`radeon_ring_write()` to ring 0. Mesa/Clover also emit compute on the GFX ring on SI.
+
+GCN1 (SI) does NOT have a true async compute engine — that was added in CIK (GCN2, Sea Islands)
+with the MEC getting full SET_SH_REG support. On SI, the "compute rings" (1/2) are primarily
+for CP internal scheduling, not for user compute dispatch with full register programming.
+
+## What the log will show Opus 4.8
+
+Key lines in `our_mmiotrace.txt` to grep:
+```bash
+grep -E "PROBE|WaitIdle timeout|CP_RB1" our_mmiotrace.txt
+```
+The stall at RPTR=64/WPTR=75 is definitive. The SET_SH_REG packets that went through (dwords
+32-64) are likely the ones WITHOUT `SHADER_TYPE_COMPUTE` (the SURFACE_SYNC, SET_CONFIG_REG
+packets); the ones WITH compute shader_type stall the ring.
+
+## Possible next steps (for Opus 4.8 to evaluate)
+
+1. **Move compute dispatch to ring 0.** This is what the kernel does on SI. Ring 0 (GFX/ME)
+   supports the full packet set including SET_SH_REG with SHADER_TYPE_COMPUTE. The GART ring
+   relocation already works for ring 0. The concern from the original handoff was that ring 0
+   fabric-hanged on dispatch — but that was BEFORE the GART fix. With rings in GART + correct
+   CNTL values, ring 0 may now work. **Test carefully: the old ring-0 fabric hang may have been
+   the VRAM ring bug all along.** Set `ring_idx=0` and test (reset bus 2 first). If it works,
+   the project is done.
+
+2. **Emit compute state on ring 0, dispatch on ring 1.** Program all SET_SH_REGs on ring 0
+   (which processes them), then emit DISPATCH_DIRECT on ring 1. This is architecturally weird
+   and probably won't work (the dispatch needs the registers to be in its ring's context).
+
+3. **Use INDIRECT_BUFFER from ring 0 for everything.** Put the full compute sequence (SET_SH_REGs
+   + DISPATCH_DIRECT + fence) on ring 0, either inline or via IB. This is the simplest approach
+   and matches what the kernel does.
+
+**Recommendation: try option 1 first** — change `ring_idx` to 0, reset, run. The original
+fabric hang reason was almost certainly the VRAM-backed ring, which is now fixed. If ring 0
+dispatches work with GART rings, the wavefront will launch and `dst[0]` should become 42.
+
+## WARNING about ring_idx=0
+The handoff doc rule says "Test ONLY with ring_idx=1" because ring 0 previously caused fabric
+hangs. That rule was written BEFORE the GART relocation. The fabric hang was caused by VRAM-backed
+rings, which is now fixed. The human (Bob) should make the call on whether to try ring 0 —
+**ALWAYS reset bus 2 first**, and be prepared for a possible cold reboot if the RD990 fabric
+still doesn't like it. The PCI secondary bus reset
+(`echo 1 > /sys/bus/pci/devices/0000:02:00.0/reset`) should recover even from a wedged GPU
+without touching the display.
+
+## IMPORTANT: do NOT tell the human to unbind the radeon driver
+Unbinding radeon on Pop!_OS resets the display system and crashes the desktop. The PCI secondary
+bus reset on bus 2 (`echo 1 > /sys/bus/pci/devices/0000:02:00.0/reset`) is safe — bus 2 is
+behind bridge `00:03.0`, separate from the display GPU on bridge `00:02.0`. Use that instead.
+
+## Files changed this session
+- `Librarys/Drivers/AMDGPU/Library.AMDGPUPM4Dispatch.ailang` — fixed IB debug readback to use
+  `Dereference(..., "dword")`, added compute register MMIO probe after SET_SH_REG commit
+- `TestCode/test_accel_gcn.ailang` — fixed 7 bare `Dereference()` calls on GART host pointers
+  to use `"dword"` size hint
+
+## Iteration / safety (unchanged)
+Reset bus 2 before EVERY run. Never run twice without a reset. Keep display guard, erratum reset,
+bus-1 RULES, backups.
+
+
+---
+
+# STATUS UPDATE 8 — 2026-06-23 (NEXT TASK: move shader to GART, drop VRAM entirely, then test ring 0)
+
+## Why
+UPDATE 7 found ring 1 (MEC) can't process compute `SET_SH_REG` on SI → compute must go on ring 0.
+Attempting ring 0 stalled in `GPU_BAR_PrimeVRAM` (65536 BAR0 MMIO reads, a VRAM write-coherency
+workaround) — NOT in the dispatch. The shader is the last thing still in VRAM. Move it to GART and the
+compute path touches NO VRAM at all → the BAR0 prime and the whole cold-VRAM-coherency problem vanish,
+and we can finally test ring 0 cleanly.
+
+## TASK E — move the shader into GART (mirror the data-buffer move you already did)
+The shader currently: `AccelGCN_Upload` copies machine code to VRAM (`vram_ptr + shader_vram`), and
+`PM4_SubmitCompute` sets `COMPUTE_PGM_LO/HI = pgm_addr >> 8` where
+`pgm_addr = PM4_VramToGPU(pgm_vram)`. Convert to GART exactly like the data buffer:
+
+1. **GARTConf** — add `SHADER_GPU_VA_HI=244 (0xF4)`, `SHADER_GPU_VA_LO` (pick the next free GART VA
+   above the data buffer; e.g. `0x40100000` if free — check the existing IH/DMA/CPRB/DATA VAs so it
+   doesn't overlap), and `SHADER_PTE_IDX = SHADER_GPU_VA_LO / 4096`. 64KB (16 pages) is plenty.
+2. **GARTState** — add `shader_host_ptr`, `shader_phys`, `shader_gart_va`.
+3. **GART_Init** — mmap+mlock 64KB, `MemorySet(0)`, loop 16 pages writing PTEs
+   (`GART_GetPhysAddr` per page → `GART_WritePTE(gpu, SHADER_PTE_IDX + pg, phys)`). Store in GARTState.
+   (Copy the data-buffer block verbatim, smaller size.)
+4. **AccelGCNCfg** — add `shader_host_ptr`, `shader_gart_va`; populate from GARTState in `AccelGCN_Init`.
+5. **AccelGCN_Upload** — copy the machine code bytes to `AccelGCNCfg.shader_host_ptr` (system RAM),
+   `sfence` (`InlineAsm["0f ae f8"]`), and RETURN the GART VA (so the caller's `pgm_addr` becomes the
+   GART VA). Drop the VRAM copy + the HDP flush (not needed for GART system RAM).
+6. **pgm_addr source** — in `AccelGCN_Dispatch`, set `pgm_addr = AccelGCNCfg.shader_gart_va` instead of
+   `PM4_VramToGPU(pgm_vram)`. `PM4_SubmitCompute` then computes `PGM_LO/HI = pgm_addr >> 8` unchanged.
+   Verify the `[DBG-SUBMIT] pgm_addr / PGM_LO / PGM_HI` log now shows the GART VA (`0xF4401xxxxx`).
+
+## TASK F — drop VRAM from the compute path
+Once the shader is in GART, NOTHING the dispatch uses is in VRAM (rings, IB, data, shader all GART).
+- **Skip `GPU_BAR_PrimeVRAM`** (called at `AccelGCN.ailang:512`) — it's a VRAM-write-coherency
+  workaround that no longer applies and was the 65536-read stall. Comment out the call (keep the
+  function for any future VRAM use).
+
+## TASK G — test ring 0 (the actual goal)
+With all compute memory in GART and the BAR0 prime gone:
+- Set `AccelGCNCfg.ring_idx = 0` (SI does compute on the GFX/ME ring; ring 1/MEC can't program compute
+  regs — UPDATE 7).
+- `echo 1 > /sys/bus/pci/devices/0000:02:00.0/reset; sleep 1` then run.
+- EXPECT: ring 0 processes the SET_SH_REGs (compute regs read back non-zero now), the wavefront
+  launches (`SQ_DEBUG_STS_GLOBAL`/`SPI_DEBUG_BUSY` go non-zero during dispatch), and `dst[0]=42`
+  (constant kernel) → then restore `dst=src+42` and expect 42,43,44,...
+- If ring 0 stalls/hangs even with everything in GART: reset recovers it (bus 2 only, display safe).
+  That would mean ring 0 has a real issue beyond the VRAM rings — re-evaluate then.
+
+## Order of operations
+TASK E (shader→GART) → TASK F (skip BAR0 prime) → TASK G (ring_idx=0, reset, run). One build, one run.
+
+## Iteration / safety (unchanged)
+Reset bus 2 before EVERY run. Never run twice without a reset. Keep display guard, 30-dispatch erratum
+reset, bus-1 RULES, backups. Do NOT unbind radeon (crashes the desktop) — PCI bus-2 reset only.

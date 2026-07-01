@@ -1,0 +1,158 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AccelGCNKCache.ailang
+//
+// Kernel cache: avoid per-dispatch CIR rebuild + GCN lowering.
+// Split from Library.AccelGCN.ailang for maintainability.
+//
+// USAGE
+//   LibraryImport.Accel.AccelGCNKCache
+
+LibraryImport.Accel.AccelGCNInit
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+
+// =============================================================================
+// KCache_Init — allocate cache metadata + per-slot mc buffers
+// Called once from AccelGCN_Init.
+// =============================================================================
+Function.KCache_Init {
+    Output: Integer
+    Body: {
+        // Allocate metadata array: 3 slots * 80 bytes = 240 bytes
+        meta_sz = Multiply(KCache.NUM_SLOTS, KCache.SLOT_SIZE)
+        meta = Allocate(meta_sz)
+        MemorySet(meta, 0, meta_sz)
+        KCacheState.meta_buf = meta
+
+        // Allocate per-slot mc buffers (64KB each — generous for any kernel)
+        s = 0
+        WhileLoop LessThan(s, KCache.NUM_SLOTS) {
+            mc = Allocate(65536)
+            slot_ptr = Add(meta, Multiply(s, KCache.SLOT_SIZE))
+            StoreValue(Add(slot_ptr, KCache.OFF_MC_PTR), mc)
+            StoreValue(Add(slot_ptr, KCache.OFF_VALID), 0)
+            s = Add(s, 1)
+        }
+
+        KCacheState.initialized = 1
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// KCache_Lookup — check if a kernel for (op, rows, cols) is cached
+// Returns slot index (0-2) on hit, -1 on miss.
+// =============================================================================
+Function.KCache_Lookup {
+    Input: kc_op: Integer
+    Input: kc_rows: Integer
+    Input: kc_cols: Integer
+    Output: Integer
+    Body: {
+        meta = KCacheState.meta_buf
+        s = 0
+        WhileLoop LessThan(s, KCache.NUM_SLOTS) {
+            slot_ptr = Add(meta, Multiply(s, KCache.SLOT_SIZE))
+            valid = Dereference(Add(slot_ptr, KCache.OFF_VALID))
+            IfCondition EqualTo(valid, 1) ThenBlock: {
+                s_op   = Dereference(Add(slot_ptr, KCache.OFF_OP))
+                s_rows = Dereference(Add(slot_ptr, KCache.OFF_ROWS))
+                s_cols = Dereference(Add(slot_ptr, KCache.OFF_COLS))
+                IfCondition EqualTo(s_op, kc_op) ThenBlock: {
+                    IfCondition EqualTo(s_rows, kc_rows) ThenBlock: {
+                        IfCondition EqualTo(s_cols, kc_cols) ThenBlock: {
+                            ReturnValue(s)
+                        }
+                    }
+                }
+            }
+            s = Add(s, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// KCache_Store — save current CIR/GCN state to cache slot (op-1) index
+// Called after CIR_Lower_GCN produces machine code for the first time.
+// =============================================================================
+Function.KCache_Store {
+    Input: ks_op: Integer
+    Input: ks_rows: Integer
+    Input: ks_cols: Integer
+    Output: Integer
+    Body: {
+        // Use op-1 as slot index (op 1,2,3 → slot 0,1,2)
+        slot_idx = Subtract(ks_op, 1)
+        IfCondition GreaterEqual(slot_idx, KCache.NUM_SLOTS) ThenBlock: { ReturnValue(-1) }
+        IfCondition LessThan(slot_idx, 0) ThenBlock: { ReturnValue(-1) }
+
+        meta = KCacheState.meta_buf
+        slot_ptr = Add(meta, Multiply(slot_idx, KCache.SLOT_SIZE))
+
+        // Check size BEFORE writing metadata — if mc exceeds the 64KB slot
+        // buffer we must NOT mark the slot valid, otherwise a future lookup
+        // would hit, restore the stale mc_size, and MemoryCopy past the
+        // 64KB allocation (heap overflow + garbage shader).
+        mc_sz = CIRProg.mc_size
+        IfCondition GreaterThan(mc_sz, 65536) ThenBlock: {
+            // Invalidate the slot so no stale hit can occur
+            StoreValue(Add(slot_ptr, KCache.OFF_VALID), 0)
+            ReturnValue(-2)
+        }
+
+        // Store metadata
+        StoreValue(Add(slot_ptr, KCache.OFF_VALID), 1)
+        StoreValue(Add(slot_ptr, KCache.OFF_OP), ks_op)
+        StoreValue(Add(slot_ptr, KCache.OFF_ROWS), ks_rows)
+        StoreValue(Add(slot_ptr, KCache.OFF_COLS), ks_cols)
+        StoreValue(Add(slot_ptr, KCache.OFF_MC_SIZE), CIRProg.mc_size)
+        StoreValue(Add(slot_ptr, KCache.OFF_VGPRS), CIRGcn.num_vgprs)
+        StoreValue(Add(slot_ptr, KCache.OFF_SGPRS), CIRGcn.num_sgprs)
+        StoreValue(Add(slot_ptr, KCache.OFF_GRP_SZ), CIRProg.group_size_x)
+        StoreValue(Add(slot_ptr, KCache.OFF_GRID_X), CIRProg.grid_x)
+
+        // Copy machine code bytes to cache
+        mc_ptr = Dereference(Add(slot_ptr, KCache.OFF_MC_PTR))
+        MemoryCopy(mc_ptr, CIRProg.mc_buf, mc_sz)
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// KCache_Restore — restore cached kernel to CIRProg/CIRGcn state
+// After this, AccelGCN_Dispatch can proceed as if CIR_Lower_GCN just ran.
+// Also rebuilds the CIR buffer descriptors for the given op layout.
+// =============================================================================
+Function.KCache_Restore {
+    Input: kr_slot: Integer
+    Output: Integer
+    Body: {
+        meta = KCacheState.meta_buf
+        slot_ptr = Add(meta, Multiply(kr_slot, KCache.SLOT_SIZE))
+
+        // Restore CIRProg fields
+        CIRProg.mc_size      = Dereference(Add(slot_ptr, KCache.OFF_MC_SIZE))
+        CIRProg.group_size_x = Dereference(Add(slot_ptr, KCache.OFF_GRP_SZ))
+        CIRProg.group_size_y = 1
+        CIRProg.group_size_z = 1
+        CIRProg.grid_x       = Dereference(Add(slot_ptr, KCache.OFF_GRID_X))
+        CIRProg.grid_y       = 1
+        CIRProg.grid_z        = 1
+        CIRProg.lowered      = 1
+
+        // Restore CIRGcn fields
+        CIRGcn.num_vgprs = Dereference(Add(slot_ptr, KCache.OFF_VGPRS))
+        CIRGcn.num_sgprs = Dereference(Add(slot_ptr, KCache.OFF_SGPRS))
+
+        // Copy cached machine code bytes back to CIRProg.mc_buf
+        mc_ptr = Dereference(Add(slot_ptr, KCache.OFF_MC_PTR))
+        mc_sz  = CIRProg.mc_size
+        MemoryCopy(CIRProg.mc_buf, mc_ptr, mc_sz)
+
+        ReturnValue(0)
+    }
+}

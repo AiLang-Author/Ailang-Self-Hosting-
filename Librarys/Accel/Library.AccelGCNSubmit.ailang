@@ -1,0 +1,1054 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AccelGCNSubmit.ailang
+//
+// HAL-compatible submit interface + VRAM read/write utilities.
+// Split from Library.AccelGCN.ailang for maintainability.
+//
+// USAGE
+//   LibraryImport.Accel.AccelGCNSubmit
+
+LibraryImport.Accel.AccelGCNInit
+LibraryImport.Accel.AccelGCNDispatch
+LibraryImport.Accel.AccelGCNKCache
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUGART
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+
+// =============================================================================
+// AccelGCN_Submit — HAL-compatible submit interface
+// Reads HALOp fields and translates to CIR+GCN dispatch.
+// This bridges the existing Mat.ailang hot path to GPU compute.
+// =============================================================================
+Function.AccelGCN_Submit {
+    Output: Integer
+    Body: {
+        gcn_op   = HALOp.op
+        gcn_dst  = HALOp.dst
+        gcn_mat  = HALOp.mat
+        gcn_vec  = HALOp.vec
+        gcn_rows = HALOp.rows
+        gcn_cols = HALOp.cols
+
+        // MatVecMul: dst[i] = sum_j(mat[i,j] * vec[j])
+        // This is the core inference operation.
+        IfCondition EqualTo(gcn_op, 1) ThenBlock: {
+            // Step 1: Compute sizes and VRAM offsets
+            // 8 bytes per element (TFElem.Size = 8, 64-bit AILang integers)
+            mat_bytes = Multiply(Multiply(gcn_rows, gcn_cols), 8)
+            vec_bytes = Multiply(gcn_cols, 8)
+            dst_bytes = Multiply(gcn_rows, 8)
+            mat_vram = 0
+            vec_vram = mat_bytes
+            dst_vram = Add(mat_bytes, vec_bytes)
+
+            // Padded dst for safe GPU writes (excess threads in last WG)
+            wg_count = Divide(Add(gcn_rows, 63), 64)
+            dst_bytes_padded = Multiply(Multiply(wg_count, 64), 8)
+
+            // Check total data fits in VRAM data region
+            // BAR=256MB (268435456) - DATA_OFFSET (101179392) = 167256064 bytes
+            total_data_size = Add(Add(mat_bytes, vec_bytes), dst_bytes_padded)
+            IfCondition GreaterThan(total_data_size, 167256064) ThenBlock: {
+                // Too large for single dispatch — tile across multiple dispatches.
+                // Each tile processes a chunk of rows. Pick tile_rows so that
+                // tile_mat + vec + tile_dst < 150 MB (safe margin).
+                // tile_mat = tile_rows * cols * 8
+                // Solve: tile_rows * cols * 8 + cols * 8 + tile_rows * 8 < 150_000_000
+                //   ≈ tile_rows * cols * 8 < 150_000_000
+                //   tile_rows < 150_000_000 / (cols * 8)
+                tile_rows = Divide(150000000, Multiply(gcn_cols, 8))
+                // Align to workgroup size (64)
+                tile_rows = Multiply(Divide(tile_rows, 64), 64)
+                IfCondition LessThan(tile_rows, 64) ThenBlock: { tile_rows = 64 }
+
+                tile_start = 0
+                WhileLoop LessThan(tile_start, gcn_rows) {
+                    tile_end = Add(tile_start, tile_rows)
+                    IfCondition GreaterThan(tile_end, gcn_rows) ThenBlock: {
+                        tile_end = gcn_rows
+                    }
+                    tile_n = Subtract(tile_end, tile_start)
+
+                    // Recompute sizes for this tile
+                    tile_mat_bytes = Multiply(Multiply(tile_n, gcn_cols), 8)
+                    tile_dst_bytes = Multiply(tile_n, 8)
+                    tile_wg = Divide(Add(tile_n, 63), 64)
+                    tile_dst_pad = Multiply(Multiply(tile_wg, 64), 8)
+
+                    tile_mat_vram = 0
+                    tile_vec_vram = tile_mat_bytes
+                    tile_dst_vram = Add(tile_mat_bytes, vec_bytes)
+
+                    // Upload tile matrix (rows [tile_start..tile_end) of original mat)
+                    tile_mat_src = Add(gcn_mat, Multiply(Multiply(tile_start, gcn_cols), 8))
+                    discard = AccelGCN_VramWrite(tile_mat_vram, tile_mat_src, tile_mat_bytes)
+                    discard = AccelGCN_VramWrite(tile_vec_vram, gcn_vec, vec_bytes)
+                    tmp_zero = Allocate(tile_dst_pad)
+                    MemorySet(tmp_zero, 0, tile_dst_pad)
+                    discard = AccelGCN_VramWrite(tile_dst_vram, tmp_zero, tile_dst_pad)
+                    Deallocate(tmp_zero, tile_dst_pad)
+
+                    // Build kernel for tile dimensions (uses cache)
+                    cache_slot = KCache_Lookup(1, tile_n, gcn_cols)
+                    IfCondition GreaterEqual(cache_slot, 0) ThenBlock: {
+                        discard_kr = KCache_Restore(cache_slot)
+                        rc = CIR_BindBuffer(0, tile_mat_vram, tile_mat_bytes, 4, 1)
+                        rc = CIR_BindBuffer(1, tile_vec_vram, vec_bytes, 4, 1)
+                        rc = CIR_BindBuffer(2, tile_dst_vram, tile_dst_pad, 4, 2)
+                        CIRProg.num_bufs = 3
+                    }
+                    IfCondition LessThan(cache_slot, 0) ThenBlock: {
+                        // Emit kernel — reuse the same looped GCN kernel builder
+                        // by recursing through HALOp with tile dimensions
+                        rc = CIR_Begin()
+                        rc = CIR_SetGroupSize(64, 1, 1)
+                        rc = CIR_SetGrid(tile_wg, 1, 1)
+                        rc = CIR_BindBuffer(0, tile_mat_vram, tile_mat_bytes, 4, 1)
+                        rc = CIR_BindBuffer(1, tile_vec_vram, vec_bytes, 4, 1)
+                        rc = CIR_BindBuffer(2, tile_dst_vram, tile_dst_pad, 4, 2)
+
+                        // Emit the same looped GCN kernel (copy of the cache-miss path)
+                        CIRGcn.mc_pos = 0
+                        GCNEnc_Emit_SOP2(38, 8, 4, 255)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(64)
+                        GCNEnc_Emit_VOP2(37, 1, 8, 0)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP1(1, 2, 128)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP1(1, 3, 128)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP1(1, 16, 255)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(gcn_cols)
+                        GCNEnc_Emit_VOP3(361, 4, 257, 272, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_SOP1(3, 9, 128)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_SOP1(3, 10, 255)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(gcn_cols)
+                        loop_start = CIRGcn.mc_pos
+                        GCNEnc_Emit_VOP1(1, 16, 9)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 5, 260, 16)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 6, 129, 5)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 7, 129, 6)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 14, 129, 16)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 15, 129, 14)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 6)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_MUBUF(12, 8, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 7)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_MUBUF(12, 9, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 14)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(tile_vec_vram)
+                        GCNEnc_Emit_MUBUF(12, 10, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 15)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(tile_vec_vram)
+                        GCNEnc_Emit_MUBUF(12, 11, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_S_WAITCNT(0, 0, 0)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP3(361, 12, 264, 266, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP3(362, 13, 264, 266, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP3(361, 14, 264, 267, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(37, 13, 269, 14)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP3(361, 15, 265, 266, 0, 0)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(37, 13, 269, 15)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 2, 258, 12)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(40, 3, 259, 13)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_SOP2(0, 9, 9, 129)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_SOPC(10, 9, 10)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        loop_off = Divide(Subtract(loop_start, Add(CIRGcn.mc_pos, 4)), 4)
+                        GCNEnc_Emit_SOPP(5, loop_off)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 6, 129, 1)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 7, 129, 6)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 6)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(tile_dst_vram)
+                        GCNEnc_Emit_MUBUF(28, 2, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_VOP2(26, 17, 130, 7)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        discard = CIRGcn_McEmit32(tile_dst_vram)
+                        GCNEnc_Emit_MUBUF(28, 3, 17, 0, 128, 20480)
+                        discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                        GCNEnc_Emit_S_WAITCNT(0, 0, 0)
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        GCNEnc_Emit_S_ENDPGM()
+                        discard = CIRGcn_McEmit32(GCNEncState.word0)
+                        CIRProg.mc_size = CIRGcn.mc_pos
+                        CIRProg.lowered = 1
+                        CIRGcn.num_vgprs = 18
+                        CIRGcn.num_sgprs = 11
+                        discard_ks = KCache_Store(1, tile_n, gcn_cols)
+                    }
+
+                    // Dispatch tile
+                    rc = AccelGCN_Dispatch()
+                    IfCondition LessThan(rc, 0) ThenBlock: {
+                        HALOp.status = -1
+                        ReturnValue(-1)
+                    }
+
+                    // Read back tile results into correct offset of dst
+                    tile_dst_host = Add(gcn_dst, Multiply(tile_start, 8))
+                    discard = AccelGCN_VramRead(tile_dst_vram, tile_dst_host, tile_dst_bytes)
+
+                    tile_start = tile_end
+                }
+
+                HALOp.status = 1
+                ReturnValue(0)
+            }
+
+            // Step 2: Upload mat and vec to VRAM, zero dst area (single dispatch path)
+            discard = AccelGCN_VramWrite(mat_vram, gcn_mat, mat_bytes)
+            discard = AccelGCN_VramWrite(vec_vram, gcn_vec, vec_bytes)
+            // Zero dst area in VRAM (so upper 4 bytes of each 8-byte slot stay 0)
+            tmp_zero = Allocate(dst_bytes_padded)
+            MemorySet(tmp_zero, 0, dst_bytes_padded)
+            discard = AccelGCN_VramWrite(dst_vram, tmp_zero, dst_bytes_padded)
+            Deallocate(tmp_zero, dst_bytes_padded)
+
+            // Step 3: Build CIR kernel (with cache)
+            cache_slot = KCache_Lookup(1, gcn_rows, gcn_cols)
+            IfCondition GreaterEqual(cache_slot, 0) ThenBlock: {
+                // Cache hit — restore mc + metadata, rebuild buffer descriptors
+                discard_kr = KCache_Restore(cache_slot)
+                // Rebind with stride=4 (DWORD addressing for 64-bit kernels)
+                rc = CIR_BindBuffer(0, mat_vram, mat_bytes, 4, 1)
+                rc = CIR_BindBuffer(1, vec_vram, vec_bytes, 4, 1)
+                rc = CIR_BindBuffer(2, dst_vram, dst_bytes_padded, 4, 2)
+                CIRProg.num_bufs = 3
+            }
+            IfCondition LessThan(cache_slot, 0) ThenBlock: {
+                // Cache miss — emit GCN directly with scalar loop
+                // (CIR has no branch/loop ops, so we bypass CIR for the kernel
+                //  and emit GCN machine code directly. CIR is still used for
+                //  buffer descriptors and dispatch metadata.)
+                rc = CIR_Begin()
+                rc = CIR_SetGroupSize(64, 1, 1)
+                rc = CIR_SetGrid(wg_count, 1, 1)
+                rc = CIR_BindBuffer(0, mat_vram, mat_bytes, 4, 1)
+                rc = CIR_BindBuffer(1, vec_vram, vec_bytes, 4, 1)
+                rc = CIR_BindBuffer(2, dst_vram, dst_bytes_padded, 4, 2)
+
+                // Register plan (all physical):
+                //   v0  = thread_id_x (HW preload)
+                //   v1  = global_id (row)
+                //   v2  = acc_lo
+                //   v3  = acc_hi
+                //   v4  = row_base = gid * cols  (precomputed)
+                //   v5  = a_idx
+                //   v6  = a_dw (a_idx*2)
+                //   v7  = a_dw+1
+                //   v8  = a_lo
+                //   v9  = a_hi
+                //   v10 = b_lo
+                //   v11 = b_hi
+                //   v12 = prod_lo
+                //   v13 = prod_hi
+                //   v14 = temp
+                //   v15 = temp2
+                //   v16 = k_vreg (copy of s9 for vector add)
+                //   v17 = scratch (byte offset calc in MUBUF)
+                //   s0-s3 = V# (buffer descriptor, HW)
+                //   s4  = group_id_x (HW preload)
+                //   s8  = scratch SGPR
+                //   s9  = k (loop counter)
+                //   s10 = cols (loop bound)
+                CIRGcn.mc_pos = 0
+
+                // ── Prologue ──
+                // global_id = group_id_x * 64 + thread_id_x
+                // S_MUL_I32 s8, s4, 64  (SOP2 op=38)
+                GCNEnc_Emit_SOP2(38, 8, 4, 255)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(64)
+                // V_ADD_I32 v1, s8, v0  (VOP2 op=37)
+                GCNEnc_Emit_VOP2(37, 1, 8, 0)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // acc_lo=0, acc_hi=0
+                // V_MOV_B32 v2, 0  (VOP1 op=1, src=128 = inline 0)
+                GCNEnc_Emit_VOP1(1, 2, 128)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // V_MOV_B32 v3, 0
+                GCNEnc_Emit_VOP1(1, 3, 128)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // row_base = gid * cols → v4
+                // V_MOV_B32 v16, literal(cols) — need cols in vreg for MUL
+                GCNEnc_Emit_VOP1(1, 16, 255)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(gcn_cols)
+                // V_MUL_LO_U32 v4, v1, v16  (VOP3 op=361)
+                GCNEnc_Emit_VOP3(361, 4, 257, 272, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // S_MOV_B32 s9, 0  — loop counter k = 0
+                GCNEnc_Emit_SOP1(3, 9, 128)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // S_MOV_B32 s10, literal(cols)  — loop bound
+                GCNEnc_Emit_SOP1(3, 10, 255)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(gcn_cols)
+
+                // ── Record loop start position ──
+                loop_start = CIRGcn.mc_pos
+
+                // ── Loop body ──
+                // Copy k to VGPR: V_MOV_B32 v16, s9
+                GCNEnc_Emit_VOP1(1, 16, 9)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // a_idx = row_base + k → v5
+                // V_ADD_I32 v5, v4, v16
+                GCNEnc_Emit_VOP2(37, 5, 260, 16)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // a_dw = a_idx * 2 → v6: V_LSHLREV_B32 v6, 1, v5
+                GCNEnc_Emit_VOP2(26, 6, 129, 5)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // a_dw+1 → v7: V_ADD_I32 v7, v6, 1
+                GCNEnc_Emit_VOP2(37, 7, 129, 6)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // k_dw = k * 2 → reuse v14: V_LSHLREV_B32 v14, 1, v16
+                GCNEnc_Emit_VOP2(26, 14, 129, 16)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // k_dw+1 → v15: V_ADD_I32 v15, v14, 1
+                GCNEnc_Emit_VOP2(37, 15, 129, 14)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // Load mat[a_dw] → v8 (needs byte offset for MUBUF offen)
+                // v17 = v6 << 2 (DWORD to byte)
+                GCNEnc_Emit_VOP2(26, 17, 130, 6)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // BUFFER_LOAD_DWORD v8, v17, s[0:3], off offen offset=0
+                GCNEnc_Emit_MUBUF(12, 8, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // Load mat[a_dw+1] → v9
+                GCNEnc_Emit_VOP2(26, 17, 130, 7)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                GCNEnc_Emit_MUBUF(12, 9, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // Load vec[k_dw] → v10: byte offset = buf1_off + v14*4
+                // v17 = v14 << 2
+                GCNEnc_Emit_VOP2(26, 17, 130, 14)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // Add buf1 byte offset (vec_vram)
+                GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(vec_vram)
+                GCNEnc_Emit_MUBUF(12, 10, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // Load vec[k_dw+1] → v11
+                GCNEnc_Emit_VOP2(26, 17, 130, 15)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(vec_vram)
+                GCNEnc_Emit_MUBUF(12, 11, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // S_WAITCNT vmcnt(0) — wait for all loads
+                GCNEnc_Emit_S_WAITCNT(0, 0, 0)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // 64-bit multiply: prod = a * b
+                // prod_lo = MUL_LO(a_lo, b_lo)
+                GCNEnc_Emit_VOP3(361, 12, 264, 266, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                // prod_hi = MUL_HI(a_lo, b_lo)
+                GCNEnc_Emit_VOP3(362, 13, 264, 266, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                // t1 = MUL_LO(a_lo, b_hi)
+                GCNEnc_Emit_VOP3(361, 14, 264, 267, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                // prod_hi += t1
+                GCNEnc_Emit_VOP2(37, 13, 269, 14)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // t2 = MUL_LO(a_hi, b_lo)
+                GCNEnc_Emit_VOP3(361, 15, 265, 266, 0, 0)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+                // prod_hi += t2
+                GCNEnc_Emit_VOP2(37, 13, 269, 15)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // 64-bit accumulate: acc += prod
+                // V_ADD_I32 v2, v2, v12 (sets VCC carry)
+                GCNEnc_Emit_VOP2(37, 2, 258, 12)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // V_ADDC_U32 v3, v3, v13 (reads VCC carry)
+                GCNEnc_Emit_VOP2(40, 3, 259, 13)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // ── Loop control ──
+                // S_ADD_U32 s9, s9, 1  (SOP2 op=0)
+                GCNEnc_Emit_SOP2(0, 9, 9, 129)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // S_CMP_LT_U32 s9, s10  (SOPC op=10) — sets SCC=1 if s9 < s10
+                GCNEnc_Emit_SOPC(10, 9, 10)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // S_CBRANCH_SCC1 offset (SOPP op=5)
+                // offset = (loop_start - (mc_pos + 4)) / 4  (signed DWORDs from next PC)
+                loop_off = Divide(Subtract(loop_start, Add(CIRGcn.mc_pos, 4)), 4)
+                GCNEnc_Emit_SOPP(5, loop_off)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // ── Epilogue: store result ──
+                // dst_dw = gid * 2 → v6: V_LSHLREV_B32 v6, 1, v1
+                GCNEnc_Emit_VOP2(26, 6, 129, 1)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // dst_dw+1 → v7: V_ADD_I32 v7, v6, 1
+                GCNEnc_Emit_VOP2(37, 7, 129, 6)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // byte offset for store: v17 = v6 << 2 + dst_vram
+                GCNEnc_Emit_VOP2(26, 17, 130, 6)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(dst_vram)
+                // BUFFER_STORE_DWORD v2, v17, s[0:3], off offen
+                GCNEnc_Emit_MUBUF(28, 2, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // byte offset for hi: v17 = v7 << 2 + dst_vram
+                GCNEnc_Emit_VOP2(26, 17, 130, 7)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                GCNEnc_Emit_VOP2(37, 17, 255, 17)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                discard = CIRGcn_McEmit32(dst_vram)
+                GCNEnc_Emit_MUBUF(28, 3, 17, 0, 128, 20480)
+                discard = CIRGcn_McEmit64(GCNEncState.word0, GCNEncState.word1)
+
+                // S_WAITCNT vmcnt(0)
+                GCNEnc_Emit_S_WAITCNT(0, 0, 0)
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+                // S_ENDPGM
+                GCNEnc_Emit_S_ENDPGM()
+                discard = CIRGcn_McEmit32(GCNEncState.word0)
+
+                // Set CIRProg metadata for dispatch
+                CIRProg.mc_size = CIRGcn.mc_pos
+                CIRProg.lowered = 1
+                CIRGcn.num_vgprs = 18
+                CIRGcn.num_sgprs = 11
+
+                // Store to cache for next time
+                discard_ks = KCache_Store(1, gcn_rows, gcn_cols)
+            }
+
+            // Step 4: Dispatch
+            rc = AccelGCN_Dispatch()
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] MatVecMul dispatch failed rc=")
+                PrintNumber(rc)
+                PrintMessage("\n")
+                HALOp.status = -1
+                ReturnValue(-1)
+            }
+            // Step 5: Read back full 64-bit results (GPU wrote both lo and hi DWORDs)
+            discard = AccelGCN_VramRead(dst_vram, gcn_dst, dst_bytes)
+
+            // Step 6: Return success
+            HALOp.status = 1
+            ReturnValue(0)
+        }
+
+        // MatTVecMul: dst[j] = sum_i(mat[i,j] * vec[i])
+        // Transposed matrix-vector multiply. Matrix is row-major [rows x cols].
+        // Each output element dst[j] is the dot product of column j with vec.
+        IfCondition EqualTo(gcn_op, 2) ThenBlock: {
+
+            // Step 1: Compute sizes and VRAM offsets
+            // 8 bytes per element (TFElem.Size = 8, 64-bit AILang integers)
+            mat_bytes = Multiply(Multiply(gcn_rows, gcn_cols), 8)
+            vec_bytes = Multiply(gcn_rows, 8)
+            dst_bytes = Multiply(gcn_cols, 8)
+            mat_vram = 0
+            vec_vram = mat_bytes
+            dst_vram = Add(mat_bytes, vec_bytes)
+
+            // Padded dst for safe GPU writes (excess threads in last WG)
+            wg_count = Divide(Add(gcn_cols, 63), 64)
+            dst_bytes_padded = Multiply(Multiply(wg_count, 64), 8)
+
+            // Step 2: Upload mat and vec to VRAM, zero dst area
+            discard = AccelGCN_VramWrite(mat_vram, gcn_mat, mat_bytes)
+            discard = AccelGCN_VramWrite(vec_vram, gcn_vec, vec_bytes)
+            // Zero dst area in VRAM (so upper 4 bytes of each 8-byte slot stay 0)
+            tmp_zero = Allocate(dst_bytes_padded)
+            MemorySet(tmp_zero, 0, dst_bytes_padded)
+            discard = AccelGCN_VramWrite(dst_vram, tmp_zero, dst_bytes_padded)
+            Deallocate(tmp_zero, dst_bytes_padded)
+
+            // Step 3: Build CIR kernel (with cache)
+            cache_slot = KCache_Lookup(2, gcn_rows, gcn_cols)
+            IfCondition GreaterEqual(cache_slot, 0) ThenBlock: {
+                // Cache hit — restore mc + metadata, rebuild buffer descriptors
+                discard_kr = KCache_Restore(cache_slot)
+                // Rebind with stride=4 (DWORD addressing for 64-bit kernels)
+                rc = CIR_BindBuffer(0, mat_vram, mat_bytes, 4, 1)
+                rc = CIR_BindBuffer(1, vec_vram, vec_bytes, 4, 1)
+                rc = CIR_BindBuffer(2, dst_vram, dst_bytes_padded, 4, 2)
+                CIRProg.num_bufs = 3
+            }
+            IfCondition LessThan(cache_slot, 0) ThenBlock: {
+                // Cache miss — full CIR build + lower
+                // 64-bit math: DWORD-indexed buffers (stride=4)
+                rc = CIR_Begin()
+                rc = CIR_SetGroupSize(64, 1, 1)
+                rc = CIR_SetGrid(wg_count, 1, 1)
+                rc = CIR_BindBuffer(0, mat_vram, mat_bytes, 4, 1)
+                rc = CIR_BindBuffer(1, vec_vram, vec_bytes, 4, 1)
+                rc = CIR_BindBuffer(2, dst_vram, dst_bytes_padded, 4, 2)
+
+                v_gid     = CIR_AllocVReg()
+                v_acc_lo  = CIR_AllocVReg()
+                v_acc_hi  = CIR_AllocVReg()
+                v_cols    = CIR_AllocVReg()
+                v_two     = CIR_AllocVReg()
+                v_one     = CIR_AllocVReg()
+                v_i       = CIR_AllocVReg()
+                v_i2      = CIR_AllocVReg()
+                v_i2p1    = CIR_AllocVReg()
+                v_a_idx   = CIR_AllocVReg()
+                v_a_idx2  = CIR_AllocVReg()
+                v_a_idx2p1 = CIR_AllocVReg()
+                v_a_lo    = CIR_AllocVReg()
+                v_a_hi    = CIR_AllocVReg()
+                v_b_lo    = CIR_AllocVReg()
+                v_b_hi    = CIR_AllocVReg()
+                v_p_lo    = CIR_AllocVReg()
+                v_p_hi    = CIR_AllocVReg()
+                v_t1      = CIR_AllocVReg()
+                v_t2      = CIR_AllocVReg()
+                v_dst_idx2 = CIR_AllocVReg()
+                v_dst_idx2p1 = CIR_AllocVReg()
+
+                rc = CIR_Op_GlobalIdX(v_gid)
+                rc = CIR_Op_LoadConst(v_cols, gcn_cols)
+                rc = CIR_Op_LoadConst(v_two, 2)
+                rc = CIR_Op_LoadConst(v_one, 1)
+                rc = CIR_Op_LoadConst(v_acc_lo, 0)
+                rc = CIR_Op_LoadConst(v_acc_hi, 0)
+
+                i = 0
+                WhileLoop LessThan(i, gcn_rows) {
+                    // mat element index: a_idx = i * cols + gid (column gid of row i)
+                    rc = CIR_Op_LoadConst(v_i, i)
+                    rc = CIR_Op_MulLoU32(v_a_idx, v_i, v_cols)
+                    rc = CIR_Op_AddU32(v_a_idx, v_a_idx, v_gid)
+
+                    // DWORD indices for mat element
+                    rc = CIR_Op_MulLoU32(v_a_idx2, v_a_idx, v_two)
+                    rc = CIR_Op_AddU32(v_a_idx2p1, v_a_idx2, v_one)
+
+                    // DWORD indices for vec[i]
+                    rc = CIR_Op_MulLoU32(v_i2, v_i, v_two)
+                    rc = CIR_Op_AddU32(v_i2p1, v_i2, v_one)
+
+                    // Load 64-bit mat element
+                    rc = CIR_Op_LoadBuf(v_a_lo, 0, v_a_idx2)
+                    rc = CIR_Op_LoadBuf(v_a_hi, 0, v_a_idx2p1)
+                    // Load 64-bit vec element
+                    rc = CIR_Op_LoadBuf(v_b_lo, 1, v_i2)
+                    rc = CIR_Op_LoadBuf(v_b_hi, 1, v_i2p1)
+                    rc = CIR_Op_WaitCnt(0, 0, 0)
+
+                    // 64-bit multiply: prod = a * b (low 64 bits)
+                    rc = CIR_Op_MulLoU32(v_p_lo, v_a_lo, v_b_lo)
+                    rc = CIR_Op_MulHiU32(v_p_hi, v_a_lo, v_b_lo)
+                    rc = CIR_Op_MulLoU32(v_t1, v_a_lo, v_b_hi)
+                    rc = CIR_Op_AddU32(v_p_hi, v_p_hi, v_t1)
+                    rc = CIR_Op_MulLoU32(v_t2, v_a_hi, v_b_lo)
+                    rc = CIR_Op_AddU32(v_p_hi, v_p_hi, v_t2)
+
+                    // 64-bit accumulate: acc += prod
+                    rc = CIR_Op_AddU32(v_acc_lo, v_acc_lo, v_p_lo)
+                    rc = CIR_Op_AddcU32(v_acc_hi, v_acc_hi, v_p_hi)
+
+                    i = Add(i, 1)
+                }
+
+                // Store 64-bit result: dst[gid] = acc
+                rc = CIR_Op_MulLoU32(v_dst_idx2, v_gid, v_two)
+                rc = CIR_Op_AddU32(v_dst_idx2p1, v_dst_idx2, v_one)
+                rc = CIR_Op_StoreBuf(v_acc_lo, 2, v_dst_idx2)
+                rc = CIR_Op_StoreBuf(v_acc_hi, 2, v_dst_idx2p1)
+                rc = CIR_Op_WaitCnt(0, 0, 0)
+                rc = CIR_Op_EndPgm()
+
+                n_insns = CIR_End()
+                mc_bytes = CIR_Lower_GCN()
+
+                // Store to cache for next time
+                discard_ks = KCache_Store(2, gcn_rows, gcn_cols)
+            }
+
+            // Step 4: Dispatch
+            rc = AccelGCN_Dispatch()
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] MatTVecMul dispatch failed rc=")
+                PrintNumber(rc)
+                PrintMessage("\n")
+                HALOp.status = -1
+                ReturnValue(-1)
+            }
+
+            // Step 5: Read back full 64-bit results (GPU wrote both lo and hi DWORDs)
+            discard = AccelGCN_VramRead(dst_vram, gcn_dst, dst_bytes)
+
+            // Step 6: Return success
+            HALOp.status = 1
+            ReturnValue(0)
+        }
+
+        // OuterAccum: mat[i,j] += avec[i] * bvec[j]
+        // Outer product accumulation — result is ADDED to the existing matrix.
+        IfCondition EqualTo(gcn_op, 3) ThenBlock: {
+            gcn_vec2 = HALOp.vec2
+
+            // Step 1: Compute sizes and VRAM offsets
+            // 8 bytes per element (64-bit AILang integers)
+            mat_bytes  = Multiply(Multiply(gcn_rows, gcn_cols), 8)
+            avec_bytes = Multiply(gcn_rows, 8)
+            bvec_bytes = Multiply(gcn_cols, 8)
+
+            mat_vram   = 0
+            avec_vram  = mat_bytes
+            bvec_vram  = Add(mat_bytes, avec_bytes)
+            out_vram   = Add(Add(mat_bytes, avec_bytes), bvec_bytes)
+
+            // Padded output for safe GPU writes (excess threads in last WG)
+            wg_count = Divide(Add(gcn_rows, 63), 64)
+            out_bytes_padded = Multiply(Multiply(Multiply(wg_count, 64), gcn_cols), 8)
+
+            // Step 2: Upload existing mat, avec, bvec to VRAM; zero output area
+            discard = AccelGCN_VramWrite(mat_vram, gcn_mat, mat_bytes)
+            discard = AccelGCN_VramWrite(avec_vram, gcn_vec, avec_bytes)
+            discard = AccelGCN_VramWrite(bvec_vram, gcn_vec2, bvec_bytes)
+            // Zero output area so upper 4 bytes of each 8-byte slot stay 0
+            tmp_zero = Allocate(out_bytes_padded)
+            MemorySet(tmp_zero, 0, out_bytes_padded)
+            discard = AccelGCN_VramWrite(out_vram, tmp_zero, out_bytes_padded)
+            Deallocate(tmp_zero, out_bytes_padded)
+
+            // Step 3: Build CIR kernel (with cache)
+            cache_slot = KCache_Lookup(3, gcn_rows, gcn_cols)
+            IfCondition GreaterEqual(cache_slot, 0) ThenBlock: {
+                // Cache hit — restore mc + metadata, rebuild buffer descriptors
+                discard_kr = KCache_Restore(cache_slot)
+                // Rebind with stride=4 (DWORD addressing for 64-bit kernels)
+                rc = CIR_BindBuffer(0, mat_vram,  mat_bytes,        4, 1)
+                rc = CIR_BindBuffer(1, avec_vram, avec_bytes,       4, 1)
+                rc = CIR_BindBuffer(2, bvec_vram, bvec_bytes,       4, 1)
+                rc = CIR_BindBuffer(3, out_vram,  out_bytes_padded, 4, 2)
+                CIRProg.num_bufs = 4
+            }
+            IfCondition LessThan(cache_slot, 0) ThenBlock: {
+                // Cache miss — full CIR build + lower
+                // 64-bit math: DWORD-indexed buffers (stride=4)
+                rc = CIR_Begin()
+                rc = CIR_SetGroupSize(64, 1, 1)
+                rc = CIR_SetGrid(wg_count, 1, 1)
+                rc = CIR_BindBuffer(0, mat_vram,  mat_bytes,        4, 1)
+                rc = CIR_BindBuffer(1, avec_vram, avec_bytes,       4, 1)
+                rc = CIR_BindBuffer(2, bvec_vram, bvec_bytes,       4, 1)
+                rc = CIR_BindBuffer(3, out_vram,  out_bytes_padded, 4, 2)
+
+                v_gid       = CIR_AllocVReg()
+                v_cols      = CIR_AllocVReg()
+                v_two       = CIR_AllocVReg()
+                v_one       = CIR_AllocVReg()
+                v_gid2      = CIR_AllocVReg()
+                v_gid2p1    = CIR_AllocVReg()
+                v_avec_lo   = CIR_AllocVReg()
+                v_avec_hi   = CIR_AllocVReg()
+                v_mat_idx   = CIR_AllocVReg()
+                v_mat_idx2  = CIR_AllocVReg()
+                v_mat_idx2p1 = CIR_AllocVReg()
+                v_k         = CIR_AllocVReg()
+                v_k2        = CIR_AllocVReg()
+                v_k2p1      = CIR_AllocVReg()
+                v_cur_lo    = CIR_AllocVReg()
+                v_cur_hi    = CIR_AllocVReg()
+                v_bval_lo   = CIR_AllocVReg()
+                v_bval_hi   = CIR_AllocVReg()
+                v_p_lo      = CIR_AllocVReg()
+                v_p_hi      = CIR_AllocVReg()
+                v_t1        = CIR_AllocVReg()
+                v_t2        = CIR_AllocVReg()
+                v_new_lo    = CIR_AllocVReg()
+                v_new_hi    = CIR_AllocVReg()
+
+                rc = CIR_Op_GlobalIdX(v_gid)
+                rc = CIR_Op_LoadConst(v_cols, gcn_cols)
+                rc = CIR_Op_LoadConst(v_two, 2)
+                rc = CIR_Op_LoadConst(v_one, 1)
+
+                // Load 64-bit avec[gid]
+                rc = CIR_Op_MulLoU32(v_gid2, v_gid, v_two)
+                rc = CIR_Op_AddU32(v_gid2p1, v_gid2, v_one)
+                rc = CIR_Op_LoadBuf(v_avec_lo, 1, v_gid2)
+                rc = CIR_Op_LoadBuf(v_avec_hi, 1, v_gid2p1)
+                rc = CIR_Op_WaitCnt(0, 0, 0)
+
+                j = 0
+                WhileLoop LessThan(j, gcn_cols) {
+                    rc = CIR_Op_LoadConst(v_k, j)
+
+                    // mat element index: mat_idx = gid * cols + j
+                    rc = CIR_Op_MulLoU32(v_mat_idx, v_gid, v_cols)
+                    rc = CIR_Op_AddU32(v_mat_idx, v_mat_idx, v_k)
+                    rc = CIR_Op_MulLoU32(v_mat_idx2, v_mat_idx, v_two)
+                    rc = CIR_Op_AddU32(v_mat_idx2p1, v_mat_idx2, v_one)
+
+                    // DWORD indices for bvec[j]
+                    rc = CIR_Op_MulLoU32(v_k2, v_k, v_two)
+                    rc = CIR_Op_AddU32(v_k2p1, v_k2, v_one)
+
+                    // Load 64-bit existing mat value and bvec value
+                    rc = CIR_Op_LoadBuf(v_cur_lo, 0, v_mat_idx2)
+                    rc = CIR_Op_LoadBuf(v_cur_hi, 0, v_mat_idx2p1)
+                    rc = CIR_Op_LoadBuf(v_bval_lo, 2, v_k2)
+                    rc = CIR_Op_LoadBuf(v_bval_hi, 2, v_k2p1)
+                    rc = CIR_Op_WaitCnt(0, 0, 0)
+
+                    // 64-bit multiply: prod = avec[gid] * bvec[j]
+                    rc = CIR_Op_MulLoU32(v_p_lo, v_avec_lo, v_bval_lo)
+                    rc = CIR_Op_MulHiU32(v_p_hi, v_avec_lo, v_bval_lo)
+                    rc = CIR_Op_MulLoU32(v_t1, v_avec_lo, v_bval_hi)
+                    rc = CIR_Op_AddU32(v_p_hi, v_p_hi, v_t1)
+                    rc = CIR_Op_MulLoU32(v_t2, v_avec_hi, v_bval_lo)
+                    rc = CIR_Op_AddU32(v_p_hi, v_p_hi, v_t2)
+
+                    // 64-bit add: new = cur + prod
+                    rc = CIR_Op_AddU32(v_new_lo, v_cur_lo, v_p_lo)
+                    rc = CIR_Op_AddcU32(v_new_hi, v_cur_hi, v_p_hi)
+
+                    // Store 64-bit result
+                    rc = CIR_Op_StoreBuf(v_new_lo, 3, v_mat_idx2)
+                    rc = CIR_Op_StoreBuf(v_new_hi, 3, v_mat_idx2p1)
+                    rc = CIR_Op_WaitCnt(0, 0, 0)
+
+                    j = Add(j, 1)
+                }
+
+                rc = CIR_Op_EndPgm()
+
+                n_insns = CIR_End()
+                mc_bytes = CIR_Lower_GCN()
+
+                // Store to cache for next time
+                discard_ks = KCache_Store(3, gcn_rows, gcn_cols)
+            }
+
+            // Step 4: Dispatch
+            rc = AccelGCN_Dispatch()
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] OuterAccum dispatch failed rc=")
+                PrintNumber(rc)
+                PrintMessage("\n")
+                HALOp.status = -1
+                ReturnValue(-1)
+            }
+
+            // Step 5: Read back full 64-bit results (GPU wrote both lo and hi DWORDs)
+            discard = AccelGCN_VramRead(out_vram, gcn_dst, mat_bytes)
+
+            // Step 6: Return success
+            HALOp.status = 1
+            ReturnValue(0)
+        }
+
+        // MatMul: C[i,j] = sum_k(A[i,k] * B[k,j])
+        // A is [rows x inner], B is [inner x cols], C is [rows x cols]
+        // vec2 carries 'inner' dimension.
+        // 1D grid: one thread per output element, gid → (row, col) via divmod.
+        IfCondition EqualTo(gcn_op, 4) ThenBlock: {
+            gcn_inner = HALOp.vec2
+
+            // Step 1: Sizes and VRAM layout
+            a_bytes = Multiply(Multiply(gcn_rows, gcn_inner), 8)
+            b_bytes = Multiply(Multiply(gcn_inner, gcn_cols), 8)
+            c_elems = Multiply(gcn_rows, gcn_cols)
+            c_bytes = Multiply(c_elems, 8)
+            a_vram = 0
+            b_vram = a_bytes
+            c_vram = Add(a_bytes, b_bytes)
+
+            // Padded C for safe GPU writes
+            mm_wg_count = Divide(Add(c_elems, 63), 64)
+            c_bytes_padded = Multiply(Multiply(mm_wg_count, 64), 8)
+
+            // Step 2: Upload A and B, zero C
+            discard = AccelGCN_VramWrite(a_vram, gcn_mat, a_bytes)
+            discard = AccelGCN_VramWrite(b_vram, gcn_vec, b_bytes)
+            mm_tmp_zero = Allocate(c_bytes_padded)
+            MemorySet(mm_tmp_zero, 0, c_bytes_padded)
+            discard = AccelGCN_VramWrite(c_vram, mm_tmp_zero, c_bytes_padded)
+            Deallocate(mm_tmp_zero, c_bytes_padded)
+
+            // Step 3: Build CIR kernel (with cache)
+            cache_slot = KCache_Lookup(4, gcn_rows, gcn_cols)
+            IfCondition GreaterEqual(cache_slot, 0) ThenBlock: {
+                discard_kr = KCache_Restore(cache_slot)
+                rc = CIR_BindBuffer(0, a_vram, a_bytes, 4, 1)
+                rc = CIR_BindBuffer(1, b_vram, b_bytes, 4, 1)
+                rc = CIR_BindBuffer(2, c_vram, c_bytes_padded, 4, 2)
+                CIRProg.num_bufs = 3
+            }
+            IfCondition LessThan(cache_slot, 0) ThenBlock: {
+                // Cache miss — full CIR build
+                // Kernel: thread gid computes C[row][col] where
+                //   row = gid / cols,  col = gid % cols
+                //   C[row,col] = sum_{k=0..inner-1}( A[row*inner+k] * B[k*cols+col] )
+                rc = CIR_Begin()
+                rc = CIR_SetGroupSize(64, 1, 1)
+                rc = CIR_SetGrid(mm_wg_count, 1, 1)
+                rc = CIR_BindBuffer(0, a_vram, a_bytes, 4, 1)
+                rc = CIR_BindBuffer(1, b_vram, b_bytes, 4, 1)
+                rc = CIR_BindBuffer(2, c_vram, c_bytes_padded, 4, 2)
+
+                v_gid     = CIR_AllocVReg()
+                v_acc_lo  = CIR_AllocVReg()
+                v_acc_hi  = CIR_AllocVReg()
+                v_inner   = CIR_AllocVReg()
+                v_cols    = CIR_AllocVReg()
+                v_two     = CIR_AllocVReg()
+                v_one     = CIR_AllocVReg()
+                v_row     = CIR_AllocVReg()
+                v_col     = CIR_AllocVReg()
+                v_row_x_inner = CIR_AllocVReg()
+                v_k       = CIR_AllocVReg()
+                v_a_idx   = CIR_AllocVReg()
+                v_a_idx2  = CIR_AllocVReg()
+                v_a_idx2p1 = CIR_AllocVReg()
+                v_b_idx   = CIR_AllocVReg()
+                v_b_idx2  = CIR_AllocVReg()
+                v_b_idx2p1 = CIR_AllocVReg()
+                v_a_lo    = CIR_AllocVReg()
+                v_a_hi    = CIR_AllocVReg()
+                v_b_lo    = CIR_AllocVReg()
+                v_b_hi    = CIR_AllocVReg()
+                v_p_lo    = CIR_AllocVReg()
+                v_p_hi    = CIR_AllocVReg()
+                v_t1      = CIR_AllocVReg()
+                v_t2      = CIR_AllocVReg()
+                v_dst_idx2 = CIR_AllocVReg()
+                v_dst_idx2p1 = CIR_AllocVReg()
+                v_k_x_cols = CIR_AllocVReg()
+
+                rc = CIR_Op_GlobalIdX(v_gid)
+                rc = CIR_Op_LoadConst(v_inner, gcn_inner)
+                rc = CIR_Op_LoadConst(v_cols, gcn_cols)
+                rc = CIR_Op_LoadConst(v_two, 2)
+                rc = CIR_Op_LoadConst(v_one, 1)
+                rc = CIR_Op_LoadConst(v_acc_lo, 0)
+                rc = CIR_Op_LoadConst(v_acc_hi, 0)
+
+                // Compute row = gid / cols, col = gid % cols
+                // For power-of-2 cols: row = gid >> log2, col = gid & (cols-1)
+                // For non-power-of-2: fall back to CPU.
+                mm_cols_is_p2 = 0
+                mm_log2 = 0
+                mm_test = gcn_cols
+                IfCondition EqualTo(BitwiseAnd(mm_test, Subtract(mm_test, 1)), 0) ThenBlock: {
+                    mm_cols_is_p2 = 1
+                    mm_shift_test = mm_test
+                    WhileLoop GreaterThan(mm_shift_test, 1) {
+                        mm_shift_test = Divide(mm_shift_test, 2)
+                        mm_log2 = Add(mm_log2, 1)
+                    }
+                }
+
+                IfCondition EqualTo(mm_cols_is_p2, 0) ThenBlock: {
+                    PrintMessage("[AccelGCN] MatMul: cols must be power-of-2 for GPU, got ")
+                    PrintNumber(gcn_cols)
+                    PrintMessage(" — falling back to CPU\n")
+                    HALOp.status = -1
+                    ReturnValue(-1)
+                }
+
+                // row = gid >> log2(cols), col = gid & (cols - 1)
+                v_shift = CIR_AllocVReg()
+                v_mask  = CIR_AllocVReg()
+                rc = CIR_Op_LoadConst(v_shift, mm_log2)
+                rc = CIR_Op_LoadConst(v_mask, Subtract(gcn_cols, 1))
+                rc = CIR_Op_ShrU32(v_row, v_gid, v_shift)
+                rc = CIR_Op_AndB32(v_col, v_gid, v_mask)
+
+                // Now v_row and v_col hold the output position
+                // Compute row * inner (for indexing into A)
+                rc = CIR_Op_MulLoU32(v_row_x_inner, v_row, v_inner)
+
+                // Inner loop: unrolled at CIR level (k known at compile time)
+                mm_k = 0
+                WhileLoop LessThan(mm_k, gcn_inner) {
+                    rc = CIR_Op_LoadConst(v_k, mm_k)
+
+                    // A index: row * inner + k → element in A
+                    rc = CIR_Op_AddU32(v_a_idx, v_row_x_inner, v_k)
+                    rc = CIR_Op_MulLoU32(v_a_idx2, v_a_idx, v_two)
+                    rc = CIR_Op_AddU32(v_a_idx2p1, v_a_idx2, v_one)
+
+                    // B index: k * cols + col → element in B
+                    rc = CIR_Op_LoadConst(v_k_x_cols, Multiply(mm_k, gcn_cols))
+                    rc = CIR_Op_AddU32(v_b_idx, v_k_x_cols, v_col)
+                    rc = CIR_Op_MulLoU32(v_b_idx2, v_b_idx, v_two)
+                    rc = CIR_Op_AddU32(v_b_idx2p1, v_b_idx2, v_one)
+
+                    // Load A[row, k] (64-bit as 2 DWORDs)
+                    rc = CIR_Op_LoadBuf(v_a_lo, 0, v_a_idx2)
+                    rc = CIR_Op_LoadBuf(v_a_hi, 0, v_a_idx2p1)
+                    // Load B[k, col] (64-bit as 2 DWORDs)
+                    rc = CIR_Op_LoadBuf(v_b_lo, 1, v_b_idx2)
+                    rc = CIR_Op_LoadBuf(v_b_hi, 1, v_b_idx2p1)
+                    rc = CIR_Op_WaitCnt(0, 0, 0)
+
+                    // 64-bit multiply: prod = a * b (low 64 bits)
+                    rc = CIR_Op_MulLoU32(v_p_lo, v_a_lo, v_b_lo)
+                    rc = CIR_Op_MulHiU32(v_p_hi, v_a_lo, v_b_lo)
+                    rc = CIR_Op_MulLoU32(v_t1, v_a_lo, v_b_hi)
+                    rc = CIR_Op_AddU32(v_p_hi, v_p_hi, v_t1)
+                    rc = CIR_Op_MulLoU32(v_t2, v_a_hi, v_b_lo)
+                    rc = CIR_Op_AddU32(v_p_hi, v_p_hi, v_t2)
+
+                    // 64-bit accumulate
+                    rc = CIR_Op_AddU32(v_acc_lo, v_acc_lo, v_p_lo)
+                    rc = CIR_Op_AddcU32(v_acc_hi, v_acc_hi, v_p_hi)
+
+                    mm_k = Add(mm_k, 1)
+                }
+
+                // Store 64-bit result: C[gid] = acc
+                rc = CIR_Op_MulLoU32(v_dst_idx2, v_gid, v_two)
+                rc = CIR_Op_AddU32(v_dst_idx2p1, v_dst_idx2, v_one)
+                rc = CIR_Op_StoreBuf(v_acc_lo, 2, v_dst_idx2)
+                rc = CIR_Op_StoreBuf(v_acc_hi, 2, v_dst_idx2p1)
+                rc = CIR_Op_WaitCnt(0, 0, 0)
+                rc = CIR_Op_EndPgm()
+
+                n_insns = CIR_End()
+                mc_bytes = CIR_Lower_GCN()
+
+                discard_ks = KCache_Store(4, gcn_rows, gcn_cols)
+            }
+
+            // Step 4: Dispatch
+            rc = AccelGCN_Dispatch()
+            IfCondition LessThan(rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] MatMul dispatch failed rc=")
+                PrintNumber(rc)
+                PrintMessage("\n")
+                HALOp.status = -1
+                ReturnValue(-1)
+            }
+
+            // Step 5: Read back C
+            discard = AccelGCN_VramRead(c_vram, gcn_dst, c_bytes)
+
+            // Step 6: Return success
+            HALOp.status = 1
+            ReturnValue(0)
+        }
+
+        PrintMessage("[AccelGCN] unknown op: ")
+        PrintNumber(gcn_op)
+        PrintMessage("\n")
+        HALOp.status = -1
+        ReturnValue(-1)
+    }
+}
+
+// =============================================================================
+// AccelGCN_VramWrite — write host data to VRAM data area
+// offset: byte offset within the data area
+// src: host memory address
+// nbytes: number of bytes to copy
+// =============================================================================
+Function.AccelGCN_VramWrite {
+    Input: offset: Integer
+    Input: src: Integer
+    Input: nbytes: Integer
+    Output: Integer
+    Body: {
+        // Write to GART-backed system RAM (coherent, no HDP flush needed)
+        host_ptr = AccelGCNCfg.data_host_ptr
+        dst = Add(host_ptr, offset)
+
+        MemoryCopy(dst, src, nbytes)
+        // sfence: ensure stores are globally visible before GPU reads
+        InlineAsm["0f ae f8"]
+
+        ReturnValue(nbytes)
+    }
+}
+
+// =============================================================================
+// AccelGCN_VramRead — read VRAM data area to host memory
+// offset: byte offset within the data area
+// dst: host memory address
+// nbytes: number of bytes to copy
+// =============================================================================
+Function.AccelGCN_VramRead {
+    Input: offset: Integer
+    Input: dst: Integer
+    Input: nbytes: Integer
+    Output: Integer
+    Body: {
+        // Read from GART-backed system RAM (coherent, no HDP flush needed)
+        host_ptr = AccelGCNCfg.data_host_ptr
+        src = Add(host_ptr, offset)
+
+        MemoryCopy(dst, src, nbytes)
+        ReturnValue(nbytes)
+    }
+}

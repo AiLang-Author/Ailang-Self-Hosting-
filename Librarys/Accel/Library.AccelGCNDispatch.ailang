@@ -1,0 +1,463 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AccelGCNDispatch.ailang
+//
+// Low-level dispatch machinery: Upload, SetupBufferV, Dispatch.
+// Split from Library.AccelGCN.ailang for maintainability.
+//
+// USAGE
+//   LibraryImport.Accel.AccelGCNDispatch
+
+LibraryImport.Accel.AccelGCNInit
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUGART
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Accel.ComputeIR
+LibraryImport.Accel.ComputeIR_GCN
+
+// =============================================================================
+// AccelGCN_Upload — copy machine code from CIRProg.mc_buf to GART system RAM
+// Returns the GART VA of the shader (256-byte aligned).
+// =============================================================================
+Function.AccelGCN_Upload {
+    Output: Integer
+    Body: {
+        mc_size = CIRProg.mc_size
+        IfCondition EqualTo(mc_size, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] no machine code to upload\n")
+            ReturnValue(0)
+        }
+        IfCondition GreaterThan(mc_size, GARTConf.SHADER_SIZE) ThenBlock: {
+            PrintMessage("[AccelGCN] shader too large: ")
+            PrintNumber(mc_size)
+            PrintMessage(" > ")
+            PrintNumber(GARTConf.SHADER_SIZE)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("\n=== [SHADER MC DUMP] mc_size=")
+        PrintNumber(mc_size)
+        PrintMessage(" vgprs=")
+        PrintNumber(CIRGcn.num_vgprs)
+        PrintMessage(" sgprs=")
+        PrintNumber(CIRGcn.num_sgprs)
+        PrintMessage(" ===\n")
+        mc_dbg_i = 0
+        WhileLoop LessThan(mc_dbg_i, mc_size) {
+            mc_dw = BitwiseOr(GetByte(CIRProg.mc_buf, mc_dbg_i), BitwiseOr(LeftShift(GetByte(CIRProg.mc_buf, Add(mc_dbg_i, 1)), 8), BitwiseOr(LeftShift(GetByte(CIRProg.mc_buf, Add(mc_dbg_i, 2)), 16), LeftShift(GetByte(CIRProg.mc_buf, Add(mc_dbg_i, 3)), 24))))
+            PrintMessage("[MC] +")
+            PrintNumber(mc_dbg_i)
+            PrintMessage(": 0x")
+            PrintHex(mc_dw)
+            PrintMessage("\n")
+            mc_dbg_i = Add(mc_dbg_i, 4)
+        }
+
+        // Copy machine code to GART-backed system RAM (coherent, no VRAM issues)
+        dst_ptr = AccelGCNCfg.shader_host_ptr
+        src_ptr = CIRProg.mc_buf
+        i = 0
+        WhileLoop LessThan(i, mc_size) {
+            b = GetByte(src_ptr, i)
+            SetByte(dst_ptr, i, b)
+            i = Add(i, 1)
+        }
+
+        // sfence to ensure all stores are visible before GPU fetches
+        InlineAsm["0f ae f8"]
+
+        // Return the GART VA (already 4K-page-aligned, which satisfies 256-byte alignment)
+        shader_va = AccelGCNCfg.shader_gart_va
+        PrintMessage("[AccelGCN] Shader uploaded to GART: host=0x")
+        PrintHex(dst_ptr)
+        PrintMessage(" GART_VA=0x")
+        PrintHex(shader_va)
+        PrintMessage(" size=")
+        PrintNumber(mc_size)
+        PrintMessage("\n")
+        ReturnValue(shader_va)
+    }
+}
+
+// =============================================================================
+// AccelGCN_SetupBufferV — write a buffer resource V# (128-bit descriptor)
+//   to VRAM at buf_desc area for use by USER_DATA SGPRs.
+//
+// SI V# (T# for textures) format — 128 bits for buffer resources:
+//   DWORD0: base_address[31:0]
+//   DWORD1: base_address[47:32] | stride[29:16] | ...
+//   DWORD2: num_records (number of elements, NOT bytes for typed buffers)
+//   DWORD3: dst_sel | num_format | data_format | element_size | ...
+//
+// For raw buffers (untyped): data_format=0, num_records=byte_count
+// For typed buffers: data_format specifies element type
+//
+// slot: which descriptor slot (0-15, matching CIR buffer binding)
+// gpu_addr: GPU virtual address of the buffer data in VRAM
+// num_bytes: size of buffer in bytes
+// stride: bytes per element (0 for raw)
+// =============================================================================
+Function.AccelGCN_SetupBufferV {
+    Input: slot: Integer
+    Input: gpu_addr: Integer
+    Input: num_bytes: Integer
+    Input: stride: Integer
+    Output: Integer
+    Body: {
+        gpu = AccelGCNCfg.gpu_idx
+        vram_state = GPU_BAR_GetState(gpu)
+        vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
+
+        // V# location: buf_desc_vram + slot * 16
+        desc_off = Add(AccelGCNCfg.buf_desc_vram, Multiply(slot, 16))
+        desc_ptr = Add(vram_ptr, desc_off)
+
+        // DWORD0: base_address[31:0]
+        dw0 = BitwiseAnd(gpu_addr, 4294967295)
+
+        // DWORD1: base_address[47:32] (bits [15:0]) | stride (bits [29:16])
+        addr_hi = BitwiseAnd(RightShift(gpu_addr, 32), 65535)
+        dw1 = BitwiseOr(addr_hi, LeftShift(BitwiseAnd(stride, 16383), 16))
+
+        // DWORD2: num_records
+        dw2 = num_bytes
+
+        // DWORD3: For raw buffer (BUF_DATA_FORMAT_32, BUF_NUM_FORMAT_UINT):
+        //   data_format = 4 (32-bit) at bits [25:22]
+        //   num_format = 1 (UINT) at bits [28:26]
+        //   dst_sel_x = 4 (SEL_X) at bits [9:7]  → actually [11:9]
+        //   For simple typed 32-bit buffer:
+        dw3 = 0
+        // data_format=4 at [25:22]: 4 << 22 = 16777216
+        dw3 = Add(dw3, Multiply(4, 4194304))
+        // num_format=1 at [28:26]: 1 << 26 = 67108864
+        dw3 = Add(dw3, 67108864)
+
+        // Write 4 DWORDs as bytes (little-endian)
+        SetByte(desc_ptr, 0, BitwiseAnd(dw0, 255))
+        SetByte(desc_ptr, 1, BitwiseAnd(RightShift(dw0, 8), 255))
+        SetByte(desc_ptr, 2, BitwiseAnd(RightShift(dw0, 16), 255))
+        SetByte(desc_ptr, 3, BitwiseAnd(RightShift(dw0, 24), 255))
+
+        SetByte(desc_ptr, 4, BitwiseAnd(dw1, 255))
+        SetByte(desc_ptr, 5, BitwiseAnd(RightShift(dw1, 8), 255))
+        SetByte(desc_ptr, 6, BitwiseAnd(RightShift(dw1, 16), 255))
+        SetByte(desc_ptr, 7, BitwiseAnd(RightShift(dw1, 24), 255))
+
+        SetByte(desc_ptr, 8, BitwiseAnd(dw2, 255))
+        SetByte(desc_ptr, 9, BitwiseAnd(RightShift(dw2, 8), 255))
+        SetByte(desc_ptr, 10, BitwiseAnd(RightShift(dw2, 16), 255))
+        SetByte(desc_ptr, 11, BitwiseAnd(RightShift(dw2, 24), 255))
+
+        SetByte(desc_ptr, 12, BitwiseAnd(dw3, 255))
+        SetByte(desc_ptr, 13, BitwiseAnd(RightShift(dw3, 8), 255))
+        SetByte(desc_ptr, 14, BitwiseAnd(RightShift(dw3, 16), 255))
+        SetByte(desc_ptr, 15, BitwiseAnd(RightShift(dw3, 24), 255))
+
+        // Readback verify V# DWORDs
+        rb0 = BitwiseOr(GetByte(desc_ptr, 0), BitwiseOr(LeftShift(GetByte(desc_ptr, 1), 8), BitwiseOr(LeftShift(GetByte(desc_ptr, 2), 16), LeftShift(GetByte(desc_ptr, 3), 24))))
+        rb1 = BitwiseOr(GetByte(desc_ptr, 4), BitwiseOr(LeftShift(GetByte(desc_ptr, 5), 8), BitwiseOr(LeftShift(GetByte(desc_ptr, 6), 16), LeftShift(GetByte(desc_ptr, 7), 24))))
+        rb2 = BitwiseOr(GetByte(desc_ptr, 8), BitwiseOr(LeftShift(GetByte(desc_ptr, 9), 8), BitwiseOr(LeftShift(GetByte(desc_ptr, 10), 16), LeftShift(GetByte(desc_ptr, 11), 24))))
+        rb3 = BitwiseOr(GetByte(desc_ptr, 12), BitwiseOr(LeftShift(GetByte(desc_ptr, 13), 8), BitwiseOr(LeftShift(GetByte(desc_ptr, 14), 16), LeftShift(GetByte(desc_ptr, 15), 24))))
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// AccelGCN_Dispatch — dispatch the current CIR program on the GPU
+//
+// Assumes CIR program has been built (CIR_Begin...CIR_End) and lowered
+// (CIR_Lower_GCN). This function:
+//   1. Uploads shader to VRAM
+//   2. Sets up buffer V# descriptors
+//   3. Programs USER_DATA SGPRs with descriptor address
+//   4. Dispatches via PM4
+//   5. Waits for completion
+//
+// Returns 0 on success, negative on error.
+// =============================================================================
+Function.AccelGCN_Dispatch {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(AccelGCNCfg.initialized, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] not initialized\n")
+            ReturnValue(-1)
+        }
+        IfCondition EqualTo(CIRProg.lowered, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] program not lowered\n")
+            ReturnValue(-2)
+        }
+
+        // 1. Upload machine code to GART system RAM
+        pgm_addr = AccelGCN_Upload()
+        IfCondition EqualTo(pgm_addr, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] upload failed\n")
+            ReturnValue(-3)
+        }
+        // 2. Build a single V# descriptor covering the entire data area
+        //    The shader uses s[0:3] as the buffer resource descriptor directly.
+        //    Both LOAD_BUF and STORE_BUF use srsrc=0 (s[0:3]) with offen mode,
+        //    where the VGPR index provides the byte offset into the buffer.
+        //    So we create one V# that spans the whole data region.
+        ring = AccelGCNCfg.ring_idx
+        gpu_data_base = AccelGCNCfg.data_gart_va
+
+        // Calculate total data area size from CIR buffer bindings
+        // Find the max (buf_addr + buf_size) across all buffers
+        nbufs = CIRProg.num_bufs
+        total_data_size = 0
+        slot = 0
+        WhileLoop LessThan(slot, nbufs) {
+            bd_ptr = Add(CIRBufs.base, Multiply(slot, 32))
+            buf_addr = Dereference(Add(bd_ptr, 0))
+            buf_size = Dereference(Add(bd_ptr, 8))
+            buf_end = Add(buf_addr, buf_size)
+            IfCondition GreaterThan(buf_end, total_data_size) ThenBlock: {
+                total_data_size = buf_end
+            }
+            slot = Add(slot, 1)
+        }
+
+        // Build 128-bit V# descriptor (4 DWORDs)
+        // DWORD0: base_address[31:0]
+        vdesc_dw0 = BitwiseAnd(gpu_data_base, 4294967295)
+        // DWORD1: base_address[47:32] (bits [15:0]) | stride (bits [29:16])
+        //         stride=0 for raw/OFFEN buffer access (GCN requires stride=0 for raw buffers)
+        vdesc_dw1 = BitwiseAnd(RightShift(gpu_data_base, 32), 65535)
+        // DWORD2: num_records (byte count for raw/offen mode)
+        vdesc_dw2 = total_data_size
+        // DWORD3 (SQ_BUF_RSRC_WORD3):
+        //   DST_SEL_X[2:0]=4(X), DST_SEL_Y[5:3]=5(Y), DST_SEL_Z[8:6]=6(Z), DST_SEL_W[11:9]=7(W)
+        //   NUM_FORMAT[14:12]=1(UINT), DATA_FORMAT[18:15]=4(BUF_DATA_FORMAT_32)
+        //   = 4 + 40 + 384 + 3584 + 4096 + 131072 = 139180 (0x21FAC)
+        vdesc_dw3 = 139180
+
+        // --- Periodic full reset (HD 7770 compute event engine bug) ---
+        // Cape Verde may leak internal compute dispatch slots after many uses.
+        // Full soft reset + firmware reload reclaims them.  GFX ring unaffected.
+        // MUST happen BEFORE any PM4 packets are emitted to the ring,
+        // because the reset reinitializes the ring and wipes pending packets.
+        // NOTE: confirmed still required even after SOPC fix — GPU hangs at ~37 dispatches.
+        IfCondition GreaterEqual(AccelGCNCfg.dispatch_count, 30) ThenBlock: {
+            rst_rc = AccelGCN_ComputeReset()
+            IfCondition LessThan(rst_rc, 0) ThenBlock: {
+                PrintMessage("[AccelGCN] FATAL: compute reset failed rc=")
+                PrintNumber(rst_rc)
+                PrintMessage("\n")
+                ReturnValue(-10)
+            }
+        }
+
+        // 3a. Breadcrumb — first packet in the dispatch stream.
+        //     WRITE_DATA to fence_off+16, carrying the upcoming fence_val.
+        //     If the CP fetches iter N's packets, breadcrumb updates to N's fence_val;
+        //     if the CP is idle and never fetches, it stays at N-1's value.
+        bc_ring = PM4_GetRing(ring)
+        bc_fence_off = Dereference(Add(bc_ring, RingField.FENCE_WB_OFF))
+        bc_fence_val = Add(Dereference(Add(bc_ring, RingField.FENCE_VAL)), 1)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 16), 0)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 20), 0)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 24), 0)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 28), 0)
+        GPU_VramWr32(AccelGCNCfg.gpu_idx, Add(bc_fence_off, 32), 0)
+        PM4_EmitWriteDataVRAM(ring, Add(bc_fence_off, 16), bc_fence_val)
+
+        // 3b. Load V# directly into USER_DATA SGPRs s[0:3]
+        //     The shader does BUFFER_LOAD/STORE with srsrc=0 → reads s[0:3] as V#.
+        //     We use 4 USER_DATA registers, so TGID_X lands at s[4].
+        bc_ring_ptr = PM4_GetRing(ring)
+        PrintMessage("[PKT-MAP] pre_USER_DATA wptr=")
+        PrintNumber(Dereference(Add(bc_ring_ptr, RingField.WPTR)))
+        PrintMessage(" ring=")
+        PrintNumber(ring)
+        PrintMessage("\n")
+        PM4_EmitSetSHReg(ring, SICompute.USER_DATA_0, vdesc_dw0, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitSetSHReg(ring, SICompute.USER_DATA_1, vdesc_dw1, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitSetSHReg(ring, SICompute.USER_DATA_2, vdesc_dw2, PM4.SHADER_TYPE_COMPUTE)
+        PM4_EmitSetSHReg(ring, SICompute.USER_DATA_3, vdesc_dw3, PM4.SHADER_TYPE_COMPUTE)
+        PrintMessage("[PKT-MAP] after_USER_DATA wptr=")
+        PrintNumber(Dereference(Add(bc_ring_ptr, RingField.WPTR)))
+        PrintMessage("\n")
+
+        // 4. Dispatch
+        dbg_gpu = AccelGCNCfg.gpu_idx
+        num_vgprs = CIRGcn.num_vgprs
+        num_sgprs = CIRGcn.num_sgprs
+
+        // Ensure minimums for register granularity
+        IfCondition LessThan(num_vgprs, 4) ThenBlock: { num_vgprs = 4 }
+        IfCondition LessThan(num_sgprs, 8) ThenBlock: { num_sgprs = 8 }
+
+        // Round up to granularity
+        num_vgprs = Multiply(Divide(Add(num_vgprs, 3), 4), 4)
+        num_sgprs = Multiply(Divide(Add(num_sgprs, 7), 8), 8)
+
+        // Fill PM4Dispatch carrier (avoids >6 arg ABI violation)
+        PM4Dispatch.pgm_addr = pgm_addr
+        PM4Dispatch.num_vgprs = num_vgprs
+        PM4Dispatch.num_sgprs = num_sgprs
+        PM4Dispatch.tg_size_x = CIRProg.group_size_x
+        PM4Dispatch.tg_size_y = CIRProg.group_size_y
+        PM4Dispatch.tg_size_z = CIRProg.group_size_z
+        PM4Dispatch.grid_x = CIRProg.grid_x
+        PM4Dispatch.grid_y = CIRProg.grid_y
+        PM4Dispatch.grid_z = CIRProg.grid_z
+        PM4Dispatch.buf_vram_off = AccelGCNCfg.data_vram
+        PM4Dispatch.buf_total_size = total_data_size
+        PM4Dispatch.ib_vram_off = AccelGCNCfg.ib_vram
+        PM4Dispatch.ib_host_ptr = AccelGCNCfg.ib_host_ptr
+        PM4Dispatch.ib_gart_va = AccelGCNCfg.ib_gart_va
+
+        PrintMessage("\n=== [DISPATCH DRYRUN] ring=")
+        PrintNumber(ring)
+        PrintMessage(" ===\n")
+        PrintMessage("[DBG] pgm_addr_GART=0x")
+        PrintHex(pgm_addr)
+        PrintMessage(" pgm_addr_GPU=0x")
+        PrintHex(pgm_addr)
+        PrintMessage("\n")
+        PrintMessage("[DBG] gpu_data_base=0x")
+        PrintHex(gpu_data_base)
+        PrintMessage(" total_data_size=")
+        PrintNumber(total_data_size)
+        PrintMessage("\n")
+        PrintMessage("[DBG] vdesc dw0=0x")
+        PrintHex(vdesc_dw0)
+        PrintMessage(" dw1=0x")
+        PrintHex(vdesc_dw1)
+        PrintMessage(" dw2=0x")
+        PrintHex(vdesc_dw2)
+        PrintMessage(" dw3=0x")
+        PrintHex(vdesc_dw3)
+        PrintMessage("\n")
+        PrintMessage("[DBG] num_vgprs=")
+        PrintNumber(num_vgprs)
+        PrintMessage(" num_sgprs=")
+        PrintNumber(num_sgprs)
+        PrintMessage("\n")
+        PrintMessage("[DBG] grid=")
+        PrintNumber(PM4Dispatch.grid_x)
+        PrintMessage("x")
+        PrintNumber(PM4Dispatch.grid_y)
+        PrintMessage("x")
+        PrintNumber(PM4Dispatch.grid_z)
+        PrintMessage(" tg=")
+        PrintNumber(PM4Dispatch.tg_size_x)
+        PrintMessage("x")
+        PrintNumber(PM4Dispatch.tg_size_y)
+        PrintMessage("x")
+        PrintNumber(PM4Dispatch.tg_size_z)
+        PrintMessage("\n")
+        PrintMessage("[DBG] data_vram=0x")
+        PrintHex(AccelGCNCfg.data_vram)
+        PrintMessage(" ib_vram=0x")
+        PrintHex(AccelGCNCfg.ib_vram)
+        PrintMessage("\n")
+        rc = PM4_SubmitCompute(ring)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] PM4 submit failed\n")
+            ReturnValue(-4)
+        }
+
+        // 5. Wait for completion — poll VRAM fence (authoritative path)
+        fence = Dereference(Add(PM4_GetRing(ring), RingField.FENCE_VAL))
+        rc = PM4_WaitFenceVRAM(ring, fence)
+        IfCondition EqualTo(rc, 0) ThenBlock: {
+            PrintMessage("[AccelGCN] fence timeout\n")
+            ReturnValue(-5)
+        }
+
+        // Post-dispatch fault/wavefront probe
+        PrintMessage("[VMFAULT] STATUS=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.VM_CONTEXT1_PROTECTION_FAULT_STATUS))
+        PrintMessage(" ADDR=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.VM_CONTEXT1_PROTECTION_FAULT_ADDR))
+        PrintMessage(" GRBM_STATUS2=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.GRBM_STATUS2))
+        PrintMessage("\n")
+
+        // === POST-FENCE WAVE-LAUNCH DIAGNOSTICS ===
+        // At this point the fence has fired, meaning the CP processed everything
+        // through EVENT_WRITE_EOP.  If a wavefront launched and completed,
+        // dst should be non-zero.  If dst is still 0, either the wave never
+        // launched (SPI never dispatched it) or the wave ran but its stores
+        // didn't land (memory path broken).
+        PrintMessage("\n[POST-FENCE] === Wave-launch diagnostics ===\n")
+        // SPI/SQ state (should be idle now if wave completed)
+        PrintMessage("[POST-FENCE] SPI_DEBUG_BUSY=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SPI_DEBUG_BUSY))
+        PrintMessage(" SQ_DEBUG_STS_GLOBAL=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SQ_DEBUG_STS_GLOBAL))
+        PrintMessage("\n")
+        PrintMessage("[POST-FENCE] GRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.GRBM_STATUS))
+        PrintMessage(" GRBM_STATUS2=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.GRBM_STATUS2))
+        PrintMessage("\n")
+        // SH_MEM — is VMID 0 configured for GART addressing?
+        PrintMessage("[POST-FENCE] SH_MEM_CONFIG=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SH_MEM_CONFIG))
+        PrintMessage(" SH_MEM_BASES=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SH_MEM_BASES))
+        PrintMessage("\n")
+        // Check SRBM_GFX_CNTL to see which VMID we're reading SH_MEM for
+        PrintMessage("[POST-FENCE] SRBM_GFX_CNTL=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SIReg.SRBM_GFX_CNTL))
+        PrintMessage("\n")
+        // Compute regs — after wave completion these may revert to idle state
+        PrintMessage("[POST-FENCE] DISPATCH_INITIATOR=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SICompute.DISPATCH_INITIATOR))
+        PrintMessage(" PGM_LO=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SICompute.PGM_LO))
+        PrintMessage(" RSRC1=0x")
+        PrintHex(GPU_Rd32(dbg_gpu, SICompute.PGM_RSRC1))
+        PrintMessage("\n")
+        // Direct GART host pointer readback of dst[0..3] — most authoritative
+        // (bypasses VRAM/BAR entirely, reads from the mmap'd system RAM page)
+        pf_hp = AccelGCNCfg.data_host_ptr
+        PrintMessage("[POST-FENCE] GART dst[0]=0x")
+        PrintHex(Dereference(Add(pf_hp, 256), "dword"))
+        PrintMessage(" dst[1]=0x")
+        PrintHex(Dereference(Add(pf_hp, 260), "dword"))
+        PrintMessage(" dst[2]=0x")
+        PrintHex(Dereference(Add(pf_hp, 264), "dword"))
+        PrintMessage(" dst[3]=0x")
+        PrintHex(Dereference(Add(pf_hp, 268), "dword"))
+        PrintMessage("\n")
+        // Also read src[0..1] to confirm GART src is still intact
+        PrintMessage("[POST-FENCE] GART src[0]=0x")
+        PrintHex(Dereference(pf_hp, "dword"))
+        PrintMessage(" src[1]=0x")
+        PrintHex(Dereference(Add(pf_hp, 4), "dword"))
+        PrintMessage("\n")
+        PrintMessage("[POST-FENCE] === end ===\n\n")
+
+        // Drain the IH ring — advance RPTR to WPTR so the ring doesn't overflow.
+        PM4_DrainIH(dbg_gpu)
+
+        // Post-fence drain: emit NOP + WaitIdle to ensure the event engine
+        // has fully retired the EOP before we submit the next dispatch.
+        // SI docs state "only one EOP event may be present in the pipeline
+        // at a time" — if we start the next dispatch before the event engine
+        // finishes internal cleanup, EOP slots accumulate and eventually
+        // the event engine silently drops fence writes (~36 dispatches).
+        PM4_EmitNOP(ring, 2)
+        PM4_Commit(ring)
+        discard_idle = PM4_WaitIdle(ring)
+
+        // HDP coherency is now handled GPU-side: PM4_SubmitCompute emits
+        // WRITE_DATA to HDP_MEM_COHERENCY_FLUSH_CNTL + HDP_HOST_PATH_CNTL
+        // after SURFACE_SYNC and before the EOP fence.  By the time we see
+        // the fence here, both HDP write and read caches are already clean.
+        // Redundant CPU-side write-cache flush (safe, cheap, belt-and-suspenders):
+        GPU_Wr32(dbg_gpu, 21632, 1)    // HDP_MEM_COHERENCY_FLUSH_CNTL = 0x5480
+
+        // Dispatch tracking
+        AccelGCNCfg.dispatch_count = Add(AccelGCNCfg.dispatch_count, 1)
+
+        ReturnValue(0)
+    }
+}
