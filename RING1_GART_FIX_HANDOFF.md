@@ -546,3 +546,28 @@ When you have the Fable output/doc, drop the key actionable list here (or the wh
 For now: CPStart dedup is in (small hygiene win, will avoid duplicate init packets on next cold run). If you want I can also insert a literal block of the missing phase 16 MMIOs (the 85xx zeros + c114/c10x sequencing) into SetupRing or right before unhalt, plus extra drains in the GART PTE loop, and force a hard fail if PTE verify still sees FFFF after retries. Say the word and we'll do a targeted "make init closer to phase 16 + make GART verify truthful" pass before the Fable doc lands. Otherwise, standby.
 
 Run the current binary (with dedup) on a fresh cold reboot if you haven't — the log will at least be cleaner (no dups), and the PTE-DBG + ILR will still show the same GART visibility / pipe stall for the Fable analysis. Always full sudo reset + cold if possible. Update this doc after the run.
+
+## 20. 2026-07-01 20:32 cold-reboot test of the RLC fixes (commit 1c2bd4bf) — no more wedge, same RPTR stall; §19 GART theory disproven; SH-bus liveness now instrumented
+
+**Run:** cold reboot, new binary (verified in-log: 2049 per-word RLC_UCODE_ADDR writes ending at word 0x7FF, correct RLC_MC_CNTL 0xC344 / RLC_UCODE_CNTL 0xC348 programmed, CG-disable path present incl. SERDES 0xC45C=0x00E000FF, clean RLC start: ADDR=0 → LB_CNTL=0 → GRBM_GFX_INDEX broadcast → SPI_LB_CU_MASK=0xFF → PA_CL_ENHANCE=7 → RLC_CNTL=1).
+
+**Wins:**
+1. **The box no longer wedges.** Full run to teardown, DPM disable, clean FAIL summary. Before the fix this scenario hung the fabric. The Bug-2 fix (we were poking RLC_SOFT_RESET_GPU=0 before every fw load) + CG disable likely bought this.
+2. **§19's "GART PTEs are the primary blocker" theory is DISPROVEN.** The CP fetched and executed packets from the GART-mapped ring: "Preamble + GFX CLEAR_STATE + VGT dealloc: idle=1", RPTR advanced to 64 — past cacheinval (wptr 58), the dispatch's compute CLEAR_STATE (60), and through the 4-dword PGM_LO SET_SH packet (60–63). GPU-side VM walk of the ring PTEs works. The `[PTE-DBG] RB0 PTE=FFFF` / `VRAM[0x1000]=0x657984A7` readbacks are a **CPU-side BAR0 read-path** unreliability on cold boot, not GPU-visible table corruption. Stop spending effort on GART fill; it's serviceable.
+
+**Unchanged:**
+- ME wedges exactly on the **first compute-type SET_SH_REG**: fetches the PGM_LO packet (RPTR reaches 64) then freezes mid-execution — RPTR pinned at 64 while WPTR runs to 149, CP_BUSY_STAT=0x802, all CP_STALLED_STAT=0 (no FFFF — good, fabric responsive), all ILR readbacks 0, no waves, dst=0, 0/64.
+
+**§18 tell #1 was INCONCLUSIVE, not failed:**
+- The non-zero SPI reads at init (`SPI_STATIC_THREAD_MGMT_3=0xFFFE`, `SPI_CONFIG_CNTL=0x3000000`) are **GRBM config space** (0x90E8/0x9100) — always readable, prove nothing about SH space.
+- The 0xB858/0xB85C=FFFF MMIO writes had **no immediate readback print** in that build. The only later read (WAVE-PROBE STATIC_SE0=0) happened AFTER the consumed compute CLEAR_STATE at wptr 60 — which legitimately zeroes SH regs. So "0" there cannot distinguish dead-bus from cleared-by-CS.
+
+**Instrumentation added this session (AccelGCNInit.ailang, right after the B858/B85C writes; rebuilt 20:40, MMIO-only):**
+`[§20-PROBE]` block:
+1. Immediate readback of STATIC_SE0/SE1 (0xB858/0xB85C) — no CLEAR_STATE can have run since the write. **0 = SH bus still dead → RLC/CG diagnosis incomplete. 0xFFFFFFFF = bus alive → the wedge is ME-side compute-packet handling (routing/context), per §18 "if 1 holds but 2–5 fail".**
+2. MMIO write 0x5A5A5A5A to COMPUTE_PGM_LO (0xB830) + readback + restore 0 — the exact register the ME wedges on, tested without the ME.
+3. RLC liveness: RLC_CNTL / RLC_CGCG_CGLS_CTRL / RLC_CGTT_MGCG_OVERRIDE / RLC_SERDES_MASTER_BUSY_0/1 readbacks. Compare against working bus-1 card (probe_post_radeon_bind.txt: CGLS_CTRL=0x0020003C, MGCG override low bits SET, SERDES idle).
+
+**Next run (cold reboot, current binary built 20:40):** the three §20-PROBE lines decide the branch:
+- SE0/PGM_LO read back written values + RLC regs match bus-1 → SH bus is up; focus shifts entirely to ME compute-packet handling on ring 0 (CP ucode state, CONTEXT_CONTROL/CLEAR_STATE interaction, kernel phase-16 MMIO diff from §19). Do NOT re-add SRBM_GFX_CNTL (§16 wedges fabric).
+- SE0/PGM_LO still 0 → SH space still unclocked/held: RLC not actually executing (check SERDES_BUSY / CGLS values), or a reset/enable we haven't found. Next lever: readback-verify a few RLC_UCODE_ADDR/DATA words after upload to prove the fw image landed.
