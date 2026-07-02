@@ -1,0 +1,469 @@
+// Library.ThreadPool.ailang
+// Persistent thread pool for parallel matrix operations.
+// Head/tail mailbox ping-pong: no epochs, no done flags, no syscalls.
+//   tail[w] = main increments to signal "work ready"
+//   head[w] = worker writes to match tail, signaling "work done"
+//   Worker polls tail. Main polls head. Pure memory ordering.
+// Self-contained: consumers are the Accel stack (AccelCPU backend) and the
+// TF/ATTN/LLM model runners. Must not import TF/ATTN libraries — the driver
+// stack depends on this file.
+// Moved from Librarys/TF/ 2026-07-01; local TP_* accessors replace TF_Mat/Vec.
+// Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.ThreadTrampoline
+
+// =============================================================================
+// LOCAL BUFFER ACCESSORS
+// Flat row-major buffers, 8 bytes per element: addr = base + (row*W + col)*8.
+// Same layout as the TF stack's TF_Mat/Vec accessors (kept there for model code).
+// =============================================================================
+FixedPool.ThrPoolFx {
+    // Q20 fixed-point scale (2^20) used by the ISGD op — must match ThrPoolFx.FSCALE
+    "FSCALE": Initialize=1048576
+}
+
+Function.TP_MatGet {
+    Input:  mat:   Integer
+    Input:  row:   Integer
+    Input:  col:   Integer
+    Input:  width: Integer
+    Output: Integer
+    Body: {
+        off = Multiply(Add(Multiply(row, width), col), 8)
+        ReturnValue(Dereference(Add(mat, off)))
+    }
+}
+
+Function.TP_MatSet {
+    Input: mat:   Integer
+    Input: row:   Integer
+    Input: col:   Integer
+    Input: width: Integer
+    Input: val:   Integer
+    Body: {
+        off = Multiply(Add(Multiply(row, width), col), 8)
+        StoreValue(Add(mat, off), val)
+        ReturnValue(0)
+    }
+}
+
+Function.TP_VecGet {
+    Input:  vec: Integer
+    Input:  idx: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(Dereference(Add(vec, Multiply(idx, 8))))
+    }
+}
+
+Function.TP_VecSet {
+    Input: vec: Integer
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        StoreValue(Add(vec, Multiply(idx, 8)), val)
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// THREAD POOL STATE
+// =============================================================================
+FixedPool.ThrPool {
+    "num_workers":  Initialize=0     // actual worker count (set at init)
+    "max_workers":  Initialize=7     // max workers (main thread does work too)
+    "initialized":  Initialize=0
+    // Mailbox pointers — per-worker head/tail arrays [max_workers * 8]
+    "p_head":       Initialize=0     // ptr: head[w] — worker-owned, written by worker
+    "p_tail":       Initialize=0     // ptr: tail[w] — main-owned, written by main
+    // Scratch slot for spin loop memory barrier (forces compiler to not hoist reads)
+    "p_scratch":    Initialize=0     // ptr: [max_workers * 8]
+    // Work descriptor — filled by dispatcher before bumping tail
+    "op":           Initialize=0     // 1=MatVecMul, 2=MatTVecMul, 3=OuterAccum, 4=ISGD
+    "dst":          Initialize=0
+    "mat":          Initialize=0
+    "vec":          Initialize=0
+    "rows":         Initialize=0
+    "cols":         Initialize=0
+    "vec2":         Initialize=0     // second vector for OuterAccum (bvec)
+    // Worker TIDs (up to 7)
+    "tid0": Initialize=0
+    "tid1": Initialize=0
+    "tid2": Initialize=0
+    "tid3": Initialize=0
+    "tid4": Initialize=0
+    "tid5": Initialize=0
+    "tid6": Initialize=0
+    // Per-worker row assignments: ptr to [(max_workers+1) * 8] boundary array
+    "assignments":  Initialize=0
+    // Total items for current dispatch (set by caller before ThrPool_Dispatch)
+    "total_items":  Initialize=0
+}
+
+// Minimum dimension to bother parallelizing
+FixedPool.ThrPoolCfg {
+    "min_parallel": Initialize=16
+}
+
+// =============================================================================
+// WORKER ENTRY — each worker gets its ID via user_data
+// Polls tail[id] mailbox. When tail != head, work is available.
+// Does work, then writes head = tail (signals done).
+// Shutdown: tail set to -1 by main.
+// =============================================================================
+Function.ThrPool_WorkerEntry {
+    Input:  worker_id: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[ThrPool] worker ")
+        PrintNumber(worker_id)
+        PrintMessage(" started\n")
+
+        // Cache pointers to my mailbox slots
+        we_head_ptr = Add(ThrPool.p_head, Multiply(worker_id, 8))
+        we_tail_ptr = Add(ThrPool.p_tail, Multiply(worker_id, 8))
+        we_scratch  = Add(ThrPool.p_scratch, Multiply(worker_id, 8))
+        we_my_head = 0
+
+        WhileLoop EqualTo(1, 1) {
+            // Poll my tail — spin until tail != head (work available)
+            // StoreValue inside loop body forces compiler to re-read (memory barrier)
+            we_my_tail = Dereference(we_tail_ptr)
+            WhileLoop EqualTo(we_my_tail, we_my_head) {
+                StoreValue(we_scratch, we_my_tail)
+                we_my_tail = Dereference(we_tail_ptr)
+            }
+
+            // Shutdown: main sets tail to -1
+            IfCondition EqualTo(we_my_tail, Negate(1)) ThenBlock: {
+                ReturnValue(0)
+            }
+
+            // Read my row range from assignments
+            we_assign = ThrPool.assignments
+            we_s_off = Multiply(worker_id, 8)
+            we_start = Dereference(Add(we_assign, we_s_off))
+            we_e_off = Multiply(Add(worker_id, 1), 8)
+            we_end   = Dereference(Add(we_assign, we_e_off))
+
+            // Read work descriptor
+            we_op   = ThrPool.op
+            we_dst  = ThrPool.dst
+            we_mat  = ThrPool.mat
+            we_vec  = ThrPool.vec
+            we_cols = ThrPool.cols
+
+            IfCondition EqualTo(we_op, 1) ThenBlock: {
+                // MatVecMul: dst[row] = dot(mat[row], vec) for my rows
+                we_row = we_start
+                WhileLoop LessThan(we_row, we_end) {
+                    we_sum = 0
+                    we_col = 0
+                    WhileLoop LessThan(we_col, we_cols) {
+                        we_mv = TP_MatGet(we_mat, we_row, we_col, we_cols)
+                        we_vv = TP_VecGet(we_vec, we_col)
+                        we_sum = Add(we_sum, Multiply(we_mv, we_vv))
+                        we_col = Add(we_col, 1)
+                    }
+                    TP_VecSet(we_dst, we_row, we_sum)
+                    we_row = Add(we_row, 1)
+                }
+            }
+
+            IfCondition EqualTo(we_op, 2) ThenBlock: {
+                // MatTVecMul: dst[col] = dot(mat[:,col], vec) for my cols
+                we_rows = ThrPool.rows
+                we_col = we_start
+                WhileLoop LessThan(we_col, we_end) {
+                    we_sum = 0
+                    we_row = 0
+                    WhileLoop LessThan(we_row, we_rows) {
+                        we_mv = TP_MatGet(we_mat, we_row, we_col, we_cols)
+                        we_vv = TP_VecGet(we_vec, we_row)
+                        we_sum = Add(we_sum, Multiply(we_mv, we_vv))
+                        we_row = Add(we_row, 1)
+                    }
+                    TP_VecSet(we_dst, we_col, we_sum)
+                    we_col = Add(we_col, 1)
+                }
+            }
+
+            IfCondition EqualTo(we_op, 3) ThenBlock: {
+                // OuterAccum: grad[row][col] += a[row] * b[col] for my rows
+                we_vec2 = ThrPool.vec2
+                we_row = we_start
+                WhileLoop LessThan(we_row, we_end) {
+                    we_av = TP_VecGet(we_vec, we_row)
+                    we_col = 0
+                    WhileLoop LessThan(we_col, we_cols) {
+                        we_bv  = TP_VecGet(we_vec2, we_col)
+                        we_old = TP_MatGet(we_dst, we_row, we_col, we_cols)
+                        we_nuw = Add(we_old, Multiply(we_av, we_bv))
+                        TP_MatSet(we_dst, we_row, we_col, we_cols, we_nuw)
+                        we_col = Add(we_col, 1)
+                    }
+                    we_row = Add(we_row, 1)
+                }
+            }
+
+            IfCondition EqualTo(we_op, 4) ThenBlock: {
+                // ISGD: w[i] -= (g[i] * lr_num * FSCALE) / lr_den for my elements
+                we_lr_num = we_vec
+                we_lr_den = ThrPool.vec2
+                we_i = we_start
+                WhileLoop LessThan(we_i, we_end) {
+                    we_ioff = Multiply(we_i, 8)
+                    we_g = Dereference(Add(we_mat, we_ioff))
+                    we_w = Dereference(Add(we_dst, we_ioff))
+                    we_upd = Divide(Multiply(Multiply(we_g, we_lr_num), ThrPoolFx.FSCALE), we_lr_den)
+                    StoreValue(Add(we_dst, we_ioff), Subtract(we_w, we_upd))
+                    we_i = Add(we_i, 1)
+                }
+            }
+
+            // Signal done: head = tail (I consumed the message)
+            we_my_head = we_my_tail
+            StoreValue(we_head_ptr, we_my_head)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// INIT — allocate mailbox arrays, spawn persistent workers
+// =============================================================================
+Function.ThrPool_Init {
+    Output: Integer
+    Body: {
+        Thread_Init()
+
+        // Allocate head/tail mailbox arrays + scratch from thread heap
+        ti_mbox_size = Multiply(ThrPool.max_workers, 8)
+        ThrPool.p_head = ThrHeap_Alloc(ti_mbox_size)
+        ThrPool.p_tail = ThrHeap_Alloc(ti_mbox_size)
+        ThrPool.p_scratch = ThrHeap_Alloc(ti_mbox_size)
+
+        // Zero both arrays — head=0, tail=0 means "no work"
+        ti_di = 0
+        WhileLoop LessThan(ti_di, ThrPool.max_workers) {
+            StoreValue(Add(ThrPool.p_head, Multiply(ti_di, 8)), 0)
+            StoreValue(Add(ThrPool.p_tail, Multiply(ti_di, 8)), 0)
+            ti_di = Add(ti_di, 1)
+        }
+
+        // Assignment array: (max_workers+1) boundary entries
+        ti_assign_size = Multiply(Add(ThrPool.max_workers, 1), 8)
+        ThrPool.assignments = ThrHeap_Alloc(ti_assign_size)
+
+        ti_nw = ThrPool.max_workers
+        ti_i = 0
+        WhileLoop LessThan(ti_i, ti_nw) {
+            ti_tid = Thread_Spawn(AddressOf(ThrPool_WorkerEntry), ti_i)
+            IfCondition EqualTo(ti_tid, 0) ThenBlock: {
+                PrintMessage("[ThrPool] spawn failed at worker ")
+                PrintNumber(ti_i)
+                PrintMessage("\n")
+                ti_nw = ti_i
+            } ElseBlock: {
+                IfCondition EqualTo(ti_i, 0) ThenBlock: { ThrPool.tid0 = ti_tid }
+                IfCondition EqualTo(ti_i, 1) ThenBlock: { ThrPool.tid1 = ti_tid }
+                IfCondition EqualTo(ti_i, 2) ThenBlock: { ThrPool.tid2 = ti_tid }
+                IfCondition EqualTo(ti_i, 3) ThenBlock: { ThrPool.tid3 = ti_tid }
+                IfCondition EqualTo(ti_i, 4) ThenBlock: { ThrPool.tid4 = ti_tid }
+                IfCondition EqualTo(ti_i, 5) ThenBlock: { ThrPool.tid5 = ti_tid }
+                IfCondition EqualTo(ti_i, 6) ThenBlock: { ThrPool.tid6 = ti_tid }
+            }
+            ti_i = Add(ti_i, 1)
+        }
+
+        ThrPool.num_workers = ti_nw
+        ThrPool.initialized = 1
+        PrintMessage("[ThrPool] ")
+        PrintNumber(ti_nw)
+        PrintMessage(" workers ready\n")
+        ReturnValue(ti_nw)
+    }
+}
+
+// =============================================================================
+// SHUTDOWN — set tail=-1 for all workers, join them
+// =============================================================================
+Function.ThrPool_Shutdown {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ThrPool.initialized, 1) ThenBlock: {
+            // Signal shutdown: set each worker's tail to -1
+            sd_i = 0
+            WhileLoop LessThan(sd_i, ThrPool.num_workers) {
+                StoreValue(Add(ThrPool.p_tail, Multiply(sd_i, 8)), Negate(1))
+                sd_i = Add(sd_i, 1)
+            }
+
+            // Join all workers
+            sd_i = 0
+            WhileLoop LessThan(sd_i, ThrPool.num_workers) {
+                sd_tid = 0
+                IfCondition EqualTo(sd_i, 0) ThenBlock: { sd_tid = ThrPool.tid0 }
+                IfCondition EqualTo(sd_i, 1) ThenBlock: { sd_tid = ThrPool.tid1 }
+                IfCondition EqualTo(sd_i, 2) ThenBlock: { sd_tid = ThrPool.tid2 }
+                IfCondition EqualTo(sd_i, 3) ThenBlock: { sd_tid = ThrPool.tid3 }
+                IfCondition EqualTo(sd_i, 4) ThenBlock: { sd_tid = ThrPool.tid4 }
+                IfCondition EqualTo(sd_i, 5) ThenBlock: { sd_tid = ThrPool.tid5 }
+                IfCondition EqualTo(sd_i, 6) ThenBlock: { sd_tid = ThrPool.tid6 }
+                IfCondition NotEqual(sd_tid, 0) ThenBlock: {
+                    Thread_Join(sd_tid)
+                }
+                sd_i = Add(sd_i, 1)
+            }
+
+            ThrPool.initialized = 0
+            PrintMessage("[ThrPool] shutdown complete\n")
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// DISPATCH — fill work desc, compute assignments, bump tails, main does chunk,
+//            poll heads until all match tails.
+// Pure memory ordering, zero syscalls.
+// =============================================================================
+Function.ThrPool_Dispatch {
+    Output: Integer
+    Body: {
+        dd_nw = ThrPool.num_workers
+        dd_nchunks = Add(dd_nw, 1)
+
+        // Calculate row/col assignments
+        dd_base = Divide(ThrPool.total_items, dd_nchunks)
+        dd_rem  = Modulo(ThrPool.total_items, dd_nchunks)
+
+        dd_pos = 0
+        dd_i = 0
+        WhileLoop LessThan(dd_i, dd_nchunks) {
+            dd_off = Multiply(dd_i, 8)
+            StoreValue(Add(ThrPool.assignments, dd_off), dd_pos)
+            dd_chunk = dd_base
+            IfCondition LessThan(dd_i, dd_rem) ThenBlock: {
+                dd_chunk = Add(dd_chunk, 1)
+            }
+            dd_pos = Add(dd_pos, dd_chunk)
+            dd_i = Add(dd_i, 1)
+        }
+        // End boundary
+        dd_off = Multiply(dd_nchunks, 8)
+        StoreValue(Add(ThrPool.assignments, dd_off), ThrPool.total_items)
+
+        // Bump each worker's tail — this IS the "go" signal
+        // Worker sees tail != head and starts working
+        dd_i = 0
+        WhileLoop LessThan(dd_i, dd_nw) {
+            dd_tail_addr = Add(ThrPool.p_tail, Multiply(dd_i, 8))
+            dd_old_tail = Dereference(dd_tail_addr)
+            StoreValue(dd_tail_addr, Add(dd_old_tail, 1))
+            dd_i = Add(dd_i, 1)
+        }
+
+        // Main thread does its chunk (the last one = chunk index dd_nw)
+        dd_assign = ThrPool.assignments
+        dd_ms_off = Multiply(dd_nw, 8)
+        dd_main_start = Dereference(Add(dd_assign, dd_ms_off))
+        dd_me_off = Multiply(dd_nchunks, 8)
+        dd_main_end = Dereference(Add(dd_assign, dd_me_off))
+
+        dd_op   = ThrPool.op
+        dd_dst  = ThrPool.dst
+        dd_mat  = ThrPool.mat
+        dd_vec  = ThrPool.vec
+        dd_cols = ThrPool.cols
+
+        IfCondition EqualTo(dd_op, 1) ThenBlock: {
+            dd_row = dd_main_start
+            WhileLoop LessThan(dd_row, dd_main_end) {
+                dd_sum = 0
+                dd_col = 0
+                WhileLoop LessThan(dd_col, dd_cols) {
+                    dd_mv = TP_MatGet(dd_mat, dd_row, dd_col, dd_cols)
+                    dd_vv = TP_VecGet(dd_vec, dd_col)
+                    dd_sum = Add(dd_sum, Multiply(dd_mv, dd_vv))
+                    dd_col = Add(dd_col, 1)
+                }
+                TP_VecSet(dd_dst, dd_row, dd_sum)
+                dd_row = Add(dd_row, 1)
+            }
+        }
+
+        IfCondition EqualTo(dd_op, 2) ThenBlock: {
+            dd_rows = ThrPool.rows
+            dd_col = dd_main_start
+            WhileLoop LessThan(dd_col, dd_main_end) {
+                dd_sum = 0
+                dd_row = 0
+                WhileLoop LessThan(dd_row, dd_rows) {
+                    dd_mv = TP_MatGet(dd_mat, dd_row, dd_col, dd_cols)
+                    dd_vv = TP_VecGet(dd_vec, dd_row)
+                    dd_sum = Add(dd_sum, Multiply(dd_mv, dd_vv))
+                    dd_row = Add(dd_row, 1)
+                }
+                TP_VecSet(dd_dst, dd_col, dd_sum)
+                dd_col = Add(dd_col, 1)
+            }
+        }
+
+        IfCondition EqualTo(dd_op, 3) ThenBlock: {
+            dd_vec2 = ThrPool.vec2
+            dd_row = dd_main_start
+            WhileLoop LessThan(dd_row, dd_main_end) {
+                dd_av = TP_VecGet(dd_vec, dd_row)
+                dd_col = 0
+                WhileLoop LessThan(dd_col, dd_cols) {
+                    dd_bv  = TP_VecGet(dd_vec2, dd_col)
+                    dd_old = TP_MatGet(dd_dst, dd_row, dd_col, dd_cols)
+                    dd_nuw = Add(dd_old, Multiply(dd_av, dd_bv))
+                    TP_MatSet(dd_dst, dd_row, dd_col, dd_cols, dd_nuw)
+                    dd_col = Add(dd_col, 1)
+                }
+                dd_row = Add(dd_row, 1)
+            }
+        }
+
+        IfCondition EqualTo(dd_op, 4) ThenBlock: {
+            // ISGD: w[i] -= (g[i] * lr_num * FSCALE) / lr_den for my elements
+            dd_lr_num = dd_vec
+            dd_lr_den = ThrPool.vec2
+            dd_i = dd_main_start
+            WhileLoop LessThan(dd_i, dd_main_end) {
+                dd_ioff = Multiply(dd_i, 8)
+                dd_g = Dereference(Add(dd_mat, dd_ioff))
+                dd_w = Dereference(Add(dd_dst, dd_ioff))
+                dd_upd = Divide(Multiply(Multiply(dd_g, dd_lr_num), ThrPoolFx.FSCALE), dd_lr_den)
+                StoreValue(Add(dd_dst, dd_ioff), Subtract(dd_w, dd_upd))
+                dd_i = Add(dd_i, 1)
+            }
+        }
+
+        // Poll heads — wait for each worker's head to match its tail
+        // head == tail means worker consumed the message (done)
+        // StoreValue inside loop body forces compiler to re-read (memory barrier)
+        dd_i = 0
+        WhileLoop LessThan(dd_i, dd_nw) {
+            dd_head_addr = Add(ThrPool.p_head, Multiply(dd_i, 8))
+            dd_tail_addr = Add(ThrPool.p_tail, Multiply(dd_i, 8))
+            dd_scratch_addr = Add(ThrPool.p_scratch, Multiply(dd_i, 8))
+            dd_expect = Dereference(dd_tail_addr)
+            dd_cur_head = Dereference(dd_head_addr)
+            WhileLoop NotEqual(dd_cur_head, dd_expect) {
+                StoreValue(dd_scratch_addr, dd_cur_head)
+                dd_cur_head = Dereference(dd_head_addr)
+            }
+            dd_i = Add(dd_i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// The TF-side parallel wrappers live in Librarys/TF/Library.Mat.ailang —
+// TF_MatVecMul, TF_MatTVecMul, and TF_OuterAccum check ThrPool.initialized
+// and dispatch to ThrPool_Dispatch() when the pool is active and the matrix
+// is large enough (>= ThrPoolCfg.min_parallel). AccelCPU fills the ThrPool
+// work descriptor and calls ThrPool_Dispatch directly.
