@@ -120,6 +120,39 @@ If still stalls at the compute SET_SH, the Fable doc will give the clear path; w
 
 The "stupid simple matching behavior" is now in for the FW load order. The log will tell if it unblocks the compute pipe.
 
+## 18. 2026-07-01 ROOT CAUSE FOUND (cross-check of bus2_all.txt vs gfx_v6_0.c vs our init): RLC firmware never loaded + gating enabled on dead RLC
+
+Evidence sweep compared the kernel mmiotrace, amdgpu gfx_v6_0.c source, probe_pre/post_radeon_bind.txt, and our_mmiotrace.txt. Three independent bugs in the RLC/CG area, all fixed and rebuilt (binary 2026-07-01 19:53):
+
+**Bug 1 — RLC ucode upload assumed ADDR autoincrement. It doesn't.**
+Kernel writes `RLC_UCODE_ADDR=i` before EVERY data word (bus2_all seqs 329397-333493: 2048 alternating ADDR/DATA pairs). Our loader wrote ADDR=0 once then streamed 2048 DATA writes — the entire firmware landed on word 0. The RLC was "started" but running garbage.
+Fix: per-word ADDR write in PM4_LoadRLCFirmware (Library.AMDGPUPM4FW.ailang).
+
+**Bug 2 — decimal typos in two RLC register offsets (Library.AMDGPUPM4Regs.ailang).**
+- RLC_MC_CNTL was 50004 = 0xC354; correct is 49988 = 0xC344.
+- RLC_UCODE_CNTL was 50008 = 0xC358 = **RLC_SOFT_RESET_GPU** (!); correct is 49992 = 0xC348.
+Neither reg was ever programmed; we were poking RLC_SOFT_RESET_GPU with 0 before each fw load. Also: MC_SI golden write "RLC_GPM_UCODE_ADDR=0x80010014 (seq 3708)" was transcribed to 0xC32C (RLC_UCODE_ADDR) — the decoder mislabels 0xC30C, which is RLC_LB_CNTL. Fixed to 49932/0xC30C.
+
+**Bug 3 — clock gating ENABLED and handed to the (dead) RLC.**
+PM4_LoadRLCFirmware ran the mgcg/cgcg ENABLE handshakes (0x00D000FF/0x00B000FF, cleared MGCG_OVERRIDE low bits, set CGCG_EN|CGLS_EN). With a non-functional RLC the SPI/SQ blocks stay clock-gated forever. This is the exact observed signature: SH-space regs (0xB858 etc.) read 0 and MMIO writes don't stick, CP-block regs fine, ME wedges on the first compute SET_SH_REG (RPTR frozen, CP_BUSY_STAT=0x802, no stall bits) waiting for a register-bus ack.
+probe_post_radeon_bind.txt confirms the working bus1 card sits with CGCG/CGLS DISABLED (RLC_CGCG_CGLS_CTRL=0x0020003C) and MGCG override bits SET.
+Fix: replaced with the kernel DISABLE paths (gfx_v6_0_enable_cgcg/mgcg(false)): 4x CB_CGTT_SCLK_CTRL dummy reads, CGLS_CTRL &= ~3, MGCG_OVERRIDE |= 3, CP_MEM_SLP_CNTL bit0 cleared, CGTS_SM_CTRL_REG |= 0x600000 (LS_OVERRIDE|OVERRIDE), SERDES broadcast 0x00E000FF. No block's clock now depends on RLC behavior.
+
+**Also fixed:**
+- PM4_CPStart order restored to kernel order: ME_INIT+SET_BASE committed (WPTR MMIO write) while HALTED, then unhalt (trace seqs 439962→439964: WR CP_RB0_WPTR=0x100 then WR CP_ME_CNTL=0). §17's "unhalt first" was a misreading.
+- GB_ADDR_CONFIG golden write back to 0x02010002 (seq 3703); the 0x12010002 ROW_SIZE-adjusted write later matches seq 329279.
+- Build fix: github merge deleted tracked Librarys/TF files while ignored stragglers still call TF_MatGet; restored Library.Float/Layer/Mat/Math/Vec.ailang from pre-merge commit 7800e83c (untracked, gitignored).
+
+**What to expect on the next cold-reboot run:**
+1. Init: `[AccelGCN] SPI_STATIC_THREAD_MGMT_SE0/SE1 set via MMIO` — the 0xB858/0xB85C writes should now READ BACK 0xFFFFFFFF (previously always 0). This is the first tell that SPI is unclocked no more.
+2. §14-ILR: SET_SH_REG readbacks should equal written values (PGM_LO=0xF44A0720 etc.).
+3. RPTR should advance past the first compute SET_SH (no more WaitIdle stall at ~62-64).
+4. WAVE-PROBE: SPI_DEBUG_BUSY / SQ_DEBUG_STS_GLOBAL non-zero during dispatch.
+5. dst[i]=42.
+If 1 holds but 2-5 fail, the remaining gap is compute context (SRBM/pipe) — but retest first; everything downstream was diagnosed while SPI/SQ were unclocked, so all prior §12-§17 conclusions about SET_SH/CS behavior are suspect.
+
+If it still stalls: capture the log; do NOT re-add the SRBM_GFX_CNTL experiment (§16 showed it wedges the fabric).
+
 ## 17. Cold reboot run - GART good, dispatch reaches first compute SET_SH but stalls (RPTR=62)
 The log shows GART success (skipping bulk, 0 failures, GART initialized, SPI MMIO base set).
 
