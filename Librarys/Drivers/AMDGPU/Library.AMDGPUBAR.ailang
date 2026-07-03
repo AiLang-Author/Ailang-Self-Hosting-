@@ -272,8 +272,12 @@ Function.GPU_BAR_Enable {
         PrintHex(Add(cmd_lo, Multiply(cmd_hi, 256)))
         PrintMessage("\n")
 
-        // Set bit 1 (Memory Space) and bit 2 (Bus Master)
-        cmd_lo = BitwiseOr(cmd_lo, 6)
+        // Set bit 0 (I/O Space), bit 1 (Memory Space), bit 2 (Bus Master).
+        // I/O bit added §37 (2026-07-02): the working amdgpu boot logs
+        // "enabling device (0006 -> 0007)" — pci_enable_device sets I/O decode
+        // because the card has an I/O BAR. Mirror the kernel exactly; this was
+        // one of the last two config-space divergences (the other is MSI).
+        cmd_lo = BitwiseOr(cmd_lo, 7)
         SetByte(buf, 0, cmd_lo)
 
         // Write back COMMAND register at offset 4
@@ -323,6 +327,128 @@ Function.GPU_BAR_Enable {
 
         // If we can't verify, assume success
         StoreValue(Add(state, GPUBarField.ENABLED), 1)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_EnableMSI — §39: mirror the working boot's MSI programming exactly.
+// Captured live 2026-07-02 23:13 (pci_working_boot/gpu_working.txt, amdgpu
+// bound, bringup verified): cap @0xa0, ctrl=0x0081 (Enable, 64-bit),
+// Address=0x00000000FEE15000 (xAPIC dest 0x15 = CPU5 on this FX-8320,
+// no AMD-Vi/IR on RD990), Data=0x0022 (vector 0x22, edge, fixed).
+// COMMAND gains DisINTx (bit 10): working boot = 0x0407, not 0x0007.
+// Write order matches msi_capability_init(): addr/data first, then
+// pci_intx_for_msi(0) (DisINTx), then the MSI enable bit.
+// Call site: A1/A2 boundary of the replay (radeon_irq_kms_init runs after
+// device init, before si_startup). Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.GPU_BAR_EnableMSI {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        // LOCKOUT: never touch the display GPU
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(index), 1) ThenBlock: {
+            IfCondition EqualTo(GPUBarLockout.allow_display, 0) ThenBlock: {
+                PrintMessage("[AMDGPU BAR] LOCKOUT: refusing MSI enable on display GPU (bus 01)\n")
+                ReturnValue(0)
+            }
+        }
+
+        path = GPU_BAR_BuildResPath(index, "config")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDWR, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[§39] Cannot open PCI config for MSI enable\n")
+            ReturnValue(0)
+        }
+
+        buf = Allocate(8)
+
+        // Sanity: cap ID at 0xa0 must be 0x05 (MSI) — abort rather than
+        // scribble on the wrong capability if the card ever differs.
+        SystemCall(GPUSys.SYS_LSEEK, fd, 160, 0, 0, 0)
+        nr = SystemCall(GPUSys.SYS_READ, fd, buf, 4, 0, 0)
+        cap_id = GetByte(buf, 0)
+        ctrl_before = Add(GetByte(buf, 2), Multiply(GetByte(buf, 3), 256))
+        IfCondition NotEqual(cap_id, 5) ThenBlock: {
+            PrintMessage("[§39] ABORT: cap @0xa0 is not MSI (id=0x")
+            PrintHex(cap_id)
+            PrintMessage(")\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(buf, 8)
+            ReturnValue(0)
+        }
+        PrintMessage("[§39] MSI ctrl before: 0x")
+        PrintHex(ctrl_before)
+        PrintMessage("\n")
+
+        // 1) Message address low @0xa4 = 0xFEE15000
+        SetByte(buf, 0, 0)     // 00
+        SetByte(buf, 1, 80)    // 0x50
+        SetByte(buf, 2, 225)   // 0xE1
+        SetByte(buf, 3, 254)   // 0xFE
+        SystemCall(GPUSys.SYS_LSEEK, fd, 164, 0, 0, 0)
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, buf, 4, 0, 0)
+        IfCondition LessThan(nw, 4) ThenBlock: {
+            PrintMessage("[§39] MSI address write failed\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(buf, 8)
+            ReturnValue(0)
+        }
+
+        // 2) Message address high @0xa8 = 0
+        SetByte(buf, 0, 0)
+        SetByte(buf, 1, 0)
+        SetByte(buf, 2, 0)
+        SetByte(buf, 3, 0)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 168, 0, 0, 0)
+        SystemCall(GPUSys.SYS_WRITE, fd, buf, 4, 0, 0)
+
+        // 3) Message data @0xac = 0x0022 (64-bit cap: data at cap+0x0C)
+        SetByte(buf, 0, 34)    // 0x22
+        SetByte(buf, 1, 0)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 172, 0, 0, 0)
+        SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+
+        // 4) COMMAND |= DisINTx (bit 10): 0x0007 -> 0x0407 (working-boot value)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        SystemCall(GPUSys.SYS_READ, fd, buf, 2, 0, 0)
+        SetByte(buf, 1, BitwiseOr(GetByte(buf, 1), 4))   // hi byte bit 2 = bit 10
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+
+        // 5) MSI ctrl @0xa2 = 0x0081 (Enable=1, 64-bit; Count=1)
+        SetByte(buf, 0, 129)   // 0x81
+        SetByte(buf, 1, 0)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 162, 0, 0, 0)
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+        IfCondition LessThan(nw, 2) ThenBlock: {
+            PrintMessage("[§39] MSI ctrl write failed\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(buf, 8)
+            ReturnValue(0)
+        }
+
+        // Verify: re-read ctrl + COMMAND
+        SystemCall(GPUSys.SYS_LSEEK, fd, 162, 0, 0, 0)
+        SystemCall(GPUSys.SYS_READ, fd, buf, 2, 0, 0)
+        ctrl_after = Add(GetByte(buf, 0), Multiply(GetByte(buf, 1), 256))
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        SystemCall(GPUSys.SYS_READ, fd, buf, 2, 0, 0)
+        cmd_after = Add(GetByte(buf, 0), Multiply(GetByte(buf, 1), 256))
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        Deallocate(buf, 8)
+
+        PrintMessage("[§39] MSI ctrl after: 0x")
+        PrintHex(ctrl_after)
+        PrintMessage("  COMMAND: 0x")
+        PrintHex(cmd_after)
+        PrintMessage(" (want ctrl 0x81, COMMAND 0x407)\n")
+        IfCondition NotEqual(BitwiseAnd(ctrl_after, 1), 1) ThenBlock: {
+            PrintMessage("[§39] MSI enable bit did not stick\n")
+            ReturnValue(0)
+        }
         ReturnValue(1)
     }
 }
