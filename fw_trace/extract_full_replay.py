@@ -98,7 +98,14 @@ NAMED = {
 for i in range(32):
     NAMED[f'GB_TILE_MODE{i}'] = 0x9910 + i * 4
 
-FORBIDDEN = {0x2C00, 0x2F4C}
+# §35 (2026-07-02, Sean-approved): HDP_HOST_PATH_CNTL 0x2C00 / HDP_MISC_CNTL
+# 0x2F4C are NO LONGER skipped. They were the only intentional divergences in
+# the replay; the VBIOS writes them at seq 130/131 on every working boot of
+# this box (values 0x0F200029 / 0x00121FE0), and skipping them left our HDP
+# at power-on state — prime suspect for the CPU->VRAM write corruption and
+# the RLC never reading valid CSB content. RULE 1 in gpu-crash.md now permits
+# kernel-verbatim replay of these regs (ad-hoc writes remain forbidden).
+FORBIDDEN = set()
 
 rx = re.compile(r'^\s*(\d+)\s+\[b2\]\s+(RD|WR)\s+(\S+)\s+=\s+0x([0-9A-Fa-f]+)')
 prot = re.compile(r'HDP_PROT_BUF(\d+)\+0x([0-9a-fA-F]+)')

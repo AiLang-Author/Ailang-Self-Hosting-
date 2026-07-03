@@ -10,7 +10,8 @@ References below like "archive §24" point there.
 ## 0. HARD RULES (summary — gpu-crash.md is authoritative)
 
 1. NEVER touch the DISPLAY GPU (bus 1 / 01:00.0). Guards stay. Every run logs `using GPU N (bus 2)`.
-2. NEVER write HDP_HOST_PATH_CNTL (0x2C00) / HDP_MISC_CNTL (0x2F4C) — RD990 fabric deadlock.
+2. HDP_HOST_PATH_CNTL (0x2C00) / HDP_MISC_CNTL (0x2F4C): kernel-verbatim replay values at
+   kernel trace positions ONLY (amended 2026-07-02, §1b) — ad-hoc writes still deadlock.
 3. NEVER write PCI config 0x7c (ASIC reset) — fabric hangs. gpu_reset.sh is deleted; do not recreate.
 4. NEVER re-add SRBM_GFX_CNTL pokes (archive §16 — wedges fabric).
 5. `gpu-mmiotrace.service` stays DISABLED (archive §32). Re-enable only to capture new traces on purpose.
@@ -38,16 +39,54 @@ truncated file survives — the §33 numbers above live only in this doc now) an
 froze the box mid-A1 at ~record 1731 (the CG_SPLL 0x600 block). The seq-7 oracle in that
 log reads 0x400 = card was POSTed ⇒ warm-entry replay, §32's predicted freeze mode, now
 twice-confirmed. The harness now refuses to start on a posted card (§34 guard below).
-Boot 20:34:58 is a true cold boot with the service disabled — the card is test-ready.
+
+## 1b. §34 COLD RUN (2026-07-02 ~21:10) — threads (a)/(b)-as-built dead; trace re-read
+## reveals the misread poll AND fingers the RULE-1 HDP skip as the last divergence
+
+The §34 binary ran on a true cold boot, clean: cold guard passed, PCI COMMAND 0x0→0x6
+(bus master enabled from cold — thread (c) closed for good), SR/CSB/ring content loaded,
+BAR0 oracles clean (only MC training + strobe-port artifacts + ring-test reads).
+**RLC_STAT still 0x6 after 2M paced reads; ring tests still fail.** With that, re-reading
+bus2_all.txt raw produced three corrections that reshape the lead:
+
+1. **The kernel never polled RLC_STAT 0x6→0x7.** Its FIRST read after RLC_CNTL=1
+   (seq 333505) is already 0x7 — the working RLC is busy INSTANTLY. The "300k-read boot
+   poll" is actually three 100,000-read timeout loops of
+   `gfx_v6_0_enable_gui_idle_interrupt(enable=false)` waiting for RLC busy to CLEAR —
+   they never succeed even on working hardware (0x7 forever) and time out harmlessly.
+   RLC_BUSY=1 is the RLC's normal running state. Wall-clock (thread a) is dead forever.
+2. **The 0x728 A1 mismatches are a pacing artifact, fully benign:** 0x728 is a
+   self-clearing strobe port (ATOM writes value|1, bit0 drops on completion). The
+   kernel's fast read-after-write catches bit0 still set; our 1 ms-paced oracle read
+   sees it already clear. Same data, different sample time. Dead.
+3. **The ONLY remaining intentional divergence was the RULE-1 HDP skip — and it is
+   load-bearing.** The VBIOS writes HDP_HOST_PATH_CNTL=0x0F200029 + HDP_MISC_CNTL=
+   0x00121FE0 at trace seq 130/131, i.e. the working boot configures the CPU→VRAM host
+   path 130 writes into POST; the kernel echoes 0x2C00 at seq 329374 (read-modify-
+   rewrite in gfx_v6_0_gpu_init). We skipped all three writes, so OUR HDP has been at
+   power-on state in every run ever — explaining the entire historic CPU→VRAM
+   corruption family (VRAM diag garbage, PTE readback FFFF, Known Issue 2), and it
+   means the §34 SR/CSB content was likely written through a broken path and never
+   landed intact — the RLC would halt reading a garbage clear-state descriptor, which
+   is exactly RLC_BUSY=0.
+
+**§35 (Sean-approved 2026-07-02): the HDP skip is removed.** extract_full_replay.py
+FORBIDDEN list emptied, tables regenerated (WR 21553→21556, SKIP 0), gpu-crash.md RULE 1
+amended (kernel-verbatim values at kernel positions only). The next cold run is the
+first 100%-verbatim replay with zero intentional divergences — and the first fair test
+of the (b) content, since CPU→VRAM writes may finally land intact.
 
 ## 2. LIVE THREADS (everything else is §3)
 
-**(a) RLC poll wall-clock** — our 2M unpaced reads ≈ 3 s; the kernel's 300k reads ran under
-mmiotrace (pagefault per access), plausibly much longer. Poll reads now paced 15 µs (~33 s max)
-and the harness verdict print is now computed, not hardcoded (archive §33 bug). Binary rebuilt.
-A timeout on the next run means "never", not "too soon".
+**(§35) HDP un-skip — THE armed experiment.** See §1b. Tables regenerated with the three
+HDP writes verbatim; binary already on disk needs no rebuild (tables load at runtime).
+One cold run answers: does a zero-divergence replay with a configured HDP host path bring
+the RLC up (busy on first read) and let the CSB/SR/ring content land?
 
-**(b) Memory-side content the trace can't carry — ARMED in the harness (§34, built 2026-07-02):**
+**(b) Memory-side content — in the harness (§34), but untested until §35 lands:** the
+content writes go CPU→FB-BAR→VRAM, the exact path the HDP skip has been corrupting; the
+§34 run's "content loaded" prints prove the CPU-side writes happened, not that VRAM holds
+them. Re-judged on the §35 run. Details:
 the replay wrote the kernel's RLC_SAVE_AND_RESTORE_BASE / RLC_CLEAR_STATE_RESTORE_BASE
 register values (0xF4002010/0xF4002020, A2 seq 329387/329388) but populated NOTHING at
 those addresses. Now: `fw_trace/extract_rlc_content.py` generates from the kernel source
@@ -61,16 +100,19 @@ The harness writes SR/CSB after GART_Init (those VRAM bytes double as never-walk
 PTE slots that GART_Init's fill sweeps). Caveat: source is the amdgpu port, trace was
 radeon — same origin code, but if something's off it shows here.
 
-**(c) Non-BAR0 device state — mostly closed 2026-07-02:**
-- PCI bus master: NOT the problem — `GPU_BAR_Enable` sets COMMAND Mem+BusMaster (0x6)
-  before every replay and logs before/after. On the next cold log expect
-  `before: 0x0 → after: 0x6`; anything else IS a finding.
-- Remaining long shots: si.c config-space writes (pcie gen switching, MSI — kernel does
-  them, likely non-essential for compute bringup), legacy VGA routing. Only chase if
-  (a)+(b) both come back clean.
+**(c) remnant — config-space long shots** (si.c pcie-gen switching, MSI, VGA routing):
+only if §35 comes back clean and RLC is still dead. Bus master itself is CLOSED — §34 cold
+run logged `COMMAND before: 0x0 → after: 0x6`.
 
 Parked symptom: CP→GART RPTR writeback never lands in host RAM (archive §28.5) — rechecks
-itself for free once ring tests are re-run with (b) in place.
+itself for free once ring tests re-run after §35.
+
+**If §35 fails too:** the last unexplored channel is memory-side capture — re-enable
+gpu-mmiotrace.service ONCE with the FB BAR also traced (mmiotrace hooks all ioremaps;
+check whether the amdgpu capture script filtered to the reg BAR), giving the kernel's
+VRAM-side writes verbatim instead of source-reconstructed. Note: the 61 MB timestamped
+amdgpu raw log referenced in archive §32 is NOT in mmiotrace_boot/ anymore — locate or
+recapture before relying on it.
 
 ## 3. RULED OUT — do not re-litigate (evidence in parentheses)
 
@@ -100,6 +142,12 @@ itself for free once ring tests are re-run with (b) in place.
 - "GART PTEs corrupt GPU-side" (§19): CPU BAR0 *readback* of VRAM is unreliable cold; GPU-side walk was fine.
 - Every conclusion from any boot between Jun 19 and §32: `gpu-mmiotrace.service` amdgpu-inited bus 2 on EVERY boot — no test in §8–§31 was cold. They were "post-amdgpu-teardown" tests (a different, still-reproducible state).
 
+**Killed by the §34 cold run + trace re-read (2026-07-02 late):**
+- RLC poll wall-clock: kernel RLC is busy on its FIRST read after RLC_CNTL=1 (seq 333505 = 0x7); no boot poll ever existed. 2M paced reads on ours never left 0x6.
+- PCI bus master: enabled from cold by GPU_BAR_Enable (logged 0x0→0x6), replay still fails.
+- 0x728 A1 mismatches: self-clearing strobe port + our 1 ms pacing = sample-time artifact.
+- "300k-read RLC_STAT poll": three 100k-read wait-for-idle timeout loops (gfx_v6_0_enable_gui_idle_interrupt(false)) that never succeed on ANY hardware — extractor's POLL-until-0x7 semantic was wrong but harmless.
+
 **Instrumentation false signals (calibration for reading future logs):**
 - RPTR==WPTR ≠ executed (fetch position). PM4_WaitIdle idle=1 is a fetch-position false positive.
 - CP_STAT=0x800001E3 has NO kernel baseline (kernel never reads it); busy-bits can mean parked OR wedged.
@@ -125,18 +173,18 @@ sudo ./test_replay_init 2>&1 | while IFS= read -r l; do printf '%s\n' "$l"; prin
   An abort means the boot wasn't cold — reboot; do not work around the guard.
 - Freeze localization: last `[§30-AT]` breadcrumb (every 100 records) → look seq range up in `fw_trace/FULL_REPLAY_A1/2.txt` BEFORE any new theory.
 
-**Read order for the next log (binary built 2026-07-02 with §34: cold guard +
-paced polls + honest verdict + SR/CSB/default-state content):**
-1. `[§34] cold entry confirmed` + `PCI COMMAND before: 0x0 after: 0x6` — entry state sane.
-2. `[§34] RLC SR content: 218 dw … CSB … 972 dw` + `RB0 default state: 906 dwords` — content landed.
-3. **`RLC_STAT 0xC34C` POLL line — THE verdict on threads (a)+(b):**
-   hit=1 ⇒ RLC solved (content and/or wall-clock was the story) — read on.
-   Still 0x6 after ~33 s paced ⇒ hypotheses (a) AND (b) both dead for RLC; the RLC's
-   blocker is deeper non-MMIO state — next lever is the (c) long-shot list, then
-   comparing against the amdgpu 61 MB timestamped trace (§5).
+**Read order for the next log (§35 run: same binary, regenerated tables with HDP verbatim):**
+1. `[§34] cold entry confirmed` + `PCI COMMAND before: 0x0 after: 0x6` — entry sane.
+2. A1 record ~97-98 region (seq 130/131): the HDP writes now execute — if the box wedges
+   HERE, RULE 1's ad-hoc-write danger extends to verbatim replay too; last breadcrumb
+   localizes it. (Not expected: VBIOS does this write on every boot of this box.)
+3. **`RLC_STAT 0xC34C` POLL — expect hit=1 with reads≈0 if HDP was the story**
+   (kernel is busy on its first read). Any hit=1 ⇒ RLC solved; still 0x6 ⇒ HDP wasn't
+   it either ⇒ go to §2 "if §35 fails" (FB-BAR capture).
 4. Three ring-test lines `reg=0x8500 want=0xDEADBEEF hit=` — hit=1 = first ME execution
    ever = cold CP bringup solved.
-5. `[§30-MIS]` lines + first_divergence_seq — judge by register class (calibration regs are noise).
+5. `[§30-MIS]` count — expect the 0x2C00 oracle mismatch at seq 329373 to DISAPPEAR
+   (we now write it). Remaining noise: 0x728 strobe artifacts, MC training data.
 6. dst=42 remains the endgame metric (separate dispatch test after replay-init succeeds).
 
 ## 5. KEY ASSETS

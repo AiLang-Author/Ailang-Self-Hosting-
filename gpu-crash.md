@@ -34,10 +34,16 @@
 
 ## RULES
 
-1. **NEVER write `HDP_HOST_PATH_CNTL` (0x2C00) or `HDP_MISC_CNTL` (0x2F4C).**
-   Both deadlock the RD990 PCIe fabric (CPU and GPU side). Other HDP registers are fine —
-   `HDP_NONSURFACE_BASE` (0x2C04), `HDP_ADDR_CONFIG` (0x2F48), and the protection buffers
-   (0x2C14+) are safe and match what the kernel writes.
+1. **`HDP_HOST_PATH_CNTL` (0x2C00) / `HDP_MISC_CNTL` (0x2F4C): kernel-verbatim only.**
+   AMENDED 2026-07-02 (Sean-approved): ad-hoc writes remain forbidden (Crash #2, Jun 16,
+   deadlocked the RD990 fabric), but replaying the KERNEL'S values at the KERNEL'S trace
+   positions is permitted — the VBIOS writes 0x2C00=0x0F200029 / 0x2F4C=0x00121FE0 at
+   trace seq 130/131 on every working boot of this box (kernel echoes 0x2C00 at 329374),
+   and skipping them left our HDP at power-on state: prime suspect for the historic
+   CPU→VRAM write corruption (Known Issue 2, VRAM diag garbage, PTE readback garbage).
+   Never write any OTHER value to these regs, and never write them outside the ATOM-init
+   sequence position. Other HDP registers are fine — `HDP_NONSURFACE_BASE` (0x2C04),
+   `HDP_ADDR_CONFIG` (0x2F48), and the protection buffers (0x2C14+) match the kernel.
    `HDP_MEM_COHERENCY_FLUSH_CNTL` (0x5480) is also safe (different block, write-cache drain).
 
 2. **NEVER run MC_SI_*, PM4_SoftResetCP, PM4_HaltCP, or AtomExec_AsicInit on the display GPU (bus 1).**
