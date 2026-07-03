@@ -80,6 +80,10 @@ FixedPool.RingConf {
     "VRAM_RING_OFFSET":     Initialize=100663296  // Ring starts at 96MB into VRAM (past 90MB GART page table)
     "VRAM_TOTAL_ALLOC":     Initialize=69632      // 64KB ring + 4KB writeback area
     "MAX_RINGS":            Initialize=4          // We support up to 4 rings
+    // §44c bisect: 1 = rings + RPTR writeback live in VRAM (the pre-7800e83c
+    // working layout, CP fetch bypasses GART PTEs via the system aperture);
+    // 0 = GART-backed system RAM. IB/data/shader/CSB placement unaffected.
+    "RINGS_IN_VRAM":        Initialize=1
 }
 
 // =============================================================================
@@ -556,15 +560,38 @@ Function.PM4_SetupRing {
             gart_va = BitwiseOr(LeftShift(GARTConf.CPRB2_GPU_VA_HI, 32), GARTConf.CPRB2_GPU_VA_LO)
         }
 
-        // Zero out the ring buffer via host pointer (system RAM)
-        MemorySet(gart_host, 0, RingConf.RING_SIZE_BYTES)
+        // §44c: VRAM mode — override the GART placement. Ring at vram_offset,
+        // RPTR writeback right after it. MC addresses land inside the system
+        // aperture, so CP fetch/writeback bypass the page table entirely.
+        wb_vram_off = Add(vram_offset, RingConf.RPTR_WB_OFFSET)
+        IfCondition EqualTo(RingConf.RINGS_IN_VRAM, 1) ThenBlock: {
+            gart_host = 0
+            gart_va = PM4_VramToGPU(vram_offset)
+        }
 
-        // RPTR writeback: use a 256-byte slot in the GART WB page per ring
-        wb_gart_va = BitwiseOr(LeftShift(GARTConf.CPRB_WB_GPU_VA_HI, 32), Add(GARTConf.CPRB_WB_GPU_VA_LO, Multiply(ring_idx, 256)))
-        wb_host = Add(GARTState.cprb_wb_host_ptr, Multiply(ring_idx, 256))
-
-        // Zero the writeback slot
-        MemorySet(wb_host, 0, 256)
+        // Zero the ring buffer + writeback slot
+        IfCondition NotEqual(gart_host, 0) ThenBlock: {
+            // GART path: host pointer into system RAM
+            MemorySet(gart_host, 0, RingConf.RING_SIZE_BYTES)
+            wb_gart_va = BitwiseOr(LeftShift(GARTConf.CPRB_WB_GPU_VA_HI, 32), Add(GARTConf.CPRB_WB_GPU_VA_LO, Multiply(ring_idx, 256)))
+            wb_host = Add(GARTState.cprb_wb_host_ptr, Multiply(ring_idx, 256))
+            MemorySet(wb_host, 0, 256)
+        }
+        IfCondition EqualTo(gart_host, 0) ThenBlock: {
+            // VRAM path: zero via BAR0
+            z_i = 0
+            WhileLoop LessThan(z_i, RingConf.RING_SIZE_BYTES) {
+                GPU_VramWr32(gpu, Add(vram_offset, z_i), 0)
+                z_i = Add(z_i, 4)
+            }
+            z_i = 0
+            WhileLoop LessThan(z_i, 256) {
+                GPU_VramWr32(gpu, Add(wb_vram_off, z_i), 0)
+                z_i = Add(z_i, 4)
+            }
+            wb_gart_va = PM4_VramToGPU(wb_vram_off)
+            wb_host = 0
+        }
 
         // Select registers
         IfCondition EqualTo(ring_idx, 0) ThenBlock: {
@@ -645,8 +672,14 @@ Function.PM4_SetupRing {
         StoreValue(Add(ring, RingField.VRAM_BASE), vram_offset)
         StoreValue(Add(ring, RingField.RING_SIZE), RingConf.RING_SIZE_DWORDS)
         StoreValue(Add(ring, RingField.WPTR), 0)
-        // RPTR_WB_ADDR: store the host pointer for reading RPTR writeback
-        StoreValue(Add(ring, RingField.RPTR_WB_ADDR), wb_host)
+        // RPTR_WB_ADDR: host pointer (GART mode) or VRAM byte offset (VRAM
+        // mode, WB_HOST_PTR==0 selects the GPU_VramRd32 path in ReadRPTR)
+        IfCondition NotEqual(wb_host, 0) ThenBlock: {
+            StoreValue(Add(ring, RingField.RPTR_WB_ADDR), wb_host)
+        }
+        IfCondition EqualTo(wb_host, 0) ThenBlock: {
+            StoreValue(Add(ring, RingField.RPTR_WB_ADDR), wb_vram_off)
+        }
         StoreValue(Add(ring, RingField.FENCE_VAL), 0)
         // Fence writeback stays in VRAM (dispatch path uses GPU_VramWr32 + PM4_VramToGPU)
         // Place it at vram_offset + RING_SIZE_BYTES + 64 (just past where RPTR WB used to be)
@@ -691,11 +724,14 @@ Function.PM4_ReadRPTR {
         ring = PM4_GetRing(ring_idx)
         IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
 
-        // RPTR_WB_ADDR now holds a host pointer into the GART WB page
+        // GART mode: RPTR_WB_ADDR is a host pointer into the GART WB page.
+        // VRAM mode (WB_HOST_PTR==0): RPTR_WB_ADDR is a VRAM byte offset.
         rptr_wb = Dereference(Add(ring, RingField.RPTR_WB_ADDR))
-
-        // Read RPTR from writeback location in system RAM (host memory)
-        ReturnValue(Dereference(rptr_wb, "dword"))
+        IfCondition NotEqual(Dereference(Add(ring, RingField.WB_HOST_PTR)), 0) ThenBlock: {
+            ReturnValue(Dereference(rptr_wb, "dword"))
+        }
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        ReturnValue(GPU_VramRd32(gpu, rptr_wb))
     }
 }
 
