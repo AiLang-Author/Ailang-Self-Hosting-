@@ -381,12 +381,16 @@ Function.SMC_SI_LoadFirmware {
             ReturnValue(-1)
         }
 
-        // Get chip-specific firmware path
-        chip = GPU_GetDeviceField(gpu, GPUDevField.CHIP)
-        fw_path = SMC_SI_GetFirmwarePath(chip)
-        IfCondition EqualTo(fw_path, 0) ThenBlock: {
-            ReturnValue(-2)
-        }
+        // §26: load the traced working boot's SMC firmware, NOT disk
+        // VERDE_smc.bin. The disk file is a different fw version (15097 vs
+        // 15380 dwords; header table offsets differ: disk state=0x1E020 vs
+        // trace state=0x1E48C) — same failure class as the §21 CP ucode
+        // mismatch. TRACE_VERDE_smc.bin is stored big-endian, so the
+        // existing byte-swap upload loop reproduces the kernel's exact
+        // written values. The image includes the fw's default data tables
+        // (upload runs to 0x1F050; the disk image ends at 0x1EBE4 and
+        // leaves the state-table region uncovered).
+        fw_path = SMCTracePath.SMC
 
         PrintMessage("[SMC_SI] Loading firmware: ")
         // Print path (up to 60 chars)
@@ -603,6 +607,112 @@ Function.SMC_SI_SendMessageArg {
     Body: {
         GPU_Wr32(gpu, SMCReg.SCRATCH0, arg)
         ReturnValue(SMC_SI_SendMessage(gpu, msg))
+    }
+}
+
+// =============================================================================
+// SMC_SI_ReplayTrace — §26: replay a kernel DPM/SMC write sequence
+// =============================================================================
+// Executes a replay table extracted from bus2_all.txt by
+// fw_trace/extract_dpm_replay.py. Each record is 12 bytes little-endian:
+//   op u32:   1 = REG_WR  direct MMIO write (addr, val)
+//             2 = SRAM_WR SMC indirect (IND_INDEX_0=addr, IND_DATA_0=val)
+//             3 = MSG     write MESSAGE_0=addr, poll RESP_0 until non-zero
+//   addr u32, val u32
+// Message-argument writes (0x884) are plain REG_WR records preceding their
+// MSG, exactly as in the trace. No IsRunning gate: the kernel sends 0x80 and
+// Resume(0x11) while the SMC is halted, so the gate would refuse them.
+// Returns the number of failed/timed-out messages, or -1 on file error.
+Function.SMC_SI_ReplayTrace {
+    Input: gpu: Integer
+    Input: path: Integer
+    Output: Integer
+    Body: {
+        rp_fd = SystemCall(2, path, 0, 0)
+        IfCondition LessThan(rp_fd, 0) ThenBlock: {
+            PrintMessage("[§26] cannot open replay file\n")
+            ReturnValue(-1)
+        }
+        rp_size = SystemCall(8, rp_fd, 0, 2)
+        SystemCall(8, rp_fd, 0, 0)
+        IfCondition LessThan(rp_size, 12) ThenBlock: {
+            SystemCall(3, rp_fd)
+            PrintMessage("[§26] replay file too small\n")
+            ReturnValue(-1)
+        }
+        rp_buf = Allocate(rp_size)
+        IfCondition EqualTo(rp_buf, 0) ThenBlock: {
+            SystemCall(3, rp_fd)
+            PrintMessage("[§26] replay alloc failed\n")
+            ReturnValue(-1)
+        }
+        rp_got = SystemCall(0, rp_fd, rp_buf, rp_size)
+        SystemCall(3, rp_fd)
+        IfCondition NotEqual(rp_got, rp_size) ThenBlock: {
+            Deallocate(rp_buf, rp_size)
+            PrintMessage("[§26] replay read incomplete\n")
+            ReturnValue(-1)
+        }
+
+        // Auto-increment OFF: every SRAM_WR record carries its own index
+        rp_acc = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseAnd(rp_acc, BitwiseNot(SMCAccessBits.AUTO_INCREMENT)))
+
+        rp_n = Divide(rp_size, 12)
+        rp_i = 0
+        rp_msgs = 0
+        rp_fail = 0
+        WhileLoop LessThan(rp_i, rp_n) {
+            rp_off = Multiply(rp_i, 12)
+            rp_op = Add(GetByte(rp_buf, rp_off), Add(LeftShift(GetByte(rp_buf, Add(rp_off, 1)), 8), Add(LeftShift(GetByte(rp_buf, Add(rp_off, 2)), 16), LeftShift(GetByte(rp_buf, Add(rp_off, 3)), 24))))
+            rp_a0 = Add(rp_off, 4)
+            rp_addr = Add(GetByte(rp_buf, rp_a0), Add(LeftShift(GetByte(rp_buf, Add(rp_a0, 1)), 8), Add(LeftShift(GetByte(rp_buf, Add(rp_a0, 2)), 16), LeftShift(GetByte(rp_buf, Add(rp_a0, 3)), 24))))
+            rp_v0 = Add(rp_off, 8)
+            rp_val = Add(GetByte(rp_buf, rp_v0), Add(LeftShift(GetByte(rp_buf, Add(rp_v0, 1)), 8), Add(LeftShift(GetByte(rp_buf, Add(rp_v0, 2)), 16), LeftShift(GetByte(rp_buf, Add(rp_v0, 3)), 24))))
+
+            IfCondition EqualTo(rp_op, 1) ThenBlock: {
+                GPU_Wr32(gpu, rp_addr, rp_val)
+            }
+            IfCondition EqualTo(rp_op, 2) ThenBlock: {
+                GPU_Wr32(gpu, SMCReg.IND_INDEX_0, rp_addr)
+                GPU_Wr32(gpu, SMCReg.IND_DATA_0, rp_val)
+            }
+            IfCondition EqualTo(rp_op, 3) ThenBlock: {
+                rp_msgs = Add(rp_msgs, 1)
+                GPU_Wr32(gpu, SMCReg.MESSAGE_0, rp_addr)
+                // Trace-faithful poll: one discard read (SMC clears RESP_0
+                // when it starts processing), then poll until non-zero.
+                rp_resp = GPU_Rd32(gpu, SMCReg.RESP_0)
+                rp_resp = 0
+                rp_p = 0
+                WhileLoop LessThan(rp_p, 2000000) {
+                    rp_resp = GPU_Rd32(gpu, SMCReg.RESP_0)
+                    IfCondition NotEqual(rp_resp, 0) ThenBlock: {
+                        ExitLoop
+                    }
+                    rp_p = Add(rp_p, 1)
+                }
+                PrintMessage("[§26] msg 0x")
+                PrintHex(rp_addr)
+                PrintMessage(" resp 0x")
+                PrintHex(rp_resp)
+                PrintMessage("\n")
+                IfCondition NotEqual(rp_resp, SMCResp.OK) ThenBlock: {
+                    rp_fail = Add(rp_fail, 1)
+                }
+            }
+            rp_i = Add(rp_i, 1)
+        }
+
+        PrintMessage("[§26] replay done: ")
+        PrintNumber(rp_n)
+        PrintMessage(" records, ")
+        PrintNumber(rp_msgs)
+        PrintMessage(" msgs, ")
+        PrintNumber(rp_fail)
+        PrintMessage(" failed\n")
+        Deallocate(rp_buf, rp_size)
+        ReturnValue(rp_fail)
     }
 }
 

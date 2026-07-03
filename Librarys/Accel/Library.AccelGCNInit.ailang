@@ -602,6 +602,8 @@ Function.AccelGCN_Init {
         // Diverging values = RLC not actually executing after RLC_CNTL=1.
         PrintMessage("[§20-PROBE] RLC_CNTL=0x")
         PrintHex(GPU_Rd32(gpu, SIReg.RLC_CNTL))
+        PrintMessage(" RLC_STAT=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_STAT))  // §23: was literal 50000=0xC350 (wrong reg, read 0)
         PrintMessage(" CGLS_CTRL=0x")
         PrintHex(GPU_Rd32(gpu, SIReg.RLC_CGCG_CGLS_CTRL))
         PrintMessage(" MGCG_OVR=0x")
@@ -685,14 +687,23 @@ Function.AccelGCN_Init {
             DPM_Init()
             dpm_rc = DPM_Enable(gpu)
             IfCondition EqualTo(dpm_rc, 1) ThenBlock: {
-                DPM_SI_UploadDriverState(gpu)
-                // Force HIGH for compute workload
-                dpm = DPM_SI_GetEntry(gpu)
-                num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
-                DPM_SetLevel(gpu, Subtract(num_levels, 1))
-                PrintMessage("[AccelGCN] DPM enabled, forced HIGH (")
-                PrintNumber(num_levels)
-                PrintMessage(" levels)\n")
+                // §26: replaces UploadDriverState + force-HIGH. The 14:48/15:02
+                // runs proved the SMC (alive, NoDisplay OK'd) REJECTS our bare
+                // SetEnabledLevels(4)/SetForcedLevels(1) with 0xFF: the state
+                // upload was never latched (no Halt(0x10) -> upload -> 0x80 ->
+                // Resume(0x11) -> SwitchToSwState(0x20) protocol) and the disk
+                // SMC fw is a different version than the traced working boot.
+                // Replay the kernel's DPM-enable message bursts A+B
+                // (bus2_all.txt @463599-467045) verbatim: 51 msgs incl. the
+                // latch protocol, driverState upload at state+0x280=0x1E70C,
+                // CAC enable, MC ARB per-level timing, and the SPLL/SCLK
+                // switch. Kernel final state: SetForcedLevels(0),
+                // SetEnabledLevels(3) — auto DPM, NOT forced high. Expect
+                // every msg resp 0x1 in the log.
+                rp_ab = SMC_SI_ReplayTrace(gpu, SMCTracePath.REPLAY_AB)
+                PrintMessage("[AccelGCN] DPM enabled, kernel burst A+B replayed (failed msgs: ")
+                PrintNumber(rp_ab)
+                PrintMessage(")\n")
             }
             ElseBlock: {
                 PrintMessage("[AccelGCN] DPM enable failed, continuing at boot clocks\n")
@@ -703,8 +714,78 @@ Function.AccelGCN_Init {
         // DCE / Display controller full init (kernel Phase 14 — dce6_resume)
         // Kernel initializes ALL 6 CRTCs, HPD, AFMT even on headless cards.
         // Must happen AFTER DPM is enabled (kernel order).
+        // §26: moved BEFORE the CG transition — kernel order is DPM bursts
+        // A/B -> display init -> MGCG @567k -> CGCG disable + burst C @667k
+        // -> IB tests. §25 had the CG block before DCE6.
         // ---------------------------------------------------------------
         DCE6_FullInit(gpu)
+
+        // ---------------------------------------------------------------
+        // §25: kernel post-DPM CG transition (bus2_all.txt @567039-567055 + @667061-667063).
+        // The working boot moves CG off golden BEFORE any IB/SH work: MGCG enable
+        // handshake, then CGCG/CGLS disable right before its IB tests. Every SH write
+        // that ever worked (36-dispatch runs on the radeon-POSTed card,
+        // probe_post_radeon_bind: CGLS_CTRL=0x0020003C) ran in THIS state; our dispatch
+        // ran with CG still at golden (CGCG_EN=1, MGCG overridden) — a state in which
+        // no working boot ever performed an SH write. Exact trace values; §18's removed
+        // CG-disable block differed (0x00E000FF pre-RLC-start, wrong override bits).
+        // 15:02 run: readbacks matched (CGTS +bit12 has no kernel readback reference,
+        // not evidence of anything) — CG state alone did NOT unwedge the ME.
+        // ---------------------------------------------------------------
+        // MGCG enable (@567040-567052)
+        GPU_Wr32(gpu, SIReg.CGTS_SM_CTRL_REG, 0x96940200)
+        GPU_Wr32(gpu, SIReg.RLC_CGTT_MGCG_OVERRIDE, 0xFFFFFFC0)
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, 0)
+        cg25_i = 0
+        WhileLoop LessThan(cg25_i, 1000) {
+            cg25_busy = BitwiseOr(GPU_Rd32(gpu, SIReg.RLC_SERDES_MASTER_BUSY_0), GPU_Rd32(gpu, SIReg.RLC_SERDES_MASTER_BUSY_1))
+            IfCondition EqualTo(cg25_busy, 0) ThenBlock: {
+                cg25_i = 1000
+            }
+            cg25_i = Add(cg25_i, 1)
+        }
+        GPU_Wr32(gpu, SIReg.RLC_SERDES_WR_MASTER_MASK_0, 0xFFFFFFFF)
+        GPU_Wr32(gpu, SIReg.RLC_SERDES_WR_MASTER_MASK_1, 0xFFFFFFFF)
+        GPU_Wr32(gpu, SIReg.RLC_SERDES_WR_CTRL, 0x00D000FF)
+        GPU_Wr32(gpu, SIReg.RLC_CNTL, 1)
+        // CGCG/CGLS disable (@667061) + CP int enables (@667063 kernel final 0x04180000)
+        GPU_Wr32(gpu, SIReg.RLC_CGCG_CGLS_CTRL, 0x0020003C)
+        GPU_Wr32(gpu, SIReg.CP_INT_CNTL_RING0, 0x04180000)
+        PrintMessage("[§25] post-DPM CG transition: CGTS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CGTS_SM_CTRL_REG))
+        PrintMessage(" MGCG_OVR=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_CGTT_MGCG_OVERRIDE))
+        PrintMessage(" CGLS_CTRL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_CGCG_CGLS_CTRL))
+        PrintMessage(" RLC_STAT=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_STAT))
+        PrintMessage("\n")
+
+        // ---------------------------------------------------------------
+        // §26: kernel burst C (bus2_all.txt @667064-668462) — the LAST thing
+        // the working boot does before its IB tests. Starts with the DMA
+        // MGCG writes (0xD0C0/0xD8C0=0x100, 0xD0DC/0xD0D8 serdes-style
+        // sequence) that §25 missed, then the full set_power_state message
+        // burst: 0x5D 0x63 0x41 0x82(1) 0x5A 0x54 0x6F Halt -> driverState +
+        // mc_arb SRAM upload + MC ARB timing -> 0x80 Resume 0x20, CAC msgs
+        // 0x6E 0x53 0x59, 0x41 0x82(1), Halt -> watermark patch -> 0x80
+        // Resume 0x20, then final SetForcedLevels(0) SetEnabledLevels(3).
+        // Every SH write that ever worked ran with the SMC in THIS state.
+        // ---------------------------------------------------------------
+        rp_c = SMC_SI_ReplayTrace(gpu, SMCTracePath.REPLAY_C)
+        PrintMessage("[§26] burst C replayed (failed msgs: ")
+        PrintNumber(rp_c)
+        PrintMessage(") CGLS_CTRL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_CGCG_CGLS_CTRL))
+        PrintMessage(" RLC_STAT=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.RLC_STAT))
+        PrintMessage("\n")
+        // Re-probe the exact register the ME wedges on, now with DPM engaged
+        GPU_Wr32(gpu, SICompute.PGM_LO, 0x5A5A5A5A)
+        PrintMessage("[§26] PGM_LO mmio-rb post-burst-C=0x")
+        PrintHex(GPU_Rd32(gpu, SICompute.PGM_LO))
+        GPU_Wr32(gpu, SICompute.PGM_LO, 0)
+        PrintMessage("\n")
 
         // BAR0 prime SKIPPED — all compute memory (rings, IB, data, shader) is now
         // in GART system RAM. The 65536-read BAR0 prime was a VRAM write-coherency

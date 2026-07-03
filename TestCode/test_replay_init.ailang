@@ -1,0 +1,239 @@
+// test_replay_init.ailang — §30 full-trace cold-init replay harness
+// Build: ./ailang.x TestCode/test_replay_init.ailang test_replay_init
+// Run:   sudo ./test_replay_init 2>&1 | tee replay_mmiotrace.txt   (from repo root)
+//
+// Replays the kernel's ENTIRE cold init verbatim from bus2_all.txt
+// (fw_trace/FULL_REPLAY_A1.bin + A2.bin, extract_full_replay.py) with every
+// kernel read acting as an oracle against our hardware's answers.
+//
+// Sequence:
+//   1. Discover GPUs; REQUIRE bus 2 (no fallback, display GPU never touched)
+//   2. Map BARs
+//   3. Replay A1 (seq 6..12087: ATOM init, MC train, golden regs — ends with
+//      BIF_FB_EN=3 @3639, so VRAM is CPU-writable after A1)
+//   4. GART_Init (page table at VRAM 0 — same location/START as kernel)
+//   5. Map host pages at the KERNEL's GART VAs (verbatim register values then
+//      need no translation):
+//        WB   0xFF00401000 (1pg)  IH 0xFF00609000 (16pg)
+//        RB0  0xFF00619000 (4pg)  RB1 0xFF0061D000 (2pg)  RB2 0xFF0061F000 (2pg)
+//   6. Pre-fill ring content the kernel wrote through GTT (invisible to
+//      mmiotrace, reconstructed from radeon si.c):
+//        RB0: ME_INITIALIZE + SET_BASE, PACKET2-pad to 0x100; PACKET2 NOP fill
+//             0x100-0x500 (kernel: si_default_state — KNOWN v1 DIVERGENCE);
+//             ring-test SET_CONFIG_REG SCRATCH_REG0=0xDEADBEEF at 0x500, pad 0x600
+//        RB1/RB2: ring-test packet at 0, pad to 0x100
+//   7. Replay A2 (seq 12088..439996: VM config, IH, RLC fw+start, CP fw,
+//      ring regs, unhalt, kernel ring scratch tests)
+//
+// VERDICT: the three [§30-POLL] reg=0x8500 want=0xDEADBEEF lines inside A2
+// are the kernel's own ring tests. hit=1 = the ME EXECUTED a ring packet —
+// first direct execution proof, achieved via pure verbatim replay.
+// hit=0 with 0 oracle mismatches = the divergence is NOT observable in BAR0
+// MMIO (memory-side or non-MMIO state). Either way: decisive.
+
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUGART
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.AMDGPUReplay
+
+// Map n_pages of host memory at consecutive GART PTE slots (kernel VA layout).
+// Returns 1 on success, 0 on failure.
+Function.ReplayMapRegion {
+    Input: gpu: Integer
+    Input: host_ptr: Integer
+    Input: n_pages: Integer
+    Input: pte_base: Integer
+    Output: Integer
+    Body: {
+        mp_i = 0
+        WhileLoop LessThan(mp_i, n_pages) {
+            mp_va = Add(host_ptr, Multiply(mp_i, 4096))
+            mp_phys = GART_GetPhysAddr(mp_va)
+            IfCondition EqualTo(mp_phys, 0) ThenBlock: {
+                PrintMessage("[§30] ERROR: no phys for region page ")
+                PrintNumber(mp_i)
+                PrintMessage("\n")
+                ReturnValue(0)
+            }
+            GART_WritePTE(gpu, Add(pte_base, mp_i), mp_phys)
+            mp_i = Add(mp_i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Allocate, mlock, zero, and fault-in an anonymous region. Returns ptr or 0.
+Function.ReplayAllocRegion {
+    Input: size: Integer
+    Output: Integer
+    Body: {
+        ar_prot = Add(GPUSys.PROT_READ, GPUSys.PROT_WRITE)
+        ar_ptr = SystemCall(GPUSys.SYS_MMAP, 0, size, ar_prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(ar_ptr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(GARTConf.SYS_MLOCK, ar_ptr, size, 0, 0, 0)
+        MemorySet(ar_ptr, 0, size)
+        ReturnValue(ar_ptr)
+    }
+}
+
+// Fill a ring image with PACKET2 padding (0x80000000) from dword a to b-1.
+Function.ReplayPad {
+    Input: base: Integer
+    Input: dw_from: Integer
+    Input: dw_to: Integer
+    Body: {
+        pd_i = dw_from
+        WhileLoop LessThan(pd_i, dw_to) {
+            StoreValue(Add(base, Multiply(pd_i, 4)), 2147483648, "dword")
+            pd_i = Add(pd_i, 1)
+        }
+    }
+}
+
+// Write the kernel ring-test packet (SET_CONFIG_REG SCRATCH_REG0=0xDEADBEEF)
+// at dword offset dw.
+Function.ReplayScratchPkt {
+    Input: base: Integer
+    Input: dw: Integer
+    Body: {
+        sp_hdr = PM4_BuildHeader(PM4.OP_SET_CONFIG_REG, 2, 0)
+        StoreValue(Add(base, Multiply(dw, 4)), sp_hdr, "dword")
+        StoreValue(Add(base, Multiply(Add(dw, 1), 4)), 320, "dword")           // (0x8500-0x8000)/4
+        StoreValue(Add(base, Multiply(Add(dw, 2), 4)), 3735928559, "dword")    // 0xDEADBEEF
+    }
+}
+
+SubRoutine.Main {
+    PrintMessage("=== §30 FULL-TRACE COLD-INIT REPLAY (bus 2 only) ===\n")
+
+    n_gpus = GPU_Discover()
+    IfCondition EqualTo(n_gpus, 0) ThenBlock: {
+        PrintMessage("[§30] no AMD GPU found\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    gpu = -1
+    gi = 0
+    WhileLoop LessThan(gi, n_gpus) {
+        bus = GPU_GetDeviceField(gi, GPUDevField.PCI_BUS)
+        IfCondition EqualTo(bus, 2) ThenBlock: { gpu = gi }
+        gi = Add(gi, 1)
+    }
+    IfCondition LessThan(gpu, 0) ThenBlock: {
+        PrintMessage("[§30] ABORT: bus 2 not found — refusing any other GPU\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[§30] using GPU ")
+    PrintNumber(gpu)
+    PrintMessage(" (bus 2)\n")
+
+    GPU_BAR_Init()
+    rc = GPU_BAR_MapMMIO(gpu)
+    IfCondition EqualTo(rc, 0) ThenBlock: {
+        PrintMessage("[§30] MMIO map failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    rc = GPU_BAR_MapVRAM(gpu)
+    IfCondition EqualTo(rc, 0) ThenBlock: {
+        PrintMessage("[§30] VRAM map failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // ---- Phase A1: ATOM/MC/golden (pure verbatim, no memory deps) ----
+    PrintMessage("[§30] === PHASE A1 ===\n")
+    mis1 = GPU_ReplayFull(gpu, "fw_trace/FULL_REPLAY_A1.bin")
+    IfCondition LessThan(mis1, 0) ThenBlock: { SystemCall(60, 1, 0, 0, 0, 0) }
+
+    // ---- GART table (VRAM 0, kernel-identical location) ----
+    rc = GART_Init(gpu)
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[§30] GART_Init failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // ---- Host pages at the kernel's GART VAs ----
+    wb_ptr  = ReplayAllocRegion(4096)
+    ih_ptr  = ReplayAllocRegion(65536)
+    rb0_ptr = ReplayAllocRegion(16384)
+    rb1_ptr = ReplayAllocRegion(8192)
+    rb2_ptr = ReplayAllocRegion(8192)
+    alloc_ok = 1
+    IfCondition EqualTo(wb_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(ih_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(rb0_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(rb1_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(rb2_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(alloc_ok, 0) ThenBlock: {
+        PrintMessage("[§30] region alloc failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    // PTE index = VA>>12 - PAGE_TABLE_START (0x0F400000), per kernel layout
+    ok = ReplayMapRegion(gpu, wb_ptr, 1, 11535361)     // 0xFF00401000
+    ok = Multiply(ok, ReplayMapRegion(gpu, ih_ptr, 16, 11535881))   // 0xFF00609000
+    ok = Multiply(ok, ReplayMapRegion(gpu, rb0_ptr, 4, 11535897))   // 0xFF00619000
+    ok = Multiply(ok, ReplayMapRegion(gpu, rb1_ptr, 2, 11535901))   // 0xFF0061D000
+    ok = Multiply(ok, ReplayMapRegion(gpu, rb2_ptr, 2, 11535903))   // 0xFF0061F000
+    IfCondition EqualTo(ok, 0) ThenBlock: {
+        PrintMessage("[§30] kernel-VA PTE mapping failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[§30] kernel-VA regions mapped (WB/IH/RB0/RB1/RB2)\n")
+
+    // ---- Ring content (kernel wrote via GTT; reconstructed) ----
+    // RB0 dw 0-10: ME_INITIALIZE + SET_BASE (same payloads as PM4_CPStart)
+    hdr = PM4_BuildHeader(PM4.OP_ME_INITIALIZE, 6, 0)
+    StoreValue(rb0_ptr, hdr, "dword")
+    StoreValue(Add(rb0_ptr, 4), 1, "dword")
+    StoreValue(Add(rb0_ptr, 8), 0, "dword")
+    StoreValue(Add(rb0_ptr, 12), 7, "dword")
+    StoreValue(Add(rb0_ptr, 16), 65536, "dword")
+    StoreValue(Add(rb0_ptr, 20), 0, "dword")
+    StoreValue(Add(rb0_ptr, 24), 0, "dword")
+    hdr = PM4_BuildHeader(PM4.OP_SET_BASE, 3, 0)
+    StoreValue(Add(rb0_ptr, 28), hdr, "dword")
+    StoreValue(Add(rb0_ptr, 32), 3, "dword")
+    StoreValue(Add(rb0_ptr, 36), 49152, "dword")
+    StoreValue(Add(rb0_ptr, 40), 57344, "dword")
+    ReplayPad(rb0_ptr, 11, 256)
+    // dw 256-1279: kernel emits si_default_state here — v1 replaces with
+    // PACKET2 NOPs (documented divergence; WPTR values 0x100/0x500 preserved)
+    ReplayPad(rb0_ptr, 256, 1280)
+    ReplayScratchPkt(rb0_ptr, 1280)
+    ReplayPad(rb0_ptr, 1283, 1536)
+    // RB1/RB2: ring-test packet + pad to 0x100
+    ReplayScratchPkt(rb1_ptr, 0)
+    ReplayPad(rb1_ptr, 3, 256)
+    ReplayScratchPkt(rb2_ptr, 0)
+    ReplayPad(rb2_ptr, 3, 256)
+    PrintMessage("[§30] ring images written\n")
+
+    // ---- Phase A2: VM, IH, RLC, CP fw, rings, unhalt, ring tests ----
+    PrintMessage("[§30] === PHASE A2 ===\n")
+    mis2 = GPU_ReplayFull(gpu, "fw_trace/FULL_REPLAY_A2.bin")
+
+    // ---- Verdict ----
+    scr = GPU_Rd32(gpu, SIReg.SCRATCH_REG0)
+    PrintMessage("\n[§30] ============ VERDICT ============\n")
+    PrintMessage("[§30] final SCRATCH_REG0=0x")
+    PrintHex(scr)
+    PrintMessage(" (0xDEADBEEF = ME executed the last ring test)\n")
+    PrintMessage("[§30] A1 mismatches=")
+    PrintNumber(mis1)
+    PrintMessage(" A2 mismatches=")
+    PrintNumber(mis2)
+    PrintMessage("\n")
+    IfCondition EqualTo(scr, 0xDEADBEEF) ThenBlock: {
+        PrintMessage("[§30] SCRATCH_REG0=0xDEADBEEF: the LAST ring test executed. Check the\n")
+        PrintMessage("[§30] three [§30-POLL] reg=0x8500 lines above for RB0/RB1/RB2 individually.\n")
+    } ElseBlock: {
+        PrintMessage("[§30] SCRATCH_REG0 != 0xDEADBEEF: ME EXECUTED NOTHING (ring tests FAILED).\n")
+        PrintMessage("[§30] Cross-check the [§30-POLL] reg=0x8500 + [§30-MIS] reg=0x8500 lines above.\n")
+    }
+    PrintMessage("[§30] =================================\n")
+
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)
