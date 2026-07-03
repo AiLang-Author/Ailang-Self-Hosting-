@@ -32,6 +32,14 @@ Conclusion: the divergence from the working boot is NOT in BAR0 register writes.
 It is in the only two channels mmiotrace cannot see — **memory-side content** (written
 via the FB BAR / CPU) and **non-BAR0 device state** (PCI config space, POST side effects).
 
+**Post-§33 incident (found 2026-07-02 late):** a second replay run ~20:33 was started
+WITHOUT a cold reboot. Its log overwrote the §33 22,308-line log (only a 1,817-line
+truncated file survives — the §33 numbers above live only in this doc now) and the run
+froze the box mid-A1 at ~record 1731 (the CG_SPLL 0x600 block). The seq-7 oracle in that
+log reads 0x400 = card was POSTed ⇒ warm-entry replay, §32's predicted freeze mode, now
+twice-confirmed. The harness now refuses to start on a posted card (§34 guard below).
+Boot 20:34:58 is a true cold boot with the service disabled — the card is test-ready.
+
 ## 2. LIVE THREADS (everything else is §3)
 
 **(a) RLC poll wall-clock** — our 2M unpaced reads ≈ 3 s; the kernel's 300k reads ran under
@@ -39,24 +47,30 @@ mmiotrace (pagefault per access), plausibly much longer. Poll reads now paced 15
 and the harness verdict print is now computed, not hardcoded (archive §33 bug). Binary rebuilt.
 A timeout on the next run means "never", not "too soon".
 
-**(b) Memory-side content the trace can't carry.** The replay writes the kernel's
-RLC_SAVE_AND_RESTORE_BASE / RLC_CLEAR_STATE_RESTORE_BASE register values but populates
-NOTHING at those addresses; the kernel populates the 218-dword verde SR list + CSB
-(256-byte descriptor header + clear-state dwords) via CPU→VRAM before RLC start.
-Same class: RB0 ring bytes 0x100–0x500 hold PACKET2 filler where the kernel has the
-si_default_state PM4 stream. Sources: `/home/bob/linux/drivers/gpu/drm/amd/amdgpu/`
-gfx_v6_0.c (`gfx_v6_0_rlc_init`, `gfx_v6_0_get_csb_buffer`, `gfx_v6_0_cp_gfx_start`,
-`verde_rlc_save_restore_register_list`) + clearstate_si.h. Fully derivable offline.
+**(b) Memory-side content the trace can't carry — ARMED in the harness (§34, built 2026-07-02):**
+the replay wrote the kernel's RLC_SAVE_AND_RESTORE_BASE / RLC_CLEAR_STATE_RESTORE_BASE
+register values (0xF4002010/0xF4002020, A2 seq 329387/329388) but populated NOTHING at
+those addresses. Now: `fw_trace/extract_rlc_content.py` generates from the kernel source
+(gfx_v6_0.c + clearstate_si.h; sizes cross-check the archive §23 numbers exactly):
+- `RLC_SR_CONTENT.bin` — 218-dword verde save/restore list → VRAM 0x201000
+- `RLC_CSB_CONTENT.bin` — 256-byte descriptor header (hi/lo of base+256, size=908) +
+  908-dword clear-state stream → VRAM 0x202000 (PA_SC_RASTER_CONFIG=0x1240 from trace)
+- `RB0_DEFAULT_STATE.bin` — 906-dword cp_gfx_start stream → RB0 dw 0x100 (closes §30's
+  "si_default_state" divergence; geometry fits the trace's WPTR 0x100→0x500 commits)
+The harness writes SR/CSB after GART_Init (those VRAM bytes double as never-walked
+PTE slots that GART_Init's fill sweeps). Caveat: source is the amdgpu port, trace was
+radeon — same origin code, but if something's off it shows here.
 
-**(c) Non-BAR0 device state.** mmiotrace captures BAR0 only. The kernel also:
-- sets PCI **bus master** (`pci_set_master`) — without COMMAND bit 2 the GPU cannot DMA:
-  no ring fetch from GART, no RPTR writeback, no fence writes. Our sysfs BAR-map path may
-  never set it on a true-cold boot; every pre-§32 boot had it set by the service's amdgpu bind.
-  **This one bit could explain the parked ME (§28.5's "RPTR writeback never lands" is a
-  DMA write that never arrives) — check FIRST.**
-- other config-space writes (si_pcie_gen3_enable, MSI) — likely optional, audit anyway.
+**(c) Non-BAR0 device state — mostly closed 2026-07-02:**
+- PCI bus master: NOT the problem — `GPU_BAR_Enable` sets COMMAND Mem+BusMaster (0x6)
+  before every replay and logs before/after. On the next cold log expect
+  `before: 0x0 → after: 0x6`; anything else IS a finding.
+- Remaining long shots: si.c config-space writes (pcie gen switching, MSI — kernel does
+  them, likely non-essential for compute bringup), legacy VGA routing. Only chase if
+  (a)+(b) both come back clean.
 
-Parked symptom, probably (c): CP→GART RPTR writeback never lands in host RAM (archive §28.5).
+Parked symptom: CP→GART RPTR writeback never lands in host RAM (archive §28.5) — rechecks
+itself for free once ring tests are re-run with (b) in place.
 
 ## 3. RULED OUT — do not re-litigate (evidence in parentheses)
 
@@ -107,20 +121,29 @@ Run (from SSH; screen survives freezes):
 sudo ./test_replay_init 2>&1 | while IFS= read -r l; do printf '%s\n' "$l"; printf '%s\n' "$l" >> replay_mmiotrace.txt; sync replay_mmiotrace.txt; done
 ```
 - Service stays disabled; cold reboot first; nothing touches bus 2 before the run (no test_accel_gcn).
+- The harness HARD-ABORTS on a posted card (§34 guard: CONFIG_MEMSIZE must read 0).
+  An abort means the boot wasn't cold — reboot; do not work around the guard.
 - Freeze localization: last `[§30-AT]` breadcrumb (every 100 records) → look seq range up in `fw_trace/FULL_REPLAY_A1/2.txt` BEFORE any new theory.
-- Cold entry sanity: seq-7 CONFIG_MEMSIZE oracle must read 0 (unposted). A mismatch storm in the first ~100 records ⇒ boot wasn't cold; stop.
 
-**Read order for the next log:**
-1. PCI COMMAND print (thread c): was bus master already set? did we set it?
-2. `RLC_STAT 0xC34C` POLL line (threads a+b): hit=1 ⇒ RLC solved — read on. Still 0x6 after ~33 s paced ⇒ "never", and (a) is dead too.
-3. Three ring-test lines `reg=0x8500 want=0xDEADBEEF hit=` — hit=1 = first ME execution ever = cold CP bringup solved.
-4. `[§30-MIS]` lines + first_divergence_seq — judge by register class (calibration regs are noise).
-5. dst=42 remains the endgame metric (separate dispatch test after replay-init succeeds).
+**Read order for the next log (binary built 2026-07-02 with §34: cold guard +
+paced polls + honest verdict + SR/CSB/default-state content):**
+1. `[§34] cold entry confirmed` + `PCI COMMAND before: 0x0 after: 0x6` — entry state sane.
+2. `[§34] RLC SR content: 218 dw … CSB … 972 dw` + `RB0 default state: 906 dwords` — content landed.
+3. **`RLC_STAT 0xC34C` POLL line — THE verdict on threads (a)+(b):**
+   hit=1 ⇒ RLC solved (content and/or wall-clock was the story) — read on.
+   Still 0x6 after ~33 s paced ⇒ hypotheses (a) AND (b) both dead for RLC; the RLC's
+   blocker is deeper non-MMIO state — next lever is the (c) long-shot list, then
+   comparing against the amdgpu 61 MB timestamped trace (§5).
+4. Three ring-test lines `reg=0x8500 want=0xDEADBEEF hit=` — hit=1 = first ME execution
+   ever = cold CP bringup solved.
+5. `[§30-MIS]` lines + first_divergence_seq — judge by register class (calibration regs are noise).
+6. dst=42 remains the endgame metric (separate dispatch test after replay-init succeeds).
 
 ## 5. KEY ASSETS
 
 - `fw_trace/` — extractors + replay tables (.bin regenerable from .txt/scripts; `*.bin` gitignored).
-  FULL_REPLAY_A1/A2 (init), DPM_REPLAY_P/AB/C (SMC), TRACE_VERDE_* (trace-exact firmware).
+  FULL_REPLAY_A1/A2 (init), DPM_REPLAY_P/AB/C (SMC), TRACE_VERDE_* (trace-exact firmware),
+  extract_rlc_content.py → RLC_SR/RLC_CSB/RB0_DEFAULT_STATE content blobs (§34, from kernel source).
 - `bus2_all.txt` — seq-only kernel mmiotrace of the working radeon cold init (Jun 19). The oracle.
 - `mmiotrace_boot/mmiotrace_raw.log` — 61 MB timestamped **amdgpu** cold init (captured 16:56 Jul 2; the radeon-timestamped original was overwritten — archive §32 DISCOVERY 2). Candidate future replay source.
 - `/home/bob/linux/drivers/gpu/drm/amd/amdgpu/` — gfx_v6_0.c, clearstate_si.h, si.c: the reference model for anything the trace can't show (memory contents, config space, timing).
