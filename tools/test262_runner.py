@@ -141,7 +141,12 @@ var __test262_failed = 0;
 function Test262Error(m) { this.message = m; this.name = "Test262Error"; }
 function $ERROR(m) { __test262_failed = 1; }
 function $DONOTEVALUATE() { __test262_failed = 1; }
-var assert = {};
+// assert must be a *function* (test262 harness): assert(cond) + assert.sameValue(...)
+// Previously assert={} so assert(true) was a no-op (CALL non-function returned undef).
+// After typed TypeError on non-callables, every assert(cond) test hard-failed.
+function assert(mustBeTrue, message) {
+  if (mustBeTrue !== true) { __test262_failed = 1; }
+}
 assert._isSameValue = function(a, b) {
   if (a !== a && b !== b) return true;
   if (a === 0 && b === 0) return (1/a === 1/b);
@@ -151,34 +156,42 @@ assert.sameValue = function(a, e, m) { if (!assert._isSameValue(a, e)) { __test2
 assert.notSameValue = function(a, u, m) { if (assert._isSameValue(a, u)) { __test262_failed = 1; } };
 assert.throws = function(E, fn, m) {
   var threw = false;
-  try { fn(); } catch (e) { threw = true; }
-  if (!threw) { __test262_failed = 1; }
+  var err = null;
+  try { fn(); } catch (e) {
+    threw = true;
+    err = e;
+    // Mole 15: generator .next() rethrow can land catch with empty binding;
+    // engine stashes the real value on __pend_exc__ (GenNext abrupt path).
+    if ((err === undefined || err === null) && typeof __pend_exc__ !== "undefined") {
+      err = __pend_exc__;
+    }
+  }
+  if (!threw) { __test262_failed = 1; return; }
+  if (E !== undefined && E !== null) {
+    if (!(err instanceof E)) { __test262_failed = 1; }
+  }
+};
+assert._toString = function(v) {
+  try { return "" + v; } catch (e) { return "unknown"; }
 };
 function $DONE(err) { if (err) { __test262_failed = 1; } }
 var $MAX_ITERATIONS = 100000;
 function verifyProperty(obj, name, desc) {
   if (desc === undefined) return;
-  var actual = obj[name];
-  if (desc.value !== undefined) { if (actual !== desc.value) { __test262_failed = 1; } }
+  // Prefer gOPD so Symbol keys + inherited same-name props (e.g. @@iterator) work.
+  var od = Object.getOwnPropertyDescriptor(obj, name);
+  if (od === undefined) { __test262_failed = 1; return; }
+  if (desc.value !== undefined) {
+    if (od.value !== desc.value) { __test262_failed = 1; }
+  }
   if (desc.writable !== undefined) {
-    var old = obj[name]; obj[name] = "___test262_probe___";
-    var changed = (obj[name] !== old);
-    if (desc.writable && !changed) { __test262_failed = 1; }
-    if (!desc.writable && changed) { __test262_failed = 1; }
-    obj[name] = old;
+    if (od.writable !== desc.writable) { __test262_failed = 1; }
   }
   if (desc.enumerable !== undefined) {
-    var found = false;
-    for (var k in obj) { if (k === name) { found = true; } }
-    if (desc.enumerable && !found) { __test262_failed = 1; }
-    if (!desc.enumerable && found) { __test262_failed = 1; }
+    if (od.enumerable !== desc.enumerable) { __test262_failed = 1; }
   }
   if (desc.configurable !== undefined) {
-    var d2 = obj[name]; delete obj[name];
-    var deleted = (obj[name] === undefined && d2 !== undefined);
-    if (desc.configurable && !deleted) { __test262_failed = 1; }
-    if (!desc.configurable && deleted) { __test262_failed = 1; }
-    if (!desc.configurable) { obj[name] = d2; }
+    if (od.configurable !== desc.configurable) { __test262_failed = 1; }
   }
 }
 function verifyNotEnumerable(obj, name) {
@@ -214,19 +227,22 @@ function compareArray(a, b) {
   return true;
 }
 assert.compareArray = function(a, b, m) { if (!compareArray(a, b)) { __test262_failed = 1; } };
-if (typeof Object === "undefined") { var Object = {}; }
-if (typeof Object.hasOwn !== "function") {
-  Object.hasOwn = function(obj, key) {
-    for (var k in obj) { if (k === key) return true; }
-    return false;
-  };
-}
-if (typeof Object.prototype === "undefined") { Object.prototype = {}; }
-if (typeof Object.prototype.hasOwnProperty !== "function") {
-  Object.prototype.hasOwnProperty = function(k) {
-    for (var p in this) { if (p === k) return true; }
-    return false;
-  };
+// IMPORTANT: never `var Object` / `var Array` here. This engine's var-hoist
+// initializes the binding to undefined and *shadows* the built-in global,
+// so Object.keys / Array.isArray die for the rest of the program.
+if (typeof Object !== "undefined") {
+  // Prefer gOPD so Symbol keys work (for-in never yields symbols).
+  if (typeof Object.hasOwn !== "function") {
+    Object.hasOwn = function(obj, key) {
+      if (obj === null || obj === undefined) return false;
+      return Object.getOwnPropertyDescriptor(obj, key) !== undefined;
+    };
+  }
+  if (typeof Object.prototype !== "undefined" && typeof Object.prototype.hasOwnProperty !== "function") {
+    Object.prototype.hasOwnProperty = function(k) {
+      return Object.getOwnPropertyDescriptor(this, k) !== undefined;
+    };
+  }
 }
 """
 
@@ -316,10 +332,28 @@ def parse_frontmatter(source):
 # PREPROCESSOR
 # =============================================================================
 
-def preprocess(source):
-    """Clean up test source for the Ailang JS engine."""
+def preprocess(source, meta=None):
+    """Clean up test source for the Ailang JS engine (frontmatter strip only)."""
     source = _FRONTMATTER_RE.sub("", source)
     return source
+
+
+def _wants_strict(meta):
+    """True when test262 flags require strict mode."""
+    flags = (meta or {}).get("flags") or []
+    return "onlyStrict" in flags and "noStrict" not in flags
+
+
+def assemble_source(processed, meta=None):
+    """Build full harness source.
+
+    onlyStrict tests get \"use strict\"; as the FIRST statement of the whole
+    program (before polyfill) so JSComp_IsStrict / VM is_strict actually fire.
+    Putting the directive after the polyfill was a silent no-op.
+    """
+    if _wants_strict(meta):
+        return '"use strict";\n' + POLYFILL + processed + EPILOGUE
+    return POLYFILL + processed + EPILOGUE
 
 
 # =============================================================================
@@ -382,8 +416,8 @@ def run_test(harness, test_path, timeout, verbose=False):
         return {"path": test_path, "status": "error", "reason": str(e), "time_ms": 0}
 
     meta = parse_frontmatter(source)
-    processed = preprocess(source)
-    full_source = POLYFILL + processed + EPILOGUE
+    processed = preprocess(source, meta)
+    full_source = assemble_source(processed, meta)
 
     tmp_path = getattr(_thread_local, 'tmp_path', TMP_FILE)
     try:
@@ -430,8 +464,8 @@ def _prepare_test(test_path):
     except Exception:
         return (test_path, {}, None)
     meta = parse_frontmatter(source)
-    processed = preprocess(source)
-    full = POLYFILL + processed + EPILOGUE
+    processed = preprocess(source, meta)
+    full = assemble_source(processed, meta)
     return (test_path, meta, full.encode("utf-8", errors="replace"))
 
 

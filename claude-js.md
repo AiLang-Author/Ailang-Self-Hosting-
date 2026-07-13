@@ -1,17 +1,30 @@
 # Ailang JavaScript Engine — Context Document
 
-> Point Claude at this file to resume JS engine work with full context.
-> Last updated: 2026-06-15
+> Point Claude / agents at this file to resume JS engine work with full context.
+> Last updated: 2026-07-13 (post Mole 15–16 partial)
 
 ## Quick Reference
 
 ```
-Build bench:    ./ailang.x JS-tests/bench_js.ailang -o bench_js.x && ./bench_js.x
+Mid-gate:       python3 tools/js_midgate.py [--rebuild|--quick]
 Build e2e:      ./ailang.x JS-tests/test_js_e2e.ailang -o test_js_e2e.x && ./test_js_e2e.x
-Build harness:  ./ailang.x JS-tests/test262_harness.ailang -o test262_harness.x
-Run bench:      ./JS-tests/bench_vs_v8.sh [sunspider|octane|all]
-Run looped:     ./JS-tests/bench_looped.sh
+Category gate:  python3 tools/test262_runner.py --categories expressions/call,arguments-object,statements/function -j 8
+Full suite:     python3 tools/test262_runner.py --full -j 8 --output-json /tmp/test262_full.json
+Plan / moles:   JS-DEPENDENCY-PLAN.md
 ```
+
+### Honest status (2026-07-13)
+
+| Gate | Result |
+|------|--------|
+| e2e / mid curated | **36/0 fail** · **25/25** (+ Mole 15/16 smokes) |
+| call / function / args slice | **60/92 · ~282/451 · mapped 37/43 + unmapped 5/5** (slice **57%**) |
+| dstr | **154/186** (elision/close green; iter-err residual) |
+| Full test262 (last re-full M9) | **10688 / 49998 (21.4%)** |
+| Next | M15 iter-err residual; M16 nested strict-delete + accessor |
+| Warts | `AILANG-WARTS.md` stdlib backlog |
+
+**Rule:** no false greens; mid-gate daily; full 50k for milestones. See `JS-DEPENDENCY-PLAN.md`.
 
 ---
 
@@ -24,11 +37,19 @@ JSEngine.ailang (orchestrator)
     → JSLexer.ailang         — tokenize source into ~30 token types
     → JSParser.ailang        — recursive descent + Pratt precedence → AST
     → JSCompiler.ailang      — walk AST → flat bytecode + constant pool
-    → JSVM.ailang            — stack-based interpreter, 50+ opcodes
+    → JSVM.ailang            — stack-based interpreter, 90+ opcodes
     → JSRuntime.ailang       — value system, type coercion, allocators
     → JSBridge.ailang        — DOM bindings, native functions, timers
     → JSJIT.ailang           — method JIT (dual-buffer ping-pong GC)
 ```
+
+### Load-bearing runtime notes (Moles 6–10)
+
+- **Closures:** free vars via `__cenv` / `__parent` (GET_FREE=90, SET_FRAME_ENV=91, SET_FREE=92). Do not dual-write bare outer globals inside functions.
+- **Call spread:** CALL_SPREAD (69) + ARR_EXTEND (68) + `JSVM_IterableToArray` (Symbol.iterator).
+- **arguments:** snapshot on CALL; restore via GlobalHash_Insert + **fresh** undefined gval — never rebind to `undef_val` singleton (poisons `typeof undefined`).
+- **SetGlobal:** refuses mutating immortal singletons.
+- **Escaped values:** do not rewind `func_slab` for escaped functions; property values live in `gval_pool`.
 
 ---
 

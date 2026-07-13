@@ -186,6 +186,43 @@ Function.JSComp__CompileExpr {
         IfCondition EqualTo(ntype, ASTType.UNARY_OP) ThenBlock: {
             uop = JSParse_GetOp(save_node)
             ul = JSParse_GetLeft(save_node)
+
+            // delete obj.prop / delete obj[key] — must not evaluate to the value
+            IfCondition EqualTo(uop, JSTokType.KW_DELETE) ThenBlock: {
+                ul_type = JSParse_GetType(ul)
+                // delete o.x → compile o, push "x", DELETE_PROP
+                IfCondition EqualTo(ul_type, ASTType.MEMBER_DOT) ThenBlock: {
+                    obj = JSParse_GetLeft(ul)
+                    JSComp__Push(ul)
+                    JSComp__CompileExpr(obj)
+                    ul = JSComp__Pop()
+                    pnp = JSParse_GetNamePtr(ul)
+                    pnl = JSParse_GetNameLen(ul)
+                    ci = JSComp__AddString(pnp, pnl)
+                    JSComp__EmitOp16(JSOp.PUSH_CONST, ci)
+                    JSComp__Emit1(JSOp.DELETE_PROP)
+                    ReturnValue(0)
+                }
+                // delete o[k] → compile o, compile k, DELETE_PROP
+                IfCondition EqualTo(ul_type, ASTType.MEMBER_BRACKET) ThenBlock: {
+                    obj = JSParse_GetLeft(ul)
+                    key = JSParse_GetRight(ul)
+                    JSComp__Push(ul)
+                    JSComp__CompileExpr(obj)
+                    ul = JSComp__Pop()
+                    key = JSParse_GetRight(ul)
+                    JSComp__CompileExpr(key)
+                    JSComp__Emit1(JSOp.DELETE_PROP)
+                    ReturnValue(0)
+                }
+                // delete ident / other — eval for side effects, push true
+                // (strict ReferenceError not implemented; non-strict returns true)
+                JSComp__CompileExpr(ul)
+                JSComp__Emit1(JSOp.POP)
+                JSComp__Emit1(JSOp.PUSH_TRUE)
+                ReturnValue(0)
+            }
+
             JSComp__CompileExpr(ul)
             IfCondition EqualTo(uop, JSTokType.MINUS) ThenBlock: {
                 JSComp__Emit1(JSOp.NEG)
@@ -209,9 +246,36 @@ Function.JSComp__CompileExpr {
         }
 
         // --- TYPEOF_EXPR ---
+        // typeof undeclaredIdentifier → "undefined" (no ReferenceError).
+        // Use GET_GLOBAL_SOFT for bare IDENT; normal GET_GLOBAL throws.
         IfCondition EqualTo(ntype, ASTType.TYPEOF_EXPR) ThenBlock: {
             tl = JSParse_GetLeft(save_node)
-            JSComp__CompileExpr(tl)
+            tl_type = JSParse_GetType(tl)
+            IfCondition EqualTo(tl_type, ASTType.IDENT) ThenBlock: {
+                // Prefer local if bound, else soft global
+                np = JSParse_GetNamePtr(tl)
+                nl = JSParse_GetNameLen(tl)
+                slot = JSComp__FindLocal(np, nl)
+                IfCondition GreaterEqual(slot, 0) ThenBlock: {
+                    // TDZ still applies for let/const
+                    IfCondition And(LessThan(slot, 256), EqualTo(GetByte(JSCompState.tdz_map, slot), 1)) ThenBlock: {
+                        ci = JSComp__AddString(np, nl)
+                        JSComp__EmitOp16(JSOp.THROW_TDZ, ci)
+                    } ElseBlock: {
+                        IfCondition EqualTo(JSCompState.func_nesting, 0) ThenBlock: {
+                            ci = JSComp__AddString(np, nl)
+                            JSComp__EmitOp16(JSOp.GET_GLOBAL_SOFT, ci)
+                        } ElseBlock: {
+                            JSComp__EmitOp16(JSOp.GET_LOCAL, slot)
+                        }
+                    }
+                } ElseBlock: {
+                    ci = JSComp__AddString(np, nl)
+                    JSComp__EmitOp16(JSOp.GET_GLOBAL_SOFT, ci)
+                }
+            } ElseBlock: {
+                JSComp__CompileExpr(tl)
+            }
             JSComp__Emit1(JSOp.TYPEOF)
             ReturnValue(0)
         }
@@ -411,11 +475,22 @@ Function.JSComp__CompileExpr {
                 }
                 IfCondition EqualTo(al_type, ASTType.MEMBER_BRACKET) ThenBlock: {
                     // Compile: RHS value, then obj, then key, SET_ELEM
-                    // JSCompDot.member_node = MEMBER_BRACKET node
-                    // JSCompDot.assign_node = ASSIGN node
-                    JSComp__CompileExpr(JSParse_GetRight(JSCompDot.assign_node))
-                    JSComp__CompileExpr(JSParse_GetLeft(JSCompDot.member_node))
-                    JSComp__CompileExpr(JSParse_GetRight(JSCompDot.member_node))
+                    // Save JSCompDot — nested function/object compile clobbers it
+                    // (same bug class as MEMBER_DOT assign).
+                    saved_member_b = JSCompDot.member_node
+                    saved_assign_b = JSCompDot.assign_node
+                    br_rhs = JSParse_GetRight(saved_assign_b)
+                    br_obj = JSParse_GetLeft(saved_member_b)
+                    br_key = JSParse_GetRight(saved_member_b)
+                    JSComp__Push(br_obj)
+                    JSComp__Push(br_key)
+                    JSComp__CompileExpr(br_rhs)
+                    br_key = JSComp__Pop()
+                    br_obj = JSComp__Pop()
+                    JSComp__Push(br_key)
+                    JSComp__CompileExpr(br_obj)
+                    br_key = JSComp__Pop()
+                    JSComp__CompileExpr(br_key)
                     JSComp__Emit1(JSOp.SET_ELEM)
                     JSComp__Emit1(JSOp.PUSH_UNDEF)
                     ReturnValue(0)
@@ -896,6 +971,17 @@ Function.JSComp__CompileExpr {
             WhileLoop GreaterEqual(prop, 0) {
                 ptype = JSParse_GetType(prop)
 
+                // --- SPREAD_ELEMENT: ...src  →  CopyDataProperties(obj, src)
+                // Stack: [obj, src] → OBJ_SPREAD → [obj]
+                IfCondition EqualTo(ptype, ASTType.SPREAD_ELEMENT) ThenBlock: {
+                    JSComp__Emit1(JSOp.DUP)
+                    pval = JSParse_GetLeft(prop)
+                    JSComp__Push(prop)
+                    JSComp__CompileExpr(pval)
+                    prop = JSComp__Pop()
+                    JSComp__Emit1(JSOp.OBJ_SPREAD)
+                } ElseBlock: {
+
                 // --- COMPUTED_PROP: [expr]: value ---
                 // Stack: obj, key, value → SET_PROP_COMPUTED
                 IfCondition EqualTo(ptype, ASTType.COMPUTED_PROP) ThenBlock: {
@@ -960,6 +1046,7 @@ Function.JSComp__CompileExpr {
                 }
                 }
                 }
+                } // end SPREAD_ELEMENT else
 
                 prop = JSParse_GetNext(prop)
             }

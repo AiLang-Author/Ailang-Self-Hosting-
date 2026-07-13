@@ -145,7 +145,8 @@ Function.JSRT_ObjGet {
         IfCondition EqualTo(otype, JSType.FUNCTION) ThenBlock: {
             ReturnValue(JSRT_FuncPropGet(save_obj, save_key))
         }
-        // ARRAY type — check side table for named properties
+        // ARRAY type — own named props in side table, then __proto__ (Mole 16).
+        // Without proto walk, [][Symbol.iterator] never reaches Array.prototype.
         IfCondition EqualTo(otype, JSType.ARRAY) ThenBlock: {
             arr_pt = ArrSide_Lookup(save_obj)
             IfCondition NotEqual(arr_pt, 0) ThenBlock: {
@@ -153,6 +154,19 @@ Function.JSRT_ObjGet {
                 IfCondition NotEqual(arr_r, -1) ThenBlock: {
                     ReturnValue(arr_r)
                 }
+                JSRT__Push(save_key)
+                proto = PropTable_Lookup(arr_pt, "__proto__")
+                save_key = JSRT__Pop()
+                IfCondition EqualTo(proto, -1) ThenBlock: {
+                    ReturnValue(JSRTState.undef_val)
+                }
+                IfCondition EqualTo(proto, 0) ThenBlock: {
+                    ReturnValue(JSRTState.undef_val)
+                }
+                ReturnValue(JSRT_ObjGet(proto, save_key))
+            }
+            IfCondition NotEqual(JSRTState.array_proto, 0) ThenBlock: {
+                ReturnValue(JSRT_ObjGet(JSRTState.array_proto, save_key))
             }
             ReturnValue(JSRTState.undef_val)
         }
@@ -202,13 +216,35 @@ Function.JSRT_ObjSet {
         // to that slot silently corrupt every property that shares it.
         // Fix: allocate a fresh val_pool slot and copy the 16-byte JSValue so
         // the property owns an independent copy of the value.
+        // Property values must survive ReclaimScope (function return).
+        // Singletons are immortal; everything else is copied into gval_pool.
         IfCondition NotEqual(save_val, 0) ThenBlock: {
-            copy = JSRT__AllocValue()
-            IfCondition NotEqual(copy, 0) ThenBlock: {
-                // Copy 16-byte JSValue: [type(8)][payload(8)]
-                StoreValue(copy, Dereference(save_val))
-                StoreValue(Add(copy, 8), Dereference(Add(save_val, 8)))
-                save_val = copy
+            use_direct = 0
+            IfCondition EqualTo(save_val, JSRTState.true_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.false_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.null_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.undef_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(use_direct, 0) ThenBlock: {
+                copy = JSRT__AllocGlobalValue()
+                IfCondition EqualTo(copy, 0) ThenBlock: {
+                    copy = JSRT__AllocValue()
+                }
+                IfCondition NotEqual(copy, 0) ThenBlock: {
+                    StoreValue(copy, Dereference(save_val))
+                    StoreValue(Add(copy, 8), Dereference(Add(save_val, 8)))
+                    IfCondition EqualTo(Dereference(save_val), JSType.STRING) ThenBlock: {
+                        spay = Dereference(Add(save_val, 8))
+                        IfCondition NotEqual(spay, 0) ThenBlock: {
+                            slen = StringLength(spay)
+                            nbuf = JSRT__StrSlabAlloc(Add(slen, 1))
+                            IfCondition NotEqual(nbuf, 0) ThenBlock: {
+                                MemoryCopy(nbuf, spay, Add(slen, 1))
+                                StoreValue(Add(copy, 8), nbuf)
+                            }
+                        }
+                    }
+                    save_val = copy
+                }
             }
         }
         otype = Dereference(save_obj)
@@ -268,7 +304,8 @@ Function.JSRT_ObjHas {
     }
 }
 
-// Delete a property from an OBJECT. Returns 1 on success, 0 if not an object.
+// Delete a property from an OBJECT or ARRAY (named side props).
+// Returns 1 on success, 0 if not an object/array.
 Function.JSRT_ObjDelete {
     Input: obj: Address
     Input: key: Address
@@ -280,6 +317,14 @@ Function.JSRT_ObjDelete {
             ReturnValue(0)
         }
         otype = Dereference(save_obj)
+        // ARRAY named props live in ArrSide PropTable
+        IfCondition EqualTo(otype, JSType.ARRAY) ThenBlock: {
+            arr_pt = ArrSide_Lookup(save_obj)
+            IfCondition NotEqual(arr_pt, 0) ThenBlock: {
+                PropTable_Delete(arr_pt, save_key)
+            }
+            ReturnValue(1)
+        }
         IfCondition NotEqual(otype, JSType.OBJECT) ThenBlock: {
             ReturnValue(0)
         }
@@ -317,9 +362,48 @@ Function.JSRT_ObjKeys {
         ki = 0
         WhileLoop LessThan(ki, klen) {
             kstr = Array.Get(raw_keys, ki)
-            // Wrap each raw string as a JSValue STRING
-            ksv = JSRT_CreateString(kstr)
-            JSRT_ArrPush(result_arr, ksv)
+            // Skip engine-internal keys: __proto__, __class__, __get_*, __set_*,
+            // __ctor__, __dom_*, __regex_*, __field_init__, etc. These are stored
+            // as ordinary PropTable entries but must not appear in Object.keys /
+            // for-in (especially after NEW_OBJECT stamps __proto__).
+            skip = 0
+            IfCondition NotEqual(kstr, 0) ThenBlock: {
+                IfCondition EqualTo(GetByte(kstr, 0), 95) ThenBlock: {
+                    IfCondition EqualTo(GetByte(kstr, 1), 95) ThenBlock: {
+                        skip = 1
+                    }
+                }
+            }
+            IfCondition EqualTo(skip, 0) ThenBlock: {
+                // Skip non-enumerable own properties (Wave 2: __a_<key> bitfield)
+                // bit1 = enumerable; missing attr key → enumerable (default 7)
+                enum_ok = 1
+                nlen2 = StringLength(kstr)
+                ak = JSRT__StrSlabAlloc(Add(nlen2, 6))
+                IfCondition NotEqual(ak, 0) ThenBlock: {
+                    SetByte(ak, 0, 95)
+                    SetByte(ak, 1, 95)
+                    SetByte(ak, 2, 97)
+                    SetByte(ak, 3, 95)
+                    MemoryCopy(Add(ak, 4), kstr, Add(nlen2, 1))
+                    av = PropTable_Lookup(hash, ak)
+                    IfCondition NotEqual(av, -1) ThenBlock: {
+                        IfCondition NotEqual(av, 0) ThenBlock: {
+                            avt = JSRT_GetType(av)
+                            IfCondition EqualTo(avt, JSType.NUMBER) ThenBlock: {
+                                bits = Float_ToInt(JSRT_GetPayload(av))
+                                IfCondition EqualTo(BitwiseAnd(bits, 2), 0) ThenBlock: {
+                                    enum_ok = 0
+                                }
+                            }
+                        }
+                    }
+                }
+                IfCondition EqualTo(enum_ok, 1) ThenBlock: {
+                    ksv = JSRT_CreateString(kstr)
+                    JSRT_ArrPush(result_arr, ksv)
+                }
+            }
             ki = Add(ki, 1)
         }
         ReturnValue(result_arr)
@@ -350,6 +434,37 @@ Function.JSRT_ArrPush {
         IfCondition EqualTo(xa, 0) ThenBlock: {
             ReturnValue(-1)
         }
+        // Persist element like ObjSet: array outlives the pushing frame.
+        // Singletons immortal; others → gval_pool copy (survives ReclaimScope).
+        IfCondition NotEqual(save_val, 0) ThenBlock: {
+            use_direct = 0
+            IfCondition EqualTo(save_val, JSRTState.true_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.false_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.null_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.undef_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(use_direct, 0) ThenBlock: {
+                copy = JSRT__AllocGlobalValue()
+                IfCondition EqualTo(copy, 0) ThenBlock: {
+                    copy = JSRT__AllocValue()
+                }
+                IfCondition NotEqual(copy, 0) ThenBlock: {
+                    StoreValue(copy, Dereference(save_val))
+                    StoreValue(Add(copy, 8), Dereference(Add(save_val, 8)))
+                    IfCondition EqualTo(Dereference(save_val), JSType.STRING) ThenBlock: {
+                        spay = Dereference(Add(save_val, 8))
+                        IfCondition NotEqual(spay, 0) ThenBlock: {
+                            slen = StringLength(spay)
+                            nbuf = JSRT__StrSlabAlloc(Add(slen, 1))
+                            IfCondition NotEqual(nbuf, 0) ThenBlock: {
+                                MemoryCopy(nbuf, spay, Add(slen, 1))
+                                StoreValue(Add(copy, 8), nbuf)
+                            }
+                        }
+                    }
+                    save_val = copy
+                }
+            }
+        }
         Array.Push(xa, save_val)
         new_len = Array.Size(xa)
         ReturnValue(new_len)
@@ -377,6 +492,12 @@ Function.JSRT_ArrGet {
             ReturnValue(JSRTState.undef_val)
         }
         result = Array.Get(xa, save_idx)
+        // Array.Get returns 0 for OOB / null arr (NOT Collections.XERROR).
+        // Returning a null JSValue pointer crashes on later GetType/ObjSet —
+        // the root cause of `var [x]=[]`, dstr defaults, and many for/dstr hangs.
+        IfCondition EqualTo(result, 0) ThenBlock: {
+            ReturnValue(JSRTState.undef_val)
+        }
         IfCondition EqualTo(result, Collections.XERROR) ThenBlock: {
             ReturnValue(JSRTState.undef_val)
         }
@@ -405,6 +526,36 @@ Function.JSRT_ArrSet {
         xa = Dereference(Add(save_arr, 8))
         IfCondition EqualTo(xa, 0) ThenBlock: {
             ReturnValue(0)
+        }
+        // Persist like ArrPush / ObjSet
+        IfCondition NotEqual(save_val, 0) ThenBlock: {
+            use_direct = 0
+            IfCondition EqualTo(save_val, JSRTState.true_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.false_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.null_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(save_val, JSRTState.undef_val) ThenBlock: { use_direct = 1 }
+            IfCondition EqualTo(use_direct, 0) ThenBlock: {
+                copy = JSRT__AllocGlobalValue()
+                IfCondition EqualTo(copy, 0) ThenBlock: {
+                    copy = JSRT__AllocValue()
+                }
+                IfCondition NotEqual(copy, 0) ThenBlock: {
+                    StoreValue(copy, Dereference(save_val))
+                    StoreValue(Add(copy, 8), Dereference(Add(save_val, 8)))
+                    IfCondition EqualTo(Dereference(save_val), JSType.STRING) ThenBlock: {
+                        spay = Dereference(Add(save_val, 8))
+                        IfCondition NotEqual(spay, 0) ThenBlock: {
+                            slen = StringLength(spay)
+                            nbuf = JSRT__StrSlabAlloc(Add(slen, 1))
+                            IfCondition NotEqual(nbuf, 0) ThenBlock: {
+                                MemoryCopy(nbuf, spay, Add(slen, 1))
+                                StoreValue(Add(copy, 8), nbuf)
+                            }
+                        }
+                    }
+                    save_val = copy
+                }
+            }
         }
         result = Array.Set(xa, save_idx, save_val)
         ReturnValue(result)
@@ -1417,9 +1568,22 @@ Function.JSRT_Reset {
         JSRTState.oom = 0
         JSRTStack.sp = 0
 
-        // Reset property tables
+        // Reset property tables — MUST zero the slab when rewinding next_slot.
+        // Otherwise CreateObject reuses slot 0..N and MemorySet wipes tables still
+        // referenced by live objects (e.g. document after EvalString reset), so
+        // document.getElementById becomes undefined and DOM SET_PROP never sees
+        // __dom_idx.
         GlobalHash_Reset()
+        IfCondition NotEqual(PropState.slab, 0) ThenBlock: {
+            slab_sz = Multiply(PropConst.MAX_TABLES, PropConst.TABLE_SIZE)
+            MemorySet(PropState.slab, 0, slab_sz)
+        }
         PropState.next_slot = 0
+        IfCondition NotEqual(PropState.arr_side, 0) ThenBlock: {
+            as_sz = Multiply(PropConst.ARR_SIDE_MAX, PropConst.ARR_SIDE_ENTRY)
+            MemorySet(PropState.arr_side, 0, as_sz)
+            PropState.arr_side_count = 0
+        }
 
         // Re-create singletons
         uv = JSRT__AllocValue()
@@ -1481,7 +1645,7 @@ Function.JSRT_Reset {
 // =============================================================================
 
 FixedPool.JSGenConst {
-    "STATE_SZ":      Initialize=112
+    "STATE_SZ":      Initialize=120
     "GEN_STACK_MAX": Initialize=512
     "GEN_FRAMES_MAX": Initialize=32
     "ST_SUSPENDED_START": Initialize=0
@@ -1578,6 +1742,10 @@ Function.JSRT_CreateGenerator {
             StoreValue(Add(gs, 72), ab_copy)
         }
         StoreValue(Add(gs, 80), save_ac)
+
+        // Mole 15: capture this at creation (custom @@iterator needs array as this)
+        this_cap = JSVM__GetGlobal("this")
+        StoreValue(Add(gs, 112), this_cap)
 
         // Bump-allocate private frames from gen slab (32 frames * 72 bytes)
         frm_sz = Multiply(JSGenConst.GEN_FRAMES_MAX, JSVMConst.FRAME_SIZE)

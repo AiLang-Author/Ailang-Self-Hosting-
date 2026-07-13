@@ -75,6 +75,8 @@ FixedPool.JSOp {
     "INSTANCEOF":    Initialize=49
     "TYPEOF":        Initialize=47
     "IN":            Initialize=38
+    // delete obj.prop — stack: [obj, key_str] → push boolean
+    "DELETE_PROP":   Initialize=39
 
     // Control
     "JMP":           Initialize=50
@@ -133,6 +135,25 @@ FixedPool.JSOp {
     // Method call (obj.method() with this binding)
     "CALL_METHOD":   Initialize=83
 
+    // typeof-safe global get (unresolvable → undefined, no ReferenceError)
+    "GET_GLOBAL_SOFT": Initialize=84
+    // Assignment to global (strict: undeclared → ReferenceError). Decls use SET_GLOBAL.
+    "SET_GLOBAL_ASSIGN": Initialize=85
+
+    // Mole 7: per-activation closure env (high numbers — avoid clashing)
+    // GET_FREE name — free-var read via callee.__cenv chain
+    "GET_FREE":      Initialize=90
+    // SET_FRAME_ENV name — dual-write own local into current frame env object
+    "SET_FRAME_ENV": Initialize=91
+    // SET_FREE name — free-var write on __cenv chain
+    "SET_FREE":      Initialize=92
+    // OBJ_SPREAD — CopyDataProperties for object spread `{...src}` (Mole 11)
+    "OBJ_SPREAD":    Initialize=93
+    // Mole 15: array destructuring via iterator protocol
+    "GET_ITER":      Initialize=94   // [iterable] → [iter_record]
+    "ITER_NEXT":     Initialize=95   // [iter_record] → [value]; sets JSVMIter.done
+    "ITER_CLOSE":    Initialize=96   // [iter_record] → []; call return if !done
+
     // Special
     "HALT":          Initialize=0
     "NOP":           Initialize=99
@@ -154,6 +175,11 @@ FixedPool.JSCompConst {
     "STR_CAP":       Initialize=524288
     "FUNC_SIZE":     Initialize=40
     "MAX_FUNCS":     Initialize=4096
+    // Finally stack: [fin_body_ast, in_try_flag] per frame
+    "MAX_FINALLY":   Initialize=32
+    "FINALLY_SIZE":  Initialize=16
+    "MAX_ENCL":      Initialize=64
+    "ENCL_ENTRY":    Initialize=24
 }
 
 // =============================================================================
@@ -177,9 +203,17 @@ FixedPool.JSCompState {
     "tdz_map":       Initialize=0
     "switch_jmps":   Initialize=0
     "func_nesting":  Initialize=0
+    "in_arrow":      Initialize=0
     "is_derived_ctor": Initialize=0
     "eval_mode":       Initialize=0 // 1=REPL/eval: last EXPR_STMT keeps value on stack
     "is_last_stmt":    Initialize=0 // 1=currently compiling the last statement in program
+    "is_strict":       Initialize=0 // Wave 3: "use strict" directive detected
+    "finally_stack":   Initialize=0
+    "finally_depth":   Initialize=0
+    // Closure capture: current function index + enclosing locals for free-var lookup
+    "current_fidx":    Initialize=0
+    "encl_count":      Initialize=0
+    "encl_buf":        Initialize=0  // [name_ptr, name_len, owner_fidx] x MAX_ENCL
 }
 
 // =============================================================================
@@ -278,6 +312,11 @@ Function.JSComp_Init {
         JSCompState.loop_stack = Allocate(lsz)
         MemorySet(JSCompState.loop_stack, 0, lsz)
 
+        fsz2 = Multiply(JSCompConst.MAX_FINALLY, JSCompConst.FINALLY_SIZE)
+        JSCompState.finally_stack = Allocate(fsz2)
+        MemorySet(JSCompState.finally_stack, 0, fsz2)
+        JSCompState.finally_depth = 0
+
         // Compiler frame stack (2048 entries x 8 bytes)
         JSCompStack.pool = Allocate(16384)
         JSCompStack.capacity = 2048
@@ -300,6 +339,13 @@ Function.JSComp_Init {
         JSCompState.switch_jmps = Allocate(2048)
         MemorySet(JSCompState.switch_jmps, 0, 2048)
 
+        // Enclosing-local table for free-var / closure capture
+        esz = Multiply(JSCompConst.MAX_ENCL, JSCompConst.ENCL_ENTRY)
+        JSCompState.encl_buf = Allocate(esz)
+        MemorySet(JSCompState.encl_buf, 0, esz)
+        JSCompState.encl_count = 0
+        JSCompState.current_fidx = 0
+
         ReturnValue(1)
     }
 }
@@ -319,18 +365,89 @@ Function.JSComp_Reset {
         MemorySet(JSCompState.func_pool, 0, fsz)
         lsz = Multiply(JSCompConst.MAX_LOOPS, JSCompConst.LOOP_SIZE)
         MemorySet(JSCompState.loop_stack, 0, lsz)
+        fsz2 = Multiply(JSCompConst.MAX_FINALLY, JSCompConst.FINALLY_SIZE)
+        MemorySet(JSCompState.finally_stack, 0, fsz2)
         JSCompState.code_pos = 0
         JSCompState.const_count = 0
         JSCompState.scope_depth = 0
         JSCompState.func_count = 0
         JSCompState.loop_depth = 0
+        JSCompState.finally_depth = 0
         JSCompState.error = 0
         JSCompState.func_nesting = 0
         JSCompState.eval_mode = 0
         JSCompState.is_last_stmt = 0
+        JSCompState.is_strict = 0
         JSCompStack.sp = 0
         MemorySet(JSCompState.tdz_map, 0, 256)
         ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// FINALLY STACK — run finally on continue/break/return (inline bodies)
+// Entry: [0]=fin_body AST idx, [8]=in_try (1 while compiling try body)
+// =============================================================================
+
+Function.JSComp__PushFinally {
+    Input: fin_body: Integer
+    Output: Integer
+    Body: {
+        save_fb = fin_body
+        IfCondition GreaterEqual(JSCompState.finally_depth, JSCompConst.MAX_FINALLY) ThenBlock: {
+            JSCompState.error = 1
+            ReturnValue(-1)
+        }
+        base = Add(JSCompState.finally_stack, Multiply(JSCompState.finally_depth, JSCompConst.FINALLY_SIZE))
+        StoreValue(base, save_fb)
+        StoreValue(Add(base, 8), 1)
+        JSCompState.finally_depth = Add(JSCompState.finally_depth, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSComp__PopFinally {
+    Output: Integer
+    Body: {
+        IfCondition LessThan(JSCompState.finally_depth, 1) ThenBlock: {
+            ReturnValue(-1)
+        }
+        JSCompState.finally_depth = Subtract(JSCompState.finally_depth, 1)
+        ReturnValue(0)
+    }
+}
+
+Function.JSComp__SetFinallyInTry {
+    Input: flag: Integer
+    Output: Integer
+    Body: {
+        save_flag = flag
+        IfCondition LessThan(JSCompState.finally_depth, 1) ThenBlock: {
+            ReturnValue(-1)
+        }
+        depth_idx = Subtract(JSCompState.finally_depth, 1)
+        base = Add(JSCompState.finally_stack, Multiply(depth_idx, JSCompConst.FINALLY_SIZE))
+        StoreValue(Add(base, 8), save_flag)
+        ReturnValue(0)
+    }
+}
+
+Function.JSComp__PeekFinallyBody {
+    Output: Integer
+    Body: {
+        IfCondition LessThan(JSCompState.finally_depth, 1) ThenBlock: {
+            ReturnValue(-1)
+        }
+        depth_idx = Subtract(JSCompState.finally_depth, 1)
+        base = Add(JSCompState.finally_stack, Multiply(depth_idx, JSCompConst.FINALLY_SIZE))
+        ReturnValue(Dereference(base))
+    }
+}
+
+Function.JSComp_IsStrict {
+    Output: Integer
+    Body: {
+        ReturnValue(JSCompState.is_strict)
     }
 }
 
@@ -665,8 +782,96 @@ Function.JSComp__FindLocalInScope {
 }
 
 // =============================================================================
-// VARIABLE RESOLUTION — emit GET/SET LOCAL or GLOBAL
+// VARIABLE RESOLUTION — emit GET/SET LOCAL or GLOBAL + closure capture cells
+// Capture cells: "__uv_<fidx>_<name>" — function-local mirrors for free vars
 // =============================================================================
+
+Function.JSComp__CapNameAdd {
+    Input: owner_fidx: Integer
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        save_f = owner_fidx
+        save_ptr = name_ptr
+        save_len = name_len
+        p = Add(JSCompState.str_buf, JSCompState.str_pos)
+        SetByte(p, 0, 95)
+        SetByte(p, 1, 95)
+        SetByte(p, 2, 117)
+        SetByte(p, 3, 118)
+        SetByte(p, 4, 95)
+        pos = 5
+        IfCondition GreaterEqual(save_f, 100) ThenBlock: {
+            SetByte(p, pos, Add(48, Divide(save_f, 100)))
+            pos = Add(pos, 1)
+            save_f = Subtract(save_f, Multiply(Divide(save_f, 100), 100))
+        }
+        IfCondition GreaterEqual(save_f, 10) ThenBlock: {
+            SetByte(p, pos, Add(48, Divide(save_f, 10)))
+            pos = Add(pos, 1)
+            save_f = Subtract(save_f, Multiply(Divide(save_f, 10), 10))
+        }
+        SetByte(p, pos, Add(48, save_f))
+        pos = Add(pos, 1)
+        SetByte(p, pos, 95)
+        pos = Add(pos, 1)
+        MemoryCopy(Add(p, pos), save_ptr, save_len)
+        pos = Add(pos, save_len)
+        SetByte(p, pos, 0)
+        JSCompState.str_pos = Add(JSCompState.str_pos, Add(pos, 1))
+        ReturnValue(JSComp__AddString(p, pos))
+    }
+}
+
+Function.JSComp__FindEnclosing {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        // Search newest-first so inner shadowing wins over grandparent names
+        save_ptr = name_ptr
+        save_len = name_len
+        i = Subtract(JSCompState.encl_count, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            ebase = Add(JSCompState.encl_buf, Multiply(i, JSCompConst.ENCL_ENTRY))
+            ep = Dereference(ebase)
+            el = Dereference(Add(ebase, 8))
+            JSComp__Push(i)
+            eq = JSComp__StrEq(save_ptr, save_len, ep, el)
+            i = JSComp__Pop()
+            IfCondition EqualTo(eq, 1) ThenBlock: {
+                ReturnValue(Dereference(Add(ebase, 16)))
+            }
+            i = Subtract(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+// True if name is "arguments" (VM injects bare global arguments per call).
+// Must not capture outer `var arguments` as free-var for nested functions.
+Function.JSComp__IsArgumentsName {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(name_len, 9) ThenBlock: {
+            ReturnValue(0)
+        }
+        // a r g u m e n t s
+        IfCondition NotEqual(GetByte(name_ptr, 0), 97) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(name_ptr, 1), 114) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(name_ptr, 2), 103) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(name_ptr, 3), 117) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(name_ptr, 4), 109) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(name_ptr, 5), 101) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(name_ptr, 6), 110) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(name_ptr, 7), 116) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(GetByte(name_ptr, 8), 115) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
 
 Function.JSComp__EmitVarGet {
     Input: name_ptr: Address
@@ -677,14 +882,10 @@ Function.JSComp__EmitVarGet {
         save_len = name_len
         slot = JSComp__FindLocal(save_ptr, save_len)
         IfCondition GreaterEqual(slot, 0) ThenBlock: {
-            // TDZ check: if slot is marked, emit THROW_TDZ
             IfCondition And(LessThan(slot, 256), EqualTo(GetByte(JSCompState.tdz_map, slot), 1)) ThenBlock: {
                 ci = JSComp__AddString(save_ptr, save_len)
                 JSComp__EmitOp16(JSOp.THROW_TDZ, ci)
             } ElseBlock: {
-                // At top-level (func_nesting==0), use GET_GLOBAL so we see
-                // mutations made by called functions (which write via SET_GLOBAL).
-                // Inside functions, GET_LOCAL is correct and faster.
                 IfCondition EqualTo(JSCompState.func_nesting, 0) ThenBlock: {
                     ci = JSComp__AddString(save_ptr, save_len)
                     JSComp__EmitOp16(JSOp.GET_GLOBAL, ci)
@@ -693,8 +894,26 @@ Function.JSComp__EmitVarGet {
                 }
             }
         } ElseBlock: {
-            ci = JSComp__AddString(save_ptr, save_len)
-            JSComp__EmitOp16(JSOp.GET_GLOBAL, ci)
+            // "arguments": arrows capture enclosing activation's args via __cenv
+            // (VM dual-writes args obj onto frame env). Non-arrows use global.
+            is_args = JSComp__IsArgumentsName(save_ptr, save_len)
+            IfCondition EqualTo(is_args, 1) ThenBlock: {
+                ci = JSComp__AddString(save_ptr, save_len)
+                IfCondition EqualTo(JSCompState.in_arrow, 1) ThenBlock: {
+                    JSComp__EmitOp16(JSOp.GET_FREE, ci)
+                } ElseBlock: {
+                    JSComp__EmitOp16(JSOp.GET_GLOBAL, ci)
+                }
+            } ElseBlock: {
+                owner = JSComp__FindEnclosing(save_ptr, save_len)
+                IfCondition GreaterEqual(owner, 0) ThenBlock: {
+                    ci = JSComp__AddString(save_ptr, save_len)
+                    JSComp__EmitOp16(JSOp.GET_FREE, ci)
+                } ElseBlock: {
+                    ci = JSComp__AddString(save_ptr, save_len)
+                    JSComp__EmitOp16(JSOp.GET_GLOBAL, ci)
+                }
+            }
         }
         ReturnValue(0)
     }
@@ -709,17 +928,47 @@ Function.JSComp__EmitVarSet {
         save_len = name_len
         slot = JSComp__FindLocal(save_ptr, save_len)
         IfCondition GreaterEqual(slot, 0) ThenBlock: {
-            // Also store as global so functions can access via GET_GLOBAL.
-            // This is needed even inside functions for top-level vars (var hoisting).
-            IfCondition GreaterEqual(JSCompState.func_nesting, 0) ThenBlock: {
+            // Top-level: mirror bare global name
+            IfCondition EqualTo(JSCompState.func_nesting, 0) ThenBlock: {
                 JSComp__Emit1(JSOp.DUP)
                 ci = JSComp__AddString(save_ptr, save_len)
                 JSComp__EmitOp16(JSOp.SET_GLOBAL, ci)
             }
+            // Inside function: mirror into frame env for nested free-var reads.
+            // Skip "arguments" — VM owns bare global "arguments" per call.
+            IfCondition GreaterThan(JSCompState.func_nesting, 0) ThenBlock: {
+                is_args2 = JSComp__IsArgumentsName(save_ptr, save_len)
+                // Only dual-write idents that appear free in nested funcs.
+                // Always dual-write for now (Mole 7); SET_FRAME_ENV is required
+                // for live capture. (Disabled path kept for debugging.)
+                IfCondition EqualTo(is_args2, 0) ThenBlock: {
+                    JSComp__Emit1(JSOp.DUP)
+                    ci = JSComp__AddString(save_ptr, save_len)
+                    JSComp__EmitOp16(JSOp.SET_FRAME_ENV, ci)
+                    // Mole 16: trailing u16 = local slot for free-var stack sync
+                    JSComp__Emit1(0)
+                    JSComp__Emit1(BitwiseAnd(ShiftRight(slot, 8), 255))
+                    JSComp__Emit1(BitwiseAnd(slot, 255))
+                }
+            }
             JSComp__EmitOp16(JSOp.SET_LOCAL, slot)
         } ElseBlock: {
-            ci = JSComp__AddString(save_ptr, save_len)
-            JSComp__EmitOp16(JSOp.SET_GLOBAL, ci)
+            is_args3 = JSComp__IsArgumentsName(save_ptr, save_len)
+            owner = -1
+            IfCondition EqualTo(is_args3, 0) ThenBlock: {
+                owner = JSComp__FindEnclosing(save_ptr, save_len)
+            }
+            IfCondition GreaterEqual(owner, 0) ThenBlock: {
+                ci = JSComp__AddString(save_ptr, save_len)
+                JSComp__EmitOp16(JSOp.SET_FREE, ci)
+            } ElseBlock: {
+                ci = JSComp__AddString(save_ptr, save_len)
+                IfCondition EqualTo(JSCompState.is_strict, 1) ThenBlock: {
+                    JSComp__EmitOp16(JSOp.SET_GLOBAL_ASSIGN, ci)
+                } ElseBlock: {
+                    JSComp__EmitOp16(JSOp.SET_GLOBAL, ci)
+                }
+            }
         }
         ReturnValue(0)
     }
