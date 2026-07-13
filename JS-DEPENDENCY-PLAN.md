@@ -5,7 +5,7 @@
 
 ---
 
-## Status (post Mole 16 + Mole 17 WIP)
+## Status
 
 | Gate | Result |
 |------|--------|
@@ -13,24 +13,22 @@
 | mid-gate `--quick` | **e2e + core PASS** |
 | dstr (`function/dstr`) | **186/186 (100%)** |
 | mapped args | **43/43 (100%)** |
-| generators (no-batch) | **231/556 (41.5%)** — was **222/556**; **+9** |
-| generators (batch) | **~204/556** — undercounts; prefer `--no-batch` for gen |
-| statements/function | **324/451 (71.8%)** |
-| expressions/call | **57/92 (62.0%)** |
+| generators (no-batch) | **347/556 (62.4%)** — was 222; **+125** |
+| gen dstr | **248/372** (expr **124/186**, was 12) |
+| statements/function | re-check after assign fix |
+| expressions/call | re-check |
 
 ---
 
 ## Gates
 
 ```bash
-python3 tools/js_midgate.py --rebuild   # after engine edits
-python3 tools/js_midgate.py --quick     # e2e + core
+python3 tools/js_midgate.py --rebuild
+python3 tools/js_midgate.py --quick
 python3 tools/test262_runner.py --categories statements/generators,expressions/generators --no-batch -j 4
-python3 tools/test262_runner.py --categories statements/function,expressions/call -j 8
-python3 tools/test262_runner.py --full -j 8 --output-json /tmp/test262_full.json   # milestones only
 ```
 
-**Any mid-gate red = stop and fix.**
+**Generators: use `--no-batch` for honest scores.**
 
 ---
 
@@ -39,46 +37,38 @@ python3 tools/test262_runner.py --full -j 8 --output-json /tmp/test262_full.json
 ### Done
 | Mole | Outcome |
 |------|---------|
-| **15** | **CLOSED** dstr 186/186 |
-| **16** | **CLOSED** mapped 43/43 — strict, accessor, free-var gval, CallFunc args, DELETE unmap, defineProperty !C, arrow lexical args |
+| **15** | dstr 186/186 |
+| **16** | mapped 43/43 |
+| **17a** | GenNext CALL-like first-resume (rest, args, frames, yield env) |
+| **17b** | **Assign clobber fix** — `f = function(){ n=1 }` no longer writes n; gen-expr dstr **+112** |
 
-### Mole 17 — Generators first-resume (IN PROGRESS)
-| Work | Status |
-|------|--------|
-| GenNext: PushFrame + rest packing + arguments | **done** |
-| RETURN base frame via `fp==0` after pop | **done** |
-| Save/restore `frame_envs` across yield | **done** |
-| `JSVM_Reset` clears gen slab pos | **done** |
-| Gen param **dstr** (236 fails, stmt 124/186 vs expr 12/186) | **next** |
-| forbidden-ext / name / prototype / yield* | later |
+### Mole 17 residual (gen)
+| Work | Notes |
+|------|-------|
+| Remaining gen dstr (~124 fail) | error paths, null/undef obj, iterator close edges |
+| forbidden-ext / name / prototype | lower priority |
+| yield* | 2 fails |
 
-**Honest score:** no-batch **231/556 (+9)**. Prefer `--no-batch` for gen gates until batch isolation is solid.
-
-### NEXT after Mole 17
-1. Finish gen dstr (close gap expr vs stmt; error paths)  
-2. Strict function edges (`caller`/`callee`, `13.*-s`)  
-3. Call leftovers (eval-spread)  
-4. Re-full test262 milestone  
-
-### Explicitly deprioritize
-async/gen/class trailing-comma args, TCO, `with`, full Date/String until gen/strict cleaner.
+### Then
+1. Strict function edges (`caller`/`callee`)  
+2. Call leftovers  
+3. Re-full test262  
 
 ---
 
-## Progress log (compact)
+## Progress log
 
-| When | Milestone | Notes |
-|------|-----------|-------|
-| M15 residual | dstr **186/186** | CallFunc nest; gen throw; class name |
-| M16 | mapped **43/43** | accessor + free-var + arrow args |
-| M17 WIP | gen **231/556** | first-resume CALL-like; +9 no-batch |
+| Milestone | Notes |
+|-----------|-------|
+| M16 | mapped 43/43 |
+| M17a | gen first-resume → 231/556 |
+| M17b | assign clobber → **347/556**, expr dstr 124/186 |
 
 ---
 
 ## Agent rules
 
 1. Mid-gate green after every mole.  
-2. Generators: use `--no-batch` for honest scores (batch gen slab / isolation still weak).  
-3. Prefer dependency order over raw fail counts.  
-4. Update Status + March forward when a mole closes.  
-5. Language smells → `AILANG-WARTS.md`.
+2. Generators: `--no-batch` for honest scores.  
+3. Update this file when a mole closes.  
+4. Language smells → `AILANG-WARTS.md`.
