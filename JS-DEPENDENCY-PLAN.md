@@ -27,6 +27,7 @@
 | mapped args | **43/43** | |
 | **language `--all`** | **13441/23899 (56.2%)** | honest batch; was 42% before gval fix |
 | compound-assignment | **298/454 (65.6%)** | M19d Number.Inf/NaN, Mod NaN, ToPrimitive, A7 key-once |
+| assignment | **289/485 (63.5%)** | M20a LHS-first bracket assign; was ~59% |
 | full `--full` (~49k) | not run | milestone only |
 
 **Batch fix (M18b):** `JSRT_Reset` rewinds `gval_pool` — batch no longer under-reports statements/function & generators.
