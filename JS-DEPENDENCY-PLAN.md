@@ -13,8 +13,8 @@
 | mid-gate `--quick` | **e2e + core PASS** |
 | dstr (`function/dstr`) | **186/186 (100%)** |
 | mapped args | **43/43 (100%)** |
-| generators (no-batch) | **473/556 (85.1%)** — was 347; **+126** |
-| gen dstr | **372/372 (100%)** — was 248 |
+| generators (no-batch) | **502/556 (90.3%)** — was 473; **+29** |
+| gen dstr | **372/372 (100%)** |
 | statements/function | re-check after assign fix |
 | expressions/call | re-check |
 
@@ -41,14 +41,17 @@ python3 tools/test262_runner.py --categories statements/generators,expressions/g
 | **16** | mapped 43/43 |
 | **17a** | GenNext CALL-like first-resume (rest, args, frames, yield env) |
 | **17b** | **Assign clobber fix** — `f = function(){ n=1 }` no longer writes n; gen-expr dstr **+112** |
-| **17c** | **FDI-at-call + nest GenNext** — body_start in FUNC_SIZE=48; throw on `f(null)`; elision nest isolates fdi_* |
+| **17c** | **FDI-at-call + nest GenNext** — body_start; throw on `f(null)`; elision nest |
+| **18** | **Function.name/length + call/apply/bind + gen [[Prototype]]** → gens **502/556** |
 
-### Mole 17 residual (gen)
+### Mole 17–18 residual (gen)
 | Work | Notes |
 |------|-------|
 | ~~Remaining gen dstr~~ | **DONE 372/372** |
-| forbidden-ext / name / prototype | lower priority (~83 fails left in gen) |
-| yield* | check residual |
+| yield as identifier / yield* newlines | ~12 fails (non-strict + ASI) |
+| forbidden-ext (caller) | ~10 fails |
+| scope / unscopables / TDZ defaults | ~12 fails |
+| prototype descriptor / params-dflt-args | few |
 
 ### Then
 1. Strict function edges (`caller`/`callee`)  
@@ -65,6 +68,7 @@ python3 tools/test262_runner.py --categories statements/generators,expressions/g
 | M17a | gen first-resume → 231/556 |
 | M17b | assign clobber → **347/556**, expr dstr 124/186 |
 | M17c | FDI-at-call + nest fdi isolation → gen dstr **372/372**, gens **473/556** |
+| M18 | Function.name/length + call/apply/bind + gen proto → **502/556** |
 
 ---
 
