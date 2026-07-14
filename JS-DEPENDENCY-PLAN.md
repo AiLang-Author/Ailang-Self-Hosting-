@@ -27,7 +27,7 @@
 | mapped args | **43/43** | |
 | **language `--all`** | **13441/23899 (56.2%)** | honest batch; was 42% before gval fix |
 | compound-assignment | **298/454 (65.6%)** | M19d Number.Inf/NaN, Mod NaN, ToPrimitive, A7 key-once |
-| assignment | **395/485 (83.5%)** | M20d iter-close/obj-rest-str; was 78.6% |
+| assignment | **407/485 (86.0%)** | M20e rtrn-close 47/47; was 83.5% |
 | full `--full` (~49k) | not run | milestone only |
 
 **Batch fix (M18b):** `JSRT_Reset` rewinds `gval_pool` — batch no longer under-reports statements/function & generators.
@@ -78,8 +78,9 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 - **Done (M20a):** LHS-first `base[prop]=`; SET_ELEM single ToPropertyKey.  
 - **Done (M20b):** CoverToPattern default swap; stack pollution; RHS result stash → **341**.  
 - **Done (M20c):** `EmitDstrBind` for MEMBER_DOT/BRACKET targets; `THROW_CONST` + const name registry; TDZ on write. **341→372 (78.6%)**.  
-- **Done (M20d):** OBJ_SPREAD string/array index keys (stable `JSVM__ArgIndexKey`); array dstr try→`ITER_CLOSE` on throw; LRef-before-IteratorStep for member/rest; `ITER_CLOSE` kind 0/1 (throw completion swallows return() throw); CallFunc uncaught restore; isolate return() from outer try. Close suite **35/47** (all thrw/nrml; **12 rtrn-close** left). Assign **372→395 (83.5%)**.  
-- **Left:** generator rtrn-close (~12); yield-ident; put-let TDZ free; S11 with/eval; fn-name; ~12 timeouts.
+- **Done (M20d):** OBJ_SPREAD string/array index keys; array dstr try→`ITER_CLOSE` on throw; LRef-before-IteratorStep; `ITER_CLOSE` kind 0/1; CallFunc restore. Assign **372→395**.  
+- **Done (M20e):** GenReturn closes open iter (rtrn-close); track open_iter on GET_ITER; GET_ITER defers next-callability; close suite **47/47**. Assign **395→407 (86.0%)**.  
+- **Left:** yield-ident residual; put-let TDZ free; S11 with/eval; fn-name; ~12 timeouts.
 
 ### M21 progress
 - **Done:** IterableToArray throw/getter/gen; call **79%**; spread-err **16/16**.  
