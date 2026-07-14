@@ -75,8 +75,9 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 - **Left:** private #fields ~48; A5/A6 putvalue+**with**/eval (~66, needs `with` stmt); 11.13.2-s strict eval (~31, M23); putvalue global-delete (~22); whitespace ~11.
 
 ### M20 progress
-- **Done:** Simple `base[prop]=rhs` evaluates base→key→RHS (not RHS-first); SET_ELEM ToPropertyKey once (no pre-ToNumber). assignment **285→289**; compound held.  
-- **Left:** dstr-assign mass; S11.13.1 A5/A6 (with/eval); strict LHS; fn-name; timeouts.
+- **Done (M20a):** LHS-first `base[prop]=`; SET_ELEM single ToPropertyKey.  
+- **Done (M20b):** CoverToPattern swaps default ASSIGN to pattern form; remove orphan PUSH_UNDEF in array dstr; stash RHS in `__dstr_rhs__` for expr result; +64 local headroom. **assignment 289→341 (74.9%)**.  
+- **Left:** ~array/obj dstr residual (iter-close edges, rest, put); S11 with/eval; fn-name; 30 timeouts.
 
 ### M21 progress
 - **Done:** IterableToArray throw/getter/gen; call **79%**; spread-err **16/16**.  
@@ -109,6 +110,7 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 | M19c | `JSRT__ParseNumberStr` — string ToNumber invalid→NaN (not 0) |
 | M19d | Number.Inf/NaN; Mod NaN edges; ToPrimitive; compound bracket key-once → compound **65.6%** |
 | M20a | assignment LHS-first for `base[prop]=`; SET_ELEM single ToPropertyKey → assign **63.5%** |
+| M20b | dstr-assign: cover default swap; stack pollution fix; RHS result stash → assign **74.9%** |
 | M21 | IterableToArray throw/getter/gen rethrow → call **69%→79%**, spread-err **16/16** |
 | M22a | `Object.prototype.isPrototypeOf`/`hasOwnProperty`; CONSTRUCT accepts fn as .prototype → function stmt **80%→81%** |
 | Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function stmt 81%; call **79%**; compound **66%** |
