@@ -1,39 +1,36 @@
-# JS Engine — Dependency-Ordered Fix Plan
+# JS Engine — Dependency Plan
 
 **Updated:** 2026-07-14  
-**Rule:** Fix in dependency order. No false greens. Mid-gate after every mole.  
-**Priority:** **Compliance first**, speed later (engine starts fast enough; optimize after green mass).  
-**Style:** **Wrap vs write** — prefer Ailang / existing primitives and thin JS-facing wrappers over hand-rolled C-shaped natives when the primitive already exists.
+**Goal:** Language compliance mass first; speed later. No false greens.
+
+| Rule | |
+|------|--|
+| Order | Fix **dependencies first** (ops → assign → call → function → eval → class → modules → async) |
+| Honesty | Generators / function / call: **`--no-batch`**. Batch OK after M18b (gval rewind). |
+| Style | **Wrap over write** — use Ailang/runtime primitives; thin JS surface |
+| Gate | Midgate green after every mole |
 
 ---
 
-## Status (post M18 scorecard)
+## Summary (now)
 
-| Gate | Result | Mode |
-|------|--------|------|
-| e2e | **36 asserts / 0 fail** | |
-| mid-gate | **e2e + core + curated PASS** | `--with-cats` informational |
-| dstr `function/dstr` | **186/186** | |
-| gen dstr | **372/372 (100%)** | no-batch |
-| fn dstr | **372/372 (100%)** | no-batch |
-| generators | **502/556 (90.3%)** | no-batch |
-| function | **601/715 (84.1%)** | no-batch |
-| call | **63/92 (68.5%)** | no-batch |
-| mapped args | **43/43** | no-batch |
-| args total | **124/263 (47%)** | no-batch |
-| **default suite** | **3594/7689 (47%)** | batch, ~336s |
-| **language `--all`** | **10120/23899 (42.5%)** pre-fix; **re-score after M18b** | batch |
-| **full `--full`** | ~49–53k | **not run yet** |
+| Gate | Score | Notes |
+|------|------:|-------|
+| e2e + midgate core | **PASS** | |
+| function dstr | **186/186** | |
+| gen dstr | **372/372** | no-batch |
+| fn dstr | **372/372** | no-batch |
+| generators | **502/556 (90%)** | no-batch |
+| function | **601/715 (84%)** | no-batch |
+| call | **63/92 (69%)** | no-batch |
+| mapped args | **43/43** | |
+| **language `--all`** | **13441/23899 (56.2%)** | honest batch; was 42% before gval fix |
+| compound-assignment | **267/454 (58.8%)** | M19a boxing; was 38% |
+| full `--full` (~49k) | not run | milestone only |
 
-**Timing note:** runner idle; harness workers pin cores. ~250ms/test no-batch, ~150ms batch — almost all **compile+VM**, not Python.
+**Batch fix (M18b):** `JSRT_Reset` rewinds `gval_pool` — batch no longer under-reports statements/function & generators.
 
-**Batch honesty (M18b fixed):** `JSRT_Reset` now rewinds `gval_pool`/`gval_count` (was exhausting mid-suite). Verified:
-| Slice | no-batch | batch |
-|-------|----------|-------|
-| statements/function | 359/451 (79.6%) | **359/451 (79.6%)** |
-| generators total | 502/556 (90.3%) | **502/556 (90.3%)** |
-
-Batch dashboards are trustworthy again for these paths.
+**Timing:** Harness workers peg cores; ~150ms/test batch. Engine, not Python.
 
 ---
 
@@ -41,75 +38,73 @@ Batch dashboards are trustworthy again for these paths.
 
 ```bash
 python3 tools/js_midgate.py --rebuild --quick
-# honest gen / function
+python3 tools/test262_runner.py --categories expressions/compound-assignment -j 4
+python3 tools/test262_runner.py --categories expressions/call --no-batch -j 4
 python3 tools/test262_runner.py --categories statements/generators,expressions/generators --no-batch -j 4
-# broad language (not full 50k)
+# broad
 python3 tools/test262_runner.py --all -j 4 --output-json /tmp/js_scorecard/language_all.json
-# milestone full suite
+# milestone
 python3 tools/test262_runner.py --full -j 4 --output-json /tmp/js_scorecard/full.json
 ```
 
-**Generators / function / call: `--no-batch` for honest scores.**
+---
+
+## Dependency-ordered march (forward)
+
+Attack **fail volume × foundational** first. Class/modules/async sit on top of ops+function+iter.
+
+| Mole | Target | Why first | Fail mass (lang-all) |
+|------|--------|-----------|----------------------|
+| **M19** | compound-assignment + core arith/bitwise | Pure opcode; unblocks assign/class code | ~280 compound alone |
+| **M20** | assignment LHS / strict assign edges | Builds on M19 | ~200 assignment |
+| **M21** | call spread **error paths** (not TCO) | Completes call; spread already partial | call residual ~29 |
+| **M22** | function residual + function-code + TDZ defaults | Function surface after M18 | ~92 + ~172 |
+| **M23** | eval-code | Needs call/function solid | ~292 @ 16% |
+| **M24** | arguments edges (gen trailing-comma etc.) | Mapped done; gen/unmapped edges | ~139 |
+| **M25** | for-of / iterator close | Gens solid; for-of next | ~386 for-of |
+| **M26** | class (+ super) | Largest remaining volume | ~2000+2000 fails |
+| **M27** | modules / import / dynamic-import | After class patterns | ~384+168+588 |
+| **M28** | async / await / async-gen / for-await-of | Last major ES2017+ block | large |
+
+**Skip / deprioritize:** TCO optional tests; forbidden-ext caller (legacy); pure whitespace unicode edges.
+
+### M19 progress
+- **Done:** Box `new Number/Boolean/String` → `__value__`/`__class__`; `ToNumber` unboxes → compound **38%→59%** (+93).  
+- **Left:** private fields (#x) ~48; strict eval/arguments assign; remaining S11 coercion (string/Date/etc.).  
+- **Next mole:** finish M19 coercion (ToPrimitive path) or M21 call spread errors.
 
 ---
 
-## Strategy
+## Strong foundations (do not regress)
 
-1. **Compliance mass** — close deal-breaker holes (eval, function-code, compound-assign, ops, args edges).  
-2. **Use primitives** — wrap Ailang/runtime facilities instead of reimplementing (bind/call already started this; continue for String/Number/ops/eval).  
-3. **Speed later** — only after large green regions; startup already fine.  
-4. **Foundation already paid** — FDI, nest GenNext, Function.prototype, dstr 100% unblock higher layers.
-
-### Hot mess (default suite, volume × low %)
-| Area | Pass% (default batch) | Next approach |
-|------|----------------------|---------------|
-| eval-code | ~1% | wrap eval pipeline / re-entry; don't hand-roll |
-| function-code | ~9% | strict / code paths on Function foundation |
-| statementList | ~0% | parse/compile gap |
-| compound-assignment + arith/compare | 20–40% | opcode/primitives, not new infra |
-| arguments-object (non-mapped) | weak | gen trailing-comma + edges |
-| async/await | thin | after sync function solid |
-
-### Strong now
-control flow, keywords, **dstr 100%**, **gens 90%**, **function 84%**, mapped args 100%.
+| Area | Status |
+|------|--------|
+| dstr (fn+gen) | 100% |
+| generators | 90% (FDI-at-call, nest GenNext) |
+| Function.name/length/call/apply/bind | M18 |
+| mapped arguments | 43/43 |
+| batch isolation | M18b gval rewind |
+| control flow / keywords / ASI / block-scope | strong |
 
 ---
 
-## March forward
+## History (compact)
 
-### Done
-| Mole | Outcome |
-|------|---------|
-| **15–16** | dstr 186/186, mapped 43/43 |
-| **17a–c** | GenNext / assign clobber / FDI+nest → gen dstr **372/372** |
-| **18** | Function.name/length + call/apply/bind + gen proto → gens **502/556** |
-
-### Residual gen (~54)
-yield-as-ident / yield* ASI; forbidden-ext; scope/unscopables; TDZ defaults; proto descriptors.
-
-### Next (compliance order)
-1. Finish scorecard: language `--all` → then **`--full` (~49k)** at milestone.  
-2. Attack hot mess with **wrap-first** (eval, ops, compound-assign).  
-3. Call leftovers + function residual.  
-4. Speed pass only after big green chunks.
-
----
-
-## Progress log
-
-| Milestone | Notes |
-|-----------|-------|
-| M16 | mapped 43/43 |
-| M17a–c | gens → **473/556**, gen dstr **372/372** |
-| M18 | Function proto surface → **502/556**; scorecard started |
-| Scorecard 2026-07-14 | default **47%**; function **84%** no-batch; call **69%**; language-all **42.5%** batch (under-reports stmt gens/func) |
+| When | What |
+|------|------|
+| M15–16 | dstr 186/186, mapped 43/43 |
+| M17a–c | GenNext CALL-like first-resume; assign clobber; FDI-at-call + nest → gen dstr **372/372**, gens **473→502** |
+| M18 | Function.name/length + call/apply/bind + gen [[Prototype]] |
+| M18b | Batch gval_pool rewind → language-all **42%→56%** (+3321 pure honesty) |
+| M19a | Number/Boolean/String boxing + ToNumber unbox → compound **38%→59%** |
+| Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function 84%; call 69% |
 
 ---
 
 ## Agent rules
 
-1. Mid-gate green after every mole.  
-2. Generators/function/call: `--no-batch` for honest scores.  
-3. Update this file when a mole closes.  
-4. Language smells → `AILANG-WARTS.md`.  
-5. **Compliance > speed.** Prefer **wrap over write**.
+1. Midgate green after every mole.  
+2. No false greens — generators/function/call claim only with `--no-batch` when in doubt.  
+3. Update this file when a mole closes (one row in History + Status numbers).  
+4. Smells → `AILANG-WARTS.md`.  
+5. Compliance > speed. Wrap > write.
