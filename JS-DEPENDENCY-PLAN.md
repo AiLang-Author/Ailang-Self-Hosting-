@@ -26,7 +26,7 @@
 | call | **73/92 (79%)** | no-batch; M21 spread-err 16/16 |
 | mapped args | **43/43** | |
 | **language `--all`** | **13441/23899 (56.2%)** | honest batch; was 42% before gval fix |
-| compound-assignment | **275/454 (60.6%)** | M19a boxing + M19c string ToNumber |
+| compound-assignment | **298/454 (65.6%)** | M19d Number.Inf/NaN, Mod NaN, ToPrimitive, A7 key-once |
 | full `--full` (~49k) | not run | milestone only |
 
 **Batch fix (M18b):** `JSRT_Reset` rewinds `gval_pool` — batch no longer under-reports statements/function & generators.
@@ -70,13 +70,12 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 **Skip / deprioritize:** TCO optional tests; forbidden-ext caller (legacy); pure whitespace unicode edges.
 
 ### M19 progress
-- **Done:** Box `new Number/Boolean/String`; `ToNumber` unbox; `JSRT__ParseNumberStr` (invalid string → NaN). Compound **38%→60.6%**.  
-- **Left:** private fields (#x) ~48; strict eval/arguments assign; remaining S11 Date/object ToPrimitive.
+- **Done:** Boxing; ParseNumberStr; **Number.POSITIVE_INFINITY/NEGATIVE_INFINITY/NaN**; Mod 0%0→NaN; **ToPrimitive** (toString/valueOf); **TO_PROP_KEY + CHECK_COERCIBLE** for compound `base[prop] op=` (ES5 order, key once). Compound **38%→65.6%** (275→298).  
+- **Left:** private #fields ~48; A5/A6 putvalue+with+eval (~66); 11.13.2-s strict eval (~31); putvalue suite (~22); whitespace ~11.
 
 ### M21 progress
-- **Done:** `JSVM_IterableToArray` — `exc_prop` after factory/next/getters; `__get_` on @@iterator; `__get_value`/`__get_done`; generator `.next` fallback; GenNext pending rethrow.  
-- **call:** **69%→79%** (63→73). All `spread-err-*` pass (16/16).  
-- **Left on call:** eval-spread/strictness (M23), TCO (skip), object-spread order/symbols, with-base.
+- **Done:** IterableToArray throw/getter/gen; call **79%**; spread-err **16/16**.  
+- **Left on call:** eval-spread (M23), TCO (skip), object-spread, with.
 
 ---
 
@@ -103,9 +102,10 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 | M18b | Batch gval_pool rewind → language-all **42%→56%** (+3321 pure honesty) |
 | M19a | Number/Boolean/String boxing + ToNumber unbox → compound **38%→59%** |
 | M19c | `JSRT__ParseNumberStr` — string ToNumber invalid→NaN (not 0) |
+| M19d | Number.Inf/NaN; Mod NaN edges; ToPrimitive; compound bracket key-once → compound **65.6%** |
 | M21 | IterableToArray throw/getter/gen rethrow → call **69%→79%**, spread-err **16/16** |
 | M22a | `Object.prototype.isPrototypeOf`/`hasOwnProperty`; CONSTRUCT accepts fn as .prototype → function stmt **80%→81%** |
-| Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function stmt 81%; call **79%** |
+| Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function stmt 81%; call **79%**; compound **66%** |
 
 ---
 
