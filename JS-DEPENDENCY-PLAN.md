@@ -21,7 +21,8 @@
 | gen dstr | **372/372** | no-batch |
 | fn dstr | **372/372** | no-batch |
 | generators | **502/556 (90%)** | no-batch |
-| function | **601/715 (84%)** | no-batch |
+| function (stmt) | **364/451 (81%)** | no-batch; M22a isPrototypeOf |
+| function (prior combined) | **601/715 (84%)** | no-batch; re-score later |
 | call | **73/92 (79%)** | no-batch; M21 spread-err 16/16 |
 | mapped args | **43/43** | |
 | **language `--all`** | **13441/23899 (56.2%)** | honest batch; was 42% before gval fix |
@@ -103,7 +104,8 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 | M19a | Number/Boolean/String boxing + ToNumber unbox → compound **38%→59%** |
 | M19c | `JSRT__ParseNumberStr` — string ToNumber invalid→NaN (not 0) |
 | M21 | IterableToArray throw/getter/gen rethrow → call **69%→79%**, spread-err **16/16** |
-| Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function 84%; call **79%** |
+| M22a | `Object.prototype.isPrototypeOf`/`hasOwnProperty`; CONSTRUCT accepts fn as .prototype → function stmt **80%→81%** |
+| Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function stmt 81%; call **79%** |
 
 ---
 
