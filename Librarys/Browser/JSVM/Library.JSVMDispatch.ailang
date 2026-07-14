@@ -427,11 +427,56 @@ Function.JSVM_Step {
                 src = JSVM__StackPop()
                 dest = JSVM__StackPop()
                 src_t = JSRT_GetType(src)
-                // Spec: null/undefined → skip (no throw)
+                // Spec: null/undefined → skip (no throw) for object spread;
+                // object rest dstr uses RequireObjectCoercible first.
                 IfCondition Or(EqualTo(src_t, JSType.NULL), EqualTo(src_t, JSType.UNDEFINED)) ThenBlock: {
                     ReturnValue(1)
                 }
-                // Objects + functions (own enumerable props). Primitives skipped for now.
+                // M20d: string → copy index keys "0".."n-1" (obj-rest-str-val)
+                // PropTable stores key *pointers* — must use stable str_slab keys
+                // (JSVM__ArgIndexKey), not a reused scratch buffer.
+                IfCondition EqualTo(src_t, JSType.STRING) ThenBlock: {
+                    sp = JSRT_GetPayload(src)
+                    sl = StringLength(sp)
+                    si = 0
+                    WhileLoop LessThan(si, sl) {
+                        JSRT__Push(dest)
+                        JSRT__Push(src)
+                        JSRT__Push(si)
+                        kbuf = JSVM__ArgIndexKey(si)
+                        chv = JSRT_CreateStringLen(Add(sp, si), 1)
+                        si = JSRT__Pop()
+                        src = JSRT__Pop()
+                        dest = JSRT__Pop()
+                        sp = JSRT_GetPayload(src)
+                        IfCondition NotEqual(kbuf, 0) ThenBlock: {
+                            JSRT_ObjSet(dest, kbuf, chv)
+                        }
+                        si = Add(si, 1)
+                    }
+                    ReturnValue(1)
+                }
+                // Arrays: copy indexed elements as string keys (stable keys)
+                IfCondition EqualTo(src_t, JSType.ARRAY) ThenBlock: {
+                    alen = JSRT_ArrLen(src)
+                    ai = 0
+                    WhileLoop LessThan(ai, alen) {
+                        JSRT__Push(dest)
+                        JSRT__Push(src)
+                        JSRT__Push(ai)
+                        kbuf = JSVM__ArgIndexKey(ai)
+                        ev = JSRT_ArrGet(src, ai)
+                        ai = JSRT__Pop()
+                        src = JSRT__Pop()
+                        dest = JSRT__Pop()
+                        IfCondition NotEqual(kbuf, 0) ThenBlock: {
+                            JSRT_ObjSet(dest, kbuf, ev)
+                        }
+                        ai = Add(ai, 1)
+                    }
+                    ReturnValue(1)
+                }
+                // Objects + functions (own enumerable props).
                 IfCondition And(NotEqual(src_t, JSType.OBJECT), NotEqual(src_t, JSType.FUNCTION)) ThenBlock: {
                     ReturnValue(1)
                 }
@@ -764,7 +809,10 @@ Function.JSVM_Step {
                 res = JSVM__CallFunc(next_fn, empty_buf, 0)
                 rec = JSRT__Pop()
                 // Mole 15: next() throw propagates via CallFunc.exc_prop
+                // Spec IteratorNext: on abrupt, set iteratorRecord.[[Done]] = true
+                // so IteratorClose is not called (thrw-close-skip).
                 IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: {
+                    JSVMIter.done = 1
                     pend2 = JSVMCall.thrown_val
                     IfCondition EqualTo(pend2, 0) ThenBlock: {
                         pend2 = JSVMState.exc_val
@@ -840,7 +888,11 @@ Function.JSVM_Step {
             }
 
             // ITER_CLOSE (96) — [iter_record] → []; call .return if not done
+            // 16-bit operand: 0 = normal completion, 1 = throw completion
+            // Spec 7.4.6: throw completion → return original (ignore return()
+            // throw and non-Object result).
             Case 96: {
+                close_kind = JSVM__Read16()
                 rec = JSVM__StackPop()
                 IfCondition EqualTo(JSVMIter.done, 1) ThenBlock: {
                     ReturnValue(1)
@@ -857,16 +909,85 @@ Function.JSVM_Step {
                 }
                 iterator = JSRT_ObjGet(rec, "__it__")
                 ret_fn = JSRT_ObjGet(iterator, "return")
-                IfCondition EqualTo(JSRT_GetType(ret_fn), JSType.FUNCTION) ThenBlock: {
-                    JSVM__SetGlobal("this", iterator)
-                    empty_buf = JSVMCallBuf.buf
-                    JSVM__CallFunc(ret_fn, empty_buf, 0)
-                    // return() throw propagates
-                    IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: {
+                rft = JSRT_GetType(ret_fn)
+                // Missing return (undefined/null): no call
+                IfCondition Or(EqualTo(rft, JSType.UNDEFINED), EqualTo(rft, JSType.NULL)) ThenBlock: {
+                    JSVMIter.done = 1
+                    ReturnValue(1)
+                }
+                // Non-callable return → TypeError (normal completion only)
+                IfCondition NotEqual(rft, JSType.FUNCTION) ThenBlock: {
+                    IfCondition EqualTo(close_kind, 0) ThenBlock: {
+                        terr = JSVM_CreateTypedError("TypeError", "iterator return is not a function")
+                        JSVM_ThrowValue(terr)
                         ReturnValue(1)
                     }
-                    IfCondition EqualTo(JSVMState.error, 1) ThenBlock: {
+                    JSVMIter.done = 1
+                    ReturnValue(1)
+                }
+                JSVM__SetGlobal("this", iterator)
+                empty_buf = JSVMCallBuf.buf
+                // Isolate return() from outer try handlers so IteratorClose
+                // can decide whether to keep original throw (kind=1) or
+                // propagate return() throw (kind=0). Without this, return()
+                // throw lands in assert.throws and skips close_kind logic.
+                save_exc_sp = JSVMState.exc_sp
+                JSVMState.exc_sp = 0
+                ret_res = JSVM__CallFunc(ret_fn, empty_buf, 0)
+                JSVMState.exc_sp = save_exc_sp
+                // return() throw: propagates only for normal completion
+                IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: {
+                    pend = JSVMCall.thrown_val
+                    IfCondition EqualTo(pend, 0) ThenBlock: {
+                        pend = JSVM__GetGlobal("__pend_exc__")
+                    }
+                    JSVMCall.thrown_val = 0
+                    JSVMCall.exc_prop = 0
+                    JSVM__SetGlobal("__pend_exc__", JSRTState.undef_val)
+                    IfCondition EqualTo(close_kind, 0) ThenBlock: {
+                        // Prefer pending value; CallFunc may only leave exc_val/error
+                        IfCondition Or(EqualTo(pend, 0), EqualTo(pend, JSRTState.undef_val)) ThenBlock: {
+                            pend = JSVMState.exc_val
+                        }
+                        JSVMState.error = 0
+                        JSVMState.halted = 0
+                        JSVMState.exc_val = 0
+                        IfCondition NotEqual(pend, 0) ThenBlock: {
+                            IfCondition NotEqual(pend, JSRTState.undef_val) ThenBlock: {
+                                JSVM_ThrowValue(pend)
+                            }
+                        }
                         ReturnValue(1)
+                    }
+                    // throw-completion: swallow return() throw, keep original
+                    JSVMState.error = 0
+                    JSVMState.halted = 0
+                    JSVMState.exc_val = 0
+                    JSVMCall.thrown_val = 0
+                    JSVMCall.exc_prop = 0
+                    JSVMIter.done = 1
+                    ReturnValue(1)
+                }
+                IfCondition EqualTo(JSVMState.error, 1) ThenBlock: {
+                    // Uncaught during return() without exc_prop path
+                    IfCondition EqualTo(close_kind, 1) ThenBlock: {
+                        JSVMState.error = 0
+                        JSVMState.halted = 0
+                        JSVMState.exc_val = 0
+                        JSVMIter.done = 1
+                        ReturnValue(1)
+                    }
+                    ReturnValue(1)
+                }
+                // Result of return() must be Object for normal completion only
+                IfCondition EqualTo(close_kind, 0) ThenBlock: {
+                    rrt = JSRT_GetType(ret_res)
+                    IfCondition And(NotEqual(rrt, JSType.OBJECT), NotEqual(rrt, JSType.FUNCTION)) ThenBlock: {
+                        IfCondition NotEqual(rrt, JSType.ARRAY) ThenBlock: {
+                            terr = JSVM_CreateTypedError("TypeError", "iterator return result is not an object")
+                            JSVM_ThrowValue(terr)
+                            ReturnValue(1)
+                        }
                     }
                 }
                 JSVMIter.done = 1
