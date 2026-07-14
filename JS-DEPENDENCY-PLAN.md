@@ -76,8 +76,9 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 
 ### M20 progress
 - **Done (M20a):** LHS-first `base[prop]=`; SET_ELEM single ToPropertyKey.  
-- **Done (M20b):** CoverToPattern swaps default ASSIGN to pattern form; remove orphan PUSH_UNDEF in array dstr; stash RHS in `__dstr_rhs__` for expr result; +64 local headroom. **assignment 289→341 (74.9%)**.  
-- **Left:** ~array/obj dstr residual (iter-close edges, rest, put); S11 with/eval; fn-name; 30 timeouts.
+- **Done (M20b):** CoverToPattern default swap; stack pollution; RHS result stash → **341**.  
+- **Done (M20c):** `EmitDstrBind` for MEMBER_DOT/BRACKET targets; `THROW_CONST` + const name registry; TDZ on write. **341→372 (78.6%)**.  
+- **Left:** iter-close/return (~24); yield-ident; put-let TDZ free; obj-rest edges; S11 with/eval; fn-name; ~12 timeouts.
 
 ### M21 progress
 - **Done:** IterableToArray throw/getter/gen; call **79%**; spread-err **16/16**.  
@@ -111,6 +112,7 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 | M19d | Number.Inf/NaN; Mod NaN edges; ToPrimitive; compound bracket key-once → compound **65.6%** |
 | M20a | assignment LHS-first for `base[prop]=`; SET_ELEM single ToPropertyKey → assign **63.5%** |
 | M20b | dstr-assign: cover default swap; stack pollution fix; RHS result stash → assign **74.9%** |
+| M20c | dstr member targets + const TypeError on reassign → assign **78.6%** |
 | M21 | IterableToArray throw/getter/gen rethrow → call **69%→79%**, spread-err **16/16** |
 | M22a | `Object.prototype.isPrototypeOf`/`hasOwnProperty`; CONSTRUCT accepts fn as .prototype → function stmt **80%→81%** |
 | Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function stmt 81%; call **79%**; compound **66%** |
