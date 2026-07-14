@@ -25,10 +25,10 @@
 | function (prior combined) | **601/715 (84%)** | no-batch; re-score later |
 | call | **73/92 (79%)** | no-batch; M21 spread-err 16/16 |
 | mapped args | **43/43** | |
-| **language `--all`** | **13441/23899 (56.2%)** | honest batch; was 42% before gval fix |
+| **language `--all`** | **~14800/24700 (59.9%)** | full-run language slice post-M20e |
 | compound-assignment | **298/454 (65.6%)** | M19d Number.Inf/NaN, Mod NaN, ToPrimitive, A7 key-once |
 | assignment | **407/485 (86.0%)** | M20e rtrn-close 47/47; was 83.5% |
-| full `--full` (~49k) | not run | milestone only |
+| full `--full` (49998) | **17617/49998 (35.3%)** | post-M20e batch; built-ins drag (Temporal/TA) |
 
 **Batch fix (M18b):** `JSRT_Reset` rewinds `gval_pool` — batch no longer under-reports statements/function & generators.
 
@@ -82,6 +82,36 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 - **Done (M20e):** GenReturn closes open iter (rtrn-close); track open_iter on GET_ITER; GET_ITER defers next-callability; close suite **47/47**. Assign **395→407 (86.0%)**.  
 - **Left:** yield-ident residual; put-let TDZ free; S11 with/eval; fn-name; ~12 timeouts.
 
+
+
+### Full scorecard 2026-07-14 (post-M20e)
+- **Full:** 17617/49998 (**35.3%**), T/O 42. JSON: `/tmp/js_scorecard/full_m20e.json`
+- **Language:** ~14798/24712 (**59.9%**) — up from 56.2% language-all.
+- **Built-ins:** ~2679/23744 (**11.3%**) — not mole-critical yet (Temporal 4.5k fails alone).
+
+#### Language fail mass → next moles (adjust)
+| Priority | Area | Fail ~ | Notes / mole |
+|----------|------|--------|----------------|
+| 1 | **class + super** | ~3800 | **M26** — largest language residual; expressions+statements class |
+| 2 | **modules / dynamic-import** | ~1000 | **M27** — dynamic-import 588; module-code + import-defer |
+| 3 | **for-of / for-in / iter** | ~970 | **M25** — for-of 195 fails; for-await is M28 |
+| 4 | **eval-code** | ~690 | **M23** — direct+indirect; annexB eval piles on |
+| 5 | **async / for-await / async-gen** | ~640+ | **M28** — after class/modules foundation |
+| 6 | **function residual** | ~510 | **M22** — defaults/TDZ/arrow edges; function stmt ~80% |
+| 7 | **compound-assignment** | ~167 | **M19 residual** — private #, with/eval putvalue |
+| 8 | **arguments** | ~200 | **M24** — unmapped/strict edges |
+| 9 | **with** | 163 | Defer or bundle with M23 (scope chain) |
+| 10 | **assignment residual** | ~80 | M20 nearly done (86–89%); yield-ident / strict |
+| — | call | ~28 | M21 nearly done |
+| — | generators | gens ~80–83% | residual FDI/yield edges |
+
+#### Built-ins (later / parallel tracks)
+Temporal (4528), Object (2842), Array (2436), RegExp (1514), TypedArray (1438), Promise (576), Date, Iterator, Set/Map…
+
+#### Mole order adjustment
+Keep M22→M23→M24→M25, but **front-load M26 (class)** if chasing language % — class alone is ~38% of language fails.  
+Alternatively: finish **M22 function** (unblocks class methods) then **M26**, with **M25 for-of** as a short parallel after M20 close work.
+
 ### M21 progress
 - **Done:** IterableToArray throw/getter/gen; call **79%**; spread-err **16/16**.  
 - **Left on call:** eval-spread (M23), TCO (skip), object-spread, with.
@@ -119,6 +149,7 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 | M21 | IterableToArray throw/getter/gen rethrow → call **69%→79%**, spread-err **16/16** |
 | M22a | `Object.prototype.isPrototypeOf`/`hasOwnProperty`; CONSTRUCT accepts fn as .prototype → function stmt **80%→81%** |
 | Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function stmt 81%; call **79%**; compound **66%** |
+| Full 2026-07-14 post-M20e | full **17617/49998 (35.3%)**; language **~59.9%**; assign **86%**; close **47/47** |
 
 ---
 
