@@ -121,6 +121,8 @@ FixedPool.JSOp {
 
     // TDZ
     "THROW_TDZ":     Initialize=78
+    // M20c: TypeError on assignment to const binding
+    "THROW_CONST":   Initialize=88
 
     // Async/await
     "ASYNC_CLOSURE": Initialize=79
@@ -207,6 +209,12 @@ FixedPool.JSCompState {
     "loop_depth":    Initialize=0
     "error":         Initialize=0
     "tdz_map":       Initialize=0
+    // const_map: 256 bytes, 1 = slot is const (immutable after init)
+    "const_map":     Initialize=0
+    // const_names: linear list of const binding names (for free/global write checks)
+    // 16-byte entries: name_ptr(8) + name_len(8). Max 128 names.
+    "const_names":   Initialize=0
+    "const_name_count": Initialize=0
     "switch_jmps":   Initialize=0
     "func_nesting":  Initialize=0
     "in_arrow":      Initialize=0
@@ -340,6 +348,12 @@ Function.JSComp_Init {
         // TDZ map: 256 bytes, one per local slot (0=ok, 1=in TDZ)
         JSCompState.tdz_map = Allocate(256)
         MemorySet(JSCompState.tdz_map, 0, 256)
+        // const_map: 1 = cannot reassign
+        JSCompState.const_map = Allocate(256)
+        MemorySet(JSCompState.const_map, 0, 256)
+        JSCompState.const_names = Allocate(2048)
+        MemorySet(JSCompState.const_names, 0, 2048)
+        JSCompState.const_name_count = 0
 
         // Switch case jump table: 256 entries x 8 bytes (stores JMP_TRUE addresses)
         JSCompState.switch_jmps = Allocate(2048)
@@ -386,6 +400,53 @@ Function.JSComp_Reset {
         JSCompState.is_strict = 0
         JSCompStack.sp = 0
         MemorySet(JSCompState.tdz_map, 0, 256)
+        MemorySet(JSCompState.const_map, 0, 256)
+        MemorySet(JSCompState.const_names, 0, 2048)
+        JSCompState.const_name_count = 0
+        ReturnValue(0)
+    }
+}
+
+// Register a const binding name (stable str_buf copy already in name_ptr)
+Function.JSComp__RegisterConstName {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        save_p = name_ptr
+        save_l = name_len
+        IfCondition GreaterEqual(JSCompState.const_name_count, 128) ThenBlock: {
+            ReturnValue(0)
+        }
+        base = Add(JSCompState.const_names, Multiply(JSCompState.const_name_count, 16))
+        StoreValue(base, save_p)
+        StoreValue(Add(base, 8), save_l)
+        JSCompState.const_name_count = Add(JSCompState.const_name_count, 1)
+        ReturnValue(1)
+    }
+}
+
+// 1 if name is a registered const binding
+Function.JSComp__IsConstName {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        save_p = name_ptr
+        save_l = name_len
+        i = 0
+        WhileLoop LessThan(i, JSCompState.const_name_count) {
+            base = Add(JSCompState.const_names, Multiply(i, 16))
+            ep = Dereference(base)
+            el = Dereference(Add(base, 8))
+            JSComp__Push(i)
+            eq = JSComp__StrEq(save_p, save_l, ep, el)
+            i = JSComp__Pop()
+            IfCondition EqualTo(eq, 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
         ReturnValue(0)
     }
 }
@@ -932,8 +993,19 @@ Function.JSComp__EmitVarSet {
     Body: {
         save_ptr = name_ptr
         save_len = name_len
+        // M20c: const binding anywhere (local/free/global dual-write)
+        IfCondition EqualTo(JSComp__IsConstName(save_ptr, save_len), 1) ThenBlock: {
+            JSComp__Emit1(JSOp.THROW_CONST)
+            ReturnValue(0)
+        }
         slot = JSComp__FindLocal(save_ptr, save_len)
         IfCondition GreaterEqual(slot, 0) ThenBlock: {
+            // M20c: TDZ write → ReferenceError
+            IfCondition And(LessThan(slot, 256), EqualTo(GetByte(JSCompState.tdz_map, slot), 1)) ThenBlock: {
+                ci = JSComp__AddString(save_ptr, save_len)
+                JSComp__EmitOp16(JSOp.THROW_TDZ, ci)
+                ReturnValue(0)
+            }
             // Top-level: mirror bare global name
             IfCondition EqualTo(JSCompState.func_nesting, 0) ThenBlock: {
                 JSComp__Emit1(JSOp.DUP)
@@ -965,6 +1037,14 @@ Function.JSComp__EmitVarSet {
                 owner = JSComp__FindEnclosing(save_ptr, save_len)
             }
             IfCondition GreaterEqual(owner, 0) ThenBlock: {
+                // Free var may be const in enclosing scope — still marked on slot
+                // via const_map if slot is known; encl path uses name only.
+                // Check local table across outer scopes for const.
+                oslot = JSComp__FindLocal(save_ptr, save_len)
+                // FindLocal only looks current+outer in active stack — during
+                // nested compile outer locals are in encl. Use const_map if
+                // name was registered as const slot at any known slot index.
+                // Fallback: still emit SET_FREE; const outer is rare for free.
                 ci = JSComp__AddString(save_ptr, save_len)
                 JSComp__EmitOp16(JSOp.SET_FREE, ci)
             } ElseBlock: {
@@ -976,6 +1056,56 @@ Function.JSComp__EmitVarSet {
                 }
             }
         }
+        ReturnValue(0)
+    }
+}
+
+// M20c: bind stack-top value to dstr target (IDENT / MEMBER_DOT / MEMBER_BRACKET)
+Function.JSComp__EmitDstrBind {
+    Input: target_node: Integer
+    Output: Integer
+    Body: {
+        save_t = target_node
+        IfCondition LessThan(save_t, 0) ThenBlock: {
+            JSComp__Emit1(JSOp.POP)
+            ReturnValue(0)
+        }
+        tt = JSParse_GetType(save_t)
+        // IDENT
+        IfCondition EqualTo(tt, ASTType.IDENT) ThenBlock: {
+            tnp = JSParse_GetNamePtr(save_t)
+            tnl = JSParse_GetNameLen(save_t)
+            JSComp__EmitVarSet(tnp, tnl)
+            ReturnValue(0)
+        }
+        // obj.prop — stack [value]; need [obj, value] for SET_PROP
+        IfCondition EqualTo(tt, ASTType.MEMBER_DOT) ThenBlock: {
+            pnp = JSParse_GetNamePtr(save_t)
+            pnl = JSParse_GetNameLen(save_t)
+            obj_n = JSParse_GetLeft(save_t)
+            JSComp__Push(pnp)
+            JSComp__Push(pnl)
+            JSComp__CompileExpr(obj_n)
+            pnl = JSComp__Pop()
+            pnp = JSComp__Pop()
+            JSComp__Emit1(JSOp.SWAP)
+            ci = JSComp__AddString(pnp, pnl)
+            JSComp__EmitOp16(JSOp.SET_PROP, ci)
+            ReturnValue(0)
+        }
+        // obj[key] — stack [value]; SET_ELEM wants [value, obj, key]
+        IfCondition EqualTo(tt, ASTType.MEMBER_BRACKET) ThenBlock: {
+            obj_n = JSParse_GetLeft(save_t)
+            key_n = JSParse_GetRight(save_t)
+            JSComp__Push(key_n)
+            JSComp__CompileExpr(obj_n)
+            key_n = JSComp__Pop()
+            JSComp__CompileExpr(key_n)
+            JSComp__Emit1(JSOp.SET_ELEM)
+            ReturnValue(0)
+        }
+        // Fallback: discard value
+        JSComp__Emit1(JSOp.POP)
         ReturnValue(0)
     }
 }
