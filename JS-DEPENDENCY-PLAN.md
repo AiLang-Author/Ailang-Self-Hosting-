@@ -22,10 +22,10 @@
 | fn dstr | **372/372** | no-batch |
 | generators | **502/556 (90%)** | no-batch |
 | function | **601/715 (84%)** | no-batch |
-| call | **63/92 (69%)** | no-batch |
+| call | **73/92 (79%)** | no-batch; M21 spread-err 16/16 |
 | mapped args | **43/43** | |
 | **language `--all`** | **13441/23899 (56.2%)** | honest batch; was 42% before gval fix |
-| compound-assignment | **267/454 (58.8%)** | M19a boxing; was 38% |
+| compound-assignment | **275/454 (60.6%)** | M19a boxing + M19c string ToNumber |
 | full `--full` (~49k) | not run | milestone only |
 
 **Batch fix (M18b):** `JSRT_Reset` rewinds `gval_pool` — batch no longer under-reports statements/function & generators.
@@ -69,9 +69,13 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 **Skip / deprioritize:** TCO optional tests; forbidden-ext caller (legacy); pure whitespace unicode edges.
 
 ### M19 progress
-- **Done:** Box `new Number/Boolean/String` → `__value__`/`__class__`; `ToNumber` unboxes → compound **38%→59%** (+93).  
-- **Left:** private fields (#x) ~48; strict eval/arguments assign; remaining S11 coercion (string/Date/etc.).  
-- **Next mole:** finish M19 coercion (ToPrimitive path) or M21 call spread errors.
+- **Done:** Box `new Number/Boolean/String`; `ToNumber` unbox; `JSRT__ParseNumberStr` (invalid string → NaN). Compound **38%→60.6%**.  
+- **Left:** private fields (#x) ~48; strict eval/arguments assign; remaining S11 Date/object ToPrimitive.
+
+### M21 progress
+- **Done:** `JSVM_IterableToArray` — `exc_prop` after factory/next/getters; `__get_` on @@iterator; `__get_value`/`__get_done`; generator `.next` fallback; GenNext pending rethrow.  
+- **call:** **69%→79%** (63→73). All `spread-err-*` pass (16/16).  
+- **Left on call:** eval-spread/strictness (M23), TCO (skip), object-spread order/symbols, with-base.
 
 ---
 
@@ -97,7 +101,9 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 | M18 | Function.name/length + call/apply/bind + gen [[Prototype]] |
 | M18b | Batch gval_pool rewind → language-all **42%→56%** (+3321 pure honesty) |
 | M19a | Number/Boolean/String boxing + ToNumber unbox → compound **38%→59%** |
-| Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function 84%; call 69% |
+| M19c | `JSRT__ParseNumberStr` — string ToNumber invalid→NaN (not 0) |
+| M21 | IterableToArray throw/getter/gen rethrow → call **69%→79%**, spread-err **16/16** |
+| Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function 84%; call **79%** |
 
 ---
 
