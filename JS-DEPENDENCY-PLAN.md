@@ -130,8 +130,9 @@ Alternatively: finish **M22 function** (unblocks class methods) then **M26**, wi
 **Order:** a→b→c→d→e then f; **g last**.
 
 - **Done (M26e / remainder a):** `this_tdz` flag + GET_GLOBAL `this` TDZ; SuperProperty TDZ; `frame_this_st` UNINIT/INIT; first SuperCall binds construct `this`; double SuperCall runs parent then RefError on bind (-3); SuperCall only when callee is class parent or `__super__`; derived undefined return uses GetThisBinding (super object return). **this-check-ordering PASS**.  
-- **M26e residual:** full `this-access-restriction{,-2}` (extends Object SuperCall native; double-super after object-return base); polish next if blocking.  
-- **Next:** **M26f** (remainder b) `extends null`.
+- **M26e residual:** full `this-access-restriction{,-2}` (extends Object SuperCall native; double-super after object-return base).  
+- **Done (M26f / remainder b):** `null.prototype` → null for extends-null wiring; `null-proto-super` TypeError on `super()`; `class-definition-parent-proto-null` PASS. Residual: `Object.getPrototypeOf(function)` vs `Function.prototype` identity (deeper, M26i).  
+- **Next:** **M26g** (remainder c) static super.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
