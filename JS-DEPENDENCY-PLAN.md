@@ -162,8 +162,8 @@ Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a
 - **Done (M26k / remainder g foundation):** weak brand private fields/methods — skip CLASS_FIELD method install (was bogus method-install of `#fields` during class eval); GET/SET TypeError without brand; private_init on field_init; hide # from Object.keys; field_init this. elements private-named **494/994 (~50%)**; private\* overall **~69%**. Residual → tirage **#1**: static private, private setters, async private, true brands.
 - **Done (M26j Array polish):** SuperCall→Array ctor via CALL_SPREAD StringMethod + this-init; stamp `[[Prototype]]` from `new.target.prototype`. Array **4/5**. Residual → tirage **#4**: length descriptor attrs.
 - **M26k.2–3 (tirage #1 crumbs):** static private; accessor brand (`__get_#`/`__set_#`); getter-only SET TypeError; hide `#` from hasOwn/gOPD. elements private **1302/1894 (68.7%)**, non-async **~77%**. Residual (defer): async private, unicode privatename stringvalue, true nested brands, BigInt receiver, super-init order.
-- **M29a (tirage #2 start):** Object.defineProperty ToObject + mixed data/accessor TypeError; preventExtensions/isExtensible; CanAssign on new props. defineProperty+extensibility slice **299/1209 (24.7%)** (defineProperty was ~19.5%). Residual: redefinition rules, symbols, defineProperties TODO.
-- **Next (tirage #2 cont.):** Object.defineProperty residual + Array method/length depth. Then #3 async, #4 Array length attrs, #5 desert last.
+- **M29a–b (tirage #2 Object):** defineProperty ToObject/mixed/non-callable get-set; empty-desc creates prop (defaults all-false); real **defineProperties**; preventExtensions/isExtensible. Slice defineProperty+defineProperties+extens **797/1841 (43.3%)** (defineProperty alone was ~21%). Residual: redefinition edges, symbols, Array sparse holes.
+- **Next (tirage #2 cont.):** Array sparse/HasProperty for map/forEach/filter; length attrs; more Object residual. Then #3 async, #4, #5 desert last.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
