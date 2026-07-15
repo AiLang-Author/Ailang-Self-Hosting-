@@ -112,6 +112,10 @@ Temporal (4528), Object (2842), Array (2436), RegExp (1514), TypedArray (1438), 
 Keep M22→M23→M24→M25, but **front-load M26 (class)** if chasing language % — class alone is ~38% of language fails.  
 Alternatively: finish **M22 function** (unblocks class methods) then **M26**, with **M25 for-of** as a short parallel after M20 close work.
 
+### M26 progress
+- **Done (M26a):** `super.prop` / `super.prop()` via SuperBase=`__super__.prototype` + this-preserving CALL_METHOD; derived default ctor calls `super()`; class ctor params bit 26 (bare call TypeError when this not object). Class ~**55.4%** (4666/8426).  
+- **Left:** super(...args) / rest in ctors; field descriptors; private; arg-forwarding default ctor; subclass edge cases.
+
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
 - **Done (M22b):** Formal TDZ for defaults → trio **87.8%** (929/1058); arrow **93.0%**.
