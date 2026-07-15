@@ -136,7 +136,9 @@ Alternatively: finish **M22 function** (unblocks class methods) then **M26**, wi
 - **Done (M26h / remainder d):** parse/compile `new.target`; CONSTRUCT sets `__new_target__`, CALL clears (SuperCall keeps). new.target suite **6/14** (core call/new/fpapply/fpcall). Residual: super/Reflect/ASI/member.  
 - **Done (M26i / remainder e):** getPrototypeOf(Function); class prototype/constructor descriptors; methods non-enumerable + no .prototype; gOPD accessors; extends [[Prototype]]; multi-level SuperCall this-TDZ. definition **30→39/65**.  
 - **Done (M26j partial / remainder f):** Error SuperCall reuses this + new.target; CALL/CALL_SPREAD SuperCall finish for natives; Error.prototype stamp. Error suite 2/3. Array/etc. residual.  
-- **Next:** **M26k** (remainder g) private fields (largest); continue Array subclassing as M26j polish.
+- **Done (M26k / remainder g foundation):** weak brand private fields/methods — skip CLASS_FIELD method install; GET/SET TypeError without brand; private_init on field_init; hide # from Object.keys; field_init this. elements private-named **494/994 (~50%)**. Residual: static private, setters, async, true brands.
+- **Done (M26j Array polish):** SuperCall→Array ctor via CALL_SPREAD StringMethod + new.target.prototype stamp. Array **4/5** (length descriptor residual).
+- **Next:** full 49k scorecard; residual M26e/i/h; private static/setters; Array length attrs.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
