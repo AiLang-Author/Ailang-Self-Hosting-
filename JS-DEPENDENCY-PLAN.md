@@ -134,7 +134,8 @@ Alternatively: finish **M22 function** (unblocks class methods) then **M26**, wi
 - **Done (M26f / remainder b):** `null.prototype` → null for extends-null wiring; `null-proto-super` TypeError on `super()`; `class-definition-parent-proto-null` PASS. Residual: `Object.getPrototypeOf(function)` vs `Function.prototype` identity (deeper, M26i).  
 - **Done (M26g / remainder c):** static SuperBase = `this.__super__`; FUNCTION getters/setters; CALL_METHOD restores this; assign `obj.prop=` leaves RHS. Super suite **8/8**.  
 - **Done (M26h / remainder d):** parse/compile `new.target`; CONSTRUCT sets `__new_target__`, CALL clears (SuperCall keeps). new.target suite **6/14** (core call/new/fpapply/fpcall). Residual: super/Reflect/ASI/member.  
-- **Next:** **M26i** (remainder e) class definition residual.
+- **Done (M26i / remainder e):** getPrototypeOf(Function); class prototype/constructor descriptors; methods non-enumerable + no .prototype; gOPD accessors; extends [[Prototype]]; multi-level SuperCall this-TDZ. definition **30→39/65**.  
+- **Next:** **M26j** (remainder f) builtin subclassing.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
