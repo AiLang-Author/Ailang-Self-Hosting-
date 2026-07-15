@@ -26,7 +26,7 @@
 | compound-assignment | **~66%** | M19d |
 | arrow-function | **~92%** | M22 |
 | **class\*** (stmt+expr) | **5975/8551 (~70%)** | M26a–k foundation |
-| **private\*** | **2854/4156 (~69%)** | M26k weak brand |
+| **private\*** | **~69%+** (elements private **68.7%** post-M26k.2) | M26k + static/setter brand |
 | **language** (full-run slice) | **16278/24744 (65.8%)** | post-M26k full |
 | **built-ins** | **2804/23770 (11.8%)** | core partial; Temporal/TA drag |
 | **full `--full` (49998)** | **19244/49998 (38.5%)** | post-M26k; JSON `/tmp/full49k.json` |
@@ -129,6 +129,8 @@ The near-zero buckets are **not language-syntax OOS** — they are **library imp
 
 So: Temporal/TypedArray are **out of the language-mole tirage**, not “invalid JS.” They’re real features that live under `built-ins/` and wait until core libs are honest.
 
+**Last-round treatment for built-ins:** Language moles first (tirage #1, #3). Core Array/Object (#2) when language mass plateaus — “getting close,” method/descriptor depth. Desert libraries (#5: Temporal, TypedArray, Map/Set, Proxy, Atomics, …) get the **last round** only after core built-ins are honest — not interleaved with class/async.
+
 #### Mole order (current)
 M26 foundation **done** (a–k). Next: tirage **1→5** above.  
 Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a tirage item depends on them (e.g. #3 needs async/M28; modules stay M27).
@@ -159,7 +161,8 @@ Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a
 - **Done (M26j partial / remainder f):** Error SuperCall reuses this + new.target; CALL/CALL_SPREAD SuperCall finish for natives; Error.prototype stamp. Error suite 2/3. Array/etc. residual.  
 - **Done (M26k / remainder g foundation):** weak brand private fields/methods — skip CLASS_FIELD method install (was bogus method-install of `#fields` during class eval); GET/SET TypeError without brand; private_init on field_init; hide # from Object.keys; field_init this. elements private-named **494/994 (~50%)**; private\* overall **~69%**. Residual → tirage **#1**: static private, private setters, async private, true brands.
 - **Done (M26j Array polish):** SuperCall→Array ctor via CALL_SPREAD StringMethod + this-init; stamp `[[Prototype]]` from `new.target.prototype`. Array **4/5**. Residual → tirage **#4**: length descriptor attrs.
-- **Next (tirage 1→5):** elements residual → core Array/Object built-ins → for-await/async → Array length attrs → Temporal/TA only after core.
+- **M26k.2 (tirage #1 partial):** static private fields (allow FUNCTION first-write); brand via `__get_#`/`__set_#`; hide `#` from hasOwn/hasOwnProperty. elements private (stmt+expr) **1302/1894 (68.7%)** was ~50% private-named; static-private-fields **30/36**, rs-private-setter **60/68**, static-private-methods **60/70**. Residual: async private, remaining static edges, true brands.
+- **Next (tirage):** finish #1 residual → **#2 core Array/Object** → #3 for-await/async → #4 Array length attrs → **#5 desert built-ins last** (Temporal/TA/Map/Set/Proxy — library tracks, last-round treatment only after core).
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
