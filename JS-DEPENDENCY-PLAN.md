@@ -161,8 +161,8 @@ Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a
 - **Done (M26j partial / remainder f):** Error SuperCall reuses this + new.target; CALL/CALL_SPREAD SuperCall finish for natives; Error.prototype stamp. Error suite 2/3. Array/etc. residual.  
 - **Done (M26k / remainder g foundation):** weak brand private fields/methods — skip CLASS_FIELD method install (was bogus method-install of `#fields` during class eval); GET/SET TypeError without brand; private_init on field_init; hide # from Object.keys; field_init this. elements private-named **494/994 (~50%)**; private\* overall **~69%**. Residual → tirage **#1**: static private, private setters, async private, true brands.
 - **Done (M26j Array polish):** SuperCall→Array ctor via CALL_SPREAD StringMethod + this-init; stamp `[[Prototype]]` from `new.target.prototype`. Array **4/5**. Residual → tirage **#4**: length descriptor attrs.
-- **M26k.2 (tirage #1 partial):** static private fields (allow FUNCTION first-write); brand via `__get_#`/`__set_#`; hide `#` from hasOwn/hasOwnProperty. elements private (stmt+expr) **1302/1894 (68.7%)** was ~50% private-named; static-private-fields **30/36**, rs-private-setter **60/68**, static-private-methods **60/70**. Residual: async private, remaining static edges, true brands.
-- **Next (tirage):** finish #1 residual → **#2 core Array/Object** → #3 for-await/async → #4 Array length attrs → **#5 desert built-ins last** (Temporal/TA/Map/Set/Proxy — library tracks, last-round treatment only after core).
+- **M26k.2–3 (tirage #1 crumbs):** static private; accessor brand (`__get_#`/`__set_#`); getter-only SET TypeError; hide `#` from hasOwn/gOPD. elements private **1302/1894 (68.7%)**, non-async **~77%**. Residual (defer): async private, unicode privatename stringvalue, true nested brands, BigInt receiver, super-init order.
+- **Next (tirage #2):** **core built-ins Array / Object** (method + descriptor depth). Then #3 for-await/async, #4 Array length attrs, #5 desert last.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
