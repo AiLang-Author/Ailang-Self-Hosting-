@@ -164,7 +164,8 @@ Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a
 - **M26k.2–3 (tirage #1 crumbs):** static private; accessor brand (`__get_#`/`__set_#`); getter-only SET TypeError; hide `#` from hasOwn/gOPD. elements private **1302/1894 (68.7%)**, non-async **~77%**. Residual (defer): async private, unicode privatename stringvalue, true nested brands, BigInt receiver, super-init order.
 - **M29a–b (tirage #2 Object):** defineProperty ToObject/mixed/non-callable get-set; empty-desc creates prop (defaults all-false); real **defineProperties**; preventExtensions/isExtensible. Slice defineProperty+defineProperties+extens **797/1841 (43.3%)** (defineProperty alone was ~21%). Residual: redefinition edges, symbols, Array sparse holes.
 - **M29c (Array holes):** elision→PUSH_HOLE; ArrHas (raw 0); ArrSet grow with holes; `in` on array indices; methods skip holes. Array overall **21.2%** (was 21.0%) — foundation in place; bulk fails remain species/thisArg/ToObject/length. Residual Object redef + Array depth.
-- **Next (tirage #2 cont.):** Array method ToObject/thisArg/species; length attrs; Object residual. Then #3 async, #5 desert last.
+- **M29d (Array call/array-like partial):** CallFunc dispatches natives (abs.call); map/forEach TypeError on null this / non-callable; array-like helpers; call arg-buffer overlap fix. map+forEach+filter **28.2%** (was ~25%). Residual: Function.prototype.call on natives still weak for array methods (shared env/this), species, length attrs.
+- **Next (tirage #2 cont.):** finish call/apply for natives; species; length; Object residual. Then #3 async, #5 desert last.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
