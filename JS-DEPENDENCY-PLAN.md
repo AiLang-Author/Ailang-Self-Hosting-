@@ -113,8 +113,9 @@ Keep M22→M23→M24→M25, but **front-load M26 (class)** if chasing language %
 Alternatively: finish **M22 function** (unblocks class methods) then **M26**, with **M25 for-of** as a short parallel after M20 close work.
 
 ### M22 progress
-- **Done (M22a):** Arrow formal defaults with patterns — wrap `ASSIGN(LEFT=default, RIGHT=pattern)` instead of mutating the pattern node. Arrow **68.8%→92.4%**; M22 trio **79.6%→87.2%** (+81).  
-- **Left:** dflt-params TDZ (ref-self/later); lexical this/super/new.target; scope-body-lex; strict 13.x; annexB function-code.
+- **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
+- **Done (M22b):** Formal TDZ for defaults → trio **87.8%** (929/1058); arrow **93.0%**.
+- **Left:** lexical this/super/new.target; scope-body-lex; strict 13.x; annexB function-code.
 
 ### M21 progress
 - **Done:** IterableToArray throw/getter/gen; call **79%**; spread-err **16/16**.  
@@ -154,7 +155,8 @@ Alternatively: finish **M22 function** (unblocks class methods) then **M26**, wi
 | M22a | `Object.prototype.isPrototypeOf`/`hasOwnProperty`; CONSTRUCT accepts fn as .prototype → function stmt **80%→81%** |
 | Scorecard 2026-07-14 | language-all **13441/23899**; gens 90%; function stmt 81%; call **79%**; compound **66%** |
 | Full 2026-07-14 post-M20e | full **17617/49998 (35.3%)**; language **~59.9%**; assign **86%**; close **47/47** |
-| M22a | arrow formal default+pattern wrap → arrow **92.4%**, trio **87.2%** |
+| M22a | arrow formal default+pattern wrap → arrow **92.4%** |
+| M22b | formal TDZ defaults → trio **87.8%** |
 
 ---
 
