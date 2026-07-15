@@ -97,7 +97,7 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 | **1** | **class/elements residual** | Largest language fail mass left inside class | static private, private setters, async private; elements **1777/2962 (60%)** |
 | **2** | **core built-ins Array / Object** | High leverage; language already depends on them; getting close | Array ~21%, Object ~19%; method/descriptor depth — **not** Temporal/TA |
 | **3** | **for-await-of / async** | Second language fail mass after class | for-await-of **47%** (653 fails); M28 track; needs async foundation |
-| **4** | **Array length descriptor** | Last M26j Array subclass edge | `subclass/builtin-objects/Array` **4/5**; `{writable:true, enumerable:false, configurable:false}` |
+| **4** | **Array length descriptor** | Last M26j Array subclass edge | **Done (M29e):** `subclass/builtin-objects/Array` **5/5** (legacy); gOPD w/e/c + truncate/RangeError |
 | **5** | **Temporal / TypedArray / collections** | Only after core built-ins | See **OOS vs built-ins** below — not language-syntax residual |
 
 **Also in queue (after / interleaved when unblocking):** M23 eval-code; M27 modules/dynamic-import; M25 for-of residual; M26e/i/h edges; M22 function residual.
@@ -165,7 +165,8 @@ Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a
 - **M29a–b (tirage #2 Object):** defineProperty ToObject/mixed/non-callable get-set; empty-desc creates prop (defaults all-false); real **defineProperties**; preventExtensions/isExtensible. Slice defineProperty+defineProperties+extens **797/1841 (43.3%)** (defineProperty alone was ~21%). Residual: redefinition edges, symbols, Array sparse holes.
 - **M29c (Array holes):** elision→PUSH_HOLE; ArrHas (raw 0); ArrSet grow with holes; `in` on array indices; methods skip holes. Array overall **21.2%** (was 21.0%) — foundation in place; bulk fails remain species/thisArg/ToObject/length. Residual Object redef + Array depth.
 - **M29d (Array call/array-like partial):** CallFunc dispatches natives (abs.call); map/forEach TypeError on null this / non-callable; array-like helpers; call arg-buffer overlap fix. map+forEach+filter **28.2%** (was ~25%). Residual: Function.prototype.call on natives still weak for array methods (shared env/this), species, length attrs.
-- **Next (tirage #2 cont.):** finish call/apply for natives; species; length; Object residual. Then #3 async, #5 desert last.
+- **M29e (tirage #2 gaps 1–3 + #4 length):** permanent `Array.prototype.*` natives (push/map/every/…); `.call`/`.apply` this-prefer for array methods; every/some/reduce array-like + TypeError; reduce 4-arg callback; gOPD array length `{w:true,e:false,c:false}`; `arr.length=` ToUint32/RangeError + ArrSetLen truncate/grow. map+forEach+filter **55.5%** (was 28.2%); every+some+reduce **54.7%**; Array/length **40.7%**; subclass Array **5/5**. Residual: species, reduceRight, Object redef, deep length defineProperty edges.
+- **Next (tirage #2 cont.):** species / more method depth; Object residual. Then #3 async; #5 desert last.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
