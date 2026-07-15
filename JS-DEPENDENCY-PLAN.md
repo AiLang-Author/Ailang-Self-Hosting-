@@ -135,7 +135,8 @@ Alternatively: finish **M22 function** (unblocks class methods) then **M26**, wi
 - **Done (M26g / remainder c):** static SuperBase = `this.__super__`; FUNCTION getters/setters; CALL_METHOD restores this; assign `obj.prop=` leaves RHS. Super suite **8/8**.  
 - **Done (M26h / remainder d):** parse/compile `new.target`; CONSTRUCT sets `__new_target__`, CALL clears (SuperCall keeps). new.target suite **6/14** (core call/new/fpapply/fpcall). Residual: super/Reflect/ASI/member.  
 - **Done (M26i / remainder e):** getPrototypeOf(Function); class prototype/constructor descriptors; methods non-enumerable + no .prototype; gOPD accessors; extends [[Prototype]]; multi-level SuperCall this-TDZ. definition **30→39/65**.  
-- **Next:** **M26j** (remainder f) builtin subclassing.
+- **Done (M26j partial / remainder f):** Error SuperCall reuses this + new.target; CALL/CALL_SPREAD SuperCall finish for natives; Error.prototype stamp. Error suite 2/3. Array/etc. residual.  
+- **Next:** **M26k** (remainder g) private fields (largest); continue Array subclassing as M26j polish.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
