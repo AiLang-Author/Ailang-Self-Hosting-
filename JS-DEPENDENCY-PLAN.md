@@ -116,8 +116,9 @@ Alternatively: finish **M22 function** (unblocks class methods) then **M26**, wi
 - **Done (M26a):** `super.prop` / `super.prop()` via SuperBase=`__super__.prototype` + this-preserving CALL_METHOD; derived default ctor calls `super()`; class bare-call TypeError path.  
 - **Done (M26b):** CONSTRUCT rest packing (bit 31) was missing; derived default `function(...args){ super(...args); return this; }`; class flag at fdesc+88 (not params bit 26 — that corrupted formal count / rest). Compiler mark via pool+40→LoadConst.  
 - **Done (M26c):** CallFunc rejects class [[Call]] (`.apply`/`.call`); SuperCall frames mark -2 so object return rebinds `this`; bound `[[Construct]]` unwraps target + partial args (`new C.bind()()`).  
-- **Gate:** midgate quick PASS; `default-constructor{,-2,-spread-override}` + `arguments/default-constructor` **4/4**; subclass non-builtin ~16/37; class bulk still ~55% (private/fields/builtins dominate).  
-- **Left:** derived this TDZ / super-must-be-called; null proto; builtin subclassing; return-override primitives; private fields; static super; new.target.
+- **Done (M26d):** fdesc+88 kind 1=base/2=derived; derived return non-object non-undefined → TypeError (handlers from ctor frame popped so uncatchable); bound CALL via JSBridge_Dispatch (was JSRT_CallNative no-op). Subclass non-builtin **23/37** (was 16).  
+- **Gate:** midgate quick PASS; default-ctor suite + binding + return-override (except Symbol) green.  
+- **Left:** this TDZ / super-must-be-called; null proto; builtin subclassing; Symbol return; for-of return-override; private fields; static super; new.target.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
