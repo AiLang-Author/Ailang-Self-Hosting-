@@ -1,6 +1,6 @@
 # JS Engine — Dependency Plan
 
-**Updated:** 2026-07-14  
+**Updated:** 2026-07-15  
 **Goal:** Language compliance mass first; speed later. No false greens.
 
 | Rule | |
@@ -16,23 +16,24 @@
 
 | Gate | Score | Notes |
 |------|------:|-------|
-| e2e + midgate core | **PASS** | |
+| e2e + midgate core | **PASS** | post-M26k |
 | function dstr | **186/186** | |
 | gen dstr | **372/372** | no-batch |
-| fn dstr | **372/372** | no-batch |
-| generators | **502/556 (90%)** | no-batch |
-| function (stmt) | **364/451 (81%)** | no-batch; M22a isPrototypeOf |
-| function (prior combined) | **601/715 (84%)** | no-batch; re-score later |
-| call | **73/92 (79%)** | no-batch; M21 spread-err 16/16 |
+| generators | **~90%** | no-batch |
+| call | **~79%** | no-batch; M21 spread-err 16/16 |
 | mapped args | **43/43** | |
-| **language `--all`** | **~14800/24700 (59.9%)** | full-run language slice post-M20e |
-| compound-assignment | **298/454 (65.6%)** | M19d Number.Inf/NaN, Mod NaN, ToPrimitive, A7 key-once |
-| assignment | **407/485 (86.0%)** | M20e rtrn-close 47/47; was 83.5% |
-| full `--full` (49998) | **17617/49998 (35.3%)** | post-M20e batch; built-ins drag (Temporal/TA) |
+| assignment | **~86%** | M20e |
+| compound-assignment | **~66%** | M19d |
+| arrow-function | **~92%** | M22 |
+| **class\*** (stmt+expr) | **5975/8551 (~70%)** | M26a–k foundation |
+| **private\*** | **2854/4156 (~69%)** | M26k weak brand |
+| **language** (full-run slice) | **16278/24744 (65.8%)** | post-M26k full |
+| **built-ins** | **2804/23770 (11.8%)** | core partial; Temporal/TA drag |
+| **full `--full` (49998)** | **19244/49998 (38.5%)** | post-M26k; JSON `/tmp/full49k.json` |
 
 **Batch fix (M18b):** `JSRT_Reset` rewinds `gval_pool` — batch no longer under-reports statements/function & generators.
 
-**Timing:** Harness workers peg cores; ~150ms/test batch. Engine, not Python.
+**Timing:** Full 50k ~33 min @ 16 workers batch.
 
 ---
 
@@ -84,33 +85,53 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 
 
 
-### Full scorecard 2026-07-14 (post-M20e)
-- **Full:** 17617/49998 (**35.3%**), T/O 42. JSON: `/tmp/js_scorecard/full_m20e.json`
-- **Language:** ~14798/24712 (**59.9%**) — up from 56.2% language-all.
-- **Built-ins:** ~2679/23744 (**11.3%**) — not mole-critical yet (Temporal 4.5k fails alone).
+### Full scorecard 2026-07-15 (post-M26k)
+- **Full:** 19244/49998 (**38.5%**), T/O 55, error 56. JSON: `/tmp/full49k.json`
+- **Language:** 16278/24744 (**65.8%**) — up from ~59.9% post-M20e.
+- **Built-ins:** 2804/23770 (**11.8%**) — core libs partial; desert is Temporal/TA/collections.
 
-#### Language fail mass → next moles (adjust)
-| Priority | Area | Fail ~ | Notes / mole |
-|----------|------|--------|----------------|
-| 1 | **class + super** | ~3800 | **M26** — largest language residual; expressions+statements class |
-| 2 | **modules / dynamic-import** | ~1000 | **M27** — dynamic-import 588; module-code + import-defer |
-| 3 | **for-of / for-in / iter** | ~970 | **M25** — for-of 195 fails; for-await is M28 |
-| 4 | **eval-code** | ~690 | **M23** — direct+indirect; annexB eval piles on |
-| 5 | **async / for-await / async-gen** | ~640+ | **M28** — after class/modules foundation |
-| 6 | **function residual** | ~510 | **M22** — defaults/TDZ/arrow edges; function stmt ~80% |
-| 7 | **compound-assignment** | ~167 | **M19 residual** — private #, with/eval putvalue |
-| 8 | **arguments** | ~200 | **M24** — unmapped/strict edges |
-| 9 | **with** | 163 | Defer or bundle with M23 (scope chain) |
-| 10 | **assignment residual** | ~80 | M20 nearly done (86–89%); yield-ident / strict |
-| — | call | ~28 | M21 nearly done |
-| — | generators | gens ~80–83% | residual FDI/yield edges |
+#### Active tirage (post-M26k) — knock out 1→5
 
-#### Built-ins (later / parallel tracks)
-Temporal (4528), Object (2842), Array (2436), RegExp (1514), TypedArray (1438), Promise (576), Date, Iterator, Set/Map…
+| # | Target | Why | Gate / notes |
+|---|--------|-----|--------------|
+| **1** | **class/elements residual** | Largest language fail mass left inside class | static private, private setters, async private; elements **1777/2962 (60%)** |
+| **2** | **core built-ins Array / Object** | High leverage; language already depends on them; getting close | Array ~21%, Object ~19%; method/descriptor depth — **not** Temporal/TA |
+| **3** | **for-await-of / async** | Second language fail mass after class | for-await-of **47%** (653 fails); M28 track; needs async foundation |
+| **4** | **Array length descriptor** | Last M26j Array subclass edge | `subclass/builtin-objects/Array` **4/5**; `{writable:true, enumerable:false, configurable:false}` |
+| **5** | **Temporal / TypedArray / collections** | Only after core built-ins | See **OOS vs built-ins** below — not language-syntax residual |
 
-#### Mole order adjustment
-Keep M22→M23→M24→M25, but **front-load M26 (class)** if chasing language % — class alone is ~38% of language fails.  
-Alternatively: finish **M22 function** (unblocks class methods) then **M26**, with **M25 for-of** as a short parallel after M20 close work.
+**Also in queue (after / interleaved when unblocking):** M23 eval-code; M27 modules/dynamic-import; M25 for-of residual; M26e/i/h edges; M22 function residual.
+
+#### Language fail mass (post-M26k full-run, largest absolute fails)
+| Area | Fail ~ | Pass% | Notes |
+|------|-------:|------:|-------|
+| statements/class | 1313 | 70% | elements private residual dominates |
+| expressions/class | 1178 | 71% | same |
+| for-await-of | 653 | 47% | **#3** |
+| dynamic-import | 588 | 41% | M27 |
+| async-generator (expr) | 287 | 54% | M28 |
+| object (expr) | 261 | 78% | residual |
+| eval-code/direct | 255 | 11% | M23 |
+| for-of | 203 | 73% | M25 residual |
+| with | 163 | 10% | scope chain / M23 |
+
+#### Built-ins: core vs deferred (not “language OOS syntax”)
+
+test262 splits **`language/`** (syntax + semantics) vs **`built-ins/`** (standard library).  
+The near-zero buckets are **not language-syntax OOS** — they are **library implementation tracks**. We still deprioritize them relative to language mass, but for different reasons:
+
+| Bucket | Status | Treatment |
+|--------|--------|-----------|
+| **Core built-ins** — Array, Object, Function, String, Number, Boolean, Error, RegExp, JSON, Math, Promise (partial) | Partial; language/DOM already use them | **In scope soon** — tirage **#2** (Array/Object first). “Getting close” = surface exists, methods/descriptors incomplete |
+| **Subclass hooks** — `extends Array/Error` | Error + Array SuperCall landed | tirage **#4** length attrs; other natives as needed |
+| **Deferred library tracks** — Temporal (~4.5k), TypedArray family (~2k), DataView, Map/Set/WeakMap/WeakSet, Proxy, Reflect, Atomics, ArrayBuffer, SharedArrayBuffer, Iterator helpers | ~0% | **Separate tracks** after core Array/Object. Standard ES, but huge greenfield — do **not** count as language residual moles |
+| **Staging / annexB piles** | Mixed | Only when unblocking a language mole |
+
+So: Temporal/TypedArray are **out of the language-mole tirage**, not “invalid JS.” They’re real features that live under `built-ins/` and wait until core libs are honest.
+
+#### Mole order (current)
+M26 foundation **done** (a–k). Next: tirage **1→5** above.  
+Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a tirage item depends on them (e.g. #3 needs async/M28; modules stay M27).
 
 ### M26 progress
 - **Done (M26a–d):** super.prop; default `super(...args)`; CONSTRUCT rest; fdesc+88 class kind; CallFunc/bound bare TypeError; SuperCall object rebind; derived return TypeError; bound CALL dispatch. Subclass non-builtin **23/37**.
@@ -136,9 +157,9 @@ Alternatively: finish **M22 function** (unblocks class methods) then **M26**, wi
 - **Done (M26h / remainder d):** parse/compile `new.target`; CONSTRUCT sets `__new_target__`, CALL clears (SuperCall keeps). new.target suite **6/14** (core call/new/fpapply/fpcall). Residual: super/Reflect/ASI/member.  
 - **Done (M26i / remainder e):** getPrototypeOf(Function); class prototype/constructor descriptors; methods non-enumerable + no .prototype; gOPD accessors; extends [[Prototype]]; multi-level SuperCall this-TDZ. definition **30→39/65**.  
 - **Done (M26j partial / remainder f):** Error SuperCall reuses this + new.target; CALL/CALL_SPREAD SuperCall finish for natives; Error.prototype stamp. Error suite 2/3. Array/etc. residual.  
-- **Done (M26k / remainder g foundation):** weak brand private fields/methods — skip CLASS_FIELD method install; GET/SET TypeError without brand; private_init on field_init; hide # from Object.keys; field_init this. elements private-named **494/994 (~50%)**. Residual: static private, setters, async, true brands.
-- **Done (M26j Array polish):** SuperCall→Array ctor via CALL_SPREAD StringMethod + new.target.prototype stamp. Array **4/5** (length descriptor residual).
-- **Next:** full 49k scorecard; residual M26e/i/h; private static/setters; Array length attrs.
+- **Done (M26k / remainder g foundation):** weak brand private fields/methods — skip CLASS_FIELD method install (was bogus method-install of `#fields` during class eval); GET/SET TypeError without brand; private_init on field_init; hide # from Object.keys; field_init this. elements private-named **494/994 (~50%)**; private\* overall **~69%**. Residual → tirage **#1**: static private, private setters, async private, true brands.
+- **Done (M26j Array polish):** SuperCall→Array ctor via CALL_SPREAD StringMethod + this-init; stamp `[[Prototype]]` from `new.target.prototype`. Array **4/5**. Residual → tirage **#4**: length descriptor attrs.
+- **Next (tirage 1→5):** elements residual → core Array/Object built-ins → for-await/async → Array length attrs → Temporal/TA only after core.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
@@ -185,6 +206,11 @@ Alternatively: finish **M22 function** (unblocks class methods) then **M26**, wi
 | Full 2026-07-14 post-M20e | full **17617/49998 (35.3%)**; language **~59.9%**; assign **86%**; close **47/47** |
 | M22a | arrow formal default+pattern wrap → arrow **92.4%** |
 | M22b | formal TDZ defaults → trio **87.8%** |
+| M26a–d | super/default-ctor/rest/class-kind/bare-call |
+| M26e–i | this TDZ; extends null; static super; new.target; definition descriptors |
+| M26j | Error + Array SuperCall subclassing (Array 4/5) |
+| M26k | private fields foundation (weak brand); elements private ~50% |
+| Full 2026-07-15 post-M26k | full **19244/49998 (38.5%)**; language **65.8%**; built-ins **11.8%**; class\* **~70%** |
 
 ---
 
