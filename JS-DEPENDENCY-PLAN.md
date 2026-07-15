@@ -113,12 +113,25 @@ Keep M22→M23→M24→M25, but **front-load M26 (class)** if chasing language %
 Alternatively: finish **M22 function** (unblocks class methods) then **M26**, with **M25 for-of** as a short parallel after M20 close work.
 
 ### M26 progress
-- **Done (M26a):** `super.prop` / `super.prop()` via SuperBase=`__super__.prototype` + this-preserving CALL_METHOD; derived default ctor calls `super()`; class bare-call TypeError path.  
-- **Done (M26b):** CONSTRUCT rest packing (bit 31) was missing; derived default `function(...args){ super(...args); return this; }`; class flag at fdesc+88 (not params bit 26 — that corrupted formal count / rest). Compiler mark via pool+40→LoadConst.  
-- **Done (M26c):** CallFunc rejects class [[Call]] (`.apply`/`.call`); SuperCall frames mark -2 so object return rebinds `this`; bound `[[Construct]]` unwraps target + partial args (`new C.bind()()`).  
-- **Done (M26d):** fdesc+88 kind 1=base/2=derived; derived return non-object non-undefined → TypeError (handlers from ctor frame popped so uncatchable); bound CALL via JSBridge_Dispatch (was JSRT_CallNative no-op). Subclass non-builtin **23/37** (was 16).  
-- **Gate:** midgate quick PASS; default-ctor suite + binding + return-override (except Symbol) green.  
-- **Left:** this TDZ / super-must-be-called; null proto; builtin subclassing; Symbol return; for-of return-override; private fields; static super; new.target.
+- **Done (M26a–d):** super.prop; default `super(...args)`; CONSTRUCT rest; fdesc+88 class kind; CallFunc/bound bare TypeError; SuperCall object rebind; derived return TypeError; bound CALL dispatch. Subclass non-builtin **23/37**.
+
+#### M26 remainder pack (knock out 1-by-1)
+
+| # | Mole | Target | Why | Gate slice |
+|---|------|--------|-----|------------|
+| **a** | **M26e** | derived `this` TDZ + double-`super` + super-must-be-called | Foundational | `definition/this-*` |
+| **b** | **M26f** | `extends null` heritage | Small, pure class eval | `class-definition-null-proto*` |
+| **c** | **M26g** | static `super` (methods/get/set) | SuperBase for static = parent ctor | `super/in-static-*` |
+| **d** | **M26h** | `new.target` | Meta property | `new.target` under class/functions |
+| **e** | **M26i** | class definition residual | methods/accessors/name/length/proto | `definition/*` minus this-TDZ |
+| **f** | **M26j** | builtin subclassing | `extends Array/Error/...` | `subclass/builtin-objects` |
+| **g** | **M26k** | private fields/methods | Largest mass — last | `elements/private*`, `#` |
+
+**Order:** a→b→c→d→e then f; **g last**.
+
+- **Done (M26e / remainder a):** `this_tdz` flag + GET_GLOBAL `this` TDZ; SuperProperty TDZ; `frame_this_st` UNINIT/INIT; first SuperCall binds construct `this`; double SuperCall runs parent then RefError on bind (-3); SuperCall only when callee is class parent or `__super__`; derived undefined return uses GetThisBinding (super object return). **this-check-ordering PASS**.  
+- **M26e residual:** full `this-access-restriction{,-2}` (extends Object SuperCall native; double-super after object-return base); polish next if blocking.  
+- **Next:** **M26f** (remainder b) `extends null`.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
