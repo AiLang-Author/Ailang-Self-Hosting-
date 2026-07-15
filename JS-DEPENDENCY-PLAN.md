@@ -169,7 +169,8 @@ Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a
 - **M29f (method depth):** find/findIndex array-like+TypeError+thisArg, **visit holes** (Get every index); indexOf/lastIndexOf/includes array-like; **reduceRight** (id 174); **flatMap** real impl; **Array.from** array-like+mapFn; keep 172–173 values/iterator on Bridge (not StringMethod). map+forEach+filter **56.0%**; find/findIndex **65%**; indexOf **67%**; reduceRight **46%**; from **32%**. Residual: species, includes SameValueZero (NaN), Object redef, length defineProperty depth.
 - **M29g (SameValueZero + species):** `JSRT_SameValueZero` (NaN≡NaN); includes uses SVZ + Get-every-index; well-known **Symbol.species**; `ArraySpeciesCreate` + `Construct` helper; map/filter species. create-species / null / undef + samevaluezero **PASS**. Residual: species on slice/concat/splice; Object redef; length defineProperty depth.
 - **M29h (species spread):** slice/concat/splice/flat/flatMap ArraySpeciesCreate; slice array-like+TypeError. create-species for slice/concat/splice **PASS**. Array overall post-M29g **45.5%**. Residual: Object redef, length defineProperty depth, species edges (poisoned/non-ctor).
-- **Next:** full ~50k baseline (`--full`); then Object residual / #3 async / #5 desert.
+- **Baseline M29h full suite (2026-07-15):** `results/test262_full_m29h_baseline.json` — **20322/49998 (40.8%)**, 86 T/O, wall **32.6 min** (`--jobs 8`). Language expr **66.9%**, statements **66.3%**; Array **1415/3081 (45.9%)** (was ~21% M29c); Object **36.6%**; Temporal/TA desert **~0–1%**. Regression anchor for future work.
+- **Next:** Object residual / species edges; then #3 async; #5 desert last. Re-run `--full` after material marches.
 
 ### M22 progress
 - **Done (M22a):** Arrow formal default+pattern wrap → arrow **92.4%**.
