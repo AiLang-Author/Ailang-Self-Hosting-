@@ -94,7 +94,7 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 
 | # | Target | Why | Gate / notes |
 |---|--------|-----|--------------|
-| **1** | **class/elements residual** | Largest language fail mass left inside class | static private, private setters, async private; elements **1777/2962 (60%)** |
+| **1** | **class/elements residual** | Largest language fail mass left inside class | **M26k.4:** HasOwn fix; stmt elements **71.5%**, expr **73.7%**; residual async-private / unicode / brands |
 | **2** | **core built-ins Array / Object** | High leverage; language already depends on them; getting close | Array ~21%, Object ~19%; method/descriptor depth — **not** Temporal/TA |
 | **3** | **for-await-of / async** | Second language fail mass after class | for-await-of **47%** (653 fails); M28 track; needs async foundation |
 | **4** | **Array length descriptor** | Last M26j Array subclass edge | **Done (M29e):** `subclass/builtin-objects/Array` **5/5** (legacy); gOPD w/e/c + truncate/RangeError |
