@@ -234,9 +234,15 @@ FixedPool.JSCompState {
     "current_fidx":    Initialize=0
     "encl_count":      Initialize=0
     "encl_buf":        Initialize=0  // [name_ptr, name_len, owner_fidx] x MAX_ENCL
-    // M26k.5: unique private-name brand per class compile (nested/extends)
+    // M26k.5/7: private-name brand stack (nested class outer private visibility)
     "priv_class_id":   Initialize=0
     "next_priv_class_id": Initialize=1
+    "priv_depth":      Initialize=0
+    "priv_name_count": Initialize=0
+    "priv_name_ptrs":  Initialize=0   // 64 x 8
+    "priv_name_lens":  Initialize=0   // 64 x 8
+    "priv_name_depths": Initialize=0  // 64 x 8 owner depth
+    "priv_stack_ids":  Initialize=0   // 16 x 8 brand id at depth
 }
 
 // =============================================================================
@@ -377,6 +383,18 @@ Function.JSComp_Init {
         JSCompState.encl_count = 0
         JSCompState.current_fidx = 0
 
+        // M26k.7: private name brand stack (64 names, 16 class depth)
+        JSCompState.priv_name_ptrs = Allocate(512)
+        MemorySet(JSCompState.priv_name_ptrs, 0, 512)
+        JSCompState.priv_name_lens = Allocate(512)
+        MemorySet(JSCompState.priv_name_lens, 0, 512)
+        JSCompState.priv_name_depths = Allocate(512)
+        MemorySet(JSCompState.priv_name_depths, 0, 512)
+        JSCompState.priv_stack_ids = Allocate(128)
+        MemorySet(JSCompState.priv_stack_ids, 0, 128)
+        JSCompState.priv_depth = 0
+        JSCompState.priv_name_count = 0
+
         ReturnValue(1)
     }
 }
@@ -411,11 +429,19 @@ Function.JSComp_Reset {
         JSCompState.is_strict = 0
         JSCompState.priv_class_id = 0
         JSCompState.next_priv_class_id = 1
+        JSCompState.priv_depth = 0
+        JSCompState.priv_name_count = 0
         JSCompStack.sp = 0
         MemorySet(JSCompState.tdz_map, 0, 256)
         MemorySet(JSCompState.const_map, 0, 256)
         MemorySet(JSCompState.const_names, 0, 2048)
         JSCompState.const_name_count = 0
+        IfCondition NotEqual(JSCompState.priv_name_ptrs, 0) ThenBlock: {
+            MemorySet(JSCompState.priv_name_ptrs, 0, 512)
+            MemorySet(JSCompState.priv_name_lens, 0, 512)
+            MemorySet(JSCompState.priv_name_depths, 0, 512)
+            MemorySet(JSCompState.priv_stack_ids, 0, 128)
+        }
         ReturnValue(0)
     }
 }
@@ -648,18 +674,92 @@ Function.JSComp__AddString {
     Body: {
         save_ptr = ptr
         save_len = len
-        // Check str_buf capacity
-        needed = Add(JSCompState.str_pos, Add(save_len, 1))
-        IfCondition GreaterEqual(needed, JSCompConst.STR_CAP) ThenBlock: {
-            JSCompState.error = 1
-            ReturnValue(-1)
+        // M26k.7: mangle private names "#name@id" using declaring class brand.
+        // Nested classes without own #x still resolve #x to outer brand.
+        use_mangle = 0
+        cid = 0
+        IfCondition And(NotEqual(JSCompState.priv_depth, 0), GreaterThan(save_len, 0)) ThenBlock: {
+            IfCondition EqualTo(GetByte(save_ptr, 0), 35) ThenBlock: {
+                has_at = 0
+                ai = 0
+                WhileLoop LessThan(ai, save_len) {
+                    IfCondition EqualTo(GetByte(save_ptr, ai), 64) ThenBlock: { has_at = 1 }
+                    ai = Add(ai, 1)
+                }
+                IfCondition EqualTo(has_at, 0) ThenBlock: {
+                    // Find declaring class: search private name table from newest
+                    found_d = -1
+                    ni = Subtract(JSCompState.priv_name_count, 1)
+                    WhileLoop GreaterEqual(ni, 0) {
+                        nptr = Dereference(Add(JSCompState.priv_name_ptrs, Multiply(ni, 8)))
+                        nlen = Dereference(Add(JSCompState.priv_name_lens, Multiply(ni, 8)))
+                        IfCondition EqualTo(nlen, save_len) ThenBlock: {
+                            same = 1
+                            bi = 0
+                            WhileLoop And(EqualTo(same, 1), LessThan(bi, save_len)) {
+                                IfCondition NotEqual(GetByte(nptr, bi), GetByte(save_ptr, bi)) ThenBlock: {
+                                    same = 0
+                                }
+                                bi = Add(bi, 1)
+                            }
+                            IfCondition EqualTo(same, 1) ThenBlock: {
+                                found_d = Dereference(Add(JSCompState.priv_name_depths, Multiply(ni, 8)))
+                                ni = -1
+                            }
+                        }
+                        ni = Subtract(ni, 1)
+                    }
+                    IfCondition GreaterEqual(found_d, 0) ThenBlock: {
+                        cid = Dereference(Add(JSCompState.priv_stack_ids, Multiply(found_d, 8)))
+                        use_mangle = 1
+                    } ElseBlock: {
+                        // Undeclared private: use current class brand
+                        cid = JSCompState.priv_class_id
+                        IfCondition NotEqual(cid, 0) ThenBlock: { use_mangle = 1 }
+                    }
+                }
+            }
         }
-        // Copy string into str_buf
-        dest = Add(JSCompState.str_buf, JSCompState.str_pos)
-        MemoryCopy(dest, save_ptr, save_len)
-        SetByte(dest, save_len, 0)
-        str_start = dest
-        JSCompState.str_pos = Add(JSCompState.str_pos, Add(save_len, 1))
+        IfCondition EqualTo(use_mangle, 1) ThenBlock: {
+            digs = 1
+            tmp = cid
+            WhileLoop GreaterEqual(tmp, 10) {
+                digs = Add(digs, 1)
+                tmp = Divide(tmp, 10)
+            }
+            nlen = Add(save_len, Add(1, digs))
+            needed = Add(JSCompState.str_pos, Add(nlen, 1))
+            IfCondition GreaterEqual(needed, JSCompConst.STR_CAP) ThenBlock: {
+                JSCompState.error = 1
+                ReturnValue(-1)
+            }
+            dest = Add(JSCompState.str_buf, JSCompState.str_pos)
+            MemoryCopy(dest, save_ptr, save_len)
+            SetByte(dest, save_len, 64)
+            di = Subtract(nlen, 1)
+            tmp = cid
+            WhileLoop GreaterEqual(di, Add(save_len, 1)) {
+                d10 = Divide(tmp, 10)
+                digit = Subtract(tmp, Multiply(d10, 10))
+                SetByte(dest, di, Add(48, digit))
+                tmp = d10
+                di = Subtract(di, 1)
+            }
+            SetByte(dest, nlen, 0)
+            str_start = dest
+            JSCompState.str_pos = Add(JSCompState.str_pos, Add(nlen, 1))
+        } ElseBlock: {
+            needed = Add(JSCompState.str_pos, Add(save_len, 1))
+            IfCondition GreaterEqual(needed, JSCompConst.STR_CAP) ThenBlock: {
+                JSCompState.error = 1
+                ReturnValue(-1)
+            }
+            dest = Add(JSCompState.str_buf, JSCompState.str_pos)
+            MemoryCopy(dest, save_ptr, save_len)
+            SetByte(dest, save_len, 0)
+            str_start = dest
+            JSCompState.str_pos = Add(JSCompState.str_pos, Add(save_len, 1))
+        }
 
         // Add pool entry
         idx = JSCompState.const_count
