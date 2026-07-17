@@ -1,11 +1,11 @@
 # JS Engine — Dependency Plan
 
-**Updated:** 2026-07-17 (post full-suite M31c + UTF-16 key reclaim)  
-**Goal:** Browser-usable JS: language mass + **core built-ins** honesty. Full test262 100% is multi-phase; see **`BROWSER_CONFORMANCE.md`**.
+**Updated:** 2026-07-17 (Object/Array/String **≥80%** product bar)  
+**Goal:** Browser-usable JS. **Product gate:** **Object, Array, and String each ≥80%** on test262. Full suite 100% is multi-phase; see **`BROWSER_CONFORMANCE.md`**.
 
 | Rule | |
 |------|--|
-| Order | Fix **dependencies first** (UTF-16 key correctness → language reclaim → **Object/Array/String** → Promise → RegExp depth → modules/async residual) |
+| Order | UTF-16 keys → **Object.defineProperty** → **Array callbacks** → **String methods** → polish to 80% → Promise/RegExp → full rescore |
 | Honesty | Generators / function / call: **`--no-batch`**. Batch OK after M18b (gval rewind). |
 | Style | **Wrap over write** — use Ailang/runtime primitives; thin JS surface |
 | Gate | Midgate green after every mole |
@@ -68,95 +68,145 @@ python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<
 2. **Real regression:** Object/Array attribute model and class method descriptors broke when JS string keys became UTF-16 while many paths still used `GetByte` / `StringLength` as if keys were C strings.  
 3. **True gaps:** Math/JSON/Number depth, Promise edges, String methods, collections — multi-phase even after reclaim.
 
+**Product bar (agreed):** **Object, Array, and String each ≥80%** on their test262 trees to be browser-useful.  
+Everything else (Promise/RegExp polish, class reclaim, full %) supports that bar.
+
 **Report both:**
-- **Browser-track core:** Object + Array + String + Function + Number + Math + JSON + Error + Promise (exclude Temporal/TA/Map/Set).  
-- **Full suite** for honesty.
+- **Browser-track:** Object + Array + String (primary) + Function + Promise + RegExp  
+- **Full suite** (Temporal/TA still desert drag)
 
-### Priority DAG
+### Math to 80% (M31c full denominators)
+
+| Built-in | Now (full M31c) | Post-M31e slice | Need for 80% | Gap (passes) |
+|----------|----------------:|----------------:|-------------:|-------------:|
+| **Object** | 1246/3411 (36.5%) | **1486 (43.6%)** | ~2729 | **~+1240** |
+| **Array** | 1337/3081 (43.4%) | **1408 (46.1%)** | ~2465 | **~+1060** |
+| **String** | 336/1223 (27.5%) | **359 (29.4%)** | ~979 | **~+620** |
+
+This is **multi-mole**, not one patch. UTF-16 key reclaim is **necessary but not sufficient**.
+
+### Fail-mass map (where the points are)
+
+**Object (~1480 fails to close):**
+| Bucket | Fail ~ | Pass% | Work |
+|--------|-------:|------:|------|
+| defineProperty | **804** | 29% | attribute model, accessors, redefinition, ToPropertyDescriptor edges |
+| defineProperties | **473** | 25% | same + multi-prop order |
+| prototype | 182 | 27% | toString/hasOwn/valueOf/isPrototypeOf |
+| create | 153 | 52% | props bag + descriptors |
+| getOwnPropertyDescriptor | 143 | 54% | attrs + function name/length |
+| assign / entries / values / fromEntries | ~95 | low | copy + enum + coercion |
+| seal/freeze/preventExt | ~90 | mid | integrity |
+
+**Array (~1120 fails to close) — almost all `Array/prototype`:**
+| Method family | Fail ~ | Notes |
+|---------------|-------:|-------|
+| reduce / reduceRight | ~280 | callback args, holes, array-like, species |
+| map / filter / forEach / some / every | ~450 | same callback contract |
+| indexOf / lastIndexOf / includes | ~170 | SameValueZero, fromIndex |
+| splice / slice / concat | ~210 | **sparse** + species + generic |
+| sort | 40 | comparefn + ToString |
+| push/pop/shift/unshift | ~80 | length / extensible |
+| ES2023: toSpliced/with/toSorted/toReversed/at | ~100 | **missing surface** |
+| from / of / fromAsync | ~140 | from partial; fromAsync absent |
+
+**String (~640 fails to close) — almost all `String/prototype`:**
+| Method family | Fail ~ | Notes |
+|---------------|-------:|-------|
+| split | 100 | regex + limit + UTF-16 |
+| trim / trimStart / trimEnd | ~110 | unicode whitespace |
+| replace / replaceAll | ~70 | regex + functional + global |
+| substring / slice | ~70 | index clamp |
+| match / search / matchAll | ~80 | RegExp coupling |
+| case maps + locale* | ~90 | full Unicode casefold optional |
+| includes/startsWith/endsWith/indexOf | ~90 | position + search string |
+| valueOf / toString / at / normalize | ~50 | boxing + missing |
+
+### Priority DAG (Object / Array / String = product)
 
 ```
-[R0] UTF-16 property-key correctness     ← active (M31d+)
-        │  gOPD / FuncPropGet-Set / ObjHas / MakeAttrKey /
-        │  defineProperty accessors / ObjKeys / GlobalHash
+[R0] UTF-16 keys (gOPD/attrs)          ✓ M31d–e, finish edges
         │
-        ├─► [R1] Reclaim language class + method name/attrs
-        │         statements/class + expressions/class ≥70%+
+        ├─► [OA1] Object.defineProperty + defineProperties   ← largest Object mass
+        │         accessors, [[DefineOwnProperty]], !configurable
         │
-        ├─► [R2] Reclaim Object property model
-        │         defineProperty / create / keys / freeze-seal
-        │         Object ≥50%+ (toward prior 54%)
+        ├─► [OA2] Object.create / gOPD / keys / assign
         │
-        ├─► [R3] Array + String spine
-        │         Array ≥48%+; String method honesty
+        ├─► [A1] Array callback methods (map/filter/reduce*/forEach/some/every)
+        │         array-like, holes, thisArg, species light
         │
-        └─► [R4] Promise residual + RegExp depth
-                  (P1 lookbehind / named; P3 set algebra; Script \p later)
+        ├─► [A2] Array mutation/slice/concat/splice + length
+        │
+        ├─► [S1] String split/slice/substring/indexOf/includes family
+        │
+        ├─► [S2] String replace/replaceAll + match/search (RegExp)
+        │
+        ├─► [A3/S3] Missing surface: Array.at/to*; String.at/replaceAll completeness
+        │
+        └─► [R5] Full rescore — Object/Array/String each ≥80% gate
 
-Defer: Temporal, TypedArray, Map/Set, Proxy, full UCD, modules mass
+Parallel: class reclaim (unblocks method descriptors) when OA1 needs it.
+Defer: Temporal, TypedArray, Map/Set, full locale casefold, fromAsync.
 ```
 
-| Pri | Work | Why | Success signal |
-|-----|------|-----|----------------|
-| **R0** | Finish **UTF-16 key** audit (no GetByte-as-C on prop names) | Unblocks class/Object/verifyProperty mass | midgate green; `gOPD(fn,"name")` + hasOwn; Object.keys enum bits |
-| **R1** | **Class reclaim** | Largest language drop (~1171 pass→fail in full Δ) | class combined **≥70%** |
-| **R2** | **Object reclaim** | defineProperty/create/keys | Object **≥50%** slice; defineProperty climb |
-| **R3** | **Array/String** residual | Product + score | Array **≥48%**; String methods no UTF-16 corruption |
-| **R4** | **Promise + RegExp** | Browser track | Promise **≥25%**; RegExp **≥35%** full-run |
-| **R5** | Full rescore | Honest baseline after R0–R2 | full **≥42%** (recover toward M29h) |
+| Phase | Work | Gate (slice) |
+|-------|------|----------------|
+| **OA1** | Object defineProperty / defineProperties honesty | defineProperty **≥70%** of 1131; defineProperties **≥60%** |
+| **OA2** | create, gOPD, keys, assign, integrity | Object overall **≥65%** |
+| **OA3** | remaining Object (entries/values/fromEntries/symbols) | Object **≥80%** |
+| **A1** | callback methods hole/array-like/thisArg | map+filter+reduce* combined **≥75%** |
+| **A2** | splice/slice/concat/sort/push family | Array overall **≥70%** |
+| **A3** | `at`, `to*`, of/from polish | Array **≥80%** |
+| **S1** | index/slice/split/includes/starts/ends | those methods **≥70%** each |
+| **S2** | replace/replaceAll/match/search/trim* | String overall **≥65%** |
+| **S3** | boxing toString/valueOf, at, pad, remaining | String **≥80%** |
 
-### R0 checklist (implementation)
+### Gates (run every mole)
 
-Already landed M31d (partial):
-- [x] gOPD `name` / `length` / `prototype` via `StrEq`
-- [x] `FuncPropGet` fixed slots via `StrEq`
-- [x] `FuncPropSet` / `ObjHas` function+array length
-- [x] `MakeAttrKey` / GetAttrBits / defineProperty `__get_`/`__set_` builders
-- [x] GlobalHash unit hash; ObjKeys/OwnNames StrUnit + no double-CreateString
-- [ ] Exhaust remaining Dispatch `GetByte(cpay)` only for **const-pool C** keys (OK); document
-- [ ] propertyHelper-heavy name tests (arrow `name.js`) still need helper/include path — track separately
-- [ ] Regression pack green before next full run
+```bash
+python3 tools/js_midgate.py --rebuild --quick
+python3 tools/test262_runner.py --paths 'built-ins/Object/defineProperty' -j 8
+python3 tools/test262_runner.py --paths 'built-ins/Object' -j 8
+python3 tools/test262_runner.py --paths 'built-ins/Array/prototype' -j 8
+python3 tools/test262_runner.py --paths 'built-ins/Array' -j 8
+python3 tools/test262_runner.py --paths 'built-ins/String/prototype' -j 6
+python3 tools/test262_runner.py --paths 'built-ins/String' -j 6
+# milestone only when Object AND Array AND String slices all ≥80%
+python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<tag>.json
+```
 
-### Built-ins honesty table (post-M31c full run)
+### Built-ins honesty table
 
-| Built-in | Pass / Total | % | Notes |
-|----------|-------------:|--:|-------|
-| Object | 1246 / 3411 | 36.6% | reclaim R2 |
-| Array | 1337 / 3081 | 43.7% | close to prior ~49% |
-| String | 336 / 1223 | 27.5% | more surface than early |
-| Function | 139 / 509 | 27.5% | name/length attrs |
-| Promise | 152 / 677 | 22.5% | |
-| RegExp | 518 / 1879 | 27.8% | `\p`/`v` landed; more to go |
-| Number | 74 / 340 | 21.8% | |
-| Math | 64 / 327 | 19.6% | |
-| JSON | 20 / 165 | 12.3% | |
-| Temporal | 36 / 4588 | 0.8% | **defer** |
-| TypedArray+ctors | 0 / ~2.1k | 0% | **defer** |
-| Map/Set/Proxy | 0 | 0% | **defer** |
+| Built-in | Full M31c | Post-M31e slice | Bar |
+|----------|----------:|----------------:|-----|
+| **Object** | 36.5% | **43.6%** | **≥80%** |
+| **Array** | 43.4% | **46.1%** | **≥80%** |
+| **String** | 27.5% | **29.4%** | **≥80%** |
+| Function | 27.5% | — | support attrs |
+| Promise | 22.5% | — | after OA/S |
+| RegExp | 27.8% | ~27.7% | after OA/S |
+| Temporal / TA / Map | ~0% | — | **defer** (not in 80% bar) |
 
 ---
 
-## RegExp / Unicode (status — not the primary bottleneck now)
+## RegExp / Unicode (parked under OA/S)
 
 | Pri | Target | Status |
 |-----|--------|--------|
 | P0 UTF-16 | DONE M31a | |
-| P2 `\p` BMP | DONE M31b–c | GC generated stable; property-escapes **202/613** |
-| P3 unicodeSets | Surface M31c | **68/152**; deepen set algebra later |
-| P1a/b lookbehind/dups | Residual | Parallel when reclaim stable |
-
-Do **not** pour into Script `\p` or full UCD until R0–R2 recover language/Object.
+| P2 `\p` BMP | DONE M31b–c | property-escapes **202/613** |
+| P3 unicodeSets | Surface M31c | **68/152** |
+| P1 lookbehind/dups | Residual | after Object/Array/String climb |
 
 ---
 
 ## Done recently
 
-- **M31a** UTF-16 strings  
-- **M31b–c** `\p`/`\P` + unicodeSets surface  
-- **M31c full suite** baseline 38.3%  
-- **M31d+** UTF-16 key reclaim (gOPD / FuncProp / ObjHas / attr keys)
+- **M31a–c** UTF-16, `\p`, unicodeSets surface; full suite **38.3%**  
+- **M31d–e** property-key reclaim; Object **36→44%** slice, Array **43→46%**, String **27→29%**
 
----
+## Next mole (start here)
 
-## Optional next after reclaim
-
-M23 eval-code; M25 for-of residual; M27 modules; M28 for-await-of; Promise/RegExp depth.
+1. **OA1** — Object.defineProperty attribute / accessor redefinition (largest single fail bucket).  
+2. **A1** — Array callback contract (holes + array-like) — shared infrastructure for half of Array fails.  
+3. **S1** — String split + slice/substring + includes family (high product value, bounded surface).

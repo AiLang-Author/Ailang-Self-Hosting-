@@ -36,13 +36,17 @@
 
 ### Target bars
 
-| Track | Near-term (after reclaim) | Browser-usable |
-|-------|---------------------------:|----------------|
-| **Language** | **≥70–72%** (recover from 60.4%) | **≥80%** |
-| **Core built-ins** (no Temporal/TA/Map) | **≥50%** combined | **≥70%** |
-| **Full suite** | **≥42–45%** (recover toward peak) | multi-phase **≥75%** |
+| Track | Near-term | Browser-useful bar |
+|-------|----------:|-------------------:|
+| **Object** | ≥65% | **≥80%** (product) |
+| **Array** | ≥70% | **≥80%** (product) |
+| **String** | ≥65% | **≥80%** (product) |
+| **Language** | ≥70% (from 60.4%) | **≥80%** |
+| **Full suite** | ≥42–45% reclaim | multi-phase; Temporal still desert |
 
 Optional: report **full excluding Temporal** so deserts don’t drown Object/Array wins.
+
+**Product call:** Object + Array + String at **80%+ each** is the usefulness gate for embedded page JS; Promise/RegExp follow.
 
 ---
 
@@ -90,54 +94,49 @@ Wall: **~34 min** @ 8 workers.
 
 ---
 
-## 3. Active plan — reclaim → core built-ins → RegExp polish
+## 3. Active plan — Object / Array / String → **80% each**
 
-### 3.1 Dependency DAG
+### 3.1 Why 80%
 
-```
-[R0] UTF-16 property keys correct          ← M31d in flight / extend
-        │
-        ├─► [R1] Class reclaim (≥70%)
-        ├─► [R2] Object property model (≥50% → 54% prior)
-        ├─► [R3] Array + String spine
-        └─► [R4] Promise + RegExp depth (P1 lookbehind; P3 set algebra)
+Page JS is not useful if property model, arrays, and strings are “half-right.”  
+**Gate:** `built-ins/Object`, `built-ins/Array`, `built-ins/String` each **≥80%** on test262 paths.
 
-Defer: Temporal, TypedArray, Map/Set, Proxy, Script \p mass, modules
-```
+| | M31c full | M31e slice | Need 80% | Gap |
+|--|----------:|-----------:|---------:|----:|
+| Object | 36.5% | **43.6%** | 80% | **~+1240** passes |
+| Array | 43.4% | **46.1%** | 80% | **~+1060** |
+| String | 27.5% | **29.4%** | 80% | **~+620** |
 
-### 3.2 Ranked work
+### 3.2 Fail mass (where to grind)
 
-| Pri | Work | Success signal |
-|-----|------|----------------|
-| **R0** | Finish key audit (`MakeAttrKey`, OwnNames, Dispatch only const-C for cpay) | midgate; gOPD name/length; hasOwn; defineProperty attrs |
-| **R1** | Class method/name/descriptor reclaim | class combined **≥70%** |
-| **R2** | Object defineProperty/create/keys/freeze | Object **≥50%** |
-| **R3** | Array holes/methods + String methods | Array **≥48%**; String no unit corruption |
-| **R4** | Promise residual; RegExp P1/P3 | Promise **≥25%**; RegExp **≥35%** |
-| **R5** | Full rescore | full **≥42%** (toward M29h peak) |
+1. **Object:** defineProperty (**804** fail) + defineProperties (**473**) dominate; then create/gOPD/assign.  
+2. **Array:** `Array/prototype` (**~1540** fail) — reduce*/map/filter/forEach/some/every + splice/slice/concat; ES2023 `to*`/`at` missing.  
+3. **String:** `String/prototype` (**~800** fail) — split, trim*, replace/replaceAll, slice/substring, match/search, case maps.
 
-### 3.3 Built-ins honesty (full M31c)
+### 3.3 Campaign phases
 
-Browser-track should emphasize Object/Array/String/Function/Promise/RegExp — not Temporal.
+| Phase | Focus | Exit gate |
+|-------|--------|-----------|
+| **OA1** | defineProperty + defineProperties | defineProperty ≥70%; Object overall ≥55% |
+| **OA2** | create, gOPD, keys, assign, freeze/seal | Object ≥65% |
+| **OA3** | entries/values/fromEntries + polish | **Object ≥80%** |
+| **A1** | callback methods (holes, array-like, thisArg) | map/filter/reduce* ≥75% combined |
+| **A2** | splice/slice/concat/sort/length mutators | Array ≥70% |
+| **A3** | `at`, `toSpliced`/`toSorted`/`toReversed`/`with`, from/of | **Array ≥80%** |
+| **S1** | split, slice, substring, includes/starts/ends/indexOf | those ≥70% |
+| **S2** | replace/replaceAll, match/search, trim* | String ≥65% |
+| **S3** | toString/valueOf boxing, at, pad, remaining | **String ≥80%** |
 
-| Built-in | % (full M31c) | After M31d slice | Priority |
-|----------|--------------:|-----------------:|----------|
-| Object | 36.6% | **43.6%** | R2 |
-| Array | 43.7% | **46.1%** | R3 |
-| String | 27.5% | **29.4%** | R3 |
-| Function | 27.5% | — | R0/R1 |
-| Promise | 22.5% | — | R4 |
-| RegExp | 27.8% | ~27.7% | R4 |
-| Temporal / TA / Map | ~0% | — | **defer** |
+**Order:** OA1 → A1 (shared callback/attr infrastructure) → S1 → OA2/A2/S2 → A3/S3/OA3 → full rescore.
 
-### 3.4 RegExp Unicode (parked under reclaim)
+### 3.4 Dependency note
 
-| Item | Status |
-|------|--------|
-| P0 UTF-16 | ✓ |
-| P2 `\p` BMP | ✓ GC generated stable; property-escapes **202/613** |
-| P3 `v` surface | ✓ **68/152**; deepen later |
-| P1 lookbehind/dups | residual |
+UTF-16 key correctness (M31d–e) unblocks descriptor tests; **keep fixing residual GetByte-as-C key paths** whenever Object/class flakes appear.  
+Class reclaim helps method `.name` / non-enumerable defaults but is secondary to OA1.
+
+### 3.5 Defer (not required for 80% OA/S)
+
+Temporal, TypedArray, Map/Set, Proxy, full locale casefold, Array.fromAsync, Script `\p` mass.
 
 ---
 
@@ -145,10 +144,14 @@ Browser-track should emphasize Object/Array/String/Function/Promise/RegExp — n
 
 ```bash
 python3 tools/js_midgate.py --rebuild --quick
-python3 tools/test262_runner.py --paths \
-  'built-ins/Object,built-ins/Array,built-ins/String' -j 8
-python3 tools/test262_runner.py --paths \
-  'language/statements/class,language/expressions/class' -j 8
-# after R0–R2
+# product spine
+python3 tools/test262_runner.py --paths 'built-ins/Object' -j 8
+python3 tools/test262_runner.py --paths 'built-ins/Array' -j 8
+python3 tools/test262_runner.py --paths 'built-ins/String' -j 6
+# hot buckets
+python3 tools/test262_runner.py --paths 'built-ins/Object/defineProperty' -j 8
+python3 tools/test262_runner.py --paths 'built-ins/Array/prototype' -j 8
+python3 tools/test262_runner.py --paths 'built-ins/String/prototype' -j 6
+# when all three ≥80%
 python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<tag>.json
 ```
