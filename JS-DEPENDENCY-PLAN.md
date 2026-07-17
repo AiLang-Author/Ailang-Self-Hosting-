@@ -1,22 +1,25 @@
 # JS Engine — Dependency Plan
 
-**Updated:** 2026-07-15  
-**Goal:** Language compliance mass first; speed later. No false greens.
+**Updated:** 2026-07-16  
+**Goal:** Browser-usable JS: language mass + **core built-ins** honesty. Full test262 100% is multi-phase; see **`BROWSER_CONFORMANCE.md`**.
 
 | Rule | |
 |------|--|
-| Order | Fix **dependencies first** (ops → assign → call → function → eval → class → modules → async) |
+| Order | Fix **dependencies first** (ops → assign → call → function → class → **core Object/Array/String** → Promise → RegExp → modules/async residual) |
 | Honesty | Generators / function / call: **`--no-batch`**. Batch OK after M18b (gval rewind). |
 | Style | **Wrap over write** — use Ailang/runtime primitives; thin JS surface |
 | Gate | Midgate green after every mole |
+| Score | Report **pass deltas (+N)** and **browser-track** (language + core built-ins); full 50k % is trailing |
 
 ---
 
-## Summary (now)
+## Summary (now) — 2026-07-16 post-M29h
+
+> **Pace check:** ~4 days of continuous grind moved full suite from the high-30s / early-40s into **43.6%**, language into **~68%**, Object **~37%→54%**, with class elements ~75%. Do not undersell that as “still mid-40s only.”
 
 | Gate | Score | Notes |
 |------|------:|-------|
-| e2e + midgate core | **PASS** | post-M26k |
+| e2e + midgate core | **PASS** | post-M26k / M27 / M29h |
 | function dstr | **186/186** | |
 | gen dstr | **372/372** | no-batch |
 | generators | **~90%** | no-batch |
@@ -25,15 +28,18 @@
 | assignment | **~86%** | M20e |
 | compound-assignment | **~66%** | M19d |
 | arrow-function | **~92%** | M22 |
-| **class\*** (stmt+expr) | **5975/8551 (~70%)** | M26a–k foundation |
-| **private\*** | **~69%+** (elements private **68.7%** post-M26k.2) | M26k + static/setter brand |
-| **language** (full-run slice) | **16278/24744 (65.8%)** | post-M26k full |
-| **built-ins** | **2804/23770 (11.8%)** | core partial; Temporal/TA drag |
-| **full `--full` (49998)** | **19244/49998 (38.5%)** | post-M26k; JSON `/tmp/full49k.json` |
+| **class\*** (stmt+expr) | **~75% / ~76%** elements; full class trees ~75% | M26a–k.11 private/yield*/brand |
+| **language** | **16310 / 23899 (68.2%)** | full-run root |
+| **built-ins** | **4848 / 23521 (20.6%)** | Object/Array spine up; Temporal/TA still desert |
+| **Object** | **1837 / 3411 (53.9%)** | M27a–c property model |
+| **Array** | **1502 / 3081 (49.2%)** | M29h of/copyWithin/findLast/ToObject |
+| **full `--full` (49998)** | **21783 / 49998 (43.6%)** | `/tmp/test262_full_m29h.json` · **+693** vs 21090 mid-Object era · **+2539** vs 19244 (38.5% full49k) |
 
 **Batch fix (M18b):** `JSRT_Reset` rewinds `gval_pool` — batch no longer under-reports statements/function & generators.
 
-**Timing:** Full 50k ~33 min @ 16 workers batch.
+**Timing:** Full 50k ~32–33 min @ 8 workers batch.
+
+**Living scoreboard + few-day plan:** [`BROWSER_CONFORMANCE.md`](./BROWSER_CONFORMANCE.md)
 
 ---
 
@@ -46,9 +52,20 @@ python3 tools/test262_runner.py --categories expressions/call --no-batch -j 4
 python3 tools/test262_runner.py --categories statements/generators,expressions/generators --no-batch -j 4
 # broad
 python3 tools/test262_runner.py --all -j 4 --output-json /tmp/js_scorecard/language_all.json
-# milestone
-python3 tools/test262_runner.py --full -j 4 --output-json /tmp/js_scorecard/full.json
+# milestone — after every major feature land (not every micro-fix)
+python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<tag>.json
 ```
+
+### Regression cadence (agreed)
+
+| When | What |
+|------|------|
+| Every rebuild | `js_midgate.py --rebuild --quick` |
+| While implementing | Feature **slice** (`--paths built-ins/Array/...` or category) |
+| Feature commit | Full feature suite (e.g. all `built-ins/Array`) + no surprise class/elements drop if language-touching |
+| **Major milestone** | **Full `--full` rescore** + short md under `results/` |
+
+This matches the hover pattern that already worked; make it intentional.
 
 ---
 
@@ -90,17 +107,23 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 - **Language:** 16278/24744 (**65.8%**) — up from ~59.9% post-M20e.
 - **Built-ins:** 2804/23770 (**11.8%**) — core libs partial; desert is Temporal/TA/collections.
 
-#### Active tirage (post-M26k) — knock out 1→5
+#### Active tirage (2026-07-16) — next few days 1→5
+
+Class private residual (M26k.8–k.11) **largely landed** for this phase (elements ~75%). Pivot is **core built-ins honesty** for the browser.
 
 | # | Target | Why | Gate / notes |
 |---|--------|-----|--------------|
-| **1** | **class/elements residual** | Largest language fail mass left inside class | **M26k.4:** HasOwn fix; stmt elements **71.5%**, expr **73.7%**; residual async-private / unicode / brands |
-| **2** | **core built-ins Array / Object** | High leverage; language already depends on them; getting close | Array ~21%, Object ~19%; method/descriptor depth — **not** Temporal/TA |
-| **3** | **for-await-of / async** | Second language fail mass after class | for-await-of **47%** (653 fails); M28 track; needs async foundation |
-| **4** | **Array length descriptor** | Last M26j Array subclass edge | **Done (M29e):** `subclass/builtin-objects/Array` **5/5** (legacy); gOPD w/e/c + truncate/RangeError |
-| **5** | **Temporal / TypedArray / collections** | Only after core built-ins | See **OOS vs built-ins** below — not language-syntax residual |
+| **1** | **Array holes + reduce/map/filter/forEach** | Highest Array residual; M29h started | Array **≥55%** (from ~49%) |
+| **2** | **String.prototype depth** | Surface exists; edges unlock volume | String **≥35–45%** (from ~22%) |
+| **3** | **Promise + async enough for pages** | Browser UX path | Promise **≥25–35%**; fewer async flakes |
+| **4** | **RegExp usable** (skip property-escapes) | Forms / validation | Climb non-escape tests; defer Unicode props |
+| **5** | **Defer** Temporal / TypedArray / Map/Set/Proxy | Desert greenfield | Last-round only; optional exclude Temporal from browser % |
 
-**Also in queue (after / interleaved when unblocking):** M23 eval-code; M27 modules/dynamic-import; M25 for-of residual; M26e/i/h edges; M22 function residual.
+**Supporting / residual:** Object defineProperty + gOPD polish; class async-private / brand edges when they block a page script.
+
+**Done recently (do not re-open as primary):** M26k private/yield*/brand; M27 Object.create/defineProperty/gOPN/gOPDescs/isFrozen; M29e Array length gOPD; M29h Array.of/copyWithin/findLast.
+
+**Also in queue (after / interleaved when unblocking):** M23 eval-code; M27 modules/dynamic-import; M25 for-of residual; M28 for-await-of mass.
 
 #### Language fail mass (post-M26k full-run, largest absolute fails)
 | Area | Fail ~ | Pass% | Notes |
@@ -129,11 +152,13 @@ The near-zero buckets are **not language-syntax OOS** — they are **library imp
 
 So: Temporal/TypedArray are **out of the language-mole tirage**, not “invalid JS.” They’re real features that live under `built-ins/` and wait until core libs are honest.
 
-**Last-round treatment for built-ins:** Language moles first (tirage #1, #3). Core Array/Object (#2) when language mass plateaus — “getting close,” method/descriptor depth. Desert libraries (#5: Temporal, TypedArray, Map/Set, Proxy, Atomics, …) get the **last round** only after core built-ins are honest — not interleaved with class/async.
+**Last-round treatment for built-ins:** Core Object/Array/String/Promise/RegExp first (tirage **1→4**). Desert libraries (Temporal, TypedArray, Map/Set, Proxy, Atomics, …) stay **#5 / last round** — not interleaved with core method depth.
+
+**Browser product bar (agreed):** language **≥80%** and core-built-ins pack **≥70–75%** for “usable browser JS.” Full-suite **75–80%** is multi-phase (needs collections/TypedArray/RegExp depth + Temporal strategy). Full-suite **50%+** is the honest few-day stretch.
 
 #### Mole order (current)
-M26 foundation **done** (a–k). Next: tirage **1→5** above.  
-Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a tirage item depends on them (e.g. #3 needs async/M28; modules stay M27).
+M26 foundation **done** (a–k.11). M27 Object property model **landed**. M29h Array methods **started**. Next: tirage **1→5** above (Array depth → String → Promise → RegExp → defer desert).  
+Legacy M22→M23→M24→M25→M27→M28 still valid as supporting tracks when a tirage item depends on them.
 
 ### M26 progress
 - **Done (M26a–d):** super.prop; default `super(...args)`; CONSTRUCT rest; fdesc+88 class kind; CallFunc/bound bare TypeError; SuperCall object rebind; derived return TypeError; bound CALL dispatch. Subclass non-builtin **23/37**.

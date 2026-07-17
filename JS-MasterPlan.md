@@ -1,6 +1,9 @@
 # Test262 100% Conformance Plan — AILang JS Engine
 
-## Current State
+> **Superseded for day-to-day grind:** use [`BROWSER_CONFORMANCE.md`](./BROWSER_CONFORMANCE.md) (product bars + scoreboard) and [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md) (moles).  
+> This file remains historical Phase planning. **2026-07-16 reality:** full suite **21783/49998 (43.6%)**, language **~68%**, Object **~54%**, Array **~49%** — multi-phase path to 75%+ browser track, not “stuck at 42%.”
+
+## Current State (historical July baseline below)
 - **3,121 / 7,689 passing (41.7%)**, 4,360 fails, 116 timeouts
 - Engine: ~28K lines across 22 AILang source files
 
