@@ -86,7 +86,8 @@ RegExp slice: `/tmp/test262_regexp_m30j.json` (post M30j reverse-lb / dups).
 | M30a–b | String ToString + Promise all/race/allSettled/any/finally |
 | M30c–j | RegExp: lastIndex, greedy, escapes, flags, backrefs, lookaround, sticky, Symbol.*, named groups, `$`/fn replace, left-first `\|`, alt lookbehind, multi-name `\k`, fromCodePoint |
 | **M31a** | **P0 UTF-16 code-unit strings** + `codePointAt`; PropTable `StrEq`; DOM/eval `StrToC`; midgate e2e+core green |
-| **M31b** | **P2 `\p`/`\P` BMP** — 44 props (ASCII/Any/GC/Hex/…), PROP NFA state, class SPLIT; property-escapes **~166/613** |
+| **M31b** | **P2 `\p`/`\P` BMP** — 44 props, PROP NFA, class SPLIT |
+| **M31c** | Loose prop names; GC generated stable; property-escapes **202/613**; **P3** `v`/unicodeSets surface **68/152** (nested/&&/--) |
 
 ---
 
@@ -100,7 +101,7 @@ Browser track **1→4 largely in flight / landed** for Array→String→Promise�
 ```
 [P0] UTF-16 / code-point string ops          ✓ M31a
         │
-        ├─► [P2] \p/\P BMP subset            ✓ M31b ──► [P3] unicodeSets (v)
+        ├─► [P2] \p/\P BMP subset            ✓ M31b/c ──► [P3] unicodeSets (v) ✓ surface M31c
         │
         └─► (optional) ID_Start tables       ──► exotic group-name SyntaxError
 

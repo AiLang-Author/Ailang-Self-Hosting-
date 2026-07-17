@@ -116,8 +116,8 @@ Browser track Array→String→Promise→RegExp **surface landed** (M29–M30). 
 | **P0** | **UTF-16 / code-unit strings** + `codePointAt` | Unblocks real `u`/`v` and property-escapes matching | **DONE M31a** — gate: `fromCodePoint(0x1F98A).length===2`; midgate e2e+core **PASS** |
 | **P1a** | **Reverse lookbehind** (dir −1) | Finish lookBehind without Unicode | lookBehind **≥15/17** |
 | **P1b** | **Duplicate named groups** | named-groups residual | named-groups **≥28/39** |
-| **P2** | **`\p`/`\P` BMP subset** | ~450 property-escapes desert | **DONE M31b** — ASCII/GC/binary tables; property-escapes ~166/613 (27.8%) |
-| **P3** | **unicodeSets (`v`)** | ~114 after `\p` | After P0+P2 |
+| **P2** | **`\p`/`\P` BMP subset** | property-escapes | **DONE M31c** — loose aliases; GC generated green; **202/613 (33.7%)** |
+| **P3** | **unicodeSets (`v`)** | set algebra + flag | **M31c surface** — v flag, nested/&&/--, unicodeSets getter; **68/152 (44.7%)** |
 | **Defer** | Full UCD, Temporal, TypedArray, Map/Set, modifiers scrape | Desert / low product ROI | Last-round |
 
 ```
@@ -130,9 +130,9 @@ P1b duplicate names     }
 
 **RegExp score (slice):** **652 / 1879 (34.7%)** post M30j — remeasure after P0 solid. lookBehind **13/17**, named-groups **21/36**.
 
-**Next:** residual P1a/P1b; expand P2 (loose names, Script, full generated); then **P3 unicodeSets**.
+**Next:** deepen P3 set ops + Script props; residual P1a/P1b; full RegExp rescore.
 
-**Done recently:** M26k–M30j; **M31a UTF-16 P0**; **M31b `\p`/`\P` BMP** (ASCII+GC+binary, Prop tables, Array.join UTF-16).
+**Done recently:** M26k–M30j; **M31a UTF-16**; **M31b–c `\p`/`\P` + unicodeSets surface** (loose names, GC generated green, v flag/&&/--).
 
 **Also in queue (after / interleaved when unblocking):** M23 eval-code; M27 modules/dynamic-import; M25 for-of residual; M28 for-await-of mass.
 

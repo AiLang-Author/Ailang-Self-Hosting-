@@ -277,6 +277,10 @@ function buildString(args) {
 }
 function testPropertyEscapes(regExp, string, expression) {
   if (string.length === 0) return;
+  // Prefer one whole-string test for ^…+$ patterns (huge win vs N×charAt alloc)
+  try {
+    if (regExp.test(string)) return;
+  } catch (e) {}
   var i;
   for (i = 0; i < string.length; i++) {
     if (!regExp.test(string.charAt(i))) {
@@ -296,6 +300,19 @@ function printStringCodePoints(string) {
     si += String.fromCodePoint(cp).length;
   }
   return buf.join(" ");
+}
+// M31c: unicodeSets harness helper (sample strings only; no huge builds)
+function testExtendedCharacterClass(args) {
+  var re = args.regExp;
+  var matchStrings = args.matchStrings || [];
+  var nonMatchStrings = args.nonMatchStrings || [];
+  var i;
+  for (i = 0; i < matchStrings.length; i++) {
+    if (!re.test(matchStrings[i])) { __test262_failed = 1; return; }
+  }
+  for (i = 0; i < nonMatchStrings.length; i++) {
+    if (re.test(nonMatchStrings[i])) { __test262_failed = 1; return; }
+  }
 }
 """
 
@@ -426,6 +443,9 @@ def _load_includes(meta):
     chunks = []
     for name in includes:
         # Skip if we already polyfill the same API in POLYFILL
+        if name in ("regExpUtils.js",):
+            continue
+        # testExtendedCharacterClass lives in our polyfill
         if name in ("regExpUtils.js",):
             continue
         path = harness_dir / name
