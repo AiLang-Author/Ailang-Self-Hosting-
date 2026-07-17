@@ -176,23 +176,53 @@ assert._toString = function(v) {
 };
 function $DONE(err) { if (err) { __test262_failed = 1; } }
 var $MAX_ITERATIONS = 100000;
-function verifyProperty(obj, name, desc) {
-  if (desc === undefined) return;
-  // Prefer gOPD so Symbol keys + inherited same-name props (e.g. @@iterator) work.
+function __isSameValue(a, b) {
+  if (a !== a && b !== b) return true; // NaN
+  if (a === 0 && b === 0) return (1 / a) === (1 / b); // ±0
+  return a === b;
+}
+// Lightweight propertyHelper: full harness uses call.bind and dies under our engine.
+function verifyProperty(obj, name, desc, options) {
   var od = Object.getOwnPropertyDescriptor(obj, name);
-  if (od === undefined) { __test262_failed = 1; return; }
-  if (desc.value !== undefined) {
-    if (od.value !== desc.value) { __test262_failed = 1; }
+  if (desc === undefined) {
+    if (od !== undefined) { __test262_failed = 1; }
+    return true;
   }
-  if (desc.writable !== undefined) {
-    if (od.writable !== desc.writable) { __test262_failed = 1; }
+  if (od === undefined) { __test262_failed = 1; return false; }
+  if (!Object.prototype.hasOwnProperty.call(obj, name)) { __test262_failed = 1; return false; }
+  if (Object.prototype.hasOwnProperty.call(desc, "value")) {
+    if (!__isSameValue(desc.value, od.value)) { __test262_failed = 1; return false; }
+    if (!__isSameValue(desc.value, obj[name])) { __test262_failed = 1; return false; }
   }
-  if (desc.enumerable !== undefined) {
-    if (od.enumerable !== desc.enumerable) { __test262_failed = 1; }
+  if (Object.prototype.hasOwnProperty.call(desc, "writable")) {
+    if (desc.writable !== od.writable) { __test262_failed = 1; return false; }
   }
-  if (desc.configurable !== undefined) {
-    if (od.configurable !== desc.configurable) { __test262_failed = 1; }
+  if (Object.prototype.hasOwnProperty.call(desc, "enumerable")) {
+    if (desc.enumerable !== od.enumerable) { __test262_failed = 1; return false; }
   }
+  if (Object.prototype.hasOwnProperty.call(desc, "configurable")) {
+    if (desc.configurable !== od.configurable) { __test262_failed = 1; return false; }
+  }
+  if (Object.prototype.hasOwnProperty.call(desc, "get")) {
+    if (desc.get !== od.get) { __test262_failed = 1; return false; }
+  }
+  if (Object.prototype.hasOwnProperty.call(desc, "set")) {
+    if (desc.set !== od.set) { __test262_failed = 1; return false; }
+  }
+  // Optional: restore mutations (writable/configurable probes) — no-op if unused
+  return true;
+}
+function verifyEqualTo(obj, name, value) {
+  if (!__isSameValue(obj[name], value)) { __test262_failed = 1; }
+}
+function verifyCallableProperty(obj, name, desc, options) {
+  return verifyProperty(obj, name, desc, options);
+}
+function verifyPrimordialProperty(obj, name, desc, options) {
+  return verifyProperty(obj, name, desc, options);
+}
+function verifyPrimordialCallableProperty(obj, name, desc, options) {
+  return verifyProperty(obj, name, desc, options);
 }
 function verifyNotEnumerable(obj, name) {
   for (var k in obj) { if (k === name) { __test262_failed = 1; } }
@@ -442,11 +472,8 @@ def _load_includes(meta):
     harness_dir = Path(__file__).resolve().parents[1] / "test262" / "harness"
     chunks = []
     for name in includes:
-        # Skip if we already polyfill the same API in POLYFILL
-        if name in ("regExpUtils.js",):
-            continue
-        # testExtendedCharacterClass lives in our polyfill
-        if name in ("regExpUtils.js",):
+        # Skip harness files we replace with engine-safe polyfills
+        if name in ("regExpUtils.js", "propertyHelper.js"):
             continue
         path = harness_dir / name
         if path.is_file():

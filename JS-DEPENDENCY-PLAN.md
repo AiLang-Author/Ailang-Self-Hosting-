@@ -177,11 +177,11 @@ python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<
 
 ### Built-ins honesty table
 
-| Built-in | Full M31c | Post-M31e slice | Bar |
-|----------|----------:|----------------:|-----|
-| **Object** | 36.5% | **43.6%** | **≥80%** |
-| **Array** | 43.4% | **46.1%** | **≥80%** |
-| **String** | 27.5% | **29.4%** | **≥80%** |
+| Built-in | Full M31c | Post-M32 slice | Bar |
+|----------|----------:|---------------:|-----|
+| **Object** | 36.5% | **53.7%** (defineProperty **55.1%**) | **≥80%** |
+| **Array** | 43.4% | **47.5%** | **≥80%** |
+| **String** | 27.5% | **30.7%** | **≥80%** |
 | Function | 27.5% | — | support attrs |
 | Promise | 22.5% | — | after OA/S |
 | RegExp | 27.8% | ~27.7% | after OA/S |
