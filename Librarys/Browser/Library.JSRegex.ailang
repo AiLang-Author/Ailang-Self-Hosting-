@@ -665,6 +665,24 @@ Function.JSRx_ParseAtom {
                             is_la = 2
                             JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
                         }
+                        // (?<= positive lookbehind  / (?<! negative
+                        IfCondition EqualTo(q2, 60) ThenBlock: {
+                            IfCondition LessThan(Add(JSRxCompiler.pos, 2), JSRxCompiler.len) ThenBlock: {
+                                q3 = GetByte(JSRxCompiler.pattern, Add(JSRxCompiler.pos, 2))
+                                IfCondition EqualTo(q3, 61) ThenBlock: {
+                                    // (?<=
+                                    is_cap = 0
+                                    is_la = 3
+                                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 3)
+                                }
+                                IfCondition EqualTo(q3, 33) ThenBlock: {
+                                    // (?<!
+                                    is_cap = 0
+                                    is_la = 4
+                                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 3)
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -684,22 +702,27 @@ Function.JSRx_ParseAtom {
                 ReturnValue(0)
             }
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
-            // Lookahead: zero-width assertion
+            // Lookahead / lookbehind: zero-width assertion
+            // is_la: 1=(?=) 2=(?!) 3=(?<=) 4=(?<!)
             IfCondition GreaterThan(is_la, 0) ThenBlock: {
                 sub_start = Dereference(sub)
-                // data1 = sub start state, data2 = 1 pos / 2 neg
-                // Patch sub outs to MATCH so nested runner can succeed
                 match_s = JSRx_AddState(JSRxStateType.MATCH, 0, 0)
                 sub_out = Dereference(Add(sub, 8))
                 JSRx_PatchList(sub_out, match_s)
-                la_state = JSRx_AddState(JSRxStateType.LOOKAHEAD, sub_start, is_la)
+                IfCondition Or(EqualTo(is_la, 3), EqualTo(is_la, 4)) ThenBlock: {
+                    // lookbehind
+                    lb_kind = 1
+                    IfCondition EqualTo(is_la, 4) ThenBlock: { lb_kind = 2 }
+                    la_state = JSRx_AddState(JSRxStateType.LOOKBEHIND, sub_start, lb_kind)
+                } ElseBlock: {
+                    la_state = JSRx_AddState(JSRxStateType.LOOKAHEAD, sub_start, is_la)
+                }
                 frag = JSRx_FragAlloc()
                 IfCondition NotEqual(frag, 0) ThenBlock: {
                     StoreValue(frag, la_state)
                     list = JSRx_CreateList(la_state)
                     StoreValue(Add(frag, 8), list)
                 }
-                // lookahead itself can be quantified rarely — allow ParsePost
                 ReturnValue(JSRx_ParsePost(frag))
             }
             // Wrap capturing group with SAVE open/close
@@ -1881,6 +1904,17 @@ Function.JSRx_ProcessState {
             ReturnValue(0)
         }
 
+        // M30g: lookbehind (?<=)/(?<!) — sub must match ending at tpos
+        IfCondition EqualTo(type, JSRxStateType.LOOKBEHIND) ThenBlock: {
+            sub_ok = JSRx_TryLookbehind(data1, tpos)
+            want = 1
+            IfCondition EqualTo(data2, 2) ThenBlock: { want = 0 }
+            IfCondition EqualTo(sub_ok, want) ThenBlock: {
+                JSRx_AddThread(out1, tpos, thread)
+            }
+            ReturnValue(0)
+        }
+
         // \b / \B word boundary
         IfCondition Or(EqualTo(type, JSRxStateType.WORD_BOUNDARY), EqualTo(type, JSRxStateType.NOT_WORD_BOUNDARY)) ThenBlock: {
             prev_w = 0
@@ -2012,16 +2046,126 @@ Function.JSRx_TryLookahead {
                 IfCondition LessThan(tp, JSRxMatch.text_len) ThenBlock: {
                     ch = GetByte(JSRxMatch.text, tp)
                 }
-                // Avoid nested lookahead re-entry clobber: skip LOOKAHEAD in sub
-                typ = JSRx_GetStateType(states, sid)
-                IfCondition EqualTo(typ, JSRxStateType.LOOKAHEAD) ThenBlock: {
-                    // treat as fail path for nested
+                // Nested lookaround via ProcessState (threads snapshotted by each try)
+                r = JSRx_ProcessState(states, sid, ch, th)
+                IfCondition EqualTo(r, 1) ThenBlock: {
+                    found = 1
+                    i = JSRxMatch.thread_count
+                }
+                i = Add(i, 1)
+            }
+            IfCondition EqualTo(found, 0) ThenBlock: {
+                tmp = JSRxMatch.threads
+                JSRxMatch.threads = JSRxMatch.next_threads
+                JSRxMatch.next_threads = tmp
+                JSRxMatch.thread_count = JSRxMatch.next_count
+            }
+        }
+        IfCondition And(NotEqual(save_th, 0), NotEqual(save_nx, 0)) ThenBlock: {
+            MemoryCopy(JSRxMatch.threads, save_th, tsize)
+            MemoryCopy(JSRxMatch.next_threads, save_nx, tsize)
+            Deallocate(save_th, tsize)
+            Deallocate(save_nx, tsize)
+        }
+        JSRxMatch.thread_count = save_tc
+        JSRxMatch.next_count = save_nc
+        JSRxMatch.pos = save_pos
+        ReturnValue(found)
+    }
+}
+
+// Lookbehind: sub-NFA must match some [start, end_pos) ending exactly at end_pos
+// Captures from a successful sub-match are kept (groups inside (?<=...)).
+Function.JSRx_TryLookbehind {
+    Input: sub_start: Integer
+    Input: end_pos: Integer
+    Output: Integer
+    Body: {
+        // Snapshot parent captures; each start attempt restores before trying
+        save_caps = 0
+        IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+            save_caps = Allocate(512)
+            IfCondition NotEqual(save_caps, 0) ThenBlock: {
+                MemoryCopy(save_caps, JSRxMatch.captures, 512)
+            }
+        }
+        // Longest-first (s=0..end): ES reverse lookbehind is greedy going
+        // backwards ≈ prefer longest successful prefix ending at end_pos.
+        s = 0
+        WhileLoop LessEqual(s, end_pos) {
+            IfCondition And(NotEqual(save_caps, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                MemoryCopy(JSRxMatch.captures, save_caps, 512)
+            }
+            ok = JSRx_TryMatchEndsAt(sub_start, s, end_pos)
+            IfCondition EqualTo(ok, 1) ThenBlock: {
+                IfCondition NotEqual(save_caps, 0) ThenBlock: {
+                    Deallocate(save_caps, 512)
+                }
+                // leave captures from successful sub-match
+                ReturnValue(1)
+            }
+            s = Add(s, 1)
+        }
+        IfCondition And(NotEqual(save_caps, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+            MemoryCopy(JSRxMatch.captures, save_caps, 512)
+            Deallocate(save_caps, 512)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Match sub from start_pos; return 1 if any MATCH occurs at exact end_pos
+Function.JSRx_TryMatchEndsAt {
+    Input: sub_start: Integer
+    Input: start_pos: Integer
+    Input: end_pos: Integer
+    Output: Integer
+    Body: {
+        save_tc = JSRxMatch.thread_count
+        save_nc = JSRxMatch.next_count
+        save_pos = JSRxMatch.pos
+        tsize = Multiply(JSRxConstants.MAX_THREADS, JSRxMatch.thread_size)
+        save_th = Allocate(tsize)
+        save_nx = Allocate(tsize)
+        IfCondition And(NotEqual(save_th, 0), NotEqual(save_nx, 0)) ThenBlock: {
+            MemoryCopy(save_th, JSRxMatch.threads, tsize)
+            MemoryCopy(save_nx, JSRxMatch.next_threads, tsize)
+        }
+        JSRxMatch.thread_count = 0
+        JSRxMatch.next_count = 0
+        JSRx_AddThread(sub_start, start_pos, 0)
+        steps = 0
+        max_s = Add(Multiply(Add(JSRxMatch.text_len, 1), 32), 64)
+        found = 0
+        states = JSRxMatch.cur_states
+        IfCondition EqualTo(states, 0) ThenBlock: {
+            states = JSRxState.states
+        }
+        WhileLoop And(And(GreaterThan(JSRxMatch.thread_count, 0), EqualTo(found, 0)), LessThan(steps, max_s)) {
+            steps = Add(steps, 1)
+            JSRxMatch.next_count = 0
+            i = 0
+            WhileLoop LessThan(i, JSRxMatch.thread_count) {
+                th = JSRx_GetThread(i)
+                sid = Dereference(th)
+                tp = Dereference(Add(th, 8))
+                // prune paths past end_pos
+                IfCondition GreaterThan(tp, end_pos) ThenBlock: {
                     i = Add(i, 1)
                 } ElseBlock: {
+                    JSRxMatch.pos = tp
+                    ch = 0
+                    IfCondition LessThan(tp, JSRxMatch.text_len) ThenBlock: {
+                        ch = GetByte(JSRxMatch.text, tp)
+                    }
+                    // Nested lookaround allowed via ProcessState (depth-limited by step cap)
                     r = JSRx_ProcessState(states, sid, ch, th)
                     IfCondition EqualTo(r, 1) ThenBlock: {
-                        found = 1
-                        i = JSRxMatch.thread_count
+                        // MATCH at tp — success only if tp == end_pos
+                        IfCondition EqualTo(tp, end_pos) ThenBlock: {
+                            found = 1
+                            i = JSRxMatch.thread_count
+                        }
                     }
                     i = Add(i, 1)
                 }
@@ -2134,7 +2278,7 @@ Function.JSRegex_SearchPosLen {
     }
 }
 
-// M30c: search from start_from (for lastIndex / sticky-ish)
+// M30c/g: search from start_from; sticky flag = only try at start_from
 Function.JSRegex_SearchPosLenFrom {
     Input: regex: Address
     Input: text: Address
@@ -2153,6 +2297,28 @@ Function.JSRegex_SearchPosLenFrom {
             ReturnValue(0)
         }
         IfCondition EqualTo(save_text, 0) ThenBlock: {
+            JSRxResult.pos = -1
+            JSRxResult.len = -1
+            ReturnValue(0)
+        }
+        // sticky (flag bit 64): only match at exact index
+        sticky = 0
+        fl = Dereference(Add(save_regex, 32))
+        IfCondition EqualTo(BitwiseAnd(fl, 64), 64) ThenBlock: {
+            sticky = 1
+        }
+        IfCondition EqualTo(sticky, 1) ThenBlock: {
+            IfCondition GreaterThan(i, save_len) ThenBlock: {
+                JSRxResult.pos = -1
+                JSRxResult.len = -1
+                ReturnValue(0)
+            }
+            match_len = JSRegex_Match(save_regex, save_text, i)
+            IfCondition GreaterEqual(match_len, 0) ThenBlock: {
+                JSRxResult.pos = i
+                JSRxResult.len = match_len
+                ReturnValue(1)
+            }
             JSRxResult.pos = -1
             JSRxResult.len = -1
             ReturnValue(0)
