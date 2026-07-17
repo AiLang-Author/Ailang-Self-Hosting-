@@ -1,6 +1,8 @@
 # JS Engine — Dependency Plan
 
 **Updated:** 2026-07-17 (Object/Array/String **≥80%** product bar)  
+**New session:** start at [`results/JS_HANDOFF_M32.md`](./results/JS_HANDOFF_M32.md).
+
 **Goal:** Browser-usable JS. **Product gate:** **Object, Array, and String each ≥80%** on test262. Full suite 100% is multi-phase; see **`BROWSER_CONFORMANCE.md`**.
 
 | Rule | |
