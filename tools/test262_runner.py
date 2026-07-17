@@ -244,6 +244,59 @@ if (typeof Object !== "undefined") {
     };
   }
 }
+// M31b: regExpUtils helpers — sample BMP via array.join (no quadratic concat).
+function buildString(args) {
+  var loneCodePoints = args.loneCodePoints || [];
+  var ranges = args.ranges || [];
+  var MAX_CP = 2048;
+  var parts = [];
+  var total = 0;
+  var i, start, end, codePoint;
+  for (i = 0; i < loneCodePoints.length; i++) {
+    if (total >= MAX_CP) break;
+    codePoint = loneCodePoints[i];
+    if (codePoint < 1 || codePoint > 0xFFFF) continue;
+    parts[total++] = String.fromCharCode(codePoint);
+  }
+  for (i = 0; i < ranges.length; i++) {
+    start = ranges[i][0];
+    end = ranges[i][1];
+    if (start < 1) start = 1;
+    if (start > 0xFFFF) continue;
+    if (end > 0xFFFF) end = 0xFFFF;
+    var span = end - start + 1;
+    var step = 1;
+    if (span > MAX_CP) step = ((span / MAX_CP) | 0) + 1;
+    for (codePoint = start; codePoint <= end; codePoint += step) {
+      if (total >= MAX_CP) break;
+      parts[total++] = String.fromCharCode(codePoint);
+    }
+    if (total >= MAX_CP) break;
+  }
+  return parts.join("");
+}
+function testPropertyEscapes(regExp, string, expression) {
+  if (string.length === 0) return;
+  var i;
+  for (i = 0; i < string.length; i++) {
+    if (!regExp.test(string.charAt(i))) {
+      __test262_failed = 1;
+      return;
+    }
+  }
+}
+function printCodePoint(codePoint) {
+  return "U+" + codePoint.toString(16).toUpperCase();
+}
+function printStringCodePoints(string) {
+  var buf = [];
+  for (var si = 0; si < string.length; ) {
+    var cp = string.codePointAt(si);
+    buf.push(printCodePoint(cp));
+    si += String.fromCodePoint(cp).length;
+  }
+  return buf.join(" ");
+}
 """
 
 EPILOGUE = """
@@ -325,6 +378,26 @@ def parse_frontmatter(source):
         if type_match:
             meta["negative_type"] = type_match.group(1)
 
+    # Parse includes: [a.js, b.js]
+    inc_match = re.search(r'^includes:\s*\[([^\]]*)\]', raw, re.MULTILINE)
+    if inc_match:
+        meta["includes"] = [f.strip().strip("'\"") for f in inc_match.group(1).split(",") if f.strip()]
+    else:
+        inc_lines = []
+        in_inc = False
+        for line in raw.split("\n"):
+            if re.match(r'^includes:\s*$', line):
+                in_inc = True
+                continue
+            if in_inc:
+                im = re.match(r'^\s+-\s+(.+)', line)
+                if im:
+                    inc_lines.append(im.group(1).strip().strip("'\""))
+                else:
+                    in_inc = False
+        if inc_lines:
+            meta["includes"] = inc_lines
+
     return meta
 
 
@@ -344,6 +417,23 @@ def _wants_strict(meta):
     return "onlyStrict" in flags and "noStrict" not in flags
 
 
+def _load_includes(meta):
+    """Load test262 harness includes listed in frontmatter (e.g. regExpUtils.js)."""
+    includes = (meta or {}).get("includes") or []
+    if not includes:
+        return ""
+    harness_dir = Path(__file__).resolve().parents[1] / "test262" / "harness"
+    chunks = []
+    for name in includes:
+        # Skip if we already polyfill the same API in POLYFILL
+        if name in ("regExpUtils.js",):
+            continue
+        path = harness_dir / name
+        if path.is_file():
+            chunks.append(path.read_text(errors="replace"))
+    return "\n".join(chunks) + ("\n" if chunks else "")
+
+
 def assemble_source(processed, meta=None):
     """Build full harness source.
 
@@ -351,9 +441,11 @@ def assemble_source(processed, meta=None):
     program (before polyfill) so JSComp_IsStrict / VM is_strict actually fire.
     Putting the directive after the polyfill was a silent no-op.
     """
+    includes = _load_includes(meta)
+    body = POLYFILL + includes + processed + EPILOGUE
     if _wants_strict(meta):
-        return '"use strict";\n' + POLYFILL + processed + EPILOGUE
-    return POLYFILL + processed + EPILOGUE
+        return '"use strict";\n' + body
+    return body
 
 
 # =============================================================================

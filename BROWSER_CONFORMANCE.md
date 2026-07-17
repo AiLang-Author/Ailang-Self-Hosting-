@@ -86,6 +86,7 @@ RegExp slice: `/tmp/test262_regexp_m30j.json` (post M30j reverse-lb / dups).
 | M30a–b | String ToString + Promise all/race/allSettled/any/finally |
 | M30c–j | RegExp: lastIndex, greedy, escapes, flags, backrefs, lookaround, sticky, Symbol.*, named groups, `$`/fn replace, left-first `\|`, alt lookbehind, multi-name `\k`, fromCodePoint |
 | **M31a** | **P0 UTF-16 code-unit strings** + `codePointAt`; PropTable `StrEq`; DOM/eval `StrToC`; midgate e2e+core green |
+| **M31b** | **P2 `\p`/`\P` BMP** — 44 props (ASCII/Any/GC/Hex/…), PROP NFA state, class SPLIT; property-escapes **~166/613** |
 
 ---
 
@@ -99,7 +100,7 @@ Browser track **1→4 largely in flight / landed** for Array→String→Promise�
 ```
 [P0] UTF-16 / code-point string ops          ✓ M31a
         │
-        ├─► [P2] \p/\P BMP subset            ──► [P3] unicodeSets (v)   ← next primary
+        ├─► [P2] \p/\P BMP subset            ✓ M31b ──► [P3] unicodeSets (v)
         │
         └─► (optional) ID_Start tables       ──► exotic group-name SyntaxError
 
@@ -115,7 +116,7 @@ Browser track **1→4 largely in flight / landed** for Array→String→Promise�
 | **P0** | **UTF-16 code-unit strings** + `codePointAt` | real `u`/`v`, property-escapes mass | — | **DONE M31a** — `fromCodePoint(0x1F98A).length===2`; midgate PASS |
 | **P1a** | **Reverse lookbehind** (direction −1) | lookBehind residual (~5), cleaner alts/backrefs | current NFA | lookBehind **≥15/17**; `captures.js` / alts / backrefs green |
 | **P1b** | **Duplicate named groups** | `duplicate-names-*` (~10) | left-first alts (done) | named-groups **≥28/39** |
-| **P2** | **`\p{…}` / `\P{…}` BMP subset** (`ASCII`, GC L/N/P/Z, …) | property-escapes first real matching wins | **P0** | property-escapes climb; generated `ASCII` / GC samples pass |
+| **P2** | **`\p{…}` / `\P{…}` BMP subset** | property-escapes matching | **P0** | **DONE M31b** — ASCII generated pass; ~166/613 slice |
 | **P3** | **unicodeSets (`v`)** set algebra | ~114 unicodeSets | P0+P2 | unicodeSets **≥40%** |
 | **P4** | ID tables for group names; modifiers/syntax-err | polish named + flags desert | light UCD | optional scrape |
 | **Defer** | Full UCD, Temporal, TypedArray, Map/Set | desert / multi-phase | — | stay out until P0–P2 solid |
