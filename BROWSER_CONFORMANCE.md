@@ -6,218 +6,149 @@
 
 ---
 
-## 0. Progress reality check (do not undersell this)
-
-In roughly **four days** of focused grind (one CLI / agent track on this branch):
+## 0. Progress reality check
 
 | Horizon | Score | Context |
 |---------|------:|---------|
-| Early full-suite / category baselines | **~18–38%** | midgate language slice / early full runs |
 | Full suite 2026-07-15 (`full49k`) | **19244 / 49998 (38.5%)** | post-M26k class foundation |
-| Full suite 2026-07-16 post Object/Array | **21783 / 49998 (43.6%)** | `/tmp/test262_full_m29h.json` |
+| Full suite 2026-07-16 post Object/Array | **21783 / 49998 (43.6%)** | `/tmp/test262_full_m29h.json` **peak** |
+| Full suite 2026-07-17 post UTF-16/`\p` | **19129 / 49998 (38.3%)** | `/tmp/test262_full_m31c.json` · **Δ −2654** vs peak |
+| Post-M31d Object/Array/String **slices** | reclaiming | Object **43.6%**, Array **46.1%**, String **29.4%** (not full-run) |
 
-**Δ on full 50k:** **+~2.5k passes** in a short window after class private work, then Object property model (M27a–c), then Array (M29h).  
-Language alone moved into the **high 60s**; Object **~37% → ~54%**; Array **~46% → ~49%**.  
+**What happened:** M31a–c delivered real UTF-16 + RegExp Unicode surface, then the first full rescore exposed a **property-key regression**: many paths still treated keys as C strings (`GetByte`/`StringLength`) while JS string keys are UTF-16. That hammered **class**, **Object.defineProperty/create**, and `verifyProperty` / function `name`/`length` mass.
 
-That is **engine-rewrite pace**, not “slow polish.” Keep reporting absolute deltas (pass count + pp), not only “still under 50% full suite.” Full-suite % is **dragged by Temporal/TypedArray/Map deserts**, not by idle work.
+**What is true at the same time:** RegExp/String/unicodeSets **gained** capability; built-ins % is also crushed by **Temporal (~4.6k @ ~0%)** and TypedArray/Map/Set deserts in the denominator.
 
 ---
 
 ## 1. Goals (agreed)
 
-### What “browser ready” means
+### Browser-ready means
 
-A page script should reliably:
+1. Language + classes (private basics)  
+2. Property model (defineProperty, create, freeze/seal, keys)  
+3. Arrays + strings usable  
+4. Promises enough for fetch/UI  
+5. RegExp usable (incl. reasonable Unicode)  
+6. DOM bridge path  
 
-1. Functions, objects, arrays, control flow, classes (incl. private basics)  
-2. Property model that matches developer intuition (defineProperty, create, freeze/seal)  
-3. Arrays + strings that work on array-likes and common methods  
-4. Promises enough for fetch / UI  
-5. RegExp usable for validation  
-6. DOM bridge path (not full WPT)  
-
-**Not required for this phase:** Temporal, TypedArray/Atomics, full Proxy/Reflect, complete modules, full async-iterator `yield*`.
+**Not this phase:** Temporal, TypedArray/Atomics, full Proxy/Reflect, complete modules.
 
 ### Target bars
 
-| Track | Definition | Near-term (days) | Browser-usable bar |
-|-------|------------|------------------:|-------------------:|
-| **Language** | `test/language` | **≥72–75%** | **≥80%** |
-| **Core built-ins** | Object + Array + String + Function + Number + Math + JSON + Error + Promise | **≥55–60%** combined | **≥70–75%** |
-| **Full suite** | `--full` (~50k) | **≥48–52%** | **≥75–80%** multi-phase only |
+| Track | Near-term (after reclaim) | Browser-usable |
+|-------|---------------------------:|----------------|
+| **Language** | **≥70–72%** (recover from 60.4%) | **≥80%** |
+| **Core built-ins** (no Temporal/TA/Map) | **≥50%** combined | **≥70%** |
+| **Full suite** | **≥42–45%** (recover toward peak) | multi-phase **≥75%** |
 
-**Product pitch (honest):**  
-> Target **75%+ language** and **70%+ core built-ins** (browser track).  
-> Full test262 **50%+ this phase**; **75% of all of test262** needs Map/Set/TypedArray/RegExp depth and either Temporal impl or Temporal excluded from the score.
-
-Optional score hygiene: report **full-suite excluding Temporal** (~45.5k tests) so 4.5k @ 1% does not drown progress.
+Optional: report **full excluding Temporal** so deserts don’t drown Object/Array wins.
 
 ---
 
-## 2. Latest scoreboard (2026-07-16 post-M29h)
+## 2. Latest scoreboard
 
-| Scope | Pass / Total | % |
+### 2.1 Full suite M31c (authoritative floor)
+
+| Scope | Pass / Total | % | vs M29h |
+|-------|-------------:|--:|--------:|
+| **Full** | **19129 / 49998** | **38.3%** | **−2654** |
+| language | 14446 / 23899 | 60.4% | −1864 |
+| built-ins | 4087 / 23521 | 17.4% | −761 |
+| Object | 1246 / 3411 | 36.6% | large drop |
+| Array | 1337 / 3081 | 43.7% | modest drop |
+| String | 336 / 1223 | 27.5% | up vs early |
+| Promise | 152 / 677 | 22.5% | |
+| RegExp | 518 / 1879 | 27.8% | net capability up |
+| Temporal | 36 / 4588 | 0.8% | desert |
+| class (stmt+expr) | — | ~62.5% post-M31d slice | was ~75% |
+
+JSON: `/tmp/test262_full_m31c.json` · writeup: `results/FULL_SUITE_M31c.md`  
+Wall: **~34 min** @ 8 workers.
+
+### 2.2 Post-M31d reclaim slices (same day, not full rescore)
+
+| Suite | Pass / Total | % |
 |-------|-------------:|--:|
-| **Full `--full`** | **21783 / 49998** | **43.6%** |
-| language | 16310 / 23899 | 68.2% |
-| built-ins | 4848 / 23521 | 20.6% |
-| statements/class | ~3282 / 4369 | ~75% |
-| expressions/class | ~3099 / 4059 | ~76% |
-| Object | 1837 / 3411 | 53.9% |
-| Array | 1502–1504 / 3081 | ~49% |
-| String | ~294 / 1334 | ~22% (pre–M30a; surface later) |
-| Promise | ~110 / 677 | ~16% (pre–M30b; surface later) |
-| **RegExp** (built-ins slice) | **652 / 1879** | **34.7%** (M30j; `/tmp/test262_regexp_m30j.json`) |
-| Temporal | 60 / 4588 | 1.3% |
-| TypedArray / Map / Set / Proxy | ~0 | 0% |
+| Object (all) | **1486 / 3411** | **43.6%** (+240 vs full M31c) |
+| Array (all) | **1408 / 3081** | **46.1%** |
+| String (all) | **359 / 1223** | **29.4%** |
+| RegExp (all) | **513 / 1879** | **27.7%** |
+| arrow-function | **310 / 343** | **90.4%** |
+| class (stmt+expr) | **5253 / 8426** | **62.5%** |
+| midgate e2e+core | **PASS** | |
 
-JSON: `/tmp/test262_full_m29h.json` (also mirror under `results/` when re-baselined).  
-RegExp slice: `/tmp/test262_regexp_m30j.json` (post M30j reverse-lb / dups).
+### 2.3 Recent moles
 
-### Recent moles (this arc)
-
-| Commit / mole | Focus |
-|---------------|--------|
-| M26k.8–k.11 | Private fields, yield*, class-factory brand, gOPD own |
-| M27a | Large Number ToString; defineProperty ToPropertyDescriptor |
-| M27b | Object.create(props); attr defaults; isFrozen/isSealed |
-| M27c / M27c2 | getOwnPropertyNames / getOwnPropertyDescriptors |
-| M29h–i | Array.of, copyWithin, findLast*, holes/array-like |
-| M30a–b | String ToString + Promise all/race/allSettled/any/finally |
-| M30c–j | RegExp: lastIndex, greedy, escapes, flags, backrefs, lookaround, sticky, Symbol.*, named groups, `$`/fn replace, left-first `\|`, alt lookbehind, multi-name `\k`, fromCodePoint |
-| **M31a** | **P0 UTF-16 code-unit strings** + `codePointAt`; PropTable `StrEq`; DOM/eval `StrToC`; midgate e2e+core green |
-| **M31b** | **P2 `\p`/`\P` BMP** — 44 props, PROP NFA, class SPLIT |
-| **M31c** | Loose prop names; GC generated stable; property-escapes **202/613**; **P3** `v`/unicodeSets surface **68/152** (nested/&&/--) |
+| Mole | Focus |
+|------|--------|
+| M26–M30 | class private, Object model, Array, String/Promise, RegExp depth |
+| **M31a** | UTF-16 code-unit strings + `codePointAt` |
+| **M31b–c** | `\p`/`\P` BMP + unicodeSets `v` surface |
+| **M31c full** | 38.3% baseline; regression map |
+| **M31d+** | UTF-16 **property-key** reclaim (gOPD, FuncProp, ObjHas, attr keys, defineProperty accessors) |
 
 ---
 
-## 3. Active plan (dependency-aware ROI) — 2026-07-17
+## 3. Active plan — reclaim → core built-ins → RegExp polish
 
-Browser track **1→4 largely in flight / landed** for Array→String→Promise→RegExp surface.  
-**P0 UTF-16 landed (M31a).** Property-escapes still depend on BMP tables (P2).
-
-### 3.1 Dependency DAG (RegExp / Unicode)
+### 3.1 Dependency DAG
 
 ```
-[P0] UTF-16 / code-point string ops          ✓ M31a
+[R0] UTF-16 property keys correct          ← M31d in flight / extend
         │
-        ├─► [P2] \p/\P BMP subset            ✓ M31b/c ──► [P3] unicodeSets (v) ✓ surface M31c
-        │
-        └─► (optional) ID_Start tables       ──► exotic group-name SyntaxError
+        ├─► [R1] Class reclaim (≥70%)
+        ├─► [R2] Object property model (≥50% → 54% prior)
+        ├─► [R3] Array + String spine
+        └─► [R4] Promise + RegExp depth (P1 lookbehind; P3 set algebra)
 
-[P1a] Reverse lookbehind matcher             } residual parallel
-[P1b] Duplicate named groups (ES2025)        }
-[P1c] RegExp residual polish                 } modifiers only if scraping %
+Defer: Temporal, TypedArray, Map/Set, Proxy, Script \p mass, modules
 ```
 
-### 3.2 Ranked next work
+### 3.2 Ranked work
 
-| Pri | Work | Unlocks | Depends on | Success signal |
-|-----|------|---------|------------|----------------|
-| **P0** | **UTF-16 code-unit strings** + `codePointAt` | real `u`/`v`, property-escapes mass | — | **DONE M31a** — `fromCodePoint(0x1F98A).length===2`; midgate PASS |
-| **P1a** | **Reverse lookbehind** (direction −1) | lookBehind residual (~5), cleaner alts/backrefs | current NFA | lookBehind **≥15/17**; `captures.js` / alts / backrefs green |
-| **P1b** | **Duplicate named groups** | `duplicate-names-*` (~10) | left-first alts (done) | named-groups **≥28/39** |
-| **P2** | **`\p{…}` / `\P{…}` BMP subset** | property-escapes matching | **P0** | **DONE M31b** — ASCII generated pass; ~166/613 slice |
-| **P3** | **unicodeSets (`v`)** set algebra | ~114 unicodeSets | P0+P2 | unicodeSets **≥40%** |
-| **P4** | ID tables for group names; modifiers/syntax-err | polish named + flags desert | light UCD | optional scrape |
-| **Defer** | Full UCD, Temporal, TypedArray, Map/Set | desert / multi-phase | — | stay out until P0–P2 solid |
+| Pri | Work | Success signal |
+|-----|------|----------------|
+| **R0** | Finish key audit (`MakeAttrKey`, OwnNames, Dispatch only const-C for cpay) | midgate; gOPD name/length; hasOwn; defineProperty attrs |
+| **R1** | Class method/name/descriptor reclaim | class combined **≥70%** |
+| **R2** | Object defineProperty/create/keys/freeze | Object **≥50%** |
+| **R3** | Array holes/methods + String methods | Array **≥48%**; String no unit corruption |
+| **R4** | Promise residual; RegExp P1/P3 | Promise **≥25%**; RegExp **≥35%** |
+| **R5** | Full rescore | full **≥42%** (toward M29h peak) |
 
-### 3.3 Practical sequence (“next week”)
+### 3.3 Built-ins honesty (full M31c)
 
-1. **P1a + P1b in parallel** (immediate RegExp %) while designing **P0**.  
-2. **P0** land (smallest honest UTF-16: store UCS-2/UTF-16LE, `length` = code units, GetByte→GetCodeUnit).  
-3. **P2** `\p{ASCII}` + GC letters/digits BMP → expand.  
-4. **P3** only after `\p` pays.  
-5. **Do not** pour into property-escapes matching before P0 — grammar-only passes are false ROI.
+Browser-track should emphasize Object/Array/String/Function/Promise/RegExp — not Temporal.
 
-### 3.4 Earlier browser track (status)
+| Built-in | % (full M31c) | After M31d slice | Priority |
+|----------|--------------:|-----------------:|----------|
+| Object | 36.6% | **43.6%** | R2 |
+| Array | 43.7% | **46.1%** | R3 |
+| String | 27.5% | **29.4%** | R3 |
+| Function | 27.5% | — | R0/R1 |
+| Promise | 22.5% | — | R4 |
+| RegExp | 27.8% | ~27.7% | R4 |
+| Temporal / TA / Map | ~0% | — | **defer** |
 
-| # | Work | Status |
-|---|------|--------|
-| 1 Array holes / methods | largely done M29i |
-| 2 String depth | partial M30a; more remains |
-| 3 Promise / async | partial M30b |
-| 4 RegExp usable | **M30c–i at 34.6% slice**; Unicode path is next phase |
+### 3.4 RegExp Unicode (parked under reclaim)
 
-Supporting: Object defineProperty residual + gOPD polish when unblocking.
+| Item | Status |
+|------|--------|
+| P0 UTF-16 | ✓ |
+| P2 `\p` BMP | ✓ GC generated stable; property-escapes **202/613** |
+| P3 `v` surface | ✓ **68/152**; deepen later |
+| P1 lookbehind/dups | residual |
 
 ---
 
-## 4. Test strategy (targeted + full regression)
-
-This is what we have been hovering around — **make it explicit**.
-
-### Tracks
-
-| Track | Command / path | When |
-|-------|----------------|------|
-| **Midgate** | `python3 tools/js_midgate.py --rebuild --quick` | After **every** mole rebuild |
-| **Feature slice** | `--paths built-ins/Array` or `--categories statements/class/elements` | While implementing; tight loop |
-| **Core built-ins pack** | Object + Array + String + Function + Promise paths | After a multi-hour Object/Array/String push |
-| **Language pack** | `--all` or language categories | After language moles |
-| **Full regression** | `python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<tag>.json` | After **every major feature milestone** (not every micro-fix) |
-
-### Recommended cadence
-
-1. **Micro-fix:** midgate + 1–2 path slices (e.g. `Array/prototype/map`).  
-2. **Feature land (commit-sized):** midgate + feature suite (e.g. all `built-ins/Array`) + no class/elements regression if language-touching.  
-3. **Major milestone** (e.g. “Array ≥55%”, “Object property model done”): **full `--full` rescore** + write `results/test262_full_<tag>.md` summary.  
-4. Keep **`--no-batch`** for flaky language areas (generators/function) when diagnosing; batch for full suite wall-clock.
-
-### Browser-track report (to add in runner when convenient)
-
-```
-language:          pass/total  %
-core-builtins:     Object+Array+String+Function+Number+Math+JSON+Error+Promise
-full-suite:        pass/total  %
-full-ex-temporal:  pass/total  %   # optional
-```
-
-Until the runner prints this automatically, compute from JSON after full runs (as in grind sessions).
-
-### Artifact convention
+## 4. Gates
 
 ```bash
-python3 tools/test262_runner.py --full -j 8 \
-  --output-json results/test262_full_<mole>.json
-# hand or script → results/test262_full_<mole>.md scoreboard
-```
-
----
-
-## 5. Deferred libraries (not “invalid JS”)
-
-| Bucket | Treatment |
-|--------|-----------|
-| Temporal (~4.5k @ ~1%) | Exclude from browser-track %; last-round or never for shell |
-| TypedArray / DataView / ArrayBuffer / Atomics | After core Array/String; needed for media/wasm later |
-| Map / Set / Weak* | After Object/Array spine; high real-world value, medium size |
-| Proxy / Reflect | After property model honesty |
-| Staging / annexB piles | Only when unblocking a core mole |
-
----
-
-## 6. Process rules (unchanged spirit)
-
-- Midgate green after rebuild  
-- No false greens; measure with test262  
-- Wrap over write — thin JS surface on Ailang primitives  
-- Celebrate **pass deltas** (+N, +pp) alongside remaining %  
-- One major full rescore per milestone, not every edit  
-
----
-
-## 7. Commands cheat sheet
-
-```bash
-# Rebuild harnesses
 python3 tools/js_midgate.py --rebuild --quick
-
-# Feature
-python3 tools/test262_runner.py --paths built-ins/Array -j 8 --output-json /tmp/arr.json
-python3 tools/test262_runner.py --paths built-ins/Object -j 8 --output-json /tmp/obj.json
-python3 tools/test262_runner.py --categories statements/class/elements -j 8
-
-# Milestone full regression (~32 min @ 8 workers)
+python3 tools/test262_runner.py --paths \
+  'built-ins/Object,built-ins/Array,built-ins/String' -j 8
+python3 tools/test262_runner.py --paths \
+  'language/statements/class,language/expressions/class' -j 8
+# after R0–R2
 python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<tag>.json
 ```
