@@ -72,7 +72,7 @@ Optional score hygiene: report **full-suite excluding Temporal** (~45.5k tests) 
 | TypedArray / Map / Set / Proxy | ~0 | 0% |
 
 JSON: `/tmp/test262_full_m29h.json` (also mirror under `results/` when re-baselined).  
-RegExp slice: `/tmp/test262_regexp_m30i4.json` (post M30i2).
+RegExp slice: `/tmp/test262_regexp_m30j.json` (post M30j reverse-lb / dups).
 
 ### Recent moles (this arc)
 
@@ -84,25 +84,26 @@ RegExp slice: `/tmp/test262_regexp_m30i4.json` (post M30i2).
 | M27c / M27c2 | getOwnPropertyNames / getOwnPropertyDescriptors |
 | M29h–i | Array.of, copyWithin, findLast*, holes/array-like |
 | M30a–b | String ToString + Promise all/race/allSettled/any/finally |
-| M30c–i | RegExp: lastIndex, greedy, escapes, flags, backrefs, lookahead/behind, sticky, Symbol.*, named groups, `$`/fn replace, left-first `\|`, fromCodePoint |
+| M30c–j | RegExp: lastIndex, greedy, escapes, flags, backrefs, lookaround, sticky, Symbol.*, named groups, `$`/fn replace, left-first `\|`, alt lookbehind, multi-name `\k`, fromCodePoint |
+| **M31a** | **P0 UTF-16 code-unit strings** + `codePointAt`; PropTable `StrEq`; DOM/eval `StrToC`; midgate e2e+core green |
 
 ---
 
 ## 3. Active plan (dependency-aware ROI) — 2026-07-17
 
 Browser track **1→4 largely in flight / landed** for Array→String→Promise→RegExp surface.  
-**RegExp is no longer “defer Unicode forever”** — property-escapes are the remaining desert, but they **depend on string code units**.
+**P0 UTF-16 landed (M31a).** Property-escapes still depend on BMP tables (P2).
 
 ### 3.1 Dependency DAG (RegExp / Unicode)
 
 ```
-[P0] UTF-16 / code-point string ops          ← highest leverage prerequisite
+[P0] UTF-16 / code-point string ops          ✓ M31a
         │
-        ├─► [P2] \p/\P BMP subset            ──► [P3] unicodeSets (v)
+        ├─► [P2] \p/\P BMP subset            ──► [P3] unicodeSets (v)   ← next primary
         │
         └─► (optional) ID_Start tables       ──► exotic group-name SyntaxError
 
-[P1a] Reverse lookbehind matcher             } parallel NOW (no Unicode wait)
+[P1a] Reverse lookbehind matcher             } residual parallel
 [P1b] Duplicate named groups (ES2025)        }
 [P1c] RegExp residual polish                 } modifiers only if scraping %
 ```
@@ -111,7 +112,7 @@ Browser track **1→4 largely in flight / landed** for Array→String→Promise�
 
 | Pri | Work | Unlocks | Depends on | Success signal |
 |-----|------|---------|------------|----------------|
-| **P0** | **UTF-16 code-unit strings** (or dual rep) + `codePointAt` / for-of / regex cursor | real `u`/`v`, property-escapes mass, CCE unicode | nothing | `String.fromCodePoint(0x1F98A).length === 2`; regex sees code units not UTF-8 bytes |
+| **P0** | **UTF-16 code-unit strings** + `codePointAt` | real `u`/`v`, property-escapes mass | — | **DONE M31a** — `fromCodePoint(0x1F98A).length===2`; midgate PASS |
 | **P1a** | **Reverse lookbehind** (direction −1) | lookBehind residual (~5), cleaner alts/backrefs | current NFA | lookBehind **≥15/17**; `captures.js` / alts / backrefs green |
 | **P1b** | **Duplicate named groups** | `duplicate-names-*` (~10) | left-first alts (done) | named-groups **≥28/39** |
 | **P2** | **`\p{…}` / `\P{…}` BMP subset** (`ASCII`, GC L/N/P/Z, …) | property-escapes first real matching wins | **P0** | property-escapes climb; generated `ASCII` / GC samples pass |

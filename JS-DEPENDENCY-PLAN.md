@@ -19,7 +19,7 @@
 
 | Gate | Score | Notes |
 |------|------:|-------|
-| e2e + midgate core | **PASS** | post-M26k / M27 / M29h |
+| e2e + midgate core | **PASS** | post-M31a UTF-16 P0 |
 | function dstr | **186/186** | |
 | gen dstr | **372/372** | no-batch |
 | generators | **~90%** | no-batch |
@@ -113,26 +113,26 @@ Browser track Array→String→Promise→RegExp **surface landed** (M29–M30). 
 
 | Pri | Target | Why | Gate / notes |
 |-----|--------|-----|--------------|
-| **P0** | **UTF-16 / code-unit strings** + `codePointAt` | Unblocks real `u`/`v` and property-escapes matching | `fromCodePoint(0x1F98A).length===2`; regex walks code units |
+| **P0** | **UTF-16 / code-unit strings** + `codePointAt` | Unblocks real `u`/`v` and property-escapes matching | **DONE M31a** — gate: `fromCodePoint(0x1F98A).length===2`; midgate e2e+core **PASS** |
 | **P1a** | **Reverse lookbehind** (dir −1) | Finish lookBehind without Unicode | lookBehind **≥15/17** |
 | **P1b** | **Duplicate named groups** | named-groups residual | named-groups **≥28/39** |
-| **P2** | **`\p`/`\P` BMP subset** | ~450 property-escapes desert | After **P0**; start ASCII + GC L/N |
+| **P2** | **`\p`/`\P` BMP subset** | ~450 property-escapes desert | **Next primary** after P0; start ASCII + GC L/N |
 | **P3** | **unicodeSets (`v`)** | ~114 after `\p` | After P0+P2 |
 | **Defer** | Full UCD, Temporal, TypedArray, Map/Set, modifiers scrape | Desert / low product ROI | Last-round |
 
 ```
-P0 UTF-16 ──► P2 \p BMP ──► P3 unicodeSets
-P1a reverse lookbehind  } parallel now
+P0 UTF-16 ✓ ──► P2 \p BMP ──► P3 unicodeSets
+P1a reverse lookbehind  } parallel residual
 P1b duplicate names     }
 ```
 
-**Do not** grind property-escape *matching* before P0 (grammar-only passes are false ROI).
+**M31a P0 landed:** JS string payloads = magic-headered UTF-16LE (`JSRT_StrLen`/`StrUnit`/`StrEq`/`StrCmp`/`StrToC`/`StrEmit`). Property keys remain C (or compare via `StrEq`). `codePointAt`; regex/string methods walk units; DOM/eval flatten via `StrToC`.
 
-**RegExp score (slice):** **652 / 1879 (34.7%)** post M30j — lookBehind **13/17**, named-groups **21/36**; left-first `\|`; reverse-ish lookbehind (shortest for top-level alt); multi-name `\k`; fromCodePoint (UTF-8 still).
+**RegExp score (slice):** **652 / 1879 (34.7%)** post M30j — remeasure after P0 solid. lookBehind **13/17**, named-groups **21/36**.
 
-**Supporting / residual:** String depth; Promise edges; Object defineProperty polish.
+**Next:** **P2 `\p` BMP**; residual P1a/P1b.
 
-**Done recently (do not re-open as primary):** M26k private/yield*/brand; M27 Object; M29 Array holes/methods; M30a–b String/Promise; **M30c–i RegExp**.
+**Done recently (do not re-open as primary):** M26k private/yield*/brand; M27 Object; M29 Array; M30a–j String/Promise/RegExp; **M31a UTF-16 P0**.
 
 **Also in queue (after / interleaved when unblocking):** M23 eval-code; M27 modules/dynamic-import; M25 for-of residual; M28 for-await-of mass.
 
