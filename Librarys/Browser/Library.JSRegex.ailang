@@ -295,11 +295,27 @@ Function.JSRegex_Match {
                 ReturnValue(-1)
             }
         }
+        // Capture slots: 64 ints (32 groups * start/end)
+        IfCondition EqualTo(JSRxMatch.captures, 0) ThenBlock: {
+            JSRxMatch.captures = Allocate(512)
+        }
+        IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+            ci = 0
+            WhileLoop LessThan(ci, 64) {
+                StoreValue(Add(JSRxMatch.captures, Multiply(ci, 8)), -1)
+                ci = Add(ci, 1)
+            }
+        }
+        JSRxResult.ngroups = capture_count
+        JSRxResult.cap_buf = JSRxMatch.captures
 
         JSRxMatch.thread_count = 0
         JSRxMatch.next_count = 0
 
         JSRx_AddThread(start_state, start_pos, 0)
+
+        // M30d: track longest match (greedy). Early MATCH return broke a+/a*/a{n}.
+        best_len = -1
 
         WhileLoop LessEqual(JSRxMatch.pos, JSRxMatch.text_len) {
             ch = 0
@@ -318,7 +334,9 @@ Function.JSRegex_Match {
 
                 IfCondition EqualTo(result, 1) ThenBlock: {
                     match_len = Subtract(JSRxMatch.pos, start_pos)
-                    ReturnValue(match_len)
+                    IfCondition GreaterThan(match_len, best_len) ThenBlock: {
+                        best_len = match_len
+                    }
                 }
 
                 i = Add(i, 1)
@@ -331,7 +349,8 @@ Function.JSRegex_Match {
                 JSRxMatch.thread_count = JSRxMatch.next_count
 
                 IfCondition EqualTo(JSRxMatch.thread_count, 0) ThenBlock: {
-                    ReturnValue(-1)
+                    // no more paths — return best so far (greedy)
+                    ReturnValue(best_len)
                 }
             } ElseBlock: {
                 BreakLoop
@@ -340,7 +359,7 @@ Function.JSRegex_Match {
             JSRxMatch.pos = Add(JSRxMatch.pos, 1)
         }
 
-        // Check final states
+        // Check final states at end of input
         i = 0
         WhileLoop LessThan(i, JSRxMatch.thread_count) {
             thread = JSRx_GetThread(i)
@@ -349,13 +368,15 @@ Function.JSRegex_Match {
 
             IfCondition EqualTo(state_type, JSRxStateType.MATCH) ThenBlock: {
                 match_len = Subtract(JSRxMatch.pos, start_pos)
-                ReturnValue(match_len)
+                IfCondition GreaterThan(match_len, best_len) ThenBlock: {
+                    best_len = match_len
+                }
             }
 
             i = Add(i, 1)
         }
 
-        ReturnValue(-1)
+        ReturnValue(best_len)
     }
 }
 
@@ -636,6 +657,27 @@ Function.JSRx_ParseAtom {
 
         IfCondition EqualTo(ch, 40) ThenBlock: {
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            // M30d: (?: non-capturing) vs ( capturing )
+            is_cap = 1
+            IfCondition LessThan(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                IfCondition EqualTo(GetByte(JSRxCompiler.pattern, JSRxCompiler.pos), 63) ThenBlock: {
+                    // (?...
+                    IfCondition LessThan(Add(JSRxCompiler.pos, 1), JSRxCompiler.len) ThenBlock: {
+                        q2 = GetByte(JSRxCompiler.pattern, Add(JSRxCompiler.pos, 1))
+                        // (?:  non-capturing
+                        IfCondition EqualTo(q2, 58) ThenBlock: {
+                            is_cap = 0
+                            JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
+                        }
+                        // (?= (?! deferred — treat as non-cap empty for now skip
+                    }
+                }
+            }
+            gid = 0
+            IfCondition EqualTo(is_cap, 1) ThenBlock: {
+                JSRxCompiler.group_count = Add(JSRxCompiler.group_count, 1)
+                gid = JSRxCompiler.group_count
+            }
             sub = JSRx_ParseAlt()
             IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
                 JSRxCompiler.error = 1
@@ -647,6 +689,25 @@ Function.JSRx_ParseAtom {
                 ReturnValue(0)
             }
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            // Wrap capturing group with SAVE open/close (data1 = slot index)
+            // slot 2*(gid-1)=start, 2*(gid-1)+1=end
+            IfCondition And(EqualTo(is_cap, 1), GreaterThan(gid, 0)) ThenBlock: {
+                open_slot = Multiply(Subtract(gid, 1), 2)
+                close_slot = Add(open_slot, 1)
+                s_open = JSRx_AddState(JSRxStateType.SAVE, open_slot, 0)
+                s_close = JSRx_AddState(JSRxStateType.SAVE, close_slot, 0)
+                sub_start = Dereference(sub)
+                sub_out = Dereference(Add(sub, 8))
+                JSRx_SetStateOut1(s_open, sub_start)
+                JSRx_PatchList(sub_out, s_close)
+                close_list = JSRx_CreateList(s_close)
+                wrapped = JSRx_FragAlloc()
+                IfCondition NotEqual(wrapped, 0) ThenBlock: {
+                    StoreValue(wrapped, s_open)
+                    StoreValue(Add(wrapped, 8), close_list)
+                }
+                ReturnValue(JSRx_ParsePost(wrapped))
+            }
             ReturnValue(JSRx_ParsePost(sub))
         }
 
@@ -663,9 +724,101 @@ Function.JSRx_ParseAtom {
             ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
 
+            // M30d: class escapes \d \D \w \W \s \S as RANGE bitmaps
+            is_class_esc = 0
+            neg_esc = 0
+            IfCondition EqualTo(ch, 100) ThenBlock: { is_class_esc = 1 } // \d
+            IfCondition EqualTo(ch, 68) ThenBlock: { is_class_esc = 1 neg_esc = 1 } // \D
+            IfCondition EqualTo(ch, 119) ThenBlock: { is_class_esc = 2 } // \w
+            IfCondition EqualTo(ch, 87) ThenBlock: { is_class_esc = 2 neg_esc = 1 } // \W
+            IfCondition EqualTo(ch, 115) ThenBlock: { is_class_esc = 3 } // \s
+            IfCondition EqualTo(ch, 83) ThenBlock: { is_class_esc = 3 neg_esc = 1 } // \S
+            IfCondition EqualTo(ch, 98) ThenBlock: {
+                // \b word boundary
+                state = JSRx_AddState(JSRxStateType.WORD_BOUNDARY, 0, 0)
+                frag = JSRx_FragAlloc()
+                IfCondition NotEqual(frag, 0) ThenBlock: {
+                    StoreValue(frag, state)
+                    list = JSRx_CreateList(state)
+                    StoreValue(Add(frag, 8), list)
+                }
+                ReturnValue(frag)
+            }
+            IfCondition EqualTo(ch, 66) ThenBlock: {
+                // \B
+                state = JSRx_AddState(JSRxStateType.NOT_WORD_BOUNDARY, 0, 0)
+                frag = JSRx_FragAlloc()
+                IfCondition NotEqual(frag, 0) ThenBlock: {
+                    StoreValue(frag, state)
+                    list = JSRx_CreateList(state)
+                    StoreValue(Add(frag, 8), list)
+                }
+                ReturnValue(frag)
+            }
+            IfCondition GreaterThan(is_class_esc, 0) ThenBlock: {
+                bitmap = JSRx_ClassAlloc()
+                IfCondition EqualTo(bitmap, 0) ThenBlock: {
+                    JSRxCompiler.error = 1
+                    ReturnValue(0)
+                }
+                bi = 0
+                WhileLoop LessThan(bi, 32) {
+                    SetByte(bitmap, bi, 0)
+                    bi = Add(bi, 1)
+                }
+                IfCondition EqualTo(is_class_esc, 1) ThenBlock: {
+                    // digits 0-9
+                    dj = 48
+                    WhileLoop LessEqual(dj, 57) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                }
+                IfCondition EqualTo(is_class_esc, 2) ThenBlock: {
+                    // word: A-Z a-z 0-9 _
+                    dj = 65
+                    WhileLoop LessEqual(dj, 90) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    dj = 97
+                    WhileLoop LessEqual(dj, 122) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    dj = 48
+                    WhileLoop LessEqual(dj, 57) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    JSRx_SetBit(bitmap, 95)
+                }
+                IfCondition EqualTo(is_class_esc, 3) ThenBlock: {
+                    // whitespace: tab LF VT FF CR space
+                    JSRx_SetBit(bitmap, 9)
+                    JSRx_SetBit(bitmap, 10)
+                    JSRx_SetBit(bitmap, 11)
+                    JSRx_SetBit(bitmap, 12)
+                    JSRx_SetBit(bitmap, 13)
+                    JSRx_SetBit(bitmap, 32)
+                    JSRx_SetBit(bitmap, 160)
+                }
+                state = JSRx_AddState(JSRxStateType.RANGE, bitmap, neg_esc)
+                frag = JSRx_FragAlloc()
+                IfCondition NotEqual(frag, 0) ThenBlock: {
+                    StoreValue(frag, state)
+                    list = JSRx_CreateList(state)
+                    StoreValue(Add(frag, 8), list)
+                }
+                ReturnValue(JSRx_ParsePost(frag))
+            }
+
+            // single-char escapes
             IfCondition EqualTo(ch, 110) ThenBlock: { ch = 10 }
             IfCondition EqualTo(ch, 114) ThenBlock: { ch = 13 }
             IfCondition EqualTo(ch, 116) ThenBlock: { ch = 9 }
+            IfCondition EqualTo(ch, 102) ThenBlock: { ch = 12 }
+            IfCondition EqualTo(ch, 118) ThenBlock: { ch = 11 }
 
             state = JSRx_AddState(JSRxStateType.CHAR, ch, 0)
             frag = JSRx_FragAlloc()
@@ -1101,6 +1254,18 @@ Function.JSRx_ProcessState {
             ReturnValue(0)
         }
 
+        // SAVE: epsilon + record capture slot (data1) at current pos into global capture buf
+        IfCondition EqualTo(type, JSRxStateType.SAVE) ThenBlock: {
+            // Store capture position: slots in JSRxMatch.captures as 8-byte ints
+            IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+                IfCondition And(GreaterEqual(data1, 0), LessThan(data1, 64)) ThenBlock: {
+                    StoreValue(Add(JSRxMatch.captures, Multiply(data1, 8)), JSRxMatch.pos)
+                }
+            }
+            JSRx_AddThread(out1, JSRxMatch.pos, thread)
+            ReturnValue(0)
+        }
+
         IfCondition EqualTo(type, JSRxStateType.ASSERT_START) ThenBlock: {
             IfCondition EqualTo(JSRxMatch.pos, 0) ThenBlock: {
                 JSRx_AddThread(out1, JSRxMatch.pos, thread)
@@ -1115,6 +1280,42 @@ Function.JSRx_ProcessState {
             ReturnValue(0)
         }
 
+        // \b / \B word boundary
+        IfCondition Or(EqualTo(type, JSRxStateType.WORD_BOUNDARY), EqualTo(type, JSRxStateType.NOT_WORD_BOUNDARY)) ThenBlock: {
+            prev_w = 0
+            cur_w = 0
+            IfCondition GreaterThan(JSRxMatch.pos, 0) ThenBlock: {
+                pc = GetByte(JSRxMatch.text, Subtract(JSRxMatch.pos, 1))
+                prev_w = JSRx_IsWordChar(pc)
+            }
+            IfCondition LessThan(JSRxMatch.pos, JSRxMatch.text_len) ThenBlock: {
+                cc = GetByte(JSRxMatch.text, JSRxMatch.pos)
+                cur_w = JSRx_IsWordChar(cc)
+            }
+            is_bound = 0
+            IfCondition NotEqual(prev_w, cur_w) ThenBlock: { is_bound = 1 }
+            ok = is_bound
+            IfCondition EqualTo(type, JSRxStateType.NOT_WORD_BOUNDARY) ThenBlock: {
+                IfCondition EqualTo(is_bound, 0) ThenBlock: { ok = 1 } ElseBlock: { ok = 0 }
+            }
+            IfCondition EqualTo(ok, 1) ThenBlock: {
+                JSRx_AddThread(out1, JSRxMatch.pos, thread)
+            }
+            ReturnValue(0)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+Function.JSRx_IsWordChar {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 95) ThenBlock: { ReturnValue(1) }
         ReturnValue(0)
     }
 }
@@ -1218,6 +1419,9 @@ Function.JSRx_Not2 {
 FixedPool.JSRxResult {
     "pos":    Initialize=-1
     "len":    Initialize=-1
+    "ngroups": Initialize=0
+    // captures[i*2]=start, captures[i*2+1]=end for group i+1; main match is pos/len
+    "cap_buf": Initialize=0
 }
 
 // Search for regex anywhere in text, returning position and length.
