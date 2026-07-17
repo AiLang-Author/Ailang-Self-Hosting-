@@ -14,6 +14,7 @@
 | Full suite 2026-07-16 post Object/Array | **21783 / 49998 (43.6%)** | `/tmp/test262_full_m29h.json` **peak** |
 | Full suite 2026-07-17 post UTF-16/`\p` | **19129 / 49998 (38.3%)** | `/tmp/test262_full_m31c.json` · **Δ −2654** vs peak |
 | Post-M31d Object/Array/String **slices** | reclaiming | Object **43.6%**, Array **46.1%**, String **29.4%** (not full-run) |
+| Post-M33 OA1 slices | reclaiming | Object **61.1%**, defineProperty **68.4%**, Array **49.1%**, String **30.9%** |
 
 **What happened:** M31a–c delivered real UTF-16 + RegExp Unicode surface, then the first full rescore exposed a **property-key regression**: many paths still treated keys as C strings (`GetByte`/`StringLength`) while JS string keys are UTF-16. That hammered **class**, **Object.defineProperty/create**, and `verifyProperty` / function `name`/`length` mass.
 

@@ -181,9 +181,9 @@ python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<
 
 | Built-in | Full M31c | Post-M32 slice | Bar |
 |----------|----------:|---------------:|-----|
-| **Object** | 36.5% | **53.7%** (defineProperty **55.1%**) | **≥80%** |
-| **Array** | 43.4% | **47.5%** | **≥80%** |
-| **String** | 27.5% | **30.7%** | **≥80%** |
+| **Object** | 36.5% | **61.1%** (defineProperty **68.4%**) | **≥80%** |
+| **Array** | 43.4% | **49.1%** | **≥80%** |
+| **String** | 27.5% | **30.9%** | **≥80%** |
 | Function | 27.5% | — | support attrs |
 | Promise | 22.5% | — | after OA/S |
 | RegExp | 27.8% | ~27.7% | after OA/S |
