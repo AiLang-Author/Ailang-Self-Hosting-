@@ -1,6 +1,6 @@
 # JS Engine — Dependency Plan
 
-**Updated:** 2026-07-16  
+**Updated:** 2026-07-17  
 **Goal:** Browser-usable JS: language mass + **core built-ins** honesty. Full test262 100% is multi-phase; see **`BROWSER_CONFORMANCE.md`**.
 
 | Rule | |
@@ -107,21 +107,32 @@ Attack **fail volume × foundational** first. Class/modules/async sit on top of 
 - **Language:** 16278/24744 (**65.8%**) — up from ~59.9% post-M20e.
 - **Built-ins:** 2804/23770 (**11.8%**) — core libs partial; desert is Temporal/TA/collections.
 
-#### Active tirage (2026-07-16) — next few days 1→5
+#### Active tirage (2026-07-17) — RegExp / Unicode dependency ROI
 
-Class private residual (M26k.8–k.11) **largely landed** for this phase (elements ~75%). Pivot is **core built-ins honesty** for the browser.
+Browser track Array→String→Promise→RegExp **surface landed** (M29–M30). Living detail: **`BROWSER_CONFORMANCE.md` §3**.
 
-| # | Target | Why | Gate / notes |
-|---|--------|-----|--------------|
-| **1** | **Array holes + reduce/map/filter/forEach** | Highest Array residual; M29h started | Array **≥55%** (from ~49%) |
-| **2** | **String.prototype depth** | Surface exists; edges unlock volume | String **≥35–45%** (from ~22%) |
-| **3** | **Promise + async enough for pages** | Browser UX path | Promise **≥25–35%**; fewer async flakes |
-| **4** | **RegExp usable** (skip property-escapes) | Forms / validation | Climb non-escape tests; defer Unicode props |
-| **5** | **Defer** Temporal / TypedArray / Map/Set/Proxy | Desert greenfield | Last-round only; optional exclude Temporal from browser % |
+| Pri | Target | Why | Gate / notes |
+|-----|--------|-----|--------------|
+| **P0** | **UTF-16 / code-unit strings** + `codePointAt` | Unblocks real `u`/`v` and property-escapes matching | `fromCodePoint(0x1F98A).length===2`; regex walks code units |
+| **P1a** | **Reverse lookbehind** (dir −1) | Finish lookBehind without Unicode | lookBehind **≥15/17** |
+| **P1b** | **Duplicate named groups** | named-groups residual | named-groups **≥28/39** |
+| **P2** | **`\p`/`\P` BMP subset** | ~450 property-escapes desert | After **P0**; start ASCII + GC L/N |
+| **P3** | **unicodeSets (`v`)** | ~114 after `\p` | After P0+P2 |
+| **Defer** | Full UCD, Temporal, TypedArray, Map/Set, modifiers scrape | Desert / low product ROI | Last-round |
 
-**Supporting / residual:** Object defineProperty + gOPD polish; class async-private / brand edges when they block a page script.
+```
+P0 UTF-16 ──► P2 \p BMP ──► P3 unicodeSets
+P1a reverse lookbehind  } parallel now
+P1b duplicate names     }
+```
 
-**Done recently (do not re-open as primary):** M26k private/yield*/brand; M27 Object.create/defineProperty/gOPN/gOPDescs/isFrozen; M29e Array length gOPD; M29h Array.of/copyWithin/findLast.
+**Do not** grind property-escape *matching* before P0 (grammar-only passes are false ROI).
+
+**RegExp score (slice):** **652 / 1879 (34.7%)** post M30j — lookBehind **13/17**, named-groups **21/36**; left-first `\|`; reverse-ish lookbehind (shortest for top-level alt); multi-name `\k`; fromCodePoint (UTF-8 still).
+
+**Supporting / residual:** String depth; Promise edges; Object defineProperty polish.
+
+**Done recently (do not re-open as primary):** M26k private/yield*/brand; M27 Object; M29 Array holes/methods; M30a–b String/Promise; **M30c–i RegExp**.
 
 **Also in queue (after / interleaved when unblocking):** M23 eval-code; M27 modules/dynamic-import; M25 for-of residual; M28 for-await-of mass.
 

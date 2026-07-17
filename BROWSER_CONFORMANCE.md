@@ -1,6 +1,6 @@
 # Browser JS Conformance — Living Scoreboard
 
-**Updated:** 2026-07-16  
+**Updated:** 2026-07-17  
 **Branch:** `gpu-45-may-baseline-restore`  
 **Audience:** grind sessions + product planning for the embedded browser
 
@@ -65,12 +65,14 @@ Optional score hygiene: report **full-suite excluding Temporal** (~45.5k tests) 
 | expressions/class | ~3099 / 4059 | ~76% |
 | Object | 1837 / 3411 | 53.9% |
 | Array | 1502–1504 / 3081 | ~49% |
-| String | ~294 / 1334 | ~22% |
-| Promise | ~110 / 677 | ~16% |
+| String | ~294 / 1334 | ~22% (pre–M30a; surface later) |
+| Promise | ~110 / 677 | ~16% (pre–M30b; surface later) |
+| **RegExp** (built-ins slice) | **652 / 1879** | **34.7%** (M30j; `/tmp/test262_regexp_m30j.json`) |
 | Temporal | 60 / 4588 | 1.3% |
 | TypedArray / Map / Set / Proxy | ~0 | 0% |
 
-JSON: `/tmp/test262_full_m29h.json` (also mirror under `results/` when re-baselined).
+JSON: `/tmp/test262_full_m29h.json` (also mirror under `results/` when re-baselined).  
+RegExp slice: `/tmp/test262_regexp_m30i4.json` (post M30i2).
 
 ### Recent moles (this arc)
 
@@ -80,21 +82,61 @@ JSON: `/tmp/test262_full_m29h.json` (also mirror under `results/` when re-baseli
 | M27a | Large Number ToString; defineProperty ToPropertyDescriptor |
 | M27b | Object.create(props); attr defaults; isFrozen/isSealed |
 | M27c / M27c2 | getOwnPropertyNames / getOwnPropertyDescriptors |
-| M29h | Array.of, copyWithin, findLast*, primitive array-like ToObject |
+| M29h–i | Array.of, copyWithin, findLast*, holes/array-like |
+| M30a–b | String ToString + Promise all/race/allSettled/any/finally |
+| M30c–i | RegExp: lastIndex, greedy, escapes, flags, backrefs, lookahead/behind, sticky, Symbol.*, named groups, `$`/fn replace, left-first `\|`, fromCodePoint |
 
 ---
 
-## 3. Next few days (ordered — agreed 1→5)
+## 3. Active plan (dependency-aware ROI) — 2026-07-17
 
-| # | Work | Why | Success signal |
-|---|------|-----|----------------|
-| **1** | **Array holes + reduce/map/filter/forEach** | Highest residual fail mass in Array; already warm | Array **≥55%** |
-| **2** | **String.prototype depth** | Surface exists; edges unlock volume | String **≥35–45%** |
-| **3** | **Promise + async enough for real scripts** | Browser UX path | Promise **≥25–35%**; fewer async flakes |
-| **4** | **RegExp usable (not property-escapes)** | Forms / validation | Non-escape RegExp climb; defer Unicode props |
-| **5** | **Defer** Temporal, TypedArray, Map/Set/Proxy unless a concrete page needs them | Desert greenfield | Stay out of tirage until core solid |
+Browser track **1→4 largely in flight / landed** for Array→String→Promise→RegExp surface.  
+**RegExp is no longer “defer Unicode forever”** — property-escapes are the remaining desert, but they **depend on string code units**.
 
-Supporting: Object defineProperty residual + gOPD polish when unblocking Array/String.
+### 3.1 Dependency DAG (RegExp / Unicode)
+
+```
+[P0] UTF-16 / code-point string ops          ← highest leverage prerequisite
+        │
+        ├─► [P2] \p/\P BMP subset            ──► [P3] unicodeSets (v)
+        │
+        └─► (optional) ID_Start tables       ──► exotic group-name SyntaxError
+
+[P1a] Reverse lookbehind matcher             } parallel NOW (no Unicode wait)
+[P1b] Duplicate named groups (ES2025)        }
+[P1c] RegExp residual polish                 } modifiers only if scraping %
+```
+
+### 3.2 Ranked next work
+
+| Pri | Work | Unlocks | Depends on | Success signal |
+|-----|------|---------|------------|----------------|
+| **P0** | **UTF-16 code-unit strings** (or dual rep) + `codePointAt` / for-of / regex cursor | real `u`/`v`, property-escapes mass, CCE unicode | nothing | `String.fromCodePoint(0x1F98A).length === 2`; regex sees code units not UTF-8 bytes |
+| **P1a** | **Reverse lookbehind** (direction −1) | lookBehind residual (~5), cleaner alts/backrefs | current NFA | lookBehind **≥15/17**; `captures.js` / alts / backrefs green |
+| **P1b** | **Duplicate named groups** | `duplicate-names-*` (~10) | left-first alts (done) | named-groups **≥28/39** |
+| **P2** | **`\p{…}` / `\P{…}` BMP subset** (`ASCII`, GC L/N/P/Z, …) | property-escapes first real matching wins | **P0** | property-escapes climb; generated `ASCII` / GC samples pass |
+| **P3** | **unicodeSets (`v`)** set algebra | ~114 unicodeSets | P0+P2 | unicodeSets **≥40%** |
+| **P4** | ID tables for group names; modifiers/syntax-err | polish named + flags desert | light UCD | optional scrape |
+| **Defer** | Full UCD, Temporal, TypedArray, Map/Set | desert / multi-phase | — | stay out until P0–P2 solid |
+
+### 3.3 Practical sequence (“next week”)
+
+1. **P1a + P1b in parallel** (immediate RegExp %) while designing **P0**.  
+2. **P0** land (smallest honest UTF-16: store UCS-2/UTF-16LE, `length` = code units, GetByte→GetCodeUnit).  
+3. **P2** `\p{ASCII}` + GC letters/digits BMP → expand.  
+4. **P3** only after `\p` pays.  
+5. **Do not** pour into property-escapes matching before P0 — grammar-only passes are false ROI.
+
+### 3.4 Earlier browser track (status)
+
+| # | Work | Status |
+|---|------|--------|
+| 1 Array holes / methods | largely done M29i |
+| 2 String depth | partial M30a; more remains |
+| 3 Promise / async | partial M30b |
+| 4 RegExp usable | **M30c–i at 34.6% slice**; Unicode path is next phase |
+
+Supporting: Object defineProperty residual + gOPD polish when unblocking.
 
 ---
 

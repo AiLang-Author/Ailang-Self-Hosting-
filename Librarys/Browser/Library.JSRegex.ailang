@@ -88,6 +88,7 @@ FixedPool.JSRxMatch {
     "thread_size": Initialize=0
     "flags": Initialize=0
     "cur_states": Initialize=0
+    "cur_regex": Initialize=0
 }
 
 // Ring-buffer slot pools for parser AST nodes
@@ -536,6 +537,7 @@ Function.JSRegex_Match {
         capture_count = Dereference(Add(regex, 24))
         JSRxMatch.flags = Dereference(Add(regex, 32))
         JSRxMatch.cur_states = states
+        JSRxMatch.cur_regex = regex
 
         JSRxMatch.text = text
         JSRxMatch.text_len = StringLength(text)
@@ -1171,9 +1173,18 @@ Function.JSRx_ParseAtom {
                     }
                     nlen = Subtract(JSRxCompiler.pos, ns)
                     JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                    // M30j: named backref — data2=1 marks multi-name (duplicate groups)
+                    // data1 = first gnum; at match time scan all groups with same name
                     gnum = JSRx_LookupName(Add(JSRxCompiler.pattern, ns), nlen)
-                    // unknown name → empty-match backref (gnum 0 treated as empty)
-                    state = JSRx_AddState(JSRxStateType.BACKREF, gnum, 0)
+                    // Store name start/len in a small side table index via data2 high bit?
+                    // Use BACKREF gnum with data2 = name table scan key: 0 = single, >0 = name_idx+1
+                    // Simpler: always multi-scan by name string at match if we keep name on state.
+                    // data1 = packed: store first gnum; data2 = nlen; name bytes copied to class pool
+                    // Even simpler: data2=2 means "named multi"; name ptr in a parallel compile-time
+                    // For now: data1=gnum (first), data2=1 → try all gnums sharing name of gnum
+                    nm_flag = 0
+                    IfCondition GreaterThan(gnum, 0) ThenBlock: { nm_flag = 1 }
+                    state = JSRx_AddState(JSRxStateType.BACKREF, gnum, nm_flag)
                     frag = JSRx_FragAlloc()
                     IfCondition NotEqual(frag, 0) ThenBlock: {
                         StoreValue(frag, state)
@@ -2247,50 +2258,153 @@ Function.JSRx_ProcessState {
             ReturnValue(0)
         }
 
-        // M30f: backreference \n — match previously captured text
-        // M30f: backreference \n
+        // M30f/j: backreference \n or \k<name> (data2=1 → all groups sharing that name)
         IfCondition EqualTo(type, JSRxStateType.BACKREF) ThenBlock: {
             gnum = data1
-            cs = -1
-            ce = -1
-            IfCondition And(NotEqual(JSRxMatch.captures, 0), GreaterThan(gnum, 0)) ThenBlock: {
-                slot = Multiply(Subtract(gnum, 1), 2)
-                IfCondition LessThan(slot, 64) ThenBlock: {
-                    cs = Dereference(Add(JSRxMatch.captures, Multiply(slot, 8)))
-                    ce = Dereference(Add(JSRxMatch.captures, Multiply(Add(slot, 1), 8)))
+            multi = data2
+            tried = 0
+            any_defined = 0
+            // Resolve candidate gnums: primary, or all with same name when multi
+            // Use a small fixed list of up to 8 candidates on the stack via loop
+            ni = 0
+            nmax = 1
+            // If multi + regex has name table, collect all gnums with same name as gnum
+            IfCondition And(EqualTo(multi, 1), NotEqual(JSRxMatch.cur_regex, 0)) ThenBlock: {
+                // find name string for gnum
+                n_name = 0
+                nc = JSRegex_NameCount(JSRxMatch.cur_regex)
+                ii = 0
+                WhileLoop LessThan(ii, nc) {
+                    IfCondition EqualTo(JSRegex_NameGnum(JSRxMatch.cur_regex, ii), gnum) ThenBlock: {
+                        n_name = JSRegex_NameAt(JSRxMatch.cur_regex, ii)
+                        ii = nc
+                    }
+                    ii = Add(ii, 1)
                 }
-            }
-            IfCondition Or(LessThan(cs, 0), LessThan(ce, cs)) ThenBlock: {
-                JSRx_AddThread(out1, tpos, thread)
-                ReturnValue(0)
-            }
-            clen = Subtract(ce, cs)
-            IfCondition GreaterThan(Add(tpos, clen), JSRxMatch.text_len) ThenBlock: {
-                ReturnValue(0)
-            }
-            ok_br = 1
-            bi = 0
-            WhileLoop LessThan(bi, clen) {
-                c1 = GetByte(JSRxMatch.text, Add(cs, bi))
-                c2 = GetByte(JSRxMatch.text, Add(tpos, bi))
-                IfCondition NotEqual(c1, c2) ThenBlock: {
-                    ok_br = 0
-                    IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.CASE_INSENSITIVE), JSRxFlags.CASE_INSENSITIVE) ThenBlock: {
-                        IfCondition EqualTo(JSRx_ToLower(c1), JSRx_ToLower(c2)) ThenBlock: {
-                            ok_br = 1
+                IfCondition NotEqual(n_name, 0) ThenBlock: {
+                    // count same-name entries → try each (reuse loop below over table)
+                    nmax = 0
+                    // we'll iterate name table directly instead of gnum list
+                    ii = 0
+                    WhileLoop LessThan(ii, nc) {
+                        np = JSRegex_NameAt(JSRxMatch.cur_regex, ii)
+                        // strcmp name
+                        same = 1
+                        IfCondition EqualTo(np, 0) ThenBlock: { same = 0 }
+                        IfCondition EqualTo(same, 1) ThenBlock: {
+                            ci = 0
+                            WhileLoop 1 {
+                                a = GetByte(n_name, ci)
+                                b = GetByte(np, ci)
+                                IfCondition NotEqual(a, b) ThenBlock: {
+                                    same = 0
+                                    BreakLoop
+                                }
+                                IfCondition EqualTo(a, 0) ThenBlock: {
+                                    BreakLoop
+                                }
+                                ci = Add(ci, 1)
+                                IfCondition GreaterThan(ci, 256) ThenBlock: { BreakLoop }
+                            }
                         }
+                        IfCondition EqualTo(same, 1) ThenBlock: {
+                            gn = JSRegex_NameGnum(JSRxMatch.cur_regex, ii)
+                            cs = -1
+                            ce = -1
+                            IfCondition And(NotEqual(JSRxMatch.captures, 0), GreaterThan(gn, 0)) ThenBlock: {
+                                slot = Multiply(Subtract(gn, 1), 2)
+                                IfCondition LessThan(slot, 64) ThenBlock: {
+                                    cs = Dereference(Add(JSRxMatch.captures, Multiply(slot, 8)))
+                                    ce = Dereference(Add(JSRxMatch.captures, Multiply(Add(slot, 1), 8)))
+                                }
+                            }
+                            IfCondition And(GreaterEqual(cs, 0), GreaterEqual(ce, cs)) ThenBlock: {
+                                any_defined = 1
+                                clen = Subtract(ce, cs)
+                                IfCondition LessEqual(Add(tpos, clen), JSRxMatch.text_len) ThenBlock: {
+                                    ok_br = 1
+                                    bi = 0
+                                    WhileLoop LessThan(bi, clen) {
+                                        c1 = GetByte(JSRxMatch.text, Add(cs, bi))
+                                        c2 = GetByte(JSRxMatch.text, Add(tpos, bi))
+                                        IfCondition NotEqual(c1, c2) ThenBlock: {
+                                            ok_br = 0
+                                            IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.CASE_INSENSITIVE), JSRxFlags.CASE_INSENSITIVE) ThenBlock: {
+                                                IfCondition EqualTo(JSRx_ToLower(c1), JSRx_ToLower(c2)) ThenBlock: {
+                                                    ok_br = 1
+                                                }
+                                            }
+                                            IfCondition EqualTo(ok_br, 0) ThenBlock: { bi = clen }
+                                        }
+                                        bi = Add(bi, 1)
+                                    }
+                                    IfCondition EqualTo(ok_br, 1) ThenBlock: {
+                                        IfCondition EqualTo(clen, 0) ThenBlock: {
+                                            JSRx_AddThread(out1, tpos, thread)
+                                        } ElseBlock: {
+                                            JSRx_AddNextThread(out1, Add(tpos, clen), thread)
+                                        }
+                                        tried = 1
+                                        ii = nc
+                                    }
+                                }
+                            }
+                        }
+                        ii = Add(ii, 1)
                     }
-                    IfCondition EqualTo(ok_br, 0) ThenBlock: {
-                        bi = clen
+                } ElseBlock: {
+                    multi = 0
+                }
+            }
+            IfCondition EqualTo(multi, 0) ThenBlock: {
+                // classic \n single group
+                cs = -1
+                ce = -1
+                IfCondition And(NotEqual(JSRxMatch.captures, 0), GreaterThan(gnum, 0)) ThenBlock: {
+                    slot = Multiply(Subtract(gnum, 1), 2)
+                    IfCondition LessThan(slot, 64) ThenBlock: {
+                        cs = Dereference(Add(JSRxMatch.captures, Multiply(slot, 8)))
+                        ce = Dereference(Add(JSRxMatch.captures, Multiply(Add(slot, 1), 8)))
                     }
                 }
-                bi = Add(bi, 1)
-            }
-            IfCondition EqualTo(ok_br, 1) ThenBlock: {
-                IfCondition EqualTo(clen, 0) ThenBlock: {
+                IfCondition Or(LessThan(cs, 0), LessThan(ce, cs)) ThenBlock: {
                     JSRx_AddThread(out1, tpos, thread)
-                } ElseBlock: {
-                    JSRx_AddNextThread(out1, Add(tpos, clen), thread)
+                    ReturnValue(0)
+                }
+                any_defined = 1
+                clen = Subtract(ce, cs)
+                IfCondition GreaterThan(Add(tpos, clen), JSRxMatch.text_len) ThenBlock: {
+                    ReturnValue(0)
+                }
+                ok_br = 1
+                bi = 0
+                WhileLoop LessThan(bi, clen) {
+                    c1 = GetByte(JSRxMatch.text, Add(cs, bi))
+                    c2 = GetByte(JSRxMatch.text, Add(tpos, bi))
+                    IfCondition NotEqual(c1, c2) ThenBlock: {
+                        ok_br = 0
+                        IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.CASE_INSENSITIVE), JSRxFlags.CASE_INSENSITIVE) ThenBlock: {
+                            IfCondition EqualTo(JSRx_ToLower(c1), JSRx_ToLower(c2)) ThenBlock: {
+                                ok_br = 1
+                            }
+                        }
+                        IfCondition EqualTo(ok_br, 0) ThenBlock: { bi = clen }
+                    }
+                    bi = Add(bi, 1)
+                }
+                IfCondition EqualTo(ok_br, 1) ThenBlock: {
+                    IfCondition EqualTo(clen, 0) ThenBlock: {
+                        JSRx_AddThread(out1, tpos, thread)
+                    } ElseBlock: {
+                        JSRx_AddNextThread(out1, Add(tpos, clen), thread)
+                    }
+                    tried = 1
+                }
+            }
+            // unmatched named multi with no defined slots → empty success
+            IfCondition And(EqualTo(tried, 0), EqualTo(any_defined, 0)) ThenBlock: {
+                IfCondition EqualTo(multi, 1) ThenBlock: {
+                    JSRx_AddThread(out1, tpos, thread)
                 }
             }
             ReturnValue(0)
@@ -2503,12 +2617,14 @@ Function.JSRx_TryLookahead {
 
 // Lookbehind: sub-NFA must match some [start, end_pos) ending exactly at end_pos
 // Captures from a successful sub-match are kept (groups inside (?<=...)).
+// M30j: start selection approximates ES reverse matching:
+//   - top-level | alternation (SPLIT data2=1): shortest success (LTR reverse alts)
+//   - else: longest success (reverse-greedy quantifiers)
 Function.JSRx_TryLookbehind {
     Input: sub_start: Integer
     Input: end_pos: Integer
     Output: Integer
     Body: {
-        // Snapshot parent captures; each start attempt restores before trying
         save_caps = 0
         IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
             save_caps = Allocate(512)
@@ -2516,9 +2632,40 @@ Function.JSRx_TryLookbehind {
                 MemoryCopy(save_caps, JSRxMatch.captures, 512)
             }
         }
-        // Longest-first (s=0..end): ES reverse greedy quantifiers prefer longer
-        // lookbehind spans. (Alternation LTR reverse still incomplete.)
+        // Prefer shortest (max s) when lookbehind body reaches a | alternation
+        // within a few epsilon/SAVE hops (covers (?<=(..|...)) wrapped in captures).
+        prefer_short = 0
+        states = JSRxMatch.cur_states
+        IfCondition EqualTo(states, 0) ThenBlock: { states = JSRxState.states }
+        IfCondition NotEqual(states, 0) ThenBlock: {
+            scan_id = sub_start
+            hops = 0
+            WhileLoop And(LessThan(hops, 8), GreaterEqual(scan_id, 0)) {
+                st_ty = JSRx_GetStateType(states, scan_id)
+                st_base = Add(states, Multiply(scan_id, JSRxConstants.STATE_SIZE))
+                IfCondition EqualTo(st_ty, JSRxStateType.SPLIT) ThenBlock: {
+                    IfCondition EqualTo(Dereference(Add(st_base, 16)), 1) ThenBlock: {
+                        prefer_short = 1
+                        hops = 8
+                    } ElseBlock: {
+                        hops = 8
+                    }
+                } ElseBlock: {
+                    // follow single out1 for SAVE/EMPTY/MATCH skip
+                    IfCondition Or(EqualTo(st_ty, JSRxStateType.SAVE), EqualTo(st_ty, JSRxStateType.EMPTY)) ThenBlock: {
+                        scan_id = Dereference(Add(st_base, 24))
+                        hops = Add(hops, 1)
+                    } ElseBlock: {
+                        hops = 8
+                    }
+                }
+            }
+        }
         best_s = -1
+        best_cap_snap = 0
+        IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+            best_cap_snap = Allocate(512)
+        }
         s = 0
         WhileLoop LessEqual(s, end_pos) {
             IfCondition And(NotEqual(save_caps, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
@@ -2526,9 +2673,31 @@ Function.JSRx_TryLookbehind {
             }
             ok = JSRx_TryMatchEndsAt(sub_start, s, end_pos)
             IfCondition EqualTo(ok, 1) ThenBlock: {
-                best_s = s
-                // leave captures; first success = longest span
-                s = Add(end_pos, 1)
+                take = 0
+                IfCondition EqualTo(best_s, -1) ThenBlock: {
+                    take = 1
+                } ElseBlock: {
+                    IfCondition EqualTo(prefer_short, 1) ThenBlock: {
+                        // prefer larger s (shorter span)
+                        IfCondition GreaterThan(s, best_s) ThenBlock: { take = 1 }
+                    } ElseBlock: {
+                        // prefer smaller s (longer span) — first success is already longest
+                        // keep first (longest) only
+                        take = 0
+                    }
+                }
+                IfCondition EqualTo(take, 1) ThenBlock: {
+                    best_s = s
+                    IfCondition And(NotEqual(best_cap_snap, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                        MemoryCopy(best_cap_snap, JSRxMatch.captures, 512)
+                    }
+                }
+                // longest mode: stop at first success (s walks 0..end)
+                IfCondition EqualTo(prefer_short, 0) ThenBlock: {
+                    s = Add(end_pos, 1)
+                } ElseBlock: {
+                    s = Add(s, 1)
+                }
             } ElseBlock: {
                 s = Add(s, 1)
             }
@@ -2536,42 +2705,46 @@ Function.JSRx_TryLookbehind {
         IfCondition LessThan(best_s, 0) ThenBlock: {
             IfCondition And(NotEqual(save_caps, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
                 MemoryCopy(JSRxMatch.captures, save_caps, 512)
-                Deallocate(save_caps, 512)
             }
+            IfCondition NotEqual(save_caps, 0) ThenBlock: { Deallocate(save_caps, 512) }
+            IfCondition NotEqual(best_cap_snap, 0) ThenBlock: { Deallocate(best_cap_snap, 512) }
             ReturnValue(0)
         }
-        // M30i: reverse-direction capture for quantified single-char groups.
-        // Forward `(\w){3}` leaves last iter; reverse leaves first char of span.
-        // Only when exactly one capture group is set, length 1, at end of lb span.
-        IfCondition And(NotEqual(JSRxMatch.captures, 0), GreaterThan(Subtract(end_pos, best_s), 1)) ThenBlock: {
-            set_count = 0
-            only_gi = -1
-            only_cs = -1
-            only_ce = -1
-            gi = 0
-            WhileLoop LessThan(gi, 32) {
-                cs = Dereference(Add(JSRxMatch.captures, Multiply(Multiply(gi, 2), 8)))
-                ce = Dereference(Add(JSRxMatch.captures, Multiply(Add(Multiply(gi, 2), 1), 8)))
-                IfCondition And(GreaterEqual(cs, 0), GreaterEqual(ce, cs)) ThenBlock: {
-                    set_count = Add(set_count, 1)
-                    only_gi = gi
-                    only_cs = cs
-                    only_ce = ce
+        // restore winning captures
+        IfCondition And(NotEqual(best_cap_snap, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+            MemoryCopy(JSRxMatch.captures, best_cap_snap, 512)
+        }
+        // reverse-direction capture for quantified single-char groups (non-alt)
+        IfCondition EqualTo(prefer_short, 0) ThenBlock: {
+            IfCondition And(NotEqual(JSRxMatch.captures, 0), GreaterThan(Subtract(end_pos, best_s), 1)) ThenBlock: {
+                set_count = 0
+                only_gi = -1
+                only_cs = -1
+                only_ce = -1
+                gi = 0
+                WhileLoop LessThan(gi, 32) {
+                    cs = Dereference(Add(JSRxMatch.captures, Multiply(Multiply(gi, 2), 8)))
+                    ce = Dereference(Add(JSRxMatch.captures, Multiply(Add(Multiply(gi, 2), 1), 8)))
+                    IfCondition And(GreaterEqual(cs, 0), GreaterEqual(ce, cs)) ThenBlock: {
+                        set_count = Add(set_count, 1)
+                        only_gi = gi
+                        only_cs = cs
+                        only_ce = ce
+                    }
+                    gi = Add(gi, 1)
                 }
-                gi = Add(gi, 1)
-            }
-            IfCondition EqualTo(set_count, 1) ThenBlock: {
-                IfCondition EqualTo(Subtract(only_ce, only_cs), 1) ThenBlock: {
-                    IfCondition EqualTo(only_cs, Subtract(end_pos, 1)) ThenBlock: {
-                        StoreValue(Add(JSRxMatch.captures, Multiply(Multiply(only_gi, 2), 8)), best_s)
-                        StoreValue(Add(JSRxMatch.captures, Multiply(Add(Multiply(only_gi, 2), 1), 8)), Add(best_s, 1))
+                IfCondition EqualTo(set_count, 1) ThenBlock: {
+                    IfCondition EqualTo(Subtract(only_ce, only_cs), 1) ThenBlock: {
+                        IfCondition EqualTo(only_cs, Subtract(end_pos, 1)) ThenBlock: {
+                            StoreValue(Add(JSRxMatch.captures, Multiply(Multiply(only_gi, 2), 8)), best_s)
+                            StoreValue(Add(JSRxMatch.captures, Multiply(Add(Multiply(only_gi, 2), 1), 8)), Add(best_s, 1))
+                        }
                     }
                 }
             }
         }
-        IfCondition NotEqual(save_caps, 0) ThenBlock: {
-            Deallocate(save_caps, 512)
-        }
+        IfCondition NotEqual(save_caps, 0) ThenBlock: { Deallocate(save_caps, 512) }
+        IfCondition NotEqual(best_cap_snap, 0) ThenBlock: { Deallocate(best_cap_snap, 512) }
         ReturnValue(1)
     }
 }
