@@ -1,8 +1,8 @@
 # Browser JS Conformance — Living Scoreboard
 
-**Updated:** 2026-07-18 (M39)  
+**Updated:** 2026-07-18 (M41)  
 **Branch:** `gpu-45-may-baseline-restore`  
-**Handoff:** [`results/JS_HANDOFF_M39.md`](./results/JS_HANDOFF_M39.md)  
+**Handoff:** [`results/JS_HANDOFF_M41.md`](./results/JS_HANDOFF_M41.md)  
 **Plan:** [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md)
 
 ---
@@ -16,7 +16,7 @@
 | **Full suite 2026-07-18 M37** | **22800 / 49998 (45.6%)** | **new high** · `results/FULL_SUITE_M37.md` |
 | language (full M37) | **67.7%** | was 60.4% M31c |
 | built-ins (full M37) | **25.5%** | Temporal desert still dominates |
-| **Object / Array / String M39 slices** | **69.5% / 57.7% / 54.3%** | product bar 80% each |
+| **Object / Array / String M41 slices** | **70.6% / 59.1% / 54.5%** | product bar 80% each |
 
 **Long goal:** ~**95%** usable JS engine for embedded browser.  
 **Near-term product gate:** Object + Array + String each **≥80%**.
@@ -40,9 +40,9 @@
 
 | Track | Now (M39) | Product bar | Long |
 |-------|----------:|------------:|-----:|
-| **Object** | **69.5%** | **≥80%** | ≥90% |
-| **Array** | **57.7%** | **≥80%** | ≥90% |
-| **String** | **54.3%** | **≥80%** | ≥90% |
+| **Object** | **70.6%** | **≥80%** | ≥90% |
+| **Array** | **59.1%** | **≥80%** | ≥90% |
+| **String** | **54.5%** | **≥80%** | ≥90% |
 | **Language** | 67.7% full | ≥80% | ≥90% |
 | **Full suite** | **45.6%** | ≥50% mid | **~95%** |
 
