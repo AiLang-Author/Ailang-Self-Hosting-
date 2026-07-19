@@ -54,3 +54,26 @@ python3 tools/test262_runner.py --paths 'built-ins/Object,built-ins/Array,built-
 ```
 
 Prefer int. No Temporal/TA/fromAsync.
+
+---
+
+## Language pivot (post full M47)
+
+**Why full needle barely moves:** 1pp full ≈ 500 tests. M37→M47 was +174 (~0.35pp) while OA/S climbed; **language lost ~591** (net −740 regressed / +149 fixed).
+
+**Language M47:** 65.2% (15581/23899). Biggest residual:
+
+| Area | Pass% | Fails | Notes |
+|------|------:|------:|-------|
+| class (stmt+expr) | ~71% | ~2450 | **fn-name dstr** was ~492 of M37→M47 regressions |
+| for-await-of | 45% | 682 | async desert |
+| dynamic-import | 41% | 584 | module desert |
+| async-generator | 33% | 418 | async desert |
+| object expr | 68% | 375 | next after names |
+| for-of | 71% | 217 | iterable |
+| eval-code | 17–22% | ~270 | lower ROI |
+| arguments-object | 45% | 144 | solid ROI |
+
+**M48:** SetFunctionName path fixed (function.name define). Expect large class/dstr reclaim on next language slice / full.
+
+**Plan:** language first (names → object → for-of → arguments) → built-ins second → deserts last. Gate remains **OA/S 90% each** + language climb toward 90%.
