@@ -1,7 +1,7 @@
 # JS Engine — Dependency Plan
 
-**Updated:** 2026-07-18 (M43)  
-**New session:** start at [`results/JS_HANDOFF_M43.md`](./results/JS_HANDOFF_M43.md).
+**Updated:** 2026-07-19 (M44)  
+**New session:** start at [`results/JS_HANDOFF_M44.md`](./results/JS_HANDOFF_M44.md).
 
 **Goal:** Browser-usable JS → long **~95%** full suite.  
 **Product gate (near-term):** **Object, Array, and String each ≥80%** on test262 trees.
@@ -29,9 +29,9 @@
 | **full (M37 harness)** | **22800 / 49998 (45.6%)** | `results/test262_full_m37.json` · wall ~33 min |
 | language (full M37) | **67.7%** | was 60.4% M31c |
 | built-ins (full M37) | **25.5%** | was 17.4% · Temporal still desert |
-| **Object slice M43** | **2447 / 3411 (72.0%)** | need ~**+280** → 80% |
-| **Array slice M43** | **1949 / 3081 (63.8%)** | need ~**+516** |
-| **String slice M43** | **745 / 1223 (61.0%)** | need ~**+233** |
+| **Object slice M44** | **2462 / 3411 (72.4%)** | need ~**+267** → 80% |
+| **Array slice M44** | **1955 / 3081 (64.0%)** | need ~**+510** |
+| **String slice M44** | **749 / 1223 (61.3%)** | need ~**+229** |
 
 **Living scoreboard:** [`BROWSER_CONFORMANCE.md`](./BROWSER_CONFORMANCE.md)
 
