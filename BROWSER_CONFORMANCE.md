@@ -13,9 +13,10 @@
 |---------|------:|---------|
 | Full suite 2026-07-16 M29h **peak** | **21783 / 49998 (43.6%)** | pre–UTF-16 key regression |
 | Full suite 2026-07-17 M31c | **19129 / 49998 (38.3%)** | UTF-16/`\p` + key regressions |
-| **Full suite 2026-07-18 M37** | **22800 / 49998 (45.6%)** | **new high** · `results/FULL_SUITE_M37.md` |
-| language (full M37) | **67.7%** | was 60.4% M31c |
-| built-ins (full M37) | **25.5%** | Temporal desert still dominates |
+| Full suite 2026-07-18 M37 | 22800 / 49998 (45.6%) | prior high |
+| **Full suite 2026-07-19 M47** | **22974 / 49998 (46.1%)** | **new high** · `results/FULL_SUITE_M47.md` |
+| language (full M47) | **65.2%** | was 67.7% M37 (net still up full) |
+| built-ins (full M47) | **28.8%** | was 25.5% M37 · Temporal desert still dominates |
 | **Object / Array / String M47 slices** | **72.5% / 68.2% / 62.2%** | product bar **90% each** |
 
 **Long goal:** ~**95%** usable JS engine for embedded browser.  
@@ -43,23 +44,23 @@
 | **Object** | **72.5%** | **≥90%** | ≥95% |
 | **Array** | **68.2%** | **≥90%** | ≥95% |
 | **String** | **62.2%** | **≥90%** | ≥95% |
-| **Language** | 67.7% full | ≥90% | ≥95% |
-| **Full suite** | **45.6%** | ≥60% mid | **~95%** |
+| **Language** | 65.2% full | ≥90% | ≥95% |
+| **Full suite** | **46.1%** | ≥60% mid | **~95%** |
 
 ---
 
 ## 2. Latest scoreboard
 
-### 2.1 Full suite M37 (authoritative high-water)
+### 2.1 Full suite M47 (authoritative high-water)
 
-| Scope | Pass / Total | % | vs M31c | vs M29h |
-|-------|-------------:|--:|--------:|--------:|
-| **Full** | **22800 / 49998** | **45.6%** | **+3671** | **+1017** |
-| language | 16172 / 23899 | 67.7% | +2726 | ~flat |
-| built-ins | 6008 / 23521 | 25.5% | +1921 | up |
+| Scope | Pass / Total | % | vs M37 | vs M31c | vs M29h |
+|-------|-------------:|--:|-------:|--------:|--------:|
+| **Full** | **22974 / 49998** | **46.1%** | **+174** | **+3845** | **+1191** |
+| language | 15581 / 23899 | 65.2% | −591 | up | — |
+| built-ins | 6767 / 23521 | 28.8% | **+759** | up | up |
 
-JSON on disk: `results/test262_full_m37.json` (often gitignored) · writeup: `results/FULL_SUITE_M37.md`  
-**Note:** Full used **M37** harness; M38/M39 fixes not yet re-scored on full 50k.
+JSON: `results/test262_full_m47.json` · writeup: `results/FULL_SUITE_M47.md`  
+Includes M38–M47 harness.
 
 ### 2.2 OA/S product slices (M47)
 

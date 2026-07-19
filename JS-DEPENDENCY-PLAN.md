@@ -17,18 +17,17 @@
 
 ---
 
-## Summary (now) — 2026-07-18 post M39
+## Summary (now) — 2026-07-19 post M47 full suite
 
-> **Full suite floor (M37 harness):** **22800 / 49998 (45.6%)** — **above M29h peak 43.6%**.  
-> Writeup: [`results/FULL_SUITE_M37.md`](./results/FULL_SUITE_M37.md).  
-> M38/M39 not yet in a full rescore.
+> **Full suite high-water (M47 harness):** **22974 / 49998 (46.1%)** — **new high** (M37 was 45.6%).  
+> Writeup: [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md).
 
 | Gate | Score | Notes |
 |------|------:|-------|
-| e2e + midgate core | **PASS** | post-M39 |
-| **full (M37 harness)** | **22800 / 49998 (45.6%)** | `results/test262_full_m37.json` · wall ~33 min |
-| language (full M37) | **67.7%** | was 60.4% M31c |
-| built-ins (full M37) | **25.5%** | was 17.4% · Temporal still desert |
+| e2e + midgate core | **PASS** | post-M47 |
+| **full (M47 harness)** | **22974 / 49998 (46.1%)** | `results/test262_full_m47.json` · wall ~47 min |
+| language (full M47) | **65.2%** | was 67.7% M37 · built-ins carried net gain |
+| built-ins (full M47) | **28.8%** | was 25.5% M37 · Temporal still desert |
 | **Object slice M47** | **2464 / 3411 (72.5%)** | need ~**+606** → **90%** |
 | **Array slice M47** | **2083 / 3081 (68.2%)** | need ~**+690** → **90%** |
 | **String slice M47** | **759 / 1223 (62.2%)** | need ~**+342** → **90%** |
