@@ -1,15 +1,15 @@
 # JS Engine Handoff — M46
 
 **Branch:** `gpu-45-may-baseline-restore`  
-**Long goal:** ~**95%** usable JS. **Near-term:** OA/S each **≥80%**.
+**Long goal:** ~**95%** usable JS. **Near-term product gate:** OA/S each **≥90%** (not aggregate).
 
 ## Scores
 
-| Suite | M45 | **M46** | Δ | Need ~80% |
-|-------|----:|--------:|--:|----------:|
-| **Object** | 72.5% | **72.5%** (2464/3411) | 0 | ~265 |
-| **Array** | 65.1% | **68.1%** (2079/3081) | **+90** | ~365 |
-| **String** | 61.3% | **62.2%** (759/1223) | **+10** | ~219 |
+| Suite | M45 | **M46** | Δ | Need ~**90%** |
+|-------|----:|--------:|--:|-------------:|
+| **Object** | 72.5% | **72.5%** (2464/3411) | 0 | ~606 |
+| **Array** | 65.1% | **68.1%** (2079/3081) | **+90** | ~694 |
+| **String** | 61.3% | **62.2%** (759/1223) | **+10** | ~342 |
 
 ### Callback methods (the big lever)
 
@@ -28,7 +28,7 @@
 1. **ArrayLikeHas/Get invoke accessors** — `__get_N` via `JSBridge__MakeAccKey` + CallFunc (defineProperty getters). Unlocks mid-iteration 8-b tests and inherited accessor paths for **all** callback methods.  
 2. **String indexOf/substring/slice ToInteger** — `+Infinity` / `NaN` / ToNumber throw propagation.
 
-## Next levers toward 80%
+## Next levers toward **90% each**
 
 1. **reduce residual (~70)** — remaining 8-b edge cases, length subclass quirks  
 2. **ArraySpeciesCreate** (~species create-* fails on map/filter)  

@@ -1,8 +1,8 @@
 # Browser JS Conformance — Living Scoreboard
 
-**Updated:** 2026-07-19 (M46)  
+**Updated:** 2026-07-19 (M47)  
 **Branch:** `gpu-45-may-baseline-restore`  
-**Handoff:** [`results/JS_HANDOFF_M46.md`](./results/JS_HANDOFF_M46.md)  
+**Handoff:** [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md)  
 **Plan:** [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md)
 
 ---
@@ -16,10 +16,10 @@
 | **Full suite 2026-07-18 M37** | **22800 / 49998 (45.6%)** | **new high** · `results/FULL_SUITE_M37.md` |
 | language (full M37) | **67.7%** | was 60.4% M31c |
 | built-ins (full M37) | **25.5%** | Temporal desert still dominates |
-| **Object / Array / String M46 slices** | **72.5% / 68.1% / 62.2%** | product bar 80% each |
+| **Object / Array / String M47 slices** | **72.5% / 68.2% / 62.2%** | product bar **90% each** |
 
 **Long goal:** ~**95%** usable JS engine for embedded browser.  
-**Near-term product gate:** Object + Array + String each **≥80%**.
+**Near-term product gate:** Object + Array + String each **≥90%** (not aggregate).
 
 ---
 
@@ -38,13 +38,13 @@
 
 ### Target bars
 
-| Track | Now (M46) | Product bar | Long |
+| Track | Now (M47) | Product bar | Long |
 |-------|----------:|------------:|-----:|
-| **Object** | **72.5%** | **≥80%** | ≥90% |
-| **Array** | **68.1%** | **≥80%** | ≥90% |
-| **String** | **62.2%** | **≥80%** | ≥90% |
-| **Language** | 67.7% full | ≥80% | ≥90% |
-| **Full suite** | **45.6%** | ≥50% mid | **~95%** |
+| **Object** | **72.5%** | **≥90%** | ≥95% |
+| **Array** | **68.2%** | **≥90%** | ≥95% |
+| **String** | **62.2%** | **≥90%** | ≥95% |
+| **Language** | 67.7% full | ≥90% | ≥95% |
+| **Full suite** | **45.6%** | ≥60% mid | **~95%** |
 
 ---
 
@@ -61,25 +61,25 @@
 JSON on disk: `results/test262_full_m37.json` (often gitignored) · writeup: `results/FULL_SUITE_M37.md`  
 **Note:** Full used **M37** harness; M38/M39 fixes not yet re-scored on full 50k.
 
-### 2.2 OA/S product slices (M46)
+### 2.2 OA/S product slices (M47)
 
-| Suite | Pass / Total | % | Δ M45 | Need ~80% |
-|-------|-------------:|--:|------:|----------:|
-| **Object** | **2464 / 3411** | **72.5%** | 0 | **~+265** |
-| **Array** | **2079 / 3081** | **68.1%** | **+90** | **~+365** |
-| **String** | **759 / 1223** | **62.2%** | **+10** | **~+219** |
+| Suite | Pass / Total | % | Δ M46 | Need ~**90%** |
+|-------|-------------:|--:|------:|-------------:|
+| **Object** | **2464 / 3411** | **72.5%** | 0 | **~+606** |
+| **Array** | **2083 / 3081** | **68.2%** | **+4** | **~+690** |
+| **String** | **759 / 1223** | **62.2%** | 0 | **~+342** |
 
 ### 2.3 Recent moles
 
 | Mole | Focus |
 |------|--------|
-| **M44** | trimEnd UTF-16; reduce length-first; Date ID collision |
 | **M45** | array-like mutators; includes; Symbol.toStringTag |
-| **M46** | **ArrayLikeGet/Has invoke accessors** (map/filter/reduce leap); String ToInteger Inf/NaN |
+| **M46** | ArrayLike accessor Get/Has; String ToInteger Inf/NaN |
+| **M47** | **Product bar → 90% each**; ArraySpeciesCreate IsConstructor + species undef |
 
 ---
 
-## 3. Active plan — crush to 80% by dependency
+## 3. Active plan — crush to **90% each** by dependency
 
 ### Done (keep green)
 

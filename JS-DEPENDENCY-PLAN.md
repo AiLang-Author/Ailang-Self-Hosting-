@@ -1,10 +1,10 @@
 # JS Engine — Dependency Plan
 
-**Updated:** 2026-07-19 (M46)  
-**New session:** start at [`results/JS_HANDOFF_M46.md`](./results/JS_HANDOFF_M46.md).
+**Updated:** 2026-07-19 (M47)  
+**New session:** start at [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md).
 
 **Goal:** Browser-usable JS → long **~95%** full suite.  
-**Product gate (near-term):** **Object, Array, and String each ≥80%** on test262 trees.
+**Product gate (near-term):** **Object, Array, and String each ≥90%** on test262 trees (not aggregate).
 
 | Rule | |
 |------|--|
@@ -12,7 +12,7 @@
 | Honesty | Generators / function / call: **`--no-batch`** when needed |
 | Style | **Wrap over write** — Ailang/runtime primitives; thin JS surface |
 | Gate | Midgate green after every mole |
-| Deserts | **Skip** Temporal, TypedArray, fromAsync until core ≥80% |
+| Deserts | **Skip** Temporal, TypedArray, fromAsync until OA/S each ≥90% |
 | Score | Report **pass deltas (+N)**; full 50k only at milestones |
 
 ---
@@ -29,15 +29,15 @@
 | **full (M37 harness)** | **22800 / 49998 (45.6%)** | `results/test262_full_m37.json` · wall ~33 min |
 | language (full M37) | **67.7%** | was 60.4% M31c |
 | built-ins (full M37) | **25.5%** | was 17.4% · Temporal still desert |
-| **Object slice M46** | **2464 / 3411 (72.5%)** | need ~**+265** → 80% |
-| **Array slice M46** | **2079 / 3081 (68.1%)** | need ~**+365** |
-| **String slice M46** | **759 / 1223 (62.2%)** | need ~**+219** |
+| **Object slice M47** | **2464 / 3411 (72.5%)** | need ~**+606** → **90%** |
+| **Array slice M47** | **2083 / 3081 (68.2%)** | need ~**+690** → **90%** |
+| **String slice M47** | **759 / 1223 (62.2%)** | need ~**+342** → **90%** |
 
 **Living scoreboard:** [`BROWSER_CONFORMANCE.md`](./BROWSER_CONFORMANCE.md)
 
 ---
 
-## Dependency DAG (march to 80% → 95%)
+## Dependency DAG (march to **90% each** OA/S → ~95% full)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -57,7 +57,7 @@
 └───────────────────────────┬─────────────────────────────────┘
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
-│  RegExp + Promise + language reclaim → full 80%+ → ~95%     │
+│  RegExp + Promise + language reclaim → OA/S 90% each → ~95% │
 └─────────────────────────────────────────────────────────────┘
 ```
 
