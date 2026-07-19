@@ -1,8 +1,8 @@
 # Browser JS Conformance — Living Scoreboard
 
-**Updated:** 2026-07-19 (M45)  
+**Updated:** 2026-07-19 (M46)  
 **Branch:** `gpu-45-may-baseline-restore`  
-**Handoff:** [`results/JS_HANDOFF_M45.md`](./results/JS_HANDOFF_M45.md)  
+**Handoff:** [`results/JS_HANDOFF_M46.md`](./results/JS_HANDOFF_M46.md)  
 **Plan:** [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md)
 
 ---
@@ -16,7 +16,7 @@
 | **Full suite 2026-07-18 M37** | **22800 / 49998 (45.6%)** | **new high** · `results/FULL_SUITE_M37.md` |
 | language (full M37) | **67.7%** | was 60.4% M31c |
 | built-ins (full M37) | **25.5%** | Temporal desert still dominates |
-| **Object / Array / String M45 slices** | **72.5% / 65.1% / 61.3%** | product bar 80% each |
+| **Object / Array / String M46 slices** | **72.5% / 68.1% / 62.2%** | product bar 80% each |
 
 **Long goal:** ~**95%** usable JS engine for embedded browser.  
 **Near-term product gate:** Object + Array + String each **≥80%**.
@@ -38,11 +38,11 @@
 
 ### Target bars
 
-| Track | Now (M45) | Product bar | Long |
+| Track | Now (M46) | Product bar | Long |
 |-------|----------:|------------:|-----:|
 | **Object** | **72.5%** | **≥80%** | ≥90% |
-| **Array** | **65.1%** | **≥80%** | ≥90% |
-| **String** | **61.3%** | **≥80%** | ≥90% |
+| **Array** | **68.1%** | **≥80%** | ≥90% |
+| **String** | **62.2%** | **≥80%** | ≥90% |
 | **Language** | 67.7% full | ≥80% | ≥90% |
 | **Full suite** | **45.6%** | ≥50% mid | **~95%** |
 
@@ -61,21 +61,21 @@
 JSON on disk: `results/test262_full_m37.json` (often gitignored) · writeup: `results/FULL_SUITE_M37.md`  
 **Note:** Full used **M37** harness; M38/M39 fixes not yet re-scored on full 50k.
 
-### 2.2 OA/S product slices (M45)
+### 2.2 OA/S product slices (M46)
 
-| Suite | Pass / Total | % | Δ M44 | Need ~80% |
+| Suite | Pass / Total | % | Δ M45 | Need ~80% |
 |-------|-------------:|--:|------:|----------:|
-| **Object** | **2464 / 3411** | **72.5%** | **+2** | **~+265** |
-| **Array** | **1989 / 3081** | **65.1%** | **+34** | **~+476** |
-| **String** | **749 / 1223** | **61.3%** | 0 | **~+229** |
+| **Object** | **2464 / 3411** | **72.5%** | 0 | **~+265** |
+| **Array** | **2079 / 3081** | **68.1%** | **+90** | **~+365** |
+| **String** | **759 / 1223** | **62.2%** | **+10** | **~+219** |
 
 ### 2.3 Recent moles
 
 | Mole | Focus |
 |------|--------|
-| **M43** | not-a-constructor; pad UTF-16; CallFunc this-bind; PropTable 128; hole→proto |
-| **M44** | trimEnd UTF-16; reduce length-first; Date ID collision 172/173→175/176 |
-| **M45** | array-like pop/push/shift/unshift/reverse; includes; Symbol.toStringTag |
+| **M44** | trimEnd UTF-16; reduce length-first; Date ID collision |
+| **M45** | array-like mutators; includes; Symbol.toStringTag |
+| **M46** | **ArrayLikeGet/Has invoke accessors** (map/filter/reduce leap); String ToInteger Inf/NaN |
 
 ---
 
