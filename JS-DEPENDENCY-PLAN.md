@@ -19,8 +19,9 @@
 | **M59** | ITER_CLOSE GetMethod (`return` getter/null); `FRESH_LET_ENV` per-iter let/const; script_env free-var capture | for-of **630/751 (85.1%)**; head-let/const-fresh + get-method-null green |
 | **M60** | free-var TDZ sentinel; IteratorClose throw stack restore; script-var free GET_GLOBAL | for-of **642/751 (86.8%, +12)**; throw.js + init-let green |
 | **M61** | for-of member PutValue → IteratorClose; ArrayLikeGet getters on array cursor | for-of **644/751 (87.0%)**; body-put-error + array-key-get-error |
+| **M62** | Map/Set + @@iterator; for-of head TDZ env + RESTORE_ENV; typeof free TDZ | for-of **651/751 (88.0%, +7)** |
 
-**Next:** for-of → ~90% (~32 more; Map/Set/TA deserts + dstr/scope). Then **full suite baseline**. Then gaps by dependency order (below).
+**Next:** for-of → ~90% (~25 more). **Full suite baseline** soon. Then gaps by dependency order (L3 object → L2 class → L5 args → L6 async → L7 modules → OA/S).
 
 ---
 
