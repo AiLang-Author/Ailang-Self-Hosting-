@@ -21,8 +21,9 @@
 | **M61** | for-of member PutValue → IteratorClose; ArrayLikeGet getters on array cursor | for-of **644/751 (87.0%)**; body-put-error + array-key-get-error |
 | **M62** | Map/Set + @@iterator; for-of head TDZ env + RESTORE_ENV; typeof free TDZ | for-of **651/751 (88.0%, +7)** |
 | **M63** | Map/Set live iterators (tombstones + live coll ref); all for-of map/set-* green | for-of **655/751 (88.5%)** |
+| **M64** | String for-of **code points**; let dstr FRESH_LET_ENV + no global leak; dstr assign IteratorClose (non-gen); skip_let_global; GET_LOCAL top-level let | for-of **661/751 (89.3%, +6)**; string-astral, head-let-destructuring, scope-body-lex-*, body-dstr-assign-error green |
 
-**Next:** for-of → ~90% (~21 more). **Full suite baseline** next session. Then L3 object → L2 class → L5 args → L6 async → L7 modules → OA/S.
+**Next:** for-of → 90% (~15 more: cptn, iterator-next-result-type, head-*-fordecl-tdz, residual dstr/TA). **Full suite baseline**. Then L3 object → L2 class → L5 args → L6 async → L7 modules → OA/S.
 
 ---
 
