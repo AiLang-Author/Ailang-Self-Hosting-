@@ -1,140 +1,118 @@
 # JS Engine — Plan to **90%** (full suite, all features)
 
-**Updated:** 2026-07-20 (M59 for-of let + IteratorClose GetMethod)  
+**Updated:** 2026-07-20 (M65 full baseline)  
 **Branch:** `gpu-45-may-baseline-restore`  
-**Handoff:** [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md) · full baseline [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md)
+**Full baseline:** [`results/FULL_SUITE_M65.md`](./results/FULL_SUITE_M65.md) · JSON `results/test262_full_m65.json`  
+**Prior:** [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md)
 
-### Recent moles (post M47)
+### Headline (M65 full 50k)
 
-| Mole | Fix | Slice note |
-|------|-----|------------|
-| M48–M51b | SetFunctionName, methods/super, Array keys/entries | class/method-def, for-of iterators |
-| **M52** | `ASTType.ELISION` vs `[null]`; UTF-16-safe `OBJ_SPREAD`/`Object.assign` getters | for-of ~592/751; **object expr ~917/1161 (79%)** |
-| **M53** | Labeled break/continue (parser kept labels; label stack) | for-of **595/751 (80.4%)**; break 18/20; continue 21/24 |
-| **M54** | for-of **iterator protocol** (not eager `TO_ARRAY`) + break→`ITER_CLOSE` | for-of **617/751 (83.4%, +22)**; 0 reg |
-| **M55** | IteratorClose on return/throw/outer-continue; do-while continue→cond; per-rec `__c__` | for-of **620/751 (83.8%)**; close-via-* green |
-| **M56** | Gen.return runs finally; YIELD saves try handlers; force_return abrupt | for-of **625/751 (84.5%, +5)** |
-| **M57** | IteratorClose preserves outer try handlers across gen.return | for-of close-via-throw path |
-| **M58** | try/finally no-catch normal path; func TDZ hoist | for-of **~632/751** |
-| **M59** | ITER_CLOSE GetMethod (`return` getter/null); `FRESH_LET_ENV` per-iter let/const; script_env free-var capture | for-of **630/751 (85.1%)**; head-let/const-fresh + get-method-null green |
-| **M60** | free-var TDZ sentinel; IteratorClose throw stack restore; script-var free GET_GLOBAL | for-of **642/751 (86.8%, +12)**; throw.js + init-let green |
-| **M61** | for-of member PutValue → IteratorClose; ArrayLikeGet getters on array cursor | for-of **644/751 (87.0%)**; body-put-error + array-key-get-error |
-| **M62** | Map/Set + @@iterator; for-of head TDZ env + RESTORE_ENV; typeof free TDZ | for-of **651/751 (88.0%, +7)** |
-| **M63** | Map/Set live iterators (tombstones + live coll ref); all for-of map/set-* green | for-of **655/751 (88.5%)** |
-| **M64** | String for-of **code points**; let dstr FRESH_LET_ENV + no global leak; dstr assign IteratorClose (non-gen); skip_let_global; GET_LOCAL top-level let | for-of **661/751 (89.3%, +6)**; string-astral, head-let-destructuring, scope-body-lex-*, body-dstr-assign-error green |
-| **M64b** | ITER_NEXT reject Symbol; `var let` binding; bare `let` expr + ASI (`let\\n{}` / `let\\nx`); Primary `let` as Ident | for-of **664/751 (89.7%, +3)** |
-| **M65** | for-let validation scope (fordecl TDZ); multi-var body N_NEXT; GetMethod `next` getters; eval for-of completion V | for-of **672/751 (90.8%, +8)** ✅ ≥90% |
+| Scope | Pass / Total | % | vs M47 |
+|-------|-------------:|--:|-------:|
+| **Full** | **24807 / 49998** | **49.6%** | **+1833 (+3.5pp)** |
+| **Language** | **17032 / 23899** | **71.3%** | **+1451 (+6.1pp)** |
+| **built-ins** | **7118 / 23521** | **30.3%** | **+351** |
+| Object | 2470 / 3411 | 72.4% | +6 |
+| Array | 2214 / 3304 | 67.0% | +131 |
+| String | 759 / 1230 | 61.7% | ~flat |
 
-**Next:** **Full suite baseline**. Residual for-of deserts (dstr/TA/Proxy). Then L3 object → L2 class → L5 args → L6 async → L7 modules → OA/S.
+### Recent moles (M48–M65 language reclaim)
 
----
+| Mole | Fix | Slice |
+|------|-----|-------|
+| M48–M51b | SetFunctionName, methods/super, Array keys/entries | class / iterators |
+| M52–M58 | elision, labels, for-of protocol, IteratorClose, gen.return, try/finally | for-of climb |
+| M59–M63 | FRESH_LET_ENV, free-var TDZ, Map/Set live iterators | for-of → 88.5% |
+| **M64/M64b** | string code points, let dstr scope, `var let`, bare `let` ASI | for-of 89.7% |
+| **M65** | for-let validation scope, multi-var body, next getters, eval cptn | for-of **672/751 (90.8%)** ✅ |
 
-## Goal (hard)
-
-| Bar | Target | Now (M47) |
-|-----|-------:|----------:|
-| **Full test262** | **≥90%** | **46.1%** (22974/49998) |
-| **Language** | **≥90%** | 65.2% |
-| **built-ins** (usable surface) | **≥90%** | 28.8% (Temporal/TA deserts dominate fails) |
-| **Object / Array / String** | **each ≥90%** | 72.5 / 68.2 / 62.2 |
-| Product | Working JS engine, **all language features + core built-ins** | partial |
-
-**Interpretation:** “90% period” means a **usable engine** — language complete enough that real code runs, core Object/Array/String/Function/Promise/RegExp solid, modules/async not deserts forever. Full 50k at 90% ≈ **+22k passes** from today (~500 tests per full-suite pp).
-
-**Not excused by deserts forever:** Temporal / TypedArray / Atomics / full Proxy can stay last-mile, but **language, OA/S, Promise, RegExp, iterators, classes, modules basics** are in scope for 90%.
+**L4 for-of language gate: DONE (≥90%).** Residual ~80 fails = dstr/TA/Proxy deserts — last-mile.
 
 ---
 
-## Why the needle barely moves (and language regressed)
+## Goal (hard) — unchanged
 
-M37 → M47 full: **+174** tests (~**0.35pp**) while OA/S climbed.
+| Bar | Target | **Now (M65 full)** |
+|-----|-------:|-------------------:|
+| **Full test262** | **≥90%** | **49.6%** |
+| **Language** | **≥90%** | **71.3%** |
+| **Object / Array / String** | **each ≥90%** | 72.4 / 67.0 / 61.7 |
+| Product | Usable JS engine, all language features + core built-ins | marching |
 
-| Slice | M37 | M47 | Δ |
-|-------|----:|----:|--:|
-| full | 45.6% | **46.1%** | **+174** |
-| language | **67.7%** | **65.2%** | **−591** |
-| built-ins | 25.5% | **28.8%** | **+759** |
-
-**What happened:** moles M38–M47 were **built-in / property-model** work (defineProperty, ArrayLike accessors, species, pad UTF-16, PropTable 128, Date ID, CallFunc this-bind, etc.). That **reclaimed OA/S** and built-ins mass, but several shared paths **broke language tests**:
-
-1. **SetFunctionName / `function.name` (~492 of ~740 language regressions)**  
-   Class / arrow / dstr defaults need `[[DefineOwnProperty]]` for `name` (`!W` `C`). Ordinary `SET_PROP` hit `CanAssign` fail → empty names → **class fn-name dstr** cascade.  
-   **M48:** FUNCTION + `"name"` → `JSRT_FuncPropSet`; compiler emits SetFunctionName for param defaults, array/obj dstr (local **and** global), object-literal properties.
-
-2. **Shared VM / property / CallFunc changes**  
-   this-bind on natives, PropTable size, array hole→proto, species Construct — intended for built-ins, but language tests use the same object model and fail when semantics drift.
-
-3. **Math:** 1pp full ≈ **500** tests. Language −591 nearly cancelled built-ins +759 → full only +174.
-
-**Lesson:** Prefer **language-safe** property/CallFunc changes; after every built-in mole, rescore a **language slice** (class + dstr + object), not only OA/S.
+**~+20k full-suite passes** still needed (~500 tests per full pp). Deserts (Temporal/TA/Atomics/Proxy) are **not** the next grind.
 
 ---
 
-## March order (to 90% full)
+## March order (reset after for-of 90%)
 
 ```
-PHASE L — Language reclaim (NOW)
-  L1  SetFunctionName complete (class/param/dstr/object lit)   ← M48 in flight
-  L2  class residual (private, static, heritage)
-  L3  object literal / computed / methods
-  L4  for-of / iterators / generators
-  L5  arguments-object
-  L6  async / await / for-await (not desert)
-  L7  modules / dynamic-import basics
+PHASE L — Language (ACTIVE)
+  L1  SetFunctionName / names          ✅ largely done (M48+)
+  L2  class residual (stmt+expr ~1.8k fails)     ← biggest language fail mass
+  L3  object literal / computed / methods (~225 fails @ 80.6%)
+  L4  for-of / iterators / generators          ✅ for-of ≥90% (M65)
+  L5  arguments-object (~45%)
+  L6  async / await / for-await (~40–53%)
+  L7  modules / dynamic-import (~41–51%)
         │
-        ▼  language ≥ ~80% then keep climbing
+        ▼  language ≥ ~80–85%, then keep climbing to 90%
 PHASE B — Built-ins to product bar
-  B1  Object → 90% (defineProperty residual, gOPD, freeze/seal)
-  B2  Array  → 90% (concat, reduce residual, sort/splice, species done)
-  B3  String → 90% (non-RegExp polish → RegExp-backed replace/match)
-  B4  Function / Promise / RegExp / Date / Map-Set basics
+  B1  Object → 90%   (need +~600)
+  B2  Array  → 90%   (need +~760)
+  B3  String → 90%   (need +~348; RegExp-backed paths later)
+  B4  Function / Promise / RegExp / Map-Set / Date basics
         │
         ▼  OA/S each ≥90%, language ≥90%
 PHASE F — Full suite → 90%
-  F1  close deserts that still own fail mass (or ship stubs that pass tests)
-  F2  full 50k rescore at milestones only
+  F1  remaining fail mass / controlled desert stubs
+  F2  full 50k only at milestones
 ```
 
-**Gates after every mole:**
+### Why this order (dependency)
 
-```bash
-python3 tools/js_midgate.py --rebuild --quick   # must PASS
-# language smoke (cheap):
-python3 tools/test262_runner.py --paths 'language/expressions/object,language/statements/class,language/expressions/arrow-function' -j 8
-# product:
-python3 tools/test262_runner.py --paths 'built-ins/Object,built-ins/Array,built-ins/String' -j 8
-```
+| Priority | Slice | Why next |
+|----------|-------|----------|
+| **1. L3 object** | expr object ~81% | Feeds class methods, OA built-ins, spread/assign; smaller surface than class |
+| **2. L2 class** | ~78–79% | Largest language fail mass; needs object/method/super solid |
+| **3. L5 arguments** | ~45% | Call/apply/strict; unblocks many built-in tests |
+| **4. L6 async** | async + for-await | Real apps; for-of protocol already green |
+| **5. L7 modules** | module-code + import | Product modules after async basics |
+| **6. B1–B3 OA/S** | 72/67/62% | Product bar; after language core stops thrashing |
+| **Last** | Temporal / TA / Atomics / Proxy | Fail mass only; not usability-critical first |
 
-Full 50k only at milestones (post L1 reclaim, post OA/S 80%, post OA/S 90%, …).
+**Optional interleave:** if a class mole needs object computed/method-def, do that object sub-mole first (L3 micro-before L2).
 
 ---
 
-## Distance math (M47)
-
-| Track | Pass | Target 90% | Still need |
-|-------|-----:|-----------:|-----------:|
-| Full | 22974 | ~44998 | **~+22000** |
-| Language | 15581 | ~21509 | **~+5928** |
-| Object | 2464 | 3070 | **+606** |
-| Array | 2083 | 2773 | **+690** |
-| String | 759 | 1101 | **+342** |
-
-Language reclaim from names alone may be **+400–700** (class/dstr). That is real full-suite movement (~1pp) **without** more built-in thrash.
-
----
-
-## Active mole — M48+ (language first)
+## Active focus — post-M65
 
 | Item | Status |
 |------|--------|
-| SET_PROP function.name → FuncPropSet | **landed** (153dff57) |
-| Param default SetFunctionName | in compiler |
-| Array/obj dstr SetFunctionName (local+global) | in compiler |
-| Object-literal `{bar: function(){}}` name | in compiler |
-| midgate green + language slice rescore | **next** |
-| Commit residual M48 when green | next |
+| for-of ≥90% | **DONE** (dedicated 672/751) |
+| Full suite M65 baseline | **DONE** (49.6%) |
+| **Next mole** | **L3 object expr** residual (computed names, methods, spread/assign edge, __proto__) |
+| Then | L2 class fail clusters (private/static/heritage/fn-name residual) |
+| Gate | midgate + object slice + class smoke |
 
-Then knock bugs in order: remaining class fn-name → object expr → for-of → arguments → async/modules.
+```bash
+python3 tools/js_midgate.py --rebuild --quick
+python3 tools/test262_runner.py --paths 'language/expressions/object' -j 8
+python3 tools/test262_runner.py --paths 'language/statements/class,language/expressions/class' -j 8
+```
+
+---
+
+## Distance math (M65)
+
+| Track | Pass | Target 90% | Still need |
+|-------|-----:|-----------:|-----------:|
+| Full | 24807 | ~44998 | **~+20191** |
+| Language | 17032 | ~21509 | **~+4477** |
+| Object | 2470 | ~3070 | **+600** |
+| Array | 2214 | ~2974 | **+760** |
+| String | 759 | ~1107 | **+348** |
+
+Class reclaim alone (stmt+expr → 90%) ≈ **+1.0–1.2k language** if achievable — real full-suite pp without desert thrash.
 
 ---
 
@@ -142,18 +120,19 @@ Then knock bugs in order: remaining class fn-name → object expr → for-of →
 
 | Rule | |
 |------|--|
-| Goal | **90% full engine, all features** — not aggregate OA/S-only theater |
-| Order | **Language first**, then OA/S, then deserts |
+| Goal | **90% full engine, all features** |
+| Order | **Language by dependency** (object → class → args → async → modules), **then OA/S**, then deserts |
 | Honesty | Generators / call / function: `--no-batch` when needed |
-| Style | Wrap over write — Ailang primitives, thin JS surface |
 | Gate | Midgate green after every mole |
-| Score | Report **pass deltas (+N)**; full 50k at milestones |
-| Regression | Language slice must not tank while “winning” built-ins |
+| Score | Report **pass deltas (+N)**; full 50k at milestones only |
+| for-of residual | dstr/TA/Proxy last-mile — do not block L3/L2 |
 
 ---
 
-## Living docs
+## Compare ladder
 
-- Scoreboard: [`BROWSER_CONFORMANCE.md`](./BROWSER_CONFORMANCE.md)
-- Full M47: [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md)
-- Session handoff: [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md)
+| Milestone | Full % | Language % | Notes |
+|-----------|-------:|-----------:|-------|
+| M37 | 45.6% | 67.7% | pre OA/S thrash high |
+| M47 | 46.1% | 65.2% | built-in moles; language dip |
+| **M65** | **49.6%** | **71.3%** | **current**; for-of ≥90% |
