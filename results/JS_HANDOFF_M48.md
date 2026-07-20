@@ -46,3 +46,9 @@ M38–M47 built-in moles shared VM/property paths. Biggest: `function.name` is `
 python3 tools/js_midgate.py --rebuild --quick
 python3 tools/test262_runner.py --paths 'language/statements/class,language/expressions/class' -j 8
 ```
+
+## M48b (same session)
+
+- `Symbol(desc)` stores `.description`
+- `SET_PROP_COMPUTED` SetFunctionName for anon functions (Symbol → `[desc]`)
+- Object/class `fn-name-*.js` with Symbol keys: **5/5 pass**
