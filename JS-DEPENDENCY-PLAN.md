@@ -23,8 +23,9 @@
 | **M63** | Map/Set live iterators (tombstones + live coll ref); all for-of map/set-* green | for-of **655/751 (88.5%)** |
 | **M64** | String for-of **code points**; let dstr FRESH_LET_ENV + no global leak; dstr assign IteratorClose (non-gen); skip_let_global; GET_LOCAL top-level let | for-of **661/751 (89.3%, +6)**; string-astral, head-let-destructuring, scope-body-lex-*, body-dstr-assign-error green |
 | **M64b** | ITER_NEXT reject Symbol; `var let` binding; bare `let` expr + ASI (`let\\n{}` / `let\\nx`); Primary `let` as Ident | for-of **664/751 (89.7%, +3)** |
+| **M65** | for-let validation scope (fordecl TDZ); multi-var body N_NEXT; GetMethod `next` getters; eval for-of completion V | for-of **672/751 (90.8%, +8)** ✅ ≥90% |
 
-**Next:** for-of → 90% (~12 more: cptn, Proxy iterator-next-result-type, head-*-fordecl-tdz, residual dstr/TA). **Full suite baseline**. Then L3 object → L2 class → L5 args → L6 async → L7 modules → OA/S.
+**Next:** **Full suite baseline**. Residual for-of deserts (dstr/TA/Proxy). Then L3 object → L2 class → L5 args → L6 async → L7 modules → OA/S.
 
 ---
 
