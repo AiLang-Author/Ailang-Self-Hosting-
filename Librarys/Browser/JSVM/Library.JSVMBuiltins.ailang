@@ -1463,14 +1463,25 @@ Function.JSVM__GenNext {
             // Set PC
             JSVMState.pc = g_pc
 
+            // M56: restore try depth from yield (TRY_POP/finally across resume)
+            // Exc entries still live on the global exc_stack from when we suspended
+            // only if this is the same outer call nesting; GenNext isolates below,
+            // so re-apply saved depth after isolate.
+            saved_gexc = Dereference(Add(gs, JSGenConst.OFF_EXC_SP))
+
             // Yield resume only: push .next(value) as the yield result
+            // M56 return-resume handled after exc restore (force_return)
             IfCondition EqualTo(is_yield_resume, 1) ThenBlock: {
-                IfCondition GreaterThan(save_argc, 0) ThenBlock: {
-                    next_arg = Dereference(save_args)
-                    JSVM__StackPush(next_arg)
-                } ElseBlock: {
-                    JSVM__StackPush(JSRT_Undefined())
+                pend_ret = Dereference(Add(gs, JSGenConst.OFF_PEND_RET))
+                IfCondition EqualTo(pend_ret, 0) ThenBlock: {
+                    IfCondition GreaterThan(save_argc, 0) ThenBlock: {
+                        next_arg = Dereference(save_args)
+                        JSVM__StackPush(next_arg)
+                    } ElseBlock: {
+                        JSVM__StackPush(JSRT_Undefined())
+                    }
                 }
+                // else: pending return — set up after exc restore below
             }
         }
 
@@ -1479,6 +1490,59 @@ Function.JSVM__GenNext {
         // then rethrow into the .next() caller (not outer try/catch directly).
         save_exc_sp = JSVMState.exc_sp
         JSVMState.exc_sp = 0
+        // M56: restore generator try handlers (saved on YIELD)
+        IfCondition Or(EqualTo(is_yield_resume, 1), EqualTo(is_init_resume, 1)) ThenBlock: {
+            saved_gexc = Dereference(Add(gs, JSGenConst.OFF_EXC_SP))
+            IfCondition GreaterThan(saved_gexc, 0) ThenBlock: {
+                IfCondition GreaterThan(saved_gexc, JSGenConst.EXC_SAVE_MAX) ThenBlock: {
+                    saved_gexc = JSGenConst.EXC_SAVE_MAX
+                }
+                MemoryCopy(JSVMState.exc_stack, Add(gs, JSGenConst.OFF_EXC_DATA), Multiply(saved_gexc, 32))
+                JSVMState.exc_sp = saved_gexc
+            }
+        }
+        // M56 return-resume: run finally handlers then complete with pending value
+        IfCondition EqualTo(is_yield_resume, 1) ThenBlock: {
+            pend_ret = Dereference(Add(gs, JSGenConst.OFF_PEND_RET))
+            IfCondition NotEqual(pend_ret, 0) ThenBlock: {
+                IfCondition GreaterThan(JSVMState.exc_sp, 0) ThenBlock: {
+                    // Enter top handler (finally) as if throw of return-completion
+                    JSVMGen.force_return = 1
+                    JSVMGen.force_return_val = pend_ret
+                    JSVMState.exc_sp = Subtract(JSVMState.exc_sp, 1)
+                    ebase = Add(JSVMState.exc_stack, Multiply(JSVMState.exc_sp, 32))
+                    catch_addr = Dereference(ebase)
+                    saved_sp = Dereference(Add(ebase, 8))
+                    saved_fp = Dereference(Add(ebase, 16))
+                    IfCondition LessThan(saved_sp, 0) ThenBlock: { saved_sp = 0 }
+                    IfCondition LessThan(saved_fp, 0) ThenBlock: { saved_fp = 0 }
+                    JSVMState.fp = saved_fp
+                    JSVMState.sp = saved_sp
+                    JSVM__StackPush(pend_ret)
+                    JSVMState.pc = catch_addr
+                } ElseBlock: {
+                    // No try: complete with return value immediately
+                    StoreValue(gs, JSGenConst.ST_COMPLETED)
+                    StoreValue(Add(gs, JSGenConst.OFF_PEND_RET), 0)
+                    JSVMGen.active_gs = 0
+                    JSVMGen.is_gen_exec = 0
+                    JSVMState.pc = JSVMGen.caller_pc
+                    JSVMState.sp = JSVMGen.caller_sp
+                    JSVMState.fp = JSVMGen.caller_fp
+                    csz = Multiply(JSVMGen.caller_sp, 8)
+                    IfCondition GreaterThan(csz, 0) ThenBlock: {
+                        MemoryCopy(JSVMState.stack, JSVMGen.caller_stack, csz)
+                    }
+                    cfsz = Multiply(JSVMGen.caller_fp, JSVMConst.FRAME_SIZE)
+                    IfCondition GreaterThan(cfsz, 0) ThenBlock: {
+                        MemoryCopy(JSVMState.frames, JSVMGen.caller_frames, cfsz)
+                    }
+                    JSVMState.exc_sp = save_exc_sp
+                    ret_ir = JSRT_CreateIterResult(pend_ret, 1)
+                    ReturnValue(ret_ir)
+                }
+            }
+        }
         JSVMState.halted = 0
         JSVMState.error = 0
         JSVMState.exc_val = 0
@@ -1777,8 +1841,14 @@ Function.JSVM__GenCloseOpenIter {
         IfCondition EqualTo(rec, 0) ThenBlock: {
             ReturnValue(0)
         }
-        // Mirror ITER_CLOSE kind=0 (return completion: return() throw wins)
-        IfCondition EqualTo(JSVMIter.done, 1) ThenBlock: {
+        // M56: per-record closed/done (global JSVMIter.done is shared)
+        closed_v = JSRT_ObjGet(rec, "__c__")
+        IfCondition EqualTo(JSRT_IsTruthy(closed_v), 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        rec_done = JSRT_ObjGet(rec, "__done__")
+        IfCondition EqualTo(JSRT_IsTruthy(rec_done), 1) ThenBlock: {
+            JSRT_ObjSet(rec, "__c__", JSRT_True())
             ReturnValue(0)
         }
         mode_v = JSRT_ObjGet(rec, "__m__")
@@ -1788,6 +1858,7 @@ Function.JSVM__GenCloseOpenIter {
         }
         IfCondition EqualTo(mode, 0) ThenBlock: {
             JSVMIter.done = 1
+            JSRT_ObjSet(rec, "__c__", JSRT_True())
             ReturnValue(0)
         }
         iterator = JSRT_ObjGet(rec, "__it__")
@@ -1846,6 +1917,7 @@ Function.JSVM__GenCloseOpenIter {
             }
         }
         JSVMIter.done = 1
+        JSRT_ObjSet(rec, "__c__", JSRT_True())
         ReturnValue(0)
     }
 }
@@ -1885,17 +1957,38 @@ Function.JSVM__GenReturn {
             ret_v = Dereference(save_args)
         }
 
-        // M20d: if suspended mid-iteration, IteratorClose open iter (rtrn-close)
+        // M20d: close open iters; M56: resume for finally when try is active
         IfCondition Or(EqualTo(gen_state, JSGenConst.ST_SUSPENDED_YIELD), EqualTo(gen_state, JSGenConst.ST_SUSPENDED_INIT)) ThenBlock: {
             close_abrupt = JSVM__GenCloseOpenIter(gs)
-            StoreValue(gs, JSGenConst.ST_COMPLETED)
             IfCondition EqualTo(close_abrupt, 1) ThenBlock: {
-                // GenCloseOpenIter already set exc_prop + thrown_val
+                StoreValue(gs, JSGenConst.ST_COMPLETED)
+                StoreValue(Add(gs, JSGenConst.OFF_PEND_RET), 0)
                 IfCondition EqualTo(JSVMCall.exc_prop, 0) ThenBlock: {
                     JSVMCall.exc_prop = 1
                 }
                 ReturnValue(JSRT_Undefined())
             }
+            // Only resume for finally if try handlers were saved at yield
+            saved_exc_n = Dereference(Add(gs, JSGenConst.OFF_EXC_SP))
+            IfCondition GreaterThan(saved_exc_n, 0) ThenBlock: {
+                StoreValue(Add(gs, JSGenConst.OFF_PEND_RET), ret_v)
+                empty_ab = JSVMCallBuf.buf
+                resume_res = JSVM__GenNext(save_fv, empty_ab, 0)
+                StoreValue(Add(gs, JSGenConst.OFF_PEND_RET), 0)
+                IfCondition EqualTo(JSVMCall.exc_prop, 0) ThenBlock: {
+                    ret_ir = JSRT_CreateIterResult(ret_v, 1)
+                    ag_rf = Dereference(Add(gs, 104))
+                    IfCondition EqualTo(ag_rf, 1) ThenBlock: {
+                        ReturnValue(JSVM__WrapInPromise(ret_ir))
+                    }
+                    ReturnValue(ret_ir)
+                }
+                ReturnValue(resume_res)
+            }
+            // No try: complete immediately (rtrn-close / plain return)
+            StoreValue(gs, JSGenConst.ST_COMPLETED)
+            StoreValue(Add(gs, JSGenConst.OFF_OPEN_ITER), 0)
+            StoreValue(Add(gs, JSGenConst.OFF_PEND_RET), 0)
             ret_ir = JSRT_CreateIterResult(ret_v, 1)
             ag_rf = Dereference(Add(gs, 104))
             IfCondition EqualTo(ag_rf, 1) ThenBlock: {
@@ -1907,6 +2000,7 @@ Function.JSVM__GenReturn {
         // suspended-start / other: just complete
         StoreValue(gs, JSGenConst.ST_COMPLETED)
         StoreValue(Add(gs, JSGenConst.OFF_OPEN_ITER), 0)
+        StoreValue(Add(gs, JSGenConst.OFF_PEND_RET), 0)
         ret_ir = JSRT_CreateIterResult(ret_v, 1)
         ag_rf = Dereference(Add(gs, 104))
         IfCondition EqualTo(ag_rf, 1) ThenBlock: {
