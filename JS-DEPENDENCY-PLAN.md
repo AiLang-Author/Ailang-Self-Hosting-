@@ -20,8 +20,9 @@
 | **M60** | free-var TDZ sentinel; IteratorClose throw stack restore; script-var free GET_GLOBAL | for-of **642/751 (86.8%, +12)**; throw.js + init-let green |
 | **M61** | for-of member PutValue → IteratorClose; ArrayLikeGet getters on array cursor | for-of **644/751 (87.0%)**; body-put-error + array-key-get-error |
 | **M62** | Map/Set + @@iterator; for-of head TDZ env + RESTORE_ENV; typeof free TDZ | for-of **651/751 (88.0%, +7)** |
+| **M63** | Map/Set live iterators (tombstones + live coll ref); all for-of map/set-* green | for-of **655/751 (88.5%)** |
 
-**Next:** for-of → ~90% (~25 more). **Full suite baseline** soon. Then gaps by dependency order (L3 object → L2 class → L5 args → L6 async → L7 modules → OA/S).
+**Next:** for-of → ~90% (~21 more). **Full suite baseline** next session. Then L3 object → L2 class → L5 args → L6 async → L7 modules → OA/S.
 
 ---
 
