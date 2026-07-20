@@ -1,6 +1,6 @@
 # JS Engine — Plan to **90%** (full suite, all features)
 
-**Updated:** 2026-07-20 (M65 full baseline)  
+**Updated:** 2026-07-20 (M66 L3 object grind)  
 **Branch:** `gpu-45-may-baseline-restore`  
 **Full baseline:** [`results/FULL_SUITE_M65.md`](./results/FULL_SUITE_M65.md) · JSON `results/test262_full_m65.json`  
 **Prior:** [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md)
@@ -16,17 +16,17 @@
 | Array | 2214 / 3304 | 67.0% | +131 |
 | String | 759 / 1230 | 61.7% | ~flat |
 
-### Recent moles (M48–M65 language reclaim)
+### Recent moles
 
 | Mole | Fix | Slice |
 |------|-----|-------|
-| M48–M51b | SetFunctionName, methods/super, Array keys/entries | class / iterators |
-| M52–M58 | elision, labels, for-of protocol, IteratorClose, gen.return, try/finally | for-of climb |
-| M59–M63 | FRESH_LET_ENV, free-var TDZ, Map/Set live iterators | for-of → 88.5% |
+| M48–M63 | names → for-of protocol → Map/Set live iters | for-of climb |
 | **M64/M64b** | string code points, let dstr scope, `var let`, bare `let` ASI | for-of 89.7% |
 | **M65** | for-let validation scope, multi-var body, next getters, eval cptn | for-of **672/751 (90.8%)** ✅ |
+| **M66** | Object lit **computed getters/setters**; UTF-16 keys; Array ToPropertyKey=join | object **960/1161 (82.7%)** |
+| **M66b** | DEF_SETTER own-key placeholder; accessor `name` = `get `/`set ` + key | object **961/1161 (82.8%)** |
 
-**L4 for-of language gate: DONE (≥90%).** Residual ~80 fails = dstr/TA/Proxy deserts — last-mile.
+**L4 for-of: DONE.** **L3 object: in progress** (80.9% → 82.8%; residual ~199, ~120 async-gen desert).
 
 ---
 
