@@ -84,20 +84,21 @@ PHASE F — Full suite → 90%
 
 ---
 
-## Active focus — post-M65
+## Active focus — L3 object (M66+)
 
 | Item | Status |
 |------|--------|
-| for-of ≥90% | **DONE** (dedicated 672/751) |
-| Full suite M65 baseline | **DONE** (49.6%) |
-| **Next mole** | **L3 object** residual: scope-meth/getter lex, cpn-*, fn-name-accessor, setter-prop-desc; skip async-gen desert |
-| Then | L2 class fail clusters (private/static/heritage) |
-| Gate | midgate + object slice + class smoke |
+| for-of ≥90% | **DONE** (672/751) |
+| Full suite M65 | **DONE** (49.6%) |
+| L3 computed accessors | **M66/M66b** → object **961/1161 (82.8%)** |
+| **Next** | L3 residual non-async (~80): scope-meth lex, cpn-*, fn-name Symbol attrs, Proxy rest/spread |
+| Skip | async-gen method dstr (~120 → L6) |
+| Then | **L2 class** (~78–79%) |
+| Gate | midgate + `language/expressions/object` |
 
 ```bash
 python3 tools/js_midgate.py --rebuild --quick
 python3 tools/test262_runner.py --paths 'language/expressions/object' -j 8
-python3 tools/test262_runner.py --paths 'language/statements/class,language/expressions/class' -j 8
 ```
 
 ---
