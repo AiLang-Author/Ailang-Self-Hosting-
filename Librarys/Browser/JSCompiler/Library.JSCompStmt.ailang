@@ -298,9 +298,14 @@ Function.JSComp__CompileNode {
             }
             // Run enclosing finally blocks before leaving the function
             JSComp__EmitPendingFinally()
+            // M55: IteratorClose all open for-of (return interrupts iteration)
+            JSComp__EmitPendingIterClose(0, 1, 0)
             JSComp__Emit1(JSOp.RETURN)
             ReturnValue(0)
         }
+
+        // THROW: do NOT EmitPendingIterClose here — catch may handle the throw.
+        // Uncaught throws from for-of body are closed by for-of's try handler.
 
         // --- EXPR_STMT ---
         IfCondition EqualTo(ntype, ASTType.EXPR_STMT) ThenBlock: {
@@ -394,28 +399,39 @@ Function.JSComp__CompileNode {
         }
 
         // --- DO_WHILE ---
+        // M55: continue must target the condition, not the body (ECMA-262).
         IfCondition EqualTo(ntype, ASTType.DO_WHILE) ThenBlock: {
-            loop_start = JSCompState.code_pos
-            JSComp__PushLoop(loop_start)
+            body_start = JSCompState.code_pos
+            // Placeholder continue target (-1); patch after body to condition
+            JSComp__PushLoop(-1)
 
             // Compile body first
             body_n = JSParse_GetBody(save_node)
 
             JSComp__Push(save_node)
-            JSComp__Push(loop_start)
+            JSComp__Push(body_start)
             JSComp__CompileNode(body_n)
-            loop_start = JSComp__Pop()
+            body_start = JSComp__Pop()
             save_node = JSComp__Pop()
+
+            // Continue lands here (before condition)
+            JSComp__PatchContinues()
+            // Also fix loop frame continue_target for labeled continue (GetContinueTarget)
+            IfCondition GreaterThan(JSCompState.loop_depth, 0) ThenBlock: {
+                ld = Subtract(JSCompState.loop_depth, 1)
+                lbase = Add(JSCompState.loop_stack, Multiply(ld, JSCompConst.LOOP_SIZE))
+                StoreValue(Add(lbase, 8), JSCompState.code_pos)
+            }
 
             // Compile condition
             cond_n = JSParse_GetCond(save_node)
 
-            JSComp__Push(loop_start)
+            JSComp__Push(body_start)
             JSComp__CompileExpr(cond_n)
-            loop_start = JSComp__Pop()
+            body_start = JSComp__Pop()
 
-            // JMP_TRUE back to start
-            JSComp__EmitOp16(JSOp.JMP_TRUE, loop_start)
+            // JMP_TRUE back to body start
+            JSComp__EmitOp16(JSOp.JMP_TRUE, body_start)
 
             JSComp__PopLoop()
             ReturnValue(0)
@@ -790,6 +806,9 @@ Function.JSComp__CompileNode {
             // --- Loop start: continue lands here ---
             loop_start = JSCompState.code_pos
             JSComp__PushLoop(loop_start)
+            // M55: track open iterator for return/throw/outer continue-break
+            forof_loop_d = Subtract(JSCompState.loop_depth, 1)
+            JSComp__PushIterClose(irec_slot, forof_loop_d)
 
             // ITER_NEXT → [value, done]
             JSComp__EmitOp16(JSOp.GET_LOCAL, irec_slot)
@@ -911,24 +930,39 @@ Function.JSComp__CompileNode {
                 }
             }
 
-            // --- Body ---
+            // --- Body with try: uncaught throw → IteratorClose; continue emits TRY_POP via finally stack ---
             body_n = JSParse_GetBody(save_node)
+            // Empty finally frame: EmitPendingFinally only TRY_POPs while in_try
+            JSComp__PushFinally(-1)
+            try_body_addr = JSCompState.code_pos
+            JSComp__EmitOp16(JSOp.TRY_PUSH, 0)
             IfCondition GreaterEqual(body_n, 0) ThenBlock: {
                 JSComp__Push(save_node)
                 JSComp__Push(irec_slot)
                 JSComp__Push(loop_start)
                 JSComp__Push(done_path_jmp)
+                JSComp__Push(try_body_addr)
                 JSComp__CompileNode(body_n)
+                try_body_addr = JSComp__Pop()
                 done_path_jmp = JSComp__Pop()
                 loop_start = JSComp__Pop()
                 irec_slot = JSComp__Pop()
                 save_node = JSComp__Pop()
             }
+            JSComp__SetFinallyInTry(0)
+            JSComp__Emit1(JSOp.TRY_POP)
+            JSComp__PopFinally()
 
             // Next iteration
             JSComp__EmitOp16(JSOp.JMP, loop_start)
 
-            // --- done path: pop unused value, skip IteratorClose ---
+            // --- uncaught throw from body: close (kind=1) and rethrow ---
+            JSComp__PatchJump(try_body_addr, JSCompState.code_pos)
+            JSComp__EmitOp16(JSOp.GET_LOCAL, irec_slot)
+            JSComp__EmitOp16(JSOp.ITER_CLOSE, 1)
+            JSComp__Emit1(JSOp.THROW)
+
+            // --- done path: pop unused value; no runtime close (iterator exhausted) ---
             JSComp__PatchJump(done_path_jmp, JSCompState.code_pos)
             JSComp__Emit1(JSOp.POP)
             skip_close_jmp = JSCompState.code_pos
@@ -940,6 +974,7 @@ Function.JSComp__CompileNode {
             JSComp__EmitOp16(JSOp.ITER_CLOSE, 0)
 
             JSComp__PatchJump(skip_close_jmp, JSCompState.code_pos)
+            JSComp__PopIterClose()
             JSComp__PopScope()
             ReturnValue(0)
         }
@@ -947,16 +982,32 @@ Function.JSComp__CompileNode {
         // --- BREAK_STMT --- (M53: optional label → label break chain)
         IfCondition EqualTo(ntype, ASTType.BREAK_STMT) ThenBlock: {
             JSComp__EmitPendingFinally()
-            brk_addr = JSCompState.code_pos
-            JSComp__EmitOp16(JSOp.JMP, 0)
             bl_np = JSParse_GetNamePtr(save_node)
             bl_nl = JSParse_GetNameLen(save_node)
+            // M55: IteratorClose for-of being exited
+            // unlabeled: close current loop depth (inclusive) — for-of break path also closes (safe via __c__)
+            // labeled with loop: close for-of at/above that loop depth
+            brk_loop_d = Subtract(JSCompState.loop_depth, 1)
+            IfCondition And(NotEqual(bl_np, 0), GreaterThan(bl_nl, 0)) ThenBlock: {
+                bl_idx = JSComp__FindLabel(bl_np, bl_nl)
+                IfCondition GreaterEqual(bl_idx, 0) ThenBlock: {
+                    bl_base = Add(JSCompState.label_stack, Multiply(bl_idx, JSCompConst.LABEL_SIZE))
+                    bl_ld = Dereference(Add(bl_base, 24))
+                    IfCondition GreaterEqual(bl_ld, 0) ThenBlock: {
+                        brk_loop_d = bl_ld
+                    }
+                }
+            }
+            IfCondition GreaterEqual(brk_loop_d, 0) ThenBlock: {
+                JSComp__EmitPendingIterClose(brk_loop_d, 1, 0)
+            }
+            brk_addr = JSCompState.code_pos
+            JSComp__EmitOp16(JSOp.JMP, 0)
             IfCondition And(NotEqual(bl_np, 0), GreaterThan(bl_nl, 0)) ThenBlock: {
                 bl_idx = JSComp__FindLabel(bl_np, bl_nl)
                 IfCondition GreaterEqual(bl_idx, 0) ThenBlock: {
                     JSComp__RecordLabelBreak(bl_idx, brk_addr)
                 } ElseBlock: {
-                    // Unknown label — fall back to nearest loop (still compile)
                     JSComp__RecordBreak(brk_addr)
                 }
             } ElseBlock: {
@@ -978,12 +1029,19 @@ Function.JSComp__CompileNode {
                     cont_loop_idx = Dereference(Add(cl_base, 24))
                 }
             }
+            // M55: close for-of nested inside the continue target (not the target itself)
+            cont_tgt_d = Subtract(JSCompState.loop_depth, 1)
+            IfCondition GreaterEqual(cont_loop_idx, 0) ThenBlock: {
+                cont_tgt_d = cont_loop_idx
+            }
+            IfCondition GreaterEqual(cont_tgt_d, 0) ThenBlock: {
+                JSComp__EmitPendingIterClose(cont_tgt_d, 0, 0)
+            }
             IfCondition GreaterEqual(cont_loop_idx, 0) ThenBlock: {
                 // Labeled continue: use bound loop frame
                 lbase = Add(JSCompState.loop_stack, Multiply(cont_loop_idx, JSCompConst.LOOP_SIZE))
                 ct = Dereference(Add(lbase, 8))
                 IfCondition LessThan(ct, 0) ThenBlock: {
-                    // Forward continue on that loop — chain on its continue list
                     cont_jmp = JSCompState.code_pos
                     JSComp__EmitOp16(JSOp.JMP, 0)
                     old_head = Dereference(Add(lbase, 24))
@@ -1392,7 +1450,7 @@ Function.JSComp__CompileNode {
             // Compile the expression to throw
             throw_expr = JSParse_GetLeft(save_node)
             JSComp__CompileExpr(throw_expr)
-            // Emit THROW opcode
+            // Leave for-of open: inner catch may handle. Uncaught → for-of try handler.
             JSComp__Emit1(JSOp.THROW)
             ReturnValue(0)
         }
