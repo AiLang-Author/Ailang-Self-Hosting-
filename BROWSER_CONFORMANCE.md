@@ -1,129 +1,71 @@
 # Browser JS Conformance — Living Scoreboard
 
-**Updated:** 2026-07-19 (M47)  
+**Updated:** 2026-07-19  
 **Branch:** `gpu-45-may-baseline-restore`  
-**Handoff:** [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md)  
-**Plan:** [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md)
+**Plan:** [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md)  
+**Handoff:** [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md)
 
 ---
 
-## 0. Progress reality check
+## Hard goal
 
-| Horizon | Score | Context |
-|---------|------:|---------|
-| Full suite 2026-07-16 M29h **peak** | **21783 / 49998 (43.6%)** | pre–UTF-16 key regression |
-| Full suite 2026-07-17 M31c | **19129 / 49998 (38.3%)** | UTF-16/`\p` + key regressions |
-| Full suite 2026-07-18 M37 | 22800 / 49998 (45.6%) | prior high |
-| **Full suite 2026-07-19 M47** | **22974 / 49998 (46.1%)** | **new high** · `results/FULL_SUITE_M47.md` |
-| language (full M47) | **65.2%** | was 67.7% M37 (net still up full) |
-| built-ins (full M47) | **28.8%** | was 25.5% M37 · Temporal desert still dominates |
-| **Object / Array / String M47 slices** | **72.5% / 68.2% / 62.2%** | product bar **90% each** |
+**90% full test262 · working JS engine · all features** (language + core built-ins).  
+OA/S each ≥90% is a **checkpoint**, not the destination.
 
-**Long goal:** ~**95%** usable JS engine for embedded browser.  
-**Near-term product gate:** Object + Array + String each **≥90%** (not aggregate).
-
----
-
-## 1. Goals
-
-### Browser-ready means
-
-1. Language + classes (private basics)  
-2. Property model (defineProperty, create, freeze/seal, keys)  
-3. Arrays + strings usable  
-4. Promises enough for fetch/UI  
-5. RegExp usable (incl. reasonable Unicode)  
-6. DOM bridge path  
-
-**Not this phase:** Temporal, TypedArray/Atomics, full Proxy/Reflect, complete modules, `Array.fromAsync`.
-
-### Target bars
-
-| Track | Now (M47) | Product bar | Long |
-|-------|----------:|------------:|-----:|
-| **Object** | **72.5%** | **≥90%** | ≥95% |
-| **Array** | **68.2%** | **≥90%** | ≥95% |
-| **String** | **62.2%** | **≥90%** | ≥95% |
-| **Language** | 65.2% full | ≥90% | ≥95% |
-| **Full suite** | **46.1%** | ≥60% mid | **~95%** |
+| Track | Now (M47) | Checkpoint | Hard bar |
+|-------|----------:|-----------:|---------:|
+| **Full suite** | **46.1%** | ≥60% mid | **≥90%** |
+| **Language** | 65.2% | ≥80% | **≥90%** |
+| **Object** | 72.5% | — | **≥90%** |
+| **Array** | 68.2% | — | **≥90%** |
+| **String** | 62.2% | — | **≥90%** |
+| built-ins overall | 28.8% | climbs with OA/S + Promise/RegExp | **≥90%** usable |
 
 ---
 
-## 2. Latest scoreboard
+## Progress ladder
 
-### 2.1 Full suite M47 (authoritative high-water)
+| Milestone | Full pass% | Notes |
+|-----------|----------:|-------|
+| M29h peak | 43.6% | pre–UTF-16 key regression |
+| M31c | 38.3% | UTF-16/`\p` floor |
+| M37 | 45.6% | prior high · language **67.7%** |
+| **M47** | **46.1%** | **baseline** · language **65.2%** (−591) · built-ins +759 |
+| M48+ | TBD | SetFunctionName · **language first** |
 
-| Scope | Pass / Total | % | vs M37 | vs M31c | vs M29h |
-|-------|-------------:|--:|-------:|--------:|--------:|
-| **Full** | **22974 / 49998** | **46.1%** | **+174** | **+3845** | **+1191** |
-| language | 15581 / 23899 | 65.2% | −591 | up | — |
-| built-ins | 6767 / 23521 | 28.8% | **+759** | up | up |
-
-JSON: `results/test262_full_m47.json` · writeup: `results/FULL_SUITE_M47.md`  
-Includes M38–M47 harness.
-
-### 2.2 OA/S product slices (M47)
-
-| Suite | Pass / Total | % | Δ M46 | Need ~**90%** |
-|-------|-------------:|--:|------:|-------------:|
-| **Object** | **2464 / 3411** | **72.5%** | 0 | **~+606** |
-| **Array** | **2083 / 3081** | **68.2%** | **+4** | **~+690** |
-| **String** | **759 / 1223** | **62.2%** | 0 | **~+342** |
-
-### 2.3 Recent moles
-
-| Mole | Focus |
-|------|--------|
-| **M45** | array-like mutators; includes; Symbol.toStringTag |
-| **M46** | ArrayLike accessor Get/Has; String ToInteger Inf/NaN |
-| **M47** | **Product bar → 90% each**; ArraySpeciesCreate IsConstructor + species undef |
+JSON: `results/test262_full_m47.json`
 
 ---
 
-## 3. Active plan — crush to **90% each** by dependency
+## Why language fell while built-ins rose
 
-### Done (keep green)
+See plan. Short version:
 
-- [x] UTF-16 string surface + key reclaim (M31+)  
-- [x] Number ToString scientific / short form (M37)  
-- [x] String unicode escapes in lexer + CreateString UTF-8 (M37)  
-- [x] Function indexed props + instanceof Function/Array (M37)  
-- [x] defineProperty reject before write (M38)  
-- [x] ParseNumberStr on UTF-16 (M38)  
-- [x] **new String index keys stable** (M39)  
-- [x] **Boolean/Number/String.prototype → Object.prototype** (M39)  
-- [x] **DescField accessor keys UTF-16** (M39)  
-- [x] **defineProperties enumerable only** (M39)  
-
-### Next crush order
-
-1. **Object defineProperty residual** (`15.2.3.6-4` redefine, propertyHelper, symbols) + **gOPD**  
-2. **defineProperties residual** + create/assign/keys  
-3. **Array callbacks** map/filter/reduce/forEach (array-like; **not** fromAsync)  
-4. **String** indexOf/slice/substring/trim residual (non-RegExp)  
-5. RegExp → replace/match/search  
-6. Promise polish → language reclaim → full rescore toward 95%  
-
-### Fail mass (M39)
-
-| Area | ~fails | Note |
-|------|-------:|------|
-| Object/defineProperty | 288 | redefine mass |
-| Object/defineProperties | 175 | residual |
-| Object/gOPD | 119 | |
-| Array reduce* | ~100 ea | |
-| Array fromAsync | 95 | **skip desert** |
-| Array map/filter/… | 50–70 ea | |
-| String replace*/match/search | high | RegExp dep |
+- M38–M47 optimized **Object/Array/String/property model**.
+- Shared paths (`function.name` !W, CallFunc this, PropTable, species, array holes) **broke class/dstr/name tests** (~492 of ~740 language regressions).
+- Net full **+174** only: language −591 ≈ cancelled half of built-ins gains.
+- **Fix order now:** reclaim language (SetFunctionName → class → object → for-of → arguments → async/modules), **then** grind OA/S to 90% each, **then** full 90%.
 
 ---
 
-## 4. Commands
+## OA/S product slices (M47)
+
+| Suite | Pass / Total | % | Need ~90% |
+|-------|-------------:|--:|----------:|
+| Object | 2464 / 3411 | 72.5% | +606 |
+| Array | 2083 / 3081 | 68.2% | +690 |
+| String | 759 / 1223 | 62.2% | +342 |
+
+---
+
+## Active work
+
+1. **M48 residual** — finish SetFunctionName paths (dstr global, object lit stack-safe); midgate; language slice.  
+2. Knock language bugs in fail-mass order (class → object → for-of → arguments).  
+3. Resume OA/S crush without regressing language.
 
 ```bash
 python3 tools/js_midgate.py --rebuild --quick
+python3 tools/test262_runner.py --paths 'language/statements/class,language/expressions/object' -j 8
 python3 tools/test262_runner.py --paths 'built-ins/Object,built-ins/Array,built-ins/String' -j 8
-python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<tag>.json
 ```
-
-Prefer int. No Temporal/TA. Full suite only at milestones.

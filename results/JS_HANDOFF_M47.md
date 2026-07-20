@@ -1,8 +1,8 @@
 # JS Engine Handoff — M47
 
 **Branch:** `gpu-45-may-baseline-restore`  
-**Long goal:** ~**95%** usable JS.  
-**Product gate (bumped):** Object, Array, and String each **≥90%** on test262 (**not** aggregate).
+**Hard goal:** **90% full test262 / working JS engine, all features.**  
+**Checkpoints:** language ≥90%, OA/S each ≥90%, then full ≥90%.
 
 ## Scores
 
@@ -76,4 +76,8 @@ Prefer int. No Temporal/TA/fromAsync.
 
 **M48:** SetFunctionName path fixed (function.name define). Expect large class/dstr reclaim on next language slice / full.
 
-**Plan:** language first (names → object → for-of → arguments) → built-ins second → deserts last. Gate remains **OA/S 90% each** + language climb toward 90%.
+**Plan (updated):** **90% full engine, period.** Language first (names → class → object → for-of → arguments → async/modules) → OA/S 90% each → remaining built-ins → full 90%. See `JS-DEPENDENCY-PLAN.md`.
+
+### Why language regressed on built-ins (M37→M47)
+
+Built-in moles shared VM paths: `function.name` CanAssign fail (~492 class/dstr), CallFunc this-bind, PropTable, species, holes. Built-ins **+759**, language **−591**, full only **+174**. Reclaim language before more OA/S thrash.

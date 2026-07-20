@@ -1,134 +1,136 @@
-# JS Engine — Dependency Plan
+# JS Engine — Plan to **90%** (full suite, all features)
 
-**Updated:** 2026-07-19 (M47)  
-**New session:** start at [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md).
+**Updated:** 2026-07-19 (post M47 + M48 language pivot)  
+**Branch:** `gpu-45-may-baseline-restore`  
+**Handoff:** [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md) · full baseline [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md)
 
-**Goal:** Browser-usable JS → long **~95%** full suite.  
-**Product gate (near-term):** **Object, Array, and String each ≥90%** on test262 trees (not aggregate).
+---
+
+## Goal (hard)
+
+| Bar | Target | Now (M47) |
+|-----|-------:|----------:|
+| **Full test262** | **≥90%** | **46.1%** (22974/49998) |
+| **Language** | **≥90%** | 65.2% |
+| **built-ins** (usable surface) | **≥90%** | 28.8% (Temporal/TA deserts dominate fails) |
+| **Object / Array / String** | **each ≥90%** | 72.5 / 68.2 / 62.2 |
+| Product | Working JS engine, **all language features + core built-ins** | partial |
+
+**Interpretation:** “90% period” means a **usable engine** — language complete enough that real code runs, core Object/Array/String/Function/Promise/RegExp solid, modules/async not deserts forever. Full 50k at 90% ≈ **+22k passes** from today (~500 tests per full-suite pp).
+
+**Not excused by deserts forever:** Temporal / TypedArray / Atomics / full Proxy can stay last-mile, but **language, OA/S, Promise, RegExp, iterators, classes, modules basics** are in scope for 90%.
+
+---
+
+## Why the needle barely moves (and language regressed)
+
+M37 → M47 full: **+174** tests (~**0.35pp**) while OA/S climbed.
+
+| Slice | M37 | M47 | Δ |
+|-------|----:|----:|--:|
+| full | 45.6% | **46.1%** | **+174** |
+| language | **67.7%** | **65.2%** | **−591** |
+| built-ins | 25.5% | **28.8%** | **+759** |
+
+**What happened:** moles M38–M47 were **built-in / property-model** work (defineProperty, ArrayLike accessors, species, pad UTF-16, PropTable 128, Date ID, CallFunc this-bind, etc.). That **reclaimed OA/S** and built-ins mass, but several shared paths **broke language tests**:
+
+1. **SetFunctionName / `function.name` (~492 of ~740 language regressions)**  
+   Class / arrow / dstr defaults need `[[DefineOwnProperty]]` for `name` (`!W` `C`). Ordinary `SET_PROP` hit `CanAssign` fail → empty names → **class fn-name dstr** cascade.  
+   **M48:** FUNCTION + `"name"` → `JSRT_FuncPropSet`; compiler emits SetFunctionName for param defaults, array/obj dstr (local **and** global), object-literal properties.
+
+2. **Shared VM / property / CallFunc changes**  
+   this-bind on natives, PropTable size, array hole→proto, species Construct — intended for built-ins, but language tests use the same object model and fail when semantics drift.
+
+3. **Math:** 1pp full ≈ **500** tests. Language −591 nearly cancelled built-ins +759 → full only +174.
+
+**Lesson:** Prefer **language-safe** property/CallFunc changes; after every built-in mole, rescore a **language slice** (class + dstr + object), not only OA/S.
+
+---
+
+## March order (to 90% full)
+
+```
+PHASE L — Language reclaim (NOW)
+  L1  SetFunctionName complete (class/param/dstr/object lit)   ← M48 in flight
+  L2  class residual (private, static, heritage)
+  L3  object literal / computed / methods
+  L4  for-of / iterators / generators
+  L5  arguments-object
+  L6  async / await / for-await (not desert)
+  L7  modules / dynamic-import basics
+        │
+        ▼  language ≥ ~80% then keep climbing
+PHASE B — Built-ins to product bar
+  B1  Object → 90% (defineProperty residual, gOPD, freeze/seal)
+  B2  Array  → 90% (concat, reduce residual, sort/splice, species done)
+  B3  String → 90% (non-RegExp polish → RegExp-backed replace/match)
+  B4  Function / Promise / RegExp / Date / Map-Set basics
+        │
+        ▼  OA/S each ≥90%, language ≥90%
+PHASE F — Full suite → 90%
+  F1  close deserts that still own fail mass (or ship stubs that pass tests)
+  F2  full 50k rescore at milestones only
+```
+
+**Gates after every mole:**
+
+```bash
+python3 tools/js_midgate.py --rebuild --quick   # must PASS
+# language smoke (cheap):
+python3 tools/test262_runner.py --paths 'language/expressions/object,language/statements/class,language/expressions/arrow-function' -j 8
+# product:
+python3 tools/test262_runner.py --paths 'built-ins/Object,built-ins/Array,built-ins/String' -j 8
+```
+
+Full 50k only at milestones (post L1 reclaim, post OA/S 80%, post OA/S 90%, …).
+
+---
+
+## Distance math (M47)
+
+| Track | Pass | Target 90% | Still need |
+|-------|-----:|-----------:|-----------:|
+| Full | 22974 | ~44998 | **~+22000** |
+| Language | 15581 | ~21509 | **~+5928** |
+| Object | 2464 | 3070 | **+606** |
+| Array | 2083 | 2773 | **+690** |
+| String | 759 | 1101 | **+342** |
+
+Language reclaim from names alone may be **+400–700** (class/dstr). That is real full-suite movement (~1pp) **without** more built-in thrash.
+
+---
+
+## Active mole — M48+ (language first)
+
+| Item | Status |
+|------|--------|
+| SET_PROP function.name → FuncPropSet | **landed** (153dff57) |
+| Param default SetFunctionName | in compiler |
+| Array/obj dstr SetFunctionName (local+global) | in compiler |
+| Object-literal `{bar: function(){}}` name | in compiler |
+| midgate green + language slice rescore | **next** |
+| Commit residual M48 when green | next |
+
+Then knock bugs in order: remaining class fn-name → object expr → for-of → arguments → async/modules.
+
+---
+
+## Rules
 
 | Rule | |
 |------|--|
-| Order | **Object attributes** → **Array callbacks / array-like** → **String methods (non-RegExp)** → RegExp/replace → Promise → full rescore |
-| Honesty | Generators / function / call: **`--no-batch`** when needed |
-| Style | **Wrap over write** — Ailang/runtime primitives; thin JS surface |
+| Goal | **90% full engine, all features** — not aggregate OA/S-only theater |
+| Order | **Language first**, then OA/S, then deserts |
+| Honesty | Generators / call / function: `--no-batch` when needed |
+| Style | Wrap over write — Ailang primitives, thin JS surface |
 | Gate | Midgate green after every mole |
-| Deserts | **Skip** Temporal, TypedArray, fromAsync until OA/S each ≥90% |
-| Score | Report **pass deltas (+N)**; full 50k only at milestones |
+| Score | Report **pass deltas (+N)**; full 50k at milestones |
+| Regression | Language slice must not tank while “winning” built-ins |
 
 ---
 
-## Summary (now) — 2026-07-19 post M47 full suite
+## Living docs
 
-> **Full suite high-water (M47 harness):** **22974 / 49998 (46.1%)** — **new high** (M37 was 45.6%).  
-> Writeup: [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md).
-
-| Gate | Score | Notes |
-|------|------:|-------|
-| e2e + midgate core | **PASS** | post-M47 |
-| **full (M47 harness)** | **22974 / 49998 (46.1%)** | `results/test262_full_m47.json` · wall ~47 min |
-| language (full M47) | **65.2%** | was 67.7% M37 · built-ins carried net gain |
-| built-ins (full M47) | **28.8%** | was 25.5% M37 · Temporal still desert |
-| **Object slice M47** | **2464 / 3411 (72.5%)** | need ~**+606** → **90%** |
-| **Array slice M47** | **2083 / 3081 (68.2%)** | need ~**+690** → **90%** |
-| **String slice M47** | **759 / 1223 (62.2%)** | need ~**+342** → **90%** |
-
-**Living scoreboard:** [`BROWSER_CONFORMANCE.md`](./BROWSER_CONFORMANCE.md)
-
----
-
-## Dependency DAG (march to **90% each** OA/S → ~95% full)
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Object.defineProperty / gOPD / attr bits / redefine        │  ← M33–M39 in flight
-│  defineProperties (enumerable only) / wrapper prototypes    │  ← M39 landed
-└───────────────────────────┬─────────────────────────────────┘
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  Array-like: String boxes (stable index keys), Function[i]  │  ← M37/M39
-│  Number("n") / length string (ParseNumberStr UTF-16)        │  ← M38
-│  Array callbacks: map/filter/reduce/forEach/some/every      │  ← NEXT mass
-└───────────────────────────┬─────────────────────────────────┘
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  String methods: trim* (mostly done), indexOf, slice,       │
-│  substring, split (non-RegExp) → then replace*/match/search │
-└───────────────────────────┬─────────────────────────────────┘
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  RegExp + Promise + language reclaim → OA/S 90% each → ~95% │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Skip until core green:** `Array.fromAsync`, Temporal, TypedArray/Atomics, Map/Set/Proxy deserts.
-
----
-
-## Landed moles (M31 → M39)
-
-| Mole | Focus | OA/S impact |
-|------|--------|-------------|
-| M31a–e | UTF-16 strings + key reclaim | full 38.3% floor |
-| M32–M33 | defineProperty array indices, this, accessors | Object climb |
-| M34–M35 | entries/fromEntries, wrappers, method this, String.proto | String +13pp |
-| M36–M37 | Number ToString, unicode `\u`/`\x`, Function index, instanceof | full **45.6%** |
-| **M38** | defineProperty value-after-reject; ParseNumberStr StrUnit | O+61 A+61 |
-| **M39** | String index slab keys; B/N/S → Object.prototype; DescField MakeAccKey; defineProperties enumerable; Array.length attrs | O+43 |
-
-### M39 detail (done — keep testing)
-
-- **Slab-copy** `new String` / `Object(string)` index keys (`IntToStr` static buf)
-- Re-link **Boolean/Number/String.prototype → Object.prototype** after Object install
-- **DescField** accessor keys via `JSBridge__MakeAccKey` (UTF-16 field names)
-- **defineProperties** only **enumerable** own keys
-- **GetAttrBits** Array.length `W !E !C`; Function name/length `!W !E C`
-
----
-
-## Next (crush residual)
-
-### OA1 — Object (need ~+357)
-
-| Bucket | Fail ~ | Work |
-|--------|-------:|------|
-| defineProperty | **288** | mostly `15.2.3.6-4` redefine / propertyHelper / symbols |
-| defineProperties | **175** | residual after enumerable filter |
-| gOPD | **119** | function name/length, array length, accessors |
-| seal/freeze/create/assign/keys | ~120 | attrs + enum |
-
-### A1 — Array (need ~+685)
-
-| Bucket | Fail ~ | Work |
-|--------|-------:|------|
-| reduce / reduceRight | ~100 each | array-like, callback args, holes |
-| map/filter/forEach/some/every | ~50–70 each | thisArg, species, array-like |
-| fromAsync | **95** | **DESERT — skip** |
-| concat / indexOf / lastIndexOf | ~50 | species, fromIndex, String boxes |
-
-### S1 — String (need ~+314)
-
-| Bucket | Fail ~ | Work |
-|--------|-------:|------|
-| replaceAll / replace / match / search | high | **RegExp dependency** |
-| split / raw / locale* | medium | locale desert lower ROI |
-| trimEnd / indexOf / substring / slice | medium | non-RegExp polish |
-
----
-
-## Gates
-
-```bash
-python3 tools/js_midgate.py --rebuild --quick
-python3 tools/test262_runner.py --paths 'built-ins/Object,built-ins/Array,built-ins/String' -j 8
-# milestone only
-python3 tools/test262_runner.py --full -j 8 --output-json results/test262_full_<tag>.json
-```
-
-| When | What |
-|------|------|
-| Every rebuild | midgate `--rebuild --quick` |
-| While implementing | feature **slice** |
-| OA/S mole done | Object + Array + String slices |
-| Major milestone | full `--full` + `results/FULL_SUITE_*.md` |
-
-Prefer int. No Temporal/TA. Full suite only at milestones.
+- Scoreboard: [`BROWSER_CONFORMANCE.md`](./BROWSER_CONFORMANCE.md)
+- Full M47: [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md)
+- Session handoff: [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md)
