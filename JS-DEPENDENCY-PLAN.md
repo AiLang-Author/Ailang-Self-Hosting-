@@ -18,8 +18,9 @@
 | **M58** | try/finally no-catch normal path; func TDZ hoist | for-of **~632/751** |
 | **M59** | ITER_CLOSE GetMethod (`return` getter/null); `FRESH_LET_ENV` per-iter let/const; script_env free-var capture | for-of **630/751 (85.1%)**; head-let/const-fresh + get-method-null green |
 | **M60** | free-var TDZ sentinel; IteratorClose throw stack restore; script-var free GET_GLOBAL | for-of **642/751 (86.8%, +12)**; throw.js + init-let green |
+| **M61** | for-of member PutValue → IteratorClose; ArrayLikeGet getters on array cursor | for-of **644/751 (87.0%)**; body-put-error + array-key-get-error |
 
-**Next language targets:** for-of dstr residual → 90% slice, Map/Set, class private/async, OA/S → 90%.
+**Next:** for-of → ~90% (~32 more; Map/Set/TA deserts + dstr/scope). Then **full suite baseline**. Then gaps by dependency order (below).
 
 ---
 
