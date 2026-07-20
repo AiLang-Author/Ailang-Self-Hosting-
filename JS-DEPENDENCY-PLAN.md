@@ -90,8 +90,8 @@ PHASE F — Full suite → 90%
 |------|--------|
 | for-of ≥90% | **DONE** (dedicated 672/751) |
 | Full suite M65 baseline | **DONE** (49.6%) |
-| **Next mole** | **L3 object expr** residual (computed names, methods, spread/assign edge, __proto__) |
-| Then | L2 class fail clusters (private/static/heritage/fn-name residual) |
+| **Next mole** | **L3 object** residual: scope-meth/getter lex, cpn-*, fn-name-accessor, setter-prop-desc; skip async-gen desert |
+| Then | L2 class fail clusters (private/static/heritage) |
 | Gate | midgate + object slice + class smoke |
 
 ```bash
