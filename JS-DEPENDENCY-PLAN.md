@@ -1,8 +1,24 @@
 # JS Engine — Plan to **90%** (full suite, all features)
 
-**Updated:** 2026-07-19 (post M47 + M48 language pivot)  
+**Updated:** 2026-07-20 (M59 for-of let + IteratorClose GetMethod)  
 **Branch:** `gpu-45-may-baseline-restore`  
 **Handoff:** [`results/JS_HANDOFF_M47.md`](./results/JS_HANDOFF_M47.md) · full baseline [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md)
+
+### Recent moles (post M47)
+
+| Mole | Fix | Slice note |
+|------|-----|------------|
+| M48–M51b | SetFunctionName, methods/super, Array keys/entries | class/method-def, for-of iterators |
+| **M52** | `ASTType.ELISION` vs `[null]`; UTF-16-safe `OBJ_SPREAD`/`Object.assign` getters | for-of ~592/751; **object expr ~917/1161 (79%)** |
+| **M53** | Labeled break/continue (parser kept labels; label stack) | for-of **595/751 (80.4%)**; break 18/20; continue 21/24 |
+| **M54** | for-of **iterator protocol** (not eager `TO_ARRAY`) + break→`ITER_CLOSE` | for-of **617/751 (83.4%, +22)**; 0 reg |
+| **M55** | IteratorClose on return/throw/outer-continue; do-while continue→cond; per-rec `__c__` | for-of **620/751 (83.8%)**; close-via-* green |
+| **M56** | Gen.return runs finally; YIELD saves try handlers; force_return abrupt | for-of **625/751 (84.5%, +5)** |
+| **M57** | IteratorClose preserves outer try handlers across gen.return | for-of close-via-throw path |
+| **M58** | try/finally no-catch normal path; func TDZ hoist | for-of **~632/751** |
+| **M59** | ITER_CLOSE GetMethod (`return` getter/null); `FRESH_LET_ENV` per-iter let/const; script_env free-var capture | for-of **630/751 (85.1%)**; head-let/const-fresh + get-method-null green |
+
+**Next language targets:** throw.js residual (~6 reg from M59 free-var dual-write), for-of dstr, Map/Set, class private/async, OA/S → 90%.
 
 ---
 
