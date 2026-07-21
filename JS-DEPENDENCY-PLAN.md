@@ -28,8 +28,9 @@
 | **M67** | `??` stack fix; Function ToPropertyKey; Symbol accessor names; computed `in` in for-init | object **968/1161 (83.5%)** |
 | **M68** | setter defaults; `&&=`/`||=`/`??=` short-circuit; ToPropertyKey-before-value; `Object.setPrototypeOf` | object **977/1161 (84.2%, +9 vs M67)** |
 | **M69** | `SET_PROP_SUPER` (`super.x=`); string LineContinuation; bare CALL strict `this` | object **980/1161 (84.5%, +3 vs M68)** |
+| **M70** | BigInt property names (`1n`); gen args pin/recreate on resume; assert.sameValue inline | object **981/1161 (84.5%, +1)** |
 
-**L4 for-of: DONE.** **L3 object: in progress** (80.9% → **84.5%**; residual ~181, ~124 async-gen desert).
+**L4 for-of: DONE.** **L3 object: in progress** (80.9% → **84.5%**; residual ~180, ~124 async-gen desert).
 
 ---
 
@@ -93,7 +94,7 @@ PHASE F — Full suite → 90%
 |------|--------|
 | for-of ≥90% | **DONE** (672/751) |
 | Full suite M65 | **DONE** (49.6%) |
-| L3 object M66–M69 | **980/1161 (84.5%)** |
+| L3 object M66–M70 | **981/1161 (84.5%)** |
 | **Next** | L3 residual non-async (~55): scope-meth lex/eval, method-def yield, Proxy rest, computed-`__proto__`, bigint keys |
 | Skip | async-gen method dstr (~124 → L6) |
 | Then | **L2 class** (~78–79%) when L3 non-async plateaus |
@@ -154,3 +155,4 @@ Class reclaim alone (stmt+expr → 90%) ≈ **+1.0–1.2k language** if achievab
 | **M65** | **49.6%** | **71.3%** | for-of ≥90% |
 | M68 object | — | object expr **84.2%** | +9 vs M67 dedicated slice |
 | M69 object | — | object expr **84.5%** | super set + line-cont + strict this |
+| M70 object | — | object expr **981/1161** | BigInt keys + gen args plumbing |
