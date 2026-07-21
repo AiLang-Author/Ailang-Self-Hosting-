@@ -1,6 +1,6 @@
 # JS Engine — Plan to **90%** (full suite, all features)
 
-**Updated:** 2026-07-20 (M66 L3 object grind)  
+**Updated:** 2026-07-20 (M68 L3 object grind)  
 **Branch:** `gpu-45-may-baseline-restore`  
 **Full baseline:** [`results/FULL_SUITE_M65.md`](./results/FULL_SUITE_M65.md) · JSON `results/test262_full_m65.json`  
 **Prior:** [`results/FULL_SUITE_M47.md`](./results/FULL_SUITE_M47.md)
@@ -25,9 +25,10 @@
 | **M65** | for-let validation scope, multi-var body, next getters, eval cptn | for-of **672/751 (90.8%)** ✅ |
 | **M66** | Object lit **computed getters/setters**; UTF-16 keys; Array ToPropertyKey=join | object **960/1161 (82.7%)** |
 | **M66b** | DEF_SETTER own-key placeholder; accessor `name` = `get `/`set ` + key | object **961/1161 (82.8%)** |
-| **M67** | `??` stack fix; Function ToPropertyKey; Symbol accessor names; computed `in` in for-init | object **968/1161 (83.5%, +7 vs M66b)** |
+| **M67** | `??` stack fix; Function ToPropertyKey; Symbol accessor names; computed `in` in for-init | object **968/1161 (83.5%)** |
+| **M68** | setter defaults; `&&=`/`||=`/`??=` short-circuit; ToPropertyKey-before-value; `Object.setPrototypeOf` | object **977/1161 (84.2%, +9 vs M67)** |
 
-**L4 for-of: DONE.** **L3 object: in progress** (80.9% → 82.8%; residual ~199, ~120 async-gen desert).
+**L4 for-of: DONE.** **L3 object: in progress** (80.9% → **84.2%**; residual ~184, ~124 async-gen desert).
 
 ---
 
@@ -50,7 +51,7 @@
 PHASE L — Language (ACTIVE)
   L1  SetFunctionName / names          ✅ largely done (M48+)
   L2  class residual (stmt+expr ~1.8k fails)     ← biggest language fail mass
-  L3  object literal / computed / methods (~225 fails @ 80.6%)
+  L3  object literal / computed / methods (~184 fails @ 84.2%)
   L4  for-of / iterators / generators          ✅ for-of ≥90% (M65)
   L5  arguments-object (~45%)
   L6  async / await / for-await (~40–53%)
@@ -73,7 +74,7 @@ PHASE F — Full suite → 90%
 
 | Priority | Slice | Why next |
 |----------|-------|----------|
-| **1. L3 object** | expr object ~81% | Feeds class methods, OA built-ins, spread/assign; smaller surface than class |
+| **1. L3 object** | expr object **84.2%** | Feeds class methods, OA built-ins, spread/assign; smaller surface than class |
 | **2. L2 class** | ~78–79% | Largest language fail mass; needs object/method/super solid |
 | **3. L5 arguments** | ~45% | Call/apply/strict; unblocks many built-in tests |
 | **4. L6 async** | async + for-await | Real apps; for-of protocol already green |
@@ -85,22 +86,34 @@ PHASE F — Full suite → 90%
 
 ---
 
-## Active focus — L3 object (M66+)
+## Active focus — L3 object (M68 done → residual)
 
 | Item | Status |
 |------|--------|
 | for-of ≥90% | **DONE** (672/751) |
 | Full suite M65 | **DONE** (49.6%) |
-| L3 object accessors + `??` + func keys | **M66–M67** → **968/1161 (83.5%)** |
-| **Next** | L3 residual non-async (~75): scope-meth lex/eval, remaining cpn/method-def, Proxy rest |
-| Skip | async-gen method dstr (~120 → L6) |
-| Then | **L2 class** (~78–79%) |
+| L3 object M66–M68 | **977/1161 (84.2%)** |
+| **Next** | L3 residual non-async (~60): scope-meth lex/eval, method-def yield/strict, Proxy rest, computed-`__proto__`, bigint keys |
+| Skip | async-gen method dstr (~124 → L6) |
+| Then | **L2 class** (~78–79%) when L3 non-async plateaus |
 | Gate | midgate + `language/expressions/object` |
 
 ```bash
 python3 tools/js_midgate.py --rebuild --quick
 python3 tools/test262_runner.py --paths 'language/expressions/object' -j 8
 ```
+
+### M68 residual buckets (184 fails)
+
+| Bucket | ~N | Action |
+|--------|---:|--------|
+| async* (gen/meth) | ~124 | **skip → L6** |
+| method-def (yield/strict/static-init) | ~24 | pick easy; many yield-in-non-strict |
+| scope-meth/setter/getter | ~16 | paramsbody varEnv / eval SyntaxError |
+| proxy rest/spread | ~6 | desert |
+| other (bigint keys, line-cont, `__proto__` computed, prop-def with/Proxy) | ~14 | selective |
+
+Need **+68** for object-expr 90% (1045/1161) — almost all non-async residual.
 
 ---
 
@@ -137,4 +150,5 @@ Class reclaim alone (stmt+expr → 90%) ≈ **+1.0–1.2k language** if achievab
 |-----------|-------:|-----------:|-------|
 | M37 | 45.6% | 67.7% | pre OA/S thrash high |
 | M47 | 46.1% | 65.2% | built-in moles; language dip |
-| **M65** | **49.6%** | **71.3%** | **current**; for-of ≥90% |
+| **M65** | **49.6%** | **71.3%** | for-of ≥90% |
+| M68 object | — | object expr **84.2%** | +9 vs M67 dedicated slice |
