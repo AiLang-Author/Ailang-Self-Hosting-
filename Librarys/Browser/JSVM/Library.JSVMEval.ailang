@@ -6,7 +6,8 @@
 //   - saves/restores outer bytecode so compile does not clobber caller
 //   - eval_mode: last expression leaves value on stack as result
 //
-// Not yet: direct-eval local scope, indirect eval differences, new Function.
+// M81: new Function(...args) via JSVM_FunctionNative.
+// Not yet: direct-eval local scope, full indirect-eval differences.
 //
 // Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
 
@@ -280,6 +281,31 @@ Function.JSVM_EvalSource {
         bc_len = JSComp_GetCodeLen()
         cp = JSComp_GetConst(0)
         cc = JSComp_GetConstCount()
+
+        // M81: permanent code+const image for functions created during this eval.
+        // RestoreOuter rewrites the shared buffers; live closures keep these.
+        JSVMEvalState.pending_code = 0
+        JSVMEvalState.pending_code_len = 0
+        JSVMEvalState.pending_const = 0
+        JSVMEvalState.pending_const_n = 0
+        IfCondition GreaterThan(bc_len, 0) ThenBlock: {
+            own_c = Allocate(bc_len)
+            IfCondition NotEqual(own_c, 0) ThenBlock: {
+                MemoryCopy(own_c, bc, bc_len)
+                JSVMEvalState.pending_code = own_c
+                JSVMEvalState.pending_code_len = bc_len
+            }
+        }
+        csz_ev = Multiply(cc, 16)
+        IfCondition And(GreaterThan(cc, 0), NotEqual(cp, 0)) ThenBlock: {
+            own_p = Allocate(csz_ev)
+            IfCondition NotEqual(own_p, 0) ThenBlock: {
+                MemoryCopy(own_p, cp, csz_ev)
+                JSVMEvalState.pending_const = own_p
+                JSVMEvalState.pending_const_n = cc
+            }
+        }
+
         JSVM_Load(bc, bc_len, cp, cc)
         JSVM_SetStrict(JSComp_IsStrict())
 
@@ -290,6 +316,12 @@ Function.JSVM_EvalSource {
         IfCondition EqualTo(JSVMState.error, 1) ThenBlock: {
             eval_result = JSRT_Undefined()
         }
+
+        // Clear pending so outer LoadConst does not stamp residual images
+        JSVMEvalState.pending_code = 0
+        JSVMEvalState.pending_code_len = 0
+        JSVMEvalState.pending_const = 0
+        JSVMEvalState.pending_const_n = 0
 
         // Save result across restore
         JSVM__Push(eval_result)
@@ -403,5 +435,199 @@ Function.JSVM_EvalNative {
         }
         SetByte(cbuf, slen, 0)
         ReturnValue(JSVM_EvalSource(cbuf, slen))
+    }
+}
+
+// =============================================================================
+// M81: Flatten JS value → null-terminated C/Latin-1 buffer (for source build)
+// =============================================================================
+Function.JSVM__FlattenToCStr {
+    Input: val: Address
+    Output: Address
+    Body: {
+        save_v = val
+        IfCondition EqualTo(save_v, 0) ThenBlock: {
+            empty = JSRT__StrSlabAlloc(1)
+            IfCondition NotEqual(empty, 0) ThenBlock: { SetByte(empty, 0, 0) }
+            ReturnValue(empty)
+        }
+        // Already string → flatten units
+        sv = save_v
+        IfCondition NotEqual(JSRT_GetType(sv), JSType.STRING) ThenBlock: {
+            sv = JSRT_ToString(save_v)
+            IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: {
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(JSVMState.error, 1) ThenBlock: {
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(sv, 0) ThenBlock: {
+                empty = JSRT__StrSlabAlloc(1)
+                IfCondition NotEqual(empty, 0) ThenBlock: { SetByte(empty, 0, 0) }
+                ReturnValue(empty)
+            }
+        }
+        sptr = JSRT_GetPayload(sv)
+        IfCondition EqualTo(sptr, 0) ThenBlock: {
+            empty = JSRT__StrSlabAlloc(1)
+            IfCondition NotEqual(empty, 0) ThenBlock: { SetByte(empty, 0, 0) }
+            ReturnValue(empty)
+        }
+        slen = JSRT_StrLen(sptr)
+        cbuf = JSRT__StrSlabAlloc(Add(slen, 1))
+        IfCondition EqualTo(cbuf, 0) ThenBlock: { ReturnValue(0) }
+        ci = 0
+        WhileLoop LessThan(ci, slen) {
+            u = JSRT_StrUnit(sptr, ci)
+            IfCondition GreaterThan(u, 255) ThenBlock: { u = 63 }
+            SetByte(cbuf, ci, u)
+            ci = Add(ci, 1)
+        }
+        SetByte(cbuf, slen, 0)
+        ReturnValue(cbuf)
+    }
+}
+
+// C strlen for slab buffers
+Function.JSVM__CStrLen {
+    Input: p: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(p, 0) ThenBlock: { ReturnValue(0) }
+        n = 0
+        WhileLoop And(LessThan(n, 65536), NotEqual(GetByte(p, n), 0)) {
+            n = Add(n, 1)
+        }
+        ReturnValue(n)
+    }
+}
+
+// =============================================================================
+// M81: Function(...args) / new Function(...args)
+// Builds "(function(P0,P1,...){\n body \n})" and evals as expression.
+// =============================================================================
+Function.JSVM_FunctionNative {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+        // Collect formal params string and body
+        // argc==0: params="", body=""
+        // argc==1: params="", body=args[0]
+        // argc>=2: params=join(args[0..argc-2], ","), body=args[argc-1]
+        params_c = JSRT__StrSlabAlloc(1)
+        IfCondition NotEqual(params_c, 0) ThenBlock: { SetByte(params_c, 0, 0) }
+        body_c = JSRT__StrSlabAlloc(1)
+        IfCondition NotEqual(body_c, 0) ThenBlock: { SetByte(body_c, 0, 0) }
+
+        IfCondition EqualTo(save_argc, 1) ThenBlock: {
+            body_c = JSVM__FlattenToCStr(Dereference(save_args))
+            IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition GreaterThan(save_argc, 1) ThenBlock: {
+            // First formal
+            params_c = JSVM__FlattenToCStr(Dereference(save_args))
+            IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(params_c, 0) ThenBlock: {
+                params_c = JSRT__StrSlabAlloc(1)
+                IfCondition NotEqual(params_c, 0) ThenBlock: { SetByte(params_c, 0, 0) }
+            }
+            // Middle formals with commas
+            pi = 1
+            WhileLoop LessThan(pi, Subtract(save_argc, 1)) {
+                next_c = JSVM__FlattenToCStr(Dereference(Add(save_args, Multiply(pi, 8))))
+                IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: { ReturnValue(0) }
+                IfCondition EqualTo(next_c, 0) ThenBlock: {
+                    next_c = JSRT__StrSlabAlloc(1)
+                    IfCondition NotEqual(next_c, 0) ThenBlock: { SetByte(next_c, 0, 0) }
+                }
+                // params_c = params_c + "," + next_c
+                pn = JSVM__CStrLen(params_c)
+                nn = JSVM__CStrLen(next_c)
+                nbuf = JSRT__StrSlabAlloc(Add(Add(pn, nn), 2))
+                IfCondition NotEqual(nbuf, 0) ThenBlock: {
+                    MemoryCopy(nbuf, params_c, pn)
+                    SetByte(nbuf, pn, 44)
+                    MemoryCopy(Add(nbuf, Add(pn, 1)), next_c, nn)
+                    SetByte(nbuf, Add(Add(pn, nn), 1), 0)
+                    params_c = nbuf
+                }
+                pi = Add(pi, 1)
+            }
+            body_c = JSVM__FlattenToCStr(Dereference(Add(save_args, Multiply(Subtract(save_argc, 1), 8))))
+            IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(body_c, 0) ThenBlock: {
+                body_c = JSRT__StrSlabAlloc(1)
+                IfCondition NotEqual(body_c, 0) ThenBlock: { SetByte(body_c, 0, 0) }
+            }
+        }
+
+        // source = "(function(" + params + "){\n" + body + "\n})"
+        // prefix "(function(" = 10, "){\n" = 3, "\n})" = 3 → +16
+        pn2 = JSVM__CStrLen(params_c)
+        bn2 = JSVM__CStrLen(body_c)
+        total = Add(Add(pn2, bn2), 20)
+        src = JSRT__StrSlabAlloc(total)
+        IfCondition EqualTo(src, 0) ThenBlock: {
+            ReturnValue(JSRT_Undefined())
+        }
+        // "(function("
+        SetByte(src, 0, 40)
+        SetByte(src, 1, 102)
+        SetByte(src, 2, 117)
+        SetByte(src, 3, 110)
+        SetByte(src, 4, 99)
+        SetByte(src, 5, 116)
+        SetByte(src, 6, 105)
+        SetByte(src, 7, 111)
+        SetByte(src, 8, 110)
+        SetByte(src, 9, 40)
+        pos = 10
+        IfCondition GreaterThan(pn2, 0) ThenBlock: {
+            MemoryCopy(Add(src, pos), params_c, pn2)
+            pos = Add(pos, pn2)
+        }
+        // "){\n"
+        SetByte(src, pos, 41)
+        SetByte(src, Add(pos, 1), 123)
+        SetByte(src, Add(pos, 2), 10)
+        pos = Add(pos, 3)
+        IfCondition GreaterThan(bn2, 0) ThenBlock: {
+            MemoryCopy(Add(src, pos), body_c, bn2)
+            pos = Add(pos, bn2)
+        }
+        // "\n})"
+        SetByte(src, pos, 10)
+        SetByte(src, Add(pos, 1), 125)
+        SetByte(src, Add(pos, 2), 41)
+        SetByte(src, Add(pos, 3), 0)
+        src_len = Add(pos, 3)
+
+        fn = JSVM_EvalSource(src, src_len)
+        // Ensure [[Prototype]] is Function.prototype
+        IfCondition EqualTo(JSRT_GetType(fn), JSType.FUNCTION) ThenBlock: {
+            IfCondition NotEqual(JSRTState.function_proto, 0) ThenBlock: {
+                // engine stores function [[Prototype]] via FuncProp / __proto__
+                JSRT_FuncPropSet(fn, "__proto__", JSRTState.function_proto)
+            }
+            // name default "anonymous" if empty
+            nm = JSRT_FuncPropGet(fn, "name")
+            set_anon = 0
+            IfCondition EqualTo(nm, 0) ThenBlock: { set_anon = 1 }
+            IfCondition EqualTo(nm, JSRTState.undef_val) ThenBlock: { set_anon = 1 }
+            IfCondition EqualTo(set_anon, 0) ThenBlock: {
+                IfCondition EqualTo(JSRT_GetType(nm), JSType.STRING) ThenBlock: {
+                    IfCondition EqualTo(JSRT_StrLen(JSRT_GetPayload(nm)), 0) ThenBlock: {
+                        set_anon = 1
+                    }
+                }
+            }
+            IfCondition EqualTo(set_anon, 1) ThenBlock: {
+                JSRT_FuncPropSet(fn, "name", JSRT_CreateString("anonymous"))
+            }
+        }
+        ReturnValue(fn)
     }
 }
