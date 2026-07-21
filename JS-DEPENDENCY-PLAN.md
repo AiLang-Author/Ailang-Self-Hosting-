@@ -25,6 +25,7 @@
 | **M65** | for-let validation scope, multi-var body, next getters, eval cptn | for-of **672/751 (90.8%)** ✅ |
 | **M66** | Object lit **computed getters/setters**; UTF-16 keys; Array ToPropertyKey=join | object **960/1161 (82.7%)** |
 | **M66b** | DEF_SETTER own-key placeholder; accessor `name` = `get `/`set ` + key | object **961/1161 (82.8%)** |
+| **M67** | `??` stack fix (JMP_NULLISH); Function ToPropertyKey; computed accessor Symbol names | object **967/1161 (83.4%, +6)** |
 
 **L4 for-of: DONE.** **L3 object: in progress** (80.9% → 82.8%; residual ~199, ~120 async-gen desert).
 
@@ -90,8 +91,8 @@ PHASE F — Full suite → 90%
 |------|--------|
 | for-of ≥90% | **DONE** (672/751) |
 | Full suite M65 | **DONE** (49.6%) |
-| L3 computed accessors | **M66/M66b** → object **961/1161 (82.8%)** |
-| **Next** | L3 residual non-async (~80): scope-meth lex, cpn-*, fn-name Symbol attrs, Proxy rest/spread |
+| L3 object accessors + `??` + func keys | **M66–M67** → **967/1161 (83.4%)** |
+| **Next** | L3 residual non-async (~75): scope-meth lex/eval, remaining cpn/method-def, Proxy rest |
 | Skip | async-gen method dstr (~120 → L6) |
 | Then | **L2 class** (~78–79%) |
 | Gate | midgate + `language/expressions/object` |
