@@ -147,13 +147,28 @@ function $DONOTEVALUATE() { __test262_failed = 1; }
 function assert(mustBeTrue, message) {
   if (mustBeTrue !== true) { __test262_failed = 1; }
 }
+// M70: inline compare (no nested method call). Nested CALL_METHOD from
+// assert.sameValue → assert._isSameValue broke generator arguments restore
+// mid-body (params-dflt-*-args-unmapped and friends).
 assert._isSameValue = function(a, b) {
   if (a !== a && b !== b) return true;
   if (a === 0 && b === 0) return (1/a === 1/b);
   return a === b;
 };
-assert.sameValue = function(a, e, m) { if (!assert._isSameValue(a, e)) { __test262_failed = 1; } };
-assert.notSameValue = function(a, u, m) { if (assert._isSameValue(a, u)) { __test262_failed = 1; } };
+assert.sameValue = function(a, e, m) {
+  var ok = false;
+  if (a !== a && e !== e) { ok = true; }
+  else if (a === 0 && e === 0) { ok = (1/a === 1/e); }
+  else { ok = (a === e); }
+  if (!ok) { __test262_failed = 1; }
+};
+assert.notSameValue = function(a, u, m) {
+  var same = false;
+  if (a !== a && u !== u) { same = true; }
+  else if (a === 0 && u === 0) { same = (1/a === 1/u); }
+  else { same = (a === u); }
+  if (same) { __test262_failed = 1; }
+};
 assert.throws = function(E, fn, m) {
   var threw = false;
   var err = null;
