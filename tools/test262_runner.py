@@ -191,6 +191,13 @@ assert._toString = function(v) {
 };
 function $DONE(err) { if (err) { __test262_failed = 1; } }
 var $MAX_ITERATIONS = 100000;
+// M108: dual-bind harness globals onto globalThis (GlobalHash ≠ object props).
+// asyncHelpers asyncTest checks hasOwnProperty.call(globalThis, "$DONE").
+globalThis.$DONE = $DONE;
+globalThis.$MAX_ITERATIONS = $MAX_ITERATIONS;
+globalThis.assert = assert;
+globalThis.Test262Error = Test262Error;
+globalThis.__test262_failed = __test262_failed;
 function __isSameValue(a, b) {
   if (a !== a && b !== b) return true; // NaN
   if (a === 0 && b === 0) return (1 / a) === (1 / b); // ±0
