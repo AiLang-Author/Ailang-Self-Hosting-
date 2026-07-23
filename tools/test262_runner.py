@@ -481,8 +481,13 @@ def preprocess(source, meta=None):
 
 
 def _wants_strict(meta):
-    """True when test262 flags require strict mode."""
+    """True when test262 flags require strict mode.
+
+    Modules are always strict (ES2015+). onlyStrict also injects the directive.
+    """
     flags = (meta or {}).get("flags") or []
+    if "module" in flags:
+        return True
     return "onlyStrict" in flags and "noStrict" not in flags
 
 
