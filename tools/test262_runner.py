@@ -488,24 +488,13 @@ def preprocess(source, meta=None, test_path=None):
     return source
 
 
-def _preprocess_module(source, test_path):
-    """Rewrite ES module import/export for single-process harness.
-
-    Handles:
-      - export default function/class Name → keep declaration (engine strips export)
-      - import X from './same-or-fixture.js' → var X = <default binding>
-      - import { a as b, c } from './…' → var b = a; var c = c; (local names)
-      - import * as ns from './…' → skipped (namespace object later)
-      - Side-effect import './fix.js' → inline fixture body once
-
-    Not a full linker; enough to lift large module-code / import clusters.
-    """
-    path = Path(test_path)
-    base = path.parent
-    self_name = path.name
-
-    # Collect export default local name (function/class)
+def _collect_module_exports(source):
+    """Return (default_local_name_or_None, {exportName: localName})."""
     dflt = None
+    named = {}
+    # After anon rewrite, default lives on __default_export__
+    if re.search(r'\b__default_export__\b', source):
+        dflt = '__default_export__'
     m = re.search(
         r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+([A-Za-z_$][\w$]*)',
         source,
@@ -513,18 +502,12 @@ def _preprocess_module(source, test_path):
     if m:
         dflt = m.group(1)
     else:
-        # export default expr assigned later — look for export { x as default }
         m2 = re.search(r'export\s*\{[^}]*\b([A-Za-z_$][\w$]*)\s+as\s+default\b', source)
         if m2:
             dflt = m2.group(1)
-
-    # Named export map: exportedName -> localName from `export { local as exported }`
-    # and from `export let/const/var/function/class name`
-    named = {}
-    for m in re.finditer(
-        r'export\s*\{([^}]+)\}',
-        source,
-    ):
+        elif re.search(r'export\s+default\s+', source):
+            dflt = '__default_export__'
+    for m in re.finditer(r'export\s*\{([^}]+)\}', source):
         for part in m.group(1).split(','):
             part = part.strip()
             if not part:
@@ -539,14 +522,127 @@ def _preprocess_module(source, test_path):
         source,
     ):
         named[m.group(1)] = m.group(1)
+    if dflt:
+        named['default'] = dflt
+    return dflt, named
 
-    # Load fixture sources for relative imports (once each)
+
+_NAME_DEFAULT = (
+    "try{Object.defineProperty(__default_export__,'name',"
+    "{value:'default',configurable:true});}catch(e){}"
+)
+
+
+def _stamp_default_name_after(source, start_marker):
+    """Insert name-stamp after the statement starting at start_marker."""
+    idx = source.find(start_marker)
+    if idx < 0:
+        return source
+    i = idx + len(start_marker)
+    # Scan to end of statement: first ';' at brace/paren depth 0
+    brace = paren = 0
+    while i < len(source):
+        ch = source[i]
+        if ch == '{':
+            brace += 1
+        elif ch == '}':
+            brace -= 1
+        elif ch == '(':
+            paren += 1
+        elif ch == ')':
+            paren -= 1
+        elif ch == ';' and brace == 0 and paren == 0:
+            i += 1
+            return source[:i] + "\n" + _NAME_DEFAULT + "\n" + source[i:]
+        i += 1
+    # class/function decl without trailing semi: after balanced braces from first {
+    j = source.find('{', idx)
+    if j >= 0:
+        brace = 0
+        k = j
+        while k < len(source):
+            if source[k] == '{':
+                brace += 1
+            elif source[k] == '}':
+                brace -= 1
+                if brace == 0:
+                    k += 1
+                    return source[:k] + "\n" + _NAME_DEFAULT + "\n" + source[k:]
+            k += 1
+    return source + "\n" + _NAME_DEFAULT + "\n"
+
+
+def _rewrite_anon_default_export(source):
+    """Turn anonymous export default into var __default_export__ = …"""
+    source, n = re.subn(
+        r'export\s+default\s+class\s*\{',
+        'var __default_export__ = class {',
+        source,
+        count=1,
+    )
+    if n:
+        return _stamp_default_name_after(source, 'var __default_export__ = class')
+    source, n = re.subn(
+        r'export\s+default\s+(async\s+)?function(\s*\*)?\s*\(',
+        r'var __default_export__ = \1function\2(',
+        source,
+        count=1,
+    )
+    if n:
+        return _stamp_default_name_after(source, 'var __default_export__ = ')
+    if re.search(r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+[A-Za-z_$]', source):
+        return source  # named — leave for engine
+    source, n = re.subn(
+        r'export\s+default\s+',
+        'var __default_export__ = ',
+        source,
+        count=1,
+    )
+    if n:
+        return _stamp_default_name_after(source, 'var __default_export__ = ')
+    return source
+
+
+def _namespace_object_js(ns_name, export_map):
+    """JS Module-namespace-like object (data props; gOPD returns [[Value]])."""
+    lines = [f'var {ns_name} = Object.create(null);']
+    for exp, loc in sorted(export_map.items()):
+        prop_js = json.dumps(exp)
+        # Data descriptor: value is current binding (built at epilogue time)
+        lines.append(
+            f'Object.defineProperty({ns_name}, {prop_js}, {{'
+            f'value:{loc},writable:true,enumerable:true,configurable:false}});'
+        )
+    lines.append(
+        f'try{{Object.defineProperty({ns_name}, Symbol.toStringTag, {{'
+        f'value:"Module",writable:false,enumerable:false,configurable:true}});}}catch(e){{}}'
+    )
+    return "\n".join(lines)
+
+
+def _preprocess_module(source, test_path):
+    """Rewrite ES module import/export for single-process harness.
+
+    Handles:
+      - named + anonymous export default
+      - import X / {a as b} / * as ns from self or FIXTURE
+      - Side-effect import './fix.js' → inline fixture body once
+
+    Not a full linker; enough to lift large module-code / import clusters.
+    """
+    path = Path(test_path)
+    base = path.parent
+    self_name = path.name
+
+    # Anonymous default → __default_export__ before collecting maps
+    source = _rewrite_anon_default_export(source)
+    dflt, named = _collect_module_exports(source)
+
     fixtures = {}
 
     def load_spec(spec):
         if not spec.startswith('.'):
             return None
-        # strip ./
         rel = spec[2:] if spec.startswith('./') else spec
         cand = (base / rel).resolve()
         if not cand.is_file():
@@ -557,13 +653,7 @@ def _preprocess_module(source, test_path):
             fixtures[key] = _FRONTMATTER_RE.sub("", raw)
         return fixtures[key]
 
-    # Rewrite import declarations → bindings / fixture inlines
-    out_lines = []
-    # Keep track of inlined fixture keys
     inlined = set()
-
-    # Process source: remove import lines, append bindings at end of imports region
-    # Use regex multi-line for import statements
     import_re = re.compile(
         r'''^import\s+(?:
             (?P<def>[A-Za-z_$][\w$]*)\s*,\s*
@@ -580,6 +670,11 @@ def _preprocess_module(source, test_path):
     )
 
     fixture_chunks = []
+    ns_epilogues = []  # namespace objects after all decls (live getters)
+
+    def parse_exports_from(src):
+        src2 = _rewrite_anon_default_export(src)
+        return src2, _collect_module_exports(src2)
 
     def handle_import(m):
         nonlocal dflt, named
@@ -589,47 +684,28 @@ def _preprocess_module(source, test_path):
         is_self = Path(spec).name == self_name or spec in ('./' + self_name, self_name)
         fix_src = None if is_self else load_spec(spec)
 
-        # Side-effect import of fixture: inline once
         if m.group('side') and fix_src is not None:
             key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
             if key not in inlined:
                 inlined.add(key)
-                fs = re.sub(r'\bexport\s+default\s+', '', fix_src)
+                fs, _ = parse_exports_from(fix_src)
+                fs = re.sub(r'\bexport\s+default\s+', '', fs)
                 fs = re.sub(r'\bexport\s+', '', fs)
                 fixture_chunks.append(fs)
             return ''
 
-        # Pull default/named maps from fixture if not self
         f_dflt = dflt if is_self else None
         f_named = dict(named) if is_self else {}
         if fix_src is not None:
             key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
-            md = re.search(
-                r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+([A-Za-z_$][\w$]*)',
-                fix_src,
-            )
-            if md:
-                f_dflt = md.group(1)
-            for me in re.finditer(r'export\s*\{([^}]+)\}', fix_src):
-                for part in me.group(1).split(','):
-                    part = part.strip()
-                    if not part:
-                        continue
-                    if ' as ' in part:
-                        loc, exp = part.split(' as ', 1)
-                        f_named[exp.strip()] = loc.strip()
-                    else:
-                        f_named[part] = part
-            for me in re.finditer(
-                r'export\s+(?:async\s+)?(?:function\s*\*?|class|let|const|var)\s+([A-Za-z_$][\w$]*)',
-                fix_src,
-            ):
-                f_named[me.group(1)] = me.group(1)
+            fs, (fd, fn) = parse_exports_from(fix_src)
+            f_dflt, f_named = fd, fn
             if key not in inlined:
                 inlined.add(key)
-                fs = re.sub(r'\bexport\s+default\s+', '', fix_src)
-                fs = re.sub(r'\bexport\s+', '', fs)
-                fixture_chunks.append(fs)
+                fs2 = re.sub(r'\bexport\s+default\s+', '', fs)
+                # if already rewritten to var __default_export__, keep it
+                fs2 = re.sub(r'\bexport\s+', '', fs2)
+                fixture_chunks.append(fs2)
 
         repl = []
         defname = m.group('def') or m.group('defonly')
@@ -640,7 +716,10 @@ def _preprocess_module(source, test_path):
 
         ns = m.group('ns')
         if ns:
-            repl.append(f'var {ns} = {{}};')
+            # Defer namespace object to epilogue (after export bindings exist)
+            ns_epilogues.append(_namespace_object_js(ns, f_named if f_named else named))
+            # placeholder so name exists early if referenced mid-module (rare)
+            repl.append(f'var {ns};')
 
         named_clause = m.group('named')
         if named_clause:
@@ -661,7 +740,19 @@ def _preprocess_module(source, test_path):
 
     new_src = import_re.sub(handle_import, source)
 
-    # Fixtures first (define their locals), then main body with imports→bindings in place
+    # Fill namespace objects before first assert (exports already initialized above)
+    if ns_epilogues:
+        filled = []
+        for block in ns_epilogues:
+            block2 = re.sub(r'^var\s+([A-Za-z_$][\w$]*)\s*=', r'\1 =', block, count=1)
+            filled.append(block2)
+        ep = "\n".join(filled) + "\n"
+        m_as = re.search(r'\bassert\.', new_src)
+        if m_as:
+            new_src = new_src[: m_as.start()] + ep + new_src[m_as.start() :]
+        else:
+            new_src = new_src + "\n" + ep
+
     parts = []
     if fixture_chunks:
         parts.append("\n".join(fixture_chunks))
