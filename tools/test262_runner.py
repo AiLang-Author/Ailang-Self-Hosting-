@@ -474,10 +474,199 @@ def parse_frontmatter(source):
 # PREPROCESSOR
 # =============================================================================
 
-def preprocess(source, meta=None):
-    """Clean up test source for the Ailang JS engine (frontmatter strip only)."""
+def preprocess(source, meta=None, test_path=None):
+    """Clean up test source for the Ailang JS engine (frontmatter strip only).
+
+    Module tests get a best-effort link rewrite so self-imports and simple
+    same-dir FIXTURE modules become plain script bindings (engine still
+    parses export/import; this supplies the missing multi-module loader).
+    """
     source = _FRONTMATTER_RE.sub("", source)
+    flags = (meta or {}).get("flags") or []
+    if "module" in flags and test_path:
+        source = _preprocess_module(source, test_path)
     return source
+
+
+def _preprocess_module(source, test_path):
+    """Rewrite ES module import/export for single-process harness.
+
+    Handles:
+      - export default function/class Name → keep declaration (engine strips export)
+      - import X from './same-or-fixture.js' → var X = <default binding>
+      - import { a as b, c } from './…' → var b = a; var c = c; (local names)
+      - import * as ns from './…' → skipped (namespace object later)
+      - Side-effect import './fix.js' → inline fixture body once
+
+    Not a full linker; enough to lift large module-code / import clusters.
+    """
+    path = Path(test_path)
+    base = path.parent
+    self_name = path.name
+
+    # Collect export default local name (function/class)
+    dflt = None
+    m = re.search(
+        r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+([A-Za-z_$][\w$]*)',
+        source,
+    )
+    if m:
+        dflt = m.group(1)
+    else:
+        # export default expr assigned later — look for export { x as default }
+        m2 = re.search(r'export\s*\{[^}]*\b([A-Za-z_$][\w$]*)\s+as\s+default\b', source)
+        if m2:
+            dflt = m2.group(1)
+
+    # Named export map: exportedName -> localName from `export { local as exported }`
+    # and from `export let/const/var/function/class name`
+    named = {}
+    for m in re.finditer(
+        r'export\s*\{([^}]+)\}',
+        source,
+    ):
+        for part in m.group(1).split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if ' as ' in part:
+                loc, exp = part.split(' as ', 1)
+                named[exp.strip()] = loc.strip()
+            else:
+                named[part] = part
+    for m in re.finditer(
+        r'export\s+(?:async\s+)?(?:function\s*\*?|class|let|const|var)\s+([A-Za-z_$][\w$]*)',
+        source,
+    ):
+        named[m.group(1)] = m.group(1)
+
+    # Load fixture sources for relative imports (once each)
+    fixtures = {}
+
+    def load_spec(spec):
+        if not spec.startswith('.'):
+            return None
+        # strip ./
+        rel = spec[2:] if spec.startswith('./') else spec
+        cand = (base / rel).resolve()
+        if not cand.is_file():
+            return None
+        key = str(cand)
+        if key not in fixtures:
+            raw = cand.read_text(errors="replace")
+            fixtures[key] = _FRONTMATTER_RE.sub("", raw)
+        return fixtures[key]
+
+    # Rewrite import declarations → bindings / fixture inlines
+    out_lines = []
+    # Keep track of inlined fixture keys
+    inlined = set()
+
+    # Process source: remove import lines, append bindings at end of imports region
+    # Use regex multi-line for import statements
+    import_re = re.compile(
+        r'''^import\s+(?:
+            (?P<def>[A-Za-z_$][\w$]*)\s*,\s*
+          )?
+          (?:
+            \*\s+as\s+(?P<ns>[A-Za-z_$][\w$]*)
+            |\{(?P<named>[^}]*)\}
+            |(?P<defonly>[A-Za-z_$][\w$]*)
+          )?
+          \s*from\s*['"](?P<spec>[^'"]+)['"]\s*;?
+          |^import\s+['"](?P<side>[^'"]+)['"]\s*;?
+        ''',
+        re.MULTILINE | re.VERBOSE,
+    )
+
+    fixture_chunks = []
+
+    def handle_import(m):
+        nonlocal dflt, named
+        spec = m.group('spec') or m.group('side')
+        if not spec:
+            return ''
+        is_self = Path(spec).name == self_name or spec in ('./' + self_name, self_name)
+        fix_src = None if is_self else load_spec(spec)
+
+        # Side-effect import of fixture: inline once
+        if m.group('side') and fix_src is not None:
+            key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+            if key not in inlined:
+                inlined.add(key)
+                fs = re.sub(r'\bexport\s+default\s+', '', fix_src)
+                fs = re.sub(r'\bexport\s+', '', fs)
+                fixture_chunks.append(fs)
+            return ''
+
+        # Pull default/named maps from fixture if not self
+        f_dflt = dflt if is_self else None
+        f_named = dict(named) if is_self else {}
+        if fix_src is not None:
+            key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+            md = re.search(
+                r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+([A-Za-z_$][\w$]*)',
+                fix_src,
+            )
+            if md:
+                f_dflt = md.group(1)
+            for me in re.finditer(r'export\s*\{([^}]+)\}', fix_src):
+                for part in me.group(1).split(','):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    if ' as ' in part:
+                        loc, exp = part.split(' as ', 1)
+                        f_named[exp.strip()] = loc.strip()
+                    else:
+                        f_named[part] = part
+            for me in re.finditer(
+                r'export\s+(?:async\s+)?(?:function\s*\*?|class|let|const|var)\s+([A-Za-z_$][\w$]*)',
+                fix_src,
+            ):
+                f_named[me.group(1)] = me.group(1)
+            if key not in inlined:
+                inlined.add(key)
+                fs = re.sub(r'\bexport\s+default\s+', '', fix_src)
+                fs = re.sub(r'\bexport\s+', '', fs)
+                fixture_chunks.append(fs)
+
+        repl = []
+        defname = m.group('def') or m.group('defonly')
+        if defname and f_dflt:
+            repl.append(f'var {defname} = {f_dflt};')
+        elif defname and is_self and dflt:
+            repl.append(f'var {defname} = {dflt};')
+
+        ns = m.group('ns')
+        if ns:
+            repl.append(f'var {ns} = {{}};')
+
+        named_clause = m.group('named')
+        if named_clause:
+            for part in named_clause.split(','):
+                part = part.strip()
+                if not part:
+                    continue
+                if ' as ' in part:
+                    exp, loc = part.split(' as ', 1)
+                    exp, loc = exp.strip(), loc.strip()
+                else:
+                    exp = loc = part
+                src_local = f_named.get(exp, exp)
+                if exp == 'default' and f_dflt:
+                    src_local = f_dflt
+                repl.append(f'var {loc} = {src_local};')
+        return "\n".join(repl)
+
+    new_src = import_re.sub(handle_import, source)
+
+    # Fixtures first (define their locals), then main body with imports→bindings in place
+    parts = []
+    if fixture_chunks:
+        parts.append("\n".join(fixture_chunks))
+    parts.append(new_src)
+    return "\n".join(parts)
 
 
 def _wants_strict(meta):
@@ -582,7 +771,7 @@ def run_test(harness, test_path, timeout, verbose=False):
         return {"path": test_path, "status": "error", "reason": str(e), "time_ms": 0}
 
     meta = parse_frontmatter(source)
-    processed = preprocess(source, meta)
+    processed = preprocess(source, meta, test_path=test_path)
     full_source = assemble_source(processed, meta)
 
     tmp_path = getattr(_thread_local, 'tmp_path', TMP_FILE)
@@ -630,7 +819,7 @@ def _prepare_test(test_path):
     except Exception:
         return (test_path, {}, None)
     meta = parse_frontmatter(source)
-    processed = preprocess(source, meta)
+    processed = preprocess(source, meta, test_path=test_path)
     full = assemble_source(processed, meta)
     return (test_path, meta, full.encode("utf-8", errors="replace"))
 
