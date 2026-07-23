@@ -483,9 +483,33 @@ def preprocess(source, meta=None, test_path=None):
     """
     source = _FRONTMATTER_RE.sub("", source)
     flags = (meta or {}).get("flags") or []
+    features = (meta or {}).get("features") or []
     if "module" in flags and test_path:
         source = _preprocess_module(source, test_path)
+        # Top-level await: wrap in async IIFE so AWAIT_EXPR is valid (in_await)
+        if "top-level-await" in features or _source_has_toplevel_await(source):
+            source = _wrap_toplevel_await(source)
     return source
+
+
+def _source_has_toplevel_await(source):
+    """Heuristic: bare `await` token outside comments/strings (rough)."""
+    # Strip line comments
+    s = re.sub(r'//.*?$', '', source, flags=re.MULTILINE)
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.DOTALL)
+    return bool(re.search(r'(?m)(^|[^.\w$])await\s', s))
+
+
+def _wrap_toplevel_await(source):
+    """Run module body as async function so await is legal; signal $DONE."""
+    return (
+        "(async function() {\n"
+        + source
+        + "\n})().then("
+        "function(){ if (typeof $DONE === 'function') $DONE(); }, "
+        "function(e){ if (typeof $DONE === 'function') $DONE(e); else throw e; }"
+        ");\n"
+    )
 
 
 def _collect_module_exports(source):

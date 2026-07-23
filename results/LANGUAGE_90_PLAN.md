@@ -10,7 +10,7 @@
 
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
-| 1 | **module-code** | 30.7% | **48.3%** (M113) | 90% | Needs TLA for 90% |
+| 1 | **module-code** | 30.7% | **75.1%** (M114) | 90% | Needs TLA for 90% |
 | 2 | **import** | ~13% | **30.2%** | 90% | With module linker |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
@@ -20,10 +20,11 @@
 ### Module-code substeps
 1. ~~export/import parse + compile unwrap~~ (M112)
 2. ~~runner self-import + FIXTURE inline~~ (M112b)
-3. **Anonymous `export default`** → synthetic binding
-4. **`import * as ns`** → namespace object with exports
-5. Remaining instn-/eval-export edges
-6. **Top-level await** (blocking for module 90%)
+3. ~~Anonymous `export default` + name default~~ (M113)
+4. ~~`import * as ns` namespace object (data props)~~ (M113, partial 20/46)
+5. Remaining instn-/eval-export / namespace edges
+6. ~~Top-level await async IIFE wrap~~ (M114: TLA 75.5%)
+7. Remaining module fails (~182) → 90%
 
 ### Math for module-code 90%
 - 748 tests × 0.9 ≈ **674** passes (need ~+322 from 352)
@@ -44,4 +45,5 @@ Review dependencies (Proxy, species, TypedArray, Promise jobs), then Object/Arra
 ## Commits
 - M112: export/import keywords + parse/compile
 - M112b: module preprocess self-import + fixtures
-- (next) M113: anon default + namespace objects
+- M113: anon default + namespace objects (in progress)
+- (next) M114: top-level await in modules
