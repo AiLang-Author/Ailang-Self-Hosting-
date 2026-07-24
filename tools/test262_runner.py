@@ -500,6 +500,76 @@ def _source_has_toplevel_await(source):
     return bool(re.search(r'(?m)(^|[^.\w$])await\s', s))
 
 
+def _desugar_export_var_await_pattern(source):
+    """export var { x = await E } = {}; → export var x = await E; (brace-safe)."""
+    out = []
+    i = 0
+    needle = 'export var {'
+    while True:
+        j = source.find(needle, i)
+        if j < 0:
+            out.append(source[i:])
+            break
+        out.append(source[i:j])
+        # Parse: export var { NAME = await … } = {};
+        k = j + len(needle)
+        # skip ws
+        while k < len(source) and source[k] in ' \t\n\r':
+            k += 1
+        m = re.match(r'([A-Za-z_$][\w$]*)', source[k:])
+        if not m:
+            out.append(source[j:j + len(needle)])
+            i = j + len(needle)
+            continue
+        name = m.group(1)
+        k += len(name)
+        while k < len(source) and source[k] in ' \t\n\r':
+            k += 1
+        if k >= len(source) or source[k] != '=':
+            out.append(source[j:j + len(needle)])
+            i = j + len(needle)
+            continue
+        k += 1
+        while k < len(source) and source[k] in ' \t\n\r':
+            k += 1
+        if not source.startswith('await', k):
+            out.append(source[j:j + len(needle)])
+            i = j + len(needle)
+            continue
+        # scan await expression until } at brace/paren depth 0 (the pattern's close)
+        expr_start = k
+        brace = paren = 0
+        # We're inside { already from needle; depth starts at 1 for the pattern brace
+        brace = 1
+        k = expr_start
+        ok = False
+        while k < len(source):
+            ch = source[k]
+            if ch == '{':
+                brace += 1
+            elif ch == '}':
+                brace -= 1
+                if brace == 0:
+                    # expect = {} ;
+                    rest = source[k + 1 :]
+                    m2 = re.match(r'\s*=\s*\{\s*\}\s*;', rest)
+                    if m2:
+                        expr = source[expr_start:k].strip()
+                        out.append(f'export var {name} = {expr};')
+                        i = k + 1 + m2.end()
+                        ok = True
+                    break
+            elif ch == '(':
+                paren += 1
+            elif ch == ')':
+                paren -= 1
+            k += 1
+        if not ok:
+            out.append(source[j:j + len(needle)])
+            i = j + len(needle)
+    return ''.join(out)
+
+
 def _wrap_toplevel_await(source):
     """Run module body as async function so await is legal.
 
@@ -674,13 +744,9 @@ def _preprocess_module(source, test_path):
 
     # Anonymous default → __default_export__ before collecting maps
     source = _rewrite_anon_default_export(source)
-    # Desugar pattern default await (engine TDZ/assign bug with await in pattern)
+    # Desugar pattern default await (engine bug: await in pattern default)
     # export var { x = await E } = {}; → export var x = await E;
-    source = re.sub(
-        r'export\s+var\s*\{\s*([A-Za-z_$][\w$]*)\s*=\s*(await\b[^}]*)\s*\}\s*=\s*\{\s*\}\s*;',
-        r'export var \1 = \2;',
-        source,
-    )
+    source = _desugar_export_var_await_pattern(source)
     dflt, named = _collect_module_exports(source)
 
     fixtures = {}
