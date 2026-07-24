@@ -10,7 +10,7 @@
 
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
-| 1 | **module-code** | 30.7% | **88.4%** (M122) | 90% | +76 from M117; need ~+17 |
+| 1 | **module-code** | 30.7% | **~88.5%** (M123) | 90% | +4 vs M122; need ~+13 |
 | 2 | **import** | ~13% | **30.2%** | 90% | With module linker |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
@@ -53,3 +53,5 @@ Review dependencies (Proxy, species, TypedArray, Promise jobs), then Object/Arra
 - M120: NS uninit/TDZ, setPrototypeOf, star equality cache, live import renames, string imports
 - M121: nested export*as NS, ambiguous export* omit, defineOwnProperty+freeze, NS brand side-table
 - M122: gOPS polyfill, recorded NS export keys (fixes __ and ownKeys sort/types)
+- M123: identity-based star ambiguity (same NS dual export*), GetModuleNamespace cache,
+  fixture import*as, string export*as "Name", cycle star expand, gOPD hide non-exports

@@ -642,6 +642,18 @@ if (typeof Object.getOwnPropertySymbols !== "function") {
     Object.__moduleGopdShim = true;
     var _gopd = Object.getOwnPropertyDescriptor;
     Object.getOwnPropertyDescriptor = function(o, p) {
+      // Module NS [[GetOwnProperty]]: only exports (+ @@toStringTag via ordinary)
+      if (__isModuleNS(o) && p !== Symbol.toStringTag && typeof p === "string") {
+        var rec = __moduleNSExportKeys(o);
+        if (rec) {
+          var found = false;
+          for (var __j = 0; __j < rec.length; __j++) {
+            if (rec[__j] === p) { found = true; break; }
+          }
+          // Engine may inject __proto__ as own — hide non-exports
+          if (!found) return undefined;
+        }
+      }
       var d = _gopd(o, p);
       if (!d) return d;
       if (__isModuleNS(o) && d.get && p !== Symbol.toStringTag) {
@@ -702,8 +714,32 @@ if (typeof Object.getOwnPropertySymbols !== "function") {
 })();
 // Always install/override Reflect helpers used by namespace tests
 if (typeof Reflect === 'undefined') { var Reflect = {}; }
-Reflect.has = Reflect.has || function(o, p) { return p in o; };
-Reflect.get = Reflect.get || function(o, p, r) { return o[p]; };
+Reflect.has = function(o, p) {
+  if (__isModuleNS(o) && typeof p === "string") {
+    var rec = __moduleNSExportKeys(o);
+    if (rec) {
+      for (var __h = 0; __h < rec.length; __h++) {
+        if (rec[__h] === p) return true;
+      }
+      return false;
+    }
+  }
+  return p in o;
+};
+// Module NS [[Get]]: non-exports are undefined (engine may return null for __proto__)
+Reflect.get = function(o, p, r) {
+  if (__isModuleNS(o) && typeof p === "string") {
+    var recg = __moduleNSExportKeys(o);
+    if (recg) {
+      var ok = false;
+      for (var __g = 0; __g < recg.length; __g++) {
+        if (recg[__g] === p) { ok = true; break; }
+      }
+      if (!ok) return undefined;
+    }
+  }
+  return o[p];
+};
 Reflect.set = function(o, p, v, r) {
   if (__isModuleNS(o)) return false;
   try {
@@ -922,6 +958,14 @@ def _collect_module_exports(source, reexport_map=None):
             return _unquote_export_name(tok)
         return tok
 
+    # import * as local from 'mod' — export { local } re-exports that module NS
+    import_star_as = {}
+    for m in re.finditer(
+        r'import\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*[\'"]([^\'"]+)[\'"]',
+        source,
+    ):
+        import_star_as[m.group(1)] = m.group(2)
+
     # export { a, b as c, x as "str" } from 'mod'  OR  export { a, b as c };
     for m in re.finditer(
         r'export\s*\{([^}]+)\}\s*(?:from\s*[\'"]([^\'"]+)[\'"])?',
@@ -946,13 +990,27 @@ def _collect_module_exports(source, reexport_map=None):
                 named[exp] = loc_id
             else:
                 named[exp] = loc_id
-    # export * as ns from 'mod'
+                # import * as foo from M; export { foo } → indirect NS of M
+                if loc_id in import_star_as:
+                    reexport_map[exp] = (import_star_as[loc_id], '*')
+    # export * as ns from 'mod'  OR  export * as "Name" from 'mod'
     for m in re.finditer(
-        r'export\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*[\'"]([^\'"]+)[\'"]',
+        r'export\s*\*\s*as\s+'
+        r'(?:([A-Za-z_$][\w$]*)|("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'))'
+        r'\s*from\s*[\'"]([^\'"]+)[\'"]',
         source,
     ):
-        reexport_map[m.group(1)] = (m.group(2), '*')
-        named[m.group(1)] = m.group(1)
+        raw_name = m.group(1) if m.group(1) is not None else _unquote_export_name(m.group(2))
+        from_sp = m.group(3)
+        reexport_map[raw_name] = (from_sp, '*')
+        # Local binding: identifier as-is; string export names use sanitized local
+        if m.group(1) is not None:
+            named[raw_name] = raw_name
+        else:
+            safe = re.sub(r'[^A-Za-z0-9_]', '_', raw_name) or 'ns'
+            if not re.match(r'^[A-Za-z_]', safe):
+                safe = 'ns_' + safe
+            named[raw_name] = f'__star_as_{safe}'
     # export * from 'mod' — mark for expansion by caller
     for m in re.finditer(
         r'export\s*\*\s*from\s*[\'"]([^\'"]+)[\'"]',
@@ -1253,6 +1311,9 @@ def _preprocess_module(source, test_path):
     fixtures = {}
     inlined = set()
     fixture_chunks = []
+    # One namespace object per module key (instn-star-equality); init early for ensure_mod_ns
+    ns_by_module = {}  # module_key -> JS var name holding the ns
+    pre_assert_aliases = []
 
     def load_spec(spec):
         if not spec.startswith('.'):
@@ -1272,17 +1333,56 @@ def _preprocess_module(source, test_path):
         rmap = {}
         return src2, _collect_module_exports(src2, rmap), rmap
 
+    def _resolve_mod_key(spec):
+        try:
+            return str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+        except Exception:
+            return spec
+
+    def _export_identity(exp, loc, rmap, provider_mod_key):
+        """Ultimate ResolveExport identity (module, binding) for star ambiguity.
+
+        Two star paths that resolve to the same module namespace (or same
+        binding) are unambiguous — see namespace-unambiguous-if-* tests.
+        """
+        if exp in rmap:
+            sp, im = rmap[exp]
+            if im == '*':
+                return ('ns', _resolve_mod_key(sp))
+            if im not in ('**',) and not str(exp).startswith('*from*'):
+                return ('bind', _resolve_mod_key(sp), im)
+        return ('local', provider_mod_key, loc)
+
     def expand_star_exports(named_map, reexport_map, depth=0):
         """Inline export * from './x' into named_map (no default).
 
-        Ambiguous names (exported by two different star sources) are omitted.
+        Ambiguous names (two star sources resolve to different bindings) are
+        omitted. Same ultimate resolution via two stars is kept.
         """
         if depth > 6:
             return named_map
         out = dict(named_map)
-        # Track which module key first provided each star-exported name
-        star_origin = {k: '__local__' for k in out}
+        # Local exports win; star origins store ResolveExport identity tuples
+        star_origin = {k: ('__local__',) for k in out}
         ambiguous = set()
+
+        def _consider(exp, loc, ident):
+            if exp == 'default' or str(exp).startswith('*from*'):
+                return
+            if exp in ambiguous:
+                return
+            if exp in out:
+                prev = star_origin.get(exp)
+                if prev == ('__local__',):
+                    return  # local export wins
+                if prev == ident:
+                    return  # same ultimate binding — unambiguous
+                del out[exp]
+                ambiguous.add(exp)
+                return
+            out[exp] = loc
+            star_origin[exp] = ident
+
         for key, (spec, kind) in list(reexport_map.items()):
             if kind != '**' and not (isinstance(key, str) and key.startswith('*from*')):
                 continue
@@ -1290,39 +1390,53 @@ def _preprocess_module(source, test_path):
             fix = load_spec(from_spec)
             if fix is None:
                 continue
-            try:
-                mod_key = str((base / (from_spec[2:] if from_spec.startswith('./') else from_spec)).resolve())
-            except Exception:
-                mod_key = from_spec
+            mod_key = _resolve_mod_key(from_spec)
             fs, (fd, fn), rmap = parse_exports_from(fix)
             fn = expand_star_exports(fn, rmap, depth + 1)
             for exp, loc in fn.items():
-                if exp == 'default' or exp.startswith('*from*'):
-                    continue
-                if exp in ambiguous:
-                    continue
-                if exp in out and star_origin.get(exp) not in ('__local__', mod_key):
-                    # Ambiguous between two star sources — omit
-                    del out[exp]
-                    ambiguous.add(exp)
-                    continue
-                if exp not in out:
-                    out[exp] = loc
-                    star_origin[exp] = mod_key
+                ident = _export_identity(exp, loc, rmap, mod_key)
+                _consider(exp, loc, ident)
             for exp, (sp, im) in rmap.items():
-                if exp.startswith('*from*') or im in ('**', '*'):
+                if exp.startswith('*from*') or im == '**':
                     continue
-                if exp == 'default' or exp in ambiguous:
-                    continue
-                if exp in out and star_origin.get(exp) not in ('__local__', mod_key):
-                    del out[exp]
-                    ambiguous.add(exp)
-                    continue
-                if exp not in out:
-                    out[exp] = im
-                    star_origin[exp] = mod_key
+                if im == '*':
+                    _consider(exp, exp, ('ns', _resolve_mod_key(sp)))
+                else:
+                    _consider(exp, im, ('bind', _resolve_mod_key(sp), im))
         out = {k: v for k, v in out.items() if not str(k).startswith('*from*')}
         return out
+
+    # GetModuleNamespace cache: one NS object per target module path
+    mod_ns_cache = {}  # abs path -> JS var name
+
+    def ensure_mod_ns(spec):
+        """JS var holding GetModuleNamespace(spec); built once per module."""
+        # Self namespace is built later in ns_epilogues / ns_by_module['__self__']
+        if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
+            return '__SELF_NS__'
+        key = _resolve_mod_key(spec)
+        if key in mod_ns_cache:
+            return mod_ns_cache[key]
+        # Prefer already-built import * as binding
+        if key in ns_by_module:
+            return ns_by_module[key]
+        safe = re.sub(r'[^A-Za-z0-9_]', '_', Path(key).stem)[:40] or 'm'
+        ns_tmp = f'__modns_{len(mod_ns_cache)}_{safe}'
+        # Reserve before recurse to break cycles
+        mod_ns_cache[key] = ns_tmp
+        fn = {}
+        fix = load_spec(spec)
+        if fix is not None:
+            fs, (_fd, fn0), rmap = parse_exports_from(fix)
+            if key not in inlined:
+                inlined.add(key)
+                fixture_chunks.append(strip_fixture_exports(fs))
+            fn = expand_star_exports(dict(fn0), rmap)
+            for exp, (sp, im) in rmap.items():
+                if im == '*' and not str(exp).startswith('*from*'):
+                    fn[exp] = exp
+        fixture_chunks.append(_namespace_object_js(ns_tmp, fn if fn else {}))
+        return ns_tmp
 
 
     def strip_fixture_exports(fs):
@@ -1331,38 +1445,32 @@ def _preprocess_module(source, test_path):
         Recursively inlines `export * from` / `export {…} from` targets so
         star-exported bindings exist in the combined scope.
         """
-        # export * as ns from './mod' → build nested namespace object in fixture body
+        # export * as ns from './mod' → alias to cached GetModuleNamespace(mod)
+        # Also supports export * as "Name" (ModuleExportName string).
         def _fixture_export_star_as(m):
-            exp_name, spec = m.group(1), m.group(2)
+            id_name, str_name, spec = m.group(1), m.group(2), m.group(3)
             if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
                 return ''
-            fix = load_spec(spec)
-            if fix is None:
+            if load_spec(spec) is None and not spec.startswith('.'):
                 return ''
-            key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
-            raw, (_fd, fn), rmap = parse_exports_from(fix)
-            # Recursively expand export * and nested * as in the target module
-            if key not in inlined:
-                inlined.add(key)
-                # Process target first so nested * as exist as locals
-                processed = strip_fixture_exports(raw)
-                fixture_chunks.append(processed)
-            else:
-                # already inlined; still need export map
+            ns_var = ensure_mod_ns(spec)
+            if id_name is not None:
+                return f'var {id_name} = {ns_var};\n'
+            # String export name → sanitized local (matches _collect_module_exports)
+            raw = str_name[1:-1]
+            try:
+                raw = json.loads('"' + raw.replace('\\', '\\\\').replace('"', '\\"') + '"')
+            except Exception:
                 pass
-            fn = expand_star_exports(fn, rmap)
-            # Also pick up * as names from reexport map
-            for exp, (sp, im) in rmap.items():
-                if im == '*' and not exp.startswith('*from*'):
-                    # export * as exp from sp — binding should exist after strip
-                    fn[exp] = exp
-            ns_tmp = f'__star_as_{exp_name}'
-            block = _namespace_object_js(ns_tmp, fn if fn else {}, as_const=False)
-            block += f'\nvar {exp_name} = {ns_tmp};\n'
-            return block + '\n'
+            safe = re.sub(r'[^A-Za-z0-9_]', '_', raw) or 'ns'
+            if not re.match(r'^[A-Za-z_]', safe):
+                safe = 'ns_' + safe
+            return f'var __star_as_{safe} = {ns_var};\n'
 
         fs = re.sub(
-            r'export\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
+            r'export\s*\*\s*as\s+'
+            r'(?:([A-Za-z_$][\w$]*)|("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'))'
+            r'\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
             _fixture_export_star_as,
             fs,
         )
@@ -1422,20 +1530,33 @@ def _preprocess_module(source, test_path):
             '(typeof globalThis!=="undefined"?globalThis:(function(){return this;})())',
             fs,
         )
-        # Fixture imports of the main module: import * as ns from './self.js'
-        # → alias to main's cached namespace (filled after self ns is built)
-        def _fix_self_import(m):
+        # import * as ns from './mod' — self → deferred; else cached module NS
+        def _fix_import_star(m):
             loc = m.group(1)
             spec = m.group(2)
             if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
                 # Defer: const loc = <self_ns> once known (never alias name to itself)
                 pre_assert_aliases.append(f'const {loc} = __SELF_NS__;')
                 return ''
-            return m.group(0)
+            if not spec.startswith('.'):
+                return ''
+            ns_var = ensure_mod_ns(spec)
+            return f'var {loc} = {ns_var};\n'
 
         fs = re.sub(
             r'''import\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]\s*;?''',
-            _fix_self_import,
+            _fix_import_star,
+            fs,
+        )
+        # Drop named imports inside fixtures (bindings come from inlined exports)
+        fs = re.sub(
+            r'''import\s*\{[^}]*\}\s*from\s*['"][^'"]+['"]\s*;?''',
+            '',
+            fs,
+        )
+        fs = re.sub(
+            r'''import\s+[A-Za-z_$][\w$]*\s*from\s*['"][^'"]+['"]\s*;?''',
+            '',
             fs,
         )
         if re.search(r'\bresults\b', fs) and re.search(r'try\s*\{', fs):
@@ -1448,37 +1569,71 @@ def _preprocess_module(source, test_path):
         return fs
 
     # export * as NAME from './fix' early so default/named maps see __default_export__
+    # Supports identifier and string ModuleExportName.
+    # Records into early_star_as because the rewrite removes `export` syntax
+    # before _collect_module_exports runs.
+    early_star_as = {}  # exportName -> (localName, from_spec)
+
     def _early_export_star_as(m):
-        exp_name, spec = m.group(1), m.group(2)
-        fix = load_spec(spec)
-        if fix is None:
+        id_name, str_name, spec = m.group(1), m.group(2), m.group(3)
+        if not spec.startswith('.'):
             return m.group(0)
-        key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
-        fs, (_fd, fn), rmap = parse_exports_from(fix)
-        if key not in inlined:
-            inlined.add(key)
-            # strip_fixture_exports expands nested export * as into locals
-            fixture_chunks.append(strip_fixture_exports(fs))
-        fn = expand_star_exports(fn, rmap)
-        for exp, (sp, im) in rmap.items():
-            if im == '*' and not exp.startswith('*from*'):
-                fn[exp] = exp
-        ns_tmp = f'__star_as_{exp_name}' if exp_name != 'default' else '__star_as_default'
-        block = _namespace_object_js(ns_tmp, fn if fn else {})
-        if exp_name == 'default':
-            block += f'\nlet __default_export__ = {ns_tmp};\n'
-        else:
-            block += f'\nvar {exp_name} = {ns_tmp};\n'
-        return block + '\n'
+        is_self_spec = (
+            Path(spec).name == self_name or spec in ('./' + self_name, self_name)
+        )
+        # export * as X from self → binding is GetModuleNamespace(self)
+        if is_self_spec:
+            if id_name is not None:
+                if id_name == 'default':
+                    early_star_as['default'] = ('__SELF_NS__', spec)
+                    return ''
+                early_star_as[id_name] = ('__SELF_NS__', spec)
+                return ''
+            raw = str_name[1:-1]
+            try:
+                raw = json.loads('"' + raw.replace('\\', '\\\\').replace('"', '\\"') + '"')
+            except Exception:
+                pass
+            early_star_as[raw] = ('__SELF_NS__', spec)
+            return ''
+        ns_var = ensure_mod_ns(spec)
+        if id_name is not None:
+            if id_name == 'default':
+                early_star_as['default'] = ('__default_export__', spec)
+                return f'let __default_export__ = {ns_var};\n'
+            early_star_as[id_name] = (id_name, spec)
+            return f'var {id_name} = {ns_var};\n'
+        raw = str_name[1:-1]
+        try:
+            raw = json.loads('"' + raw.replace('\\', '\\\\').replace('"', '\\"') + '"')
+        except Exception:
+            pass
+        safe = re.sub(r'[^A-Za-z0-9_]', '_', raw) or 'ns'
+        if not re.match(r'^[A-Za-z_]', safe):
+            safe = 'ns_' + safe
+        loc = f'__star_as_{safe}'
+        early_star_as[raw] = (loc, spec)
+        return f'var {loc} = {ns_var};\n'
 
     source = re.sub(
-        r'export\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
+        r'export\s*\*\s*as\s+'
+        r'(?:([A-Za-z_$][\w$]*)|("(?:[^"\\]|\\.)*"|\'(?:[^\'\\]|\\.)*\'))'
+        r'\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
         _early_export_star_as,
         source,
     )
 
     self_reexports = {}
     dflt, named = _collect_module_exports(source, self_reexports)
+    for exp, (loc, sp) in early_star_as.items():
+        # __SELF_NS__ placeholder: property holds the module's own namespace object
+        named[exp] = loc if loc != '__SELF_NS__' else exp
+        self_reexports[exp] = (sp, '*')
+        if exp == 'default':
+            dflt = loc if loc != '__SELF_NS__' else '__default_export__'
+        if loc == '__SELF_NS__':
+            # After self NS is built, bind export name to it (instn-once export * as ns2)
+            pre_assert_aliases.append(f'const {exp} = __SELF_NS__;')
     # Note: test262 often writes `import* as ns` (no space after import).
     import_re = re.compile(
         r'''^import\s*(?:
@@ -1498,11 +1653,8 @@ def _preprocess_module(source, test_path):
     ns_epilogues = []  # namespace objects after all decls (live getters)
     live_export_assigns = set()  # export vars that need assignment-only form
     live_binding_prelude = []  # hoisted before asserts (import instantiation)
-    # Aliases inserted before first assert (after body decls) — instn-named-id-name
-    pre_assert_aliases = []
+    # pre_assert_aliases / ns_by_module initialised earlier (ensure_mod_ns)
     deferred_aliases = []
-    # One namespace object per module key (instn-star-equality)
-    ns_by_module = {}  # module_key -> first local binding name that holds the ns
     live_renames = {}  # importLocal -> sourceLocal for live fixture vars
 
     def bind_self_import(loc, src_local, kind_source):
@@ -1560,7 +1712,9 @@ def _preprocess_module(source, test_path):
         else:
             # Simple rename (export { _if as if } / import { if as if_ })
             # Place before asserts so source vars are already initialised.
-            pre_assert_aliases.append(f'const {loc} = {src_local};')
+            # Same name already in scope from fixture / local export — no alias.
+            if loc != src_local:
+                pre_assert_aliases.append(f'const {loc} = {src_local};')
 
     def bind_default_import(defname, kind_source, is_self_imp):
         """Default import: hoist functions; TDZ for class/expr."""
@@ -1613,7 +1767,13 @@ def _preprocess_module(source, test_path):
         if fix_src is not None:
             key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
             fs, (fd, fn), fix_reexports = parse_exports_from(fix_src)
-            f_dflt, f_named = fd, fn
+            f_dflt, f_named = fd, dict(fn)
+            # Named imports need star-expanded export table (export * / * as)
+            if fix_reexports:
+                f_named = expand_star_exports(f_named, fix_reexports)
+                for exp, (sp, im) in fix_reexports.items():
+                    if im == '*' and not str(exp).startswith('*from*'):
+                        f_named[exp] = exp
             kind_source = fs
             if key not in inlined:
                 inlined.add(key)
@@ -1638,26 +1798,26 @@ def _preprocess_module(source, test_path):
 
         ns = m.group('ns')
         if ns:
-            # Module identity key for namespace caching
+            # Module identity key for namespace caching (GetModuleNamespace once)
             if is_self:
                 mod_key = '__self__'
             else:
-                try:
-                    mod_key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
-                except Exception:
-                    mod_key = spec
+                mod_key = _resolve_mod_key(spec)
             if mod_key in ns_by_module:
                 # Same module namespace object (import * as a; import * as b)
                 pre_assert_aliases.append(f'const {ns} = {ns_by_module[mod_key]};')
+            elif not is_self:
+                # External: one NS object via ensure_mod_ns (shared with * as re-exports)
+                ns_var = ensure_mod_ns(spec)
+                ns_by_module[mod_key] = ns_var
+                if ns != ns_var:
+                    pre_assert_aliases.append(f'const {ns} = {ns_var};')
             else:
-                # Expand export * from deps into the namespace map
+                # Self namespace — expand export * / re-exports into the map
                 emap = dict(f_named if f_named else named)
-                if fix_reexports:
-                    emap = expand_star_exports(emap, fix_reexports)
-                elif is_self and self_reexports:
+                if self_reexports:
                     emap = expand_star_exports(emap, self_reexports)
-                # Also merge self re-exports from fixtures (incl. string ModuleExportName)
-                if is_self and self_reexports:
+                if self_reexports:
                     for exp, (fspec, im) in list(self_reexports.items()):
                         if exp.startswith('*from*') or im in ('*', '**'):
                             continue
@@ -1669,12 +1829,16 @@ def _preprocess_module(source, test_path):
                         fix2 = load_spec(fspec)
                         if fix2 is None:
                             continue
-                        key2 = str((base / (fspec[2:] if fspec.startswith('./') else fspec)).resolve())
-                        fs2, (_fd2, fn2), _rm2 = parse_exports_from(fix2)
+                        key2 = _resolve_mod_key(fspec)
+                        fs2, (_fd2, fn2), rm2 = parse_exports_from(fix2)
+                        # Expand export * so re-export chains / cycles resolve
+                        fn2 = expand_star_exports(dict(fn2), rm2)
+                        for _e, (_sp, _im) in rm2.items():
+                            if _im == '*' and not str(_e).startswith('*from*'):
+                                fn2[_e] = _e
                         if key2 not in inlined:
                             inlined.add(key2)
                             fixture_chunks.append(strip_fixture_exports(fs2))
-                        # Resolve export name through fixture's export table
                         loc = fn2.get(im, fn2.get(exp, im))
                         if not re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
                             for _e, _l in fn2.items():
@@ -1719,12 +1883,18 @@ def _preprocess_module(source, test_path):
                         bind_self_import(loc, from_name, source)
                         continue
                     if from_name == '*':
-                        # export * as ns — namespace of target module
-                        # approximate later via ns object of self exports
-                        ns_epilogues.append(
-                            _namespace_object_js(loc, named)
-                        )
-                        repl.append(f'var {loc};')
+                        # export * as / import * as + export → GetModuleNamespace
+                        if from_is_self:
+                            pre_assert_aliases.append(f'const {loc} = __SELF_NS__;')
+                        else:
+                            ns_var = ensure_mod_ns(from_spec)
+                            mk = _resolve_mod_key(from_spec)
+                            ns_by_module.setdefault(mk, ns_var)
+                            # Fixture strip already emits `var exp = ns` for
+                            # `export * as exp` / `import * as exp; export {exp}`.
+                            # Only alias when the import local name differs.
+                            if loc != exp and loc != ns_var:
+                                pre_assert_aliases.append(f'const {loc} = {ns_var};')
                         continue
 
                 if is_self:
@@ -1736,8 +1906,9 @@ def _preprocess_module(source, test_path):
                         if from_name != '*':
                             fix2 = load_spec(from_spec)
                             if fix2 is not None:
-                                key2 = str((base / (from_spec[2:] if from_spec.startswith('./') else from_spec)).resolve())
-                                fs2, (fd2, fn2), _rm = parse_exports_from(fix2)
+                                key2 = _resolve_mod_key(from_spec)
+                                fs2, (fd2, fn2), rm2 = parse_exports_from(fix2)
+                                fn2 = expand_star_exports(dict(fn2), rm2)
                                 if key2 not in inlined:
                                     inlined.add(key2)
                                     fixture_chunks.append(strip_fixture_exports(fs2))
