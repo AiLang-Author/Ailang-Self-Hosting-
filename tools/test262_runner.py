@@ -1272,6 +1272,59 @@ def _preprocess_module(source, test_path):
         rmap = {}
         return src2, _collect_module_exports(src2, rmap), rmap
 
+    def expand_star_exports(named_map, reexport_map, depth=0):
+        """Inline export * from './x' into named_map (no default).
+
+        Ambiguous names (exported by two different star sources) are omitted.
+        """
+        if depth > 6:
+            return named_map
+        out = dict(named_map)
+        # Track which module key first provided each star-exported name
+        star_origin = {k: '__local__' for k in out}
+        ambiguous = set()
+        for key, (spec, kind) in list(reexport_map.items()):
+            if kind != '**' and not (isinstance(key, str) and key.startswith('*from*')):
+                continue
+            from_spec = spec
+            fix = load_spec(from_spec)
+            if fix is None:
+                continue
+            try:
+                mod_key = str((base / (from_spec[2:] if from_spec.startswith('./') else from_spec)).resolve())
+            except Exception:
+                mod_key = from_spec
+            fs, (fd, fn), rmap = parse_exports_from(fix)
+            fn = expand_star_exports(fn, rmap, depth + 1)
+            for exp, loc in fn.items():
+                if exp == 'default' or exp.startswith('*from*'):
+                    continue
+                if exp in ambiguous:
+                    continue
+                if exp in out and star_origin.get(exp) not in ('__local__', mod_key):
+                    # Ambiguous between two star sources — omit
+                    del out[exp]
+                    ambiguous.add(exp)
+                    continue
+                if exp not in out:
+                    out[exp] = loc
+                    star_origin[exp] = mod_key
+            for exp, (sp, im) in rmap.items():
+                if exp.startswith('*from*') or im in ('**', '*'):
+                    continue
+                if exp == 'default' or exp in ambiguous:
+                    continue
+                if exp in out and star_origin.get(exp) not in ('__local__', mod_key):
+                    del out[exp]
+                    ambiguous.add(exp)
+                    continue
+                if exp not in out:
+                    out[exp] = im
+                    star_origin[exp] = mod_key
+        out = {k: v for k, v in out.items() if not str(k).startswith('*from*')}
+        return out
+
+
     def strip_fixture_exports(fs):
         """Remove export keywords / export-from lines for inlined fixture bodies.
 
@@ -1451,58 +1504,6 @@ def _preprocess_module(source, test_path):
     # One namespace object per module key (instn-star-equality)
     ns_by_module = {}  # module_key -> first local binding name that holds the ns
     live_renames = {}  # importLocal -> sourceLocal for live fixture vars
-
-    def expand_star_exports(named_map, reexport_map, depth=0):
-        """Inline export * from './x' into named_map (no default).
-
-        Ambiguous names (exported by two different star sources) are omitted.
-        """
-        if depth > 6:
-            return named_map
-        out = dict(named_map)
-        # Track which module key first provided each star-exported name
-        star_origin = {k: '__local__' for k in out}
-        ambiguous = set()
-        for key, (spec, kind) in list(reexport_map.items()):
-            if kind != '**' and not (isinstance(key, str) and key.startswith('*from*')):
-                continue
-            from_spec = spec
-            fix = load_spec(from_spec)
-            if fix is None:
-                continue
-            try:
-                mod_key = str((base / (from_spec[2:] if from_spec.startswith('./') else from_spec)).resolve())
-            except Exception:
-                mod_key = from_spec
-            fs, (fd, fn), rmap = parse_exports_from(fix)
-            fn = expand_star_exports(fn, rmap, depth + 1)
-            for exp, loc in fn.items():
-                if exp == 'default' or exp.startswith('*from*'):
-                    continue
-                if exp in ambiguous:
-                    continue
-                if exp in out and star_origin.get(exp) not in ('__local__', mod_key):
-                    # Ambiguous between two star sources — omit
-                    del out[exp]
-                    ambiguous.add(exp)
-                    continue
-                if exp not in out:
-                    out[exp] = loc
-                    star_origin[exp] = mod_key
-            for exp, (sp, im) in rmap.items():
-                if exp.startswith('*from*') or im in ('**', '*'):
-                    continue
-                if exp == 'default' or exp in ambiguous:
-                    continue
-                if exp in out and star_origin.get(exp) not in ('__local__', mod_key):
-                    del out[exp]
-                    ambiguous.add(exp)
-                    continue
-                if exp not in out:
-                    out[exp] = im
-                    star_origin[exp] = mod_key
-        out = {k: v for k, v in out.items() if not str(k).startswith('*from*')}
-        return out
 
     def bind_self_import(loc, src_local, kind_source):
         """Create immutable import binding for self (or re-export of self)."""
