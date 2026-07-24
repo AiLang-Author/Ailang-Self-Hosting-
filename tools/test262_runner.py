@@ -1435,6 +1435,18 @@ def _preprocess_module(source, test_path):
             for exp, (sp, im) in rmap.items():
                 if im == '*' and not str(exp).startswith('*from*'):
                     fn[exp] = exp
+            # Resolve multi-hop indirect exports to ultimate locals (IEE cycles).
+            # resolve_export is defined later; name is resolved at call time.
+            try:
+                _resolve = resolve_export
+            except NameError:
+                _resolve = None
+            if _resolve is not None:
+                resolved = {}
+                for exp in list(fn.keys()):
+                    ult = _resolve(spec, exp)
+                    resolved[exp] = ult if ult is not None else fn[exp]
+                fn = resolved
         fixture_chunks.append(_namespace_object_js(ns_tmp, fn if fn else {}))
         return ns_tmp
 
@@ -1524,10 +1536,17 @@ def _preprocess_module(source, test_path):
         # orphan export lists after export keyword strip
         fs = re.sub(r'(?m)^\{\s*[^}]*\bas\b[^}]*\}\s*;\s*$', '', fs)
         fs = re.sub(r'(?m)^\{\s*[A-Za-z_$][\w$]*\s*\}\s*;\s*$', '', fs)
-        # Function("return this;")() SIGSEGVs in our engine
+        # Function("return this;")() SIGSEGVs; also `new Function(...)()`
+        # (must rewrite `new Function` first so `new` is not left dangling)
+        _gthis = '(typeof globalThis!=="undefined"?globalThis:(function(){return this;})())'
         fs = re.sub(
-            r'''Function\s*\(\s*['"]return this;?['"]\s*\)\s*\(\s*\)''',
-            '(typeof globalThis!=="undefined"?globalThis:(function(){return this;})())',
+            r'''new\s+Function\s*\(\s*['"]return this;?['"]\s*\)\s*\(\s*\)''',
+            _gthis,
+            fs,
+        )
+        fs = re.sub(
+            r'''(?<![\w$.])Function\s*\(\s*['"]return this;?['"]\s*\)\s*\(\s*\)''',
+            _gthis,
             fs,
         )
         # import * as ns from './mod' — self → deferred; else cached module NS
@@ -1634,6 +1653,62 @@ def _preprocess_module(source, test_path):
         if loc == '__SELF_NS__':
             # After self NS is built, bind export name to it (instn-once export * as ns2)
             pre_assert_aliases.append(f'const {exp} = __SELF_NS__;')
+
+    def _is_self_spec(spec):
+        return (
+            spec == '__self__'
+            or Path(spec).name == self_name
+            or spec in ('./' + self_name, self_name)
+        )
+
+    def resolve_export(mod_spec, export_name, resolve_set=None):
+        """Follow indirect export {a as b} from chains to an ultimate local binding.
+
+        Returns a JS identifier (local binding name) or None if circular/unresolved.
+        Handles multi-hop cycles (instn-named-iee-cycle, instn-star-iee-cycle).
+        """
+        if resolve_set is None:
+            resolve_set = set()
+        if export_name is None or str(export_name).startswith('*from*'):
+            return None
+        if _is_self_spec(mod_spec):
+            mod_key = '__self__'
+            nmap = named
+            rmap = self_reexports
+        else:
+            if not str(mod_spec).startswith('.'):
+                return None
+            mod_key = _resolve_mod_key(mod_spec)
+            fix = load_spec(mod_spec)
+            if fix is None:
+                return None
+            _fs, (_fd, fn0), rmap = parse_exports_from(fix)
+            nmap = expand_star_exports(dict(fn0), rmap)
+            for exp, (sp, im) in rmap.items():
+                if im == '*' and not str(exp).startswith('*from*'):
+                    nmap[exp] = exp
+
+        key = (mod_key, export_name)
+        if key in resolve_set:
+            return None  # circular import request → null
+        resolve_set = set(resolve_set)
+        resolve_set.add(key)
+
+        # IndirectExportEntries first (specific re-exports)
+        if export_name in rmap:
+            sp, im = rmap[export_name]
+            if im in ('*', '**') or str(export_name).startswith('*from*'):
+                return None  # namespace / star — not a single local
+            target = '__self__' if _is_self_spec(sp) else sp
+            return resolve_export(target, im, resolve_set)
+
+        # LocalExportEntries
+        if export_name in nmap:
+            loc = nmap[export_name]
+            if re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
+                return str(loc)
+        return None
+
     # Note: test262 often writes `import* as ns` (no space after import).
     import_re = re.compile(
         r'''^import\s*(?:
@@ -1758,7 +1833,29 @@ def _preprocess_module(source, test_path):
             if key not in inlined:
                 inlined.add(key)
                 fs, _, _ = parse_exports_from(fix_src)
-                fixture_chunks.append(strip_fixture_exports(fs))
+                body = strip_fixture_exports(fs)
+                # Side-effect import: isolate fixture bindings (instn-uniq-env-rec).
+                # Engine leaks function/class decls out of nested functions, so
+                # rename top-level bindings instead of relying on IIFE scope alone.
+                pfx = f"__fx{len(inlined)}_"
+                body = re.sub(
+                    r'\bfunction\s*(\*?)\s*([A-Za-z_$][\w$]*)',
+                    rf'function\1 {pfx}\2',
+                    body,
+                )
+                body = re.sub(
+                    r'\bclass\s+([A-Za-z_$][\w$]*)',
+                    rf'class {pfx}\1',
+                    body,
+                )
+                body = re.sub(
+                    r'\b(var|let|const)\s+([A-Za-z_$][\w$]*)',
+                    rf'\1 {pfx}\2',
+                    body,
+                )
+                fixture_chunks.append(
+                    "(function(){\n" + body + "\n})();\n"
+                )
             return ''
 
         f_dflt = dflt if is_self else None
@@ -1821,8 +1918,22 @@ def _preprocess_module(source, test_path):
                     for exp, (fspec, im) in list(self_reexports.items()):
                         if exp.startswith('*from*') or im in ('*', '**'):
                             continue
+                        # Multi-hop resolve (export chains / IEE cycles)
+                        ult = resolve_export('__self__', exp)
+                        if ult is not None:
+                            emap[exp] = ult
+                            # Ensure defining fixture bodies are inlined
+                            if not _is_self_spec(fspec):
+                                fix2 = load_spec(fspec)
+                                if fix2 is not None:
+                                    key2 = _resolve_mod_key(fspec)
+                                    if key2 not in inlined:
+                                        inlined.add(key2)
+                                        fs2, _, _ = parse_exports_from(fix2)
+                                        fixture_chunks.append(strip_fixture_exports(fs2))
+                            continue
                         # Re-export from self (export { x as y } from './self') — local only
-                        if Path(fspec).name == self_name or fspec in ('./' + self_name, self_name):
+                        if _is_self_spec(fspec):
                             if re.match(r'^[A-Za-z_$][\w$]*$', str(im)):
                                 emap[exp] = im
                             continue
@@ -1831,20 +1942,11 @@ def _preprocess_module(source, test_path):
                             continue
                         key2 = _resolve_mod_key(fspec)
                         fs2, (_fd2, fn2), rm2 = parse_exports_from(fix2)
-                        # Expand export * so re-export chains / cycles resolve
                         fn2 = expand_star_exports(dict(fn2), rm2)
-                        for _e, (_sp, _im) in rm2.items():
-                            if _im == '*' and not str(_e).startswith('*from*'):
-                                fn2[_e] = _e
                         if key2 not in inlined:
                             inlined.add(key2)
                             fixture_chunks.append(strip_fixture_exports(fs2))
                         loc = fn2.get(im, fn2.get(exp, im))
-                        if not re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
-                            for _e, _l in fn2.items():
-                                if _e == exp or _e == im:
-                                    loc = _l
-                                    break
                         if re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
                             emap[exp] = loc
                 ns_epilogues.append(_namespace_object_js(ns, emap, as_const=True))
@@ -1871,56 +1973,43 @@ def _preprocess_module(source, test_path):
                 if exp == 'default' and f_dflt:
                     src_local = f_dflt
 
-                # Re-export from fixture pointing back at self: treat as self-import
-                reexp = fix_reexports.get(exp)
-                if reexp and not is_self:
-                    from_spec, from_name = reexp
-                    from_is_self = (
-                        Path(from_spec).name == self_name
-                        or from_spec in ('./' + self_name, self_name)
-                    )
-                    if from_is_self and from_name != '*':
-                        bind_self_import(loc, from_name, source)
-                        continue
-                    if from_name == '*':
-                        # export * as / import * as + export → GetModuleNamespace
-                        if from_is_self:
-                            pre_assert_aliases.append(f'const {loc} = __SELF_NS__;')
-                        else:
-                            ns_var = ensure_mod_ns(from_spec)
-                            mk = _resolve_mod_key(from_spec)
-                            ns_by_module.setdefault(mk, ns_var)
-                            # Fixture strip already emits `var exp = ns` for
-                            # `export * as exp` / `import * as exp; export {exp}`.
-                            # Only alias when the import local name differs.
-                            if loc != exp and loc != ns_var:
-                                pre_assert_aliases.append(f'const {loc} = {ns_var};')
-                        continue
-
-                if is_self:
-                    # Self-import of a name re-exported from a fixture:
-                    #   export { a as b } from './fix'; import { b } from './self'
-                    reexp_self = self_reexports.get(exp) or self_reexports.get(src_local)
-                    if reexp_self:
-                        from_spec, from_name = reexp_self
-                        if from_name != '*':
-                            fix2 = load_spec(from_spec)
-                            if fix2 is not None:
-                                key2 = _resolve_mod_key(from_spec)
-                                fs2, (fd2, fn2), rm2 = parse_exports_from(fix2)
-                                fn2 = expand_star_exports(dict(fn2), rm2)
-                                if key2 not in inlined:
-                                    inlined.add(key2)
-                                    fixture_chunks.append(strip_fixture_exports(fs2))
-                                real = fn2.get(from_name, from_name)
-                                # Fixture already evaluated — alias to real local
-                                if loc != real:
-                                    repl.append(f'const {loc} = {real};')
-                                # else same name already in scope from fixture
-                                continue
-                    bind_self_import(loc, src_local, source)
-                else:
-                    # fixture local export (e.g. results)
+                # Multi-hop ResolveExport for fixture / self named imports
+                if not is_self:
+                    reexp = fix_reexports.get(exp)
+                    if reexp:
+                        from_spec, from_name = reexp
+                        from_is_self = _is_self_spec(from_spec)
+                        if from_name == '*':
+                            if from_is_self:
+                                pre_assert_aliases.append(f'const {loc} = __SELF_NS__;')
+                            else:
+                                ns_var = ensure_mod_ns(from_spec)
+                                mk = _resolve_mod_key(from_spec)
+                                ns_by_module.setdefault(mk, ns_var)
+                                if loc != exp and loc != ns_var:
+                                    pre_assert_aliases.append(f'const {loc} = {ns_var};')
+                            continue
+                        # Re-export chain ending on self / multi-hop
+                        ult = resolve_export(spec, exp)
+                        if ult is not None:
+                            # One-hop: fixture re-exports a local of self
+                            # (iee-bndng: export { A as B } from self)
+                            one_hop_local = (
+                                from_is_self
+                                and from_name == ult
+                                and re.search(
+                                    rf'\bexport\s+(?:var|let|const|class|async\s+function|function\s*\*?)\s+{re.escape(ult)}\b',
+                                    source,
+                                )
+                            )
+                            if one_hop_local:
+                                bind_self_import(loc, ult, source)
+                            else:
+                                # Multi-hop cycle (named-iee-cycle a→…→z)
+                                if loc != ult:
+                                    pre_assert_aliases.append(f'const {loc} = {ult};')
+                            continue
+                    # Fall through to simple fixture local alias
                     is_fun = bool(re.search(
                         rf'export\s+(?:async\s+)?function\s*\*?\s+{re.escape(src_local)}\b',
                         kind_source,
@@ -1940,9 +2029,38 @@ def _preprocess_module(source, test_path):
                         if loc != src_local:
                             live_renames[loc] = src_local
                     else:
-                        # export { x } / bare binding from fixture
                         if loc != src_local:
                             live_renames[loc] = src_local
+                else:
+                    # Self-import of a name re-exported from a fixture
+                    reexp_self = self_reexports.get(exp) or self_reexports.get(src_local)
+                    if reexp_self:
+                        from_spec, from_name = reexp_self
+                        if from_name != '*':
+                            # Always inline the export source module first
+                            if not _is_self_spec(from_spec):
+                                fix2 = load_spec(from_spec)
+                                if fix2 is not None:
+                                    key2 = _resolve_mod_key(from_spec)
+                                    if key2 not in inlined:
+                                        inlined.add(key2)
+                                        fs2, _, _ = parse_exports_from(fix2)
+                                        fixture_chunks.append(strip_fixture_exports(fs2))
+                            ult = resolve_export('__self__', exp)
+                            if ult is not None:
+                                # Prefer live binding semantics on ultimate local
+                                bind_self_import(loc, ult, source)
+                                continue
+                            if not _is_self_spec(from_spec):
+                                fix2 = load_spec(from_spec)
+                                if fix2 is not None:
+                                    fs2, (fd2, fn2), rm2 = parse_exports_from(fix2)
+                                    fn2 = expand_star_exports(dict(fn2), rm2)
+                                    real = fn2.get(from_name, from_name)
+                                    if loc != real:
+                                        repl.append(f'const {loc} = {real};')
+                                    continue
+                    bind_self_import(loc, src_local, source)
         return "\n".join(repl)
 
     new_src = import_re.sub(handle_import, source)

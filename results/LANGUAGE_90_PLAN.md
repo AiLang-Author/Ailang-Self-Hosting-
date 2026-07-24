@@ -10,7 +10,7 @@
 
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
-| 1 | **module-code** | 30.7% | **~88.5%** (M123) | 90% | +4 vs M122; need ~+13 |
+| 1 | **module-code** | 30.7% | **89.4%** (M124, 668/748) | 90% | need +6 absolute |
 | 2 | **import** | ~13% | **30.2%** | 90% | With module linker |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
@@ -55,3 +55,5 @@ Review dependencies (Proxy, species, TypedArray, Promise jobs), then Object/Arra
 - M122: gOPS polyfill, recorded NS export keys (fixes __ and ownKeys sort/types)
 - M123: identity-based star ambiguity (same NS dual export*), GetModuleNamespace cache,
   fixture import*as, string export*as "Name", cycle star expand, gOPD hide non-exports
+- M124: multi-hop ResolveExport (IEE cycles), side-effect fixture isolation (uniq-env),
+  new Function→globalThis (same-global); 668/748 ~89.4%
