@@ -606,6 +606,19 @@ def _wrap_toplevel_await(source):
 # NS uses accessors (set throws) so assignment is TypeError; gOPD is shimmed to
 # report data descriptors {value, writable:true, enumerable, configurable:false}.
 _MODULE_REFLECT_STUB = """
+// Brand module namespace objects without an own string key (keeps gOPN length clean)
+var __moduleNSList = [];
+function __isModuleNS(o) {
+  if (!o) return false;
+  for (var __i = 0; __i < __moduleNSList.length; __i++) {
+    if (__moduleNSList[__i] === o) return true;
+  }
+  return false;
+}
+function __markModuleNS(o) {
+  __moduleNSList.push(o);
+  return o;
+}
 (function() {
   if (!Object.__moduleGopdShim) {
     Object.__moduleGopdShim = true;
@@ -613,7 +626,7 @@ _MODULE_REFLECT_STUB = """
     Object.getOwnPropertyDescriptor = function(o, p) {
       var d = _gopd(o, p);
       if (!d) return d;
-      if (o && o.__moduleNamespace__ && d.get && p !== "__moduleNamespace__" && p !== Symbol.toStringTag) {
+      if (__isModuleNS(o) && d.get && p !== Symbol.toStringTag) {
         var v;
         try { v = d.get.call(o); } catch (e) { throw e; }
         return { value: v, writable: true, enumerable: !!d.enumerable, configurable: false };
@@ -633,7 +646,7 @@ _MODULE_REFLECT_STUB = """
       for (var i = 0; i < names.length; i++) {
         if (names[i] !== "__moduleNamespace__") out.push(names[i]);
       }
-      if (o && o.__moduleNamespace__) {
+      if (__isModuleNS(o)) {
         out.sort(); // code-unit order per OrdinaryOwnPropertyKeys for strings
       }
       return out;
@@ -641,7 +654,7 @@ _MODULE_REFLECT_STUB = """
     // hasOwnProperty / propertyIsEnumerable must [[Get]] uninit bindings (throw RE)
     var _hasOwn = Object.prototype.hasOwnProperty;
     Object.prototype.hasOwnProperty = function(p) {
-      if (this && this.__moduleNamespace__) {
+      if (__isModuleNS(this)) {
         var d = Object.getOwnPropertyDescriptor(this, p);
         return d !== undefined;
       }
@@ -649,7 +662,7 @@ _MODULE_REFLECT_STUB = """
     };
     var _pie = Object.prototype.propertyIsEnumerable;
     Object.prototype.propertyIsEnumerable = function(p) {
-      if (this && this.__moduleNamespace__) {
+      if (__isModuleNS(this)) {
         var d = Object.getOwnPropertyDescriptor(this, p);
         return !!(d && d.enumerable);
       }
@@ -662,11 +675,11 @@ if (typeof Reflect === 'undefined') { var Reflect = {}; }
 Reflect.has = Reflect.has || function(o, p) { return p in o; };
 Reflect.get = Reflect.get || function(o, p, r) { return o[p]; };
 Reflect.set = function(o, p, v, r) {
-  if (o && o.__moduleNamespace__) return false;
+  if (__isModuleNS(o)) return false;
   try {
     var old = o[p];
     o[p] = v;
-    if (o.__moduleNamespace__) return false;
+    if (__isModuleNS(o)) return false;
     return true;
   } catch (e) { return false; }
 };
@@ -677,7 +690,7 @@ Reflect.ownKeys = function(o) {
   for (var i = 0; i < names.length; i++) {
     if (names[i] !== "__moduleNamespace__") out.push(names[i]);
   }
-  if (o && o.__moduleNamespace__) {
+  if (__isModuleNS(o)) {
     // ensure string keys sorted (belt-and-suspenders)
     out.sort();
   }
@@ -691,11 +704,84 @@ Reflect.getOwnPropertyDescriptor = function(o, p) {
   return Object.getOwnPropertyDescriptor(o, p);
 };
 Reflect.defineProperty = function(o, p, d) {
-  if (o && o.__moduleNamespace__) return false;
-  try { Object.defineProperty(o, p, d); return true; } catch (e) { return false; }
+  if (__isModuleNS(o)) {
+    // Non-exported → false
+    var cur = null;
+    try { cur = Object.getOwnPropertyDescriptor(o, p); } catch (e) {
+      // uninit binding still "own"
+      cur = { writable: true, enumerable: true, configurable: false };
+    }
+    if (!cur) return false;
+    d = d || {};
+    // No change / compatible data-desc for exports: writable true, enum true, conf false
+    var keys = Object.keys(d);
+    if (keys.length === 0) return true;
+    if (p === Symbol.toStringTag) {
+      if (d.value !== undefined && d.value !== "Module") return false;
+      if (d.writable === true) return false;
+      if (d.enumerable === true) return false;
+      if (d.configurable === true) return false;
+      return true;
+    }
+    // Export bindings report writable:true, enumerable:true, configurable:false
+    if (d.configurable === true) return false;
+    if (d.enumerable === false) return false;
+    if (d.writable === false) return false;
+    if (d.get || d.set) return false;
+    // value change requested
+    if (d.value !== undefined) {
+      try {
+        if (d.value !== o[p]) return false;
+      } catch (e) { return false; }
+    }
+    return true;
+  }
+  try {
+    var _odp = Object.defineProperty;
+    _odp(o, p, d);
+    return true;
+  } catch (e) { return false; }
 };
+// Object.defineProperty throws when Reflect.defineProperty is false (strict)
+(function() {
+  if (Object.__moduleDefPropShim) return;
+  Object.__moduleDefPropShim = true;
+  var _odp = Object.defineProperty;
+  Object.defineProperty = function(o, p, d) {
+    if (__isModuleNS(o)) {
+      // Avoid recursion: inline the NS check (don't call Reflect which may call us)
+      var cur = null;
+      try { cur = Object.getOwnPropertyDescriptor(o, p); } catch (e) {
+        cur = { writable: true, enumerable: true, configurable: false };
+      }
+      if (!cur) throw new TypeError("Module namespace [[DefineOwnProperty]]");
+      d = d || {};
+      var ok = true;
+      var keys = Object.keys(d);
+      if (keys.length !== 0) {
+        if (p === Symbol.toStringTag) {
+          if (d.value !== undefined && d.value !== "Module") ok = false;
+          if (d.writable === true) ok = false;
+          if (d.enumerable === true) ok = false;
+          if (d.configurable === true) ok = false;
+        } else {
+          if (d.configurable === true) ok = false;
+          if (d.enumerable === false) ok = false;
+          if (d.writable === false) ok = false;
+          if (d.get || d.set) ok = false;
+          if (d.value !== undefined) {
+            try { if (d.value !== o[p]) ok = false; } catch (e) { ok = false; }
+          }
+        }
+      }
+      if (!ok) throw new TypeError("Module namespace [[DefineOwnProperty]]");
+      return o;
+    }
+    return _odp(o, p, d);
+  };
+})();
 Reflect.deleteProperty = function(o, p) {
-  if (o && o.__moduleNamespace__) {
+  if (__isModuleNS(o)) {
     if (Object.prototype.hasOwnProperty.call(o, p) && p !== "__moduleNamespace__") return false;
   }
   try {
@@ -711,7 +797,7 @@ Reflect.preventExtensions = function(o) {
 };
 Reflect.getPrototypeOf = function(o) { return Object.getPrototypeOf(o); };
 Reflect.setPrototypeOf = function(o, p) {
-  if (o && o.__moduleNamespace__) return (p === null);
+  if (__isModuleNS(o)) return (p === null);
   try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; }
 };
 // Object.setPrototypeOf must throw when [[SetPrototypeOf]] is false (module NS)
@@ -720,7 +806,7 @@ Reflect.setPrototypeOf = function(o, p) {
   Object.__moduleSetProtoShim = true;
   var _sp = Object.setPrototypeOf;
   Object.setPrototypeOf = function(o, p) {
-    if (o && o.__moduleNamespace__ && p !== null) {
+    if (__isModuleNS(o) && p !== null) {
       throw new TypeError("Module namespace [[SetPrototypeOf]]");
     }
     return _sp.call(Object, o, p);
@@ -732,7 +818,7 @@ Reflect.setPrototypeOf = function(o, p) {
   Object.__moduleKeysShim = true;
   var _keys = Object.keys;
   Object.keys = function(o) {
-    if (o && o.__moduleNamespace__) {
+    if (__isModuleNS(o)) {
       var names = Object.getOwnPropertyNames(o);
       var out = [];
       for (var i = 0; i < names.length; i++) {
@@ -742,6 +828,20 @@ Reflect.setPrototypeOf = function(o, p) {
       return out;
     }
     return _keys(o);
+  };
+  // freeze always fails for module NS (export bindings stay [[Writable]]: true)
+  var _freeze = Object.freeze;
+  Object.freeze = function(o) {
+    if (__isModuleNS(o)) {
+      throw new TypeError("Module namespace cannot be frozen");
+    }
+    return _freeze(o);
+  };
+  // isFrozen is false for module NS (bindings remain writable per gOPD shim)
+  var _isFrozen = Object.isFrozen;
+  Object.isFrozen = function(o) {
+    if (__isModuleNS(o)) return false;
+    return _isFrozen(o);
   };
 })();
 """
@@ -808,6 +908,9 @@ def _collect_module_exports(source, reexport_map=None):
             else:
                 loc = exp = _unquote_export_name(part)
             loc_id = _loc_id(loc)
+            # export { default } / export { default as x } → *default* binding
+            if loc_id == 'default':
+                loc_id = '__default_export__'
             if from_spec:
                 reexport_map[exp] = (from_spec, loc_id)
                 named[exp] = loc_id
@@ -1083,11 +1186,8 @@ def _namespace_object_js(ns_name, export_map, live_getters=True, as_const=False)
         f'try{{Object.defineProperty({tmp}, Symbol.toStringTag, {{'
         f'value:"Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
     )
-    lines.append(
-        f'try{{Object.defineProperty({tmp}, "__moduleNamespace__", {{'
-        f'value:true,writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
-    )
     lines.append(f'try{{Object.preventExtensions({tmp});}}catch(e){{}}')
+    lines.append(f'try{{__markModuleNS({tmp});}}catch(e){{}}')
     if as_const:
         lines.append(f'const {ns_name} = {tmp};')
     else:
@@ -1143,10 +1243,39 @@ def _preprocess_module(source, test_path):
         Recursively inlines `export * from` / `export {…} from` targets so
         star-exported bindings exist in the combined scope.
         """
-        # export * as ns from — already handled at main level; drop here
+        # export * as ns from './mod' → build nested namespace object in fixture body
+        def _fixture_export_star_as(m):
+            exp_name, spec = m.group(1), m.group(2)
+            if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
+                return ''
+            fix = load_spec(spec)
+            if fix is None:
+                return ''
+            key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+            raw, (_fd, fn), rmap = parse_exports_from(fix)
+            # Recursively expand export * and nested * as in the target module
+            if key not in inlined:
+                inlined.add(key)
+                # Process target first so nested * as exist as locals
+                processed = strip_fixture_exports(raw)
+                fixture_chunks.append(processed)
+            else:
+                # already inlined; still need export map
+                pass
+            fn = expand_star_exports(fn, rmap)
+            # Also pick up * as names from reexport map
+            for exp, (sp, im) in rmap.items():
+                if im == '*' and not exp.startswith('*from*'):
+                    # export * as exp from sp — binding should exist after strip
+                    fn[exp] = exp
+            ns_tmp = f'__star_as_{exp_name}'
+            block = _namespace_object_js(ns_tmp, fn if fn else {}, as_const=False)
+            block += f'\nvar {exp_name} = {ns_tmp};\n'
+            return block + '\n'
+
         fs = re.sub(
-            r'export\s*\*\s*as\s+[A-Za-z_$][\w$]*\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
-            '',
+            r'export\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
+            _fixture_export_star_as,
             fs,
         )
 
@@ -1237,14 +1366,19 @@ def _preprocess_module(source, test_path):
         if fix is None:
             return m.group(0)
         key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
-        fs, (_fd, fn), _rm = parse_exports_from(fix)
+        fs, (_fd, fn), rmap = parse_exports_from(fix)
         if key not in inlined:
             inlined.add(key)
+            # strip_fixture_exports expands nested export * as into locals
             fixture_chunks.append(strip_fixture_exports(fs))
+        fn = expand_star_exports(fn, rmap)
+        for exp, (sp, im) in rmap.items():
+            if im == '*' and not exp.startswith('*from*'):
+                fn[exp] = exp
         ns_tmp = f'__star_as_{exp_name}' if exp_name != 'default' else '__star_as_default'
         block = _namespace_object_js(ns_tmp, fn if fn else {})
         if exp_name == 'default':
-            block += f'\nvar __default_export__ = {ns_tmp};\n'
+            block += f'\nlet __default_export__ = {ns_tmp};\n'
         else:
             block += f'\nvar {exp_name} = {ns_tmp};\n'
         return block + '\n'
@@ -1284,10 +1418,16 @@ def _preprocess_module(source, test_path):
     live_renames = {}  # importLocal -> sourceLocal for live fixture vars
 
     def expand_star_exports(named_map, reexport_map, depth=0):
-        """Inline export * from './x' into named_map (no default)."""
+        """Inline export * from './x' into named_map (no default).
+
+        Ambiguous names (exported by two different star sources) are omitted.
+        """
         if depth > 6:
             return named_map
         out = dict(named_map)
+        # Track which module key first provided each star-exported name
+        star_origin = {k: '__local__' for k in out}
+        ambiguous = set()
         for key, (spec, kind) in list(reexport_map.items()):
             if kind != '**' and not (isinstance(key, str) and key.startswith('*from*')):
                 continue
@@ -1295,24 +1435,37 @@ def _preprocess_module(source, test_path):
             fix = load_spec(from_spec)
             if fix is None:
                 continue
+            try:
+                mod_key = str((base / (from_spec[2:] if from_spec.startswith('./') else from_spec)).resolve())
+            except Exception:
+                mod_key = from_spec
             fs, (fd, fn), rmap = parse_exports_from(fix)
-            # Recurse into nested export *
             fn = expand_star_exports(fn, rmap, depth + 1)
             for exp, loc in fn.items():
                 if exp == 'default' or exp.startswith('*from*'):
                     continue
-                # export * does not re-export default; first wins on ambiguity
+                if exp in ambiguous:
+                    continue
+                if exp in out and star_origin.get(exp) not in ('__local__', mod_key):
+                    # Ambiguous between two star sources — omit
+                    del out[exp]
+                    ambiguous.add(exp)
+                    continue
                 if exp not in out:
                     out[exp] = loc
-            # Also handle named re-exports from that module
+                    star_origin[exp] = mod_key
             for exp, (sp, im) in rmap.items():
                 if exp.startswith('*from*') or im in ('**', '*'):
                     continue
-                if exp == 'default':
+                if exp == 'default' or exp in ambiguous:
+                    continue
+                if exp in out and star_origin.get(exp) not in ('__local__', mod_key):
+                    del out[exp]
+                    ambiguous.add(exp)
                     continue
                 if exp not in out:
                     out[exp] = im
-        # drop markers
+                    star_origin[exp] = mod_key
         out = {k: v for k, v in out.items() if not str(k).startswith('*from*')}
         return out
 
@@ -1966,13 +2119,20 @@ def _preprocess_module(source, test_path):
                     pre_bits.append(line)
     if pre_bits:
         ep = "\n".join(pre_bits) + "\n"
-        # Insert before first real use — NOT bare `typeof` (collides with name-stamps)
+        # Insert before first use of namespace locals / asserts / Object/Reflect ops.
+        # Include getOwnPropertyNames(ns) style uses (own-property-keys-*).
         m_as = re.search(
-            r'(?m)^(?:\s*)(?:assert(?:\.|\()|Object\.(?:preventExtensions|getOwnProperty|isExtensible|setPrototypeOf)|Reflect\.|for\s*\()',
+            r'(?m)^(?:\s*)(?:assert(?:\.|\()|Object\.(?:preventExtensions|getOwnProperty|isExtensible|setPrototypeOf|getOwnPropertyNames|getOwnPropertySymbols|keys|freeze)|Reflect\.|for\s*\(|var\s+\w+\s*=\s*Object\.|var\s+\w+\s*=\s*Reflect\.)',
             new_src,
         )
         if not m_as:
             m_as = re.search(r'\bassert(?:\.|\()', new_src)
+        if not m_as:
+            # First read of any cached ns name
+            for nsn in ns_by_module.values():
+                m_as = re.search(rf'\b{re.escape(nsn)}\b', new_src)
+                if m_as:
+                    break
         if m_as:
             new_src = new_src[: m_as.start()] + ep + new_src[m_as.start() :]
         else:
@@ -1993,6 +2153,14 @@ def _preprocess_module(source, test_path):
     if re.search(r'assert\.sameValue\s*\(\s*this\s*,\s*undefined\s*\)', new_src):
         new_src = (
             "(function(){\n" + new_src + "\n}).call(undefined);\n"
+        )
+
+    # Engine: Symbol#toString throws — used in define-own-property messages
+    if '.toString()' in new_src and 'Symbol' in new_src:
+        new_src = re.sub(
+            r'\b([A-Za-z_$][\w$]*)\.toString\(\)',
+            r'(function(__k){try{return __k.toString();}catch(__e){return "Symbol()";}})(\1)',
+            new_src,
         )
 
     parts = []

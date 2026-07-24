@@ -10,7 +10,7 @@
 
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
-| 1 | **module-code** | 30.7% | **87.6%** (M120) | 90% | +67 from M117; need ~+26 |
+| 1 | **module-code** | 30.7% | **88.1%** (M121) | 90% | +73 from M117; need ~+20 |
 | 2 | **import** | ~13% | **30.2%** | 90% | With module linker |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
@@ -51,3 +51,4 @@ Review dependencies (Proxy, species, TypedArray, Promise jobs), then Object/Arra
 - M118b: export*as default, live ns getters, eval-this, iee trailing comma
 - M119: ns exotic (set/delete/gOPD shim), export*, string expnames, star-props, keyword import names
 - M120: NS uninit/TDZ, setPrototypeOf, star equality cache, live import renames, string imports
+- M121: nested export*as NS, ambiguous export* omit, defineOwnProperty+freeze, NS brand side-table
