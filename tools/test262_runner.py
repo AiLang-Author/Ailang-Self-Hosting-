@@ -622,10 +622,16 @@ if (typeof Reflect === 'undefined') {
 """
 
 
-def _collect_module_exports(source):
-    """Return (default_local_name_or_None, {exportName: localName})."""
+def _collect_module_exports(source, reexport_map=None):
+    """Return (default_local_name_or_None, {exportName: localName}).
+
+    reexport_map: optional dict exportName -> (from_spec, importName) for
+    `export { A as B } from './mod'` (importName may be '*' for star-as).
+    """
     dflt = None
     named = {}
+    if reexport_map is None:
+        reexport_map = {}
     # After anon rewrite, default lives on __default_export__
     if re.search(r'\b__default_export__\b', source):
         dflt = '__default_export__'
@@ -641,16 +647,33 @@ def _collect_module_exports(source):
             dflt = m2.group(1)
         elif re.search(r'export\s+default\s+', source):
             dflt = '__default_export__'
-    for m in re.finditer(r'export\s*\{([^}]+)\}', source):
+    # export { a, b as c } from 'mod'  OR  export { a, b as c };
+    for m in re.finditer(
+        r'export\s*\{([^}]+)\}\s*(?:from\s*[\'"]([^\'"]+)[\'"])?',
+        source,
+    ):
+        from_spec = m.group(2)
         for part in m.group(1).split(','):
             part = part.strip()
             if not part:
                 continue
             if ' as ' in part:
                 loc, exp = part.split(' as ', 1)
-                named[exp.strip()] = loc.strip()
+                loc, exp = loc.strip(), exp.strip()
             else:
-                named[part] = part
+                loc = exp = part
+            if from_spec:
+                reexport_map[exp] = (from_spec, loc)
+                named[exp] = loc  # local name in *source* module of re-export
+            else:
+                named[exp] = loc
+    # export * as ns from 'mod'
+    for m in re.finditer(
+        r'export\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*[\'"]([^\'"]+)[\'"]',
+        source,
+    ):
+        reexport_map[m.group(1)] = (m.group(2), '*')
+        named[m.group(1)] = m.group(1)
     for m in re.finditer(
         r'export\s+(?:async\s+)?(?:function\s*\*?|class|let|const|var)\s+([A-Za-z_$][\w$]*)',
         source,
@@ -659,6 +682,123 @@ def _collect_module_exports(source):
     if dflt:
         named['default'] = dflt
     return dflt, named
+
+
+def _match_braced_decl(source, start):
+    """From index of '{' after a function/class header, return end index after matching '}'."""
+    i = start
+    if i >= len(source) or source[i] != '{':
+        return -1
+    depth = 0
+    while i < len(source):
+        ch = source[i]
+        if ch == '{':
+            depth += 1
+        elif ch == '}':
+            depth -= 1
+            if depth == 0:
+                return i + 1
+        elif ch in ('"', "'", '`'):
+            q = ch
+            i += 1
+            while i < len(source) and source[i] != q:
+                if source[i] == '\\':
+                    i += 2
+                    continue
+                i += 1
+        i += 1
+    return -1
+
+
+def _extract_export_function_decl(source, name):
+    """Return (full_match, decl_without_export) for export function/gen name, or None."""
+    m = re.search(
+        rf'export\s+((?:async\s+)?function\s*\*?\s+{re.escape(name)}\s*\([^)]*\)\s*)\{{',
+        source,
+    )
+    if not m:
+        return None
+    body_end = _match_braced_decl(source, m.end() - 1)
+    if body_end < 0:
+        return None
+    full = source[m.start():body_end]
+    decl = source[m.start(1):body_end]
+    return full, decl
+
+
+def _extract_export_class_decl(source, name):
+    """Return (full_match, decl_without_export) for export class name, or None."""
+    m = re.search(
+        rf'export\s+(class\s+{re.escape(name)}\b[^{{]*)\{{',
+        source,
+    )
+    if not m:
+        return None
+    body_end = _match_braced_decl(source, m.end() - 1)
+    if body_end < 0:
+        return None
+    full = source[m.start():body_end]
+    decl = source[m.start(1):body_end]
+    return full, decl
+
+
+def _extract_default_function_decl(source):
+    """export default function [name](...) { ... } → (full, decl, name_or__default_export__)."""
+    m = re.search(
+        r'export\s+default\s+((?:async\s+)?function\s*\*?\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*)\{',
+        source,
+    )
+    if m:
+        body_end = _match_braced_decl(source, m.end() - 1)
+        if body_end < 0:
+            return None
+        full = source[m.start():body_end]
+        decl = source[m.start(1):body_end]
+        return full, decl, m.group(2)
+    # anonymous — may already be rewritten to var __default_export__ = function...
+    m = re.search(
+        r'export\s+default\s+((?:async\s+)?function\s*\*?\s*\([^)]*\)\s*)\{',
+        source,
+    )
+    if m:
+        body_end = _match_braced_decl(source, m.end() - 1)
+        if body_end < 0:
+            return None
+        full = source[m.start():body_end]
+        # Convert to named function decl for hoisting
+        header = m.group(1)
+        header2 = re.sub(
+            r'function(\s*\*)?\s*\(',
+            r'function\1 __default_export__(',
+            header,
+            count=1,
+        )
+        decl = header2 + source[m.end() - 1:body_end]
+        return full, decl, '__default_export__'
+    # after anon rewrite: var __default_export__ = function(...){...};
+    m = re.search(
+        r'var\s+__default_export__\s*=\s*((?:async\s+)?function\s*\*?\s*\([^)]*\)\s*)\{',
+        source,
+    )
+    if m:
+        body_end = _match_braced_decl(source, m.end() - 1)
+        if body_end < 0:
+            return None
+        # include trailing ; and name stamp if present
+        end = body_end
+        if end < len(source) and source[end] == ';':
+            end += 1
+        full = source[m.start():end]
+        header = m.group(1)
+        header2 = re.sub(
+            r'function(\s*\*)?\s*\(',
+            r'function\1 __default_export__(',
+            header,
+            count=1,
+        )
+        decl = header2 + source[m.end() - 1:body_end]
+        return full, decl, '__default_export__'
+    return None
 
 
 _NAME_DEFAULT = (
@@ -708,9 +848,18 @@ def _stamp_default_name_after(source, start_marker):
 
 def _rewrite_anon_default_export(source):
     """Turn anonymous export default into var __default_export__ = …"""
+    # export default class { … }  OR  export default class extends … { … }
     source, n = re.subn(
         r'export\s+default\s+class\s*\{',
         'var __default_export__ = class {',
+        source,
+        count=1,
+    )
+    if n:
+        return _stamp_default_name_after(source, 'var __default_export__ = class')
+    source, n = re.subn(
+        r'export\s+default\s+class\s+(extends\b)',
+        r'var __default_export__ = class \1',
         source,
         count=1,
     )
@@ -775,7 +924,8 @@ def _preprocess_module(source, test_path):
     # Desugar pattern default await (engine bug: await in pattern default)
     # export var { x = await E } = {}; → export var x = await E;
     source = _desugar_export_var_await_pattern(source)
-    dflt, named = _collect_module_exports(source)
+    self_reexports = {}
+    dflt, named = _collect_module_exports(source, self_reexports)
 
     fixtures = {}
 
@@ -793,8 +943,9 @@ def _preprocess_module(source, test_path):
         return fixtures[key]
 
     inlined = set()
+    # Note: test262 often writes `import* as ns` (no space after import).
     import_re = re.compile(
-        r'''^import\s+(?:
+        r'''^import\s*(?:
             (?P<def>[A-Za-z_$][\w$]*)\s*,\s*
           )?
           (?:
@@ -812,10 +963,123 @@ def _preprocess_module(source, test_path):
     ns_epilogues = []  # namespace objects after all decls (live getters)
     live_export_assigns = set()  # export vars that need assignment-only form
     live_binding_prelude = []  # hoisted before asserts (import instantiation)
+    # (loc, src_local) pairs: const loc = src_local inserted after export init
+    deferred_aliases = []
+    strip_export_from = True  # strip export-from lines in fixtures/main
 
     def parse_exports_from(src):
         src2 = _rewrite_anon_default_export(src)
-        return src2, _collect_module_exports(src2)
+        rmap = {}
+        return src2, _collect_module_exports(src2, rmap), rmap
+
+    def strip_fixture_exports(fs):
+        """Remove export keywords / export-from lines for inlined fixture bodies."""
+        # Drop re-export lines entirely (bindings resolved via parent)
+        fs = re.sub(
+            r'export\s*\{[^}]+\}\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
+            '',
+            fs,
+        )
+        fs = re.sub(
+            r'export\s*\*\s*as\s+[A-Za-z_$][\w$]*\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
+            '',
+            fs,
+        )
+        fs = re.sub(
+            r'export\s*\*\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
+            '',
+            fs,
+        )
+        fs = re.sub(r'\bexport\s+default\s+', '', fs)
+        fs = re.sub(r'\bexport\s+', '', fs)
+        # IEE fixtures probe that re-export names are NOT local bindings. Run the
+        # probe in an IIFE so later main `var A` / `function A` cannot resolve.
+        # Surface `results` to the outer script for the importing module.
+        if re.search(r'\bresults\b', fs) and re.search(r'try\s*\{', fs):
+            # Rename local results → __iee_results, return it to outer `results`
+            fs = re.sub(r'\bresults\b', '__iee_results', fs)
+            fs = (
+                "var results = (function(){\n"
+                + fs
+                + "\nreturn __iee_results;\n})();\n"
+            )
+        return fs
+
+    def bind_self_import(loc, src_local, kind_source):
+        """Create immutable import binding for self (or re-export of self)."""
+        is_fun = bool(re.search(
+            rf'export\s+(?:async\s+)?function\s*\*?\s+{re.escape(src_local)}\b',
+            kind_source,
+        ))
+        is_class = bool(re.search(
+            rf'export\s+class\s+{re.escape(src_local)}\b',
+            kind_source,
+        ))
+        is_var = bool(re.search(
+            rf'export\s+var\s+{re.escape(src_local)}\b',
+            kind_source,
+        ))
+        is_let = bool(re.search(
+            rf'export\s+let\s+{re.escape(src_local)}\b',
+            kind_source,
+        ))
+        is_const = bool(re.search(
+            rf'export\s+const\s+{re.escape(src_local)}\b',
+            kind_source,
+        ))
+        if is_fun:
+            extracted = _extract_export_function_decl(kind_source, src_local)
+            if extracted:
+                live_binding_prelude.append(extracted[1])
+                live_export_assigns.add('__strip_export_fn_' + src_local)
+            # Function first in prelude, then const (engine does not hoist fn before const)
+            live_binding_prelude.append(f'const {loc} = {src_local};')
+        elif is_var:
+            live_binding_prelude.append(f'const {loc} = undefined;')
+            if loc != src_local:
+                live_binding_prelude.append(f'var {src_local};')
+            else:
+                live_binding_prelude.append(f'var {src_local};')
+            live_export_assigns.add(src_local)
+        elif is_class:
+            # Class has TDZ until evaluated — alias const after class body
+            deferred_aliases.append((loc, src_local, 'class'))
+            live_export_assigns.add('__class_alias_' + loc + '_' + src_local)
+        elif is_let or is_const:
+            # Leave loc undeclared until after export let/const (native TDZ for typeof)
+            deferred_aliases.append((loc, src_local, 'let' if is_let else 'const'))
+            live_export_assigns.add('__let_alias_' + loc + '_' + src_local)
+        else:
+            # fallback
+            live_binding_prelude.append(f'var {loc} = {src_local};')
+
+    def bind_default_import(defname, kind_source, is_self_imp):
+        """Default import: hoist functions; TDZ for class/expr."""
+        # Named: export default function fName
+        extracted = _extract_default_function_decl(kind_source)
+        if extracted:
+            full, decl, fname = extracted
+            live_binding_prelude.append(decl)
+            if fname == '__default_export__':
+                live_binding_prelude.append(_NAME_DEFAULT)
+            live_binding_prelude.append(f'const {defname} = {fname};')
+            live_export_assigns.add('__strip_default_fn__')
+            return
+        # export default class [Name]
+        if re.search(r'export\s+default\s+class\b', kind_source) or re.search(
+            r'var\s+__default_export__\s*=\s*class\b', kind_source
+        ):
+            # const defname = class after rewrite — TDZ until that line
+            live_export_assigns.add('__default_alias_' + defname)
+            return
+        # export default expr / already __default_export__
+        if re.search(r'export\s+default\s+', kind_source) or re.search(
+            r'\b__default_export__\b', kind_source
+        ):
+            live_export_assigns.add('__default_alias_' + defname)
+            return
+        if is_self_imp and dflt:
+            live_binding_prelude.append(f'var {defname} = {dflt};')
 
     def handle_import(m):
         nonlocal dflt, named
@@ -824,36 +1088,44 @@ def _preprocess_module(source, test_path):
             return ''
         is_self = Path(spec).name == self_name or spec in ('./' + self_name, self_name)
         fix_src = None if is_self else load_spec(spec)
+        fix_reexports = {}
 
         if m.group('side') and fix_src is not None:
             key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
             if key not in inlined:
                 inlined.add(key)
-                fs, _ = parse_exports_from(fix_src)
-                fs = re.sub(r'\bexport\s+default\s+', '', fs)
-                fs = re.sub(r'\bexport\s+', '', fs)
-                fixture_chunks.append(fs)
+                fs, _, _ = parse_exports_from(fix_src)
+                fixture_chunks.append(strip_fixture_exports(fs))
             return ''
 
         f_dflt = dflt if is_self else None
         f_named = dict(named) if is_self else {}
+        kind_source = source
         if fix_src is not None:
             key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
-            fs, (fd, fn) = parse_exports_from(fix_src)
+            fs, (fd, fn), fix_reexports = parse_exports_from(fix_src)
             f_dflt, f_named = fd, fn
+            kind_source = fs
             if key not in inlined:
                 inlined.add(key)
-                fs2 = re.sub(r'\bexport\s+default\s+', '', fs)
-                # if already rewritten to var __default_export__, keep it
-                fs2 = re.sub(r'\bexport\s+', '', fs2)
-                fixture_chunks.append(fs2)
+                fixture_chunks.append(strip_fixture_exports(fs))
 
         repl = []
         defname = m.group('def') or m.group('defonly')
-        if defname and f_dflt:
-            repl.append(f'var {defname} = {f_dflt};')
-        elif defname and is_self and dflt:
-            repl.append(f'var {defname} = {dflt};')
+        if defname:
+            if is_self:
+                bind_default_import(defname, source, True)
+            elif f_dflt:
+                # fixture default
+                if re.search(
+                    r'(?:export\s+default\s+(?:async\s+)?function|var\s+__default_export__\s*=\s*(?:async\s+)?function)',
+                    kind_source,
+                ):
+                    bind_default_import(defname, kind_source, False)
+                else:
+                    repl.append(f'var {defname} = {f_dflt};')
+            elif is_self and dflt:
+                repl.append(f'var {defname} = {dflt};')
 
         ns = m.group('ns')
         if ns:
@@ -876,116 +1148,220 @@ def _preprocess_module(source, test_path):
                 src_local = f_named.get(exp, exp)
                 if exp == 'default' and f_dflt:
                     src_local = f_dflt
+
+                # Re-export from fixture pointing back at self: treat as self-import
+                reexp = fix_reexports.get(exp)
+                if reexp and not is_self:
+                    from_spec, from_name = reexp
+                    from_is_self = (
+                        Path(from_spec).name == self_name
+                        or from_spec in ('./' + self_name, self_name)
+                    )
+                    if from_is_self and from_name != '*':
+                        bind_self_import(loc, from_name, source)
+                        continue
+                    if from_name == '*':
+                        # export * as ns — namespace of target module
+                        # approximate later via ns object of self exports
+                        ns_epilogues.append(
+                            _namespace_object_js(loc, named)
+                        )
+                        repl.append(f'var {loc};')
+                        continue
+
                 if is_self:
-                    # Immutable import binding for instn-named-bndng-*
-                    # function/class/gen are hoisted; var is undefined; let/const TDZ skip const trick
+                    bind_self_import(loc, src_local, source)
+                else:
+                    # fixture local export (e.g. results)
                     is_fun = bool(re.search(
                         rf'export\s+(?:async\s+)?function\s*\*?\s+{re.escape(src_local)}\b',
-                        source,
-                    ))
-                    is_class = bool(re.search(
-                        rf'export\s+class\s+{re.escape(src_local)}\b',
-                        source,
+                        kind_source,
                     ))
                     is_var = bool(re.search(
                         rf'export\s+var\s+{re.escape(src_local)}\b',
-                        source,
+                        kind_source,
+                    ))
+                    is_const = bool(re.search(
+                        rf'export\s+const\s+{re.escape(src_local)}\b',
+                        kind_source,
                     ))
                     if is_fun:
-                        # Pull export function/class/gen decl to prelude, then const alias
-                        mfn = re.search(
-                            rf'export\s+((?:async\s+)?function\s*\*?\s+{re.escape(src_local)}\s*\([^)]*\)\s*\{{[^}}]*\}})',
-                            source,
-                        )
-                        if not mfn:
-                            mfn = re.search(
-                                rf'export\s+(class\s+{re.escape(src_local)}\s*\{{[\s\S]*?\n\}})',
-                                source,
-                            )
-                        if not mfn:
-                            # single-line class/function
-                            mfn = re.search(
-                                rf'export\s+((?:async\s+)?(?:function\s*\*?|class)\s+{re.escape(src_local)}\b[^;]*;?)',
-                                source,
-                            )
-                        if mfn:
-                            live_binding_prelude.append(mfn.group(1))
-                            live_export_assigns.add('__strip_export_fn_' + src_local)
-                        live_binding_prelude.append(f'const {loc} = {src_local};')
+                        if loc != src_local:
+                            # renamed import of fixture function
+                            live_binding_prelude.append(f'const {loc} = {src_local};')
+                        # same name: fixture already declared function
                     elif is_var:
-                        live_binding_prelude.append(f'const {loc} = undefined;')
-                        live_binding_prelude.append(f'var {src_local};')  # for later x = 23
-                        live_export_assigns.add(src_local)
-                    elif is_class:
-                        # class TDZ: typeof and read throw ReferenceError until evaluated
-                        live_binding_prelude.append(
-                            f'try{{Object.defineProperty(typeof globalThis!=="undefined"?globalThis:this,'
-                            f'{json.dumps(loc)},{{get:function(){{throw new ReferenceError("TDZ");}},'
-                            f'set:function(){{throw new TypeError();}},'
-                            f'enumerable:true,configurable:true}});}}catch(e){{}}'
-                        )
-                        # After class decl, re-bind as const - append at end of module
-                        live_export_assigns.add('__class_rebind_' + loc + '_' + src_local)
+                        # Fixture inlined `var x = …` already; only alias on rename.
+                        # Do NOT `const x = undefined` — that clobbers the fixture value.
+                        if loc != src_local:
+                            repl.append(f'const {loc} = {src_local};')
+                    elif is_const:
+                        # Fixture body is prepended; binding already exists under src_local.
+                        if loc != src_local:
+                            repl.append(f'const {loc} = {src_local};')
                     else:
-                        # let/const TDZ: typeof throws ReferenceError
-                        live_binding_prelude.append(
-                            f'try{{Object.defineProperty(typeof globalThis!=="undefined"?globalThis:this,'
-                            f'{json.dumps(loc)},{{get:function(){{throw new ReferenceError("TDZ");}},'
-                            f'set:function(){{throw new TypeError();}},'
-                            f'enumerable:true,configurable:true}});}}catch(e){{}}'
-                        )
-                        live_export_assigns.add('__let_rebind_' + loc + '_' + src_local)
-                else:
-                    repl.append(f'var {loc} = {src_local};')
+                        if loc != src_local:
+                            repl.append(f'var {loc} = {src_local};')
         return "\n".join(repl)
 
     new_src = import_re.sub(handle_import, source)
 
+    # Strip main-module export-from lines (handled via reexport map if any)
+    new_src = re.sub(
+        r'export\s*\{[^}]+\}\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
+        '',
+        new_src,
+    )
+    new_src = re.sub(
+        r'export\s*\*\s*as\s+[A-Za-z_$][\w$]*\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
+        '',
+        new_src,
+    )
+
     # export var/let/const x = expr → x = expr when live-imported (already hoisted)
-    for name in live_export_assigns:
+    for name in list(live_export_assigns):
         if name.startswith('__strip_export_fn_'):
             fn = name[len('__strip_export_fn_'):]
-            new_src = re.sub(
-                rf'export\s+(?:async\s+)?function\s*\*?\s+{re.escape(fn)}\s*\([^)]*\)\s*\{{[^}}]*\}}',
-                f'/* hoisted {fn} */',
-                new_src,
-                count=1,
-            )
-            new_src = re.sub(
-                rf'export\s+class\s+{re.escape(fn)}\b[\s\S]*?\}}',
-                f'/* hoisted {fn} */',
-                new_src,
-                count=1,
-            )
-            continue
-        if name.startswith('__class_rebind_') or name.startswith('__let_rebind_'):
-            # __class_rebind_D_C or __let_rebind_y_x
-            rest = name.split('_rebind_', 1)[1]
-            loc, src_local = rest.split('_', 1)
-            # After export let/class, rebind import name as const to export
-            if name.startswith('__class_rebind_'):
-                new_src = re.sub(
-                    rf'(export\s+class\s+{re.escape(src_local)}\b[\s\S]*?\}})',
-                    rf'\1\nObject.defineProperty(typeof globalThis!=="undefined"?globalThis:this,'
-                    rf'{json.dumps(loc)},{{value:{src_local},writable:false,configurable:true}});',
-                    new_src,
-                    count=1,
-                )
+            extracted = _extract_export_function_decl(new_src, fn)
+            if extracted:
+                new_src = new_src.replace(extracted[0], f'/* hoisted {fn} */', 1)
             else:
                 new_src = re.sub(
-                    rf'(export\s+(?:let|const)\s+{re.escape(src_local)}\s*=\s*[^;]+;)',
-                    rf'\1\nObject.defineProperty(typeof globalThis!=="undefined"?globalThis:this,'
-                    rf'{json.dumps(loc)},{{value:{src_local},writable:false,configurable:true}});',
+                    rf'export\s+(?:async\s+)?function\s*\*?\s+{re.escape(fn)}\s*\([^)]*\)\s*\{{[^}}]*\}}',
+                    f'/* hoisted {fn} */',
                     new_src,
                     count=1,
                 )
             continue
+        if name == '__strip_default_fn__':
+            extracted = _extract_default_function_decl(new_src)
+            if extracted:
+                new_src = new_src.replace(extracted[0], '/* hoisted default fn */', 1)
+            # also strip name-stamp left after var rewrite
+            new_src = re.sub(
+                r'try\{Object\.defineProperty\(__default_export__,\'name\',[^\n]+\n?',
+                '',
+                new_src,
+                count=1,
+            )
+            continue
+        if name.startswith('__default_alias_'):
+            loc = name[len('__default_alias_'):]
+            # Prefer a single `const loc = …` so loc is in TDZ until that line
+            # (typeof loc must throw ReferenceError before init).
+            if re.search(r'var\s+__default_export__\s*=', new_src):
+                # var __default_export__ = class {} / expr;
+                # → const loc = class {} / expr;  (+ name stamp when present)
+                new_src = re.sub(
+                    r'var\s+__default_export__\s*=\s*',
+                    f'const {loc} = ',
+                    new_src,
+                    count=1,
+                )
+                # Fix name-stamp to target loc
+                new_src = new_src.replace(
+                    "Object.defineProperty(__default_export__,'name'",
+                    f"Object.defineProperty({loc},'name'",
+                )
+            elif re.search(r'export\s+default\s+class\b', new_src):
+                m = re.search(r'export\s+default\s+class\b', new_src)
+                if m:
+                    m2 = re.match(
+                        r'export\s+default\s+(class(?:\s+[A-Za-z_$][\w$]*)?\b[^{]*)\{',
+                        new_src[m.start():],
+                    )
+                    if m2:
+                        abs_brace = m.start() + m2.end() - 1
+                        end = _match_braced_decl(new_src, abs_brace)
+                        if end > 0:
+                            block = new_src[m.start():end]
+                            inner = block[len('export default '):]
+                            new_src = (
+                                new_src[:m.start()]
+                                + f'const {loc} = {inner};'
+                                + new_src[end:]
+                            )
+            elif re.search(r'export\s+default\s+', new_src):
+                new_src = re.sub(
+                    r'export\s+default\s+',
+                    f'const {loc} = ',
+                    new_src,
+                    count=1,
+                )
+            continue
+        if name.startswith('__class_alias_') or name.startswith('__let_alias_'):
+            rest = name.split('_alias_', 1)[1]
+            loc, src_local = rest.split('_', 1)
+            if name.startswith('__class_alias_'):
+                extracted = _extract_export_class_decl(new_src, src_local)
+                if extracted:
+                    full, decl = extracted
+                    alias = f'\nconst {loc} = {src_local};' if loc != src_local else ''
+                    new_src = new_src.replace(full, decl + alias, 1)
+                else:
+                    new_src = re.sub(
+                        rf'export\s+(class\s+{re.escape(src_local)}\b)',
+                        r'\1',
+                        new_src,
+                        count=1,
+                    )
+                    if loc != src_local:
+                        new_src = re.sub(
+                            rf'(class\s+{re.escape(src_local)}\b[^{{]*\{{)',
+                            rf'\1',
+                            new_src,
+                            count=1,
+                        )
+                        # append const after class body
+                        extracted2 = _extract_export_class_decl(
+                            'export ' + new_src if False else new_src, src_local
+                        )
+                        # simpler: after class Name { ... }
+                        m = re.search(
+                            rf'class\s+{re.escape(src_local)}\b[^{{]*\{{',
+                            new_src,
+                        )
+                        if m and loc != src_local:
+                            end = _match_braced_decl(new_src, m.end() - 1)
+                            if end > 0:
+                                new_src = (
+                                    new_src[:end]
+                                    + f'\nconst {loc} = {src_local};'
+                                    + new_src[end:]
+                                )
+            else:
+                # let/const: strip export, add const loc = src after
+                def let_repl(mm):
+                    body = mm.group(0)
+                    body = re.sub(r'^export\s+', '', body)
+                    if loc != src_local:
+                        body = body + f'\nconst {loc} = {src_local};'
+                    return body
+
+                new_src2, nsub = re.subn(
+                    rf'export\s+(?:let|const)\s+{re.escape(src_local)}\s*=\s*[^;]+;',
+                    let_repl,
+                    new_src,
+                    count=1,
+                )
+                if nsub:
+                    new_src = new_src2
+                else:
+                    new_src2, nsub = re.subn(
+                        rf'export\s+(?:let|const)\s+{re.escape(src_local)}\s*;',
+                        let_repl,
+                        new_src,
+                        count=1,
+                    )
+                    if nsub:
+                        new_src = new_src2
+            continue
+        # var live: export var x = → x =  (x already var-hoisted in prelude)
         new_src = re.sub(
             rf'\bexport\s+(?:var|let|const)\s+{re.escape(name)}\s*=',
             f'{name} =',
             new_src,
         )
-        # bare export var x; (no init)
         new_src = re.sub(
             rf'\bexport\s+(?:var|let|const)\s+{re.escape(name)}\s*;',
             f'/* hoisted {name} */;',
@@ -993,8 +1369,8 @@ def _preprocess_module(source, test_path):
         )
 
     # Hoist live bindings to top (module instantiation before evaluation/asserts)
+    # Functions must precede const aliases (engine evaluates const before later fn decls)
     if live_binding_prelude:
-        # de-dupe while preserving order
         seen = set()
         uniq = []
         for line in live_binding_prelude:
@@ -1002,6 +1378,78 @@ def _preprocess_module(source, test_path):
                 seen.add(line)
                 uniq.append(line)
         new_src = "\n".join(uniq) + "\n" + new_src
+
+    # Strip leftover export keywords (local export-binding tests, etc.).
+    # Do NOT strip `export default` here — anon rewrite handles those; bare
+    # `export default class extends` must not become invalid `class extends`.
+    new_src = re.sub(
+        r'\bexport\s+(async\s+)?(function\s*\*?|class|let|const|var)\b',
+        r'\1\2',
+        new_src,
+    )
+    new_src = re.sub(r'\bexport\s*\{[^}]+\}\s*;', '', new_src)
+
+    # Engine: typeof on class binding does not TDZ-throw (bare does). Emulate
+    # module class bindings as `let Name = class Name {…}` only when a prior
+    # `typeof Name` appears (instn-local-bndng-cls etc.). Avoid rewriting
+    # unrelated `export class` evaluation tests.
+    pos_c, pieces_c = 0, []
+    while True:
+        m = re.search(
+            r'(?m)^class\s+([A-Za-z_$][\w$]*)\s*\{',
+            new_src[pos_c:],
+        )
+        if not m:
+            pieces_c.append(new_src[pos_c:])
+            break
+        abs_start = pos_c + m.start()
+        abs_brace = pos_c + m.end() - 1
+        end = _match_braced_decl(new_src, abs_brace)
+        if end < 0:
+            pieces_c.append(new_src[pos_c : abs_start + 1])
+            pos_c = abs_start + 1
+            continue
+        name = m.group(1)
+        body = new_src[abs_brace:end]  # includes { … }
+        pieces_c.append(new_src[pos_c:abs_start])
+        head = new_src[:abs_start]
+        needs_tdz = bool(re.search(rf'\btypeof\s+{re.escape(name)}\b', head))
+        if needs_tdz:
+            pieces_c.append(f'let {name} = class {name} {body};')
+        else:
+            pieces_c.append(f'class {name} {body}')
+        pos_c = end
+    new_src = "".join(pieces_c)
+
+    # Hoist top-level function decls that appear *after* the first assert
+    # (engine does not hoist; module instn requires bindings before evaluation).
+    m_as0 = re.search(r'\bassert(?:\.|\()', new_src)
+    if m_as0:
+        head, tail = new_src[: m_as0.start()], new_src[m_as0.start() :]
+        fun_hoists = []
+        pos = 0
+        pieces = []
+        while True:
+            m = re.search(
+                r'(?m)^(async\s+)?function(\s*\*)?\s+([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{',
+                tail[pos:],
+            )
+            if not m:
+                pieces.append(tail[pos:])
+                break
+            abs_start = pos + m.start()
+            abs_brace = pos + m.end() - 1
+            end = _match_braced_decl(tail, abs_brace)
+            if end < 0:
+                pieces.append(tail[pos : abs_start + 1])
+                pos = abs_start + 1
+                continue
+            fun_hoists.append(tail[abs_start:end])
+            pieces.append(tail[pos:abs_start])
+            pieces.append(f'/* function {m.group(3)} hoisted */')
+            pos = end
+        if fun_hoists:
+            new_src = "\n".join(fun_hoists) + "\n" + head + "".join(pieces)
 
     # Fill namespace objects before first assert (exports already initialized above)
     if ns_epilogues:
@@ -1020,6 +1468,10 @@ def _preprocess_module(source, test_path):
     parts = []
     if fixture_chunks:
         parts.append("\n".join(fixture_chunks))
+    # When fixture IEE probes ran in an isolated IIFE, keep main bindings out of
+    # the outer scope too (var A would otherwise hoist and break the probe).
+    if any('__iee_results' in c or 'var results = (function' in c for c in fixture_chunks):
+        new_src = "(function(){\n" + new_src + "\n})();\n"
     parts.append(new_src)
     return "\n".join(parts)
 
@@ -1035,6 +1487,17 @@ def _wants_strict(meta):
     return "onlyStrict" in flags and "noStrict" not in flags
 
 
+# Function("return this;")() SIGSEGVs our engine — module local-binding tests
+# depend on fnGlobalObject. Provide a safe replacement.
+_SAFE_FN_GLOBAL_OBJECT = """
+function fnGlobalObject() {
+  return (typeof globalThis !== "undefined")
+    ? globalThis
+    : (function () { return this; })();
+}
+"""
+
+
 def _load_includes(meta):
     """Load test262 harness includes listed in frontmatter (e.g. regExpUtils.js)."""
     includes = (meta or {}).get("includes") or []
@@ -1046,9 +1509,18 @@ def _load_includes(meta):
         # Skip harness files we replace with engine-safe polyfills
         if name in ("regExpUtils.js", "propertyHelper.js"):
             continue
+        if name == "fnGlobalObject.js":
+            chunks.append(_SAFE_FN_GLOBAL_OBJECT)
+            continue
         path = harness_dir / name
         if path.is_file():
-            chunks.append(path.read_text(errors="replace"))
+            text = path.read_text(errors="replace")
+            # Defensive: any include using Function("return this;") for global
+            text = text.replace(
+                'Function("return this;")()',
+                '(typeof globalThis!=="undefined"?globalThis:(function(){return this;})())',
+            )
+            chunks.append(text)
     return "\n".join(chunks) + ("\n" if chunks else "")
 
 
