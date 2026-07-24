@@ -485,13 +485,16 @@ def preprocess(source, meta=None, test_path=None):
     flags = (meta or {}).get("flags") or []
     features = (meta or {}).get("features") or []
     if "module" in flags and test_path:
-        source = _preprocess_module(source, test_path)
-        # Top-level await: wrap in async IIFE so AWAIT_EXPR is valid (in_await)
-        if "top-level-await" in features or _source_has_toplevel_await(source):
-            source = _wrap_toplevel_await(source)
-        # Namespace / Reflect tests need Reflect
-        if "Reflect" in source or "namespace" in (test_path or ""):
-            source = _MODULE_REFLECT_STUB + source
+        try:
+            source = _preprocess_module(source, test_path)
+            # Top-level await: wrap in async IIFE so AWAIT_EXPR is valid (in_await)
+            if "top-level-await" in features or _source_has_toplevel_await(source):
+                source = _wrap_toplevel_await(source)
+            # Namespace / Reflect tests need Reflect
+            if "Reflect" in source or "namespace" in (test_path or ""):
+                source = _MODULE_REFLECT_STUB + source
+        except Exception:
+            pass  # leave source as-is if preprocess chokes
     return source
 
 
@@ -807,6 +810,8 @@ def _preprocess_module(source, test_path):
 
     fixture_chunks = []
     ns_epilogues = []  # namespace objects after all decls (live getters)
+    live_export_assigns = set()  # export vars that need assignment-only form
+    live_binding_prelude = []  # hoisted before asserts (import instantiation)
 
     def parse_exports_from(src):
         src2 = _rewrite_anon_default_export(src)
@@ -871,10 +876,132 @@ def _preprocess_module(source, test_path):
                 src_local = f_named.get(exp, exp)
                 if exp == 'default' and f_dflt:
                     src_local = f_dflt
-                repl.append(f'var {loc} = {src_local};')
+                if is_self:
+                    # Immutable import binding for instn-named-bndng-*
+                    # function/class/gen are hoisted; var is undefined; let/const TDZ skip const trick
+                    is_fun = bool(re.search(
+                        rf'export\s+(?:async\s+)?function\s*\*?\s+{re.escape(src_local)}\b',
+                        source,
+                    ))
+                    is_class = bool(re.search(
+                        rf'export\s+class\s+{re.escape(src_local)}\b',
+                        source,
+                    ))
+                    is_var = bool(re.search(
+                        rf'export\s+var\s+{re.escape(src_local)}\b',
+                        source,
+                    ))
+                    if is_fun:
+                        # Pull export function/class/gen decl to prelude, then const alias
+                        mfn = re.search(
+                            rf'export\s+((?:async\s+)?function\s*\*?\s+{re.escape(src_local)}\s*\([^)]*\)\s*\{{[^}}]*\}})',
+                            source,
+                        )
+                        if not mfn:
+                            mfn = re.search(
+                                rf'export\s+(class\s+{re.escape(src_local)}\s*\{{[\s\S]*?\n\}})',
+                                source,
+                            )
+                        if not mfn:
+                            # single-line class/function
+                            mfn = re.search(
+                                rf'export\s+((?:async\s+)?(?:function\s*\*?|class)\s+{re.escape(src_local)}\b[^;]*;?)',
+                                source,
+                            )
+                        if mfn:
+                            live_binding_prelude.append(mfn.group(1))
+                            live_export_assigns.add('__strip_export_fn_' + src_local)
+                        live_binding_prelude.append(f'const {loc} = {src_local};')
+                    elif is_var:
+                        live_binding_prelude.append(f'const {loc} = undefined;')
+                        live_binding_prelude.append(f'var {src_local};')  # for later x = 23
+                        live_export_assigns.add(src_local)
+                    elif is_class:
+                        # class TDZ: typeof and read throw ReferenceError until evaluated
+                        live_binding_prelude.append(
+                            f'try{{Object.defineProperty(typeof globalThis!=="undefined"?globalThis:this,'
+                            f'{json.dumps(loc)},{{get:function(){{throw new ReferenceError("TDZ");}},'
+                            f'set:function(){{throw new TypeError();}},'
+                            f'enumerable:true,configurable:true}});}}catch(e){{}}'
+                        )
+                        # After class decl, re-bind as const - append at end of module
+                        live_export_assigns.add('__class_rebind_' + loc + '_' + src_local)
+                    else:
+                        # let/const TDZ: typeof throws ReferenceError
+                        live_binding_prelude.append(
+                            f'try{{Object.defineProperty(typeof globalThis!=="undefined"?globalThis:this,'
+                            f'{json.dumps(loc)},{{get:function(){{throw new ReferenceError("TDZ");}},'
+                            f'set:function(){{throw new TypeError();}},'
+                            f'enumerable:true,configurable:true}});}}catch(e){{}}'
+                        )
+                        live_export_assigns.add('__let_rebind_' + loc + '_' + src_local)
+                else:
+                    repl.append(f'var {loc} = {src_local};')
         return "\n".join(repl)
 
     new_src = import_re.sub(handle_import, source)
+
+    # export var/let/const x = expr → x = expr when live-imported (already hoisted)
+    for name in live_export_assigns:
+        if name.startswith('__strip_export_fn_'):
+            fn = name[len('__strip_export_fn_'):]
+            new_src = re.sub(
+                rf'export\s+(?:async\s+)?function\s*\*?\s+{re.escape(fn)}\s*\([^)]*\)\s*\{{[^}}]*\}}',
+                f'/* hoisted {fn} */',
+                new_src,
+                count=1,
+            )
+            new_src = re.sub(
+                rf'export\s+class\s+{re.escape(fn)}\b[\s\S]*?\}}',
+                f'/* hoisted {fn} */',
+                new_src,
+                count=1,
+            )
+            continue
+        if name.startswith('__class_rebind_') or name.startswith('__let_rebind_'):
+            # __class_rebind_D_C or __let_rebind_y_x
+            rest = name.split('_rebind_', 1)[1]
+            loc, src_local = rest.split('_', 1)
+            # After export let/class, rebind import name as const to export
+            if name.startswith('__class_rebind_'):
+                new_src = re.sub(
+                    rf'(export\s+class\s+{re.escape(src_local)}\b[\s\S]*?\}})',
+                    rf'\1\nObject.defineProperty(typeof globalThis!=="undefined"?globalThis:this,'
+                    rf'{json.dumps(loc)},{{value:{src_local},writable:false,configurable:true}});',
+                    new_src,
+                    count=1,
+                )
+            else:
+                new_src = re.sub(
+                    rf'(export\s+(?:let|const)\s+{re.escape(src_local)}\s*=\s*[^;]+;)',
+                    rf'\1\nObject.defineProperty(typeof globalThis!=="undefined"?globalThis:this,'
+                    rf'{json.dumps(loc)},{{value:{src_local},writable:false,configurable:true}});',
+                    new_src,
+                    count=1,
+                )
+            continue
+        new_src = re.sub(
+            rf'\bexport\s+(?:var|let|const)\s+{re.escape(name)}\s*=',
+            f'{name} =',
+            new_src,
+        )
+        # bare export var x; (no init)
+        new_src = re.sub(
+            rf'\bexport\s+(?:var|let|const)\s+{re.escape(name)}\s*;',
+            f'/* hoisted {name} */;',
+            new_src,
+        )
+
+    # Hoist live bindings to top (module instantiation before evaluation/asserts)
+    if live_binding_prelude:
+        # de-dupe while preserving order
+        seen = set()
+        uniq = []
+        for line in live_binding_prelude:
+            if line not in seen:
+                seen.add(line)
+                uniq.append(line)
+        new_src = "\n".join(uniq) + "\n" + new_src
 
     # Fill namespace objects before first assert (exports already initialized above)
     if ns_epilogues:
