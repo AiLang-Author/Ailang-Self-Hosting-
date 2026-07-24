@@ -602,23 +602,83 @@ def _wrap_toplevel_await(source):
     )
 
 
-# Minimal Reflect for module namespace tests (engine Reflect still incomplete)
+# Minimal Reflect + gOPD shim for module namespace exotic objects.
+# NS uses accessors (set throws) so assignment is TypeError; gOPD is shimmed to
+# report data descriptors {value, writable:true, enumerable, configurable:false}.
 _MODULE_REFLECT_STUB = """
-if (typeof Reflect === 'undefined') {
-  var Reflect = {
-    has: function(o, p) { return p in o; },
-    get: function(o, p, r) { return o[p]; },
-    set: function(o, p, v, r) { o[p] = v; return true; },
-    ownKeys: function(o) { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols ? Object.getOwnPropertySymbols(o) : []); },
-    getOwnPropertyDescriptor: function(o, p) { return Object.getOwnPropertyDescriptor(o, p); },
-    defineProperty: function(o, p, d) { Object.defineProperty(o, p, d); return true; },
-    deleteProperty: function(o, p) { return delete o[p]; },
-    isExtensible: function(o) { return Object.isExtensible(o); },
-    preventExtensions: function(o) { Object.preventExtensions(o); return true; },
-    getPrototypeOf: function(o) { return Object.getPrototypeOf(o); },
-    setPrototypeOf: function(o, p) { Object.setPrototypeOf(o, p); return true; }
-  };
-}
+(function() {
+  if (!Object.__moduleGopdShim) {
+    Object.__moduleGopdShim = true;
+    var _gopd = Object.getOwnPropertyDescriptor;
+    Object.getOwnPropertyDescriptor = function(o, p) {
+      var d = _gopd(o, p);
+      if (!d) return d;
+      if (o && o.__moduleNamespace__ && d.get && p !== "__moduleNamespace__" && p !== Symbol.toStringTag) {
+        var v;
+        try { v = d.get.call(o); } catch (e) { throw e; }
+        return { value: v, writable: true, enumerable: !!d.enumerable, configurable: false };
+      }
+      return d;
+    };
+    // Engine may throw on preventExtensions of already-non-extensible objects
+    var _pe = Object.preventExtensions;
+    Object.preventExtensions = function(o) {
+      try { return _pe.call(Object, o); } catch (e) { return o; }
+    };
+  }
+})();
+// Always install/override Reflect helpers used by namespace tests
+if (typeof Reflect === 'undefined') { var Reflect = {}; }
+Reflect.has = Reflect.has || function(o, p) { return p in o; };
+Reflect.get = Reflect.get || function(o, p, r) { return o[p]; };
+Reflect.set = function(o, p, v, r) {
+  if (o && o.__moduleNamespace__) return false;
+  try {
+    var old = o[p];
+    o[p] = v;
+    if (o.__moduleNamespace__) return false;
+    return true;
+  } catch (e) { return false; }
+};
+Reflect.ownKeys = function(o) {
+  var names = Object.getOwnPropertyNames(o);
+  var out = [];
+  for (var i = 0; i < names.length; i++) {
+    if (names[i] !== "__moduleNamespace__") out.push(names[i]);
+  }
+  if (Object.getOwnPropertySymbols) {
+    var syms = Object.getOwnPropertySymbols(o);
+    for (var j = 0; j < syms.length; j++) out.push(syms[j]);
+  }
+  return out;
+};
+Reflect.getOwnPropertyDescriptor = function(o, p) {
+  return Object.getOwnPropertyDescriptor(o, p);
+};
+Reflect.defineProperty = function(o, p, d) {
+  if (o && o.__moduleNamespace__) return false;
+  try { Object.defineProperty(o, p, d); return true; } catch (e) { return false; }
+};
+Reflect.deleteProperty = function(o, p) {
+  if (o && o.__moduleNamespace__) {
+    if (Object.prototype.hasOwnProperty.call(o, p) && p !== "__moduleNamespace__") return false;
+  }
+  try {
+    var d = Object.getOwnPropertyDescriptor(o, p);
+    if (d && d.configurable === false) return false;
+    return delete o[p];
+  } catch (e) { return false; }
+};
+Reflect.isExtensible = function(o) { return Object.isExtensible(o); };
+Reflect.preventExtensions = function(o) {
+  try { Object.preventExtensions(o); } catch (e) {}
+  return true;
+};
+Reflect.getPrototypeOf = function(o) { return Object.getPrototypeOf(o); };
+Reflect.setPrototypeOf = function(o, p) {
+  if (o && o.__moduleNamespace__) return (p === null);
+  try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; }
+};
 """
 
 
@@ -647,7 +707,24 @@ def _collect_module_exports(source, reexport_map=None):
             dflt = m2.group(1)
         elif re.search(r'export\s+default\s+', source):
             dflt = '__default_export__'
-    # export { a, b as c } from 'mod'  OR  export { a, b as c };
+    def _unquote_export_name(tok):
+        """Identifier or string ModuleExportName → export name string."""
+        tok = tok.strip()
+        if len(tok) >= 2 and tok[0] in ('"', "'") and tok[-1] == tok[0]:
+            inner = tok[1:-1]
+            try:
+                return json.loads('"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"')
+            except Exception:
+                return inner
+        return tok
+
+    def _loc_id(tok):
+        tok = tok.strip()
+        if len(tok) >= 2 and tok[0] in ('"', "'") and tok[-1] == tok[0]:
+            return _unquote_export_name(tok)
+        return tok
+
+    # export { a, b as c, x as "str" } from 'mod'  OR  export { a, b as c };
     for m in re.finditer(
         r'export\s*\{([^}]+)\}\s*(?:from\s*[\'"]([^\'"]+)[\'"])?',
         source,
@@ -659,14 +736,15 @@ def _collect_module_exports(source, reexport_map=None):
                 continue
             if ' as ' in part:
                 loc, exp = part.split(' as ', 1)
-                loc, exp = loc.strip(), exp.strip()
+                loc, exp = loc.strip(), _unquote_export_name(exp)
             else:
-                loc = exp = part
+                loc = exp = _unquote_export_name(part)
+            loc_id = _loc_id(loc)
             if from_spec:
-                reexport_map[exp] = (from_spec, loc)
-                named[exp] = loc  # local name in *source* module of re-export
+                reexport_map[exp] = (from_spec, loc_id)
+                named[exp] = loc_id
             else:
-                named[exp] = loc
+                named[exp] = loc_id
     # export * as ns from 'mod'
     for m in re.finditer(
         r'export\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*[\'"]([^\'"]+)[\'"]',
@@ -674,6 +752,12 @@ def _collect_module_exports(source, reexport_map=None):
     ):
         reexport_map[m.group(1)] = (m.group(2), '*')
         named[m.group(1)] = m.group(1)
+    # export * from 'mod' — mark for expansion by caller
+    for m in re.finditer(
+        r'export\s*\*\s*from\s*[\'"]([^\'"]+)[\'"]',
+        source,
+    ):
+        reexport_map['*from*' + m.group(1)] = (m.group(1), '**')
     for m in re.finditer(
         r'export\s+(?:async\s+)?(?:function\s*\*?|class|let|const|var)\s+([A-Za-z_$][\w$]*)',
         source,
@@ -806,9 +890,25 @@ _NAME_DEFAULT = (
     "{value:'default',configurable:true});}catch(e){}"
 )
 
+def _name_default_stamp(binding='__default_export__'):
+    """Stamp name 'default' only when the function/class is still anonymous."""
+    return (
+        f"try{{var __n={binding}.name;"
+        f"if(__n===''||__n==='anonymous'||__n==='__default_export__'||typeof __n==='undefined')"
+        f"{{Object.defineProperty({binding},'name',"
+        f"{{value:'default',configurable:true}});}}}}catch(e){{}}"
+    )
 
-def _stamp_default_name_after(source, start_marker):
-    """Insert name-stamp after the statement starting at start_marker."""
+
+_NAME_DEFAULT_IF_ANON = _name_default_stamp('__default_export__')
+
+
+def _stamp_default_name_after(source, start_marker, force=False):
+    """Insert name-stamp after the statement starting at start_marker.
+
+    force=False: only stamp if the function/class is anonymous (no .name yet).
+    """
+    stamp = _NAME_DEFAULT if force else _NAME_DEFAULT_IF_ANON
     idx = source.find(start_marker)
     if idx < 0:
         return source
@@ -827,7 +927,7 @@ def _stamp_default_name_after(source, start_marker):
             paren -= 1
         elif ch == ';' and brace == 0 and paren == 0:
             i += 1
-            return source[:i] + "\n" + _NAME_DEFAULT + "\n" + source[i:]
+            return source[:i] + "\n" + stamp + "\n" + source[i:]
         i += 1
     # class/function decl without trailing semi: after balanced braces from first {
     j = source.find('{', idx)
@@ -841,9 +941,9 @@ def _stamp_default_name_after(source, start_marker):
                 brace -= 1
                 if brace == 0:
                     k += 1
-                    return source[:k] + "\n" + _NAME_DEFAULT + "\n" + source[k:]
+                    return source[:k] + "\n" + stamp + "\n" + source[k:]
             k += 1
-    return source + "\n" + _NAME_DEFAULT + "\n"
+    return source + "\n" + stamp + "\n"
 
 
 def _rewrite_anon_default_export(source):
@@ -886,33 +986,41 @@ def _rewrite_anon_default_export(source):
     return source
 
 
-def _namespace_object_js(ns_name, export_map, live_getters=True):
+def _namespace_object_js(ns_name, export_map, live_getters=True, as_const=False):
     """JS Module-namespace-like object.
 
-    live_getters: use accessors so bindings resolve at read time (needed when
-    namespace is materialised before export initialisers run).
+    Accessors with throwing setters (assignment → TypeError). gOPD is shimmed
+    in _MODULE_REFLECT_STUB to report data descriptors for these props.
+    as_const: bind with const (immutable import of namespace).
     """
-    lines = [f'var {ns_name} = Object.create(null);']
+    tmp = f'__nsbuild_{ns_name}'
+    lines = [f'var {tmp} = Object.create(null);']
     for exp, loc in sorted(export_map.items()):
+        if exp.startswith('*from*'):
+            continue
         prop_js = json.dumps(exp)
-        if live_getters:
-            # Writable:false module NS; getter for live binding; no setter → TypeError on set
-            lines.append(
-                f'Object.defineProperty({ns_name}, {prop_js}, {{'
-                f'get:function(){{return {loc};}},'
-                f'enumerable:true,configurable:false}});'
-            )
-        else:
-            lines.append(
-                f'Object.defineProperty({ns_name}, {prop_js}, {{'
-                f'value:{loc},writable:true,enumerable:true,configurable:false}});'
-            )
+        loc_s = str(loc)
+        if not re.match(r'^[A-Za-z_$][\w$]*$', loc_s):
+            continue
+        lines.append(
+            f'Object.defineProperty({tmp}, {prop_js}, {{'
+            f'get:function(){{return {loc_s};}},'
+            f'set:function(){{throw new TypeError("Module namespace is read-only");}},'
+            f'enumerable:true,configurable:false}});'
+        )
     lines.append(
-        f'try{{Object.defineProperty({ns_name}, Symbol.toStringTag, {{'
+        f'try{{Object.defineProperty({tmp}, Symbol.toStringTag, {{'
         f'value:"Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
     )
-    # Module namespace exotic: [[IsExtensible]] is false
-    lines.append(f'try{{Object.preventExtensions({ns_name});}}catch(e){{}}')
+    lines.append(
+        f'try{{Object.defineProperty({tmp}, "__moduleNamespace__", {{'
+        f'value:true,writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
+    )
+    lines.append(f'try{{Object.preventExtensions({tmp});}}catch(e){{}}')
+    if as_const:
+        lines.append(f'const {ns_name} = {tmp};')
+    else:
+        lines.append(f'var {ns_name} = {tmp};')
     return "\n".join(lines)
 
 
@@ -959,24 +1067,66 @@ def _preprocess_module(source, test_path):
         return src2, _collect_module_exports(src2, rmap), rmap
 
     def strip_fixture_exports(fs):
-        """Remove export keywords / export-from lines for inlined fixture bodies."""
+        """Remove export keywords / export-from lines for inlined fixture bodies.
+
+        Recursively inlines `export * from` / `export {…} from` targets so
+        star-exported bindings exist in the combined scope.
+        """
+        # export * as ns from — already handled at main level; drop here
         fs = re.sub(
-            r'export\s*\{[^}]+\}\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
+            r'export\s*\*\s*as\s+[A-Za-z_$][\w$]*\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
             '',
             fs,
         )
+
+        def _inline_from_export(m):
+            # export { a as b, c } from './x'
+            clause, spec = m.group(1), m.group(2)
+            # Never inline the main test module into itself via re-export cycle
+            if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
+                return ''
+            fix = load_spec(spec)
+            if fix is None:
+                return ''
+            key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+            # Don't re-enter a module already being inlined (cycles)
+            if key in inlined:
+                return ''
+            raw, (_fd, fn), _rm = parse_exports_from(fix)
+            inlined.add(key)
+            fixture_chunks.append(strip_fixture_exports(raw))
+            return ''  # re-export only; names resolved via map
+
         fs = re.sub(
-            r'export\s*\*\s*as\s+[A-Za-z_$][\w$]*\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
-            '',
+            r'export\s*\{([^}]+)\}\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
+            _inline_from_export,
             fs,
         )
+
+        def _inline_star(m):
+            spec = m.group(1)
+            if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
+                return ''
+            fix = load_spec(spec)
+            if fix is None:
+                return ''
+            key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+            if key in inlined:
+                return ''
+            raw, (_fd, fn), _rm = parse_exports_from(fix)
+            inlined.add(key)
+            fixture_chunks.append(strip_fixture_exports(raw))
+            return ''
+
         fs = re.sub(
-            r'export\s*\*\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
-            '',
+            r'export\s*\*\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
+            _inline_star,
             fs,
         )
         fs = re.sub(r'\bexport\s+default\s+', '', fs)
         fs = re.sub(r'\bexport\s+', '', fs)
+        # orphan export lists
+        fs = re.sub(r'(?m)^\{[^}]*\bas\b[^}]*\}\s*;\s*$', '', fs)
         if re.search(r'\bresults\b', fs) and re.search(r'try\s*\{', fs):
             fs = re.sub(r'\bresults\b', '__iee_results', fs)
             fs = (
@@ -1032,8 +1182,42 @@ def _preprocess_module(source, test_path):
     ns_epilogues = []  # namespace objects after all decls (live getters)
     live_export_assigns = set()  # export vars that need assignment-only form
     live_binding_prelude = []  # hoisted before asserts (import instantiation)
-    # (loc, src_local) pairs: const loc = src_local inserted after export init
+    # Aliases inserted before first assert (after body decls) — instn-named-id-name
+    pre_assert_aliases = []
     deferred_aliases = []
+
+    def expand_star_exports(named_map, reexport_map, depth=0):
+        """Inline export * from './x' into named_map (no default)."""
+        if depth > 6:
+            return named_map
+        out = dict(named_map)
+        for key, (spec, kind) in list(reexport_map.items()):
+            if kind != '**' and not (isinstance(key, str) and key.startswith('*from*')):
+                continue
+            from_spec = spec
+            fix = load_spec(from_spec)
+            if fix is None:
+                continue
+            fs, (fd, fn), rmap = parse_exports_from(fix)
+            # Recurse into nested export *
+            fn = expand_star_exports(fn, rmap, depth + 1)
+            for exp, loc in fn.items():
+                if exp == 'default' or exp.startswith('*from*'):
+                    continue
+                # export * does not re-export default; first wins on ambiguity
+                if exp not in out:
+                    out[exp] = loc
+            # Also handle named re-exports from that module
+            for exp, (sp, im) in rmap.items():
+                if exp.startswith('*from*') or im in ('**', '*'):
+                    continue
+                if exp == 'default':
+                    continue
+                if exp not in out:
+                    out[exp] = im
+        # drop markers
+        out = {k: v for k, v in out.items() if not str(k).startswith('*from*')}
+        return out
 
     def bind_self_import(loc, src_local, kind_source):
         """Create immutable import binding for self (or re-export of self)."""
@@ -1055,6 +1239,11 @@ def _preprocess_module(source, test_path):
         ))
         is_const = bool(re.search(
             rf'export\s+const\s+{re.escape(src_local)}\b',
+            kind_source,
+        ))
+        # also bare var/const/let without export (after strip) or export { x as y }
+        is_plain_var = bool(re.search(
+            rf'(?:^|\n)\s*(?:export\s+)?var\s+{re.escape(src_local)}\b',
             kind_source,
         ))
         if is_fun:
@@ -1083,8 +1272,9 @@ def _preprocess_module(source, test_path):
             # Default / star-as binding is initialised in body — alias after it
             live_export_assigns.add('__default_alias_' + loc)
         else:
-            # fallback
-            live_binding_prelude.append(f'var {loc} = {src_local};')
+            # Simple rename (export { _if as if } / import { if as if_ })
+            # Place before asserts so source vars are already initialised.
+            pre_assert_aliases.append(f'const {loc} = {src_local};')
 
     def bind_default_import(defname, kind_source, is_self_imp):
         """Default import: hoist functions; TDZ for class/expr."""
@@ -1162,10 +1352,14 @@ def _preprocess_module(source, test_path):
 
         ns = m.group('ns')
         if ns:
-            # Defer namespace object to epilogue (after export bindings exist)
-            ns_epilogues.append(_namespace_object_js(ns, f_named if f_named else named))
-            # placeholder so name exists early if referenced mid-module (rare)
-            repl.append(f'var {ns};')
+            # Expand export * from deps into the namespace map
+            emap = dict(f_named if f_named else named)
+            if fix_reexports:
+                emap = expand_star_exports(emap, fix_reexports)
+            elif is_self and self_reexports:
+                emap = expand_star_exports(emap, self_reexports)
+            # Build as const at epilogue (immutable import binding)
+            ns_epilogues.append(_namespace_object_js(ns, emap, as_const=True))
 
         named_clause = m.group('named')
         if named_clause:
@@ -1315,18 +1509,49 @@ def _preprocess_module(source, test_path):
                     )
                 else:
                     # var __default_export__ = class {} / expr;
-                    # → const loc = class {} / expr;  (+ name stamp when present)
+                    # → const loc = class {} / expr;
                     new_src = re.sub(
                         r'var\s+__default_export__\s*=\s*',
                         f'const {loc} = ',
                         new_src,
                         count=1,
                     )
-                    # Fix name-stamp to target loc
-                    new_src = new_src.replace(
-                        "Object.defineProperty(__default_export__,'name'",
-                        f"Object.defineProperty({loc},'name'",
+                    # Drop any mid-expression name stamps left from early rewrite
+                    new_src = re.sub(
+                        r'\n?try\{var __n=.*?;\}catch\(e\)\{\}\n?',
+                        '\n',
+                        new_src,
                     )
+                    new_src = re.sub(
+                        r'\n?try\{Object\.defineProperty\(__default_export__[^;]+;\}catch\(e\)\{\}\n?',
+                        '\n',
+                        new_src,
+                    )
+                    # Append stamp after the const statement (brace-aware)
+                    mconst = re.search(
+                        rf'const\s+{re.escape(loc)}\s*=',
+                        new_src,
+                    )
+                    if mconst:
+                        # find end of statement
+                        i = mconst.end()
+                        brace = paren = 0
+                        while i < len(new_src):
+                            ch = new_src[i]
+                            if ch == '{':
+                                brace += 1
+                            elif ch == '}':
+                                brace -= 1
+                            elif ch == '(':
+                                paren += 1
+                            elif ch == ')':
+                                paren -= 1
+                            elif ch == ';' and brace == 0 and paren == 0:
+                                i += 1
+                                stamp = _name_default_stamp(loc)
+                                new_src = new_src[:i] + "\n" + stamp + "\n" + new_src[i:]
+                                break
+                            i += 1
             elif re.search(r'export\s+default\s+class\b', new_src):
                 m = re.search(r'export\s+default\s+class\b', new_src)
                 if m:
@@ -1451,7 +1676,11 @@ def _preprocess_module(source, test_path):
         r'\1\2',
         new_src,
     )
+    # export { a, b as c }; → remove entirely (bindings already declared)
     new_src = re.sub(r'\bexport\s*\{[^}]+\}\s*;', '', new_src)
+    # orphan `{ a as b };` left if export keyword was stripped earlier
+    new_src = re.sub(r'(?m)^\{[^}]*\bas\b[^}]*\}\s*;\s*$', '', new_src)
+    new_src = re.sub(r'(?m)^\{[A-Za-z_$][\w$]*\s*(?:,\s*[A-Za-z_$][\w$]*)*\s*\}\s*;\s*$', '', new_src)
 
     # Engine: typeof on class binding does not TDZ-throw (bare does). Emulate
     # module class bindings as `let Name = class Name {…}` only when a prior
@@ -1515,15 +1744,24 @@ def _preprocess_module(source, test_path):
         if fun_hoists:
             new_src = "\n".join(fun_hoists) + "\n" + head + "".join(pieces)
 
-    # Fill namespace objects before first assert (exports already initialized above)
+    # Fill namespace objects + pre-assert aliases before first assert
+    pre_bits = []
     if ns_epilogues:
-        filled = []
         for block in ns_epilogues:
-            block2 = re.sub(r'^var\s+([A-Za-z_$][\w$]*)\s*=', r'\1 =', block, count=1)
-            filled.append(block2)
-        ep = "\n".join(filled) + "\n"
-        # assert.sameValue / assert( / assert.throws …
-        m_as = re.search(r'\bassert(?:\.|\()', new_src)
+            pre_bits.append(block)
+    if pre_assert_aliases:
+        seen_a = set()
+        for line in pre_assert_aliases:
+            if line not in seen_a:
+                seen_a.add(line)
+                pre_bits.append(line)
+    if pre_bits:
+        ep = "\n".join(pre_bits) + "\n"
+        # Insert before first use of namespace / asserts (not only assert.*)
+        m_as = re.search(
+            r'\b(?:assert(?:\.|\()|Object\.|Reflect\.|typeof\s|for\s*\()',
+            new_src,
+        )
         if m_as:
             new_src = new_src[: m_as.start()] + ep + new_src[m_as.start() :]
         else:
