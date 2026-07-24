@@ -625,6 +625,19 @@ _MODULE_REFLECT_STUB = """
     Object.preventExtensions = function(o) {
       try { return _pe.call(Object, o); } catch (e) { return o; }
     };
+    // Module NS [[OwnPropertyKeys]]: string keys sorted, then symbols
+    var _gopn = Object.getOwnPropertyNames;
+    Object.getOwnPropertyNames = function(o) {
+      var names = _gopn(o);
+      var out = [];
+      for (var i = 0; i < names.length; i++) {
+        if (names[i] !== "__moduleNamespace__") out.push(names[i]);
+      }
+      if (o && o.__moduleNamespace__) {
+        out.sort(); // code-unit order per OrdinaryOwnPropertyKeys for strings
+      }
+      return out;
+    };
   }
 })();
 // Always install/override Reflect helpers used by namespace tests
@@ -716,7 +729,10 @@ def _collect_module_exports(source, reexport_map=None):
                 return json.loads('"' + inner.replace('\\', '\\\\').replace('"', '\\"') + '"')
             except Exception:
                 return inner
-        return tok
+        # IdentifierName may contain \uXXXX escapes
+        def _uesc(m):
+            return chr(int(m.group(1), 16))
+        return re.sub(r'\\u([0-9a-fA-F]{4})', _uesc, tok)
 
     def _loc_id(tok):
         tok = tok.strip()
@@ -975,14 +991,13 @@ def _rewrite_anon_default_export(source):
         return _stamp_default_name_after(source, 'var __default_export__ = ')
     if re.search(r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+[A-Za-z_$]', source):
         return source  # named — leave for engine
+    # Plain expression default — rewrite without name stamp (stamp only for fn/class)
     source, n = re.subn(
         r'export\s+default\s+',
         'var __default_export__ = ',
         source,
         count=1,
     )
-    if n:
-        return _stamp_default_name_after(source, 'var __default_export__ = ')
     return source
 
 
@@ -1757,11 +1772,13 @@ def _preprocess_module(source, test_path):
                 pre_bits.append(line)
     if pre_bits:
         ep = "\n".join(pre_bits) + "\n"
-        # Insert before first use of namespace / asserts (not only assert.*)
+        # Insert before first real use — NOT bare `typeof` (collides with name-stamps)
         m_as = re.search(
-            r'\b(?:assert(?:\.|\()|Object\.|Reflect\.|typeof\s|for\s*\()',
+            r'(?m)^(?:\s*)(?:assert(?:\.|\()|Object\.(?:preventExtensions|getOwnProperty|isExtensible|setPrototypeOf)|Reflect\.|for\s*\()',
             new_src,
         )
+        if not m_as:
+            m_as = re.search(r'\bassert(?:\.|\()', new_src)
         if m_as:
             new_src = new_src[: m_as.start()] + ep + new_src[m_as.start() :]
         else:
