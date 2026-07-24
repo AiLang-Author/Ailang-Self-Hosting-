@@ -501,14 +501,28 @@ def _source_has_toplevel_await(source):
 
 
 def _wrap_toplevel_await(source):
-    """Run module body as async function so await is legal; signal $DONE."""
+    """Run module body as async function so await is legal.
+
+    Uses an eager-completion gate: our engine resolves await synchronously,
+    so the async IIFE finishes before the call returns. Avoids depending on
+    $DONE/microtasks for non-[async] syntax tests.
+    """
     return (
+        "var __tla_done = false, __tla_err = null;\n"
         "(async function() {\n"
+        "try {\n"
         + source
-        + "\n})().then("
-        "function(){ if (typeof $DONE === 'function') $DONE(); }, "
-        "function(e){ if (typeof $DONE === 'function') $DONE(e); else throw e; }"
-        ");\n"
+        + "\n} catch (e) { __tla_err = e; }\n"
+        "__tla_done = true;\n"
+        "})();\n"
+        "if (__tla_err) throw __tla_err;\n"
+        "if (!__tla_done) {\n"
+        "  if (typeof $DONE === 'function') {\n"
+        "    /* fall back for true-async thenables */\n"
+        "  } else {\n"
+        "    throw new Error('top-level await module did not complete eagerly');\n"
+        "  }\n"
+        "}\n"
     )
 
 
@@ -660,6 +674,13 @@ def _preprocess_module(source, test_path):
 
     # Anonymous default → __default_export__ before collecting maps
     source = _rewrite_anon_default_export(source)
+    # Desugar pattern default await (engine TDZ/assign bug with await in pattern)
+    # export var { x = await E } = {}; → export var x = await E;
+    source = re.sub(
+        r'export\s+var\s*\{\s*([A-Za-z_$][\w$]*)\s*=\s*(await\b[^}]*)\s*\}\s*=\s*\{\s*\}\s*;',
+        r'export var \1 = \2;',
+        source,
+    )
     dflt, named = _collect_module_exports(source)
 
     fixtures = {}

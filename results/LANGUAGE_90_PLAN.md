@@ -10,7 +10,7 @@
 
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
-| 1 | **module-code** | 30.7% | **75.1%** (M114) | 90% | Needs TLA for 90% |
+| 1 | **module-code** | 30.7% | **76.3%** (M114b) | 90% | Needs TLA for 90% |
 | 2 | **import** | ~13% | **30.2%** | 90% | With module linker |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
