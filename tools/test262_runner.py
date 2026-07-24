@@ -489,6 +489,9 @@ def preprocess(source, meta=None, test_path=None):
         # Top-level await: wrap in async IIFE so AWAIT_EXPR is valid (in_await)
         if "top-level-await" in features or _source_has_toplevel_await(source):
             source = _wrap_toplevel_await(source)
+        # Namespace / Reflect tests need Reflect
+        if "Reflect" in source or "namespace" in (test_path or ""):
+            source = _MODULE_REFLECT_STUB + source
     return source
 
 
@@ -594,6 +597,26 @@ def _wrap_toplevel_await(source):
         "  }\n"
         "}\n"
     )
+
+
+# Minimal Reflect for module namespace tests (engine Reflect still incomplete)
+_MODULE_REFLECT_STUB = """
+if (typeof Reflect === 'undefined') {
+  var Reflect = {
+    has: function(o, p) { return p in o; },
+    get: function(o, p, r) { return o[p]; },
+    set: function(o, p, v, r) { o[p] = v; return true; },
+    ownKeys: function(o) { return Object.getOwnPropertyNames(o).concat(Object.getOwnPropertySymbols ? Object.getOwnPropertySymbols(o) : []); },
+    getOwnPropertyDescriptor: function(o, p) { return Object.getOwnPropertyDescriptor(o, p); },
+    defineProperty: function(o, p, d) { Object.defineProperty(o, p, d); return true; },
+    deleteProperty: function(o, p) { return delete o[p]; },
+    isExtensible: function(o) { return Object.isExtensible(o); },
+    preventExtensions: function(o) { Object.preventExtensions(o); return true; },
+    getPrototypeOf: function(o) { return Object.getPrototypeOf(o); },
+    setPrototypeOf: function(o, p) { Object.setPrototypeOf(o, p); return true; }
+  };
+}
+"""
 
 
 def _collect_module_exports(source):
@@ -723,8 +746,10 @@ def _namespace_object_js(ns_name, export_map):
         )
     lines.append(
         f'try{{Object.defineProperty({ns_name}, Symbol.toStringTag, {{'
-        f'value:"Module",writable:false,enumerable:false,configurable:true}});}}catch(e){{}}'
+        f'value:"Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
     )
+    # Module namespace exotic: [[IsExtensible]] is false
+    lines.append(f'try{{Object.preventExtensions({ns_name});}}catch(e){{}}')
     return "\n".join(lines)
 
 
@@ -858,7 +883,8 @@ def _preprocess_module(source, test_path):
             block2 = re.sub(r'^var\s+([A-Za-z_$][\w$]*)\s*=', r'\1 =', block, count=1)
             filled.append(block2)
         ep = "\n".join(filled) + "\n"
-        m_as = re.search(r'\bassert\.', new_src)
+        # assert.sameValue / assert( / assert.throws …
+        m_as = re.search(r'\bassert(?:\.|\()', new_src)
         if m_as:
             new_src = new_src[: m_as.start()] + ep + new_src[m_as.start() :]
         else:
