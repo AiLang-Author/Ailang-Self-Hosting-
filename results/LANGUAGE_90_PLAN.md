@@ -10,7 +10,7 @@
 
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
-| 1 | **module-code** | 30.7% | **89.4%** (M124, 668/748) | 90% | need +6 absolute |
+| 1 | **module-code** | 30.7% | **90.4%** (M125, 675/748) | 90% | **HIT** (need dynimport/eval next) |
 | 2 | **import** | ~13% | **30.2%** | 90% | With module linker |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
@@ -57,3 +57,5 @@ Review dependencies (Proxy, species, TypedArray, Promise jobs), then Object/Arra
   fixture import*as, string export*as "Name", cycle star expand, gOPD hide non-exports
 - M124: multi-hop ResolveExport (IEE cycles), side-effect fixture isolation (uniq-env),
   new Function→globalThis (same-global); 668/748 ~89.4%
+- M125: RequestedModules source order, import attributes strip, per-fixture defaults,
+  NS __proto__ via Reflect, for-in→Object.keys TDZ; **675/748 ~90.4% HIT**

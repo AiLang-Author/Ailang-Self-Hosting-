@@ -714,10 +714,11 @@ if (typeof Object.getOwnPropertySymbols !== "function") {
 })();
 // Always install/override Reflect helpers used by namespace tests
 if (typeof Reflect === 'undefined') { var Reflect = {}; }
-Reflect.has = function(o, p) {
+function __moduleReflectHas(o, p) {
   if (__isModuleNS(o) && typeof p === "string") {
     var rec = __moduleNSExportKeys(o);
-    if (rec) {
+    // empty array is valid (no exports) — still hide engine-injected __proto__
+    if (rec !== null && rec !== undefined) {
       for (var __h = 0; __h < rec.length; __h++) {
         if (rec[__h] === p) return true;
       }
@@ -725,12 +726,11 @@ Reflect.has = function(o, p) {
     }
   }
   return p in o;
-};
-// Module NS [[Get]]: non-exports are undefined (engine may return null for __proto__)
-Reflect.get = function(o, p, r) {
+}
+function __moduleReflectGet(o, p, r) {
   if (__isModuleNS(o) && typeof p === "string") {
     var recg = __moduleNSExportKeys(o);
-    if (recg) {
+    if (recg !== null && recg !== undefined) {
       var ok = false;
       for (var __g = 0; __g < recg.length; __g++) {
         if (recg[__g] === p) { ok = true; break; }
@@ -739,7 +739,19 @@ Reflect.get = function(o, p, r) {
     }
   }
   return o[p];
-};
+}
+try { Reflect.has = __moduleReflectHas; } catch (__e) {}
+try {
+  Object.defineProperty(Reflect, "has", {
+    value: __moduleReflectHas, writable: true, configurable: true, enumerable: false
+  });
+} catch (__e) {}
+try { Reflect.get = __moduleReflectGet; } catch (__e) {}
+try {
+  Object.defineProperty(Reflect, "get", {
+    value: __moduleReflectGet, writable: true, configurable: true, enumerable: false
+  });
+} catch (__e) {}
 Reflect.set = function(o, p, v, r) {
   if (__isModuleNS(o)) return false;
   try {
@@ -923,9 +935,10 @@ def _collect_module_exports(source, reexport_map=None):
     named = {}
     if reexport_map is None:
         reexport_map = {}
-    # After anon rewrite, default lives on __default_export__
-    if re.search(r'\b__default_export__\b', source):
-        dflt = '__default_export__'
+    # After anon rewrite, default lives on __default_export__ or __dflt_<mod>
+    m_dloc = re.search(r'\b(__default_export__|__dflt_[A-Za-z0-9_]+)\b', source)
+    if m_dloc:
+        dflt = m_dloc.group(1)
     m = re.search(
         r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+([A-Za-z_$][\w$]*)',
         source,
@@ -937,7 +950,7 @@ def _collect_module_exports(source, reexport_map=None):
         if m2:
             dflt = m2.group(1)
         elif re.search(r'export\s+default\s+', source):
-            dflt = '__default_export__'
+            dflt = dflt or '__default_export__'
     def _unquote_export_name(tok):
         """Identifier or string ModuleExportName → export name string."""
         tok = tok.strip()
@@ -1205,43 +1218,45 @@ def _stamp_default_name_after(source, start_marker, force=False):
     return source + "\n" + stamp + "\n"
 
 
-def _rewrite_anon_default_export(source):
-    """Turn anonymous export default into let __default_export__ = …
+def _rewrite_anon_default_export(source, local_name='__default_export__'):
+    """Turn anonymous export default into let <local_name> = …
 
     Use `let` (not var) so default is TDZ until the export statement runs
     (namespace uninit tests: ns.default throws ReferenceError).
+    local_name may be module-specific so multiple fixtures don't clash.
     """
+    loc = local_name
     # export default class { … }  OR  export default class extends … { … }
     source, n = re.subn(
         r'export\s+default\s+class\s*\{',
-        'let __default_export__ = class {',
+        f'let {loc} = class {{',
         source,
         count=1,
     )
     if n:
-        return _stamp_default_name_after(source, 'let __default_export__ = class')
+        return _stamp_default_name_after(source, f'let {loc} = class', force=False)
     source, n = re.subn(
         r'export\s+default\s+class\s+(extends\b)',
-        r'let __default_export__ = class \1',
+        rf'let {loc} = class \1',
         source,
         count=1,
     )
     if n:
-        return _stamp_default_name_after(source, 'let __default_export__ = class')
+        return _stamp_default_name_after(source, f'let {loc} = class')
     source, n = re.subn(
         r'export\s+default\s+(async\s+)?function(\s*\*)?\s*\(',
-        r'let __default_export__ = \1function\2(',
+        rf'let {loc} = \1function\2(',
         source,
         count=1,
     )
     if n:
-        return _stamp_default_name_after(source, 'let __default_export__ = ')
+        return _stamp_default_name_after(source, f'let {loc} = ')
     if re.search(r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+[A-Za-z_$]', source):
         return source  # named — leave for engine
     # Plain expression default — rewrite without name stamp (stamp only for fn/class)
     source, n = re.subn(
         r'export\s+default\s+',
-        'let __default_export__ = ',
+        f'let {loc} = ',
         source,
         count=1,
     )
@@ -1302,6 +1317,11 @@ def _preprocess_module(source, test_path):
     base = path.parent
     self_name = path.name
 
+    # Drop import attributes / assertions (with {} / assert {}) — unsupported
+    # by the engine; semantics are ignored for these harness rewrites.
+    source = re.sub(r'\s+with\s*\{[^}]*\}', '', source)
+    source = re.sub(r'\s+assert\s*\{[^}]*\}', '', source)
+
     # Anonymous default → __default_export__ before collecting maps
     source = _rewrite_anon_default_export(source)
     # Desugar pattern default await (engine bug: await in pattern default)
@@ -1328,10 +1348,30 @@ def _preprocess_module(source, test_path):
             fixtures[key] = _FRONTMATTER_RE.sub("", raw)
         return fixtures[key]
 
-    def parse_exports_from(src):
-        src2 = _rewrite_anon_default_export(src)
+    def _default_local_for_key(key):
+        safe = re.sub(r'[^A-Za-z0-9_]', '_', Path(str(key)).stem)[:40] or 'm'
+        return f'__dflt_{safe}'
+
+    def parse_exports_from(src, default_local=None):
+        """Parse exports; optional per-module default local avoids clashes."""
+        if default_local is None:
+            default_local = '__default_export__'
+        src2 = _rewrite_anon_default_export(src, local_name=default_local)
         rmap = {}
-        return src2, _collect_module_exports(src2, rmap), rmap
+        dflt, named = _collect_module_exports(src2, rmap)
+        if default_local != '__default_export__' and re.search(
+            rf'\b{re.escape(default_local)}\b', src2
+        ):
+            dflt = default_local
+            named['default'] = default_local
+        return src2, (dflt, named), rmap
+
+    def parse_exports_from_spec(spec):
+        fix = load_spec(spec)
+        if fix is None:
+            return None, (None, {}), {}
+        key = _resolve_mod_key(spec)
+        return parse_exports_from(fix, default_local=_default_local_for_key(key))
 
     def _resolve_mod_key(spec):
         try:
@@ -1391,7 +1431,9 @@ def _preprocess_module(source, test_path):
             if fix is None:
                 continue
             mod_key = _resolve_mod_key(from_spec)
-            fs, (fd, fn), rmap = parse_exports_from(fix)
+            fs, (fd, fn), rmap = parse_exports_from(
+                fix, default_local=_default_local_for_key(mod_key)
+            )
             fn = expand_star_exports(fn, rmap, depth + 1)
             for exp, loc in fn.items():
                 ident = _export_identity(exp, loc, rmap, mod_key)
@@ -1408,6 +1450,87 @@ def _preprocess_module(source, test_path):
 
     # GetModuleNamespace cache: one NS object per target module path
     mod_ns_cache = {}  # abs path -> JS var name
+
+    # Reserved words illegal as Identifier in BindingIdentifier / var name
+    _JS_RESERVED = {
+        'break', 'case', 'catch', 'class', 'const', 'continue', 'debugger',
+        'default', 'delete', 'do', 'else', 'export', 'extends', 'finally',
+        'for', 'function', 'if', 'import', 'in', 'instanceof', 'new', 'return',
+        'super', 'switch', 'this', 'throw', 'try', 'typeof', 'var', 'void',
+        'while', 'with', 'yield', 'enum', 'await', 'let', 'static',
+        'implements', 'interface', 'package', 'private', 'protected', 'public',
+    }
+
+    def _safe_binding_name(name):
+        """JS local for an export name; reserved/string names → __star_as_*."""
+        if (
+            isinstance(name, str)
+            and re.match(r'^[A-Za-z_$][\w$]*$', name)
+            and name not in _JS_RESERVED
+        ):
+            return name
+        safe = re.sub(r'[^A-Za-z0-9_]', '_', str(name)) or 'ns'
+        if not re.match(r'^[A-Za-z_]', safe) or safe in _JS_RESERVED:
+            safe = 'ns_' + safe
+        return f'__star_as_{safe}'
+
+    def _inline_fixture_body(spec, isolate_side_effect=False):
+        """Inline fixture once into fixture_chunks. Returns True if newly inlined."""
+        if not spec.startswith('.'):
+            return False
+        if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
+            return False
+        key = _resolve_mod_key(spec)
+        if key in inlined:
+            return False
+        fix = load_spec(spec)
+        if fix is None:
+            return False
+        inlined.add(key)
+        dloc = _default_local_for_key(key)
+        fs, (fd, fn), rmap = parse_exports_from(fix, default_local=dloc)
+        body = strip_fixture_exports(fs)
+        has_exports = bool(fd) or bool(fn) or any(
+            not str(k).startswith('*from*') for k in rmap
+        )
+        # Pure side-effect modules: isolate locals (uniq-env-rec). Keep
+        # modules with exports in shared scope so bindings are reachable.
+        if isolate_side_effect and not has_exports:
+            pfx = f"__fx{len(inlined)}_"
+            body = re.sub(
+                r'\bfunction\s*(\*?)\s*([A-Za-z_$][\w$]*)',
+                rf'function\1 {pfx}\2',
+                body,
+            )
+            body = re.sub(
+                r'\bclass\s+([A-Za-z_$][\w$]*)',
+                rf'class {pfx}\1',
+                body,
+            )
+            body = re.sub(
+                r'\b(var|let|const)\s+([A-Za-z_$][\w$]*)',
+                rf'\1 {pfx}\2',
+                body,
+            )
+            body = "(function(){\n" + body + "\n})();\n"
+        fixture_chunks.append(body)
+        return True
+
+    def _preload_requested_in_order(src):
+        """Evaluate RequestedModules once in source order (eval-rqstd-order)."""
+        seen = set()
+        for m in re.finditer(
+            r'''(?:^import\s+['"](\.[^'"]+)['"])|(?:from\s*['"](\.[^'"]+)['"])''',
+            src,
+            re.MULTILINE,
+        ):
+            spec = m.group(1) or m.group(2)
+            if not spec or spec in seen:
+                continue
+            if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
+                continue
+            seen.add(spec)
+            _inline_fixture_body(spec, isolate_side_effect=True)
 
     def ensure_mod_ns(spec):
         """JS var holding GetModuleNamespace(spec); built once per module."""
@@ -1427,10 +1550,10 @@ def _preprocess_module(source, test_path):
         fn = {}
         fix = load_spec(spec)
         if fix is not None:
-            fs, (_fd, fn0), rmap = parse_exports_from(fix)
-            if key not in inlined:
-                inlined.add(key)
-                fixture_chunks.append(strip_fixture_exports(fs))
+            # Body may already be inlined by _preload_requested_in_order
+            _inline_fixture_body(spec, isolate_side_effect=True)
+            dloc = _default_local_for_key(key)
+            fs, (_fd, fn0), rmap = parse_exports_from(fix, default_local=dloc)
             fn = expand_star_exports(dict(fn0), rmap)
             for exp, (sp, im) in rmap.items():
                 if im == '*' and not str(exp).startswith('*from*'):
@@ -1587,6 +1710,10 @@ def _preprocess_module(source, test_path):
             )
         return fs
 
+    # Evaluate RequestedModules once in source order before rewriting exports
+    # (eval-rqstd-order: deps run as '123456789' before main asserts).
+    _preload_requested_in_order(source)
+
     # export * as NAME from './fix' early so default/named maps see __default_export__
     # Supports identifier and string ModuleExportName.
     # Records into early_star_as because the rewrite removes `export` syntax
@@ -1606,7 +1733,11 @@ def _preprocess_module(source, test_path):
                 if id_name == 'default':
                     early_star_as['default'] = ('__SELF_NS__', spec)
                     return ''
+                loc = _safe_binding_name(id_name)
                 early_star_as[id_name] = ('__SELF_NS__', spec)
+                # reserved export names need a safe local alias later
+                if loc != id_name:
+                    early_star_as[id_name] = ('__SELF_NS__', spec)
                 return ''
             raw = str_name[1:-1]
             try:
@@ -1620,17 +1751,15 @@ def _preprocess_module(source, test_path):
             if id_name == 'default':
                 early_star_as['default'] = ('__default_export__', spec)
                 return f'let __default_export__ = {ns_var};\n'
-            early_star_as[id_name] = (id_name, spec)
-            return f'var {id_name} = {ns_var};\n'
+            loc = _safe_binding_name(id_name)
+            early_star_as[id_name] = (loc, spec)
+            return f'var {loc} = {ns_var};\n'
         raw = str_name[1:-1]
         try:
             raw = json.loads('"' + raw.replace('\\', '\\\\').replace('"', '\\"') + '"')
         except Exception:
             pass
-        safe = re.sub(r'[^A-Za-z0-9_]', '_', raw) or 'ns'
-        if not re.match(r'^[A-Za-z_]', safe):
-            safe = 'ns_' + safe
-        loc = f'__star_as_{safe}'
+        loc = _safe_binding_name(raw)
         early_star_as[raw] = (loc, spec)
         return f'var {loc} = {ns_var};\n'
 
@@ -1646,13 +1775,19 @@ def _preprocess_module(source, test_path):
     dflt, named = _collect_module_exports(source, self_reexports)
     for exp, (loc, sp) in early_star_as.items():
         # __SELF_NS__ placeholder: property holds the module's own namespace object
-        named[exp] = loc if loc != '__SELF_NS__' else exp
-        self_reexports[exp] = (sp, '*')
-        if exp == 'default':
-            dflt = loc if loc != '__SELF_NS__' else '__default_export__'
         if loc == '__SELF_NS__':
+            bind_name = _safe_binding_name(exp)
+            named[exp] = bind_name
+            self_reexports[exp] = (sp, '*')
+            if exp == 'default':
+                dflt = '__default_export__'
             # After self NS is built, bind export name to it (instn-once export * as ns2)
-            pre_assert_aliases.append(f'const {exp} = __SELF_NS__;')
+            pre_assert_aliases.append(f'const {bind_name} = __SELF_NS__;')
+        else:
+            named[exp] = loc
+            self_reexports[exp] = (sp, '*')
+            if exp == 'default':
+                dflt = loc
 
     def _is_self_spec(spec):
         return (
@@ -1682,7 +1817,9 @@ def _preprocess_module(source, test_path):
             fix = load_spec(mod_spec)
             if fix is None:
                 return None
-            _fs, (_fd, fn0), rmap = parse_exports_from(fix)
+            _fs, (_fd, fn0), rmap = parse_exports_from(
+                fix, default_local=_default_local_for_key(mod_key)
+            )
             nmap = expand_star_exports(dict(fn0), rmap)
             for exp, (sp, im) in rmap.items():
                 if im == '*' and not str(exp).startswith('*from*'):
@@ -1797,6 +1934,21 @@ def _preprocess_module(source, test_path):
         extracted = _extract_default_function_decl(kind_source)
         if extracted:
             full, decl, fname = extracted
+            # Fixture already inlined as `function fname` via strip — don't
+            # duplicate the decl. Live-rename import to track mutations
+            # (eval-gtbndng-indirect-update-dflt: fn=2 updates default).
+            if (
+                not is_self_imp
+                and fname
+                and fname != '__default_export__'
+                and re.search(
+                    rf'\bfunction\s*{re.escape(fname)}\s*\(',
+                    "\n".join(fixture_chunks),
+                )
+            ):
+                if defname != fname:
+                    live_renames[defname] = fname
+                return
             live_binding_prelude.append(decl)
             if fname == '__default_export__':
                 live_binding_prelude.append(_NAME_DEFAULT)
@@ -1829,33 +1981,8 @@ def _preprocess_module(source, test_path):
         fix_reexports = {}
 
         if m.group('side') and fix_src is not None:
-            key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
-            if key not in inlined:
-                inlined.add(key)
-                fs, _, _ = parse_exports_from(fix_src)
-                body = strip_fixture_exports(fs)
-                # Side-effect import: isolate fixture bindings (instn-uniq-env-rec).
-                # Engine leaks function/class decls out of nested functions, so
-                # rename top-level bindings instead of relying on IIFE scope alone.
-                pfx = f"__fx{len(inlined)}_"
-                body = re.sub(
-                    r'\bfunction\s*(\*?)\s*([A-Za-z_$][\w$]*)',
-                    rf'function\1 {pfx}\2',
-                    body,
-                )
-                body = re.sub(
-                    r'\bclass\s+([A-Za-z_$][\w$]*)',
-                    rf'class {pfx}\1',
-                    body,
-                )
-                body = re.sub(
-                    r'\b(var|let|const)\s+([A-Za-z_$][\w$]*)',
-                    rf'\1 {pfx}\2',
-                    body,
-                )
-                fixture_chunks.append(
-                    "(function(){\n" + body + "\n})();\n"
-                )
+            # May already be inlined by _preload_requested_in_order
+            _inline_fixture_body(spec, isolate_side_effect=True)
             return ''
 
         f_dflt = dflt if is_self else None
@@ -1863,7 +1990,10 @@ def _preprocess_module(source, test_path):
         kind_source = source
         if fix_src is not None:
             key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
-            fs, (fd, fn), fix_reexports = parse_exports_from(fix_src)
+            dloc = _default_local_for_key(key)
+            fs, (fd, fn), fix_reexports = parse_exports_from(
+                fix_src, default_local=dloc
+            )
             f_dflt, f_named = fd, dict(fn)
             # Named imports need star-expanded export table (export * / * as)
             if fix_reexports:
@@ -1872,9 +2002,8 @@ def _preprocess_module(source, test_path):
                     if im == '*' and not str(exp).startswith('*from*'):
                         f_named[exp] = exp
             kind_source = fs
-            if key not in inlined:
-                inlined.add(key)
-                fixture_chunks.append(strip_fixture_exports(fs))
+            # Prefer shared inliner (unique defaults, isolation rules)
+            _inline_fixture_body(spec, isolate_side_effect=True)
 
         repl = []
         defname = m.group('def') or m.group('defonly')
@@ -2077,7 +2206,7 @@ def _preprocess_module(source, test_path):
 
     # Strip remaining export { … } from lines (resolved via reexport map + import)
     new_src = re.sub(
-        r'export\s*\{[^}]+\}\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
+        r'export\s*\{[^}]*\}\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
         '',
         new_src,
     )
@@ -2479,6 +2608,45 @@ def _preprocess_module(source, test_path):
         new_src = (
             "(function(){\n" + new_src + "\n}).call(undefined);\n"
         )
+
+    # Engine injects own __proto__ on Object.create(null). Module NS exotic
+    # [[Get]]/[[HasProperty]] must not surface it — route through Reflect shims.
+    if (
+        '__nsbuild_' in new_src
+        or any('__nsbuild_' in c for c in fixture_chunks)
+        or '__markModuleNS' in new_src
+    ):
+        new_src = re.sub(
+            r'''(['"])__proto__\1\s+in\s+([A-Za-z_$][\w$]*)''',
+            r'Reflect.has(\2, "__proto__")',
+            new_src,
+        )
+        new_src = re.sub(
+            r'''\b([A-Za-z_$][\w$]*)\.__proto__\b(?!\s*=)''',
+            r'Reflect.get(\1, "__proto__")',
+            new_src,
+        )
+        # for-in bypasses gOPD shims; Object.keys hits [[GetOwnProperty]] (TDZ)
+        ns_names = set(ns_by_module.values())
+        for m in re.finditer(
+            r'const\s+([A-Za-z_$][\w$]*)\s*=\s*__nsbuild_',
+            new_src,
+        ):
+            ns_names.add(m.group(1))
+        for m in re.finditer(
+            r'var\s+([A-Za-z_$][\w$]*)\s*=\s*__nsbuild_',
+            new_src,
+        ):
+            ns_names.add(m.group(1))
+        for nsn in ns_names:
+            if not nsn or not re.match(r'^[A-Za-z_$]', nsn):
+                continue
+            new_src = re.sub(
+                rf'for\s*\(\s*(var|let|const)\s+([A-Za-z_$][\w$]*)\s+in\s+{re.escape(nsn)}\s*\)',
+                rf'for (var \2, __mk=Object.keys({nsn}), __mi=0; '
+                rf'__mi<__mk.length; \2=__mk[__mi++])',
+                new_src,
+            )
 
     # Engine: Symbol#toString throws — used in define-own-property messages
     if '.toString()' in new_src and 'Symbol' in new_src:
