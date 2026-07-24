@@ -671,10 +671,15 @@ Reflect.set = function(o, p, v, r) {
   } catch (e) { return false; }
 };
 Reflect.ownKeys = function(o) {
+  // getOwnPropertyNames already filters/sorts for module NS
   var names = Object.getOwnPropertyNames(o);
   var out = [];
   for (var i = 0; i < names.length; i++) {
     if (names[i] !== "__moduleNamespace__") out.push(names[i]);
+  }
+  if (o && o.__moduleNamespace__) {
+    // ensure string keys sorted (belt-and-suspenders)
+    out.sort();
   }
   if (Object.getOwnPropertySymbols) {
     var syms = Object.getOwnPropertySymbols(o);
