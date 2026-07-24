@@ -606,8 +606,10 @@ def _wrap_toplevel_await(source):
 # NS uses accessors (set throws) so assignment is TypeError; gOPD is shimmed to
 # report data descriptors {value, writable:true, enumerable, configurable:false}.
 _MODULE_REFLECT_STUB = """
-// Brand module namespace objects without an own string key (keeps gOPN length clean)
+// Brand module namespace objects + remember their export string keys.
+// Engine gOPN drops some names (e.g. "__") and lacks getOwnPropertySymbols.
 var __moduleNSList = [];
+var __moduleNSKeys = []; // parallel array of string-key arrays
 function __isModuleNS(o) {
   if (!o) return false;
   for (var __i = 0; __i < __moduleNSList.length; __i++) {
@@ -615,9 +617,25 @@ function __isModuleNS(o) {
   }
   return false;
 }
-function __markModuleNS(o) {
+function __markModuleNS(o, keys) {
   __moduleNSList.push(o);
+  __moduleNSKeys.push(keys || []);
   return o;
+}
+function __moduleNSExportKeys(o) {
+  for (var __i = 0; __i < __moduleNSList.length; __i++) {
+    if (__moduleNSList[__i] === o) return __moduleNSKeys[__i];
+  }
+  return null;
+}
+// Engine lacks Object.getOwnPropertySymbols — minimal polyfill for module NS
+if (typeof Object.getOwnPropertySymbols !== "function") {
+  Object.getOwnPropertySymbols = function(o) {
+    if (__isModuleNS(o)) {
+      return [Symbol.toStringTag];
+    }
+    return [];
+  };
 }
 (function() {
   if (!Object.__moduleGopdShim) {
@@ -641,13 +659,25 @@ function __markModuleNS(o) {
     // Module NS [[OwnPropertyKeys]]: string keys sorted, then symbols
     var _gopn = Object.getOwnPropertyNames;
     Object.getOwnPropertyNames = function(o) {
+      if (__isModuleNS(o)) {
+        // Prefer recorded export keys (engine gOPN may drop "__" etc.)
+        var recorded = __moduleNSExportKeys(o);
+        if (recorded && recorded.length) {
+          var copy = recorded.slice();
+          copy.sort();
+          return copy;
+        }
+      }
       var names = _gopn(o);
       var out = [];
       for (var i = 0; i < names.length; i++) {
-        if (names[i] !== "__moduleNamespace__") out.push(names[i]);
+        var n = names[i];
+        if (n === "__moduleNamespace__") continue;
+        if (__isModuleNS(o) && n && n.indexOf("@") >= 0) continue;
+        out.push(n);
       }
       if (__isModuleNS(o)) {
-        out.sort(); // code-unit order per OrdinaryOwnPropertyKeys for strings
+        out.sort();
       }
       return out;
     };
@@ -1169,25 +1199,30 @@ def _namespace_object_js(ns_name, export_map, live_getters=True, as_const=False)
     """
     tmp = f'__nsbuild_{ns_name}'
     lines = [f'var {tmp} = Object.create(null);']
+    key_list = []
     for exp, loc in sorted(export_map.items()):
-        if exp.startswith('*from*'):
+        if str(exp).startswith('*from*'):
             continue
-        prop_js = json.dumps(exp)
         loc_s = str(loc)
+        # loc must be a JS identifier expression (or __default_export__)
         if not re.match(r'^[A-Za-z_$][\w$]*$', loc_s):
             continue
+        prop_js = json.dumps(exp, ensure_ascii=False)
         lines.append(
             f'Object.defineProperty({tmp}, {prop_js}, {{'
             f'get:function(){{return {loc_s};}},'
             f'set:function(){{throw new TypeError("Module namespace is read-only");}},'
             f'enumerable:true,configurable:false}});'
         )
+        key_list.append(exp)
     lines.append(
         f'try{{Object.defineProperty({tmp}, Symbol.toStringTag, {{'
         f'value:"Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
     )
     lines.append(f'try{{Object.preventExtensions({tmp});}}catch(e){{}}')
-    lines.append(f'try{{__markModuleNS({tmp});}}catch(e){{}}')
+    # Record export keys for gOPN (engine drops names like "__")
+    keys_js = json.dumps(key_list, ensure_ascii=False)
+    lines.append(f'try{{__markModuleNS({tmp}, {keys_js});}}catch(e){{}}')
     if as_const:
         lines.append(f'const {ns_name} = {tmp};')
     else:
