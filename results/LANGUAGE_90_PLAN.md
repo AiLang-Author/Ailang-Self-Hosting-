@@ -10,7 +10,7 @@
 
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
-| 1 | **module-code** | 30.7% | **85.8%** (M119) | 90% | +51 from M117; need ~+42 |
+| 1 | **module-code** | 30.7% | **87.6%** (M120) | 90% | +67 from M117; need ~+26 |
 | 2 | **import** | ~13% | **30.2%** | 90% | With module linker |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
@@ -50,3 +50,4 @@ Review dependencies (Proxy, species, TypedArray, Promise jobs), then Object/Arra
 - M118: live default imports, let/const TDZ aliases, IEE re-exports, safe fnGlobalObject, local-bndng (+26 → 82.5%)
 - M118b: export*as default, live ns getters, eval-this, iee trailing comma
 - M119: ns exotic (set/delete/gOPD shim), export*, string expnames, star-props, keyword import names
+- M120: NS uninit/TDZ, setPrototypeOf, star equality cache, live import renames, string imports

@@ -638,6 +638,23 @@ _MODULE_REFLECT_STUB = """
       }
       return out;
     };
+    // hasOwnProperty / propertyIsEnumerable must [[Get]] uninit bindings (throw RE)
+    var _hasOwn = Object.prototype.hasOwnProperty;
+    Object.prototype.hasOwnProperty = function(p) {
+      if (this && this.__moduleNamespace__) {
+        var d = Object.getOwnPropertyDescriptor(this, p);
+        return d !== undefined;
+      }
+      return _hasOwn.call(this, p);
+    };
+    var _pie = Object.prototype.propertyIsEnumerable;
+    Object.prototype.propertyIsEnumerable = function(p) {
+      if (this && this.__moduleNamespace__) {
+        var d = Object.getOwnPropertyDescriptor(this, p);
+        return !!(d && d.enumerable);
+      }
+      return _pie.call(this, p);
+    };
   }
 })();
 // Always install/override Reflect helpers used by namespace tests
@@ -692,6 +709,36 @@ Reflect.setPrototypeOf = function(o, p) {
   if (o && o.__moduleNamespace__) return (p === null);
   try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; }
 };
+// Object.setPrototypeOf must throw when [[SetPrototypeOf]] is false (module NS)
+(function() {
+  if (Object.__moduleSetProtoShim) return;
+  Object.__moduleSetProtoShim = true;
+  var _sp = Object.setPrototypeOf;
+  Object.setPrototypeOf = function(o, p) {
+    if (o && o.__moduleNamespace__ && p !== null) {
+      throw new TypeError("Module namespace [[SetPrototypeOf]]");
+    }
+    return _sp.call(Object, o, p);
+  };
+})();
+// Object.keys must [[GetOwnProperty]] each key (throws on uninit NS bindings)
+(function() {
+  if (Object.__moduleKeysShim) return;
+  Object.__moduleKeysShim = true;
+  var _keys = Object.keys;
+  Object.keys = function(o) {
+    if (o && o.__moduleNamespace__) {
+      var names = Object.getOwnPropertyNames(o);
+      var out = [];
+      for (var i = 0; i < names.length; i++) {
+        var d = Object.getOwnPropertyDescriptor(o, names[i]);
+        if (d && d.enumerable) out.push(names[i]);
+      }
+      return out;
+    }
+    return _keys(o);
+  };
+})();
 """
 
 
@@ -875,9 +922,9 @@ def _extract_default_function_decl(source):
         )
         decl = header2 + source[m.end() - 1:body_end]
         return full, decl, '__default_export__'
-    # after anon rewrite: var __default_export__ = function(...){...};
+    # after anon rewrite: let/var __default_export__ = function(...){...};
     m = re.search(
-        r'var\s+__default_export__\s*=\s*((?:async\s+)?function\s*\*?\s*\([^)]*\)\s*)\{',
+        r'(?:var|let|const)\s+__default_export__\s*=\s*((?:async\s+)?function\s*\*?\s*\([^)]*\)\s*)\{',
         source,
     )
     if m:
@@ -963,38 +1010,42 @@ def _stamp_default_name_after(source, start_marker, force=False):
 
 
 def _rewrite_anon_default_export(source):
-    """Turn anonymous export default into var __default_export__ = …"""
+    """Turn anonymous export default into let __default_export__ = …
+
+    Use `let` (not var) so default is TDZ until the export statement runs
+    (namespace uninit tests: ns.default throws ReferenceError).
+    """
     # export default class { … }  OR  export default class extends … { … }
     source, n = re.subn(
         r'export\s+default\s+class\s*\{',
-        'var __default_export__ = class {',
+        'let __default_export__ = class {',
         source,
         count=1,
     )
     if n:
-        return _stamp_default_name_after(source, 'var __default_export__ = class')
+        return _stamp_default_name_after(source, 'let __default_export__ = class')
     source, n = re.subn(
         r'export\s+default\s+class\s+(extends\b)',
-        r'var __default_export__ = class \1',
+        r'let __default_export__ = class \1',
         source,
         count=1,
     )
     if n:
-        return _stamp_default_name_after(source, 'var __default_export__ = class')
+        return _stamp_default_name_after(source, 'let __default_export__ = class')
     source, n = re.subn(
         r'export\s+default\s+(async\s+)?function(\s*\*)?\s*\(',
-        r'var __default_export__ = \1function\2(',
+        r'let __default_export__ = \1function\2(',
         source,
         count=1,
     )
     if n:
-        return _stamp_default_name_after(source, 'var __default_export__ = ')
+        return _stamp_default_name_after(source, 'let __default_export__ = ')
     if re.search(r'export\s+default\s+(?:async\s+)?(?:function\s*\*?|class)\s+[A-Za-z_$]', source):
         return source  # named — leave for engine
     # Plain expression default — rewrite without name stamp (stamp only for fn/class)
     source, n = re.subn(
         r'export\s+default\s+',
-        'var __default_export__ = ',
+        'let __default_export__ = ',
         source,
         count=1,
     )
@@ -1140,8 +1191,31 @@ def _preprocess_module(source, test_path):
         )
         fs = re.sub(r'\bexport\s+default\s+', '', fs)
         fs = re.sub(r'\bexport\s+', '', fs)
-        # orphan export lists
-        fs = re.sub(r'(?m)^\{[^}]*\bas\b[^}]*\}\s*;\s*$', '', fs)
+        # orphan export lists after export keyword strip
+        fs = re.sub(r'(?m)^\{\s*[^}]*\bas\b[^}]*\}\s*;\s*$', '', fs)
+        fs = re.sub(r'(?m)^\{\s*[A-Za-z_$][\w$]*\s*\}\s*;\s*$', '', fs)
+        # Function("return this;")() SIGSEGVs in our engine
+        fs = re.sub(
+            r'''Function\s*\(\s*['"]return this;?['"]\s*\)\s*\(\s*\)''',
+            '(typeof globalThis!=="undefined"?globalThis:(function(){return this;})())',
+            fs,
+        )
+        # Fixture imports of the main module: import * as ns from './self.js'
+        # → alias to main's cached namespace (filled after self ns is built)
+        def _fix_self_import(m):
+            loc = m.group(1)
+            spec = m.group(2)
+            if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
+                # Defer: const loc = <self_ns> once known (never alias name to itself)
+                pre_assert_aliases.append(f'const {loc} = __SELF_NS__;')
+                return ''
+            return m.group(0)
+
+        fs = re.sub(
+            r'''import\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]\s*;?''',
+            _fix_self_import,
+            fs,
+        )
         if re.search(r'\bresults\b', fs) and re.search(r'try\s*\{', fs):
             fs = re.sub(r'\bresults\b', '__iee_results', fs)
             fs = (
@@ -1200,6 +1274,9 @@ def _preprocess_module(source, test_path):
     # Aliases inserted before first assert (after body decls) — instn-named-id-name
     pre_assert_aliases = []
     deferred_aliases = []
+    # One namespace object per module key (instn-star-equality)
+    ns_by_module = {}  # module_key -> first local binding name that holds the ns
+    live_renames = {}  # importLocal -> sourceLocal for live fixture vars
 
     def expand_star_exports(named_map, reexport_map, depth=0):
         """Inline export * from './x' into named_map (no default)."""
@@ -1305,7 +1382,7 @@ def _preprocess_module(source, test_path):
             return
         # export default class [Name]
         if re.search(r'export\s+default\s+class\b', kind_source) or re.search(
-            r'var\s+__default_export__\s*=\s*class\b', kind_source
+            r'(?:var|let|const)\s+__default_export__\s*=\s*class\b', kind_source
         ):
             # const defname = class after rewrite — TDZ until that line
             live_export_assigns.add('__default_alias_' + defname)
@@ -1367,14 +1444,53 @@ def _preprocess_module(source, test_path):
 
         ns = m.group('ns')
         if ns:
-            # Expand export * from deps into the namespace map
-            emap = dict(f_named if f_named else named)
-            if fix_reexports:
-                emap = expand_star_exports(emap, fix_reexports)
-            elif is_self and self_reexports:
-                emap = expand_star_exports(emap, self_reexports)
-            # Build as const at epilogue (immutable import binding)
-            ns_epilogues.append(_namespace_object_js(ns, emap, as_const=True))
+            # Module identity key for namespace caching
+            if is_self:
+                mod_key = '__self__'
+            else:
+                try:
+                    mod_key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+                except Exception:
+                    mod_key = spec
+            if mod_key in ns_by_module:
+                # Same module namespace object (import * as a; import * as b)
+                pre_assert_aliases.append(f'const {ns} = {ns_by_module[mod_key]};')
+            else:
+                # Expand export * from deps into the namespace map
+                emap = dict(f_named if f_named else named)
+                if fix_reexports:
+                    emap = expand_star_exports(emap, fix_reexports)
+                elif is_self and self_reexports:
+                    emap = expand_star_exports(emap, self_reexports)
+                # Also merge self re-exports from fixtures (incl. string ModuleExportName)
+                if is_self and self_reexports:
+                    for exp, (fspec, im) in list(self_reexports.items()):
+                        if exp.startswith('*from*') or im in ('*', '**'):
+                            continue
+                        # Re-export from self (export { x as y } from './self') — local only
+                        if Path(fspec).name == self_name or fspec in ('./' + self_name, self_name):
+                            if re.match(r'^[A-Za-z_$][\w$]*$', str(im)):
+                                emap[exp] = im
+                            continue
+                        fix2 = load_spec(fspec)
+                        if fix2 is None:
+                            continue
+                        key2 = str((base / (fspec[2:] if fspec.startswith('./') else fspec)).resolve())
+                        fs2, (_fd2, fn2), _rm2 = parse_exports_from(fix2)
+                        if key2 not in inlined:
+                            inlined.add(key2)
+                            fixture_chunks.append(strip_fixture_exports(fs2))
+                        # Resolve export name through fixture's export table
+                        loc = fn2.get(im, fn2.get(exp, im))
+                        if not re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
+                            for _e, _l in fn2.items():
+                                if _e == exp or _e == im:
+                                    loc = _l
+                                    break
+                        if re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
+                            emap[exp] = loc
+                ns_epilogues.append(_namespace_object_js(ns, emap, as_const=True))
+                ns_by_module[mod_key] = ns
 
         named_clause = m.group('named')
         if named_clause:
@@ -1387,6 +1503,12 @@ def _preprocess_module(source, test_path):
                     exp, loc = exp.strip(), loc.strip()
                 else:
                     exp = loc = part
+                # ModuleExportName string: import { "☿" as Ami }
+                if len(exp) >= 2 and exp[0] in ('"', "'") and exp[-1] == exp[0]:
+                    try:
+                        exp = json.loads('"' + exp[1:-1].replace('\\', '\\\\').replace('"', '\\"') + '"')
+                    except Exception:
+                        exp = exp[1:-1]
                 src_local = f_named.get(exp, exp)
                 if exp == 'default' and f_dflt:
                     src_local = f_dflt
@@ -1448,24 +1570,27 @@ def _preprocess_module(source, test_path):
                     ))
                     if is_fun:
                         if loc != src_local:
-                            # renamed import of fixture function
                             live_binding_prelude.append(f'const {loc} = {src_local};')
-                        # same name: fixture already declared function
-                    elif is_var:
-                        # Fixture inlined `var x = …` already; only alias on rename.
-                        # Do NOT `const x = undefined` — that clobbers the fixture value.
+                    elif is_var or is_const:
                         if loc != src_local:
-                            repl.append(f'const {loc} = {src_local};')
-                    elif is_const:
-                        # Fixture body is prepended; binding already exists under src_local.
-                        if loc != src_local:
-                            repl.append(f'const {loc} = {src_local};')
+                            live_renames[loc] = src_local
                     else:
+                        # export { x } / bare binding from fixture
                         if loc != src_local:
-                            repl.append(f'var {loc} = {src_local};')
+                            live_renames[loc] = src_local
         return "\n".join(repl)
 
     new_src = import_re.sub(handle_import, source)
+
+    # Apply live renames (import { x as y } where x is mutable fixture binding)
+    for loc, src_local in live_renames.items():
+        if loc == src_local:
+            continue
+        new_src = re.sub(
+            rf'(?<![\w$.]){re.escape(loc)}(?![\w$])',
+            src_local,
+            new_src,
+        )
 
     # Strip remaining export { … } from lines (resolved via reexport map + import)
     new_src = re.sub(
@@ -1473,6 +1598,34 @@ def _preprocess_module(source, test_path):
         '',
         new_src,
     )
+    # export * from './fix' — expand into named (already in maps) and drop syntax
+    def _strip_export_star(m):
+        spec = m.group(1)
+        if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
+            return ''
+        fix = load_spec(spec)
+        if fix is None:
+            return ''
+        key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+        if key not in inlined:
+            inlined.add(key)
+            fs, (_fd, fn), rmap = parse_exports_from(fix)
+            fixture_chunks.append(strip_fixture_exports(fs))
+            # Merge into module-level named for any later ns of self
+            for exp, loc in expand_star_exports(fn, rmap).items():
+                if exp != 'default' and exp not in named:
+                    named[exp] = loc
+        return ''
+
+    new_src = re.sub(
+        r'export\s*\*\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
+        _strip_export_star,
+        new_src,
+    )
+    # If self ns was already built before export * expansion, rebuild is too late
+    # for this pass; ensure named map merges are used when building self ns by
+    # expanding export * before import handling when possible — handled below if
+    # any leftover export * remains after early collect.
 
     # export var/let/const x = expr → x = expr when live-imported (already hoisted)
     for name in list(live_export_assigns):
@@ -1505,28 +1658,28 @@ def _preprocess_module(source, test_path):
             loc = name[len('__default_alias_'):]
             # Prefer a single `const loc = …` so loc is in TDZ until that line
             # (typeof loc must throw ReferenceError before init).
-            if re.search(r'var\s+__default_export__\s*=', new_src):
+            if re.search(r'(?:var|let|const)\s+__default_export__\s*=', new_src):
                 # If __default_export__ is already a complete binding (e.g. export *
                 # as default → ns object), only alias — don't rewrite the var.
                 if re.search(
-                    r'var\s+__default_export__\s*=\s*__star_as_',
+                    r'(?:var|let|const)\s+__default_export__\s*=\s*__star_as_',
                     new_src,
                 ) or re.search(
-                    r'var\s+__default_export__\s*=\s*[A-Za-z_$][\w$]*\s*;',
+                    r'(?:var|let|const)\s+__default_export__\s*=\s*[A-Za-z_$][\w$]*\s*;',
                     new_src,
                 ):
                     # Insert const alias after the var line
                     new_src = re.sub(
-                        r'(var\s+__default_export__\s*=\s*[^;]+;)',
+                        r'((?:var|let|const)\s+__default_export__\s*=\s*[^;]+;)',
                         rf'\1\nconst {loc} = __default_export__;',
                         new_src,
                         count=1,
                     )
                 else:
-                    # var __default_export__ = class {} / expr;
+                    # let/var __default_export__ = class {} / expr;
                     # → const loc = class {} / expr;
                     new_src = re.sub(
-                        r'var\s+__default_export__\s*=\s*',
+                        r'(?:var|let|const)\s+__default_export__\s*=\s*',
                         f'const {loc} = ',
                         new_src,
                         count=1,
@@ -1693,9 +1846,21 @@ def _preprocess_module(source, test_path):
     )
     # export { a, b as c }; → remove entirely (bindings already declared)
     new_src = re.sub(r'\bexport\s*\{[^}]+\}\s*;', '', new_src)
-    # orphan `{ a as b };` left if export keyword was stripped earlier
-    new_src = re.sub(r'(?m)^\{[^}]*\bas\b[^}]*\}\s*;\s*$', '', new_src)
-    new_src = re.sub(r'(?m)^\{[A-Za-z_$][\w$]*\s*(?:,\s*[A-Za-z_$][\w$]*)*\s*\}\s*;\s*$', '', new_src)
+    # orphan `{ a as b };` / `{ testNs };` left if export keyword was stripped
+    new_src = re.sub(r'(?m)^\{\s*[^}]*\bas\b[^}]*\}\s*;\s*$', '', new_src)
+    new_src = re.sub(
+        r'(?m)^\{\s*[A-Za-z_$][\w$]*(?:\s*,\s*[A-Za-z_$][\w$]*)*\s*\}\s*;\s*$',
+        '',
+        new_src,
+    )
+    fixture_chunks[:] = [
+        re.sub(r'(?m)^\{\s*[A-Za-z_$][\w$]*\s*\}\s*;\s*$', '', c)
+        for c in fixture_chunks
+    ]
+    fixture_chunks[:] = [
+        re.sub(r'(?m)^\{\s*[^}]*\bas\b[^}]*\}\s*;\s*$', '', c)
+        for c in fixture_chunks
+    ]
 
     # Engine: typeof on class binding does not TDZ-throw (bare does). Emulate
     # module class bindings as `let Name = class Name {…}` only when a prior
@@ -1770,6 +1935,30 @@ def _preprocess_module(source, test_path):
             if line not in seen_a:
                 seen_a.add(line)
                 pre_bits.append(line)
+    # Resolve fixture-self-ns placeholders to the actual self namespace binding
+    if '__SELF_NS__' in "\n".join(pre_assert_aliases + ns_epilogues) or any(
+        '__SELF_NS__' in c for c in fixture_chunks
+    ):
+        self_ns = ns_by_module.get('__self__')
+        if self_ns:
+            pre_assert_aliases = [
+                a.replace('__SELF_NS__', self_ns) for a in pre_assert_aliases
+            ]
+            fixture_chunks = [c.replace('__SELF_NS__', self_ns) for c in fixture_chunks]
+            # Also fix any leftover in new_src later
+
+    if pre_bits or pre_assert_aliases:
+        # rebuild pre_bits with updated aliases
+        pre_bits = []
+        if ns_epilogues:
+            for block in ns_epilogues:
+                pre_bits.append(block)
+        if pre_assert_aliases:
+            seen_a = set()
+            for line in pre_assert_aliases:
+                if line not in seen_a:
+                    seen_a.add(line)
+                    pre_bits.append(line)
     if pre_bits:
         ep = "\n".join(pre_bits) + "\n"
         # Insert before first real use — NOT bare `typeof` (collides with name-stamps)
@@ -1783,6 +1972,17 @@ def _preprocess_module(source, test_path):
             new_src = new_src[: m_as.start()] + ep + new_src[m_as.start() :]
         else:
             new_src = new_src + "\n" + ep
+    if ns_by_module.get('__self__'):
+        sn = ns_by_module['__self__']
+        new_src = new_src.replace('__SELF_NS__', sn)
+        for i, c in enumerate(fixture_chunks):
+            fixture_chunks[i] = c.replace('__SELF_NS__', sn)
+        # Drop self-alias `const ns = ns` if somehow produced
+        new_src = re.sub(
+            rf'const\s+{re.escape(sn)}\s*=\s*{re.escape(sn)}\s*;',
+            '',
+            new_src,
+        )
 
     # Module this-binding is undefined (eval-this.js). Scripts use global this.
     if re.search(r'assert\.sameValue\s*\(\s*this\s*,\s*undefined\s*\)', new_src):
