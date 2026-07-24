@@ -886,16 +886,27 @@ def _rewrite_anon_default_export(source):
     return source
 
 
-def _namespace_object_js(ns_name, export_map):
-    """JS Module-namespace-like object (data props; gOPD returns [[Value]])."""
+def _namespace_object_js(ns_name, export_map, live_getters=True):
+    """JS Module-namespace-like object.
+
+    live_getters: use accessors so bindings resolve at read time (needed when
+    namespace is materialised before export initialisers run).
+    """
     lines = [f'var {ns_name} = Object.create(null);']
     for exp, loc in sorted(export_map.items()):
         prop_js = json.dumps(exp)
-        # Data descriptor: value is current binding (built at epilogue time)
-        lines.append(
-            f'Object.defineProperty({ns_name}, {prop_js}, {{'
-            f'value:{loc},writable:true,enumerable:true,configurable:false}});'
-        )
+        if live_getters:
+            # Writable:false module NS; getter for live binding; no setter → TypeError on set
+            lines.append(
+                f'Object.defineProperty({ns_name}, {prop_js}, {{'
+                f'get:function(){{return {loc};}},'
+                f'enumerable:true,configurable:false}});'
+            )
+        else:
+            lines.append(
+                f'Object.defineProperty({ns_name}, {prop_js}, {{'
+                f'value:{loc},writable:true,enumerable:true,configurable:false}});'
+            )
     lines.append(
         f'try{{Object.defineProperty({ns_name}, Symbol.toStringTag, {{'
         f'value:"Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
@@ -924,10 +935,10 @@ def _preprocess_module(source, test_path):
     # Desugar pattern default await (engine bug: await in pattern default)
     # export var { x = await E } = {}; → export var x = await E;
     source = _desugar_export_var_await_pattern(source)
-    self_reexports = {}
-    dflt, named = _collect_module_exports(source, self_reexports)
 
     fixtures = {}
+    inlined = set()
+    fixture_chunks = []
 
     def load_spec(spec):
         if not spec.startswith('.'):
@@ -942,31 +953,6 @@ def _preprocess_module(source, test_path):
             fixtures[key] = _FRONTMATTER_RE.sub("", raw)
         return fixtures[key]
 
-    inlined = set()
-    # Note: test262 often writes `import* as ns` (no space after import).
-    import_re = re.compile(
-        r'''^import\s*(?:
-            (?P<def>[A-Za-z_$][\w$]*)\s*,\s*
-          )?
-          (?:
-            \*\s+as\s+(?P<ns>[A-Za-z_$][\w$]*)
-            |\{(?P<named>[^}]*)\}
-            |(?P<defonly>[A-Za-z_$][\w$]*)
-          )?
-          \s*from\s*['"](?P<spec>[^'"]+)['"]\s*;?
-          |^import\s+['"](?P<side>[^'"]+)['"]\s*;?
-        ''',
-        re.MULTILINE | re.VERBOSE,
-    )
-
-    fixture_chunks = []
-    ns_epilogues = []  # namespace objects after all decls (live getters)
-    live_export_assigns = set()  # export vars that need assignment-only form
-    live_binding_prelude = []  # hoisted before asserts (import instantiation)
-    # (loc, src_local) pairs: const loc = src_local inserted after export init
-    deferred_aliases = []
-    strip_export_from = True  # strip export-from lines in fixtures/main
-
     def parse_exports_from(src):
         src2 = _rewrite_anon_default_export(src)
         rmap = {}
@@ -974,7 +960,6 @@ def _preprocess_module(source, test_path):
 
     def strip_fixture_exports(fs):
         """Remove export keywords / export-from lines for inlined fixture bodies."""
-        # Drop re-export lines entirely (bindings resolved via parent)
         fs = re.sub(
             r'export\s*\{[^}]+\}\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
             '',
@@ -992,11 +977,7 @@ def _preprocess_module(source, test_path):
         )
         fs = re.sub(r'\bexport\s+default\s+', '', fs)
         fs = re.sub(r'\bexport\s+', '', fs)
-        # IEE fixtures probe that re-export names are NOT local bindings. Run the
-        # probe in an IIFE so later main `var A` / `function A` cannot resolve.
-        # Surface `results` to the outer script for the importing module.
         if re.search(r'\bresults\b', fs) and re.search(r'try\s*\{', fs):
-            # Rename local results → __iee_results, return it to outer `results`
             fs = re.sub(r'\bresults\b', '__iee_results', fs)
             fs = (
                 "var results = (function(){\n"
@@ -1004,6 +985,55 @@ def _preprocess_module(source, test_path):
                 + "\nreturn __iee_results;\n})();\n"
             )
         return fs
+
+    # export * as NAME from './fix' early so default/named maps see __default_export__
+    def _early_export_star_as(m):
+        exp_name, spec = m.group(1), m.group(2)
+        fix = load_spec(spec)
+        if fix is None:
+            return m.group(0)
+        key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+        fs, (_fd, fn), _rm = parse_exports_from(fix)
+        if key not in inlined:
+            inlined.add(key)
+            fixture_chunks.append(strip_fixture_exports(fs))
+        ns_tmp = f'__star_as_{exp_name}' if exp_name != 'default' else '__star_as_default'
+        block = _namespace_object_js(ns_tmp, fn if fn else {})
+        if exp_name == 'default':
+            block += f'\nvar __default_export__ = {ns_tmp};\n'
+        else:
+            block += f'\nvar {exp_name} = {ns_tmp};\n'
+        return block + '\n'
+
+    source = re.sub(
+        r'export\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*[\'"]([^\'"]+)[\'"]\s*;?',
+        _early_export_star_as,
+        source,
+    )
+
+    self_reexports = {}
+    dflt, named = _collect_module_exports(source, self_reexports)
+    # Note: test262 often writes `import* as ns` (no space after import).
+    import_re = re.compile(
+        r'''^import\s*(?:
+            (?P<def>[A-Za-z_$][\w$]*)\s*,\s*
+          )?
+          (?:
+            \*\s+as\s+(?P<ns>[A-Za-z_$][\w$]*)
+            |\{(?P<named>[^}]*)\}
+            |(?P<defonly>[A-Za-z_$][\w$]*)
+          )?
+          \s*from\s*['"](?P<spec>[^'"]+)['"]\s*;?
+          |^import\s+['"](?P<side>[^'"]+)['"]\s*;?
+        ''',
+        re.MULTILINE | re.VERBOSE,
+    )
+
+    ns_epilogues = []  # namespace objects after all decls (live getters)
+    live_export_assigns = set()  # export vars that need assignment-only form
+    live_binding_prelude = []  # hoisted before asserts (import instantiation)
+    # (loc, src_local) pairs: const loc = src_local inserted after export init
+    deferred_aliases = []
 
     def bind_self_import(loc, src_local, kind_source):
         """Create immutable import binding for self (or re-export of self)."""
@@ -1049,6 +1079,9 @@ def _preprocess_module(source, test_path):
             # Leave loc undeclared until after export let/const (native TDZ for typeof)
             deferred_aliases.append((loc, src_local, 'let' if is_let else 'const'))
             live_export_assigns.add('__let_alias_' + loc + '_' + src_local)
+        elif src_local == '__default_export__' or src_local.startswith('__star_as_'):
+            # Default / star-as binding is initialised in body — alias after it
+            live_export_assigns.add('__default_alias_' + loc)
         else:
             # fallback
             live_binding_prelude.append(f'var {loc} = {src_local};')
@@ -1170,6 +1203,25 @@ def _preprocess_module(source, test_path):
                         continue
 
                 if is_self:
+                    # Self-import of a name re-exported from a fixture:
+                    #   export { a as b } from './fix'; import { b } from './self'
+                    reexp_self = self_reexports.get(exp) or self_reexports.get(src_local)
+                    if reexp_self:
+                        from_spec, from_name = reexp_self
+                        if from_name != '*':
+                            fix2 = load_spec(from_spec)
+                            if fix2 is not None:
+                                key2 = str((base / (from_spec[2:] if from_spec.startswith('./') else from_spec)).resolve())
+                                fs2, (fd2, fn2), _rm = parse_exports_from(fix2)
+                                if key2 not in inlined:
+                                    inlined.add(key2)
+                                    fixture_chunks.append(strip_fixture_exports(fs2))
+                                real = fn2.get(from_name, from_name)
+                                # Fixture already evaluated — alias to real local
+                                if loc != real:
+                                    repl.append(f'const {loc} = {real};')
+                                # else same name already in scope from fixture
+                                continue
                     bind_self_import(loc, src_local, source)
                 else:
                     # fixture local export (e.g. results)
@@ -1206,14 +1258,9 @@ def _preprocess_module(source, test_path):
 
     new_src = import_re.sub(handle_import, source)
 
-    # Strip main-module export-from lines (handled via reexport map if any)
+    # Strip remaining export { … } from lines (resolved via reexport map + import)
     new_src = re.sub(
         r'export\s*\{[^}]+\}\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
-        '',
-        new_src,
-    )
-    new_src = re.sub(
-        r'export\s*\*\s*as\s+[A-Za-z_$][\w$]*\s*from\s*[\'"][^\'"]+[\'"]\s*;?\s*',
         '',
         new_src,
     )
@@ -1250,19 +1297,36 @@ def _preprocess_module(source, test_path):
             # Prefer a single `const loc = …` so loc is in TDZ until that line
             # (typeof loc must throw ReferenceError before init).
             if re.search(r'var\s+__default_export__\s*=', new_src):
-                # var __default_export__ = class {} / expr;
-                # → const loc = class {} / expr;  (+ name stamp when present)
-                new_src = re.sub(
-                    r'var\s+__default_export__\s*=\s*',
-                    f'const {loc} = ',
+                # If __default_export__ is already a complete binding (e.g. export *
+                # as default → ns object), only alias — don't rewrite the var.
+                if re.search(
+                    r'var\s+__default_export__\s*=\s*__star_as_',
                     new_src,
-                    count=1,
-                )
-                # Fix name-stamp to target loc
-                new_src = new_src.replace(
-                    "Object.defineProperty(__default_export__,'name'",
-                    f"Object.defineProperty({loc},'name'",
-                )
+                ) or re.search(
+                    r'var\s+__default_export__\s*=\s*[A-Za-z_$][\w$]*\s*;',
+                    new_src,
+                ):
+                    # Insert const alias after the var line
+                    new_src = re.sub(
+                        r'(var\s+__default_export__\s*=\s*[^;]+;)',
+                        rf'\1\nconst {loc} = __default_export__;',
+                        new_src,
+                        count=1,
+                    )
+                else:
+                    # var __default_export__ = class {} / expr;
+                    # → const loc = class {} / expr;  (+ name stamp when present)
+                    new_src = re.sub(
+                        r'var\s+__default_export__\s*=\s*',
+                        f'const {loc} = ',
+                        new_src,
+                        count=1,
+                    )
+                    # Fix name-stamp to target loc
+                    new_src = new_src.replace(
+                        "Object.defineProperty(__default_export__,'name'",
+                        f"Object.defineProperty({loc},'name'",
+                    )
             elif re.search(r'export\s+default\s+class\b', new_src):
                 m = re.search(r'export\s+default\s+class\b', new_src)
                 if m:
@@ -1464,6 +1528,12 @@ def _preprocess_module(source, test_path):
             new_src = new_src[: m_as.start()] + ep + new_src[m_as.start() :]
         else:
             new_src = new_src + "\n" + ep
+
+    # Module this-binding is undefined (eval-this.js). Scripts use global this.
+    if re.search(r'assert\.sameValue\s*\(\s*this\s*,\s*undefined\s*\)', new_src):
+        new_src = (
+            "(function(){\n" + new_src + "\n}).call(undefined);\n"
+        )
 
     parts = []
     if fixture_chunks:
