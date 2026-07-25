@@ -1317,8 +1317,24 @@ def _preprocess_module(source, test_path):
     base = path.parent
     self_name = path.name
 
+    # Capture import attributes type: before stripping with-clauses
+    # e.g. from './x.json' with { type: 'json' }  →  module_type['./x.json']='json'
+    module_type_by_spec = {}
+    for m in re.finditer(
+        r'''from\s*['"]([^'"]+)['"]\s*with\s*\{\s*type\s*:\s*['"]([^'"]+)['"]''',
+        source,
+    ):
+        module_type_by_spec[m.group(1)] = m.group(2).lower()
+    # also: import './x' with { type: 'json' } (side-effect; rare)
+    for m in re.finditer(
+        r'''^import\s*['"]([^'"]+)['"]\s*with\s*\{\s*type\s*:\s*['"]([^'"]+)['"]''',
+        source,
+        re.MULTILINE,
+    ):
+        module_type_by_spec[m.group(1)] = m.group(2).lower()
+
     # Drop import attributes / assertions (with {} / assert {}) — unsupported
-    # by the engine; semantics are ignored for these harness rewrites.
+    # by the engine; type already captured above for synthetic modules.
     source = re.sub(r'\s+with\s*\{[^}]*\}', '', source)
     source = re.sub(r'\s+assert\s*\{[^}]*\}', '', source)
 
@@ -1334,6 +1350,8 @@ def _preprocess_module(source, test_path):
     # One namespace object per module key (instn-star-equality); init early for ensure_mod_ns
     ns_by_module = {}  # module_key -> JS var name holding the ns
     pre_assert_aliases = []
+    # Synthetic module defaults (json/text): key → JS local name holding the value
+    synthetic_defaults = {}  # abs path -> dloc
 
     def load_spec(spec):
         if not spec.startswith('.'):
@@ -1345,17 +1363,56 @@ def _preprocess_module(source, test_path):
         key = str(cand)
         if key not in fixtures:
             raw = cand.read_text(errors="replace")
-            fixtures[key] = _FRONTMATTER_RE.sub("", raw)
+            # Only strip test262 frontmatter from .js fixtures
+            if cand.suffix.lower() in ('.js', '.mjs', '.cjs', ''):
+                raw = _FRONTMATTER_RE.sub("", raw)
+            fixtures[key] = raw
         return fixtures[key]
 
     def _default_local_for_key(key):
         safe = re.sub(r'[^A-Za-z0-9_]', '_', Path(str(key)).stem)[:40] or 'm'
         return f'__dflt_{safe}'
 
-    def parse_exports_from(src, default_local=None):
-        """Parse exports; optional per-module default local avoids clashes."""
+    def _synthetic_kind(spec, key=None):
+        """Return 'json', 'text', or None for synthetic module records."""
+        t = module_type_by_spec.get(spec)
+        if t in ('json', 'text'):
+            return t
+        k = key or (str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
+                    if spec.startswith('.') else '')
+        if k.endswith('.json') or (spec and spec.endswith('.json')):
+            return 'json'
+        return None
+
+    def _synthetic_module_js(raw, dloc, kind):
+        """Emit JS binding for a JSON/text synthetic default export.
+
+        Engine lacks reliable JSON.parse — parse in Python and emit a JS literal
+        (JSON text is a subset of JS for the values test262 uses).
+        """
+        if kind == 'text':
+            return f'var {dloc} = {json.dumps(raw)};\n'
+        # json
+        try:
+            val = json.loads(raw)
+        except Exception:
+            # Invalid JSON — resolution/parse error for negative tests
+            return (
+                f'throw new SyntaxError("JSON module parse failed");\n'
+                f'var {dloc} = undefined;\n'
+            )
+        return f'var {dloc} = {json.dumps(val, ensure_ascii=False)};\n'
+
+    def parse_exports_from(src, default_local=None, synthetic=None):
+        """Parse exports; optional per-module default local avoids clashes.
+
+        synthetic: 'json' | 'text' | None — CreateDefaultExportSyntheticModule.
+        """
         if default_local is None:
             default_local = '__default_export__'
+        if synthetic in ('json', 'text'):
+            body = _synthetic_module_js(src, default_local, synthetic)
+            return body, (default_local, {'default': default_local}), {}
         src2 = _rewrite_anon_default_export(src, local_name=default_local)
         rmap = {}
         dflt, named = _collect_module_exports(src2, rmap)
@@ -1431,9 +1488,14 @@ def _preprocess_module(source, test_path):
             if fix is None:
                 continue
             mod_key = _resolve_mod_key(from_spec)
+            syn = _synthetic_kind(from_spec, mod_key)
             fs, (fd, fn), rmap = parse_exports_from(
-                fix, default_local=_default_local_for_key(mod_key)
+                fix,
+                default_local=_default_local_for_key(mod_key),
+                synthetic=syn,
             )
+            if syn:
+                synthetic_defaults[mod_key] = _default_local_for_key(mod_key)
             fn = expand_star_exports(fn, rmap, depth + 1)
             for exp, loc in fn.items():
                 ident = _export_identity(exp, loc, rmap, mod_key)
@@ -1488,14 +1550,24 @@ def _preprocess_module(source, test_path):
             return False
         inlined.add(key)
         dloc = _default_local_for_key(key)
-        fs, (fd, fn), rmap = parse_exports_from(fix, default_local=dloc)
+        syn = _synthetic_kind(spec, key)
+        fs, (fd, fn), rmap = parse_exports_from(
+            fix, default_local=dloc, synthetic=syn
+        )
+        if syn:
+            synthetic_defaults[key] = dloc
+            fixture_chunks.append(fs)  # already a complete var binding
+            return True
         body = strip_fixture_exports(fs)
         has_exports = bool(fd) or bool(fn) or any(
             not str(k).startswith('*from*') for k in rmap
         )
+        # Fixtures that import other modules need shared scope (bindings +
+        # globalThis side effects) — do not rename-isolate them.
+        has_imports = bool(re.search(r'\bimport\b', fix or ''))
         # Pure side-effect modules: isolate locals (uniq-env-rec). Keep
         # modules with exports in shared scope so bindings are reachable.
-        if isolate_side_effect and not has_exports:
+        if isolate_side_effect and not has_exports and not has_imports:
             pfx = f"__fx{len(inlined)}_"
             body = re.sub(
                 r'\bfunction\s*(\*?)\s*([A-Za-z_$][\w$]*)',
@@ -1516,15 +1588,206 @@ def _preprocess_module(source, test_path):
         fixture_chunks.append(body)
         return True
 
+    # Specs requested only via `import defer` must not evaluate at load time
+    _defer_only_specs = set()
+    _eager_specs = set()
+    for m in re.finditer(
+        r'''^import\s+defer\s*\*\s*as\s+[A-Za-z_$][\w$]*\s*from\s*['"]([^'"]+)['"]''',
+        source,
+        re.MULTILINE,
+    ):
+        _defer_only_specs.add(m.group(1))
+    for m in re.finditer(
+        r'''(?:^import\s+['"](\.[^'"]+)['"])|(?:^import(?!\s+defer)\b[^;]*from\s*['"]([^'"]+)['"])|(?:^export\b[^;]*from\s*['"]([^'"]+)['"])''',
+        source,
+        re.MULTILINE,
+    ):
+        sp = m.group(1) or m.group(2) or m.group(3)
+        if sp:
+            _eager_specs.add(sp)
+    # If also eagerly imported, not defer-only
+    _defer_only_specs -= _eager_specs
+
+    # Deferred module records: abs key -> {flag, eval_fn, ns_tmp, exports}
+    _deferred_emitted = {}  # key -> ns JS var name
+
+    def _emit_deferred_namespace(spec, ns_bind_name=None):
+        """Build lazy deferred NS; return internal JS var name of the NS object.
+
+        import defer * as ns from './mod' — body of mod (and its eager deps)
+        runs only when a property of ns is accessed. Nested import-defer stays
+        lazy until that child NS is accessed.
+        """
+        key = _resolve_mod_key(spec)
+        if key in _deferred_emitted:
+            internal = _deferred_emitted[key]
+            if ns_bind_name and ns_bind_name != internal:
+                pre_assert_aliases.append(f'const {ns_bind_name} = {internal};')
+            return internal
+        fix = load_spec(spec)
+        safe = re.sub(r'[^A-Za-z0-9_]', '_', Path(key).stem)[:40] or 'm'
+        # Unique per emit count if stem collides
+        safe = f'{safe}_{len(_deferred_emitted)}'
+        flag = f'__defDone_{safe}'
+        eval_fn = f'__defEval_{safe}'
+        ns_tmp = f'__defNS_{safe}'
+        dloc = _default_local_for_key(key + str(len(_deferred_emitted)))
+
+        if fix is None:
+            fixture_chunks.append(
+                f'var {ns_tmp} = Object.create(null);\n'
+                f'var {ns_bind_name or ns_tmp} = {ns_tmp};\n'
+            )
+            _deferred_emitted[key] = ns_tmp
+            return ns_tmp
+
+        raw = _FRONTMATTER_RE.sub('', fix)
+        nested_defers = []  # (export_name, child_spec)
+
+        def _nest_defer(m):
+            nested_defers.append((m.group(1), m.group(2)))
+            return f'/* nested defer {m.group(1)} */\n'
+
+        body = re.sub(
+            r'''import\s+defer\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]\s*;?''',
+            _nest_defer,
+            raw,
+        )
+        eager_chunks = []
+
+        def _nest_side(m):
+            sp = m.group(1)
+            k2 = _resolve_mod_key(sp)
+            # Always put eager dep body into this eval thunk (may re-run once flag)
+            fix2 = load_spec(sp)
+            if fix2 is not None:
+                syn = _synthetic_kind(sp, k2)
+                if syn:
+                    d2 = _default_local_for_key(k2)
+                    eager_chunks.append(_synthetic_module_js(fix2, d2, syn))
+                    synthetic_defaults[k2] = d2
+                else:
+                    # Don't use global inlined — keep body inside thunk
+                    fs2 = _FRONTMATTER_RE.sub('', fix2)
+                    fs2 = re.sub(r'\s+with\s*\{[^}]*\}', '', fs2)
+                    # Recurse eager side-effects of the dependency
+                    def _deep_side(mm):
+                        sp3 = mm.group(1)
+                        fix3 = load_spec(sp3)
+                        if fix3 is None:
+                            return ''
+                        eager_chunks.append(
+                            strip_fixture_exports(_FRONTMATTER_RE.sub('', fix3))
+                        )
+                        return ''
+                    fs2 = re.sub(
+                        r'''^import\s+['"]([^'"]+)['"]\s*;?''',
+                        _deep_side,
+                        fs2,
+                        flags=re.MULTILINE,
+                    )
+                    fs2 = re.sub(
+                        r'''^import\s+[^;]+;?\s*$''',
+                        '',
+                        fs2,
+                        flags=re.MULTILINE,
+                    )
+                    eager_chunks.append(strip_fixture_exports(fs2))
+            return ''
+
+        body = re.sub(
+            r'''^import\s+['"]([^'"]+)['"]\s*;?''',
+            _nest_side,
+            body,
+            flags=re.MULTILINE,
+        )
+        body = re.sub(
+            r'''^import\s+[^;]+;?\s*$''',
+            '',
+            body,
+            flags=re.MULTILINE,
+        )
+        fs, (fd, fn), rmap = parse_exports_from(body, default_local=dloc)
+        body_exec = strip_fixture_exports(fs)
+        # Nested deferred children (unique internal names)
+        for child_exp, child_spec in nested_defers:
+            child_internal = _emit_deferred_namespace(child_spec, None)
+            fn[child_exp] = child_internal
+
+        if rmap:
+            fn = expand_star_exports(dict(fn), rmap)
+            for exp, (sp, im) in rmap.items():
+                if im == '*' and not str(exp).startswith('*from*'):
+                    fn[exp] = exp
+
+        lines = []
+        lines.append(f'var {flag} = false;')
+        lines.append(f'function {eval_fn}(){{')
+        lines.append(f'  if ({flag}) return;')
+        lines.append(f'  {flag} = true;')
+        for c in eager_chunks:
+            for ln in c.splitlines():
+                lines.append('  ' + ln)
+        for ln in body_exec.splitlines():
+            lines.append('  ' + ln)
+        lines.append('}')
+        lines.append(f'var {ns_tmp} = Object.create(null);')
+        # Hidden touch/eval hook for any property access (no Proxy in engine)
+        lines.append(
+            f'Object.defineProperty({ns_tmp}, "__defEval", {{'
+            f'value:{eval_fn},enumerable:false,configurable:false,writable:false}});'
+        )
+        key_list = []
+        for exp, loc in sorted(fn.items()):
+            if str(exp).startswith('*from*'):
+                continue
+            if not re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
+                continue
+            prop = json.dumps(exp, ensure_ascii=False)
+            lines.append(
+                f'Object.defineProperty({ns_tmp}, {prop}, {{'
+                f'get:function(){{ {eval_fn}(); return {loc}; }},'
+                f'set:function(){{throw new TypeError("deferred NS read-only");}},'
+                f'enumerable:true,configurable:false}});'
+            )
+            key_list.append(exp)
+        if fd and re.match(r'^[A-Za-z_$][\w$]*$', str(fd)) and 'default' not in key_list:
+            lines.append(
+                f'Object.defineProperty({ns_tmp}, "default", {{'
+                f'get:function(){{ {eval_fn}(); return {fd}; }},'
+                f'set:function(){{throw new TypeError("deferred NS read-only");}},'
+                f'enumerable:true,configurable:false}});'
+            )
+            key_list.append('default')
+        lines.append(
+            f'try{{Object.defineProperty({ns_tmp}, Symbol.toStringTag, {{'
+            f'value:"Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
+        )
+        lines.append(f'try{{Object.preventExtensions({ns_tmp});}}catch(e){{}}')
+        keys_js = json.dumps(key_list, ensure_ascii=False)
+        lines.append(f'try{{__markModuleNS({ns_tmp}, {keys_js});}}catch(e){{}}')
+        if ns_bind_name and ns_bind_name != ns_tmp:
+            lines.append(f'var {ns_bind_name} = {ns_tmp};')
+        fixture_chunks.append("\n".join(lines) + "\n")
+        _deferred_emitted[key] = ns_tmp
+        inlined.add(key)
+        return ns_tmp
+
     def _preload_requested_in_order(src):
-        """Evaluate RequestedModules once in source order (eval-rqstd-order)."""
+        """Evaluate non-deferred RequestedModules in source order.
+
+        Does not treat `import defer … from` as an evaluation trigger (even if
+        the same module is later imported eagerly — that later import runs then).
+        """
         seen = set()
         for m in re.finditer(
-            r'''(?:^import\s+['"](\.[^'"]+)['"])|(?:from\s*['"](\.[^'"]+)['"])''',
+            r'''(?:^import\s+['"](\.[^'"]+)['"]\s*;?)'''
+            r'''|(?:^import(?!\s+defer)\b[^;\n]*from\s*['"](\.[^'"]+)['"])'''
+            r'''|(?:^export\b[^;\n]*from\s*['"](\.[^'"]+)['"])''',
             src,
             re.MULTILINE,
         ):
-            spec = m.group(1) or m.group(2)
+            spec = m.group(1) or m.group(2) or m.group(3)
             if not spec or spec in seen:
                 continue
             if Path(spec).name == self_name or spec in ('./' + self_name, self_name):
@@ -1553,7 +1816,12 @@ def _preprocess_module(source, test_path):
             # Body may already be inlined by _preload_requested_in_order
             _inline_fixture_body(spec, isolate_side_effect=True)
             dloc = _default_local_for_key(key)
-            fs, (_fd, fn0), rmap = parse_exports_from(fix, default_local=dloc)
+            syn = _synthetic_kind(spec, key)
+            fs, (_fd, fn0), rmap = parse_exports_from(
+                fix, default_local=dloc, synthetic=syn
+            )
+            if syn:
+                synthetic_defaults[key] = dloc
             fn = expand_star_exports(dict(fn0), rmap)
             for exp, (sp, im) in rmap.items():
                 if im == '*' and not str(exp).startswith('*from*'):
@@ -1580,6 +1848,37 @@ def _preprocess_module(source, test_path):
         Recursively inlines `export * from` / `export {…} from` targets so
         star-exported bindings exist in the combined scope.
         """
+        # Capture + strip import attributes inside fixtures (json/text modules)
+        for m in re.finditer(
+            r'''from\s*['"]([^'"]+)['"]\s*with\s*\{\s*type\s*:\s*['"]([^'"]+)['"]''',
+            fs,
+        ):
+            module_type_by_spec[m.group(1)] = m.group(2).lower()
+        fs = re.sub(r'\s+with\s*\{[^}]*\}', '', fs)
+        fs = re.sub(r'\s+assert\s*\{[^}]*\}', '', fs)
+
+        # import dflt from './x.json'  (after with strip) → alias synthetic default
+        def _fixture_import_default(m):
+            loc, spec = m.group(1), m.group(2)
+            key = _resolve_mod_key(spec) if spec.startswith('.') else None
+            syn = _synthetic_kind(spec, key)
+            if not syn or key is None:
+                return m.group(0)
+            _inline_fixture_body(spec, isolate_side_effect=False)
+            dloc = synthetic_defaults.get(key) or _default_local_for_key(key)
+            return f'var {loc} = {dloc};\n'
+
+        fs = re.sub(
+            r'''import\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]\s*;?''',
+            _fixture_import_default,
+            fs,
+        )
+        fs = re.sub(
+            r'''import\s*\{\s*default\s+as\s+([A-Za-z_$][\w$]*)\s*\}\s*from\s*['"]([^'"]+)['"]\s*;?''',
+            _fixture_import_default,
+            fs,
+        )
+
         # export * as ns from './mod' → alias to cached GetModuleNamespace(mod)
         # Also supports export * as "Name" (ModuleExportName string).
         def _fixture_export_star_as(m):
@@ -1672,6 +1971,35 @@ def _preprocess_module(source, test_path):
             _gthis,
             fs,
         )
+        # import defer * as ns from './mod' inside eagerly-inlined fixture
+        def _fix_import_defer(m):
+            loc, spec = m.group(1), m.group(2)
+            if not spec.startswith('.'):
+                return m.group(0)
+            internal = _emit_deferred_namespace(spec, None)
+            return f'var {loc} = {internal};\n'
+
+        fs = re.sub(
+            r'''import\s+defer\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]\s*;?''',
+            _fix_import_defer,
+            fs,
+        )
+
+        # Side-effect import './mod' inside fixture — inline eagerly
+        def _fix_side_import(m):
+            spec = m.group(1)
+            if not spec.startswith('.'):
+                return ''
+            _inline_fixture_body(spec, isolate_side_effect=False)
+            return ''
+
+        fs = re.sub(
+            r'''^import\s+['"]([^'"]+)['"]\s*;?''',
+            _fix_side_import,
+            fs,
+            flags=re.MULTILINE,
+        )
+
         # import * as ns from './mod' — self → deferred; else cached module NS
         def _fix_import_star(m):
             loc = m.group(1)
@@ -1712,7 +2040,40 @@ def _preprocess_module(source, test_path):
 
     # Evaluate RequestedModules once in source order before rewriting exports
     # (eval-rqstd-order: deps run as '123456789' before main asserts).
+    # Skip import-defer-only specs (evaluated lazily on NS access).
     _preload_requested_in_order(source)
+
+    # import defer * as ns from './mod' → deferred namespace (lazy eval)
+    _top_defer_binds = []  # local names bound to deferred NS
+
+    def _early_import_defer(m):
+        ns_name, spec = m.group(1), m.group(2)
+        if not spec.startswith('.'):
+            return m.group(0)
+        # If same module is also eagerly imported, it's not deferred — use
+        # normal namespace (module-imported-defer-and-eager).
+        if spec not in _defer_only_specs:
+            ns_var = ensure_mod_ns(spec)
+            if ns_name != ns_var:
+                pre_assert_aliases.append(f'const {ns_name} = {ns_var};')
+            return ''
+        _emit_deferred_namespace(spec, ns_name)
+        _top_defer_binds.append(ns_name)
+        return ''
+
+    source = re.sub(
+        r'''^import\s+defer\s*\*\s*as\s+([A-Za-z_$][\w$]*)\s*from\s*['"]([^'"]+)['"]\s*;?''',
+        _early_import_defer,
+        source,
+        flags=re.MULTILINE,
+    )
+    if _deferred_emitted:
+        fixture_chunks.insert(
+            0,
+            'function __defTouch(o){'
+            'if(o&&typeof o.__defEval==="function")o.__defEval();'
+            'return o;}\n',
+        )
 
     # export * as NAME from './fix' early so default/named maps see __default_export__
     # Supports identifier and string ModuleExportName.
@@ -1991,10 +2352,13 @@ def _preprocess_module(source, test_path):
         if fix_src is not None:
             key = str((base / (spec[2:] if spec.startswith('./') else spec)).resolve())
             dloc = _default_local_for_key(key)
+            syn = _synthetic_kind(spec, key)
             fs, (fd, fn), fix_reexports = parse_exports_from(
-                fix_src, default_local=dloc
+                fix_src, default_local=dloc, synthetic=syn
             )
             f_dflt, f_named = fd, dict(fn)
+            if syn:
+                synthetic_defaults[key] = dloc
             # Named imports need star-expanded export table (export * / * as)
             if fix_reexports:
                 f_named = expand_star_exports(f_named, fix_reexports)
@@ -2004,14 +2368,37 @@ def _preprocess_module(source, test_path):
             kind_source = fs
             # Prefer shared inliner (unique defaults, isolation rules)
             _inline_fixture_body(spec, isolate_side_effect=True)
+            # JSON modules: named imports (other than default) are a resolution error
+            if syn == 'json' and m.group('named'):
+                bad = False
+                for part in (m.group('named') or '').split(','):
+                    part = part.strip()
+                    if not part:
+                        continue
+                    exp = part.split(' as ')[0].strip() if ' as ' in part else part
+                    if exp != 'default':
+                        bad = True
+                        break
+                if bad:
+                    return 'throw new SyntaxError("JSON modules have no named exports");\n'
 
         repl = []
         defname = m.group('def') or m.group('defonly')
         if defname:
-            if is_self:
+            # Self as text module: import value from './self.js' with { type: 'text' }
+            if is_self and module_type_by_spec.get(spec) == 'text':
+                try:
+                    raw_self = Path(test_path).read_text(errors='replace')
+                    raw_self = _FRONTMATTER_RE.sub('', raw_self)
+                except Exception:
+                    raw_self = ''
+                dloc = f'__dflt_self_text'
+                fixture_chunks.append(f'var {dloc} = {json.dumps(raw_self)};\n')
+                repl.append(f'var {defname} = {dloc};')
+            elif is_self:
                 bind_default_import(defname, source, True)
             elif f_dflt:
-                # fixture default
+                # fixture default (incl. JSON/text synthetic)
                 if re.search(
                     r'(?:export\s+default\s+(?:async\s+)?function|var\s+__default_export__\s*=\s*(?:async\s+)?function)',
                     kind_source,
@@ -2608,6 +2995,42 @@ def _preprocess_module(source, test_path):
         new_src = (
             "(function(){\n" + new_src + "\n}).call(undefined);\n"
         )
+
+    # Deferred NS: any property access should trigger evaluation (no Proxy).
+    # Rewrite id.prop → (__defTouch(id), id.prop) for known deferred bindings
+    # and for locals assigned from deferred gets (const x = ns.y patterns).
+    if _deferred_emitted:
+        defer_ids = set(_top_defer_binds)
+        # locals assigned from deferred: const x = ns.foo or const x = ns1.ns_1_2
+        for m in re.finditer(
+            r'''(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*([A-Za-z_$][\w$]*)\s*\.\s*[A-Za-z_$]''',
+            new_src,
+        ):
+            if m.group(2) in defer_ids or m.group(2) in _deferred_emitted.values():
+                defer_ids.add(m.group(1))
+        for did in list(defer_ids):
+            new_src = re.sub(
+                rf'(?<![\w$.]){re.escape(did)}\.([A-Za-z_$][\w$]*)',
+                rf'(__defTouch({did}),{did}.\1)',
+                new_src,
+            )
+
+    # Dynamic import of JSON modules (engine has no import()) — resolve to
+    # the same synthetic default binding as static import (idempotency).
+    def _dyn_json_import(m):
+        spec = m.group(1)
+        if not spec.startswith('.'):
+            return m.group(0)
+        key = _resolve_mod_key(spec)
+        _inline_fixture_body(spec, isolate_side_effect=False)
+        dloc = synthetic_defaults.get(key) or _default_local_for_key(key)
+        return f'Promise.resolve({{default:{dloc}}})'
+
+    new_src = re.sub(
+        r'''import\s*\(\s*['"]([^'"]+\.json)['"]\s*(?:,\s*[^)]*)?\s*\)''',
+        _dyn_json_import,
+        new_src,
+    )
 
     # Engine injects own __proto__ on Object.create(null). Module NS exotic
     # [[Get]]/[[HasProperty]] must not surface it — route through Reflect shims.

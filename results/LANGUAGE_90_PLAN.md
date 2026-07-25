@@ -11,7 +11,7 @@
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
 | 1 | **module-code** | 30.7% | **90.4%** (M125, 675/748) | 90% | **HIT** (need dynimport/eval next) |
-| 2 | **import** | ~13% | **30.2%** | 90% | With module linker |
+| 2 | **import** | ~13% | **54.4%** (M126, 99/182) | 90% | JSON/text modules + import-defer lazy NS |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
 | 5 | **function-code** | 68% batch | multipath ~92% earlier | 90% batch | Rescore multipath |
