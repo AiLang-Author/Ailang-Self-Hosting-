@@ -1,8 +1,11 @@
 # Language → 90% then Built-ins — Plan
 
+> **Superseded for targets:** see **`results/LANGUAGE_95_PLAN.md`**  
+> Full suite M127: language **84.2%** → target **95%** (+2,550); overall 57.2%.
+
 **Branch:** `gpu-45-may-baseline-restore`  
-**Full suite baseline:** M110 — overall 56.6%, language 82.4%, built-ins 32.8%  
-**Ordering:** A (language ≥90%) → B (language ~95%) → C (built-ins)
+**Full suite baseline:** M127 — overall 57.2%, language 84.2%, built-ins 32.5%  
+**Ordering:** L1–L9 language ≥95% → B1–B7 built-ins (Reflect→…→Temporal last)
 
 ---
 
@@ -11,7 +14,7 @@
 | Order | Cluster | M110 | Latest | Target | Notes |
 |------:|---------|-----:|-------:|-------:|-------|
 | 1 | **module-code** | 30.7% | **90.4%** (M125, 675/748) | 90% | **HIT** (need dynimport/eval next) |
-| 2 | **import** | ~13% | **54.4%** (M126, 99/182) | 90% | JSON/text modules + import-defer lazy NS |
+| 2 | **import** | ~13% | **78.7%** (M127, 100/127 real) | 90% | JSON native + defer triggers; need ~115/127 |
 | 3 | **dynamic-import** | 46% | — | 90% | After modules |
 | 4 | **eval-code** | 52% | — | 90% | Parallelizable |
 | 5 | **function-code** | 68% batch | multipath ~92% earlier | 90% batch | Rescore multipath |
@@ -59,3 +62,10 @@ Review dependencies (Proxy, species, TypedArray, Promise jobs), then Object/Arra
   new Function→globalThis (same-global); 668/748 ~89.4%
 - M125: RequestedModules source order, import attributes strip, per-fixture defaults,
   NS __proto__ via Reflect, for-in→Object.keys TDZ; **675/748 ~90.4% HIT**
+- M126: JSON/text synthetic modules + import defer lazy NS; import 38→99/182 (with FIXTUREs)
+- M127: **Native JSJSON** in `Librarys/Browser/JSRuntime/Library.JSJSON.ailang` (UTF-16 JSON.parse);
+  ToNumber sci scale single-div SameValue; JSON objects get Object.prototype;
+  runner: skip `*_FIXTURE.js`, deferred NS GetModuleExportsList via Reflect/gOPD shims,
+  "Deferred Module" toStringTag, nested-defer multipass rewrites;
+  **import 100/127 (78.7%)** — attrs 17/17, defer 79/101; need ~+15 for 90%
+  (bytes×5, TLA defer, error races, super/private, residual NS identity)

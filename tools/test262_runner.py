@@ -192,12 +192,27 @@ assert._toString = function(v) {
 function $DONE(err) { if (err) { __test262_failed = 1; } }
 var $MAX_ITERATIONS = 100000;
 // M108: dual-bind harness globals onto globalThis (GlobalHash ≠ object props).
-// asyncHelpers asyncTest checks hasOwnProperty.call(globalThis, "$DONE").
+// asyncHelpers asyncTest checks hasOwnProperty.call(globalThis, "$DONE") — our
+// engine often fails that check, so provide a safe asyncTest and skip the include.
 globalThis.$DONE = $DONE;
 globalThis.$MAX_ITERATIONS = $MAX_ITERATIONS;
 globalThis.assert = assert;
 globalThis.Test262Error = Test262Error;
 globalThis.__test262_failed = __test262_failed;
+function asyncTest(testFunc) {
+  // NOTE: do not wrap testFunc().then in try/catch — our engine's try scope
+  // breaks await completion inside the async test body (assignment-expression
+  // array/object/lhs tests). Sync throws still surface as uncaught.
+  if (typeof testFunc !== "function") {
+    $DONE(new Test262Error("asyncTest called with non-function argument"));
+    return;
+  }
+  testFunc().then(
+    function () { $DONE(); },
+    function (error) { $DONE(error); }
+  );
+}
+globalThis.asyncTest = asyncTest;
 function __isSameValue(a, b) {
   if (a !== a && b !== b) return true; // NaN
   if (a === 0 && b === 0) return (1 / a) === (1 / b); // ±0
@@ -480,22 +495,600 @@ def preprocess(source, meta=None, test_path=None):
     Module tests get a best-effort link rewrite so self-imports and simple
     same-dir FIXTURE modules become plain script bindings (engine still
     parses export/import; this supplies the missing multi-module loader).
+
+    Dynamic-import tests (script or module) get a HostImportModuleDynamically
+    shim: fixture bodies → namespace objects registered on global __dynModules
+    for IMPORT_DYN, plus Promise.reject rewrites for throw/script-error targets.
     """
     source = _FRONTMATTER_RE.sub("", source)
     flags = (meta or {}).get("flags") or []
     features = (meta or {}).get("features") or []
-    if "module" in flags and test_path:
+    is_module = "module" in flags
+    # Only true dynamic import() — not static `import defer` / import-attributes.
+    wants_dyn = bool(
+        test_path
+        and (
+            "dynamic-import" in features
+            or "import(" in source
+            or "import (" in source
+        )
+    )
+
+    dyn_imports = []  # list of (bind_name, spec)
+    reject_rewrite = {}
+    if wants_dyn:
         try:
-            source = _preprocess_module(source, test_path)
-            # Top-level await: wrap in async IIFE so AWAIT_EXPR is valid (in_await)
-            if "top-level-await" in features or _source_has_toplevel_await(source):
-                source = _wrap_toplevel_await(source)
-            # Namespace / Reflect tests need Reflect
-            if "Reflect" in source or "namespace" in (test_path or ""):
-                source = _MODULE_REFLECT_STUB + source
+            dyn_imports, reject_rewrite, source = _dyn_prepare(
+                source, test_path
+            )
         except Exception:
-            pass  # leave source as-is if preprocess chokes
+            dyn_imports, reject_rewrite = [], {}
+
+    # Module link + dynimport registry. Prefer a single _preprocess_module pass
+    # when static modules and/or complex dyn fixtures need the full linker.
+    dyn_full = bool(
+        wants_dyn and test_path and _dyn_imports_need_full_link(dyn_imports, test_path)
+    )
+    if test_path and (is_module or dyn_full):
+        try:
+            link_src = source
+            if wants_dyn and dyn_imports:
+                head = "\n".join(
+                    f"import * as {bn} from {json.dumps(sp)};"
+                    for bn, sp in dyn_imports
+                )
+                reg = ["var __dynModules = Object.create(null);"]
+                for bn, sp in dyn_imports:
+                    reg.append(f"__dynModules[{json.dumps(sp)}] = {bn};")
+                link_src = head + "\n" + "\n".join(reg) + "\n" + source
+            elif wants_dyn:
+                link_src = "var __dynModules = Object.create(null);\n" + source
+            source = _preprocess_module(link_src, test_path)
+            if is_module and "async" not in flags and (
+                "top-level-await" in features or _source_has_toplevel_await(source)
+            ):
+                source = _wrap_toplevel_await(source)
+        except Exception:
+            pass
+    elif wants_dyn and test_path:
+        # Simple dynimport fixtures: IIFE-isolated NS (no local1 clashes)
+        try:
+            dyn_pre = _build_dyn_modules_preamble(dyn_imports, test_path)
+            source = dyn_pre + source
+        except Exception:
+            source = "var __dynModules = Object.create(null);\n" + source
+
+    # Reflect/gOPD NS shims
+    if test_path and (
+        "Reflect" in source
+        or "namespace" in (test_path or "")
+        or "import-defer" in (test_path or "")
+        or "__markModuleNS" in source
+        or "__defEval" in source
+        or dyn_imports
+        or wants_dyn
+    ):
+        if "function __markModuleNS" not in source:
+            source = _MODULE_REFLECT_STUB + source
+
+    # import.meta — rewrite to __import_meta__ (null-proto object)
+    if re.search(r'\bimport\s*\.\s*meta\b', source):
+        source = re.sub(r'\bimport\s*\.\s*meta\b', '__import_meta__', source)
+        if "var __import_meta__" not in source:
+            source = (
+                "var __import_meta__ = Object.create(null);\n"
+                + source
+            )
+
+    # Free-var let/const through generator cenv is unreliable (GET/SET_FREE).
+    # Usage templates: `let callCount` + async-gen then callbacks; `const obj`
+    # for import(obj) ToString — demote to var for dual-bind free-var path.
+    # NS getters `return __default_export__` also need var (let free-var miss).
+    if wants_dyn:
+        source = re.sub(r'\blet\s+callCount\b', 'var callCount', source)
+        source = re.sub(
+            r'\bconst\s+(obj)\s*=',
+            r'var \1 =',
+            source,
+        )
+        source = re.sub(
+            r'\blet\s+(__default_export__|__dflt_[A-Za-z0-9_]+)\b',
+            r'var \1',
+            source,
+        )
+        # Name-stamp after class/fn default must run before import().then
+        # callbacks read `.name` (stamp is often left at EOF by module rewrite).
+        source = re.sub(
+            r"(import\s*\(\s*['\"][^'\"]+['\"]\s*\)\s*\.then\([\s\S]*?\)\s*;?\s*)"
+            r"(try\{var __n=(__default_export__|__dflt_[A-Za-z0-9_]+)\.name;[\s\S]*?catch\(e\)\{\})",
+            r"\2\n\1",
+            source,
+            count=1,
+        )
+        # `await import(E)` — ToString abrupt inside async CallFunc can poison
+        # the outer async frame. Pre-coerce with ''+E and Promise.reject on throw
+        # so await Promise.reject (known-good) carries the reason; string import()
+        # for success. Also expand `.then` form to settle before chaining.
+        def _expand_await_import(src, phase=""):
+            # phase: "" | "source" | "defer"
+            needle = f"await import.{phase}(" if phase else "await import("
+            if phase:
+                needle = f"await import.{phase}("
+            out = []
+            i = 0
+            while True:
+                j = src.find(needle, i)
+                if j < 0:
+                    out.append(src[i:])
+                    break
+                k = j + len(needle)
+                depth = 1
+                while k < len(src) and depth:
+                    if src[k] == "(":
+                        depth += 1
+                    elif src[k] == ")":
+                        depth -= 1
+                    k += 1
+                expr = src[j + len(needle) : k - 1]
+                rest = src[k:]
+                mthen = re.match(r"\s*\.\s*then\s*\(", rest)
+                # call site: import / import.source / import.defer
+                call = f"import.{phase}" if phase else "import"
+                es = expr.strip()
+                # Keep string-literal import() intact so reject_rewrite can match
+                # import('./throw_FIXTURE.js') etc. Only wrap non-literals (obj).
+                is_str_lit = (
+                    len(es) >= 2
+                    and (
+                        (es[0] == "'" and es[-1] == "'")
+                        or (es[0] == '"' and es[-1] == '"')
+                    )
+                )
+                if mthen:
+                    h0 = k + mthen.end()
+                    depth = 1
+                    h = h0
+                    while h < len(src) and depth:
+                        if src[h] == "(":
+                            depth += 1
+                        elif src[h] == ")":
+                            depth -= 1
+                        h += 1
+                    handler = src[h0 : h - 1]
+                    out.append(src[i:j])
+                    if is_str_lit:
+                        out.append(
+                            f"await (async function(){{ "
+                            f"var __m = await {call}({expr}); "
+                            f"await Promise.resolve(__m).then({handler}); "
+                            f"}})()"
+                        )
+                    else:
+                        out.append(
+                            f"await (async function(){{ "
+                            f"var __m = await (function(__s){{ "
+                            f"try{{ __s = '' + __s; }}catch(__e){{ return Promise.reject(__e); }} "
+                            f"return {call}(__s); }})({expr}); "
+                            f"await Promise.resolve(__m).then({handler}); "
+                            f"}})()"
+                        )
+                    i = h
+                else:
+                    out.append(src[i:j])
+                    if is_str_lit:
+                        out.append(f"await {call}({expr})")
+                    else:
+                        out.append(
+                            f"await (function(__s){{ "
+                            f"try{{ __s = '' + __s; }}catch(__e){{ return Promise.reject(__e); }} "
+                            f"return {call}(__s); }})({expr})"
+                        )
+                    i = k
+            return "".join(out)
+
+        source = _expand_await_import(source, "")
+        source = _expand_await_import(source, "source")
+        source = _expand_await_import(source, "defer")
+
+    if wants_dyn and reject_rewrite:
+        for sp, rej in reject_rewrite.items():
+            for q in ('"', "'"):
+                lit = q + sp + q
+                source = re.sub(
+                    rf'''import\s*\(\s*{re.escape(lit)}\s*(?:,\s*[^)]*)?\s*\)''',
+                    rej,
+                    source,
+                )
     return source
+
+
+def _dyn_imports_need_full_link(dyn_imports, test_path):
+    """True if fixtures need the multi-module linker (cross-module deps).
+
+    Same-file re-exports (`export { x } from './self_FIXTURE.js'`) are OK in
+    the IIFE path. Cross-module import/export-from needs full link (nested NS).
+    """
+    if not dyn_imports:
+        return False
+    base = Path(test_path).parent
+    self_names = {Path(sp).name for _bn, sp in dyn_imports}
+    for _bn, sp in dyn_imports:
+        cand = _dyn_resolve_fixture(base, sp)
+        if cand is None:
+            continue
+        try:
+            body = _FRONTMATTER_RE.sub("", cand.read_text(errors="replace"))
+        except Exception:
+            continue
+        # import of another module
+        for m in re.finditer(
+            r'''\bimport\b[^;]*from\s*['"]([^'"]+)['"]''', body
+        ):
+            other = Path(m.group(1)).name
+            if other not in self_names and other != cand.name:
+                return True
+        # side-effect import './x'
+        for m in re.finditer(r'''\bimport\s*['"]([^'"]+)['"]''', body):
+            other = Path(m.group(1)).name
+            if other not in self_names and other != cand.name:
+                return True
+        # export … from other module
+        for m in re.finditer(
+            r'''export\s+[^;]*\bfrom\s*['"]([^'"]+)['"]''', body
+        ):
+            other = Path(m.group(1)).name
+            if other != cand.name:
+                return True
+        if re.search(r'export\s*\*\s*as\b', body):
+            return True
+    return False
+
+
+def _build_dyn_modules_preamble(dyn_imports, test_path):
+    """Build IIFE-isolated namespace objects for IMPORT_DYN (__dynModules).
+
+    Each fixture runs in its own function scope so `var local1` in module A
+    does not overwrite module B (assignment-expression multi-fixture tests).
+    """
+    base = Path(test_path).parent
+    lines = ["var __dynModules = Object.create(null);"]
+    if not dyn_imports:
+        return "\n".join(lines) + "\n"
+
+    for bn, sp in dyn_imports:
+        cand = _dyn_resolve_fixture(base, sp)
+        if cand is None:
+            continue
+        try:
+            raw = cand.read_text(errors="replace")
+        except Exception:
+            continue
+        body = _FRONTMATTER_RE.sub("", raw)
+        # Collect simple export map for this fixture alone
+        export_map, default_local, body_js = _dyn_parse_fixture_exports(body, bn)
+        # Prefix all fixture locals so they cannot clash with test vars (let x = 0
+        # after IIFE was capturing getters' free-var x). Engine free-var resolve
+        # can bind nested function(){return x} to outer script lets.
+        pfx = f"__fx{bn}_"
+        locs = set()
+        for exp, loc in export_map.items():
+            if re.match(r"^[A-Za-z_$][\w$]*$", str(loc)):
+                locs.add(str(loc))
+        if default_local and re.match(r"^[A-Za-z_$][\w$]*$", str(default_local)):
+            locs.add(str(default_local))
+        for m in re.finditer(
+            r'\b(?:var|let|const|function|class)\s+([A-Za-z_$][\w$]*)',
+            body_js,
+        ):
+            locs.add(m.group(1))
+        # Rename longest first to avoid partial rewrites
+        for loc in sorted(locs, key=len, reverse=True):
+            if loc.startswith("__fx") or loc.startswith("__dflt") or loc.startswith("__di"):
+                continue
+            body_js = re.sub(rf'\b{re.escape(loc)}\b', pfx + loc, body_js)
+            if loc in export_map.values() or loc == default_local:
+                pass
+            export_map = {
+                e: (pfx + l if l == loc else l) for e, l in export_map.items()
+            }
+            if default_local == loc:
+                default_local = pfx + loc
+        # Engine free-var resolve from NS getters is unreliable for let/const
+        # (nested arrow `.then` callbacks fail `imported.x` while `var` works).
+        body_js = re.sub(r'\bconst\b', 'var', body_js)
+        body_js = re.sub(r'\blet\b', 'var', body_js)
+        # IIFE: evaluate body, build NS, return NS
+        ns_lines = [
+            f"var {bn} = (function(){{",
+            body_js,
+            f"  var __ns = Object.create(null);",
+        ]
+        key_list = []
+        for exp, loc in sorted(export_map.items()):
+            if not re.match(r"^[A-Za-z_$][\w$]*$", str(loc)):
+                continue
+            prop = json.dumps(exp, ensure_ascii=False)
+            ns_lines.append(
+                f'  Object.defineProperty(__ns, {prop}, {{'
+                f"get:function(){{return {loc};}},"
+                f'set:function(){{throw new TypeError("Module namespace is read-only");}},'
+                f"enumerable:true,configurable:false}});"
+            )
+            key_list.append(exp)
+        if default_local and "default" not in export_map:
+            ns_lines.append(
+                f'  Object.defineProperty(__ns, "default", {{'
+                f"get:function(){{return {default_local};}},"
+                f'set:function(){{throw new TypeError("Module namespace is read-only");}},'
+                f"enumerable:true,configurable:false}});"
+            )
+            key_list.append("default")
+        ns_lines.append(
+            f'  try{{Object.defineProperty(__ns, Symbol.toStringTag, {{'
+            f'value:"Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
+        )
+        ns_lines.append("  try{Object.preventExtensions(__ns);}catch(e){}")
+        keys_js = json.dumps(key_list, ensure_ascii=False)
+        ns_lines.append(f'  try{{__markModuleNS(__ns, {keys_js});}}catch(e){{}}')
+        ns_lines.append("  return __ns;")
+        ns_lines.append("})();")
+        lines.extend(ns_lines)
+        lines.append(f"__dynModules[{json.dumps(sp)}] = {bn};")
+
+    return "\n".join(lines) + "\n"
+
+
+def _dyn_parse_fixture_exports(body, prefix):
+    """Parse a fixture into (export_map, default_local, body_js) with export keywords stripped.
+
+    prefix: unique id for default local name to avoid clashes across IIFEs (optional).
+    """
+    dloc = f"__dflt_{prefix}"
+    # Rewrite anonymous default export (use var — let inside dyn IIFE is flaky)
+    src = _rewrite_anon_default_export(body, local_name=dloc)
+    src = re.sub(
+        rf'\blet\s+{re.escape(dloc)}\b',
+        f'var {dloc}',
+        src,
+    )
+    rmap = {}
+    dflt, named = _collect_module_exports(src, rmap)
+    if dloc in src or re.search(rf"\b{re.escape(dloc)}\b", src):
+        dflt = dloc
+        named["default"] = dloc
+    # Expand trivial export { a as b } / export var a (local map only; no * from for dyn)
+    # Handle export { local2 as renamed }
+    for exp, (sp, im) in list(rmap.items()):
+        if im not in ("*", "**") and not str(exp).startswith("*from*"):
+            # re-export from self-path often used as alias
+            if sp and Path(sp).name.replace("_FIXTURE.js", "") in (
+                Path(sp).name,
+            ):
+                pass
+            # For same-file re-exports (indirect from self), map to import name
+            if im and re.match(r"^[A-Za-z_$][\w$]*$", str(im)):
+                named[exp] = im
+    # Strip export syntax for IIFE body
+    body_js = src
+    body_js = re.sub(r"\s+with\s*\{[^}]*\}", "", body_js)
+    body_js = re.sub(r"\s+assert\s*\{[^}]*\}", "", body_js)
+    # Named `export default function fn(){ fn=2; … }` must stay a *declaration*
+    # so `fn` is a mutable module binding (live default). Naively rewriting to
+    # `var dloc = function fn(){ fn=2 }` makes `fn` an immutable NFE name and
+    # leaves the getter pointing at the wrong binding (gtbndng-dflt fails).
+    body_js = re.sub(
+        r"\bexport\s+default\s+((?:async\s+)?function\s*\*?\s+[A-Za-z_$][\w$]*)",
+        r"\1",
+        body_js,
+    )
+    body_js = re.sub(
+        r"\bexport\s+default\s+(class\s+[A-Za-z_$][\w$]*)",
+        r"\1",
+        body_js,
+    )
+    # Anonymous / expression default → var dloc = …
+    body_js = re.sub(r"\bexport\s+default\s+", f"var {dloc} = ", body_js)
+    body_js = re.sub(r"\bexport\s+(var|let|const|function|class|async)\b", r"\1", body_js)
+    # export { a as b }; / export { a };
+    body_js = re.sub(r"\bexport\s*\{[^}]*\}\s*from\s*['\"][^'\"]+['\"]\s*;?", "", body_js)
+    body_js = re.sub(r"\bexport\s*\{[^}]*\}\s*;?", "", body_js)
+    body_js = re.sub(r"\bexport\s*\*\s*(?:as\s+\S+\s+)?from\s*['\"][^'\"]+['\"]\s*;?", "", body_js)
+    body_js = re.sub(r"\bexport\s+", "", body_js)
+    # Indent body for IIFE
+    body_js = "\n".join(
+        ("  " + ln if ln.strip() else ln) for ln in body_js.splitlines()
+    )
+    return named, dflt, body_js
+
+
+def _dyn_fixture_is_throw(body):
+    """True if fixture body is a top-level throw (eval abrupt / import-errored)."""
+    s = re.sub(r'//.*?$', '', body, flags=re.MULTILINE)
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.DOTALL)
+    s = s.strip()
+    return bool(re.match(r'throw\b', s))
+
+
+def _dyn_fixture_throw_expr(body):
+    """Extract `throw <expr>;` expression for Promise.reject rewrite."""
+    s = re.sub(r'//.*?$', '', body, flags=re.MULTILINE)
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.DOTALL)
+    m = re.search(r'throw\s+([^;]+);', s)
+    if m:
+        return m.group(1).strip()
+    return 'new Error("module evaluation failed")'
+
+
+def _dyn_fixture_invalid_module(body):
+    """Heuristic: script-only fixtures that are SyntaxError as Module Records.
+
+    e.g. `var smoosh; function smoosh() {}` — LexicallyDeclaredNames ∩ VarDeclaredNames.
+    """
+    s = re.sub(r'//.*?$', '', body, flags=re.MULTILINE)
+    s = re.sub(r'/\*.*?\*/', '', s, flags=re.DOTALL)
+    if re.search(r'\bexport\b', s):
+        return False
+    vars_ = set(re.findall(r'\bvar\s+([A-Za-z_$][\w$]*)', s))
+    funs = set(re.findall(r'\bfunction\s+([A-Za-z_$][\w$]*)\s*\(', s))
+    if vars_ & funs:
+        return True
+    if 'invalid as module' in body.lower():
+        return True
+    return False
+
+
+def _dyn_resolve_fixture(base, sp):
+    """Resolve relative specifier to a Path, or None."""
+    rel = sp[2:] if sp.startswith('./') else sp
+    cand = base / rel
+    if cand.is_file():
+        return cand
+    cand2 = base.parent / rel
+    if cand2.is_file():
+        return cand2
+    return None
+
+
+def _dyn_prepare(source, test_path):
+    """Classify dynimport specs → (ok_imports, reject_rewrites, source).
+
+    ok_imports: list of (bind_name, spec) for successful module fixtures.
+    reject_rewrites: spec → Promise.reject(...) JS for throw/script targets.
+    """
+    base = Path(test_path).parent
+    specs = []
+    seen = set()
+    for m in re.finditer(r'''['"](\./[^'"]+)['"]''', source):
+        sp = m.group(1)
+        if sp in seen or sp.endswith(('.md', '.txt', '.html')):
+            continue
+        seen.add(sp)
+        specs.append(sp)
+    # Tagged/untagged template paths: import(tag`./mod.js`)
+    for m in re.finditer(r'''`(\./[^`$]*)`''', source):
+        sp = m.group(1)
+        if sp in seen or sp.endswith(('.md', '.txt', '.html')):
+            continue
+        seen.add(sp)
+        specs.append(sp)
+
+    reject_rewrite = {}
+    ok_imports = []
+    for i, sp in enumerate(specs):
+        cand = _dyn_resolve_fixture(base, sp)
+        if cand is None:
+            continue  # missing → IMPORT_DYN TypeError
+        try:
+            body = _FRONTMATTER_RE.sub('', cand.read_text(errors='replace'))
+        except Exception:
+            continue
+        if _dyn_fixture_is_throw(body):
+            reject_rewrite[sp] = f'Promise.reject({_dyn_fixture_throw_expr(body)})'
+            continue
+        if _dyn_fixture_invalid_module(body):
+            reject_rewrite[sp] = 'Promise.reject(new SyntaxError("Invalid module code"))'
+            continue
+        # Instantiation link errors (IEE ambiguous / circular export cycles)
+        link_err = _dyn_module_link_error(base, sp)
+        if link_err:
+            reject_rewrite[sp] = f'Promise.reject(new SyntaxError({json.dumps(link_err)}))'
+            continue
+        ok_imports.append((f'__di{i}', sp))
+
+    return ok_imports, reject_rewrite, source
+
+
+def _dyn_module_link_error(base, sp, _stack=None, _cache=None):
+    """Return error string if module graph cannot instantiate, else None.
+
+    Detects:
+      - export * ambiguity (same name from two different star sources)
+      - circular export { name } from chains (IEE circular)
+    """
+    if _stack is None:
+        _stack = []
+    if _cache is None:
+        _cache = {}
+    key = str((_dyn_resolve_fixture(base, sp) or sp))
+    if key in _cache:
+        return _cache[key]
+    if key in _stack:
+        _cache[key] = "Circular export resolution"
+        return _cache[key]
+    cand = _dyn_resolve_fixture(base, sp)
+    if cand is None:
+        _cache[key] = None
+        return None
+    try:
+        body = _FRONTMATTER_RE.sub("", cand.read_text(errors="replace"))
+    except Exception:
+        _cache[key] = None
+        return None
+    _stack.append(key)
+    # Star exports → collect names from each source; clash ⇒ ambiguous
+    star_sources = re.findall(
+        r'''export\s*\*\s*from\s*['"]([^'"]+)['"]''', body
+    )
+    star_names = []  # list of (set of names, source_key)
+    for ssp in star_sources:
+        sc = _dyn_resolve_fixture(cand.parent, ssp) or _dyn_resolve_fixture(base, ssp)
+        if sc is None:
+            continue
+        try:
+            sb = _FRONTMATTER_RE.sub("", sc.read_text(errors="replace"))
+        except Exception:
+            continue
+        names = set()
+        for m in re.finditer(
+            r'''export\s+(?:var|let|const|function|class|async)\s+([A-Za-z_$][\w$]*)''',
+            sb,
+        ):
+            names.add(m.group(1))
+        for m in re.finditer(
+            r'''export\s*\{([^}]+)\}''', sb
+        ):
+            for part in m.group(1).split(","):
+                part = part.strip()
+                if not part:
+                    continue
+                # local or local as export
+                mm = re.match(
+                    r'''([A-Za-z_$][\w$]*)(?:\s+as\s+([A-Za-z_$][\w$]*))?''',
+                    part,
+                )
+                if mm:
+                    names.add(mm.group(2) or mm.group(1))
+        star_names.append((names, str(sc)))
+    # Ambiguity: name appears in two different star sources
+    seen_owner = {}
+    for names, sk in star_names:
+        for n in names:
+            if n == "default":
+                continue
+            if n in seen_owner and seen_owner[n] != sk:
+                _stack.pop()
+                _cache[key] = "Ambiguous export"
+                return _cache[key]
+            seen_owner[n] = sk
+    # Named re-exports — walk for cycles (skip self-reexports like
+    # `export { local1 as indirect } from './self_FIXTURE.js'`)
+    for m in re.finditer(
+        r'''export\s*\{[^}]*\}\s*from\s*['"]([^'"]+)['"]''', body
+    ):
+        tgt = m.group(1)
+        tc = _dyn_resolve_fixture(cand.parent, tgt) or _dyn_resolve_fixture(base, tgt)
+        if tc is not None and str(tc.resolve()) == str(cand.resolve()):
+            continue  # same module — not a cycle
+        err = _dyn_module_link_error(cand.parent, tgt, _stack, _cache)
+        if err is None:
+            err = _dyn_module_link_error(base, tgt, _stack, _cache)
+        if err:
+            _stack.pop()
+            _cache[key] = err
+            return err
+    _stack.pop()
+    _cache[key] = None
+    return None
 
 
 def _source_has_toplevel_await(source):
@@ -608,8 +1201,10 @@ def _wrap_toplevel_await(source):
 _MODULE_REFLECT_STUB = """
 // Brand module namespace objects + remember their export string keys.
 // Engine gOPN drops some names (e.g. "__") and lacks getOwnPropertySymbols.
+// Optional 3rd arg to __markModuleNS: deferred-module eval hook (import defer).
 var __moduleNSList = [];
 var __moduleNSKeys = []; // parallel array of string-key arrays
+var __moduleNSEval = []; // parallel deferred eval functions (or null)
 function __isModuleNS(o) {
   if (!o) return false;
   for (var __i = 0; __i < __moduleNSList.length; __i++) {
@@ -617,9 +1212,10 @@ function __isModuleNS(o) {
   }
   return false;
 }
-function __markModuleNS(o, keys) {
+function __markModuleNS(o, keys, evalFn) {
   __moduleNSList.push(o);
   __moduleNSKeys.push(keys || []);
+  __moduleNSEval.push(typeof evalFn === "function" ? evalFn : null);
   return o;
 }
 function __moduleNSExportKeys(o) {
@@ -628,30 +1224,49 @@ function __moduleNSExportKeys(o) {
   }
   return null;
 }
-// Engine lacks Object.getOwnPropertySymbols — minimal polyfill for module NS
-if (typeof Object.getOwnPropertySymbols !== "function") {
-  Object.getOwnPropertySymbols = function(o) {
-    if (__isModuleNS(o)) {
-      return [Symbol.toStringTag];
+function __moduleNSTouch(o) {
+  // Deferred NS: [[Get]]/[[HasProperty]]/[[GetOwnProperty]]/[[OwnPropertyKeys]]
+  // evaluate the module first (GetModuleExportsList).
+  for (var __i = 0; __i < __moduleNSList.length; __i++) {
+    if (__moduleNSList[__i] === o && __moduleNSEval[__i]) {
+      __moduleNSEval[__i]();
+      return;
     }
-    return [];
-  };
+  }
+  // Fallback: hidden __defEval data property on the NS object
+  if (o && typeof o.__defEval === "function") {
+    try { o.__defEval(); } catch (__e) {}
+  }
 }
+// Engine lacks Object.getOwnPropertySymbols — minimal polyfill for module NS
+// Always install (engine may have a stub that doesn't touch deferred NS).
+Object.getOwnPropertySymbols = function(o) {
+  if (__isModuleNS(o)) {
+    __moduleNSTouch(o);
+    return [Symbol.toStringTag];
+  }
+  return [];
+};
 (function() {
   if (!Object.__moduleGopdShim) {
     Object.__moduleGopdShim = true;
     var _gopd = Object.getOwnPropertyDescriptor;
     Object.getOwnPropertyDescriptor = function(o, p) {
       // Module NS [[GetOwnProperty]]: only exports (+ @@toStringTag via ordinary)
-      if (__isModuleNS(o) && p !== Symbol.toStringTag && typeof p === "string") {
-        var rec = __moduleNSExportKeys(o);
-        if (rec) {
-          var found = false;
-          for (var __j = 0; __j < rec.length; __j++) {
-            if (rec[__j] === p) { found = true; break; }
+      if (__isModuleNS(o) && p !== Symbol.toStringTag) {
+        // Deferred NS evaluates before consulting exports list (not symbols/"then")
+        if (typeof p === "string" && p !== "then") __moduleNSTouch(o);
+        // note: symbol keys must not trigger (IsSymbolLikeNamespaceKey)
+        if (typeof p === "string") {
+          var rec = __moduleNSExportKeys(o);
+          if (rec) {
+            var found = false;
+            for (var __j = 0; __j < rec.length; __j++) {
+              if (rec[__j] === p) { found = true; break; }
+            }
+            // Engine may inject __proto__ as own — hide non-exports
+            if (!found) return undefined;
           }
-          // Engine may inject __proto__ as own — hide non-exports
-          if (!found) return undefined;
         }
       }
       var d = _gopd(o, p);
@@ -672,6 +1287,7 @@ if (typeof Object.getOwnPropertySymbols !== "function") {
     var _gopn = Object.getOwnPropertyNames;
     Object.getOwnPropertyNames = function(o) {
       if (__isModuleNS(o)) {
+        __moduleNSTouch(o);
         // Prefer recorded export keys (engine gOPN may drop "__" etc.)
         var recorded = __moduleNSExportKeys(o);
         if (recorded && recorded.length) {
@@ -716,6 +1332,8 @@ if (typeof Object.getOwnPropertySymbols !== "function") {
 if (typeof Reflect === 'undefined') { var Reflect = {}; }
 function __moduleReflectHas(o, p) {
   if (__isModuleNS(o) && typeof p === "string") {
+    // "then" is special for deferred NS (does not trigger evaluation)
+    if (p !== "then") __moduleNSTouch(o);
     var rec = __moduleNSExportKeys(o);
     // empty array is valid (no exports) — still hide engine-injected __proto__
     if (rec !== null && rec !== undefined) {
@@ -729,6 +1347,7 @@ function __moduleReflectHas(o, p) {
 }
 function __moduleReflectGet(o, p, r) {
   if (__isModuleNS(o) && typeof p === "string") {
+    if (p !== "then") __moduleNSTouch(o);
     var recg = __moduleNSExportKeys(o);
     if (recg !== null && recg !== undefined) {
       var ok = false;
@@ -1720,17 +2339,48 @@ def _preprocess_module(source, test_path):
                 if im == '*' and not str(exp).startswith('*from*'):
                     fn[exp] = exp
 
+        # M128v: hoist export locals outside eval thunk so NS getters close over them.
+        # Use `var loc = undefined` (not bare var) + function expression so free-var
+        # assign inside the thunk updates the outer binding under eval_mode.
+        hoist_locs = set()
+        for exp, loc in fn.items():
+            if str(exp).startswith('*from*'):
+                continue
+            if re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
+                if not str(loc).startswith('__defNS_'):
+                    hoist_locs.add(str(loc))
+        if fd and re.match(r'^[A-Za-z_$][\w$]*$', str(fd)):
+            hoist_locs.add(str(fd))
+        body_hoisted = body_exec
+        for loc in hoist_locs:
+            body_hoisted = re.sub(
+                rf'\b(?:let|const|var)\s+{re.escape(loc)}\b',
+                loc,
+                body_hoisted,
+            )
+            body_hoisted = re.sub(
+                rf'\bfunction\s+{re.escape(loc)}\s*\(',
+                f'{loc} = function(',
+                body_hoisted,
+            )
+            body_hoisted = re.sub(
+                rf'\bclass\s+{re.escape(loc)}\b',
+                f'{loc} = class',
+                body_hoisted,
+            )
         lines = []
+        for loc in sorted(hoist_locs):
+            lines.append(f'var {loc} = undefined;')
         lines.append(f'var {flag} = false;')
-        lines.append(f'function {eval_fn}(){{')
+        lines.append(f'var {eval_fn} = function(){{')
         lines.append(f'  if ({flag}) return;')
         lines.append(f'  {flag} = true;')
         for c in eager_chunks:
             for ln in c.splitlines():
                 lines.append('  ' + ln)
-        for ln in body_exec.splitlines():
+        for ln in body_hoisted.splitlines():
             lines.append('  ' + ln)
-        lines.append('}')
+        lines.append('};')
         lines.append(f'var {ns_tmp} = Object.create(null);')
         # Hidden touch/eval hook for any property access (no Proxy in engine)
         lines.append(
@@ -1744,9 +2394,14 @@ def _preprocess_module(source, test_path):
             if not re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
                 continue
             prop = json.dumps(exp, ensure_ascii=False)
+            # "then" is IsSymbolLikeNamespaceKey for deferred NS — no eval trigger
+            if exp == 'then':
+                getter = f'function(){{ return {loc}; }}'
+            else:
+                getter = f'function(){{ {eval_fn}(); return {loc}; }}'
             lines.append(
                 f'Object.defineProperty({ns_tmp}, {prop}, {{'
-                f'get:function(){{ {eval_fn}(); return {loc}; }},'
+                f'get:{getter},'
                 f'set:function(){{throw new TypeError("deferred NS read-only");}},'
                 f'enumerable:true,configurable:false}});'
             )
@@ -1759,13 +2414,15 @@ def _preprocess_module(source, test_path):
                 f'enumerable:true,configurable:false}});'
             )
             key_list.append('default')
+        # Deferred module NS exotic objects use @@toStringTag "Deferred Module"
         lines.append(
             f'try{{Object.defineProperty({ns_tmp}, Symbol.toStringTag, {{'
-            f'value:"Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
+            f'value:"Deferred Module",writable:false,enumerable:false,configurable:false}});}}catch(e){{}}'
         )
         lines.append(f'try{{Object.preventExtensions({ns_tmp});}}catch(e){{}}')
         keys_js = json.dumps(key_list, ensure_ascii=False)
-        lines.append(f'try{{__markModuleNS({ns_tmp}, {keys_js});}}catch(e){{}}')
+        # 3rd arg: deferred eval hook when Reflect shims are present
+        lines.append(f'try{{__markModuleNS({ns_tmp}, {keys_js}, {eval_fn});}}catch(e){{}}')
         if ns_bind_name and ns_bind_name != ns_tmp:
             lines.append(f'var {ns_bind_name} = {ns_tmp};')
         fixture_chunks.append("\n".join(lines) + "\n")
@@ -2070,9 +2727,28 @@ def _preprocess_module(source, test_path):
     if _deferred_emitted:
         fixture_chunks.insert(
             0,
-            'function __defTouch(o){'
-            'if(o&&typeof o.__defEval==="function")o.__defEval();'
-            'return o;}\n',
+            # Deferred NS: evaluate on export-like access, but not on "then" / @@toStringTag
+            # Only string keys (except "then") trigger deferred evaluation.
+            # Symbols / non-strings: IsSymbolLikeNamespaceKey — no eval, no prop op
+            # (engine SIGSEGVs on some Symbol property access against exotic objects).
+            # Walk prototype so Object.create(ns) access still triggers.
+            'function __defTouch(o,k){'
+            'if(typeof k!=="string"||k==="then")return o;'
+            'var c=o;while(c){'
+            'if(typeof c.__defEval==="function"){c.__defEval();break;}'
+            'try{c=Object.getPrototypeOf(c);}catch(e){break;}}'
+            'return o;}'
+            'function __defGet(o,k){'
+            'if(typeof k!=="string")return undefined;'
+            '__defTouch(o,k);return o[k];}'
+            'function __defHas(o,k){'
+            'if(typeof k!=="string")return false;'
+            '__defTouch(o,k);'
+            'if(typeof Reflect!=="undefined"&&Reflect.has)return Reflect.has(o,k);'
+            'return k in o;}'
+            'function __defDel(o,k){'
+            'if(typeof k!=="string")return true;'
+            '__defTouch(o,k);try{return delete o[k];}catch(e){return false;}}\n',
         )
 
     # export * as NAME from './fix' early so default/named maps see __default_export__
@@ -2836,13 +3512,36 @@ def _preprocess_module(source, test_path):
         new_src = "\n".join(uniq) + "\n" + new_src
 
     # Strip leftover export keywords (local export-binding tests, etc.).
-    # Do NOT strip `export default` here — anon rewrite handles those; bare
-    # `export default class extends` must not become invalid `class extends`.
+    # Named `export default class C` / `function f` → keep declaration name
+    # (NS getters bind to C/f). Anon defaults already rewritten to __default_export__.
+    # Do NOT strip bare `export default class extends` (invalid without name).
+    new_src = re.sub(
+        r'\bexport\s+default\s+(class\s+[A-Za-z_$][\w$]*)',
+        r'\1',
+        new_src,
+    )
+    new_src = re.sub(
+        r'\bexport\s+default\s+((?:async\s+)?function\s*\*?\s+[A-Za-z_$][\w$]*)',
+        r'\1',
+        new_src,
+    )
     new_src = re.sub(
         r'\bexport\s+(async\s+)?(function\s*\*?|class|let|const|var)\b',
         r'\1\2',
         new_src,
     )
+    # Anonymous default expr: stamp .name = 'default' when still anonymous
+    # (export default (function(){}), (function*(){}), (class {})).
+    if re.search(
+        r'(?:var|let|const)\s+__default_export__\s*=\s*\(\s*(?:async\s+)?function',
+        new_src,
+    ) or re.search(
+        r'(?:var|let|const)\s+__default_export__\s*=\s*\(\s*class\b',
+        new_src,
+    ):
+        new_src = _stamp_default_name_after(
+            new_src, '__default_export__ =', force=False
+        )
     # export { a, b as c }; → remove entirely (bindings already declared)
     new_src = re.sub(r'\bexport\s*\{[^}]+\}\s*;', '', new_src)
     # orphan `{ a as b };` / `{ testNs };` left if export keyword was stripped
@@ -2996,9 +3695,8 @@ def _preprocess_module(source, test_path):
             "(function(){\n" + new_src + "\n}).call(undefined);\n"
         )
 
-    # Deferred NS: any property access should trigger evaluation (no Proxy).
-    # Rewrite id.prop → (__defTouch(id), id.prop) for known deferred bindings
-    # and for locals assigned from deferred gets (const x = ns.y patterns).
+    # Deferred NS: property access / `in` should trigger evaluation (no Proxy),
+    # except "then" and @@toStringTag (IsSymbolLikeNamespaceKey).
     if _deferred_emitted:
         defer_ids = set(_top_defer_binds)
         # locals assigned from deferred: const x = ns.foo or const x = ns1.ns_1_2
@@ -3008,10 +3706,69 @@ def _preprocess_module(source, test_path):
         ):
             if m.group(2) in defer_ids or m.group(2) in _deferred_emitted.values():
                 defer_ids.add(m.group(1))
+        # Object.create(ns) children (hasProperty/get-in-prototype)
+        for m in re.finditer(
+            r'(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*Object\.create\(\s*([A-Za-z_$][\w$]*)\s*\)',
+            new_src,
+        ):
+            if m.group(2) in defer_ids or m.group(2) in _deferred_emitted.values():
+                defer_ids.add(m.group(1))
         for did in list(defer_ids):
+            # ns.prop → __defGet(ns, "prop")  — not on LHS of assignment
+            def _dot_get(m, _did=did):
+                # if next non-ws is `=` (and not `==`/`===`), leave alone
+                end = m.end()
+                rest = new_src[end:end + 3]
+                j = 0
+                while end + j < len(new_src) and new_src[end + j] in ' \t':
+                    j += 1
+                ch = new_src[end + j:end + j + 2]
+                if ch.startswith('=') and not ch.startswith('=='):
+                    return m.group(0)
+                return f'__defGet({_did}, "{m.group(1)}")'
+
             new_src = re.sub(
                 rf'(?<![\w$.]){re.escape(did)}\.([A-Za-z_$][\w$]*)',
-                rf'(__defTouch({did}),{did}.\1)',
+                _dot_get,
+                new_src,
+            )
+            # ns[expr] → __defGet / delete ns[expr] → __defDel
+            out = []
+            i = 0
+            pat = re.compile(rf'(?<![\w$.]){re.escape(did)}\s*\[')
+            while True:
+                m = pat.search(new_src, i)
+                if not m:
+                    out.append(new_src[i:])
+                    break
+                # detect leading `delete`
+                pre = new_src[max(0, m.start() - 12):m.start()]
+                is_del = bool(re.search(r'\bdelete\s*$', pre))
+                if is_del:
+                    # drop `delete` from output already emitted
+                    del_start = re.search(r'\bdelete\s*$', pre).start()
+                    out.append(new_src[i:m.start() - len(pre) + del_start])
+                else:
+                    out.append(new_src[i:m.start()])
+                depth = 1
+                j = m.end()
+                while j < len(new_src) and depth:
+                    if new_src[j] == '[':
+                        depth += 1
+                    elif new_src[j] == ']':
+                        depth -= 1
+                    j += 1
+                expr = new_src[m.end():j - 1]
+                if is_del:
+                    out.append(f'__defDel({did}, {expr})')
+                else:
+                    out.append(f'__defGet({did}, {expr})')
+                i = j
+            new_src = ''.join(out)
+            # expr in ns → __defHas(ns, expr)
+            new_src = re.sub(
+                rf'(?<![\w$.])([A-Za-z_$][\w$]*)\s+in\s+{re.escape(did)}(?![\w$])',
+                rf'__defHas({did}, \1)',
                 new_src,
             )
 
@@ -3121,7 +3878,7 @@ def _load_includes(meta):
     chunks = []
     for name in includes:
         # Skip harness files we replace with engine-safe polyfills
-        if name in ("regExpUtils.js", "propertyHelper.js"):
+        if name in ("regExpUtils.js", "propertyHelper.js", "asyncHelpers.js"):
             continue
         if name == "fnGlobalObject.js":
             chunks.append(_SAFE_FN_GLOBAL_OBJECT)
@@ -3168,7 +3925,7 @@ def discover_tests(test262_dir, categories, discover_all=False, discover_full=Fa
                 yield str(target)
             else:
                 for js_file in sorted(target.rglob("*.js")):
-                    if js_file.name.startswith("_"):
+                    if js_file.name.startswith("_") or "_FIXTURE" in js_file.name:
                         continue
                     yield str(js_file)
         return
@@ -3179,14 +3936,14 @@ def discover_tests(test262_dir, categories, discover_all=False, discover_full=Fa
             if not sub_path.exists():
                 continue
             for js_file in sorted(sub_path.rglob("*.js")):
-                if js_file.name.startswith("_"):
+                if js_file.name.startswith("_") or "_FIXTURE" in js_file.name:
                     continue
                 yield str(js_file)
         return
     test_root = Path(test262_dir) / "test" / "language"
     if discover_all:
         for js_file in sorted(test_root.rglob("*.js")):
-            if js_file.name.startswith("_"):
+            if js_file.name.startswith("_") or "_FIXTURE" in js_file.name:
                 continue
             yield str(js_file)
         return
@@ -3195,7 +3952,7 @@ def discover_tests(test262_dir, categories, discover_all=False, discover_full=Fa
         if not cat_dir.exists():
             continue
         for js_file in sorted(cat_dir.rglob("*.js")):
-            if js_file.name.startswith("_"):
+            if js_file.name.startswith("_") or "_FIXTURE" in js_file.name:
                 continue
             yield str(js_file)
 

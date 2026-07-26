@@ -1295,6 +1295,18 @@ Function.JSVM_InstallBuiltins {
         JSVM__SetGlobal("this", glob_this)
         JSVM__SetGlobal("globalThis", glob_this)
 
+        // ES global immortals: re-mirror + non-configurable/non-writable attrs
+        // so CanDeclareGlobalFunction rejects eval("function NaN(){}").
+        nan_v = JSVM__GetGlobal("NaN")
+        inf_v = JSVM__GetGlobal("Infinity")
+        und_v = JSVM__GetGlobal("undefined")
+        JSRT_ObjSet(glob_this, "NaN", nan_v)
+        JSRT_ObjSet(glob_this, "Infinity", inf_v)
+        JSRT_ObjSet(glob_this, "undefined", und_v)
+        JSBridge__SetAttrBits(glob_this, "NaN", 0)
+        JSBridge__SetAttrBits(glob_this, "Infinity", 0)
+        JSBridge__SetAttrBits(glob_this, "undefined", 0)
+
         ReturnValue(1)
     }
 }
@@ -1319,18 +1331,50 @@ Function.JSVM__WrapInPromise {
         JSRT_ObjSet(p, "__class__", cls_s)
         JSRT_ObjSet(p, "__state__", JSRT_CreateNumber(1))
         JSRT_ObjSet(p, "__value__", save_val)
-        // Attach then/catch methods
-        JSRT__Push(p)
-        then_f = JSBridge__CreateNativeFunc(JSNativeID.PROMISE_THEN, "then", 2)
-        p = JSRT__Pop()
-        JSRT_FuncSetEnv(then_f, p)
-        JSRT_ObjSet(p, "then", then_f)
-        JSRT__Push(p)
-        catch_f = JSBridge__CreateNativeFunc(JSNativeID.PROMISE_CATCH, "catch", 1)
-        p = JSRT__Pop()
-        JSRT_FuncSetEnv(catch_f, p)
-        JSRT_ObjSet(p, "catch", catch_f)
+        // Prefer Promise.prototype methods; own only if no shared proto.
+        IfCondition EqualTo(JSRTState.promise_proto, 0) ThenBlock: {
+            JSRT__Push(p)
+            then_f = JSBridge__CreateNativeFunc(JSNativeID.PROMISE_THEN, "then", 2)
+            p = JSRT__Pop()
+            JSRT_FuncSetEnv(then_f, p)
+            JSRT_ObjSet(p, "then", then_f)
+            JSRT__Push(p)
+            catch_f = JSBridge__CreateNativeFunc(JSNativeID.PROMISE_CATCH, "catch", 1)
+            p = JSRT__Pop()
+            JSRT_FuncSetEnv(catch_f, p)
+            JSRT_ObjSet(p, "catch", catch_f)
+        }
         ReturnValue(p)
+    }
+}
+
+// M128ax: async function completion — PromiseResolve (adopt settled Promise).
+// Plain WrapInPromise always fulfilled, so `return Promise.reject(x)` became a
+// fulfilled Promise-of-Promise. Copy settled state into a *fresh* Promise so
+// ReclaimScope cannot free a frame-local promise returned by identity.
+Function.JSVM__AsyncReturnPromise {
+    Input: val: Address
+    Output: Address
+    Body: {
+        save_val = val
+        IfCondition EqualTo(JSRT_GetType(save_val), JSType.OBJECT) ThenBlock: {
+            p_st = JSRT_ObjGet(save_val, "__state__")
+            IfCondition EqualTo(JSRT_GetType(p_st), JSType.NUMBER) ThenBlock: {
+                sn = Float_ToInt(JSRT_GetPayload(p_st))
+                IfCondition EqualTo(sn, 1) ThenBlock: {
+                    p_val = JSRT_ObjGet(save_val, "__value__")
+                    ReturnValue(JSBridge__CreatePromise(1, p_val))
+                }
+                IfCondition EqualTo(sn, 2) ThenBlock: {
+                    p_val = JSRT_ObjGet(save_val, "__value__")
+                    ReturnValue(JSBridge__CreatePromise(2, p_val))
+                }
+                IfCondition EqualTo(sn, 0) ThenBlock: {
+                    ReturnValue(save_val)
+                }
+            }
+        }
+        ReturnValue(JSVM__WrapInPromise(save_val))
     }
 }
 
@@ -2506,7 +2550,9 @@ Function.JSVM__CallFunc {
             cf_bc_chk = JSRT_FuncGetBC(save_fv)
             IfCondition GreaterEqual(cf_bc_chk, 0) ThenBlock: {
                 cf_pcount = Dereference(Add(fdesc_cf, 8))
-                IfCondition EqualTo(BitwiseAnd(cf_pcount, 536870912), 0) ThenBlock: {
+                // Skip ToObject box for async (env 65) — always-strict ThisBinding
+            cf_fenv_bind = JSRT_FuncGetEnv(save_fv)
+            IfCondition And(EqualTo(BitwiseAnd(cf_pcount, 536870912), 0), NotEqual(cf_fenv_bind, 65)) ThenBlock: {
                     th_b = JSVM__GetGlobal("this")
                     tht_b = JSRT_GetType(th_b)
                     // null/undefined → globalThis
@@ -2745,6 +2791,15 @@ Function.JSVM__CallFunc {
         IfCondition NotEqual(BitwiseAnd(cf_params, 536870912), 0) ThenBlock: {
             JSVMState.is_strict = 1
         }
+        // M128: async functions via Function.prototype.call/apply (CallFunc path).
+        // CALL marks frames with -65 when FuncGetEnv==65 so RETURN wraps Promise.
+        // Without this, async fn.call(...) returns a bare value and .then fails.
+        // Async is always strict — keep primitive thisArg (no ToObject box).
+        cf_fenv = JSRT_FuncGetEnv(save_fv)
+        IfCondition EqualTo(cf_fenv, 65) ThenBlock: {
+            StoreValue(Add(faddr_cf, 40), -65)
+            JSVMState.is_strict = 1
+        }
 
         li = 0
         WhileLoop LessThan(li, cf_locals) {
@@ -2788,6 +2843,8 @@ Function.JSVM__CallFunc {
 
         JSVMState.pc = cf_bc
         JSVMState.halted = 0
+        // Nested CallFunc: ThrowValue must set exc_prop, not async-reject outer frame
+        JSVMCall.depth = Add(JSVMCall.depth, 1)
 
         done_n = 0
         WhileLoop EqualTo(done_n, 0) {
@@ -2798,6 +2855,9 @@ Function.JSVM__CallFunc {
                 done_n = 1
             }
             IfCondition EqualTo(JSVMState.halted, 1) ThenBlock: {
+                done_n = 1
+            }
+            IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: {
                 done_n = 1
             }
             IfCondition EqualTo(done_n, 0) ThenBlock: {
@@ -2811,8 +2871,16 @@ Function.JSVM__CallFunc {
             }
         }
 
+        JSVMCall.depth = Subtract(JSVMCall.depth, 1)
+        IfCondition LessThan(JSVMCall.depth, 0) ThenBlock: {
+            JSVMCall.depth = 0
+        }
+
         prop = 0
         IfCondition EqualTo(JSVMState.error, 1) ThenBlock: {
+            prop = 1
+        }
+        IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: {
             prop = 1
         }
         IfCondition LessThan(JSVMState.fp, entry_fp) ThenBlock: {
@@ -2864,6 +2932,10 @@ Function.JSVM__CallFunc {
         IfCondition GreaterThan(JSVMState.sp, entry_sp) ThenBlock: {
             cf_result = JSVM__StackPop()
         }
+        // Clear sticky exception from nested throws that CallFunc already consumed
+        JSVMCall.exc_prop = 0
+        JSVMCall.thrown_val = 0
+        JSVMState.exc_val = 0
         // M83b: ensure outer code restored if callee did not RETURN normally
         JSVM__LeaveFuncCode()
         JSVMState.halted = entry_halted
