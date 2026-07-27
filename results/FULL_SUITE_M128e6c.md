@@ -70,10 +70,18 @@ Class recovery from M128ba collapse is the dominant story.
 
 ---
 
-## Post-suite priorities
+## Post-suite grind (same session, after score)
 
-1. Close class gap 84.7% → ≥90% (still ~292 fails vs M128c).  
+| Gate | At suite (e6c) | After e6d–e6f |
+|------|---------------:|--------------:|
+| statements/class | 84.7% | **91.3%** (3958/4367) |
+| expressions/super | 69.1% | **74.5%** (70/94) |
+| statements/with | 69.1% | 69.1% (125/181) |
+
+**e6f fix:** init-path early `ReturnValue` skipped let/const TDZ clear → every top-level `let` read used THROW_TDZ.
+
+### Next priorities
+1. Re-full suite (expect language ≫ 82.7% with class restored).  
 2. for-await-of residual (−245 vs m127).  
-3. Ship e6d harness into main binaries (super getter this).  
-4. with residual / unscopables if high leverage.  
-5. Re-full when class ≥90% and language trending to 95%.
+3. with residual / unscopables.  
+4. Language toward 95%.
