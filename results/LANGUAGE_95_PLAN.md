@@ -2,20 +2,31 @@
 
 **Branch:** `gpu-45-may-baseline-restore`  
 **Baseline:** full test262 M127 (`results/test262_full_m127.json`)  
-**Date:** 2026-07-25  
+**Latest full suite:** M128e6c (`results/test262_full_m128e6c.json` / `FULL_SUITE_M128e6c.md`)  
+**Latest grind tip:** **M128e6q** (`results/M128e6q_PROGRESS.md`) — 2026-07-27  
 
-| Scope | Pass | Total | Pass% | Target |
-|-------|-----:|------:|------:|--------|
-| **Overall** | 28,457 | 49,723 | 57.2% | later |
-| **language** | **19,904** | **23,635** | **84.2%** | **95%** |
-| built-ins | 7,653 | 23,518 | 32.5% | after language |
-| annexB | 521 | 1,086 | 48.0% | after language core |
-| staging | 379 | 1,484 | 25.5% | last / opportunistic |
+| Scope | Pass | Total | Pass% | Target | Notes |
+|-------|-----:|------:|------:|--------|-------|
+| **Overall** | 27,650 | 49,723 | **55.6%** | later | full @ e6c (M127 was 57.2%) |
+| **language** | **19,552** | **23,635** | **82.7%** | **95%** | full @ e6c; M127 peak 84.2% |
+| built-ins | 7,418 | 23,518 | 31.5% | after language | full @ e6c |
+| annexB | 419 | 1,086 | 38.6% | after language core | |
+| staging | 261 | 1,484 | 17.6% | last / opportunistic | |
+
+### Goal status (95%+ full language test262)
+
+| Gate | Need | Current | Status |
+|------|-----:|--------:|--------|
+| **G1 language ≥90%** | 21,272 | 19,552 | **open** (~+1,720) |
+| **G2 language ≥95%** | 22,454 | 19,552 | **open** (~**+2,902**) |
+| **G3 built-ins bulk** | — | — | **blocked on G2** |
 
 ### Math to language 95%
 - 23,635 × 0.95 → **need 22,454 passes**
-- Current 19,904 → **need +2,550 language passes**
-- 90% intermediate: +1,368 (useful checkpoint)
+- Full suite language @ e6c: 19,552 → **need +2,902**
+- M127 peak 19,904 → +2,550 (historical best full language)
+- 90% intermediate: +1,720 from e6c
+- DEFAULT_CATEGORIES slice @ e6q: **6,532/7,689 (85.0%)** — grind signal only
 
 Largest fail masses (language):
 
@@ -76,7 +87,8 @@ Already landed (M112–M127); **do not regress**:
 ---
 
 ## Phase L2 — Dynamic import → ≥70% then ≥90%  
-**Fails: 628 — largest single language lever (~+500 if 90%)**
+**Status M128e6p: 926/941 (98.4%) — EXIT MET (>>90%)**  
+**Residual ~15:** with-related, attrs 2nd-param edges, defer behavioral, NS edges.
 
 Depends on: modules, Promise (thenables), job queue, optional import attributes.
 
@@ -131,30 +143,36 @@ Depends on: OOP, heritage, private methods (already ~92% private), constructors.
 ---
 
 ## Phase L5 — Generators / yield / async iteration residual  
-**Fails: yield ~33, async-generator residual, for-await residual ~49**
+**Status M128e6p: for-await-of 1234/1234 (100%) — EXIT MET**  
+Residual: yield* / async-gen pockets outside for-await category (track via full language).
 
 Depends on: iterators, Promise, yield* throw/return protocol.
 
-| Order | Work | Est. +pass |
-|------:|------|-----------:|
-| 5.1 | `yield*` throw/return protocol | +25–35 |
-| 5.2 | async generator residual | +20–30 |
-| 5.3 | for-await-of residual | +20–30 |
+| Order | Work | Status |
+|------:|------|--------|
+| 5.1 | `yield*` throw/return protocol | partial (e6n GenReturn) |
+| 5.2 | async generator residual | partial (e6o/e6p Promise jobs) |
+| 5.3 | for-await-of residual | **DONE 100%** |
 
 ---
 
 ## Phase L6 — `with` / unscopables  
-**Fails: 162 @ 10.5%**
+**Status M128e6q: 132/181 (72.9%)** — was 126/181 e6p, 11% at M127 plan time  
+**Residual 49:** Proxy env (~10), S12.10 clusters, scope-var, cptn-abrupt, has-property-err, TypedArray proto; get-err flaky in batch
 
 Depends on: env records, `@@unscopables`, object HasBinding.
 
-| Order | Work | Est. +pass |
-|------:|------|-----------:|
-| 6.1 | `with` object env + mutable binding | +80–100 |
-| 6.2 | `@@unscopables` | +40–50 |
-| 6.3 | strict mode forbids `with` (if any negative tests) | +5 |
+| Order | Work | Status |
+|------:|------|--------|
+| 6.1 | `with` object env + mutable binding | largely done (GET_WITH/SET_WITH) |
+| 6.2 | `@@unscopables` Get + accessors + rethrow | **e6q done** (ObjGetAcc) |
+| 6.3 | delete-in-get-unscopables + strict RE | **e6q done** |
+| 6.4 | IDENT ++/-- single HasBinding | **e6q done** (unscopables-inc-dec) |
+| 6.5 | eval with completion (cptn-nrml) | **e6q done** |
+| 6.6 | Proxy has / env residual | open (needs Proxy) |
+| 6.7 | S12.10 / scope-var / cptn-abrupt | open |
 
-**High ROI for language %** once L2–L3 done.
+**High ROI remaining is limited** without Proxy; prefer L4/L7 for language % next.
 
 ---
 
@@ -304,19 +322,20 @@ Only after language ≥95% and B1–B3:
 
 ---
 
-## Immediate next actions (start here)
+## Immediate next actions (start here) — post M128e6q
 
-1. **L1** — grind remaining `language/import` + module residual (+import.meta).
-2. **L2** — design/implement real **`import()`** (Promise + module NS); this is the language-95 bottleneck.
-3. **L3** — direct/indirect **eval** scope.
-4. Re-score full `language` after L2+L3; then L4 class/super or L6 `with` by remaining fail mass.
+1. **L7** — assignment / compound-assignment residual (DEFAULT slice ~75 + ~67 fails).
+2. **L4** — class residual rescore (stmt ~91% / ~390 fails) + elements.
+3. **L6** — only cheap with residual (skip Proxy bulk until B1).
+4. Full **language** rescore → refresh G1/G2 distance in this doc.
+5. **Do not** start Temporal / TypedArray bulk until G2.
 
 ### Success criteria
-| Gate | Criterion |
-|------|-----------|
-| G1 | language ≥ **90%** (~21,272 pass) |
-| G2 | language ≥ **95%** (~22,454 pass) |
-| G3 | Only then open B1 Reflect/Proxy |
+| Gate | Criterion | Status 2026-07-27 |
+|------|-----------|-------------------|
+| G1 | language ≥ **90%** (~21,272 pass) | open (~82.7% @ e6c) |
+| G2 | language ≥ **95%** (~22,454 pass) | open (~**+2.9k** passes) |
+| G3 | Only then open B1 Reflect/Proxy | blocked |
 
 ---
 
@@ -417,3 +436,11 @@ Only after language ≥95% and B1–B3:
   Results: `results/test262_eval_m128t.json`. ~15 residual (4 arrow-args-named-param,
   with, import/export, realm, heritage, lower-lex, direct global-env-rec-eval).
 - **Built-ins deferred** until language greener (user: eventually need work too).
+- M128e6j–e6p: free-var dual-bind, for-of var, no VAR_DECL double-init, THROW/CallFunc
+  isolation, GenReturn reject, GET_PROP rethrow, Promise microtasks, CoverToPattern
+  COMPUTED_PROP, for-await AWAIT nextValue.
+  **for-await-of 1234/1234 (100%)**; **dynimport 926/941 (98.4%)**.
+- **M128e6q:** `JSVM__ObjGetAcc`; GET_WITH/SET_WITH @@unscopables accessors + rethrow;
+  re-HasProperty after unscopables Get; IDENT ++/-- single Get; `cptn_prop` eval with
+  completion. **with 126→132/181 (72.9%)**; for-await held 100%.
+  Progress: `results/M128e6q_PROGRESS.md`.
