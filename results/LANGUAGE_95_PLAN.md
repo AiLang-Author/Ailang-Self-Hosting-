@@ -3,7 +3,8 @@
 **Branch:** `gpu-45-may-baseline-restore`  
 **Baseline:** full test262 M127 (`results/test262_full_m127.json`)  
 **Latest full suite:** M128e6c (`results/test262_full_m128e6c.json` / `FULL_SUITE_M128e6c.md`)  
-**Latest grind tip:** **M128e6q** (`results/M128e6q_PROGRESS.md`) — 2026-07-27  
+**Latest grind tip:** **M128e6t** (`results/M128e6t_PROGRESS.md`) — 2026-07-27  
+
 
 | Scope | Pass | Total | Pass% | Target | Notes |
 |-------|-----:|------:|------:|--------|-------|
