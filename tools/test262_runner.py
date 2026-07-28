@@ -213,6 +213,63 @@ function asyncTest(testFunc) {
   );
 }
 globalThis.asyncTest = asyncTest;
+// M128e6ai: always provide Reflect (Proxy with tests / set-mutable-binding)
+if (typeof Reflect === "undefined") { var Reflect = {}; }
+if (typeof Reflect.has !== "function") {
+  Reflect.has = function(o, p) { return p in o; };
+}
+if (typeof Reflect.get !== "function") {
+  Reflect.get = function(o, p, r) { return o[p]; };
+}
+// OrdinarySet with Receiver (Proxy gOPD/defineProperty traps fire on r)
+Reflect.set = function(target, p, v, receiver) {
+  if (arguments.length < 4) receiver = target;
+  try {
+    var desc = Object.getOwnPropertyDescriptor(target, p);
+    if (desc && Object.prototype.hasOwnProperty.call(desc, "value")) {
+      if (desc.writable === false) return false;
+      if (receiver !== target) {
+        var existing = Object.getOwnPropertyDescriptor(receiver, p);
+        if (existing === undefined) {
+          Object.defineProperty(receiver, p, {
+            value: v, writable: true, enumerable: true, configurable: true
+          });
+        } else {
+          if (existing.writable === false) return false;
+          Object.defineProperty(receiver, p, { value: v });
+        }
+        return true;
+      }
+      target[p] = v;
+      return true;
+    }
+    target[p] = v;
+    return true;
+  } catch (e) { return false; }
+};
+if (typeof Reflect.getOwnPropertyDescriptor !== "function") {
+  Reflect.getOwnPropertyDescriptor = function(o, p) {
+    return Object.getOwnPropertyDescriptor(o, p);
+  };
+}
+if (typeof Reflect.defineProperty !== "function") {
+  Reflect.defineProperty = function(o, p, d) {
+    try { Object.defineProperty(o, p, d); return true; } catch (e) { return false; }
+  };
+}
+globalThis.Reflect = Reflect;
+// Minimal TypedArray for with ObjectEnv tests (features: TypedArray)
+if (typeof Int32Array === "undefined") {
+  function Int32Array(n) {
+    var a = [];
+    var len = n | 0;
+    if (len < 0) len = 0;
+    a.length = len;
+    for (var i = 0; i < len; i++) a[i] = 0;
+    return a;
+  }
+  globalThis.Int32Array = Int32Array;
+}
 function __isSameValue(a, b) {
   if (a !== a && b !== b) return true; // NaN
   if (a === 0 && b === 0) return (1 / a) === (1 / b); // ±0
@@ -1373,10 +1430,28 @@ try {
 } catch (__e) {}
 Reflect.set = function(o, p, v, r) {
   if (__isModuleNS(o)) return false;
+  // M128e6ai: OrdinarySet with Receiver so Proxy gOPD/defineProperty fire
+  if (arguments.length < 4) r = o;
   try {
-    var old = o[p];
+    var desc = Object.getOwnPropertyDescriptor(o, p);
+    if (desc && Object.prototype.hasOwnProperty.call(desc, "value")) {
+      if (desc.writable === false) return false;
+      if (r !== o) {
+        var existing = Object.getOwnPropertyDescriptor(r, p);
+        if (existing === undefined) {
+          Object.defineProperty(r, p, {
+            value: v, writable: true, enumerable: true, configurable: true
+          });
+        } else {
+          if (existing.writable === false) return false;
+          Object.defineProperty(r, p, { value: v });
+        }
+        return true;
+      }
+      o[p] = v;
+      return true;
+    }
     o[p] = v;
-    if (__isModuleNS(o)) return false;
     return true;
   } catch (e) { return false; }
 };
