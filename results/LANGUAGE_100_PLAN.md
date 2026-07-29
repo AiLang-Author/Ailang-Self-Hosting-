@@ -146,3 +146,4 @@ global-code, function-code, operators, using (if required).
 | 2026-07-29 | class/elements e7 probe | 1328/1534 | partial free-var |
 | 2026-07-29 | M128e7 field_init free-var | *measuring* | in_field_init + CONSTRUCT abort |
 | 2026-07-29 | M128e7c private method !W | not-writable + set-access pass | PrivateSet method kind |
+| 2026-07-29 | M128e7d static ctor + PrivateFieldAdd | elements **93.4%** (+5) | static constructor(); double private field |
