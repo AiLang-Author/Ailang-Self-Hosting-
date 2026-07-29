@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29  
 **Branch:** `master`  
-**Tip:** **M128e7j** (class `.prototype` !W + static propname)  
+**Tip:** **M128e7k** (PrivateMethodOrAccessorAdd double-init)  
 **Full suite baseline:** M128e6ak — 60.1% overall, language **89.1%**
 
 ---
