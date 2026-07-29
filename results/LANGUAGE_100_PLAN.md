@@ -118,9 +118,9 @@ global-code, function-code, operators, using (if required).
 
 ## Current grind
 
-**Active:** L-B class/elements (field free-var + private residual)  
-**Next:** rescore elements after e7; private/static; then L-C subclass  
-**Commit series:** M128e7…  
+**Active:** L-B class/elements residual (private bulk ~122 fails)  
+**Next:** private methods/fields → L-C subclass/super → L-D eval-code  
+**Commit series:** M128e7, M128e7b…  
 
 ### Fail mass (e6ak full language)
 
