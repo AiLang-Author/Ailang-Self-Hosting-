@@ -54,14 +54,14 @@
 | L-D | eval-code | next |
 | L-E… | for-of, residual statements, long tail | later |
 
-### L-B residual clusters (~96 fails)
+### L-B residual clusters (~81 fails)
 
 1. Private brand / nested shadow / double-init methods  
 2. Private + direct eval visibility  
 3. Optional chain + private (`o?.c.#f`)  
 4. Non-extensible private **methods** (fields path green)  
 5. eval/supercall-in-field edges  
-6. syntax edges (field get/set ASI, prototype accessor)
+6. syntax edges (field get/set ASI) — prototype/constructor propname green
 
 ### Strategy
 
