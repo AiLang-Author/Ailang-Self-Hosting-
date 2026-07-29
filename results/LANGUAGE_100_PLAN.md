@@ -2,136 +2,76 @@
 
 **Date:** 2026-07-29  
 **Branch:** `master`  
-**Tip:** e6al (with 100%) + full suite M128e6ak baseline  
-**Active grind:** M128e7 class field_init free-var → elements residual  
+**Tip:** **M128e7e** (optional-chain continuation)  
+**Full suite baseline:** M128e6ak — 60.1% overall, language **89.1%**
 
 ---
 
-## Goals
+## Where things stand (backfill)
 
-| Gate | Target | Baseline (e6ak full) | Status |
-|------|--------|---------------------:|--------|
-| **G1 language ≥90%** | ≥90% | **~89.1%** | nearly |
-| **G2 language ≥95%** | ≥95% | ~89% | **active** |
-| **G3 language 100%** | 100% | ~2.5k fails | **campaign** |
-| **G4 built-ins bulk** | after G2/G3 | 33.8% | **blocked** |
+| Gate | Target | Status |
+|------|--------|--------|
+| **G1 language ≥90%** | ≥90% | nearly (89.1% e6ak full) |
+| **G2 language ≥95%** | ≥95% | **active** (~+1.4k passes) |
+| **G3 language 100%** | 100% | campaign |
+| **G4 built-ins bulk** | after G2 | **blocked** |
 
-### Math (language ~23.6k tests)
+### Done (keep green)
 
-| Target | Approx passes needed | From ~89% |
-|--------|---------------------:|-----------|
-| 95% | ~22.45k | **~+1.4k** |
-| 100% | all | **~+2.6k** |
+| Item | Score | Commit |
+|------|------:|--------|
+| statements/with | **181/181 (100%)** | e6al |
+| class/dstr | **1920/1920 (100%)** | pre-e7 |
+| Full suite overall | 60.1% | e6ak |
 
----
+### Class elements grind (L-B) — active
 
-## Strategy
+| Milestone | elements pass/fail | runner pass% |
+|-----------|-------------------:|-------------:|
+| pre-e7 base | 1326 / 127 (+72 t/o) | 91.3% |
+| **e7e tip** | **1351 / 95 (+8 t/o)** | **93.4%** |
 
-1. **Language only** until ≥95% (ideally 100% core); no Temporal/TypedArray bulk.
-2. **Dependency order** below; measure after every stage.
-3. **Slices:** class elements / dstr / subclass; regression: `statements/with` + dstr.
-4. **Prefer engine/Ailang** over runner shims.
-5. **Commit + push** when a cluster moves and regressions stay green.
+### Commits this campaign (master → github)
 
-### Regression watch (every stage)
+| Commit | Summary |
+|--------|---------|
+| e6al | with 100% |
+| e6ak | full suite baseline 60.1% |
+| **e7** | field_init free-var GET_FREE |
+| **e7b** | static field `this`; Proxy define/get |
+| **e7c** | private method not-writable |
+| **e7d** | static `constructor()` method; PrivateFieldAdd TypeErrors |
+
+### Phase order
+
+| Phase | Focus | Status |
+|-------|-------|--------|
+| L-A | class/dstr | **DONE** |
+| **L-B** | class/elements residual (~96 fails) | **ACTIVE** |
+| L-C | subclass / super | next |
+| L-D | eval-code | next |
+| L-E… | for-of, residual statements, long tail | later |
+
+### L-B residual clusters (~96 fails)
+
+1. Private brand / nested shadow / double-init methods  
+2. Private + direct eval visibility  
+3. Optional chain + private (`o?.c.#f`)  
+4. Non-extensible private **methods** (fields path green)  
+5. eval/supercall-in-field edges  
+6. syntax edges (field get/set ASI, prototype accessor)
+
+### Strategy
+
+1. Language only until ≥95%  
+2. Prefer engine/Ailang over shims  
+3. Regression every stage: with 100%, dstr 100%, elements delta  
+4. Commit + push on green clusters  
 
 ```bash
-# must stay 100%:
 python3 tools/test262_runner.py --categories statements/with --timeout 10 --no-batch -j 4
-# dstr must stay 100% (1920):
-python3 tools/test262_runner.py --paths statements/class/dstr --timeout 12 -j 8
-# cluster under test:
-python3 tools/test262_runner.py --paths statements/class/elements --timeout 12 -j 8
+python3 tools/test262_runner.py --paths language/statements/class/elements --timeout 12 -j 8
 ```
-
----
-
-## Phase order
-
-### L-A — Class dstr — **DONE** (1920/1920)
-
-| Order | Work | Status |
-|------:|------|--------|
-| A1–A4 | Method/gen/async/static/ctor dstr | **100%** |
-
-### L-B — Class elements — **ACTIVE** (~91%, ~206 residual)
-
-| Order | Work | Status |
-|------:|------|--------|
-| B1 | Public instance fields + free-var in field_init | **M128e7 in flight** |
-| B2 | Public static fields | next |
-| B3 | Private `#` fields/methods | residual bulk |
-| B4 | Static blocks / computed residual | residual |
-
-**Known B1 fix (M128e7):** `in_field_init` forces free-var GET_FREE/SET_FREE
-(not outer script GET_LOCAL). Field-init only has local 0 = `this`.
-CONSTRUCT path: clean rethrow + pop frame on field-init abort.
-
-### L-C — Subclass / super (~90+ + expressions/super)
-
-| Order | Work |
-|------:|------|
-| C1 | `extends` + SuperCall |
-| C2 | `super.prop` / `super[prop]` |
-| C3 | subclass-builtins |
-
-### L-D — Eval-code (~189)
-
-direct then indirect (env, strict, new.target).
-
-### L-E — Iteration + residual statements
-
-for-of, for-in, try, variable/let-const edges.
-
-### L-F — Syntax edges
-
-regexp language, yield/generators, tagged-template, modules TLA/import-defer.
-
-### L-G — Long tail → 100%
-
-global-code, function-code, operators, using (if required).
-
----
-
-## Defer
-
-| Area | Why |
-|------|-----|
-| built-ins bulk | After language 95%+ |
-| staging / annexB | Optional |
-| decorators | Tiny + proposal edge |
-
----
-
-## Done (keep green)
-
-| Item | Score |
-|------|------:|
-| statements/with | **181/181 (100%)** e6al |
-| class/dstr | **1920/1920 (100%)** |
-| block-scope | ~97% |
-| arguments-object | ~94% |
-| Full suite overall | 60.1% e6ak |
-| language | 89.1% e6ak |
-
----
-
-## Current grind
-
-**Active:** L-B class/elements residual (private bulk ~122 fails)  
-**Next:** private methods/fields → L-C subclass/super → L-D eval-code  
-**Commit series:** M128e7, M128e7b…  
-
-### Fail mass (e6ak full language)
-
-| Fails | Folder |
-|------:|--------|
-| ~753 | statements/class (dstr green; elements/subclass residual) |
-| ~173 | expressions/class |
-| ~189 | eval-code |
-| ~94 | statements/for-of |
-| ~70 | literals/regexp |
-| residual | yield, assignment, import-defer, using, …
 
 ---
 
@@ -142,8 +82,9 @@ global-code, function-code, operators, using (if required).
 | 2026-07-29 | with | 181/181 | e6al |
 | 2026-07-29 | full | 60.1% / lang 89.1% | e6ak |
 | 2026-07-29 | class/dstr | 1920/1920 | L-A done |
-| 2026-07-29 | class/elements base | 1326/1534 (~86.4% pass; +timeouts) | pre-e7 |
-| 2026-07-29 | class/elements e7 probe | 1328/1534 | partial free-var |
-| 2026-07-29 | M128e7 field_init free-var | *measuring* | in_field_init + CONSTRUCT abort |
-| 2026-07-29 | M128e7c private method !W | not-writable + set-access pass | PrivateSet method kind |
-| 2026-07-29 | M128e7d static ctor + PrivateFieldAdd | elements **93.4%** (+5) | static constructor(); double private field |
+| 2026-07-29 | elements base | 1326 pass | pre-e7 |
+| 2026-07-29 | M128e7 field free-var | +25-ish | in_field_init |
+| 2026-07-29 | M128e7b static this + Proxy | merged ~1404/1534 true | |
+| 2026-07-29 | M128e7c private method !W | not-writable green | |
+| 2026-07-29 | M128e7d static ctor + PFA | **1350/96 (93.4%)** | tip |
+| 2026-07-29 | M128e7e optional chain cont. | elements 1351/95 | o?.c.#f short-circuit |
