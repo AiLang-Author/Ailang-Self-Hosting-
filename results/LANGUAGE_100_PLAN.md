@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29  
 **Branch:** `master`  
-**Tip:** **M128e7g** (private setter-only get TypeError)  
+**Tip:** **M128e7h** (no private setter data placeholder)  
 **Full suite baseline:** M128e6ak — 60.1% overall, language **89.1%**
 
 ---
@@ -29,7 +29,7 @@
 | Milestone | elements pass/fail | runner pass% |
 |-----------|-------------------:|-------------:|
 | pre-e7 base | 1326 / 127 (+72 t/o) | 91.3% |
-| **e7g tip** | **1356 / 90 (+8 t/o)** | **93.8%** |
+| **e7h tip** | **1357 / 89 (+8 t/o)** | **93.8%** |
 
 ### Commits this campaign (master → github)
 
@@ -89,3 +89,4 @@ python3 tools/test262_runner.py --paths language/statements/class/elements --tim
 | 2026-07-29 | M128e7d static ctor + PFA | **1350/96 (93.4%)** | tip |
 | 2026-07-29 | M128e7e optional chain cont. | elements 1351/95 | o?.c.#f short-circuit |
 | 2026-07-29 | M128e7g private setter-only get | **1356/90 (93.8%)** | +5; TypeError no getter |
+| 2026-07-29 | M128e7h private setter placeholder | **1357/89** | static missing getter |
