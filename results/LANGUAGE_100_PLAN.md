@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29  
 **Branch:** `master`  
-**Tip:** **M128e7k** (PrivateMethodOrAccessorAdd double-init)  
+**Tip:** **M128e7l** (unique `__cc_N` nested class slots)  
 **Full suite baseline:** M128e6ak — 60.1% overall, language **89.1%**
 
 ---
@@ -30,7 +30,9 @@
 |-----------|-------------------:|-------------:|
 | pre-e7 base | 1326 / 127 (+72 t/o) | 91.3% |
 | e7i tip | 1362 / 83 (+8 t/o) | 94.3% |
-| **e7j tip** | **1445 / 81 (+8 t/o)** no-batch | **94.7%** |
+| e7j tip | 1445 / 81 (+8 t/o) no-batch | 94.7% |
+| e7k tip | 1449 / 77 (+8 t/o) no-batch | 95.0% |
+| **e7l tip** | **1461 / 65 (+8 t/o)** no-batch | **95.7%** |
 
 ### Commits this campaign (master → github)
 
@@ -43,6 +45,7 @@
 | **e7c** | private method not-writable |
 | **e7d** | static `constructor()` method; PrivateFieldAdd TypeErrors |
 | **e7j** | class `.prototype` !W; static `['constructor']` field attrs |
+| **e7k** | PrivateMethodOrAccessorAdd on construct; double-init TypeError |
 
 ### Phase order
 
@@ -54,7 +57,7 @@
 | L-D | eval-code | next |
 | L-E… | for-of, residual statements, long tail | later |
 
-### L-B residual clusters (~81 fails)
+### L-B residual clusters (~77 fails)
 
 1. Private brand / nested shadow / double-init methods  
 2. Private + direct eval visibility  
@@ -94,3 +97,4 @@ python3 tools/test262_runner.py --paths language/statements/class/elements --tim
 | 2026-07-29 | M128e7h private setter placeholder | **1357/89** | static missing getter |
 | 2026-07-29 | M128e7i computed `#` + PRIVATE div | **1362/83 (94.3%)** | +7 clobber/visibility |
 | 2026-07-29 | M128e7j class prototype !W + ctor field | **1445/81 (94.7%)** nb | static `['prototype']` TypeError; static `['constructor']` enumerable; stamp after MakeConstructor |
+| 2026-07-29 | M128e7k private method install on construct | **1449/77 (95.0%)** nb | PrivateMethodOrAccessorAdd; double-init TypeError; brand fdesc check |
