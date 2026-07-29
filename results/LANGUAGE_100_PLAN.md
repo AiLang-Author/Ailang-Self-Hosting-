@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-29  
 **Branch:** `master`  
-**Tip:** **M128e7i** (computed `#` field + private div)  
+**Tip:** **M128e7j** (class `.prototype` !W + static propname)  
 **Full suite baseline:** M128e6ak — 60.1% overall, language **89.1%**
 
 ---
@@ -29,7 +29,8 @@
 | Milestone | elements pass/fail | runner pass% |
 |-----------|-------------------:|-------------:|
 | pre-e7 base | 1326 / 127 (+72 t/o) | 91.3% |
-| **e7i tip** | **1362 / 83 (+8 t/o)** | **94.3%** |
+| e7i tip | 1362 / 83 (+8 t/o) | 94.3% |
+| **e7j tip** | **1445 / 81 (+8 t/o)** no-batch | **94.7%** |
 
 ### Commits this campaign (master → github)
 
@@ -41,6 +42,7 @@
 | **e7b** | static field `this`; Proxy define/get |
 | **e7c** | private method not-writable |
 | **e7d** | static `constructor()` method; PrivateFieldAdd TypeErrors |
+| **e7j** | class `.prototype` !W; static `['constructor']` field attrs |
 
 ### Phase order
 
@@ -91,3 +93,4 @@ python3 tools/test262_runner.py --paths language/statements/class/elements --tim
 | 2026-07-29 | M128e7g private setter-only get | **1356/90 (93.8%)** | +5; TypeError no getter |
 | 2026-07-29 | M128e7h private setter placeholder | **1357/89** | static missing getter |
 | 2026-07-29 | M128e7i computed `#` + PRIVATE div | **1362/83 (94.3%)** | +7 clobber/visibility |
+| 2026-07-29 | M128e7j class prototype !W + ctor field | **1445/81 (94.7%)** nb | static `['prototype']` TypeError; static `['constructor']` enumerable; stamp after MakeConstructor |
