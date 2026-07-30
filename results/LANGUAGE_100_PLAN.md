@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-30  
 **Branch:** `master`  
-**Tip:** **M128e7m** (private visible to direct eval) (unique `__cc_N` nested class slots)  
+**Tip:** **M128e7n** (static/get/set ClassElementName ASI)  
 **Full suite baseline:** **M128e7l** — **60.6%** overall, language **90.1%**  
 **Prior:** M128e6ak — 60.1% / lang 89.1%
 
@@ -36,6 +36,7 @@
 | e7k tip | 1449 / 77 (+8 t/o) no-batch | 95.0% |
 | e7l tip | 1461 / 65 (+8 t/o) no-batch | 95.7% |
 | **e7m tip** | **1467 / 59 (+8 t/o)** no-batch | **96.1%** |
+| **e7n tip** | **1471 / 55 (+8 t/o)** no-batch | **96.4%** |
 
 ### Commits this campaign (master → github)
 
@@ -57,19 +58,21 @@
 | Phase | Focus | Status |
 |-------|-------|--------|
 | L-A | class/dstr | **DONE** |
-| **L-B** | class/elements residual (~65 no-batch) | **ACTIVE** |
+| **L-B** | class/elements residual (~55 no-batch) | **ACTIVE** |
 | **L-C** | subclass / super | next (61+ fails in full) |
 | L-D | eval-code / private+direct eval | next (ROI) |
 | L-E… | for-of dstr, residual statements | later |
 | **G4** | built-ins bulk | after G2 — plan in `BUILTINS_ROADMAP.md` |
 
-### L-B residual clusters (~65 fails no-batch)
+### L-B residual clusters (~55 fails no-batch)
 
-1. Private + **direct eval** visibility  
+1. Private + **direct eval** visibility — partial green (e7m)  
 2. Non-extensible private methods / remaining brand edges  
-3. eval/supercall-in-field / arguments early errors  
+3. eval/supercall-in-field / arguments early errors (largest residual)  
 4. Nested private static — **usage/shadow green** (e7l)  
 5. Double-init private methods — **green** (e7k)  
+6. `static` / `get` / `set` as ClassElementName ASI — **green** (e7n)  
+7. private-before-super-return (ctor / field init) 
 
 ### Strategy
 
@@ -107,3 +110,4 @@ python3 tools/test262_runner.py --paths language/statements/class/elements --tim
 | 2026-07-29 | M128e7l unique class temp slots | **1461/65 (95.7%)** nb | nested static field class no longer clobbers `__cc__` |
 | 2026-07-30 | **full suite M128e7l** | **60.6% / lang 90.1%** | 30113/49723 pass; built-ins 33.9%; **G1 met**; +0.5pp vs e6ak |
 | 2026-07-30 | M128e7m private+direct eval | **1467/59 (96.1%)** nb | PrivateEnv seed; eval code switch; field_define clear |
+| 2026-07-30 | M128e7n static/get/set as field names | **1471/55 (96.4%)** nb | `static;`/`static=x` not keyword; `get`/`set` before STAR/SEMI/ASSIGN not accessor prefix (ASI) |
