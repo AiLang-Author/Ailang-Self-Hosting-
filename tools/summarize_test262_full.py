@@ -1,68 +1,128 @@
 #!/usr/bin/env python3
-"""Summarize test262 full suite JSON results."""
-import json, sys, os
-from collections import defaultdict
+"""Summarize a full test262_runner --full JSON dump into section/category stats."""
+import json
+import sys
+from collections import Counter, defaultdict
+from pathlib import Path
 
-path = sys.argv[1] if len(sys.argv) > 1 else "results/test262_full_m128e6ak.json"
-if not os.path.exists(path):
-    print("missing", path)
-    sys.exit(1)
-data = json.load(open(path))
-tests = data if isinstance(data, list) else data.get("results", data.get("tests", []))
-by_sec = defaultdict(lambda: {"total":0,"pass":0,"fail":0,"error":0,"timeout":0,"skip":0})
-by_status = defaultdict(int)
-for t in tests:
-    st = t.get("status", "unknown")
-    by_status[st] += 1
-    p = t.get("path", "")
-    # section: test262/test/<section>/...
-    parts = p.replace("\\", "/").split("/")
-    sec = "other"
+
+def section_of(path: str) -> str:
+    # .../test262/test/language/... or built-ins / annexB / staging
+    parts = Path(path).parts
     if "test" in parts:
         i = parts.index("test")
         if i + 1 < len(parts):
-            sec = parts[i+1]
-    by_sec[sec]["total"] += 1
-    if st in by_sec[sec]:
-        by_sec[sec][st] += 1
-    elif st == "pass":
-        by_sec[sec]["pass"] += 1
-    else:
-        by_sec[sec]["fail"] += 1
+            return parts[i + 1]
+    return "other"
 
-total = len(tests)
-passed = by_status.get("pass", 0)
-print(f"# Full test262 summary")
-print(f"**Source:** `{path}`")
-print(f"**Tests:** {total}")
-print(f"**Pass:** {passed} ({100*passed/total:.1f}%)" if total else "empty")
-print()
-print("| Status | Count |")
-print("|--------|------:|")
-for k,v in sorted(by_status.items(), key=lambda x: -x[1]):
-    print(f"| {k} | {v} |")
-print()
-print("| Section | Total | Pass | Pass% |")
-print("|---------|------:|-----:|------:|")
-for sec, d in sorted(by_sec.items(), key=lambda x: -x[1]["total"]):
-    pct = 100*d["pass"]/d["total"] if d["total"] else 0
-    print(f"| {sec} | {d['total']} | {d['pass']} | {pct:.1f}% |")
-# language subsections if present
-lang = defaultdict(lambda: {"total":0,"pass":0})
-for t in tests:
-    p = t.get("path","").replace("\\","/")
-    if "/language/" not in p:
-        continue
-    rest = p.split("/language/",1)[1]
-    sub = rest.split("/")[0] if rest else "language"
-    lang[sub]["total"] += 1
-    if t.get("status")=="pass":
-        lang[sub]["pass"] += 1
-if lang:
+
+def lang_category(path: str) -> str:
+    """language/<area>/... → area (statements, expressions, ...)."""
+    parts = Path(path).parts
+    if "language" not in parts:
+        return ""
+    i = parts.index("language")
+    if i + 1 < len(parts):
+        return parts[i + 1]
+    return "language"
+
+
+def main():
+    src = Path(sys.argv[1] if len(sys.argv) > 1 else "results/test262_full_m128e7l.json")
+    d = json.loads(src.read_text())
+    results = d.get("results") or d
+    if not isinstance(results, list):
+        print("bad json shape", type(results))
+        sys.exit(1)
+
+    by_status = Counter(r.get("status") for r in results)
+    total = len(results)
+    pass_n = by_status.get("pass", 0)
+    fail_n = by_status.get("fail", 0)
+    err_n = by_status.get("error", 0)
+    to_n = by_status.get("timeout", 0)
+    skip_n = by_status.get("skip", 0)
+
+    sec = defaultdict(lambda: Counter())
+    lang_area = defaultdict(lambda: Counter())
+    bi_area = defaultdict(lambda: Counter())
+
+    for r in results:
+        p = r.get("path", "")
+        st = r.get("status", "?")
+        s = section_of(p)
+        sec[s][st] += 1
+        if s == "language":
+            lang_area[lang_category(p)][st] += 1
+        elif s == "built-ins":
+            # built-ins/Object/... → Object
+            parts = Path(p).parts
+            if "built-ins" in parts:
+                i = parts.index("built-ins")
+                if i + 1 < len(parts):
+                    bi_area[parts[i + 1]][st] += 1
+
+    def pct(n, t):
+        return 100.0 * n / t if t else 0.0
+
+    print(f"# Full suite summary — {src.name}")
+    print(f"total_tests_field: {d.get('total_tests', total)}")
+    print(f"wall_time_s: {d.get('wall_time_s', '?')}")
     print()
-    print("## language subsections (top by size)")
-    print("| Sub | Total | Pass | Pass% |")
-    print("|-----|------:|-----:|------:|")
-    for sub,d in sorted(lang.items(), key=lambda x: -x[1]["total"])[:25]:
-        pct = 100*d["pass"]/d["total"] if d["total"] else 0
-        print(f"| {sub} | {d['total']} | {d['pass']} | {pct:.1f}% |")
+    print("## Headline")
+    print(f"| Metric | Value |")
+    print(f"|--------|------:|")
+    print(f"| Tests | {total} |")
+    print(f"| Pass | {pass_n} (**{pct(pass_n, total):.1f}%**) |")
+    print(f"| Fail | {fail_n} |")
+    print(f"| Error | {err_n} |")
+    print(f"| Timeout | {to_n} |")
+    print(f"| Skip | {skip_n} |")
+    print()
+    print("## By section")
+    print("| Section | Total | Pass | Fail | Err | T/O | Pass% |")
+    print("|---------|------:|-----:|-----:|----:|----:|------:|")
+    for s in sorted(sec.keys(), key=lambda x: -sum(sec[x].values())):
+        c = sec[s]
+        t = sum(c.values())
+        p = c.get("pass", 0)
+        print(f"| {s} | {t} | {p} | {c.get('fail',0)} | {c.get('error',0)} | {c.get('timeout',0)} | {pct(p,t):.1f}% |")
+    print()
+    print("## Language top areas")
+    print("| Area | Total | Pass | Pass% |")
+    print("|------|------:|-----:|------:|")
+    rows = []
+    for a, c in lang_area.items():
+        t = sum(c.values())
+        p = c.get("pass", 0)
+        rows.append((a, t, p, pct(p, t)))
+    for a, t, p, pc in sorted(rows, key=lambda x: -x[1])[:20]:
+        print(f"| {a} | {t} | {p} | {pc:.1f}% |")
+    print()
+    print("## Built-ins top (by total)")
+    print("| Builtin | Total | Pass | Pass% |")
+    print("|---------|------:|-----:|------:|")
+    brows = []
+    for a, c in bi_area.items():
+        t = sum(c.values())
+        p = c.get("pass", 0)
+        brows.append((a, t, p, pct(p, t)))
+    for a, t, p, pc in sorted(brows, key=lambda x: -x[1])[:25]:
+        print(f"| {a} | {t} | {p} | {pc:.1f}% |")
+    print()
+    # residual language fails sample
+    print("## Sample language fails (first 30 paths)")
+    n = 0
+    for r in results:
+        if r.get("status") not in ("fail", "error", "timeout"):
+            continue
+        if section_of(r.get("path", "")) != "language":
+            continue
+        print("-", r.get("path", "").split("test/")[-1] if "test/" in r.get("path","") else r.get("path"))
+        n += 1
+        if n >= 30:
+            break
+
+
+if __name__ == "__main__":
+    main()
