@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-30  
 **Branch:** `master`  
-**Tip:** **M128e7l** (unique `__cc_N` nested class slots)  
+**Tip:** **M128e7m** (private visible to direct eval) (unique `__cc_N` nested class slots)  
 **Full suite baseline:** **M128e7l** — **60.6%** overall, language **90.1%**  
 **Prior:** M128e6ak — 60.1% / lang 89.1%
 
@@ -34,7 +34,8 @@
 | e7i tip | 1362 / 83 (+8 t/o) | 94.3% |
 | e7j tip | 1445 / 81 (+8 t/o) no-batch | 94.7% |
 | e7k tip | 1449 / 77 (+8 t/o) no-batch | 95.0% |
-| **e7l tip** | **1461 / 65 (+8 t/o)** no-batch | **95.7%** |
+| e7l tip | 1461 / 65 (+8 t/o) no-batch | 95.7% |
+| **e7m tip** | **1467 / 59 (+8 t/o)** no-batch | **96.1%** |
 
 ### Commits this campaign (master → github)
 
@@ -105,3 +106,4 @@ python3 tools/test262_runner.py --paths language/statements/class/elements --tim
 | 2026-07-29 | M128e7k private method install on construct | **1449/77 (95.0%)** nb | PrivateMethodOrAccessorAdd; double-init TypeError; brand fdesc check |
 | 2026-07-29 | M128e7l unique class temp slots | **1461/65 (95.7%)** nb | nested static field class no longer clobbers `__cc__` |
 | 2026-07-30 | **full suite M128e7l** | **60.6% / lang 90.1%** | 30113/49723 pass; built-ins 33.9%; **G1 met**; +0.5pp vs e6ak |
+| 2026-07-30 | M128e7m private+direct eval | **1467/59 (96.1%)** nb | PrivateEnv seed; eval code switch; field_define clear |
