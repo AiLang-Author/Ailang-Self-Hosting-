@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-30  
 **Branch:** `master`  
-**Tip:** **M128e7n** (static/get/set ClassElementName ASI)  
+**Tip:** **M128e7o** (field-init direct eval ContainsArguments)  
 **Full suite baseline:** **M128e7l** — **60.6%** overall, language **90.1%**  
 **Prior:** M128e6ak — 60.1% / lang 89.1%
 
@@ -37,6 +37,7 @@
 | e7l tip | 1461 / 65 (+8 t/o) no-batch | 95.7% |
 | **e7m tip** | **1467 / 59 (+8 t/o)** no-batch | **96.1%** |
 | **e7n tip** | **1471 / 55 (+8 t/o)** no-batch | **96.4%** |
+| **e7o tip** | **1477 / 49 (+8 t/o)** no-batch | **96.8%** |
 
 ### Commits this campaign (master → github)
 
@@ -58,13 +59,13 @@
 | Phase | Focus | Status |
 |-------|-------|--------|
 | L-A | class/dstr | **DONE** |
-| **L-B** | class/elements residual (~55 no-batch) | **ACTIVE** |
+| **L-B** | class/elements residual (~49 no-batch) | **ACTIVE** |
 | **L-C** | subclass / super | next (61+ fails in full) |
 | L-D | eval-code / private+direct eval | next (ROI) |
 | L-E… | for-of dstr, residual statements | later |
 | **G4** | built-ins bulk | after G2 — plan in `BUILTINS_ROADMAP.md` |
 
-### L-B residual clusters (~55 fails no-batch)
+### L-B residual clusters (~49 fails no-batch)
 
 1. Private + **direct eval** visibility — partial green (e7m)  
 2. Non-extensible private methods / remaining brand edges  
@@ -111,3 +112,4 @@ python3 tools/test262_runner.py --paths language/statements/class/elements --tim
 | 2026-07-30 | **full suite M128e7l** | **60.6% / lang 90.1%** | 30113/49723 pass; built-ins 33.9%; **G1 met**; +0.5pp vs e6ak |
 | 2026-07-30 | M128e7m private+direct eval | **1467/59 (96.1%)** nb | PrivateEnv seed; eval code switch; field_define clear |
 | 2026-07-30 | M128e7n static/get/set as field names | **1471/55 (96.4%)** nb | `static;`/`static=x` not keyword; `get`/`set` before STAR/SEMI/ASSIGN not accessor prefix (ASI) |
+| 2026-07-30 | M128e7o field-init eval ContainsArguments | **1477/49 (96.8%)** nb | direct eval in field init / nested CFI funcs: arguments → SyntaxError |
