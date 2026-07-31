@@ -163,3 +163,9 @@ Updates postfix/prefix still **100%** (tip).
 | instanceof | **36/43 (87.8%)** was 25/43 |
 
 Residual: TypeError⊆Error chain, Function() ctor edge, Function.prototype.prototype getter redefine.
+
+## M128e7av (2026-07-31) — Error() without new stamps prototype
+
+TypeError/RangeError/… function call (not `new`) now links `[[Prototype]]` to `Ctor.prototype` so `TypeError("x") instanceof TypeError`.
+
+instanceof **37/43**.
