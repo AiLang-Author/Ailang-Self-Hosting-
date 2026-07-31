@@ -145,3 +145,21 @@ Updates postfix/prefix still **100%** (tip).
 | logical-not | **19/19 (100%)** |
 | equals / strict-equals / void | 100% |
 | logical-and/or residual | TCO-only (`tco-right`) |
+
+## M128e7au (2026-07-31) — instanceof + Symbol.hasInstance
+
+| Area | Change |
+|------|--------|
+| `JSRT_Instanceof` | ES order: TypeError non-object RHS; `@@hasInstance`; non-callable TE; non-object `prototype` TE; accessor Get |
+| `Symbol.hasInstance` | well-known installed |
+| `Function.prototype` | real callable native (typeof function); no auto `.prototype` |
+| FuncPropGet | no self-recurse on Function.prototype; PropTable before prototype slot |
+| INSTANCEOF dispatch | rethrow pending |
+
+### Measured
+
+| Category | Score |
+|----------|------:|
+| instanceof | **36/43 (87.8%)** was 25/43 |
+
+Residual: TypeError⊆Error chain, Function() ctor edge, Function.prototype.prototype getter redefine.
