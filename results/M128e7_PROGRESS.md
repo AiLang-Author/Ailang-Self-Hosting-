@@ -200,3 +200,20 @@ OWN-only `__get_*` accessors in GET_PROP / ObjGetAcc (inherited `__get_prototype
 | expressions/in | **36/36 (100%)** (legacy no-batch; batch may harness_eof flake 1) |
 | instanceof | still **43/43** |
 | typeof / logical-not / modulus | still 100% |
+
+## M128e7az (2026-07-31) — block-comment re-peek + ternary +In
+
+| Area | Change |
+|------|--------|
+| Lexer main loop | After `//` or `/* */`, re-peek + SkipWS so next token is not scanned with stale `/` (was dropping first source char: `/*x*/var`→`ar`, `new./* */target`→`arget`) |
+| SkipBlockComment | Early-return rewrite on `*/` |
+| Ternary consequent | Always `no_in=0` (`AssignmentExpression[+In]`) for `? … in … :` inside for-init |
+
+### Measured
+
+| Category | Score |
+|----------|------:|
+| new.target | **12/14** (asi/comment green; Reflect.apply/construct need Reflect) |
+| conditional | **20/22** (in-branch-1 green; 2 TCO residual) |
+| expressions/in | still 100% (no-batch) |
+| block-comment probes | pass |
