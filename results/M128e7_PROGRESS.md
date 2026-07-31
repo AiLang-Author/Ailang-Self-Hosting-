@@ -217,3 +217,19 @@ OWN-only `__get_*` accessors in GET_PROP / ObjGetAcc (inherited `__get_prototype
 | conditional | **20/22** (in-branch-1 green; 2 TCO residual) |
 | expressions/in | still 100% (no-batch) |
 | block-comment probes | pass |
+
+## M128e7ba (2026-07-31) — Array.prototype.toString
+
+| Area | Change |
+|------|--------|
+| `JSNativeID.ARR_TO_STRING` (265) | native → `ArrJoin(recv, args, 0)` |
+| `Array.prototype.toString` | installed (was Object → `"[object Array]"`) |
+| MatchArrayMethod | `"toString"` → ARR_TO_STRING |
+| CallFunc | id 265 uses global `this` + DispatchStringMethod |
+
+### Measured
+
+| Category | Score |
+|----------|------:|
+| expressions/concatenation | **5/5 (100%)** |
+| a+"" / Array.toString | pass |
