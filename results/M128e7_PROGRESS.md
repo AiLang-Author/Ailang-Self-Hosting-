@@ -135,3 +135,13 @@ Updates postfix/prefix still **100%** (tip).
 |----------|------:|
 | literals/numeric | **157/157 (100%)** |
 | exponentiation | still 100% |
+
+## M128e7at (2026-07-31) — ToBoolean BigInt
+
+`JSRT_IsTruthy`: BigInt `0n` → false; other BigInts true (`!0n`/`!1n`).
+
+| Category | Score |
+|----------|------:|
+| logical-not | **19/19 (100%)** |
+| equals / strict-equals / void | 100% |
+| logical-and/or residual | TCO-only (`tco-right`) |
