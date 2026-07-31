@@ -175,3 +175,11 @@ instanceof **37/43**.
 `JSComp__HoistVars` always emits `SET_GLOBAL_VAR` (even `eval_mode=1`) so `x; var x` is not ReferenceError under the test262 harness path.
 
 instanceof **40/43** (residual: Function.prototype.prototype getter redefine only).
+
+## M128e7ax (2026-07-31) — instanceof 100%
+
+OWN-only `__get_*` accessors in GET_PROP / ObjGetAcc (inherited `__get_prototype` from Function.prototype no longer intercepts `Array.prototype`).
+
+| Category | Score |
+|----------|------:|
+| instanceof | **43/43 (100%)** |
