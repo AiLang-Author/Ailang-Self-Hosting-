@@ -48,4 +48,24 @@ L-B residual: static fields, private, then L-C subclass/super.
 - **e7am**: `%` IEEE remainder edges + object ToNumeric — modulus **100%**.
 - Prior: full BigInt (ops, relational, updates), sticky `__pend_exc__` fix.
 
-Tip: b6057142 + modulus commit.
+## M128e7an (2026-07-31) — string const NUL + relational 100%
+
+| Area | Change |
+|------|--------|
+| `JSComp__AddStringRaw` | Type **5** pool entry: `[len:8][bytes...][0]`; embedded `\u0000` preserved |
+| `JSVM__LoadConst` type 5 | `JSRT_CreateStringUTF8Len` (UTF-8→UTF-16 + length; not Latin-1) |
+| `JSRT_CreateString` | Thin wrapper over UTF8Len via `StringLength` |
+| `JSRT_GreaterThan` | ToPrimitive L→R then `b < a` |
+| `JSRT_LessEqual` / `GreaterEqual` | ToPrimitive L→R; **string** path via `StrCmp` (equal strings no longer fall through ToNumeric→NaN) |
+
+### Measured (batch harness)
+
+| Category | Score |
+|----------|------:|
+| less-than | **45/45 (100%)** |
+| greater-than | **49/49 (100%)** |
+| less-than-or-equal | **47/47 (100%)** |
+| greater-than-or-equal | **43/43 (100%)** |
+| modulus | **39/40 pass** (+1 harness_eof flake) |
+
+Tip: string-const type5 + relational order/string-eq.
