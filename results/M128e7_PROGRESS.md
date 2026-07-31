@@ -69,3 +69,23 @@ L-B residual: static fields, private, then L-C subclass/super.
 | modulus | **39/40 pass** (+1 harness_eof flake) |
 
 Tip: string-const type5 + relational order/string-eq.
+
+## M128e7ao (2026-07-31) — ** ToNumeric, escapes, Date(), MAX_VALUE parse
+
+| Area | Change |
+|------|--------|
+| `JSRT_Exp` | ToNumeric for non-NUMBER (bool/null/…); no NumericBin stub → was ** undefined |
+| Lexer string | `\b` `\f` `\v` single escapes |
+| `DATE_CTOR` | `Date()` without new → string (`__new_target__` undefined); `new Date()` → object |
+| `JSRT__ParseNumberStr` | scale `10^n` via float *10; apply exp as one mul (MAX_VALUE `1.797…e+308` finite) |
+
+### Measured
+
+| Category | Score |
+|----------|------:|
+| exponentiation | **44/44 (100%)** |
+| addition / mul / div / sub / delete / updates | **100%** (prior rescore) |
+| typeof | 13/16 (Date() string fixed; proxy/symbol/native-call residual) |
+| literals/string | 67/73 |
+
+Next: typeof residuals, string line-continuation/legacy-octal, numeric legacy octal.
