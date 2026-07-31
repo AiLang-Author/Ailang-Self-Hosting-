@@ -113,3 +113,10 @@ Lexer: full LegacyOctalEscapeSequence `\0`-`\377` + NonOctalDecimal `\8`/`\9`.
 literals/string **68/73** (was 67).
 
 Residual: line-continuation CR/LS/PS, a few harness_eof / hex edge.
+
+## M128e7ar (2026-07-31) — string LineContinuation LS/PS
+
+Lexer LineContinuation: `\\` + LF/CR/CRLF/**LS/PS** (UTF-8 E2 80 A8/A9) → empty SV.
+literals/string **70/73** (line-continuation double/single green).
+Residual 3: batch `harness_eof` / sticky fail — **pass alone** on single+batch harness.
+Updates postfix/prefix still **100%** (tip).
