@@ -41,3 +41,11 @@
 ## Next
 
 L-B residual: static fields, private, then L-C subclass/super.
+
+## M128e7al–am (2026-07-31)
+
+- **e7al**: `delete` removes `__get_`/`__set_`; `UPDATE_ELEM` for `base[key]++` (single key eval, null base TypeError first). postfix/prefix ++/-- **100%**.
+- **e7am**: `%` IEEE remainder edges + object ToNumeric — modulus **100%**.
+- Prior: full BigInt (ops, relational, updates), sticky `__pend_exc__` fix.
+
+Tip: b6057142 + modulus commit.
