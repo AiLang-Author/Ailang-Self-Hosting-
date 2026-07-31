@@ -169,3 +169,9 @@ Residual: TypeError⊆Error chain, Function() ctor edge, Function.prototype.prot
 TypeError/RangeError/… function call (not `new`) now links `[[Prototype]]` to `Ctor.prototype` so `TypeError("x") instanceof TypeError`.
 
 instanceof **37/43**.
+
+## M128e7aw (2026-07-31) — var hoist under EvalString
+
+`JSComp__HoistVars` always emits `SET_GLOBAL_VAR` (even `eval_mode=1`) so `x; var x` is not ReferenceError under the test262 harness path.
+
+instanceof **40/43** (residual: Function.prototype.prototype getter redefine only).
