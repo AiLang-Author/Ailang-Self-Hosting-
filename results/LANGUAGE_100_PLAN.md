@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-30  
 **Branch:** `master`  
-**Tip:** **M128e7q** (private brand own-install + eval AllPrivateNamesValid)  
+**Tip:** **M128e7r** (CallFunc new.target + deep new.target earlyerr)  
 **Full suite baseline:** **M128e7l** — **60.6%** overall, language **90.1%**  
 **Prior:** M128e6ak — 60.1% / lang 89.1%
 
@@ -40,6 +40,7 @@
 | **e7o tip** | **1477 / 49 (+8 t/o)** no-batch | **96.8%** |
 | **e7p tip** | **1493 / 33 (+8 t/o)** no-batch | **97.8%** |
 | **e7q tip** | **1505 / 21 (+8 t/o)** no-batch | **98.6%** |
+| **e7r tip** | **1509 / 17 (+8 t/o)** no-batch | **98.9%** |
 
 ### Commits this campaign (master → github)
 
@@ -61,13 +62,13 @@
 | Phase | Focus | Status |
 |-------|-------|--------|
 | L-A | class/dstr | **DONE** |
-| **L-B** | class/elements residual (~21 no-batch) | **ACTIVE** |
+| **L-B** | class/elements residual (~17 no-batch) | **ACTIVE** |
 | **L-C** | subclass / super | next (61+ fails in full) |
 | L-D | eval-code / private+direct eval | next (ROI) |
 | L-E… | for-of dstr, residual statements | later |
 | **G4** | built-ins bulk | after G2 — plan in `BUILTINS_ROADMAP.md` |
 
-### L-B residual clusters (~21 fails no-batch)
+### L-B residual clusters (~17 fails no-batch)
 
 1. Private + **direct eval** visibility — partial green (e7m)  
 2. Non-extensible private methods / remaining brand edges  
