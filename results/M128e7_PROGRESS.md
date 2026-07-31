@@ -106,3 +106,10 @@ Next: typeof residuals, string line-continuation/legacy-octal, numeric legacy oc
 | typeof | **16/16 (100%)** |
 | exponentiation | 100% |
 
+
+## M128e7aq (2026-07-31) — legacy octal string escapes
+
+Lexer: full LegacyOctalEscapeSequence `\0`-`\377` + NonOctalDecimal `\8`/`\9`.
+literals/string **68/73** (was 67).
+
+Residual: line-continuation CR/LS/PS, a few harness_eof / hex edge.
