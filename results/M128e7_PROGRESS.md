@@ -89,3 +89,20 @@ Tip: string-const type5 + relational order/string-eq.
 | literals/string | 67/73 |
 
 Next: typeof residuals, string line-continuation/legacy-octal, numeric legacy octal.
+
+## M128e7ap (2026-07-31) — typeof 100%
+
+| Area | Change |
+|------|--------|
+| Object global | native `OBJ_CTOR` function (was plain object) |
+| `Object(Symbol)` | box primitive Symbol → typeof `"object"` |
+| Proxy | `__proxy_callable__` flag; `Proxy.revocable` + revoke |
+| `typeof` Proxy | uses callable flag (survives revoke) |
+
+### Measured
+
+| Category | Score |
+|----------|------:|
+| typeof | **16/16 (100%)** |
+| exponentiation | 100% |
+
