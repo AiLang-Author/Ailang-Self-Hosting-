@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-30  
 **Branch:** `master`  
-**Tip:** **M128e7p** (eval SuperCall/SuperProperty deep walk)  
+**Tip:** **M128e7q** (private brand own-install + eval AllPrivateNamesValid)  
 **Full suite baseline:** **M128e7l** — **60.6%** overall, language **90.1%**  
 **Prior:** M128e6ak — 60.1% / lang 89.1%
 
@@ -39,6 +39,7 @@
 | **e7n tip** | **1471 / 55 (+8 t/o)** no-batch | **96.4%** |
 | **e7o tip** | **1477 / 49 (+8 t/o)** no-batch | **96.8%** |
 | **e7p tip** | **1493 / 33 (+8 t/o)** no-batch | **97.8%** |
+| **e7q tip** | **1505 / 21 (+8 t/o)** no-batch | **98.6%** |
 
 ### Commits this campaign (master → github)
 
@@ -60,13 +61,13 @@
 | Phase | Focus | Status |
 |-------|-------|--------|
 | L-A | class/dstr | **DONE** |
-| **L-B** | class/elements residual (~33 no-batch) | **ACTIVE** |
+| **L-B** | class/elements residual (~21 no-batch) | **ACTIVE** |
 | **L-C** | subclass / super | next (61+ fails in full) |
 | L-D | eval-code / private+direct eval | next (ROI) |
 | L-E… | for-of dstr, residual statements | later |
 | **G4** | built-ins bulk | after G2 — plan in `BUILTINS_ROADMAP.md` |
 
-### L-B residual clusters (~33 fails no-batch)
+### L-B residual clusters (~21 fails no-batch)
 
 1. Private + **direct eval** visibility — partial green (e7m)  
 2. Non-extensible private methods / remaining brand edges  
@@ -115,3 +116,4 @@ python3 tools/test262_runner.py --paths language/statements/class/elements --tim
 | 2026-07-30 | M128e7n static/get/set as field names | **1471/55 (96.4%)** nb | `static;`/`static=x` not keyword; `get`/`set` before STAR/SEMI/ASSIGN not accessor prefix (ASI) |
 | 2026-07-30 | M128e7o field-init eval ContainsArguments | **1477/49 (96.8%)** nb | direct eval in field init / nested CFI funcs: arguments → SyntaxError |
 | 2026-07-31 | M128e7p eval SuperCall/SuperProperty deep | **1493/33 (97.8%)** nb | deep walk into arrows for SuperCall/SuperProperty early errors |
+| 2026-07-31 | M128e7q private brand + eval priv earlyerr | **1505/21 (98.6%)** nb | own-install brand (before-super); AllPrivateNamesValid in direct eval |
