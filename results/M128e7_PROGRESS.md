@@ -183,3 +183,20 @@ OWN-only `__get_*` accessors in GET_PROP / ObjGetAcc (inherited `__get_prototype
 | Category | Score |
 |----------|------:|
 | instanceof | **43/43 (100%)** |
+
+## M128e7ay (2026-07-31) — `in` TypeError + private-in 100%
+
+| Area | Change |
+|------|--------|
+| IN dispatch | TypeError when RHS not Object/Function/Array/Generator |
+| `ASTType.PRIVATE_IDENT` | bare `#name` primary (class / allow_private_eval) |
+| CompExpr PRIVATE_IDENT | `AddString` + PUSH_CONST (mangled private key) |
+| FuncDecl/FuncExpr name | `await` BindingIdentifier outside Await (`function await()`) |
+
+### Measured
+
+| Category | Score |
+|----------|------:|
+| expressions/in | **36/36 (100%)** (legacy no-batch; batch may harness_eof flake 1) |
+| instanceof | still **43/43** |
+| typeof / logical-not / modulus | still 100% |
