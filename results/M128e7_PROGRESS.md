@@ -120,3 +120,18 @@ Lexer LineContinuation: `\\` + LF/CR/CRLF/**LS/PS** (UTF-8 E2 80 A8/A9) → empt
 literals/string **70/73** (line-continuation double/single green).
 Residual 3: batch `harness_eof` / sticky fail — **pass alone** on single+batch harness.
 Updates postfix/prefix still **100%** (tip).
+
+## M128e7as (2026-07-31) — numeric 100%
+
+| Area | Change |
+|------|--------|
+| ParseNumberStr | Annex B legacy octal `0[0-7]+` base-8; `08`/`080` stay decimal |
+| ParseNumberStr | unified significand for ≤15 digits (`1.1e-1 === 0.11`) |
+| Parse NUMBER_LIT | strict mode rejects LegacyOctalIntegerLiteral |
+
+### Measured
+
+| Category | Score |
+|----------|------:|
+| literals/numeric | **157/157 (100%)** |
+| exponentiation | still 100% |
