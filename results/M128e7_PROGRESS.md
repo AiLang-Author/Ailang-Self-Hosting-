@@ -422,3 +422,19 @@ Root cause of e7x→e7bh eval-code attr regressions: e7aa stamped all new Global
 | optional/array/template/new.target | **100%** | safety |
 
 Remaining eval residuals: Annex B block-level function-in-if/switch in eval (~50), local-exstng, strict.
+
+## M128e7bj (2026-08-01) — break/continue ASI + LineTerminator line tracking
+
+| Area | Change |
+|------|--------|
+| `JSParse__BreakStmt` / `ContStmt` | No label if Identifier on a later line than break/continue |
+| `JSLex__Advance` | CR, CRLF, LS, PS bump `line` (was LF-only) |
+| `IsWSHere` | LS/PS return 1 (Advance consumes full sequence) |
+
+### Measured
+
+| Suite | Score |
+|-------|------:|
+| **statements/break** | **20/20 (100%)** |
+| **statements/continue** | **24/24 (100%)** |
+| expressions/exponentiation | **44/44 (100%)** (already green) |
