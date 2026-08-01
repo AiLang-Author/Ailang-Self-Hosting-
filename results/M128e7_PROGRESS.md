@@ -438,3 +438,20 @@ Remaining eval residuals: Annex B block-level function-in-if/switch in eval (~50
 | **statements/break** | **20/20 (100%)** |
 | **statements/continue** | **24/24 (100%)** |
 | expressions/exponentiation | **44/44 (100%)** (already green) |
+
+## M128e7bk (2026-08-01) — IteratorValue getter abrupt rethrow
+
+| Area | Change |
+|------|--------|
+| `ITER_NEXT` | On `__get_value` / `__get_done` CallFunc throw: mark record done + `ThrowValue` (was swallow) |
+
+Fixes e7x→e7bh mass **iter-val-err** dstr regressions (IteratorValue abrupt).
+
+### Measured
+
+| Suite | Score | Notes |
+|-------|------:|-------|
+| e7x→e7bh `*iter-val-err*` | **49/49** recovered | |
+| expressions/function | **251/264** | was 246/264 full e7bh |
+| expressions/arrow-function | **328/343** | was 324/343 full e7bh |
+| safety optional/array/delete/break | still green | |
