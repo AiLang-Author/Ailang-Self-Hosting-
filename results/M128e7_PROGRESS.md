@@ -292,3 +292,33 @@ Root cause of mass e7x→e7bb regressions on `fn.call` / Array methods TypeError
 | Array every/at/from (slice) | improved; at abrupt + from mapfn TypeError green |
 
 **Do not full-suite again until more P0 chips;** use targeted slices to avoid burn.
+
+## M128e7bd (2026-08-01) — optional-chain 100% + new.target 100%
+
+| Area | Change |
+|------|--------|
+| GET_ELEM / SET_ELEM | Array non-index keys (`true`→`"true"`, `1.1`→`"1.1"`) via ToPropertyKey digit check before ToNumber index |
+| OPT_CALL | `super.method?.()` SuperBase+this; `f?.(...spread)` → CALL_SPREAD |
+| Postfix loop | Continue on `TMPL_FULL` so `f()`tpl`` / `o.m`tpl`` tagged templates parse |
+| POLYFILL | `Reflect.construct` / `Reflect.apply` (drive `__new_target__` + apply) |
+| Runner | Module NS Reflect stub only for module/dyn/namespace paths (not bare `"Reflect"`) — multi-let free-var under CallFunc was broken by the huge stub |
+
+### Measured (no-batch)
+
+| Suite | Score | Was |
+|-------|------:|----:|
+| **optional-chaining** | **38/38 (100%)** | 33/38 |
+| **new.target** | **14/14 (100%)** | 10–12/14 |
+| **expressions/array** | **52/52 (100%)** | 44/52 |
+| **expressions/delete** | **69/69 (100%)** | 68/69 |
+| expressions/call | **81/92 (88%)** | 73/92 |
+| concatenation / instanceof / in | still **100%** | |
+| template-literal | 43/57 (unchanged residual) | |
+| coalesce / comma / conditional | TCO residual unchanged | |
+
+### Next P0 chips
+
+- coalesce (2), comma (1), conditional (2) — TCO residual
+- call (11 residual)
+- template-literal (14)
+- logical-assignment / if / for-in bulk

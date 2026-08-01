@@ -257,6 +257,39 @@ if (typeof Reflect.defineProperty !== "function") {
     try { Object.defineProperty(o, p, d); return true; } catch (e) { return false; }
   };
 }
+// M128e7bd: Reflect.construct / Reflect.apply — new.target suite + optional-call
+if (typeof Reflect.construct !== "function") {
+  Reflect.construct = function(target, args, newTarget) {
+    if (typeof target !== "function") throw new TypeError("Reflect.construct");
+    if (newTarget === undefined) newTarget = target;
+    if (typeof newTarget !== "function") throw new TypeError("Reflect.construct");
+    var proto = newTarget.prototype;
+    var obj;
+    if (proto !== null && (typeof proto === "object" || typeof proto === "function")) {
+      obj = Object.create(proto);
+    } else {
+      obj = {};
+    }
+    var save = __new_target__;
+    __new_target__ = newTarget;
+    var result;
+    try {
+      result = Function.prototype.apply.call(target, obj, args || []);
+    } finally {
+      __new_target__ = save;
+    }
+    if (result !== null && (typeof result === "object" || typeof result === "function")) {
+      return result;
+    }
+    return obj;
+  };
+}
+if (typeof Reflect.apply !== "function") {
+  Reflect.apply = function(target, thisArg, args) {
+    if (typeof target !== "function") throw new TypeError("Reflect.apply");
+    return Function.prototype.apply.call(target, thisArg, args || []);
+  };
+}
 globalThis.Reflect = Reflect;
 // Minimal TypedArray for with ObjectEnv tests (features: TypedArray)
 if (typeof Int32Array === "undefined") {
@@ -615,15 +648,19 @@ def preprocess(source, meta=None, test_path=None):
         except Exception:
             source = "var __dynModules = Object.create(null);\n" + source
 
-    # Reflect/gOPD NS shims
+    # Reflect/gOPD NS shims — only for module-namespace / dynimport surfaces.
+    # M128e7bd: do NOT inject on bare "Reflect" in source. Language tests that
+    # only use Reflect.construct/apply (new.target, optional-chaining) paid a
+    # huge free-var cost: multi-let SET_FREE under CallFunc broke (context/called).
     if test_path and (
-        "Reflect" in source
-        or "namespace" in (test_path or "")
+        "namespace" in (test_path or "")
         or "import-defer" in (test_path or "")
+        or "module-code" in (test_path or "")
         or "__markModuleNS" in source
         or "__defEval" in source
         or dyn_imports
         or wants_dyn
+        or is_module
     ):
         if "function __markModuleNS" not in source:
             source = _MODULE_REFLECT_STUB + source
