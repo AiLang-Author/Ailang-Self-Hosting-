@@ -383,3 +383,22 @@ Root cause of mass e7x→e7bb regressions on `fn.call` / Array methods TypeError
 |-------|------:|
 | **template-literal** | **57/57 (100%)** |
 | optional / array / concat / string | still **100%** |
+
+---
+
+## Status snapshot (e7bh) — full suite / G2 / built-ins
+
+Canonical write-up: **`results/TEST262_STATUS_M128e7bh.md`**.
+
+| | Value |
+|--|------:|
+| Last full suite | **e7bb** (`6dbf7744`) — 58.65% overall · lang **87.49%** · built-ins **32.38%** |
+| Best full suite | **e7x** — lang **91.42%** · G2 gap **847** · built-ins **33.86%** |
+| G2 need | **22,454** / 23,635 language passes |
+| G2 gap | **~847** (from e7x) … **~1,775** (from e7bb; pre-e7bc) |
+| Built-ins residual | **~15.5–15.9k** non-pass — **not G2**; blocked until language ≥95% |
+| Full re-run since e7bc–e7bh chips | **No** — safety slices green; schedule full vs e7x when claiming recovery |
+
+### Safety pack at tip (no-batch)
+
+optional-chaining / new.target / array / template-literal / concat / instanceof / in / string — **100%** where listed above.

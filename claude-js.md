@@ -1,30 +1,36 @@
 # Ailang JavaScript Engine — Context Document
 
 > Point Claude / agents at this file to resume JS engine work with full context.
-> Last updated: 2026-07-13 (post Mole 15–16 partial)
+> Last updated: 2026-08-01 (M128e7bh — template-literal 100%)
 
 ## Quick Reference
 
 ```
 Mid-gate:       python3 tools/js_midgate.py [--rebuild|--quick]
-Build e2e:      ./ailang.x JS-tests/test_js_e2e.ailang -o test_js_e2e.x && ./test_js_e2e.x
-Category gate:  python3 tools/test262_runner.py --categories expressions/call,arguments-object,statements/function -j 8
-Full suite:     python3 tools/test262_runner.py --full -j 8 --output-json /tmp/test262_full.json
-Plan / moles:   JS-DEPENDENCY-PLAN.md
+Build harness:  ./ailang.x JS-tests/test262_harness.ailang -o test262_harness.x
+                ./ailang.x JS-tests/test262_harness_batch.ailang -o test262_harness_batch.x
+Category gate:  python3 tools/test262_runner.py --categories expressions/call --no-batch -j 1
+Full suite:     python3 tools/test262_runner.py --full -j 8 --timeout 12 \
+                  --output-json results/test262_full_m128e7.json
+Baseline report: python3 tools/test262_baseline_report.py results/test262_full_NEW.json \
+                  --prior results/test262_full_m128e7x.json --label M128e7xx
+Status (G2):    results/TEST262_STATUS_M128e7bh.md
+Progress log:   results/M128e7_PROGRESS.md
 ```
 
-### Honest status (2026-07-13)
+### Honest status (2026-08-01, tip e7bh)
 
 | Gate | Result |
 |------|--------|
-| e2e / mid curated | **36/0 fail** · **25/25** (+ Mole 15/16 smokes) |
-| call / function / args slice | **60/92 · ~282/451 · mapped 37/43 + unmapped 5/5** (slice **57%**) |
-| dstr | **154/186** (elision/close green; iter-err residual) |
-| Full test262 (last re-full M9) | **10688 / 49998 (21.4%)** |
-| Next | M15 iter-err residual; M16 nested strict-delete + accessor |
-| Warts | `AILANG-WARTS.md` stdlib backlog |
+| **G2** (language ≥95%) | **Not met** — gap **~847** (best full e7x) … **~1,775** (latest full e7bb, pre-e7bc) |
+| **Built-ins** | **~32–34%** (~15.5k residual) — **blocked on G2**; not the current target |
+| Last full suite | **e7bb** 58.65% overall · lang 87.49% · built-ins 32.38% |
+| Best full suite | **e7x** 61.35% · lang **91.42%** · G2 gap **847** |
+| Full suite since e7bc fix | **Not re-run** — use safety slices; re-full to prove recovery |
+| Safety 100% chips | optional-chaining, new.target, array, template-literal, concat, instanceof, in, string |
+| Next | Full rescore vs e7x; P0 call eval-spread / line-terminators; class bulk toward G2 |
 
-**Rule:** no false greens; mid-gate daily; full 50k for milestones. See `JS-DEPENDENCY-PLAN.md`.
+**Rule:** no false greens; no full-suite burn every chip; full ~50k for milestones / G2 claims.
 
 ---
 
