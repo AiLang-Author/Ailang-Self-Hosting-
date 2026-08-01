@@ -255,3 +255,40 @@ OWN-only `__get_*` accessors in GET_PROP / ObjGetAcc (inherited `__get_prototype
 | concatenation / instanceof / in | still 100% |
 
 Residual optional: tagged-template `fn()`tpl`?.a`, early-errors templates, a few async/prod edges.
+
+## Full suite baseline M128e7bb (2026-08-01)
+
+Tip `6dbf7744`. Wall **2936s** (~49 min). Artifacts under `results/test262_full_m128e7bb_*`.
+
+| Metric | e7x | **e7bb** | Δ |
+|--------|----:|---------:|--:|
+| Overall pass | 61.35% | **58.65%** | −2.70 pp |
+| Language | 91.42% | **87.49%** | −3.93 pp |
+| G2 gap | 847 | **1,775** | +928 |
+| Language pass | 21,607 | **20,679** | −928 |
+
+Transitions vs e7x: **fixed 1,109** / **regressed 2,452** (lang 800 / 1,784).
+Knockout: `results/test262_full_m128e7bb_KNOCKOUT.md` (P0 near-complete list).
+Report tool: `tools/test262_baseline_report.py`.
+
+## M128e7bc (2026-08-01) — CallFunc throw / try-catch (regression fix)
+
+Root cause of mass e7x→e7bb regressions on `fn.call` / Array methods TypeError paths:
+
+1. **Double catch delivery:** nested `CallFunc` delivered throw to outer `try` (popping catch), then CALL rethrew uncaught → VM error.
+2. **Fix:** `ThrowValue` / THROW opcode: if `JSVMCall.depth > 0`, surface `exc_prop` only (do not deliver catch). Outer CALL rethrows once.
+3. **Native CallFunc:** bump depth around DispatchStringMethod/Bridge; clear sticky halt on exc_prop.
+4. **Array methods:** honor `thisArg` null/undefined for RequireObjectCoercible; ARR_AT in CallFunc routes.
+5. **throw_delivered:** after mid-native catch delivery, CALL skips success push (no sticky `exc_prop` poison).
+
+### Safe recheck (no-batch)
+
+| Suite | Score |
+|-------|------:|
+| instanceof | **43/43 (100%)** |
+| expressions/in | **36/36 (100%)** |
+| concatenation | **5/5** |
+| optional-chaining | **33/38** |
+| Array every/at/from (slice) | improved; at abrupt + from mapfn TypeError green |
+
+**Do not full-suite again until more P0 chips;** use targeted slices to avoid burn.
