@@ -322,3 +322,16 @@ Root cause of mass e7x→e7bb regressions on `fn.call` / Array methods TypeError
 - call (11 residual)
 - template-literal (14)
 - logical-assignment / if / for-in bulk
+
+## M128e7be (2026-08-01) — ?? cannot mix with && / ||
+
+| Area | Change |
+|------|--------|
+| `JSParse__Precedence` | Reject BINARY_OP mixing `??` with `&&`/`||` (unparenthesized) → SyntaxError |
+
+### Measured
+
+| Suite | Score |
+|-------|------:|
+| **coalesce** | **22/24 (91.7%)** — 4 cannot-chain early-errors green; residual 2× TCO |
+| optional-chaining / new.target / in / instanceof / concat | still **100%** |
