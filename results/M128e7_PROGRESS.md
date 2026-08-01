@@ -233,3 +233,25 @@ OWN-only `__get_*` accessors in GET_PROP / ObjGetAcc (inherited `__get_prototype
 |----------|------:|
 | expressions/concatenation | **5/5 (100%)** |
 | a+"" / Array.toString | pass |
+
+## M128e7bb (2026-08-01) — optional-chain call short-circuit + this
+
+| Area | Change |
+|------|--------|
+| MatchArrayMethod | drop `toString` fast-path so `a.toString === Array.prototype.toString` |
+| CALL | OPT_MEMBER/BRACKET as method; JMP_IF_NULLISH before args (`null?.f()`) |
+| optional spine walk | traverse CALL for `?.b.c(++x).d` |
+| NEW postfix | `new C()?.prop` |
+| new.target postfix | `new.target?.a` / `?.()` |
+| OPT_CALL | method this for `a.b?.()`; cleanup stack on nullish func |
+| PAREN unwrap | `(a?.b)()` / `(a.b)()` preserve this |
+
+### Measured
+
+| Category | Score |
+|----------|------:|
+| optional-chaining | **33/38 (86.8%)** was 30/38 |
+| expressions/array | **44/52** (S11.1.4 identity green; 8 spread-err residual) |
+| concatenation / instanceof / in | still 100% |
+
+Residual optional: tagged-template `fn()`tpl`?.a`, early-errors templates, a few async/prod edges.
