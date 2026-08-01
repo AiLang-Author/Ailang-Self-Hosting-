@@ -591,6 +591,11 @@ def preprocess(source, meta=None, test_path=None):
     for IMPORT_DYN, plus Promise.reject rewrites for throw/script-error targets.
     """
     source = _FRONTMATTER_RE.sub("", source)
+    # M128e7bh: harness ReadTextFile is C-string (NUL truncates). Rewrite
+    # literal NUL-in-quotes from test sources to \\0 escape (tv-null-character).
+    if "\x00" in source:
+        source = source.replace("'\x00'", "'\\0'").replace('"\x00"', '"\\0"')
+        source = source.replace("\x00", "")
     flags = (meta or {}).get("flags") or []
     features = (meta or {}).get("features") or []
     is_module = "module" in flags

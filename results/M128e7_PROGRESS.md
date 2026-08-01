@@ -365,5 +365,21 @@ Root cause of mass e7x→e7bb regressions on `fn.call` / Array methods TypeError
 | Suite | Score | Was |
 |-------|------:|----:|
 | **template-literal** | **52/57 (91.2%)** | 43/57 |
-| Residual | 3× multi-part tagged tv-head/mid/tail; null-char; evaluation-order | |
+| Residual | was 5 — fixed in e7bh | |
 | optional / array / concat | still **100%** | |
+
+## M128e7bh (2026-08-01) — multiparts tagged templates; template-literal 100%
+
+| Area | Change |
+|------|--------|
+| Tagged `TMPL_HEAD`…`TAIL` | CALL(tag, TemplateObject, …exprs); TemplateObject all cooked/raw parts |
+| Postfix continue | `TMPL_HEAD` after call/member |
+| Runner | Rewrite embedded NUL in test sources (`ReadTextFile` C-string truncates) |
+| ScanString | Loop on `pos < src_len` so embedded NUL is not EOF |
+
+### Measured
+
+| Suite | Score |
+|-------|------:|
+| **template-literal** | **57/57 (100%)** |
+| optional / array / concat / string | still **100%** |
