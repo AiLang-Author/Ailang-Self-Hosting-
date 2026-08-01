@@ -403,3 +403,22 @@ Wall **2965s**. Artifacts `results/test262_full_m128e7bh_*`.
 ### Safety pack (no-batch) still green
 
 optional / new.target / array / template-literal / concat / instanceof / in / string — 100% (batch full may show 1 flake on template/delete).
+
+## M128e7bi (2026-08-01) — eval global bindings configurable (D=true)
+
+| Area | Change |
+|------|--------|
+| `JSVM__MirrorGlobalProp` | New mirrors under `JSVMEvalState.depth>0` use attr **7** (W\|E\|C); script stays **3** (W\|E\|!C) |
+
+Root cause of e7x→e7bh eval-code attr regressions: e7aa stamped all new GlobalHash mirrors as script DontDelete (bits 3), including eval `CreateGlobalVar/FunctionBinding` which must be configurable.
+
+### Measured (no-batch)
+
+| Suite | Score | Notes |
+|-------|------:|-------|
+| eval-code/direct | **264/286** | +2 vs e7bh full (var-env-*-global-new) |
+| eval-code/indirect | **53/61** | +2 |
+| expressions/delete | **69/69** | script DontDelete preserved |
+| optional/array/template/new.target | **100%** | safety |
+
+Remaining eval residuals: Annex B block-level function-in-if/switch in eval (~50), local-exstng, strict.
