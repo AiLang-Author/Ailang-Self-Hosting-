@@ -455,3 +455,18 @@ Fixes e7x→e7bh mass **iter-val-err** dstr regressions (IteratorValue abrupt).
 | expressions/function | **251/264** | was 246/264 full e7bh |
 | expressions/arrow-function | **328/343** | was 324/343 full e7bh |
 | safety optional/array/delete/break | still green | |
+
+## M128e7bl (2026-08-01) — setter throw rethrow on SET_PROP / SET_ELEM
+
+| Area | Change |
+|------|--------|
+| SET_PROP / SET_ELEM / SET_PROP_COMPUTED / SET_PROP_SUPER | On setter CallFunc throw: clear exc_prop + `ThrowValue` |
+
+Same swallow pattern as e7bk ITER_NEXT. Recovers put-prop-ref-user-err dstr.
+
+### Measured
+
+| | |
+|--|--|
+| put-prop-ref e7x→e7bh | **4/4** recovered |
+| safety optional/array/delete | 100% |
