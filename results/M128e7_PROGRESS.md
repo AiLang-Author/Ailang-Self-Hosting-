@@ -335,3 +335,18 @@ Root cause of mass e7x→e7bb regressions on `fn.call` / Array methods TypeError
 |-------|------:|
 | **coalesce** | **22/24 (91.7%)** — 4 cannot-chain early-errors green; residual 2× TCO |
 | optional-chaining / new.target / in / instanceof / concat | still **100%** |
+
+## M128e7bf (2026-08-01) — with bare call this = WithBaseObject
+
+| Area | Change |
+|------|--------|
+| `PUSH_WITH_CALL_THIS` (127) | After GET_WITH, push WithRef.base if valid else globalThis |
+| bare IDENT call under `with` | PUSH + SWAP → CALL_METHOD so `with (obj) { method() }` has this=obj |
+
+### Measured
+
+| Suite | Score |
+|-------|------:|
+| **expressions/call** | **82/92 (89.1%)** (+1 with-base-obj; residual mostly TCO + eval-spread) |
+| statements/with | 177/181 (4 proxy-env residual — pre-existing) |
+| optional / new.target / array / coalesce | unchanged |
