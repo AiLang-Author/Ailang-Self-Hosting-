@@ -350,3 +350,20 @@ Root cause of mass e7x→e7bb regressions on `fn.call` / Array methods TypeError
 | **expressions/call** | **82/92 (89.1%)** (+1 with-base-obj; residual mostly TCO + eval-spread) |
 | statements/with | 177/181 (4 proxy-env residual — pre-existing) |
 | optional / new.target / array / coalesce | unchanged |
+
+
+## M128e7bg (2026-08-01) — TemplateObject .raw + template escapes
+
+| Area | Change |
+|------|--------|
+| `JSLex__ScanTemplate` | Dual cooked/raw buffers; pack `cooked\\0raw\\0`; proper `\\b/\\f/\\v/\\u/\\x` |
+| Tagged `TMPL_FULL` | ARRAY_LIT N_OP=1 TemplateObject; STRING N_VALUE=1 |
+| ARRAY_LIT compile | Emit cooked array + `.raw` array from packed TRV |
+
+### Measured
+
+| Suite | Score | Was |
+|-------|------:|----:|
+| **template-literal** | **52/57 (91.2%)** | 43/57 |
+| Residual | 3× multi-part tagged tv-head/mid/tail; null-char; evaluation-order | |
+| optional / array / concat | still **100%** | |
