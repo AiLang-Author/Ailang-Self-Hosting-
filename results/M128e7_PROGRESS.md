@@ -386,19 +386,20 @@ Root cause of mass e7x→e7bb regressions on `fn.call` / Array methods TypeError
 
 ---
 
-## Status snapshot (e7bh) — full suite / G2 / built-ins
+## Status snapshot (e7bh full suite) — G2 / built-ins
 
-Canonical write-up: **`results/TEST262_STATUS_M128e7bh.md`**.
+Canonical: **`results/TEST262_STATUS_M128e7bh.md`** · summary **`results/test262_full_m128e7bh_SUMMARY.md`**.
 
-| | Value |
-|--|------:|
-| Last full suite | **e7bb** (`6dbf7744`) — 58.65% overall · lang **87.49%** · built-ins **32.38%** |
-| Best full suite | **e7x** — lang **91.42%** · G2 gap **847** · built-ins **33.86%** |
-| G2 need | **22,454** / 23,635 language passes |
-| G2 gap | **~847** (from e7x) … **~1,775** (from e7bb; pre-e7bc) |
-| Built-ins residual | **~15.5–15.9k** non-pass — **not G2**; blocked until language ≥95% |
-| Full re-run since e7bc–e7bh chips | **No** — safety slices green; schedule full vs e7x when claiming recovery |
+| | e7x | e7bb | **e7bh full** |
+|--|----:|-----:|--------------:|
+| Overall | 61.35% | 58.65% | **60.58%** (30,123/49,723) |
+| Language | **91.42%** | 87.49% | **88.70%** (20,964) |
+| Built-ins | 33.86% | 32.38% | **35.22%** (8,283) |
+| **G2 gap** | **847** | 1,775 | **1,490** |
 
-### Safety pack at tip (no-batch)
+vs e7bb: **+961 net** · vs e7x: **−382 net** (language still −643).  
+Wall **2965s**. Artifacts `results/test262_full_m128e7bh_*`.
 
-optional-chaining / new.target / array / template-literal / concat / instanceof / in / string — **100%** where listed above.
+### Safety pack (no-batch) still green
+
+optional / new.target / array / template-literal / concat / instanceof / in / string — 100% (batch full may show 1 flake on template/delete).

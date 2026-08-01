@@ -18,17 +18,18 @@ Status (G2):    results/TEST262_STATUS_M128e7bh.md
 Progress log:   results/M128e7_PROGRESS.md
 ```
 
-### Honest status (2026-08-01, tip e7bh)
+### Honest status (2026-08-01, full suite e7bh)
 
 | Gate | Result |
 |------|--------|
-| **G2** (language ≥95%) | **Not met** — gap **~847** (best full e7x) … **~1,775** (latest full e7bb, pre-e7bc) |
-| **Built-ins** | **~32–34%** (~15.5k residual) — **blocked on G2**; not the current target |
-| Last full suite | **e7bb** 58.65% overall · lang 87.49% · built-ins 32.38% |
-| Best full suite | **e7x** 61.35% · lang **91.42%** · G2 gap **847** |
-| Full suite since e7bc fix | **Not re-run** — use safety slices; re-full to prove recovery |
+| **G2** (language ≥95%) | **Not met** — gap **1,490** (lang **88.70%**, 20,964/23,635) |
+| **Built-ins** | **35.22%** (8,283/23,518) — best full yet; still ~15k residual; after G2 |
+| Full suite e7bh | **60.58%** overall (30,123/49,723) · wall ~49 min |
+| vs e7x | overall **−382** · language **−643** |
+| vs e7bb | overall **+961** · language **+285** (recovered most of CallFunc dip) |
 | Safety 100% chips | optional-chaining, new.target, array, template-literal, concat, instanceof, in, string |
-| Next | Full rescore vs e7x; P0 call eval-spread / line-terminators; class bulk toward G2 |
+| Next | Close language gap to e7x (class bulk); then G2; built-ins later |
+| Status doc | `results/TEST262_STATUS_M128e7bh.md` |
 
 **Rule:** no false greens; no full-suite burn every chip; full ~50k for milestones / G2 claims.
 
