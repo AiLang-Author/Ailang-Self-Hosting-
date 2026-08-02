@@ -214,7 +214,7 @@ function asyncTest(testFunc) {
 }
 globalThis.asyncTest = asyncTest;
 // M128e6ai: always provide Reflect (Proxy with tests / set-mutable-binding)
-if (typeof Reflect === "undefined") { var Reflect = {}; }
+if (typeof Reflect === "undefined") { Reflect = {}; }
 if (typeof Reflect.has !== "function") {
   Reflect.has = function(o, p) { return p in o; };
 }

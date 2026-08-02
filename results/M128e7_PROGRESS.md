@@ -565,3 +565,29 @@ Root cause of class wall dstr bulk: tests expose private methods via `get method
 
 - private/static/proxy field edges
 - timeouts (~28 stmt) — separate from SuperCall SE
+
+## M128e7br (2026-08-02) — Reflect + field SuperProp + nested-fn SuperCall fix
+
+| Area | Change |
+|------|--------|
+| `Reflect.has/get/set` | Native install + JSBridge dispatch (IDs 286–288) |
+| Field-init eval | SuperCall SE; SuperProperty + `new.target` allowed |
+| SuperCall detect | Only via caller `__super__` match (not any class ctor) |
+| Class fidx stamp | Constructor/method use **pre**-CompileFunc fidx (nested fns no longer steal class flags) |
+| `+40` flags | High-bit class/method markers (not plain 1/2/4 body_start) |
+| test262 polyfill | `Reflect = {}` without `var` (hoist was wiping native Reflect) |
+
+### Measured
+
+| Suite | Score |
+|-------|------:|
+| expressions/class/elements | **1409 pass / 6 fail / 8 t/o (99.6%)** |
+| statements/class/elements | **1456 pass / 7 fail / 8 t/o (99.5%)** |
+| elements combined | **2865 / 13 / 16 of 2962 (99.5%)** |
+| assignment | **485/485 (100%)** |
+| prod-private-method | pass |
+| *supercall* residual | still green |
+
+### Residual
+
+~13 hard fails + timeouts (not SuperCall/Reflect bulk).
