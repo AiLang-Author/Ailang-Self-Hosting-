@@ -160,16 +160,17 @@ python3 tools/test262_runner.py --full -j 8 --timeout 12 --output-json results/t
 
 ## 7. Scoreboard (fill on each baseline)
 
-| Slice | e7bb full | B0 (e7bt tip) | e7bu | B1 80% | Notes |
-|-------|----------:|-------------:|-----:|-------:|-------|
-| Object | 64.7% | **72.7%** | **73.1%** | | assign ToObject; gOPS; groupBy |
-| Array | 71.9% | **74.9%** | | | |
-| String | 58.7% | **62.2%** | | | |
-| Promise | 66.0% | **65.5%** | | | |
-| built-ins overall | 32.3% | (core OA/SP **71.4%**) | | | deserts drag full % |
+| Slice | e7bb full | B0 (e7bt tip) | e7bu | tip e7c2 | Notes |
+|-------|----------:|-------------:|-----:|---------:|-------|
+| Object | 64.7% | **72.7%** | **73.1%** | **82.0%** ✅ B1 80% | defineProperty 85%; array attr spine; assign Set |
+| Array | 71.9% | **74.9%** | | **78.4%** | concat IsConcatSpreadable; ARR_OF ID fix |
+| String | 58.7% | **62.2%** | | **65.4%** | |
+| Promise | 66.0% | **65.5%** | | **66.7%** | |
+| built-ins overall | 32.3% | (core OA/SP **71.4%**) | | core climbing | deserts still drag full % |
 | language | ~87% | **~96% G2** | G2 | — | freeze language campaign |
 
-**e7bu:** `Library.JSVMObjectMethods.ailang` (new); symbol registry; assign boxes primitives.
+**e7bu:** `Library.JSVMObjectMethods.ailang` (new); symbol registry; assign boxes primitives.  
+**e7bz–e7c2:** SET_PROP/GET_PROP ARRAY accessors; ArrSetLen non-config; length defineProperty; assign throw; concat; Array.of ID uncollide.
 
 Update this table in place; don’t spawn another parallel plan file.
 
