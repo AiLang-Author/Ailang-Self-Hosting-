@@ -277,6 +277,9 @@ if (typeof Reflect.construct !== "function") {
         __n === "is" || __n === "hasOwn" || __n === "preventExtensions" ||
         __n === "isExtensible" || __n === "isFrozen" || __n === "isSealed" ||
         __n === "getPrototypeOf" || __n === "setPrototypeOf" ||
+        __n === "propertyIsEnumerable" || __n === "isPrototypeOf" ||
+        __n === "hasOwnProperty" || __n === "toString" || __n === "valueOf" ||
+        __n === "toLocaleString" ||
         (__n && __n.length > 0 && __n.charCodeAt(0) >= 97 && __n.charCodeAt(0) <= 122 &&
          __n !== "get" && __n !== "set" && __n !== "has" && __n !== "apply" &&
          __n !== "call" && __n !== "bind")) {
