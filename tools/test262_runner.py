@@ -639,7 +639,10 @@ def preprocess(source, meta=None, test_path=None):
             elif wants_dyn:
                 link_src = "var __dynModules = Object.create(null);\n" + source
             source = _preprocess_module(link_src, test_path)
-            if is_module and "async" not in flags and (
+            # M128e7bt: wrap TLA even when flags include [async]. Engine has no
+            # bare top-level await; async suite uses $DONE but still needs the
+            # async-IIFE wrapper so `await` is legal (28/32 TLA fails were async).
+            if is_module and (
                 "top-level-await" in features or _source_has_toplevel_await(source)
             ):
                 source = _wrap_toplevel_await(source)
@@ -2313,7 +2316,16 @@ def _preprocess_module(source, test_path):
         has_imports = bool(re.search(r'\bimport\b', fix or ''))
         # Pure side-effect modules: isolate locals (uniq-env-rec). Keep
         # modules with exports in shared scope so bindings are reachable.
-        if isolate_side_effect and not has_exports and not has_imports:
+        # M128e7bt: never IIFE-wrap fixtures that touch globalThis — dual-bind
+        # of globalThis.evaluations (import-defer setup_FIXTURE) breaks once
+        # deferred NS getters close over free vars (length reads VM-error).
+        touches_globalthis = bool(re.search(r'\bglobalThis\b', body))
+        if (
+            isolate_side_effect
+            and not has_exports
+            and not has_imports
+            and not touches_globalthis
+        ):
             pfx = f"__fx{len(inlined)}_"
             body = re.sub(
                 r'\bfunction\s*(\*?)\s*([A-Za-z_$][\w$]*)',
@@ -2466,9 +2478,9 @@ def _preprocess_module(source, test_path):
                 if im == '*' and not str(exp).startswith('*from*'):
                     fn[exp] = exp
 
-        # M128v: hoist export locals outside eval thunk so NS getters close over them.
-        # Use `var loc = undefined` (not bare var) + function expression so free-var
-        # assign inside the thunk updates the outer binding under eval_mode.
+        # M128v/e7bt: export locals live on a store object (not free-var bindings).
+        # Free-var SET breaks once func_count climbs (module Reflect stub ~77 fns);
+        # property sets on a closed-over store object remain reliable.
         hoist_locs = set()
         for exp, loc in fn.items():
             if str(exp).startswith('*from*'):
@@ -2478,6 +2490,7 @@ def _preprocess_module(source, test_path):
                     hoist_locs.add(str(loc))
         if fd and re.match(r'^[A-Za-z_$][\w$]*$', str(fd)):
             hoist_locs.add(str(fd))
+        store = f'__defStore_{safe}'
         body_hoisted = body_exec
         for loc in hoist_locs:
             body_hoisted = re.sub(
@@ -2495,13 +2508,21 @@ def _preprocess_module(source, test_path):
                 f'{loc} = class',
                 body_hoisted,
             )
+        # Rewrite identifiers → store.prop (longest first to avoid partial replaces)
+        for loc in sorted(hoist_locs, key=len, reverse=True):
+            body_hoisted = re.sub(
+                rf'\b{re.escape(loc)}\b',
+                f'{store}.{loc}',
+                body_hoisted,
+            )
         lines = []
-        for loc in sorted(hoist_locs):
-            lines.append(f'var {loc} = undefined;')
-        lines.append(f'var {flag} = false;')
+        lines.append(f'var {store} = Object.create(null);')
+        # Keep done-flag on the store too — free-var SET of a bool flag also
+        # breaks under high func_count (same SET_FREE cliff as export binds).
+        lines.append(f'{store}.__done = false;')
         lines.append(f'var {eval_fn} = function(){{')
-        lines.append(f'  if ({flag}) return;')
-        lines.append(f'  {flag} = true;')
+        lines.append(f'  if ({store}.__done) return;')
+        lines.append(f'  {store}.__done = true;')
         for c in eager_chunks:
             for ln in c.splitlines():
                 lines.append('  ' + ln)
@@ -2521,11 +2542,16 @@ def _preprocess_module(source, test_path):
             if not re.match(r'^[A-Za-z_$][\w$]*$', str(loc)):
                 continue
             prop = json.dumps(exp, ensure_ascii=False)
+            if str(loc).startswith('__defNS_'):
+                # Nested deferred NS object — not on the store
+                val_expr = str(loc)
+            else:
+                val_expr = f'{store}.{loc}'
             # "then" is IsSymbolLikeNamespaceKey for deferred NS — no eval trigger
             if exp == 'then':
-                getter = f'function(){{ return {loc}; }}'
+                getter = f'function(){{ return {val_expr}; }}'
             else:
-                getter = f'function(){{ {eval_fn}(); return {loc}; }}'
+                getter = f'function(){{ {eval_fn}(); return {val_expr}; }}'
             lines.append(
                 f'Object.defineProperty({ns_tmp}, {prop}, {{'
                 f'get:{getter},'
@@ -2534,9 +2560,13 @@ def _preprocess_module(source, test_path):
             )
             key_list.append(exp)
         if fd and re.match(r'^[A-Za-z_$][\w$]*$', str(fd)) and 'default' not in key_list:
+            if str(fd).startswith('__defNS_'):
+                dval = str(fd)
+            else:
+                dval = f'{store}.{fd}'
             lines.append(
                 f'Object.defineProperty({ns_tmp}, "default", {{'
-                f'get:function(){{ {eval_fn}(); return {fd}; }},'
+                f'get:function(){{ {eval_fn}(); return {dval}; }},'
                 f'set:function(){{throw new TypeError("deferred NS read-only");}},'
                 f'enumerable:true,configurable:false}});'
             )
@@ -2854,28 +2884,22 @@ def _preprocess_module(source, test_path):
     if _deferred_emitted:
         fixture_chunks.insert(
             0,
-            # Deferred NS: evaluate on export-like access, but not on "then" / @@toStringTag
-            # Only string keys (except "then") trigger deferred evaluation.
-            # Symbols / non-strings: IsSymbolLikeNamespaceKey — no eval, no prop op
-            # (engine SIGSEGVs on some Symbol property access against exotic objects).
-            # Walk prototype so Object.create(ns) access still triggers.
-            'function __defTouch(o,k){'
-            'if(typeof k!=="string"||k==="then")return o;'
-            'var c=o;while(c){'
+            # M128e7bt: single dispatcher instead of 4 decls — each extra function
+            # pushes free-var/getter scripts over the ~80 func_count cliff with the
+            # module Reflect stub. kind: 0=get 1=has 2=del.
+            # Deferred NS: string keys except "then" trigger eval; walk prototype
+            # so Object.create(ns) still triggers; symbols skip eval.
+            'function __defOp(kind,o,k){'
+            'if(typeof k!=="string"){'
+            'if(kind===0)return undefined;if(kind===1)return false;return true;}'
+            'if(k!=="then"){var c=o;while(c){'
             'if(typeof c.__defEval==="function"){c.__defEval();break;}'
-            'try{c=Object.getPrototypeOf(c);}catch(e){break;}}'
-            'return o;}'
-            'function __defGet(o,k){'
-            'if(typeof k!=="string")return undefined;'
-            '__defTouch(o,k);return o[k];}'
-            'function __defHas(o,k){'
-            'if(typeof k!=="string")return false;'
-            '__defTouch(o,k);'
+            'try{c=Object.getPrototypeOf(c);}catch(e){break;}}}'
+            'if(kind===0)return o[k];'
+            'if(kind===1){'
             'if(typeof Reflect!=="undefined"&&Reflect.has)return Reflect.has(o,k);'
             'return k in o;}'
-            'function __defDel(o,k){'
-            'if(typeof k!=="string")return true;'
-            '__defTouch(o,k);try{return delete o[k];}catch(e){return false;}}\n',
+            'try{return delete o[k];}catch(e){return false;}}\n',
         )
 
     # export * as NAME from './fix' early so default/named maps see __default_export__
@@ -3841,7 +3865,7 @@ def _preprocess_module(source, test_path):
             if m.group(2) in defer_ids or m.group(2) in _deferred_emitted.values():
                 defer_ids.add(m.group(1))
         for did in list(defer_ids):
-            # ns.prop → __defGet(ns, "prop")  — not on LHS of assignment
+            # ns.prop → __defOp(0, ns, "prop")  — not on LHS of assignment
             def _dot_get(m, _did=did):
                 # if next non-ws is `=` (and not `==`/`===`), leave alone
                 end = m.end()
@@ -3852,14 +3876,14 @@ def _preprocess_module(source, test_path):
                 ch = new_src[end + j:end + j + 2]
                 if ch.startswith('=') and not ch.startswith('=='):
                     return m.group(0)
-                return f'__defGet({_did}, "{m.group(1)}")'
+                return f'__defOp(0, {_did}, "{m.group(1)}")'
 
             new_src = re.sub(
                 rf'(?<![\w$.]){re.escape(did)}\.([A-Za-z_$][\w$]*)',
                 _dot_get,
                 new_src,
             )
-            # ns[expr] → __defGet / delete ns[expr] → __defDel
+            # ns[expr] → __defOp(0,...) / delete ns[expr] → __defOp(2,...)
             out = []
             i = 0
             pat = re.compile(rf'(?<![\w$.]){re.escape(did)}\s*\[')
@@ -3887,15 +3911,15 @@ def _preprocess_module(source, test_path):
                     j += 1
                 expr = new_src[m.end():j - 1]
                 if is_del:
-                    out.append(f'__defDel({did}, {expr})')
+                    out.append(f'__defOp(2, {did}, {expr})')
                 else:
-                    out.append(f'__defGet({did}, {expr})')
+                    out.append(f'__defOp(0, {did}, {expr})')
                 i = j
             new_src = ''.join(out)
-            # expr in ns → __defHas(ns, expr)
+            # expr in ns → __defOp(1, ns, expr)
             new_src = re.sub(
                 rf'(?<![\w$.])([A-Za-z_$][\w$]*)\s+in\s+{re.escape(did)}(?![\w$])',
-                rf'__defHas({did}, \1)',
+                rf'__defOp(1, {did}, \1)',
                 new_src,
             )
 
