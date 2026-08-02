@@ -1427,8 +1427,19 @@ Object.getOwnPropertySymbols = function(o) {
     };
   }
 })();
-// Always install/override Reflect helpers used by namespace tests
-if (typeof Reflect === 'undefined') { var Reflect = {}; }
+// Always install/override Reflect helpers used by namespace tests.
+// M128e7bs: never `var Reflect` here — var-hoist wipes the polyfill/native Reflect
+// and bare `Reflect.x = fn` can throw/VM-error mid-stub, killing dyn-import async.
+// Install via try + defineProperty (same pattern as has/get).
+if (typeof Reflect === "undefined") { Reflect = {}; }
+function __installReflectMethod(name, fn) {
+  try { Reflect[name] = fn; } catch (__e) {}
+  try {
+    Object.defineProperty(Reflect, name, {
+      value: fn, writable: true, configurable: true, enumerable: false
+    });
+  } catch (__e) {}
+}
 function __moduleReflectHas(o, p) {
   if (__isModuleNS(o) && typeof p === "string") {
     // "then" is special for deferred NS (does not trigger evaluation)
@@ -1458,19 +1469,7 @@ function __moduleReflectGet(o, p, r) {
   }
   return o[p];
 }
-try { Reflect.has = __moduleReflectHas; } catch (__e) {}
-try {
-  Object.defineProperty(Reflect, "has", {
-    value: __moduleReflectHas, writable: true, configurable: true, enumerable: false
-  });
-} catch (__e) {}
-try { Reflect.get = __moduleReflectGet; } catch (__e) {}
-try {
-  Object.defineProperty(Reflect, "get", {
-    value: __moduleReflectGet, writable: true, configurable: true, enumerable: false
-  });
-} catch (__e) {}
-Reflect.set = function(o, p, v, r) {
+function __moduleReflectSet(o, p, v, r) {
   if (__isModuleNS(o)) return false;
   // M128e6ai: OrdinarySet with Receiver so Proxy gOPD/defineProperty fire
   if (arguments.length < 4) r = o;
@@ -1496,8 +1495,8 @@ Reflect.set = function(o, p, v, r) {
     o[p] = v;
     return true;
   } catch (e) { return false; }
-};
-Reflect.ownKeys = function(o) {
+}
+function __moduleReflectOwnKeys(o) {
   // getOwnPropertyNames already filters/sorts for module NS
   var names = Object.getOwnPropertyNames(o);
   var out = [];
@@ -1513,11 +1512,11 @@ Reflect.ownKeys = function(o) {
     for (var j = 0; j < syms.length; j++) out.push(syms[j]);
   }
   return out;
-};
-Reflect.getOwnPropertyDescriptor = function(o, p) {
+}
+function __moduleReflectGOPD(o, p) {
   return Object.getOwnPropertyDescriptor(o, p);
-};
-Reflect.defineProperty = function(o, p, d) {
+}
+function __moduleReflectDefineProperty(o, p, d) {
   if (__isModuleNS(o)) {
     // Non-exported → false
     var cur = null;
@@ -1555,7 +1554,38 @@ Reflect.defineProperty = function(o, p, d) {
     _odp(o, p, d);
     return true;
   } catch (e) { return false; }
-};
+}
+function __moduleReflectDeleteProperty(o, p) {
+  if (__isModuleNS(o)) {
+    if (Object.prototype.hasOwnProperty.call(o, p) && p !== "__moduleNamespace__") return false;
+  }
+  try {
+    var d = Object.getOwnPropertyDescriptor(o, p);
+    if (d && d.configurable === false) return false;
+    return delete o[p];
+  } catch (e) { return false; }
+}
+function __moduleReflectIsExtensible(o) { return Object.isExtensible(o); }
+function __moduleReflectPreventExtensions(o) {
+  try { Object.preventExtensions(o); } catch (e) {}
+  return true;
+}
+function __moduleReflectGetPrototypeOf(o) { return Object.getPrototypeOf(o); }
+function __moduleReflectSetPrototypeOf(o, p) {
+  if (__isModuleNS(o)) return (p === null);
+  try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; }
+}
+__installReflectMethod("has", __moduleReflectHas);
+__installReflectMethod("get", __moduleReflectGet);
+__installReflectMethod("set", __moduleReflectSet);
+__installReflectMethod("ownKeys", __moduleReflectOwnKeys);
+__installReflectMethod("getOwnPropertyDescriptor", __moduleReflectGOPD);
+__installReflectMethod("defineProperty", __moduleReflectDefineProperty);
+__installReflectMethod("deleteProperty", __moduleReflectDeleteProperty);
+__installReflectMethod("isExtensible", __moduleReflectIsExtensible);
+__installReflectMethod("preventExtensions", __moduleReflectPreventExtensions);
+__installReflectMethod("getPrototypeOf", __moduleReflectGetPrototypeOf);
+__installReflectMethod("setPrototypeOf", __moduleReflectSetPrototypeOf);
 // Object.defineProperty throws when Reflect.defineProperty is false (strict)
 (function() {
   if (Object.__moduleDefPropShim) return;
@@ -1594,26 +1624,6 @@ Reflect.defineProperty = function(o, p, d) {
     return _odp(o, p, d);
   };
 })();
-Reflect.deleteProperty = function(o, p) {
-  if (__isModuleNS(o)) {
-    if (Object.prototype.hasOwnProperty.call(o, p) && p !== "__moduleNamespace__") return false;
-  }
-  try {
-    var d = Object.getOwnPropertyDescriptor(o, p);
-    if (d && d.configurable === false) return false;
-    return delete o[p];
-  } catch (e) { return false; }
-};
-Reflect.isExtensible = function(o) { return Object.isExtensible(o); };
-Reflect.preventExtensions = function(o) {
-  try { Object.preventExtensions(o); } catch (e) {}
-  return true;
-};
-Reflect.getPrototypeOf = function(o) { return Object.getPrototypeOf(o); };
-Reflect.setPrototypeOf = function(o, p) {
-  if (__isModuleNS(o)) return (p === null);
-  try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; }
-};
 // Object.setPrototypeOf must throw when [[SetPrototypeOf]] is false (module NS)
 (function() {
   if (Object.__moduleSetProtoShim) return;
