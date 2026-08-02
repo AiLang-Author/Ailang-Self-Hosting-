@@ -1,5 +1,10 @@
 # JS Engine — Plan to **90%** (full suite, all features)
 
+> **HISTORICAL (language march archive).**  
+> Language **G2 met** (~96% pass/(pass+fail), M128e7bt).  
+> **Active plan:** [`Plans/JS_BUILTINS_PLAN.md`](./Plans/JS_BUILTINS_PLAN.md) — built-ins leg.  
+> Do not use this file’s march order or M65 scores for new work.
+
 **Updated:** 2026-07-20 (M70 L3 object grind)  
 **Branch:** `gpu-45-may-baseline-restore`  
 **Full baseline:** [`results/FULL_SUITE_M65.md`](./results/FULL_SUITE_M65.md) · JSON `results/test262_full_m65.json`  

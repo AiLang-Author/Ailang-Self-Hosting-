@@ -1,8 +1,12 @@
 # Browser JS Conformance — Living Scoreboard
 
+> **STALE scores (M65 era).** Language G2 certificate: [`results/test262_lang_m128e7bt_SUMMARY.md`](./results/test262_lang_m128e7bt_SUMMARY.md).  
+> **Active plan:** [`Plans/JS_BUILTINS_PLAN.md`](./Plans/JS_BUILTINS_PLAN.md).  
+> Old plan archive: [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md).
+
 **Updated:** 2026-07-20  
 **Branch:** `gpu-45-may-baseline-restore`  
-**Plan:** [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md)  
+**Plan:** [`Plans/JS_BUILTINS_PLAN.md`](./Plans/JS_BUILTINS_PLAN.md) (was JS-DEPENDENCY-PLAN)  
 **Full baseline:** [`results/FULL_SUITE_M65.md`](./results/FULL_SUITE_M65.md)
 
 ---
