@@ -540,3 +540,28 @@ Root cause of class wall dstr bulk: tests expose private methods via `get method
 | class/dstr total recovered | **~969** | dominant class regression cluster |
 | e7x→e7bh class/elements | **208/305 (68%)** | residual private/static/proxy |
 | definition/accessors + probes | green | |
+
+## M128e7bq (2026-08-02) — field-init eval SuperCall SE + SuperCall delivery
+
+| Area | Change |
+|------|--------|
+| `JSVM__RunFieldInitForCtor` | After CallFunc (depth>0), re-`ThrowValue` pending so SuperCall RETURN/native paths deliver SE (base CONSTRUCT already rethrew; extends swallowed bare `exc_prop`) |
+| `JSVMEvalState.in_field_init_run` | Sticky around field_init CallFunc |
+| `__field_init__` name on fi fdesc | Reliable field-init caller detect (bit26 collides with count) |
+| `JSVM_Eval__SourceHasSuperCall` | UTF-8 source scan for `super(` before deep AST |
+| Eval SuperCall early errors | SE unless constructor direct-eval; field-init always SE |
+
+### Measured
+
+| Suite | Score | Notes |
+|-------|------:|-------|
+| **\*supercall\* class/elements** | **72/72 (100%)** | expr+stmt; was bulk residual |
+| **statements/class/elements** | **1427 pass / 30 fail / 28 t/o (97.9%)** | was ~1351 pass / 107 fail |
+| **expressions/class/elements** | **1386–1391 pass / ~29 fail / ~8 t/o (98.0%)** | |
+| **expressions/class/dstr** | **1920/1920 (100%)** | regression OK |
+| **expressions/assignment** | **485/485 (100%)** | regression OK |
+
+### Residual (elements)
+
+- private/static/proxy field edges
+- timeouts (~28 stmt) — separate from SuperCall SE
