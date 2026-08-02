@@ -521,3 +521,22 @@ Root cause of mass Annex B eval-func-update + any post-eval call that returns a 
 | expressions/assignment residual 3 | **3/3** |
 | **expressions/assignment** | **485/485 (100%)** |
 | safety optional/array/delete/break/continue | **100%** |
+
+## M128e7bp (2026-08-01) — class instance getters via prototype chain
+
+| Area | Change |
+|------|--------|
+| `GET_PROP` | OrdinaryGet: walk `[[Prototype]]` for `__get_<name>`; prefer accessor over same-object data placeholder; `this` = Receiver |
+| `JSVM__ObjGetAcc` | Same walk (with / Proxy get path) |
+
+Root cause of class wall dstr bulk: tests expose private methods via `get method() { return this.#m }`. OWN-only `__get_*` left `new C().method` as `undefined` (proto data placeholder won via ObjGet) while `C.prototype.method` worked.
+
+### Measured
+
+| Suite | Score | Notes |
+|-------|------:|-------|
+| e7x→e7bh private class/dstr | **764/764** | was 0/200 sample |
+| e7x→e7bh public class/dstr | **205/205** | |
+| class/dstr total recovered | **~969** | dominant class regression cluster |
+| e7x→e7bh class/elements | **208/305 (68%)** | residual private/static/proxy |
+| definition/accessors + probes | green | |
