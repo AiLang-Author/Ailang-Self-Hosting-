@@ -489,3 +489,19 @@ Same CallFunc-swallow class as e7bk ITER_NEXT / e7bl SET_PROP. Recovers object-r
 | expressions/assignment | **482/485** | 99.4% |
 | safety optional/array/delete/break/continue | **100%** | |
 | template-literal | 55/57 | pre-existing TV line-cont/terminator residual (not this change) |
+
+## M128e7bn (2026-08-01) — DeepOwnConst type-5 / bigint strings for eval closures
+
+| Area | Change |
+|------|--------|
+| `JSVM_Eval__DeepOwnConst` | Own **type 5** STRING_LEN (`[len:8][bytes][0]`) and **type 4** BigInt digit strings out of `str_buf` |
+
+Root cause of mass Annex B eval-func-update + any post-eval call that returns a string literal: e7an switched literals to type 5, but DeepOwnConst only permanentized type 2. After `RestoreOuter` rewrote `str_buf`, LoadConst type5 read dangling bytes → VM error. Numbers survived (no str_buf).
+
+### Measured
+
+| Suite | Score | Notes |
+|-------|------:|-------|
+| e7x→e7bh `annexB/.../eval-code` regs | **57/57** | all recovered |
+| annexB eval-code direct+indirect | **345/469 (73.7%)** | was ~55% direct-only pre-fix sample |
+| probes ret_str / block / arrow / global | pass | |
