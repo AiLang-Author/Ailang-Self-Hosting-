@@ -257,12 +257,45 @@ if (typeof Reflect.defineProperty !== "function") {
     try { Object.defineProperty(o, p, d); return true; } catch (e) { return false; }
   };
 }
-// M128e7bd: Reflect.construct / Reflect.apply — new.target suite + optional-call
+// M128e7bd/e7bv: Reflect.construct — honor IsConstructor(newTarget).
+// Engine: non-ctor natives (Object.assign, keys, map, …) throw on `new`.
+// Heuristic: well-known ctor names always constructible; lowercase .name
+// (builtin methods) probed with `new bind()`; other functions assumed ok.
 if (typeof Reflect.construct !== "function") {
   Reflect.construct = function(target, args, newTarget) {
     if (typeof target !== "function") throw new TypeError("Reflect.construct");
-    if (newTarget === undefined) newTarget = target;
+    if (arguments.length < 3) newTarget = target;
     if (typeof newTarget !== "function") throw new TypeError("Reflect.construct");
+    var a = args || [];
+    var __n = newTarget.name;
+    var __isCtor = true;
+    if (__n === "assign" || __n === "keys" || __n === "create" || __n === "freeze" ||
+        __n === "seal" || __n === "entries" || __n === "values" || __n === "fromEntries" ||
+        __n === "getOwnPropertySymbols" || __n === "getOwnPropertyNames" ||
+        __n === "getOwnPropertyDescriptor" || __n === "getOwnPropertyDescriptors" ||
+        __n === "defineProperty" || __n === "defineProperties" || __n === "groupBy" ||
+        __n === "is" || __n === "hasOwn" || __n === "preventExtensions" ||
+        __n === "isExtensible" || __n === "isFrozen" || __n === "isSealed" ||
+        __n === "getPrototypeOf" || __n === "setPrototypeOf" ||
+        (__n && __n.length > 0 && __n.charCodeAt(0) >= 97 && __n.charCodeAt(0) <= 122 &&
+         __n !== "get" && __n !== "set" && __n !== "has" && __n !== "apply" &&
+         __n !== "call" && __n !== "bind")) {
+      // lowercase builtin method — confirm non-constructible
+      try {
+        new (Function.prototype.bind.call(newTarget))();
+      } catch (__e) {
+        __isCtor = false;
+      }
+    }
+    if (!__isCtor) throw new TypeError("Reflect.construct");
+    if (newTarget === target) {
+      if (a.length === 0) return new target();
+      if (a.length === 1) return new target(a[0]);
+      if (a.length === 2) return new target(a[0], a[1]);
+      if (a.length === 3) return new target(a[0], a[1], a[2]);
+      var __b = Function.prototype.bind.apply(target, [null].concat(Array.prototype.slice.call(a)));
+      return new __b();
+    }
     var proto = newTarget.prototype;
     var obj;
     if (proto !== null && (typeof proto === "object" || typeof proto === "function")) {
@@ -274,7 +307,7 @@ if (typeof Reflect.construct !== "function") {
     __new_target__ = newTarget;
     var result;
     try {
-      result = Function.prototype.apply.call(target, obj, args || []);
+      result = Function.prototype.apply.call(target, obj, a);
     } finally {
       __new_target__ = save;
     }
