@@ -395,14 +395,34 @@ function verifyEnumerable(obj, name) {
   for (var k in obj) { if (k === name) { found = true; } }
   if (!found) { __test262_failed = 1; }
 }
-function verifyWritable(obj, name) {
-  var old = obj[name]; obj[name] = "___test262_w___";
-  if (obj[name] === old) { __test262_failed = 1; }
-  obj[name] = old;
+// M128e7by: match test262 propertyHelper isWritable — 3rd arg verifyProp for
+// accessors (set updates obj[verifyProp], not obj[name] which is still getter).
+function verifyWritable(obj, name, verifyProp, value) {
+  var newValue = (value !== undefined) ? value : "___test262_w___";
+  var oldValue = obj[name];
+  if (newValue === oldValue) newValue = newValue + "2";
+  var had = Object.prototype.hasOwnProperty.call(obj, name);
+  try { obj[name] = newValue; } catch (e) { __test262_failed = 1; return; }
+  var check = (verifyProp !== undefined && verifyProp !== null) ? obj[verifyProp] : obj[name];
+  if (check !== newValue) { __test262_failed = 1; }
+  else {
+    if (had) {
+      try { obj[name] = oldValue; } catch (e2) {}
+    } else {
+      try { delete obj[name]; } catch (e3) {}
+    }
+  }
 }
-function verifyNotWritable(obj, name) {
-  var old = obj[name]; obj[name] = "___test262_w___";
-  if (obj[name] !== old) { __test262_failed = 1; }
+function verifyNotWritable(obj, name, verifyProp, value) {
+  var newValue = (value !== undefined) ? value : "___test262_w___";
+  var oldValue = obj[name];
+  var oldCheck = (verifyProp !== undefined && verifyProp !== null) ? obj[verifyProp] : obj[name];
+  try { obj[name] = newValue; } catch (e) { /* TypeError expected for non-writable */ }
+  var check = (verifyProp !== undefined && verifyProp !== null) ? obj[verifyProp] : obj[name];
+  if (check !== oldCheck && check === newValue) { __test262_failed = 1; }
+  else {
+    try { obj[name] = oldValue; } catch (e2) {}
+  }
 }
 function verifyConfigurable(obj, name) {
   var old = obj[name]; delete obj[name];
