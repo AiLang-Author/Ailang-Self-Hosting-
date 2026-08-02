@@ -470,3 +470,22 @@ Same swallow pattern as e7bk ITER_NEXT. Recovers put-prop-ref-user-err dstr.
 |--|--|
 | put-prop-ref e7x→e7bh | **4/4** recovered |
 | safety optional/array/delete | 100% |
+
+## M128e7bm (2026-08-01) — OBJ_SPREAD / GET_ELEM getter abrupt rethrow
+
+| Area | Change |
+|------|--------|
+| `OBJ_SPREAD` (93) | On `__get_*` CallFunc throw: clear exc_prop + `ThrowValue` (was bare return — swallow) |
+| `GET_ELEM` object + array-index | Same rethrow pattern for getter CallFunc |
+
+Same CallFunc-swallow class as e7bk ITER_NEXT / e7bl SET_PROP. Recovers object-rest getter abrupt + keeps for-of value-attr path green.
+
+### Measured
+
+| Suite | Score | Notes |
+|-------|------:|-------|
+| e7x→e7bh `obj-rest` / `getter-abrupt` / `iter-val-err` / put-prop slice | **36/36** | all recovered |
+| e7x→e7bh `statements/for-of` regs | **25/25** | includes value-attr-error |
+| expressions/assignment | **482/485** | 99.4% |
+| safety optional/array/delete/break/continue | **100%** | |
+| template-literal | 55/57 | pre-existing TV line-cont/terminator residual (not this change) |
