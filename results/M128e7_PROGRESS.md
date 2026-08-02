@@ -505,3 +505,19 @@ Root cause of mass Annex B eval-func-update + any post-eval call that returns a 
 | e7x→e7bh `annexB/.../eval-code` regs | **57/57** | all recovered |
 | annexB eval-code direct+indirect | **345/469 (73.7%)** | was ~55% direct-only pre-fix sample |
 | probes ret_str / block / arrow / global | pass | |
+
+## M128e7bo (2026-08-01) — assignment: name/length/super[key]
+
+| Area | Change |
+|------|--------|
+| SET_PROP / SET_PROP_COMPUTED | Define-style write only for function **name** (not length) — strict `Function.length=` TypeError |
+| SET_PROP | SetFunctionName for anon fn only when `field_define=1` — not `o.attr = function(){}` |
+| Compiler + `SET_ELEM_SUPER` (112) | `super[key] = val` uses SuperBase + Receiver this; RHS before PutValue null TypeError |
+
+### Measured
+
+| Suite | Score |
+|-------|------:|
+| expressions/assignment residual 3 | **3/3** |
+| **expressions/assignment** | **485/485 (100%)** |
+| safety optional/array/delete/break/continue | **100%** |
