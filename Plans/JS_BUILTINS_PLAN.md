@@ -160,17 +160,17 @@ python3 tools/test262_runner.py --full -j 8 --timeout 12 --output-json results/t
 
 ## 7. Scoreboard (fill on each baseline)
 
-| Slice | e7bb full | B0 (e7bt tip) | e7bu | tip e7c4 | Notes |
-|-------|----------:|-------------:|-----:|---------:|-------|
-| Object | 64.7% | **72.7%** | **73.1%** | **82.0%** ✅ B1 | defineProperty 85%; array attr spine; assign Set |
-| Array | 71.9% | **74.9%** | | **80.9%** ✅ B2 | change-array-by-copy; concat; Array.of |
-| String | 58.7% | **62.2%** | | **66.4%** | replaceAll landed |
-| Promise | 66.0% | **65.5%** | | **66.7%** | |
-| built-ins overall | 32.3% | (core OA/SP **71.4%**) | | climbing | deserts still drag full % |
-| language | ~87% | **~96% G2** | G2 | — | freeze language campaign |
+| Slice | e7bb full | B0 (e7bt tip) | tip e7c4 full | Notes |
+|-------|----------:|-------------:|-------------:|-------|
+| **full suite** | 58.7% | — | **64.9%** (+3.1k pass) | `results/test262_full_m128e7c4_SUMMARY.md` |
+| **language** | 87.5% | **~96% G2** | **94.5%** tot / **~95.9%** p/(p+f) | G2 held |
+| **built-ins** | 32.4% | — | **38.2%** | deserts drag; excl. deserts ≈58% |
+| Object | 64.7% | 72.7% | **81.9%** ✅ B1 | defineProperty spine; assign Set |
+| Array | 71.9% | 74.9% | **79.8%** ≈B2 | change-array; concat; Array.of |
+| String | 58.7% | 62.2% | **66.3%** | replaceAll |
+| Promise | 66.0% | 65.5% | **66.3%** | next |
 
-**e7bu:** `Library.JSVMObjectMethods.ailang` (new); symbol registry; assign boxes primitives.  
-**e7bz–e7c4:** array attr spine; assign throw; concat IsConcatSpreadable; Array.of ID; ES2023 change-array lib; replaceAll.
+**e7bu–e7c4 grind:** ObjectMethods; array attr spine; assign throw; concat; Array.of ID; ES2023 change-array lib; replaceAll.
 
 Update this table in place; don’t spawn another parallel plan file.
 
