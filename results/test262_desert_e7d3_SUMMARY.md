@@ -1,26 +1,27 @@
-# M128e7d3 — %TypedArray% chain, species, buffer-arg, CONSTRUCT rethrow
+# M128e7d3 — %TypedArray% chain, species, buffer-arg, HasProperty
 
-**vs e7d2:** 766 → **880** (+114), **26.2% → 30.1%**  
-**vs e7d0:** 566 → **880** (+314)
+**Desert tip:** **882 / 2931 (30.2%)**  
+**vs e7d0:** 566 → **882** (**+316**)  
+**vs e7d2:** 766 → **882** (**+116**)
 
-| Category | e7d2 | e7d3 | Δ |
-|----------|-----:|-----:|--:|
-| ArrayBuffer | 23.0% | **24.0%** | +1.0pp |
-| DataView | 27.1% | **28.0%** | +0.9pp |
-| TypedArray | 16.1% | **26.4%** | **+10.3pp** |
-| TypedArrayConstructors | 46.2% | 40.7% | -5.5pp (stricter new/buffer) |
-| **TOTAL** | 26.2% | **30.1%** | **+3.9pp** |
+| Category | Pass% | Pass/Tot |
+|----------|------:|---------:|
+| ArrayBuffer | 24.0% | 47/196 |
+| DataView | 28.0% | 157/561 |
+| TypedArray | **26.3%** | 375/1438 |
+| TypedArrayConstructors | 41.3% | 303/736 |
 
-## Changes
+## Changes (e7d3)
 
-1. **%TypedArray% intrinsic** — `Object.getPrototypeOf(Int8Array)` is shared base; shared methods on `.prototype`
-2. **Symbol.species** data prop on each TA ctor
-3. **SpeciesConstructor** for OBJECT `constructor` + getter `@@species` (map/filter/slice)
-4. **subarray** species with `(buffer, byteOffset, length)` args
-5. **buffer-arg** ToIndex, alignment, length bounds
-6. **CONSTRUCT rethrow** of native RangeError/TypeError (was swallowed)
-7. TypedArray ctor requires `new`
+1. **%TypedArray% intrinsic** — ctor [[Prototype]] chain for `Object.getPrototypeOf(Int8Array)`
+2. **Symbol.species** on each TA constructor
+3. **SpeciesConstructor** for OBJECT constructor + @@species getters
+4. **subarray** species Construct(buffer, offset, length)
+5. **buffer-arg** ToIndex / align / bounds
+6. **CONSTRUCT rethrow** of native RangeError/TypeError
+7. **HasProperty** integer-index exotic for TypedArray (`0 in ta`)
+8. Writable+configurable `constructor` on TA.prototype
 
-## Full-suite path
+## Full-suite 95% note
 
-Desert still ~2.0k fails. At +314 from e7d0, keep grinding species/detach/set/internals toward full 95%.
+~2.0k desert fails remain (detach, BigInt fidelity, SAB, transfer/resize, float16, more species/internals). Keep grinding — essential for raw 95%.
