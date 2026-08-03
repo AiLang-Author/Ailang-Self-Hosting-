@@ -326,6 +326,45 @@ if (typeof Reflect.apply !== "function") {
     return Function.prototype.apply.call(target, thisArg, args || []);
   };
 }
+// M128e7d6: Reflect.ownKeys — [[OwnPropertyKeys]] (TypedArray indexes + symbols)
+if (typeof Reflect.ownKeys !== "function") {
+  Reflect.ownKeys = function(o) {
+    if (o === null || o === undefined) throw new TypeError("Reflect.ownKeys");
+    var names = Object.getOwnPropertyNames(o);
+    var out = [];
+    for (var i = 0; i < names.length; i++) out.push(names[i]);
+    if (typeof Object.getOwnPropertySymbols === "function") {
+      var syms = Object.getOwnPropertySymbols(o);
+      for (var j = 0; j < syms.length; j++) out.push(syms[j]);
+    }
+    return out;
+  };
+}
+if (typeof Reflect.deleteProperty !== "function") {
+  Reflect.deleteProperty = function(o, p) {
+    try { return delete o[p]; } catch (e) { return false; }
+  };
+}
+if (typeof Reflect.preventExtensions !== "function") {
+  Reflect.preventExtensions = function(o) {
+    try { Object.preventExtensions(o); return true; } catch (e) { return false; }
+  };
+}
+if (typeof Reflect.isExtensible !== "function") {
+  Reflect.isExtensible = function(o) {
+    return Object.isExtensible(o);
+  };
+}
+if (typeof Reflect.getPrototypeOf !== "function") {
+  Reflect.getPrototypeOf = function(o) {
+    return Object.getPrototypeOf(o);
+  };
+}
+if (typeof Reflect.setPrototypeOf !== "function") {
+  Reflect.setPrototypeOf = function(o, p) {
+    try { Object.setPrototypeOf(o, p); return true; } catch (e) { return false; }
+  };
+}
 globalThis.Reflect = Reflect;
 // Minimal TypedArray for with ObjectEnv tests (features: TypedArray)
 if (typeof Int32Array === "undefined") {
