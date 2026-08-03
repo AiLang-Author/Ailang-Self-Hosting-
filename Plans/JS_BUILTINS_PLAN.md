@@ -89,6 +89,8 @@ Contributors can open one method family, read Ailang, fix a mole, re-run a path.
 | **B-product** | Map/Set/Function/Number/Math **≥70%** each | “Runs normal library code” |
 | **G3 full** | full test262 **≥70%** then **≥80%** | Optional milestone; deserts optional |
 | **Not a goal** | 100% language or 100% built-ins | Diminishing returns |
+| **95% full raw** | ~47.2k passes | **Desert-blocked** without Temporal/TypedArray (~8k fails stay near 0); product path max ~80–85% full without deserts |
+| **Product 95%** | B-core each ≥90%, full ≥70% | Usable engine; preferred 95% framing |
 
 Full-suite math (rough): language already ~22k pass. Built-ins need roughly **+8–12k passes** to feel “real”; Temporal alone is 4.5k fails you can ignore.
 
