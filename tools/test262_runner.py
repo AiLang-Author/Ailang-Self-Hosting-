@@ -257,47 +257,43 @@ if (typeof Reflect.defineProperty !== "function") {
     try { Object.defineProperty(o, p, d); return true; } catch (e) { return false; }
   };
 }
-// M128e7bd/e7bv: Reflect.construct — honor IsConstructor(newTarget).
-// Engine: non-ctor natives (Object.assign, keys, map, …) throw on `new`.
-// Heuristic: well-known ctor names always constructible; lowercase .name
-// (builtin methods) probed with `new bind()`; other functions assumed ok.
+// M128e7di: Reflect.construct — IsConstructor(target) + IsConstructor(newTarget).
+// Probe with bare `new f()` (not bind — bind wrongly throws for user fns).
+// Known ctors skip probe (DataView needs args). Method-like names that throw
+// on `new` → non-constructible (set, forEach, getInt32, …).
 if (typeof Reflect.construct !== "function") {
   Reflect.construct = function(target, args, newTarget) {
     if (typeof target !== "function") throw new TypeError("Reflect.construct");
     if (arguments.length < 3) newTarget = target;
     if (typeof newTarget !== "function") throw new TypeError("Reflect.construct");
     var a = args || [];
-    var __n = newTarget.name;
-    var __isCtor = true;
-    if (__n === "assign" || __n === "keys" || __n === "create" || __n === "freeze" ||
-        __n === "seal" || __n === "entries" || __n === "values" || __n === "fromEntries" ||
-        __n === "getOwnPropertySymbols" || __n === "getOwnPropertyNames" ||
-        __n === "getOwnPropertyDescriptor" || __n === "getOwnPropertyDescriptors" ||
-        __n === "defineProperty" || __n === "defineProperties" || __n === "groupBy" ||
-        __n === "is" || __n === "hasOwn" || __n === "preventExtensions" ||
-        __n === "isExtensible" || __n === "isFrozen" || __n === "isSealed" ||
-        __n === "getPrototypeOf" || __n === "setPrototypeOf" ||
-        __n === "propertyIsEnumerable" || __n === "isPrototypeOf" ||
-        __n === "hasOwnProperty" || __n === "toString" || __n === "valueOf" ||
-        __n === "toLocaleString" ||
-        // M128e7dc: only all-lowercase names (map/keys/…) — camelCase user
-        // newTargets like newTarget/makeCtor were misclassified and broke
-        // Reflect.construct(TA, …, newTarget).
-        (__n && __n.length > 0 && __n.charCodeAt(0) >= 97 && __n.charCodeAt(0) <= 122 &&
-         __n === __n.toLowerCase() &&
-         __n !== "get" && __n !== "set" && __n !== "has" && __n !== "apply" &&
-         __n !== "call" && __n !== "bind" && __n !== "bound")) {
-      // lowercase builtin method — confirm non-constructible
+    var __knownCtor = {
+      Object:1, Function:1, Array:1, String:1, Boolean:1, Number:1, BigInt:1,
+      Symbol:1, Date:1, RegExp:1, Error:1, TypeError:1, RangeError:1,
+      SyntaxError:1, ReferenceError:1, URIError:1, EvalError:1, AggregateError:1,
+      Promise:1, Map:1, Set:1, WeakMap:1, WeakSet:1, ArrayBuffer:1, DataView:1,
+      Int8Array:1, Uint8Array:1, Uint8ClampedArray:1, Int16Array:1, Uint16Array:1,
+      Int32Array:1, Uint32Array:1, Float16Array:1, Float32Array:1, Float64Array:1,
+      BigInt64Array:1, BigUint64Array:1, Proxy:1
+    };
+    function __isConstructible(f) {
+      var n = f && f.name;
+      if (n && __knownCtor[n]) return true;
+      if (!n || n.length === 0) return true;
+      if (n.charCodeAt(0) >= 65 && n.charCodeAt(0) <= 90) return true;
+      // Bound functions used as newTarget (custom-proto-access-throws)
+      if (n.indexOf("bound") === 0) return true;
+      // Lowercase-start: try bare `new f()`. User helpers (newTarget/makeCtor)
+      // succeed; builtin methods throw TypeError → non-constructible.
       try {
-        new (Function.prototype.bind.call(newTarget))();
+        new f();
+        return true;
       } catch (__e) {
-        __isCtor = false;
+        return false;
       }
     }
-    if (!__isCtor) throw new TypeError("Reflect.construct");
-    // M128e7db: always Construct(target, args) then, if newTarget differs,
-    // set [[Prototype]] from newTarget.prototype. Applying target as a call
-    // cleared engine __new_target__ and broke TypedArray/ArrayBuffer natives.
+    if (!__isConstructible(target)) throw new TypeError("Reflect.construct");
+    if (!__isConstructible(newTarget)) throw new TypeError("Reflect.construct");
     var result;
     if (a.length === 0) result = new target();
     else if (a.length === 1) result = new target(a[0]);
@@ -309,8 +305,6 @@ if (typeof Reflect.construct !== "function") {
     }
     if (newTarget !== target) {
       var proto = newTarget.prototype;
-      // GetPrototypeFromConstructor: non-object prototype → keep default from
-      // Construct(target) (TA.prototype / ArrayBuffer.prototype / …)
       if (proto !== null && (typeof proto === "object" || typeof proto === "function")) {
         try { Object.setPrototypeOf(result, proto); } catch (__e) {}
       }
