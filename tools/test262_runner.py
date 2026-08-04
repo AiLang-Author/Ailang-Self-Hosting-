@@ -291,33 +291,27 @@ if (typeof Reflect.construct !== "function") {
       }
     }
     if (!__isCtor) throw new TypeError("Reflect.construct");
-    if (newTarget === target) {
-      if (a.length === 0) return new target();
-      if (a.length === 1) return new target(a[0]);
-      if (a.length === 2) return new target(a[0], a[1]);
-      if (a.length === 3) return new target(a[0], a[1], a[2]);
-      var __b = Function.prototype.bind.apply(target, [null].concat(Array.prototype.slice.call(a)));
-      return new __b();
-    }
-    var proto = newTarget.prototype;
-    var obj;
-    if (proto !== null && (typeof proto === "object" || typeof proto === "function")) {
-      obj = Object.create(proto);
-    } else {
-      obj = {};
-    }
-    var save = __new_target__;
-    __new_target__ = newTarget;
+    // M128e7db: always Construct(target, args) then, if newTarget differs,
+    // set [[Prototype]] from newTarget.prototype. Applying target as a call
+    // cleared engine __new_target__ and broke TypedArray/ArrayBuffer natives.
     var result;
-    try {
-      result = Function.prototype.apply.call(target, obj, a);
-    } finally {
-      __new_target__ = save;
+    if (a.length === 0) result = new target();
+    else if (a.length === 1) result = new target(a[0]);
+    else if (a.length === 2) result = new target(a[0], a[1]);
+    else if (a.length === 3) result = new target(a[0], a[1], a[2]);
+    else {
+      var __b = Function.prototype.bind.apply(target, [null].concat(Array.prototype.slice.call(a)));
+      result = new __b();
     }
-    if (result !== null && (typeof result === "object" || typeof result === "function")) {
-      return result;
+    if (newTarget !== target) {
+      var proto = newTarget.prototype;
+      if (proto !== null && (typeof proto === "object" || typeof proto === "function")) {
+        try { Object.setPrototypeOf(result, proto); } catch (__e) {}
+      } else {
+        try { Object.setPrototypeOf(result, Object.prototype); } catch (__e2) {}
+      }
     }
-    return obj;
+    return result;
   };
 }
 if (typeof Reflect.apply !== "function") {
