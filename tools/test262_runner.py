@@ -213,6 +213,10 @@ function asyncTest(testFunc) {
   );
 }
 globalThis.asyncTest = asyncTest;
+// M128e7dr: dual-bind $262 host (engine installs detachArrayBuffer)
+if (typeof $262 !== "undefined") {
+  globalThis.$262 = $262;
+}
 // M128e6ai: always provide Reflect (Proxy with tests / set-mutable-binding)
 if (typeof Reflect === "undefined") { Reflect = {}; }
 if (typeof Reflect.has !== "function") {
