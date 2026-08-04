@@ -280,9 +280,13 @@ if (typeof Reflect.construct !== "function") {
         __n === "propertyIsEnumerable" || __n === "isPrototypeOf" ||
         __n === "hasOwnProperty" || __n === "toString" || __n === "valueOf" ||
         __n === "toLocaleString" ||
+        // M128e7dc: only all-lowercase names (map/keys/…) — camelCase user
+        // newTargets like newTarget/makeCtor were misclassified and broke
+        // Reflect.construct(TA, …, newTarget).
         (__n && __n.length > 0 && __n.charCodeAt(0) >= 97 && __n.charCodeAt(0) <= 122 &&
+         __n === __n.toLowerCase() &&
          __n !== "get" && __n !== "set" && __n !== "has" && __n !== "apply" &&
-         __n !== "call" && __n !== "bind")) {
+         __n !== "call" && __n !== "bind" && __n !== "bound")) {
       // lowercase builtin method — confirm non-constructible
       try {
         new (Function.prototype.bind.call(newTarget))();
@@ -305,10 +309,10 @@ if (typeof Reflect.construct !== "function") {
     }
     if (newTarget !== target) {
       var proto = newTarget.prototype;
+      // GetPrototypeFromConstructor: non-object prototype → keep default from
+      // Construct(target) (TA.prototype / ArrayBuffer.prototype / …)
       if (proto !== null && (typeof proto === "object" || typeof proto === "function")) {
         try { Object.setPrototypeOf(result, proto); } catch (__e) {}
-      } else {
-        try { Object.setPrototypeOf(result, Object.prototype); } catch (__e2) {}
       }
     }
     return result;
