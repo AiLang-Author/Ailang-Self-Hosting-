@@ -178,7 +178,7 @@ Sketch_0  (part root / origin plane)
 | J2.1 | `MakeCutToolCylinder` / `CreateHole` tool path | **done** |
 | J2.2 | Analytic isect subset (plane–plane, line–plane, …) | pending |
 | J2.3 | `Bool.Difference` restricted: box − cyl → kind3 through-hole | **done** |
-| J2.4 | Look-at: `cad_plate_with_hole.stl` (hole visible); STEP outer-only TODO | **partial** |
+| J2.4 | Look-at: `cad_plate_with_hole.stl` sharp corners + STEP with CIRCLE/CYL hole | **done** |
 | J2.5 | Feat wrappers honest | **done** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
