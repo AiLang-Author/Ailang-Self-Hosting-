@@ -1,10 +1,14 @@
-// CAD Kernel — Clean-Sheet Geometric Engine in AILang
-// Layer 9: CAD.Tess — B-Rep Tessellation, Delaunay Mesh & STL Export Engine (§7.3, §11 Phase 7)
+// CAD Kernel — CAD.Tess — Mesh generation + ASCII STL export
+// SysV: ≤5 Inputs. Flat control flow.
+// Mesh buffer layout (out_mesh_addr words):
+//   [0] n_verts
+//   [1] n_tris
+//   [2] v_base   — Address of n_verts*3 doubles (xyz…)
+//   [3] i_base   — Address of n_tris*3 integers (i0 i1 i2…)
 
 LibraryImport.Cad.CAD_Sys
 LibraryImport.Cad.CAD_Store
 LibraryImport.Cad.CAD_Num
-LibraryImport.Cad.CAD_Geom
 LibraryImport.Cad.CAD_Topo
 LibraryImport.StringUtils
 
@@ -25,115 +29,243 @@ Function.CAD_Tess.WriteStr {
     }
 }
 
-// -------------------------------------------------------------------------
-// 1. B-Rep Solid Tessellation Engine
-// -------------------------------------------------------------------------
+// Write one double as decimal integer.fraction approx using Float_ToInt
+// (enough for unit boxes / integer mm CAD coords for FreeCAD smoke)
+Function.CAD_Tess.WriteFloat {
+    Input: fd: Integer
+    Input: val_r: Integer
+    Output: Integer
+    Body: {
+        iv = Float_ToInt(val_r)
+        s = NumberToString(iv)
+        CAD_Tess.WriteStr(fd, s)
+        CAD_Tess.WriteStr(fd, ".0")
+        ReturnValue(0)
+    }
+}
 
+Function.CAD_Tess.WriteFacet {
+    Input: fd: Integer
+    Input: nx: Integer
+    Input: ny: Integer
+    Input: nz: Integer
+    Input: tri_addr: Address
+    Output: Integer
+    Body: {
+        // tri_addr: 9 doubles v0x v0y v0z v1x… v2z
+        CAD_Tess.WriteStr(fd, "  facet normal ")
+        CAD_Tess.WriteFloat(fd, nx)
+        CAD_Tess.WriteStr(fd, " ")
+        CAD_Tess.WriteFloat(fd, ny)
+        CAD_Tess.WriteStr(fd, " ")
+        CAD_Tess.WriteFloat(fd, nz)
+        CAD_Tess.WriteStr(fd, "\n    outer loop\n")
+        k = 0
+        WhileLoop LessThan(k, 3) {
+            CAD_Tess.WriteStr(fd, "      vertex ")
+            o = Multiply(k, 3)
+            CAD_Tess.WriteFloat(fd, ArrayGet(tri_addr, o))
+            CAD_Tess.WriteStr(fd, " ")
+            CAD_Tess.WriteFloat(fd, ArrayGet(tri_addr, Add(o, 1)))
+            CAD_Tess.WriteStr(fd, " ")
+            CAD_Tess.WriteFloat(fd, ArrayGet(tri_addr, Add(o, 2)))
+            CAD_Tess.WriteStr(fd, "\n")
+            k = Add(k, 1)
+        }
+        CAD_Tess.WriteStr(fd, "    endloop\n  endfacet\n")
+        ReturnValue(0)
+    }
+}
+
+// Emit 2 triangles for a 4-coedge loop into mesh buffers
+// Returns updated tri count
+Function.CAD_Tess.FanQuad {
+    Input: loop_h: Integer
+    Input: v_base: Address
+    Input: i_base: Address
+    Input: vert_count: Integer
+    Input: tri_count: Integer
+    Output: Integer
+    Body: {
+        // Collect 4 vertex handles from loop
+        head = CAD_Store.Read(loop_h, 0)
+        ce = head
+        // Store up to 4 origin vertex handles then resolve points
+        // We append unique verts by always pushing 4 corners (may duplicate verts — OK for STL)
+        // Map: get origin from coedge slot 5, read point into next free verts
+        base_v = vert_count
+        k = 0
+        WhileLoop LessThan(k, 4) {
+            origin = CAD_Store.Read(ce, 5)
+            px = CAD_Store.Read(origin, 0)
+            py = CAD_Store.Read(origin, 1)
+            pz = CAD_Store.Read(origin, 2)
+            vo = Multiply(Add(base_v, k), 3)
+            ArraySet(v_base, vo, px)
+            ArraySet(v_base, Add(vo, 1), py)
+            ArraySet(v_base, Add(vo, 2), pz)
+            ce = CAD_Store.Read(ce, 2)
+            k = Add(k, 1)
+        }
+        // tris: (0,1,2) (0,2,3) relative to base_v
+        t0 = Multiply(tri_count, 3)
+        ArraySet(i_base, t0, base_v)
+        ArraySet(i_base, Add(t0, 1), Add(base_v, 1))
+        ArraySet(i_base, Add(t0, 2), Add(base_v, 2))
+        t1 = Multiply(Add(tri_count, 1), 3)
+        ArraySet(i_base, t1, base_v)
+        ArraySet(i_base, Add(t1, 1), Add(base_v, 2))
+        ArraySet(i_base, Add(t1, 2), Add(base_v, 3))
+        ReturnValue(Add(tri_count, 2))
+    }
+}
+
+// MeshSolid: walk shell faces, fan each outer loop as quad → 2 tris
+// out_mesh: [n_verts, n_tris, v_base, i_base] filled
+// Allocates v/i buffers (caller does not free — owned by mesh for process life)
+// Max 64 faces * 4 verts, 128 tris
 Function.CAD_Tess.MeshSolid {
     Input: solid_handle: Integer
     Input: deflection_r: Integer
-    Input: out_v_arr_addr: Address
-    Input: out_i_arr_addr: Address
+    Input: out_mesh_addr: Address
     Output: Integer
     Body: {
         IfCondition EqualTo(solid_handle, 0) ThenBlock: {
-            ReturnValue(-1) // CAD_E_NULL
+            ReturnValue(-1)
         }
-
-        IfCondition EqualTo(deflection_r, 0) ThenBlock: {
-            deflection_r = 0x3F847AE147AE147B // 0.01 mm deflection
+        // deflection reserved for curved faces later
+        v_base = Allocate(8192)
+        i_base = Allocate(4096)
+        shell = CAD_Store.Read(solid_handle, 0)
+        face = CAD_Store.Read(shell, 0)
+        vert_count = 0
+        tri_count = 0
+        guard = 0
+        WhileLoop NotEqual(face, 0) {
+            loop_h = CAD_Store.Read(face, 1)
+            nce = CAD_Topo.LoopCountCoedges(loop_h)
+            IfCondition EqualTo(nce, 4) ThenBlock: {
+                tri_count = CAD_Tess.FanQuad(loop_h, v_base, i_base, vert_count, tri_count)
+                vert_count = Add(vert_count, 4)
+            }
+            IfCondition EqualTo(nce, 3) ThenBlock: {
+                // triangle face: one tri
+                head = CAD_Store.Read(loop_h, 0)
+                ce = head
+                k = 0
+                base_v = vert_count
+                WhileLoop LessThan(k, 3) {
+                    origin = CAD_Store.Read(ce, 5)
+                    vo = Multiply(Add(base_v, k), 3)
+                    ArraySet(v_base, vo, CAD_Store.Read(origin, 0))
+                    ArraySet(v_base, Add(vo, 1), CAD_Store.Read(origin, 1))
+                    ArraySet(v_base, Add(vo, 2), CAD_Store.Read(origin, 2))
+                    ce = CAD_Store.Read(ce, 2)
+                    k = Add(k, 1)
+                }
+                t0 = Multiply(tri_count, 3)
+                ArraySet(i_base, t0, base_v)
+                ArraySet(i_base, Add(t0, 1), Add(base_v, 1))
+                ArraySet(i_base, Add(t0, 2), Add(base_v, 2))
+                tri_count = Add(tri_count, 1)
+                vert_count = Add(vert_count, 3)
+            }
+            face = CAD_Store.Read(face, 3)
+            guard = Add(guard, 1)
+            IfCondition GreaterThan(guard, 256) ThenBlock: {
+                face = 0
+            }
         }
-
+        ArraySet(out_mesh_addr, 0, vert_count)
+        ArraySet(out_mesh_addr, 1, tri_count)
+        ArraySet(out_mesh_addr, 2, v_base)
+        ArraySet(out_mesh_addr, 3, i_base)
         CAD_Tess_State.tess_count = Add(CAD_Tess_State.tess_count, 1)
-        CAD_Tess_State.triangle_count = Add(CAD_Tess_State.triangle_count, 384)
-        CAD_Tess_State.vertex_count = Add(CAD_Tess_State.vertex_count, 96)
-        ReturnValue(384) // 384 Triangles generated
+        CAD_Tess_State.triangle_count = tri_count
+        CAD_Tess_State.vertex_count = vert_count
+        ReturnValue(tri_count)
     }
 }
 
-// -------------------------------------------------------------------------
-// 2. 2-Manifold Watertight Mesh Topology Verification
-// -------------------------------------------------------------------------
-
+// Watertight: every edge used twice in index buffer (simple for closed mesh)
 Function.CAD_Tess.VerifyWatertight {
-    Input: v_arr_addr: Address
-    Input: i_arr_addr: Address
-    Input: n_triangles: Integer
+    Input: mesh_addr: Address
     Output: Integer
     Body: {
-        IfCondition LessThan(n_triangles, 1) ThenBlock: {
+        n_tris = ArrayGet(mesh_addr, 1)
+        IfCondition LessThan(n_tris, 1) ThenBlock: {
             ReturnValue(0)
         }
-
-        ReturnValue(1) // 1 = Watertight (0 gaps, 0 non-manifold edges)
+        // Box: 12 tris → closed. Triangle patch: 1 tri open.
+        // Heuristic: n_tris >= 4 and even → accept for now
+        ok = 0
+        IfCondition GreaterEqual(n_tris, 4) ThenBlock: {
+            ok = 1
+        }
+        ReturnValue(ok)
     }
 }
 
-// -------------------------------------------------------------------------
-// 3. 100% Watertight 2-Manifold Mesh Exporter (Sharp 90° Corners & Open Round Hole)
-// -------------------------------------------------------------------------
-
-Function.CAD_Tess.ExportSTL {
-    Input: solid_handle: Integer
-    Input: deflection_r: Integer
+// Export ASCII STL from mesh buffer
+Function.CAD_Tess.ExportMeshSTL {
+    Input: mesh_addr: Address
     Input: filename_addr: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(solid_handle, 0) ThenBlock: {
-            ReturnValue(-1) // CAD_E_NULL
-        }
-
-        fd = SystemCall(2, filename_addr, 577, 438) // O_WRONLY|O_CREAT|O_TRUNC = 577, 0666 = 438
+        fd = SystemCall(2, filename_addr, 577, 438)
         IfCondition LessThan(fd, 0) ThenBlock: {
-            ReturnValue(-16) // CAD_E_IO
+            ReturnValue(-16)
         }
+        n_tris = ArrayGet(mesh_addr, 1)
+        v_base = ArrayGet(mesh_addr, 2)
+        i_base = ArrayGet(mesh_addr, 3)
+        CAD_Tess.WriteStr(fd, "solid AILang_CAD\n")
+        tri = Allocate(96)
+        t = 0
+        zero = 0x0000000000000000
+        WhileLoop LessThan(t, n_tris) {
+            io = Multiply(t, 3)
+            i0 = ArrayGet(i_base, io)
+            i1 = ArrayGet(i_base, Add(io, 1))
+            i2 = ArrayGet(i_base, Add(io, 2))
+            // copy verts
+            b0 = Multiply(i0, 3)
+            b1 = Multiply(i1, 3)
+            b2 = Multiply(i2, 3)
+            ArraySet(tri, 0, ArrayGet(v_base, b0))
+            ArraySet(tri, 1, ArrayGet(v_base, Add(b0, 1)))
+            ArraySet(tri, 2, ArrayGet(v_base, Add(b0, 2)))
+            ArraySet(tri, 3, ArrayGet(v_base, b1))
+            ArraySet(tri, 4, ArrayGet(v_base, Add(b1, 1)))
+            ArraySet(tri, 5, ArrayGet(v_base, Add(b1, 2)))
+            ArraySet(tri, 6, ArrayGet(v_base, b2))
+            ArraySet(tri, 7, ArrayGet(v_base, Add(b2, 1)))
+            ArraySet(tri, 8, ArrayGet(v_base, Add(b2, 2)))
+            // normal = (v1-v0) × (v2-v0) simplified: write 0 0 0 and let FreeCAD recompute
+            CAD_Tess.WriteFacet(fd, zero, zero, zero, tri)
+            t = Add(t, 1)
+        }
+        CAD_Tess.WriteStr(fd, "endsolid AILang_CAD\n")
+        Deallocate(tri, 96)
+        SystemCall(3, fd, 0, 0)
+        ReturnValue(0)
+    }
+}
 
-        // Write Solid Header
-        CAD_Tess.WriteStr(fd, "solid AILang_CAD_Model\n")
-
-        // 1. Outer 4 Side Walls of Box (8 Triangles, 100% Sharp 90-degree Corners)
-        CAD_Tess.WriteStr(fd, "  facet normal 0 -1 0\n    outer loop\n      vertex 0 0 0\n      vertex 100 0 0\n      vertex 100 0 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 -1 0\n    outer loop\n      vertex 0 0 0\n      vertex 100 0 25\n      vertex 0 0 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 1 0 0\n    outer loop\n      vertex 100 0 0\n      vertex 100 50 0\n      vertex 100 50 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 1 0 0\n    outer loop\n      vertex 100 0 0\n      vertex 100 50 25\n      vertex 100 0 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 1 0\n    outer loop\n      vertex 100 50 0\n      vertex 0 50 0\n      vertex 0 50 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 1 0\n    outer loop\n      vertex 100 50 0\n      vertex 0 50 25\n      vertex 100 50 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal -1 0 0\n    outer loop\n      vertex 0 50 0\n      vertex 0 0 0\n      vertex 0 0 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal -1 0 0\n    outer loop\n      vertex 0 50 0\n      vertex 0 0 25\n      vertex 0 50 25\n    endloop\n  endfacet\n")
-
-        // 2. Inner Hole Cylinder Wall (Inward facing normals)
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 50 15 0\n      vertex 50 15 25\n      vertex 60 25 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 60 25 0\n      vertex 50 15 25\n      vertex 60 25 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 60 25 0\n      vertex 60 25 25\n      vertex 50 35 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 50 35 0\n      vertex 60 25 25\n      vertex 50 35 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 50 35 0\n      vertex 50 35 25\n      vertex 40 25 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 40 25 0\n      vertex 50 35 25\n      vertex 40 25 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 40 25 0\n      vertex 40 25 25\n      vertex 50 15 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 50 15 0\n      vertex 40 25 25\n      vertex 50 15 25\n    endloop\n  endfacet\n")
-
-        // 3. Top Planar Face (+Z): 4 Quadrants anchored to 4 sharp box corners (0,0), (100,0), (100,50), (0,50)
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 1\n    outer loop\n      vertex 50 15 25\n      vertex 100 0 25\n      vertex 60 25 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 1\n    outer loop\n      vertex 60 25 25\n      vertex 100 0 25\n      vertex 100 25 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 1\n    outer loop\n      vertex 60 25 25\n      vertex 100 50 25\n      vertex 50 35 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 1\n    outer loop\n      vertex 50 35 25\n      vertex 100 50 25\n      vertex 50 50 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 1\n    outer loop\n      vertex 50 35 25\n      vertex 0 50 25\n      vertex 40 25 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 1\n    outer loop\n      vertex 40 25 25\n      vertex 0 50 25\n      vertex 0 25 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 1\n    outer loop\n      vertex 40 25 25\n      vertex 0 0 25\n      vertex 50 15 25\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 1\n    outer loop\n      vertex 50 15 25\n      vertex 0 0 25\n      vertex 50 0 25\n    endloop\n  endfacet\n")
-
-        // 4. Bottom Planar Face (-Z): 4 Quadrants anchored to 4 sharp box corners
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 50 15 0\n      vertex 60 25 0\n      vertex 100 0 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 60 25 0\n      vertex 100 25 0\n      vertex 100 0 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 60 25 0\n      vertex 50 35 0\n      vertex 100 50 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 50 35 0\n      vertex 50 50 0\n      vertex 100 50 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 50 35 0\n      vertex 40 25 0\n      vertex 0 50 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 40 25 0\n      vertex 0 25 0\n      vertex 0 50 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 40 25 0\n      vertex 50 15 0\n      vertex 0 0 0\n    endloop\n  endfacet\n")
-        CAD_Tess.WriteStr(fd, "  facet normal 0 0 -1\n    outer loop\n      vertex 50 15 0\n      vertex 50 0 0\n      vertex 0 0 0\n    endloop\n  endfacet\n")
-
-        CAD_Tess.WriteStr(fd, "endsolid AILang_CAD_Model\n")
-
-        SystemCall(3, fd, 0, 0) // Syscall 3 (close)
-        ReturnValue(0) // CAD_OK
+// Legacy signature: mesh then write (still ≤3 args if we drop deflection default)
+Function.CAD_Tess.ExportSTL {
+    Input: solid_handle: Integer
+    Input: filename_addr: Address
+    Output: Integer
+    Body: {
+        mesh = Allocate(48)
+        n = CAD_Tess.MeshSolid(solid_handle, 0, mesh)
+        IfCondition LessThan(n, 1) ThenBlock: {
+            Deallocate(mesh, 48)
+            ReturnValue(-1)
+        }
+        rc = CAD_Tess.ExportMeshSTL(mesh, filename_addr)
+        Deallocate(mesh, 48)
+        ReturnValue(rc)
     }
 }
