@@ -110,7 +110,7 @@ Make **exact** geometry the solid truth; mesh and STEP **derive** from it.
 | J1.2 | Exact topo: 2V + CIRCLE×2 + LINE + 3 faces | **done** |
 | J1.3 | Tess: `MeshCylinderAnalytic` samples by deflection | **done** |
 | J1.4 | STEP: CIRCLE + CYLINDRICAL_SURFACE | **done** |
-| J1.5 | Sphere solid (analytic) + look-at STL/STEP | pending |
+| J1.5 | Sphere solid (analytic) + look-at STL/STEP | **done** |
 | J1.6 | `MakeCylinderPrismSolid` n-gon debug path | **done** |
 
 ### 4.3 Exit criteria Jump 1
@@ -161,36 +161,48 @@ Sketch_0  (part root / origin plane)
 - Planes are **recipes** from Sketch_0 / faces  
 - B-Rep / STEP / STL are **derived** after regen  
 
-### 5.3 Jump map vs Fusion paths
+### 5.3 Priority order (locked 2026-08-05)
+
+**Kernel geometry engine first. Sketch-driven solids wait.**
+
+Sketch → pad/revolve is the Fusion *control panel*; cart-before-horse if the solid
+engine is incomplete. Ailang function layers make features easy to hang on later.
+
+| Order | Work | Why |
+|------:|------|-----|
+| 1 | Analytic solids (box, cyl, **sphere**) | Exact B-Rep truth |
+| 2 | **Transforms** (translate, later rotate) | Place tools / holes not only at origin |
+| 3 | **Bool** expand + **Isect** | Real cuts beyond plate−cyl special case |
+| 4 | Then Sketch_0 + pad/pocket/revolve | Authoring on top of working solids |
+
+### 5.4 Jump map
 
 | Jump | Delivers |
 |-----:|----------|
-| **1** (cyl exact) | Tool bodies for holes exist as real cylinders ✓ |
-| **2** | `Isect` + `Bool.Difference` → **visible hole** in box |
-| **3** | Sketch_0 + plane + **Pad** + **Pocket/Hole** feature records + regen |
-| **4** | Fillet on edges, import, viewport |
+| **1** | Exact cyl ✓ · sphere · transforms |
+| **2** | Restricted hole ✓ · richer bool/isect |
+| **3** | Sketch_0 + Pad/Hole **(deferred until kernel solid)** |
+| **4** | Fillet, import, viewport |
 
-### 5.4 Jump 2 plan (next engine work)
+### 5.5 Jump 1b / 2 remaining (active)
 
 | ID | Task | Status |
 |----|------|--------|
-| J2.0 | Document Fusion feature map (this §) | **done** |
-| J2.1 | `MakeCutToolCylinder` / `CreateHole` tool path | **done** |
-| J2.2 | Analytic isect subset (plane–plane, line–plane, …) | pending |
-| J2.3 | `Bool.Difference` restricted: box − cyl → kind3 through-hole | **done** |
-| J2.4 | Look-at: `cad_plate_with_hole.stl` sharp corners + STEP with CIRCLE/CYL hole | **done** |
-| J2.5 | Feat wrappers honest | **done** |
+| J1.5 | Sphere solid + tess + STEP | **active** |
+| J1.7 | `TranslateSolid` (box, cyl placement, plate, sphere) | **active** |
+| J2.2 | Analytic isect subset | pending |
+| J2.3–J2.4 | Restricted plate hole | **done** |
+| J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
 
 ---
 
-## 6. Backlog (after Jump 2)
+## 6. Backlog (after solid engine)
 
-1. Jump 3: Sketch_0 + plane handle + CreatePad (rect → box) + ordered feature list  
-2. Repo: `feature_tree` JSONB commit/open  
-3. Jump 4: blend, STEP import, viewport  
-4. Optional J1.5: sphere solid (same pattern as cylinder)  
+1. Sketch_0 + pad + circle hole (thin feature spine)  
+2. Repo `feature_tree` JSONB  
+3. Fillet / blend, STEP import, viewport  
 
 ---
 
