@@ -218,8 +218,10 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | `3c5e7b1b` | Fusion map; cut tool path | green |
 | 2026-08-05 | `c11d2960`/`9dd4e73b` | Plate with hole mesh+STEP | green |
 | 2026-08-05 | `d0cc8981`/`942bf429` | Analytic 8-octant sphere STEP | green |
-| 2026-08-05 | *(this)* | Placement (cx,cy); real Isect gates; offset hole demo | green |
-| | | *next: richer bool / more isect; sketch deferred* | |
+| 2026-08-05 | `e97d29b0` | Placement + base Isect | green |
+| 2026-08-05 | prior | LineCyl/PlaneCyl; blind pocket mesh depth; offset hole | green |
+| 2026-08-05 | *(this)* | Blind STEP: z_floor cyl + solid bottom + floor disk (STL already OK) | green |
+| | | *next: more isect (plane–cyl general) / multi-hole; sketch deferred* | |
 
 ---
 
