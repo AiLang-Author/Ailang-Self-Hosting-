@@ -70,7 +70,9 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 ```bash
 ./ailang.x CAD/demo_primitives.ailang -o /tmp/demo_prim && /tmp/demo_prim
 ./ailang.x CAD/demo_hole_intent.ailang -o /tmp/demo_hole && /tmp/demo_hole
+./ailang.x CAD/demo_blind_hole.ailang -o /tmp/demo_blind && /tmp/demo_blind
 ./ailang.x CAD/demo_multi_hole.ailang -o /tmp/demo_mh && /tmp/demo_mh
+./ailang.x CAD/demo_counterbore.ailang -o /tmp/demo_cb && /tmp/demo_cb
 ```
 
 | File | Notes |
@@ -78,8 +80,11 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `test-stl/cad_box_10x20x30.stp` | box mm |
 | `test-stl/cad_box_unit.stp` | 1 mm cube |
 | `test-stl/cad_cylinder_r10_h30.stp` | analytic CIRCLE + CYL |
-| `test-stl/cad_sphere_r10.stp` | analytic 8-octant sphere |
-| `test-stl/cad_plate_*.stp` | hole / blind / multi-hole |
+| `test-stl/cad_sphere_r10.stp` | octahedron shell (walk) |
+| `test-stl/cad_plate_hole_offset.stp` | single through hole (walk) |
+| `test-stl/cad_plate_blind_pocket.stp` | blind floor disk (walk) |
+| `test-stl/cad_plate_multi_hole.stp` | through + blind independent (walk) |
+| `test-stl/cad_counterbore.stp` | nested annular floor (walk) |
 
 ### Gates (must stay green)
 
@@ -93,9 +98,10 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 
 ### Known limitations (honest)
 
-- Cylinder B-Rep is **chords**, not CIRCLE/CYLINDER as topology truth → looks segmented (correct).
-- `CreateHole` / Bool / Isect not real.
-- STEP walk is polyhedral only (planes + lines).
+- Exact-cyl B-Rep is CIRCLE/CYL; prism path still n-gon.
+- `CreateHole` = restricted Bool (box−cyl → kind-3 plate; append ≤5 holes), not general B-Rep.
+- Plate shells cover Z-axis holes; side-axis / freeform cuts still TODO.
+- Sphere shell is octahedron (faceted walk); analytic sphere surface later.
 - Sketch_0 / Feat regen / PG product path not implemented.
 
 ---
@@ -200,7 +206,8 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J2.6 | PlaneCylinder general (circle/gens/ellipse) + LineSphere | **done** |
 | J2.7 | `RotateSolidZ` (kernel) | **done** |
 | J2.8 | **Kill STEP recipes**; Export = `WritePolySolidSTEP` only | **done** |
-| J2.9 | Multi / blind / nested hole **shells** (not export matchers) | **next** |
+| J2.9 | Multi / blind / nested hole **shells** (Topo, not export) | **done** |
+| J2.10 | Richer Bool/Isect; side-axis tools; general B-Rep cut | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -236,8 +243,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | `b6a59f52` | **STEP-first policy**: demos export STEP only | green |
 | 2026-08-05 | prior | PlaneCyl + LineSphere; RotateSolidZ; bad rot45 demo | mixed |
 | 2026-08-05 | prior | Counterbore STEP recipe (temporary) | mixed |
-| 2026-08-05 | *(this)* | **Delete all STEP recipes**; ExportSTEP = B-Rep walk only | green |
-| | | *next: multi/blind/nested hole shells; richer bool; no new recipes* | |
+| 2026-08-05 | `5fbf4901` | **Delete all STEP recipes**; ExportSTEP = B-Rep walk only | green |
+| 2026-08-05 | *(this)* | **J2.9** `BuildPlateHoleShell`: multi/blind/nested counterbore; demos STEP walk | green |
+| | | *next: richer bool/isect; no new STEP recipes* | |
 
 ---
 

@@ -193,9 +193,19 @@ export special cases.
 ```bash
 ./ailang.x CAD/demo_primitives.ailang -o /tmp/demo_prim && /tmp/demo_prim
 ./ailang.x CAD/demo_hole_intent.ailang -o /tmp/demo_hole && /tmp/demo_hole
+./ailang.x CAD/demo_blind_hole.ailang -o /tmp/demo_blind && /tmp/demo_blind
 ./ailang.x CAD/demo_multi_hole.ailang -o /tmp/demo_mh && /tmp/demo_mh
+./ailang.x CAD/demo_counterbore.ailang -o /tmp/demo_cb && /tmp/demo_cb
 # FreeCAD: test-stl/cad_*.stp only
 ```
+
+**Plate-hole shells (Topo, not STEP recipes)**
+
+- `BuildPlateHoleShell` attaches walkable B-Rep for kind-3 plates.
+- Independent holes (through/blind) share top openings; through open bottom.
+- Nested coaxial counterbore (large shallow + small deeper): annular floor,
+  pilot wall only below floor — no thin septum wall.
+- `AppendBoxHole` / first cut rebuild shell after param write.
 
 **Next (geometry spine for real STEP + features)**
 
@@ -203,9 +213,9 @@ export special cases.
 2. [x] `MakeBoxSolid` edges/faces carry real curve/surface handles (not null)
 3. [x] `MakeCylinderSolid` (n-gon + circle/cyl analytic handles) + tess n-gon fan
 3b. [x] Tess segments from chordal deflection `CircleSegCount(r,δ)` — not fixed n
-4. [x] Walk-based poly STEP (`WritePolySolidSTEP`); AABB box only as fallback
-5. [ ] Sphere solid; better cylinder STEP (not AABB box)
-6. [ ] `CAD_Isect` analytic then `CAD_Bool` Difference (holes become real)
+4. [x] Walk-based poly STEP (`WritePolySolidSTEP`); no kind recipes
+5. [x] Hole shells: through / blind / multi / nested counterbore (Topo)
+6. [ ] Richer Bool/Isect; side-axis tools; general B-Rep cut
 7. [ ] Fillet/chamfer after offset surfaces exist
 8. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
 9. [ ] Viewport/Vulkan **after** tess emits real buffers
