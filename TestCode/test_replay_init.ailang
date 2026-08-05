@@ -1,0 +1,565 @@
+// test_replay_init.ailang — §30 full-trace cold-init replay harness
+// Build: ./ailang.x TestCode/test_replay_init.ailang test_replay_init
+// Run:   sudo ./test_replay_init 2>&1 | tee replay_mmiotrace.txt   (from repo root)
+//
+// Replays the kernel's ENTIRE cold init verbatim from bus2_all.txt
+// (fw_trace/FULL_REPLAY_A1.bin + A2.bin, extract_full_replay.py) with every
+// kernel read acting as an oracle against our hardware's answers.
+//
+// Sequence:
+//   1. Discover GPUs; REQUIRE bus 2 (no fallback, display GPU never touched)
+//   2. Map BARs
+//   3. Replay A1 (seq 6..12087: ATOM init, MC train, golden regs — ends with
+//      BIF_FB_EN=3 @3639, so VRAM is CPU-writable after A1)
+//   4. GART_Init (page table at VRAM 0 — same location/START as kernel)
+//   5. Map host pages at the KERNEL's GART VAs (verbatim register values then
+//      need no translation):
+//        WB   0xFF00401000 (1pg)  IH 0xFF00609000 (16pg)
+//        RB0  0xFF00619000 (4pg)  RB1 0xFF0061D000 (2pg)  RB2 0xFF0061F000 (2pg)
+//   6. Pre-fill ring content the kernel wrote through GTT (invisible to
+//      mmiotrace, reconstructed from radeon si.c):
+//        RB0: ME_INITIALIZE + SET_BASE, PACKET2-pad to 0x100; PACKET2 NOP fill
+//             0x100-0x500 (kernel: si_default_state — KNOWN v1 DIVERGENCE);
+//             ring-test SET_CONFIG_REG SCRATCH_REG0=0xDEADBEEF at 0x500, pad 0x600
+//        RB1/RB2: ring-test packet at 0, pad to 0x100
+//   7. Replay A2 (seq 12088..439996: VM config, IH, RLC fw+start, CP fw,
+//      ring regs, unhalt, kernel ring scratch tests)
+//
+// VERDICT: the three [§30-POLL] reg=0x8500 want=0xDEADBEEF lines inside A2
+// are the kernel's own ring tests. hit=1 = the ME EXECUTED a ring packet —
+// first direct execution proof, achieved via pure verbatim replay.
+// hit=0 with 0 oracle mismatches = the divergence is NOT observable in BAR0
+// MMIO (memory-side or non-MMIO state). Either way: decisive.
+
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUGART
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.AMDGPUReplay
+
+// Map n_pages of host memory at consecutive GART PTE slots (kernel VA layout).
+// Returns 1 on success, 0 on failure.
+Function.ReplayMapRegion {
+    Input: gpu: Integer
+    Input: host_ptr: Integer
+    Input: n_pages: Integer
+    Input: pte_base: Integer
+    Output: Integer
+    Body: {
+        mp_i = 0
+        WhileLoop LessThan(mp_i, n_pages) {
+            mp_va = Add(host_ptr, Multiply(mp_i, 4096))
+            mp_phys = GART_GetPhysAddr(mp_va)
+            IfCondition EqualTo(mp_phys, 0) ThenBlock: {
+                PrintMessage("[§30] ERROR: no phys for region page ")
+                PrintNumber(mp_i)
+                PrintMessage("\n")
+                ReturnValue(0)
+            }
+            GART_WritePTE(gpu, Add(pte_base, mp_i), mp_phys)
+            mp_i = Add(mp_i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Allocate, mlock, zero, and fault-in an anonymous region. Returns ptr or 0.
+Function.ReplayAllocRegion {
+    Input: size: Integer
+    Output: Integer
+    Body: {
+        ar_prot = Add(GPUSys.PROT_READ, GPUSys.PROT_WRITE)
+        ar_ptr = SystemCall(GPUSys.SYS_MMAP, 0, size, ar_prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(ar_ptr, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(GARTConf.SYS_MLOCK, ar_ptr, size, 0, 0, 0)
+        MemorySet(ar_ptr, 0, size)
+        ReturnValue(ar_ptr)
+    }
+}
+
+// Fill a ring image with PACKET2 padding (0x80000000) from dword a to b-1.
+Function.ReplayPad {
+    Input: base: Integer
+    Input: dw_from: Integer
+    Input: dw_to: Integer
+    Body: {
+        pd_i = dw_from
+        WhileLoop LessThan(pd_i, dw_to) {
+            StoreValue(Add(base, Multiply(pd_i, 4)), 2147483648, "dword")
+            pd_i = Add(pd_i, 1)
+        }
+    }
+}
+
+// §34: load a .bin of LE dwords and write it into VRAM at byte offset
+// vram_off via GPU_VramWr32 (CPU->FB-BAR path, same as the kernel's kmap
+// writes for the RLC SR/CSB objects). Returns dword count, -1 on error.
+Function.ReplayVramBlob {
+    Input: gpu: Integer
+    Input: path: Integer
+    Input: vram_off: Integer
+    Output: Integer
+    Body: {
+        vb_fd = SystemCall(2, path, 0, 0)
+        IfCondition LessThan(vb_fd, 0) ThenBlock: { ReturnValue(-1) }
+        vb_size = SystemCall(8, vb_fd, 0, 2)
+        SystemCall(8, vb_fd, 0, 0)
+        vb_buf = Allocate(vb_size)
+        IfCondition EqualTo(vb_buf, 0) ThenBlock: {
+            SystemCall(3, vb_fd)
+            ReturnValue(-1)
+        }
+        vb_got = SystemCall(0, vb_fd, vb_buf, vb_size)
+        SystemCall(3, vb_fd)
+        IfCondition NotEqual(vb_got, vb_size) ThenBlock: {
+            Deallocate(vb_buf, vb_size)
+            ReturnValue(-1)
+        }
+        vb_n = Divide(vb_size, 4)
+        vb_i = 0
+        WhileLoop LessThan(vb_i, vb_n) {
+            vb_d = Dereference(Add(vb_buf, Multiply(vb_i, 4)), "dword")
+            GPU_VramWr32(gpu, Add(vram_off, Multiply(vb_i, 4)), vb_d)
+            vb_i = Add(vb_i, 1)
+        }
+        Deallocate(vb_buf, vb_size)
+        ReturnValue(vb_n)
+    }
+}
+
+// §34: load a .bin of LE dwords into host memory at dst (ring images).
+// Returns dword count, -1 on error.
+Function.ReplayHostBlob {
+    Input: path: Integer
+    Input: dst: Integer
+    Output: Integer
+    Body: {
+        hb_fd = SystemCall(2, path, 0, 0)
+        IfCondition LessThan(hb_fd, 0) ThenBlock: { ReturnValue(-1) }
+        hb_size = SystemCall(8, hb_fd, 0, 2)
+        SystemCall(8, hb_fd, 0, 0)
+        hb_got = SystemCall(0, hb_fd, dst, hb_size)
+        SystemCall(3, hb_fd)
+        IfCondition NotEqual(hb_got, hb_size) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Divide(hb_size, 4))
+    }
+}
+
+// Write the kernel ring-test packet (SET_CONFIG_REG SCRATCH_REG0=0xDEADBEEF)
+// at dword offset dw.
+Function.ReplayScratchPkt {
+    Input: base: Integer
+    Input: dw: Integer
+    Body: {
+        sp_hdr = PM4_BuildHeader(PM4.OP_SET_CONFIG_REG, 2, 0)
+        StoreValue(Add(base, Multiply(dw, 4)), sp_hdr, "dword")
+        StoreValue(Add(base, Multiply(Add(dw, 1), 4)), 320, "dword")           // (0x8500-0x8000)/4
+        StoreValue(Add(base, Multiply(Add(dw, 2), 4)), 3735928559, "dword")    // 0xDEADBEEF
+    }
+}
+
+// §42: tracer station — SET_CONFIG_REG SCRATCH_REG1=marker at dword offset dw.
+// Same 3-dw packet shape as the kernel's own ring test; SCRATCH_REG1 (0x8504)
+// keeps 0x8500 clean as the kernel's ring-test oracle.
+Function.ReplayTracerPkt {
+    Input: base: Integer
+    Input: dw: Integer
+    Input: marker: Integer
+    Body: {
+        tp_hdr = PM4_BuildHeader(PM4.OP_SET_CONFIG_REG, 2, 0)
+        StoreValue(Add(base, Multiply(dw, 4)), tp_hdr, "dword")
+        StoreValue(Add(base, Multiply(Add(dw, 1), 4)), 321, "dword")           // (0x8504-0x8000)/4
+        StoreValue(Add(base, Multiply(Add(dw, 2), 4)), marker, "dword")
+    }
+}
+
+// §42: copy count dwords from src dword offset to dst dword offset.
+Function.ReplayCopyDW {
+    Input: src: Integer
+    Input: src_dw: Integer
+    Input: dst: Integer
+    Input: dst_dw: Integer
+    Input: count: Integer
+    Body: {
+        cd_i = 0
+        WhileLoop LessThan(cd_i, count) {
+            cd_v = Dereference(Add(src, Multiply(Add(src_dw, cd_i), 4)), "dword")
+            StoreValue(Add(dst, Multiply(Add(dst_dw, cd_i), 4)), cd_v, "dword")
+            cd_i = Add(cd_i, 1)
+        }
+    }
+}
+
+SubRoutine.Main {
+    PrintMessage("=== §30 FULL-TRACE COLD-INIT REPLAY (bus 2 only) ===\n")
+    PrintMessage("[§40] de-pace armed: A2 window seq 12088-439996 (A1 stays paced)\n")
+    PrintMessage("[§42] tracer armed: 13 stations on SCRATCH_REG1 (0x8504) + RPTR 3x resample\n")
+    PrintMessage("[§43] anchors armed: 4 context-reg readbacks (H1 no-execute vs H2 writes-lost)\n")
+
+    n_gpus = GPU_Discover()
+    IfCondition EqualTo(n_gpus, 0) ThenBlock: {
+        PrintMessage("[§30] no AMD GPU found\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    gpu = -1
+    gi = 0
+    WhileLoop LessThan(gi, n_gpus) {
+        bus = GPU_GetDeviceField(gi, GPUDevField.PCI_BUS)
+        IfCondition EqualTo(bus, 2) ThenBlock: { gpu = gi }
+        gi = Add(gi, 1)
+    }
+    IfCondition LessThan(gpu, 0) ThenBlock: {
+        PrintMessage("[§30] ABORT: bus 2 not found — refusing any other GPU\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[§30] using GPU ")
+    PrintNumber(gpu)
+    PrintMessage(" (bus 2)\n")
+
+    GPU_BAR_Init()
+    rc = GPU_BAR_MapMMIO(gpu)
+    IfCondition EqualTo(rc, 0) ThenBlock: {
+        PrintMessage("[§30] MMIO map failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    rc = GPU_BAR_MapVRAM(gpu)
+    IfCondition EqualTo(rc, 0) ThenBlock: {
+        PrintMessage("[§30] VRAM map failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // ---- §34 COLD-ENTRY GUARD ----
+    // CONFIG_MEMSIZE (0x5428) reads 0 on an unposted (true cold) card, 0x400
+    // once anything has POSTed it. Replaying the from-unposted A1 sequence
+    // onto a posted card reprograms live SPLL/MC state and wedges the fabric —
+    // that is exactly what froze the box at 20:34 Jul 2 (run on a warm card,
+    // froze at the SPLL block ~record 1731). Refuse to run warm.
+    cm = GPU_Rd32(gpu, 0x5428)
+    IfCondition NotEqual(cm, 0) ThenBlock: {
+        PrintMessage("[§34] ABORT: CONFIG_MEMSIZE=0x")
+        PrintHex(cm)
+        PrintMessage(" — card is already POSTed, this boot is NOT cold.\n")
+        PrintMessage("[§34] Replaying warm froze the box (Jul 2 20:34). Cold reboot first;\n")
+        PrintMessage("[§34] nothing may touch bus 2 before this harness runs.\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[§34] cold entry confirmed (CONFIG_MEMSIZE=0)\n")
+
+    // ---- Phase A1: ATOM/MC/golden (pure verbatim, no memory deps) ----
+    PrintMessage("[§30] === PHASE A1 ===\n")
+    mis1 = GPU_ReplayFull(gpu, "fw_trace/FULL_REPLAY_A1.bin", 0, 0)
+    IfCondition LessThan(mis1, 0) ThenBlock: { SystemCall(60, 1, 0, 0, 0, 0) }
+
+    // ---- GART table (VRAM 0, kernel-identical location) ----
+    rc = GART_Init(gpu)
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[§30] GART_Init failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // ---- Host pages at the kernel's GART VAs ----
+    wb_ptr  = ReplayAllocRegion(4096)
+    ih_ptr  = ReplayAllocRegion(65536)
+    rb0_ptr = ReplayAllocRegion(16384)
+    rb1_ptr = ReplayAllocRegion(8192)
+    rb2_ptr = ReplayAllocRegion(8192)
+    alloc_ok = 1
+    IfCondition EqualTo(wb_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(ih_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(rb0_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(rb1_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(rb2_ptr, 0) ThenBlock: { alloc_ok = 0 }
+    IfCondition EqualTo(alloc_ok, 0) ThenBlock: {
+        PrintMessage("[§30] region alloc failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    // PTE index = VA>>12 - PAGE_TABLE_START (0x0F400000), per kernel layout
+    ok = ReplayMapRegion(gpu, wb_ptr, 1, 11535361)     // 0xFF00401000
+    ok = Multiply(ok, ReplayMapRegion(gpu, ih_ptr, 16, 11535881))   // 0xFF00609000
+    ok = Multiply(ok, ReplayMapRegion(gpu, rb0_ptr, 4, 11535897))   // 0xFF00619000
+    ok = Multiply(ok, ReplayMapRegion(gpu, rb1_ptr, 2, 11535901))   // 0xFF0061D000
+    ok = Multiply(ok, ReplayMapRegion(gpu, rb2_ptr, 2, 11535903))   // 0xFF0061F000
+    IfCondition EqualTo(ok, 0) ThenBlock: {
+        PrintMessage("[§30] kernel-VA PTE mapping failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[§30] kernel-VA regions mapped (WB/IH/RB0/RB1/RB2)\n")
+
+    // ---- Ring content (kernel wrote via GTT; reconstructed) ----
+    // RB0 dw 0-10: ME_INITIALIZE + SET_BASE (same payloads as PM4_CPStart)
+    hdr = PM4_BuildHeader(PM4.OP_ME_INITIALIZE, 6, 0)
+    StoreValue(rb0_ptr, hdr, "dword")
+    StoreValue(Add(rb0_ptr, 4), 1, "dword")
+    StoreValue(Add(rb0_ptr, 8), 0, "dword")
+    StoreValue(Add(rb0_ptr, 12), 7, "dword")
+    StoreValue(Add(rb0_ptr, 16), 65536, "dword")
+    StoreValue(Add(rb0_ptr, 20), 0, "dword")
+    StoreValue(Add(rb0_ptr, 24), 0, "dword")
+    // §42 st1 (0x42000001): did ME_INITIALIZE itself execute?
+    ReplayTracerPkt(rb0_ptr, 7, 0x42000001)
+    hdr = PM4_BuildHeader(PM4.OP_SET_BASE, 3, 0)
+    StoreValue(Add(rb0_ptr, 40), hdr, "dword")
+    StoreValue(Add(rb0_ptr, 44), 3, "dword")
+    StoreValue(Add(rb0_ptr, 48), 49152, "dword")
+    StoreValue(Add(rb0_ptr, 52), 57344, "dword")
+    // §42 st2 (0x42000002): after SET_BASE — chunk 1 fully executed.
+    ReplayTracerPkt(rb0_ptr, 14, 0x42000002)
+    ReplayPad(rb0_ptr, 17, 256)
+    // §34: the kernel's actual default-state stream (gfx_v6_0_cp_gfx_start:
+    // preamble + si_cs_data extents + clear state + SET_CONTEXT 0x316),
+    // generated by fw_trace/extract_rlc_content.py.
+    // §42: interleaved with tracer stations st3..st13 at the stream's 11
+    // top-level packet boundaries (§41 pinned the wedge inside this stream;
+    // deliberate content divergence — SCRATCH_REG1 bisects execution in one
+    // boot). 906 stream + 33 tracer dw end at dw 1195 < 1280: the WPTR chunk
+    // boundaries (0x100/0x500/0x600) and the ring test at dw 1280 are unmoved.
+    ds_buf = Allocate(4096)
+    IfCondition EqualTo(ds_buf, 0) ThenBlock: {
+        PrintMessage("[§42] ds_buf alloc failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    ds_n = ReplayHostBlob("fw_trace/RB0_DEFAULT_STATE.bin", ds_buf)
+    IfCondition NotEqual(ds_n, 906) ThenBlock: {
+        PrintMessage("[§34] RB0_DEFAULT_STATE.bin load failed / wrong size\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[§34] RB0 default state: ")
+    PrintNumber(ds_n)
+    PrintMessage(" dwords at dw 256 (§42: 11 tracers interleaved)\n")
+    ReplayCopyDW(ds_buf, 0, rb0_ptr, 256, 2)        // PREAMBLE_CNTL begin
+    ReplayTracerPkt(rb0_ptr, 258, 0x42000003)
+    ReplayCopyDW(ds_buf, 2, rb0_ptr, 261, 214)      // SET_CONTEXT_REG 0xA000
+    ReplayTracerPkt(rb0_ptr, 475, 0x42000004)
+    ReplayCopyDW(ds_buf, 216, rb0_ptr, 478, 274)    // SET_CONTEXT_REG 0xA0D8
+    ReplayTracerPkt(rb0_ptr, 752, 0x42000005)
+    ReplayCopyDW(ds_buf, 490, rb0_ptr, 755, 8)      // SET_CONTEXT_REG 0xA1F5
+    ReplayTracerPkt(rb0_ptr, 763, 0x42000006)
+    ReplayCopyDW(ds_buf, 498, rb0_ptr, 766, 159)    // SET_CONTEXT_REG 0xA200
+    ReplayTracerPkt(rb0_ptr, 925, 0x42000007)
+    ReplayCopyDW(ds_buf, 657, rb0_ptr, 928, 3)      // SET_CONTEXT_REG 0xA2A1
+    ReplayTracerPkt(rb0_ptr, 931, 0x42000008)
+    ReplayCopyDW(ds_buf, 660, rb0_ptr, 934, 3)      // SET_CONTEXT_REG 0xA2A3
+    ReplayTracerPkt(rb0_ptr, 937, 0x42000009)
+    ReplayCopyDW(ds_buf, 663, rb0_ptr, 940, 235)    // SET_CONTEXT_REG 0xA2A5
+    ReplayTracerPkt(rb0_ptr, 1175, 0x4200000A)
+    ReplayCopyDW(ds_buf, 898, rb0_ptr, 1178, 2)     // PREAMBLE_CNTL end
+    ReplayTracerPkt(rb0_ptr, 1180, 0x4200000B)
+    ReplayCopyDW(ds_buf, 900, rb0_ptr, 1183, 2)     // CLEAR_STATE
+    ReplayTracerPkt(rb0_ptr, 1185, 0x4200000C)
+    ReplayCopyDW(ds_buf, 902, rb0_ptr, 1188, 4)     // SET_CONTEXT_REG 0xA316
+    ReplayTracerPkt(rb0_ptr, 1192, 0x4200000D)
+    ReplayPad(rb0_ptr, 1195, 1280)
+    ReplayScratchPkt(rb0_ptr, 1280)
+    ReplayPad(rb0_ptr, 1283, 1536)
+    // RB1/RB2: ring-test packet + pad to 0x100
+    ReplayScratchPkt(rb1_ptr, 0)
+    ReplayPad(rb1_ptr, 3, 256)
+    ReplayScratchPkt(rb2_ptr, 0)
+    ReplayPad(rb2_ptr, 3, 256)
+    PrintMessage("[§30] ring images written\n")
+
+    // ---- §34: RLC SR/CSB content at the KERNEL's VRAM addresses ----
+    // The trace writes RLC_SAVE_AND_RESTORE_BASE=0xF4002010 and
+    // RLC_CLEAR_STATE_RESTORE_BASE=0xF4002020 (A2 seq 329387/329388) but the
+    // CONTENT at those addresses went through the FB BAR — invisible to
+    // mmiotrace and never populated by the replay (§33 hypothesis b, the
+    // RLC-stuck-at-0x6 lead). Kernel: SR = 218-dword verde list; CSB =
+    // 256-byte descriptor header + 908-dword clear-state stream.
+    // Must run AFTER GART_Init: these VRAM bytes double as PTE slots for
+    // never-walked VRAM-range VAs, and GART_Init's fill sweeps them.
+    sr_n = ReplayVramBlob(gpu, "fw_trace/RLC_SR_CONTENT.bin", 0x201000)
+    csb_n = ReplayVramBlob(gpu, "fw_trace/RLC_CSB_CONTENT.bin", 0x202000)
+    IfCondition LessThan(sr_n, 0) ThenBlock: {
+        PrintMessage("[§34] RLC_SR_CONTENT.bin load failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    IfCondition LessThan(csb_n, 0) ThenBlock: {
+        PrintMessage("[§34] RLC_CSB_CONTENT.bin load failed\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[§34] RLC SR content: ")
+    PrintNumber(sr_n)
+    PrintMessage(" dw @ VRAM 0x201000; CSB (hdr+stream): ")
+    PrintNumber(csb_n)
+    PrintMessage(" dw @ VRAM 0x202000\n")
+
+    // ---- §39: MSI mirror (the last GPU-config-space delta) ----
+    // Working boot enables MSI in radeon_irq_kms_init — after device init
+    // (A1), before si_startup (all of A2). Exact captured values
+    // (pci_working_boot/gpu_working.txt 2026-07-02): addr 0xFEE15000,
+    // data 0x0022, ctrl 0x0081, COMMAND 0x0407 (DisINTx set).
+    rc = GPU_BAR_EnableMSI(gpu)
+    IfCondition EqualTo(rc, 0) ThenBlock: {
+        PrintMessage("[§39] MSI mirror FAILED — aborting (config space must be verbatim)\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+    PrintMessage("[§39] MSI mirrored (addr 0xFEE15000 data 0x0022, COMMAND 0x407)\n")
+
+    // ---- Phase A2: VM, IH, RLC, CP fw, rings, unhalt, ring tests ----
+    // §40: A2 runs UNPACED (seq window covers the whole table) — pacing is
+    // the last unfalsifiable difference vs the working boot (§39 closed MSI).
+    // A1 stays paced: its 1,185 oracles already falsify A1 pacing.
+    // §42: SCRATCH_REG1 power-on baseline (GRBM-routed — SPLL is up post-A1).
+    // Any 0x420000NN read at verdict time can only have come from a tracer.
+    t42 = GPU_Rd32(gpu, SIReg.SCRATCH_REG1)
+    PrintMessage("[§42] SCRATCH_REG1 baseline=0x")
+    PrintHex(t42)
+    PrintMessage("\n")
+    // §43: power-on baselines for the context-reg anchors (H1-vs-H2 fork).
+    // The default-state stream SET_CONTEXT_REGs these to known values; A1/A2
+    // never MMIO-write any of them (grep-verified), so post-run == stream
+    // value can ONLY mean the ME executed the stream. Context-reg MMIO reads
+    // are trace-proven safe on this box (A1 oracle-reads 0x28350 @seq 3672).
+    // Anchors: 0x28230 PA_SC_EDGERULE (pkt 2, stream value 0xAA99AAAA),
+    // 0x28810 (pkt 5, 0x00090000), 0x28BDC (pkt 8, 0x00001000),
+    // 0x28C58 (final pkt, 0x0000000E — stream-done marker).
+    a43 = GPU_Rd32(gpu, 0x28230)
+    PrintMessage("[§43] anchor baseline 0x28230=0x")
+    PrintHex(a43)
+    a43 = GPU_Rd32(gpu, 0x28810)
+    PrintMessage(" 0x28810=0x")
+    PrintHex(a43)
+    a43 = GPU_Rd32(gpu, 0x28BDC)
+    PrintMessage(" 0x28BDC=0x")
+    PrintHex(a43)
+    a43 = GPU_Rd32(gpu, 0x28C58)
+    PrintMessage(" 0x28C58=0x")
+    PrintHex(a43)
+    PrintMessage("\n")
+    PrintMessage("[§30] === PHASE A2 ===\n")
+    mis2 = GPU_ReplayFull(gpu, "fw_trace/FULL_REPLAY_A2.bin", 12088, 439996)
+
+    // ---- §41: fetch-vs-content discriminator ----
+    // WPTR readback should hold the trace's final values (0x600/0x100/0x100).
+    // RPTR is the CP's fetch position, MMIO read only (the GART WB shadow is a
+    // known false signal). RPTR moved = the CP fetched our GART ring pages and
+    // the failure is content/execution-side; RPTR frozen at 0 = the CP never
+    // fetched a single dword — the CP→GART fetch path itself is dead cold
+    // (parked §28.5 symptom, same family). Offsets kernel-verified:
+    // 0x8700/0x86FC/0x86F8 (mmCP_RB0/1/2_RPTR 0x21C0/0x21BF/0x21BE).
+    p41 = GPU_Rd32(gpu, SIReg.CP_RB0_RPTR)
+    q41 = GPU_Rd32(gpu, SIReg.CP_RB0_WPTR)
+    PrintMessage("[§41] RB0 RPTR=0x")
+    PrintHex(p41)
+    PrintMessage(" WPTR=0x")
+    PrintHex(q41)
+    PrintMessage("\n")
+    p41 = GPU_Rd32(gpu, SIReg.CP_RB1_RPTR)
+    q41 = GPU_Rd32(gpu, SIReg.CP_RB1_WPTR)
+    PrintMessage("[§41] RB1 RPTR=0x")
+    PrintHex(p41)
+    PrintMessage(" WPTR=0x")
+    PrintHex(q41)
+    PrintMessage("\n")
+    p41 = GPU_Rd32(gpu, SIReg.CP_RB2_RPTR)
+    q41 = GPU_Rd32(gpu, SIReg.CP_RB2_WPTR)
+    PrintMessage("[§41] RB2 RPTR=0x")
+    PrintHex(p41)
+    PrintMessage(" WPTR=0x")
+    PrintHex(q41)
+    PrintMessage("\n")
+    p41 = GPU_Rd32(gpu, SIReg.CP_ME_CNTL)
+    q41 = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+    PrintMessage("[§41] CP_ME_CNTL=0x")
+    PrintHex(p41)
+    PrintMessage(" GRBM_STATUS=0x")
+    PrintHex(q41)
+    PrintMessage("\n")
+
+    // ---- §42a: RPTR frozen-vs-crawling (3 samples, 1 s apart) ----
+    ts42 = Allocate(16)
+    StoreValue(ts42, 1)
+    StoreValue(Add(ts42, 8), 0)
+    s42 = 0
+    WhileLoop LessThan(s42, 3) {
+        SystemCall(35, ts42, 0, 0, 0, 0, 0)
+        PrintMessage("[§42] RPTR sample ")
+        PrintNumber(s42)
+        r42 = GPU_Rd32(gpu, SIReg.CP_RB0_RPTR)
+        PrintMessage(": RB0=0x")
+        PrintHex(r42)
+        r42 = GPU_Rd32(gpu, SIReg.CP_RB1_RPTR)
+        PrintMessage(" RB1=0x")
+        PrintHex(r42)
+        r42 = GPU_Rd32(gpu, SIReg.CP_RB2_RPTR)
+        PrintMessage(" RB2=0x")
+        PrintHex(r42)
+        PrintMessage("\n")
+        s42 = Add(s42, 1)
+    }
+
+    // ---- §42b: tracer readout — last executed station ----
+    // Station map (doc §2.1): 01 after ME_INITIALIZE, 02 after SET_BASE,
+    // 03 after PREAMBLE-begin, 04..0A after SET_CONTEXT_REG 0xA000/0xA0D8/
+    // 0xA1F5/0xA200/0xA2A1/0xA2A3/0xA2A5, 0B after PREAMBLE-end,
+    // 0C after CLEAR_STATE, 0D after SET_CONTEXT_REG 0xA316 (stream done).
+    t42 = GPU_Rd32(gpu, SIReg.SCRATCH_REG1)
+    PrintMessage("[§42] SCRATCH_REG1=0x")
+    PrintHex(t42)
+    PrintMessage(" (0x420000NN = last executed station; baseline printed pre-A2)\n")
+
+    // ---- §43: context-reg anchor readback — splits the §42 fork ----
+    // Any anchor == stream value ⇒ the ME EXECUTED the stream and its
+    // register writes to SCRATCH space are what's lost (H2). All anchors at
+    // power-on baseline ⇒ leans H1 (ME executes nothing) — not conclusive
+    // alone: CP-write→MMIO-read visibility on SI is unconfirmed (doc §2.1).
+    m43 = 0
+    a43 = GPU_Rd32(gpu, 0x28230)
+    PrintMessage("[§43] anchor 0x28230=0x")
+    PrintHex(a43)
+    PrintMessage(" want=0xAA99AAAA\n")
+    IfCondition EqualTo(a43, 0xAA99AAAA) ThenBlock: { m43 = Add(m43, 1) }
+    a43 = GPU_Rd32(gpu, 0x28810)
+    PrintMessage("[§43] anchor 0x28810=0x")
+    PrintHex(a43)
+    PrintMessage(" want=0x00090000\n")
+    IfCondition EqualTo(a43, 0x00090000) ThenBlock: { m43 = Add(m43, 1) }
+    a43 = GPU_Rd32(gpu, 0x28BDC)
+    PrintMessage("[§43] anchor 0x28BDC=0x")
+    PrintHex(a43)
+    PrintMessage(" want=0x00001000\n")
+    IfCondition EqualTo(a43, 0x00001000) ThenBlock: { m43 = Add(m43, 1) }
+    a43 = GPU_Rd32(gpu, 0x28C58)
+    PrintMessage("[§43] anchor 0x28C58=0x")
+    PrintHex(a43)
+    PrintMessage(" want=0x0000000E\n")
+    IfCondition EqualTo(a43, 0x0000000E) ThenBlock: { m43 = Add(m43, 1) }
+    g43 = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+    PrintMessage("[§43] GRBM_STATUS resample=0x")
+    PrintHex(g43)
+    PrintMessage(" (box normal 0xA0003028; §42 saw 0xA24C3028)\n")
+    PrintMessage("[§43] anchors matching stream: ")
+    PrintNumber(m43)
+    PrintMessage("/4 — ")
+    IfCondition NotEqual(m43, 0) ThenBlock: {
+        PrintMessage("ME EXECUTED the stream: H2, register-write path is the loss\n")
+    } ElseBlock: {
+        PrintMessage("no anchor moved: leans H1 (cross-check baselines above)\n")
+    }
+
+    // ---- Verdict ----
+    scr = GPU_Rd32(gpu, SIReg.SCRATCH_REG0)
+    PrintMessage("\n[§30] ============ VERDICT ============\n")
+    PrintMessage("[§30] final SCRATCH_REG0=0x")
+    PrintHex(scr)
+    PrintMessage(" (0xDEADBEEF = ME executed the last ring test)\n")
+    PrintMessage("[§30] A1 mismatches=")
+    PrintNumber(mis1)
+    PrintMessage(" A2 mismatches=")
+    PrintNumber(mis2)
+    PrintMessage("\n")
+    IfCondition EqualTo(scr, 0xDEADBEEF) ThenBlock: {
+        PrintMessage("[§30] SCRATCH_REG0=0xDEADBEEF: the LAST ring test executed. Check the\n")
+        PrintMessage("[§30] three [§30-POLL] reg=0x8500 lines above for RB0/RB1/RB2 individually.\n")
+    } ElseBlock: {
+        PrintMessage("[§30] SCRATCH_REG0 != 0xDEADBEEF: ME EXECUTED NOTHING (ring tests FAILED).\n")
+        PrintMessage("[§30] Cross-check the [§30-POLL] reg=0x8500 + [§30-MIS] reg=0x8500 lines above.\n")
+    }
+    PrintMessage("[§30] =================================\n")
+
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)

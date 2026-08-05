@@ -25,9 +25,7 @@ LibraryImport.PostgreSQL_Complete
 LibraryImport.Display.Render.Framebuffer
 LibraryImport.TermFont
 
-Import.OS.Login
 Import.OS.Schema
-Import.OS.Installer
 
 // =============================================================================
 // STUB: DebugLog_Push (needed by Framebuffer library, no-op here)
@@ -455,7 +453,7 @@ Function.Init_LoadModulesAuto {
             dpos = 0
             WhileLoop LessThan(dpos, nread) {
                 // d_reclen at offset 16 (2 bytes)
-                reclen = Or(GetByte(dents, Add(dpos, 16)), ShiftLeft(GetByte(dents, Add(dpos, 17)), 8))
+                reclen = Add(GetByte(dents, Add(dpos, 16)), Multiply(GetByte(dents, Add(dpos, 17)), 256))
                 // d_name at offset 19
                 name_off = Add(dpos, 19)
                 first_byte = GetByte(dents, name_off)
@@ -653,9 +651,31 @@ Function.Init_InitPGData {
         Deallocate(pg_version_path, 0)
 
         IfCondition GreaterEqual(fd, 0) ThenBlock: {
-            // PG_VERSION exists — already initialized
+            // PG_VERSION exists — already initialized (pre-built data dir)
             SystemCall(InitSys.SYS_CLOSE, fd, 0, 0, 0, 0)
-            PrintMessage("[INIT] PostgreSQL data directory already initialized\n")
+            // Ensure ownership is correct (data dir may have been built on host as different user)
+            SystemCall(92, "/var/lib/postgresql", InitConst.PG_UID, InitConst.PG_GID, 0, 0)
+            SystemCall(92, InitPaths.pg_data, InitConst.PG_UID, InitConst.PG_GID, 0, 0)
+            // Recursively chown: fork/exec chown -R 121:124 /var/lib/postgresql/data
+            chown_argv = Allocate(40)
+            StoreValue(Add(chown_argv, 0), "/bin/chown")
+            StoreValue(Add(chown_argv, 8), "-R")
+            StoreValue(Add(chown_argv, 16), "121:124")
+            StoreValue(Add(chown_argv, 24), InitPaths.pg_data)
+            StoreValue(Add(chown_argv, 32), 0)
+            chown_pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+            IfCondition EqualTo(chown_pid, 0) ThenBlock: {
+                chown_envp = Allocate(8)
+                StoreValue(Add(chown_envp, 0), 0)
+                SystemCall(InitSys.SYS_EXECVE, "/bin/chown", chown_argv, chown_envp, 0, 0)
+                SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+            }
+            IfCondition GreaterThan(chown_pid, 0) ThenBlock: {
+                chown_ws = Allocate(4)
+                SystemCall(InitSys.SYS_WAIT4, chown_pid, chown_ws, 0, 0, 0)
+                Deallocate(chown_ws, 4)
+            }
+            PrintMessage("[INIT] PostgreSQL data directory ready (pre-built)\n")
             ReturnValue(0)
         }
 
@@ -710,7 +730,7 @@ Function.Init_InitPGData {
             hba_path = StringConcat(InitPaths.pg_data, "/pg_hba.conf")
             hba_fd = SystemCall(InitSys.SYS_OPEN, hba_path, 577, 420, 0, 0)  // O_WRONLY|O_CREAT|O_TRUNC=577, 0644=420
             IfCondition GreaterEqual(hba_fd, 0) ThenBlock: {
-                hba_content = "local all all trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\nhost all all 10.0.2.0/24 trust\n"
+                hba_content = "local all postgres trust\nlocal all bob trust\nhost all all 127.0.0.1/32 trust\nhost all all ::1/128 trust\nhost all all 10.0.2.0/24 trust\n"
                 hba_len = StringLength(hba_content)
                 SystemCall(InitSys.SYS_WRITE, hba_fd, hba_content, hba_len, 0, 0)
                 SystemCall(InitSys.SYS_CLOSE, hba_fd, 0, 0, 0, 0)
@@ -987,7 +1007,18 @@ Function.Init_SetupNetwork {
         }
 
         // Discover Ethernet interface by scanning /sys/class/net/
-        eth_name = Init_FindEthInterface()
+        // Retry a few times — NIC driver may still be initializing
+        eth_name = 0
+        eth_try = 0
+        WhileLoop LessThan(eth_try, 3) {
+            eth_name = Init_FindEthInterface()
+            IfCondition NotEqual(eth_name, 0) ThenBlock: { eth_try = 99 }
+            IfCondition And(EqualTo(eth_name, 0), LessThan(eth_try, 2)) ThenBlock: {
+                PrintMessage("[INIT] No eth interface yet, retrying...\n")
+                Init_Sleep(1)
+            }
+            eth_try = Add(eth_try, 1)
+        }
         IfCondition EqualTo(eth_name, 0) ThenBlock: {
             PrintMessage("[INIT] WARNING: no Ethernet interface found\n")
             Init_TryWiFiFallback()
@@ -1103,6 +1134,8 @@ Function.Init_FindEthInterface {
                 IfCondition EqualTo(GetByte(dents, name_off), 119) ThenBlock: { skip = 1 }
                 // Skip sit0 tunnel interfaces (starts with 's' = 115)
                 IfCondition EqualTo(GetByte(dents, name_off), 115) ThenBlock: { skip = 1 }
+                // Skip dummy* interfaces (starts with 'd' = 100)
+                IfCondition EqualTo(GetByte(dents, name_off), 100) ThenBlock: { skip = 1 }
 
                 // Take first non-skipped interface (prefer eth/enp)
                 IfCondition And(EqualTo(skip, 0), EqualTo(found, 0)) ThenBlock: {
@@ -1430,6 +1463,12 @@ SubRoutine.Main {
     PrintMessage("\n[INIT] Step 1c: Loading modules\n")
     Init_LoadModules()
 
+    // Brief pause for NIC drivers to create /sys/class/net/ entries
+    // Without this, Init_FindEthInterface runs before the kernel
+    // has finished creating the interface and only finds "lo".
+    PrintMessage("[INIT] Waiting for NIC enumeration...\n")
+    Init_Sleep(2)
+
     // Step 1d: Setup network (mode from config: dhcp/static/none)
     PrintMessage("\n[INIT] Step 1d: Network setup\n")
     Init_SetupNetwork()
@@ -1449,27 +1488,8 @@ SubRoutine.Main {
     PrintMessage("\n[INIT] Step 1f: Start sshd\n")
     InitState.sshd_pid = Init_StartSSHD()
 
-    // Step 2: Login screen (controlled by boot config, not kernel cmdline)
-    PrintMessage("\n[INIT] Step 2: Login\n")
-    show_login = Init_BootConfigIsYes(BootConfig.login)
-    IfCondition EqualTo(show_login, 0) ThenBlock: {
-        PrintMessage("[INIT] Login disabled in boot config\n\n")
-    } ElseBlock: {
-    fb_fd = SystemCall(InitSys.SYS_OPEN, "/dev/fb0", 0, 0, 0, 0)
-    IfCondition GreaterEqual(fb_fd, 0) ThenBlock: {
-        SystemCall(InitSys.SYS_CLOSE, fb_fd, 0, 0, 0, 0)
-        login_result = Login_Run()
-        IfCondition EqualTo(login_result, 0) ThenBlock: {
-            PrintMessage("[INIT] Login failed or cancelled. Halting.\n")
-            WhileLoop EqualTo(1, 1) {
-                Init_Sleep(3600)
-            }
-        }
-        PrintMessage("[INIT] Login successful\n\n")
-    } ElseBlock: {
-        PrintMessage("[INIT] No /dev/fb0 — serial console mode\n\n")
-    }
-    }
+    // Step 2: (reserved — Login runs after PG is ready, see Step 5b)
+    PrintMessage("\n[INIT] Step 2: (Login deferred until PG ready)\n")
 
     // Step 3: Initialize PG data directory if needed, then start PostgreSQL
     PrintMessage("[INIT] Step 3: Start PostgreSQL\n")
@@ -1547,51 +1567,61 @@ SubRoutine.Main {
         PrintMessage("[INIT] bob user already exists (or createuser failed)\n")
     }
 
-    // Step 5: Bootstrap schema
-    PrintMessage("\n[INIT] Step 5: Bootstrap schema\n")
-    schema_ok = Init_BootstrapSchema()
-    IfCondition EqualTo(schema_ok, 0) ThenBlock: {
-        PrintMessage("[INIT] WARNING: Schema bootstrap failed (continuing anyway)\n")
-    }
+    // Step 5: Schema bootstrap handled by display.x after PG unlock
+    PrintMessage("\n[INIT] Step 5: Schema managed by display server\n")
 
-    // Step 5b: First-boot installer — check if any user has a password set
-    PrintMessage("\n[INIT] Step 5b: Check first-boot installer\n")
-
-    skip_installer = Init_BootConfigIsYes(BootConfig.login)
-    // If login is disabled, skip installer too (development/liveboot mode)
-    IfCondition EqualTo(skip_installer, 0) ThenBlock: {
-        PrintMessage("[INIT] Login disabled — skipping first-boot installer\n")
-    } ElseBlock: {
-    inst_conn = PG_Connect("127.0.0.1", 5432, "ailang_system", "bob", "")
-    IfCondition NotEqual(inst_conn, 0) ThenBlock: {
-        inst_r = PG_Query(inst_conn, "SELECT id FROM users WHERE password_hash IS NOT NULL AND password_hash != '' LIMIT 1")
-        need_install = 1
-        IfCondition NotEqual(inst_r, 0) ThenBlock: {
-            inst_count = Array.Size(inst_r)
-            IfCondition GreaterThan(inst_count, 0) ThenBlock: {
-                need_install = 0
-            }
-            PG_DestroyResult(inst_r)
-        }
-        PG_Disconnect(inst_conn)
-
-        IfCondition EqualTo(need_install, 1) ThenBlock: {
-            PrintMessage("[INIT] No configured users — running first-boot installer\n")
-            inst_result = Installer_Run()
-            IfCondition EqualTo(inst_result, 1) ThenBlock: {
-                PrintMessage("[INIT] Installer completed successfully\n")
-            } ElseBlock: {
-                PrintMessage("[INIT] Installer skipped or failed (continuing with defaults)\n")
-            }
-        } ElseBlock: {
-            PrintMessage("[INIT] Users already configured — skipping installer\n")
-        }
-    } ElseBlock: {
-        PrintMessage("[INIT] Cannot connect to PG for installer check — skipping\n")
-    }
-    }
     } ElseBlock: {
         PrintMessage("[INIT] Skipping DB setup — PostgreSQL not available\n")
+    }
+
+    // Step 5b: Login — fork/exec login.x (validates credentials against PG bcrypt)
+    // login.x exits 0 on success, 1 on failure/cancel
+    PrintMessage("\n[INIT] Step 5b: Login\n")
+    IfCondition EqualTo(pg_ok, 1) ThenBlock: {
+        login_argv = Allocate(16)
+        StoreValue(Add(login_argv, 0), "/system/bin/login.x")
+        StoreValue(Add(login_argv, 8), 0)
+
+        login_pid = SystemCall(InitSys.SYS_FORK, 0, 0, 0, 0, 0)
+        IfCondition EqualTo(login_pid, 0) ThenBlock: {
+            // CHILD — exec login.x
+            login_envp = Allocate(16)
+            StoreValue(Add(login_envp, 0), "HOME=/")
+            StoreValue(Add(login_envp, 8), 0)
+            SystemCall(InitSys.SYS_EXECVE, "/system/bin/login.x", login_argv, login_envp, 0, 0)
+            PrintMessage("[INIT] ERROR: login.x execve failed\n")
+            SystemCall(InitSys.SYS_EXIT, 127, 0, 0, 0, 0)
+        }
+
+        // PARENT — wait for login.x to exit
+        IfCondition GreaterThan(login_pid, 0) ThenBlock: {
+            PrintMessage("[INIT] login.x started (pid=")
+            PrintNumber(login_pid)
+            PrintMessage(")\n")
+            login_ws = Allocate(8)
+            StoreValue(login_ws, 0)
+            SystemCall(InitSys.SYS_WAIT4, login_pid, login_ws, 0, 0, 0)
+            login_wstatus = Dereference(login_ws)
+            login_exit = BitwiseAnd(Divide(login_wstatus, 256), 255)
+            Deallocate(login_ws, 8)
+
+            PrintMessage("[INIT] login.x exited with code ")
+            PrintNumber(login_exit)
+            PrintMessage("\n")
+
+            IfCondition NotEqual(login_exit, 0) ThenBlock: {
+                PrintMessage("[INIT] FATAL: Login failed — halting\n")
+                WhileLoop EqualTo(1, 1) {
+                    Init_Sleep(3600)
+                }
+            }
+            PrintMessage("[INIT] Login successful — continuing boot\n")
+        } ElseBlock: {
+            PrintMessage("[INIT] ERROR: fork failed for login.x\n")
+        }
+        Deallocate(login_argv, 16)
+    } ElseBlock: {
+        PrintMessage("[INIT] WARNING: PG not available, skipping login\n")
     }
 
     // ── Redirect fd 0/1/2 to /dev/null ──────────────────────────────

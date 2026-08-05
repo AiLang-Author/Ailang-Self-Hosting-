@@ -1,0 +1,2231 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUDPM_SI.ailang
+//
+// Southern Islands DPM backend. Builds SMC state tables, computes SPLL
+// shadow register values, and implements the DPM enable/disable sequence.
+//
+// The SMC firmware manages clock/voltage transitions autonomously once
+// the state table is uploaded and DPM is enabled. This replaces the
+// fragile direct-SPLL programming used by AccelGCN_SetSCLK.
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDPM_SI
+//
+// DEPENDS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+//   LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+//   LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUSMCRegs
+//   LibraryImport.Drivers.AMDGPU.AMDGPUSMC_SI
+//   LibraryImport.Drivers.AMDGPU.AMDGPUSMC
+//   LibraryImport.Drivers.AMDGPU.AMDGPUPowerPlay
+//   LibraryImport.Drivers.AMDGPU.AMDGPUVoltage
+//
+// SMC STATE TABLE LAYOUT (SISLANDS_SMC_STATETABLE):
+//   +0x000: u8  thermalProtectType
+//   +0x001: u8  systemFlags
+//   +0x002: u8  maxVDDCIndexInPPTable
+//   +0x003: u8  extraFlags
+//   +0x004: u32[32] lowSMIO           (GPIO voltage IDs, 128 bytes)
+//   +0x084: VOLTAGEMASKTABLE[4]       (16 bytes: VDDC, MVDD, VDDCI, PHASE masks)
+//   +0x094: VOLTAGEMASKTABLE[4]       (16 bytes: phase mask table)
+//   +0x0A4: DPM2Parameters            (20 bytes)
+//   +0x0B8: SWSTATE_SINGLE            (152 bytes: initialState)
+//   +0x150: SWSTATE_SINGLE            (152 bytes: ACPIState)
+//   +0x1E8: SWSTATE_SINGLE            (152 bytes: ULVState)
+//   +0x280: SWSTATE (variable)        (4 + N*148 bytes: driverState)
+//
+// SISLANDS_SMC_HW_PERFORMANCE_LEVEL (148 bytes / 0x94):
+//   +0x00: u8  ACIndex
+//   +0x01: u8  displayWatermark
+//   +0x02: u8  gen2PCIE
+//   +0x03-0x07: watermarks/flags/padding
+//   +0x08: u32 aT
+//   +0x0C: u32 bSP
+//   +0x10: SCLK_VALUE (28 bytes: 7 regs — SPLL_FUNC_CNTL, _2, _3, _4, SS, SS2, sclk_value)
+//   +0x2C: MCLK_VALUE (40 bytes: 10 regs — MPLL_FUNC_CNTL, _1, _2, AD, DQ, PWRMGT, DLL, SS, SS2, mclk_value)
+//   +0x54: VOLTAGE_VALUE (4 bytes: vddc)
+//   +0x58: VOLTAGE_VALUE (4 bytes: mvdd)
+//   +0x5C: VOLTAGE_VALUE (4 bytes: vddci)
+//   +0x60: VOLTAGE_VALUE (4 bytes: std_vddc)
+//   +0x64: u8  hysteresisUp/Down/stateFlags/arbRefreshState
+//   +0x68: u32 SQPowerThrottle/2
+//   +0x70: u32 MaxPoweredUpCU
+//   +0x74: VOLTAGE_VALUE (4 bytes: high_temp_vddc)
+//   +0x78: VOLTAGE_VALUE (4 bytes: low_temp_vddc)
+//   +0x7C: u32[2] reserved
+//   +0x84: DPM2PerfLevel (16 bytes)
+//   Total: 132 + 16 = 148 bytes
+//
+// SWSTATE_SINGLE = 4-byte header + 148-byte level = 152 bytes
+//
+// All multi-byte fields are BIG-ENDIAN in SMC SRAM.
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+
+// State table byte offsets
+FixedPool.SMCTbl {
+    "THERMAL_PROTECT":     Initialize=0
+    "SYSTEM_FLAGS":        Initialize=1
+    "MAX_VDDC_IDX":        Initialize=2
+    "EXTRA_FLAGS":         Initialize=3
+    "LOW_SMIO":            Initialize=4      // u32[32] = 128 bytes
+    "VOLT_MASK_TBL":       Initialize=132    // 16 bytes
+    "PHASE_MASK_TBL":      Initialize=148    // 16 bytes
+    "DPM2_PARAMS":         Initialize=164    // 20 bytes
+    "INITIAL_STATE":       Initialize=184    // 152 bytes (SWSTATE_SINGLE = 4 + 148)
+    "ACPI_STATE":          Initialize=336    // 152 bytes
+    "ULV_STATE":           Initialize=488    // 152 bytes
+    "DRIVER_STATE":        Initialize=640    // 4 + N*148 bytes
+}
+
+// SWSTATE header (4 bytes before levels)
+FixedPool.SWSHdr {
+    "FLAGS":               Initialize=0      // u8
+    "LEVEL_COUNT":         Initialize=1      // u8
+    "PAD2":                Initialize=2      // u8
+    "PAD3":                Initialize=3      // u8
+}
+
+// HW_PERFORMANCE_LEVEL offsets (148 bytes)
+FixedPool.HWLevel {
+    "AC_INDEX":            Initialize=0      // u8
+    "DISPLAY_WM":          Initialize=1      // u8
+    "GEN2_PCIE":           Initialize=2      // u8
+    "UVD_WM":              Initialize=3      // u8
+    "VCE_WM":              Initialize=4      // u8
+    "STROBE_MODE":         Initialize=5      // u8
+    "MC_FLAGS":            Initialize=6      // u8
+    "PADDING":             Initialize=7      // u8
+    "AT":                  Initialize=8      // u32
+    "BSP":                 Initialize=12     // u32
+    // SCLK_VALUE at +16 (28 bytes)
+    "SCLK_CNTL":           Initialize=16     // CG_SPLL_FUNC_CNTL
+    "SCLK_CNTL_2":         Initialize=20     // CG_SPLL_FUNC_CNTL_2
+    "SCLK_CNTL_3":         Initialize=24     // CG_SPLL_FUNC_CNTL_3
+    "SCLK_CNTL_4":         Initialize=28     // CG_SPLL_FUNC_CNTL_4
+    "SCLK_SS":             Initialize=32     // CG_SPLL_SPREAD_SPECTRUM
+    "SCLK_SS_2":           Initialize=36     // CG_SPLL_SPREAD_SPECTRUM_2
+    "SCLK_VALUE":          Initialize=40     // u32: SCLK in 10kHz
+    // MCLK_VALUE at +44 (40 bytes)
+    "MCLK_CNTL":           Initialize=44     // vMPLL_FUNC_CNTL
+    "MCLK_CNTL_1":         Initialize=48     // vMPLL_FUNC_CNTL_1
+    "MCLK_CNTL_2":         Initialize=52     // vMPLL_FUNC_CNTL_2
+    "MCLK_AD_CNTL":        Initialize=56     // vMPLL_AD_FUNC_CNTL
+    "MCLK_DQ_CNTL":        Initialize=60     // vMPLL_DQ_FUNC_CNTL
+    "MCLK_PWRMGT":         Initialize=64     // vMCLK_PWRMGT_CNTL
+    "MCLK_DLL":            Initialize=68     // vDLL_CNTL
+    "MCLK_SS":             Initialize=72     // vMPLL_SS
+    "MCLK_SS_2":           Initialize=76     // vMPLL_SS2
+    "MCLK_VALUE":          Initialize=80     // u32: MCLK in 10kHz
+    // Voltage values at +84
+    "VDDC":                Initialize=84     // 4 bytes: VOLTAGE_VALUE
+    "MVDD":                Initialize=88     // 4 bytes
+    "VDDCI":               Initialize=92     // 4 bytes
+    "STD_VDDC":            Initialize=96     // 4 bytes
+    "HYST_UP":             Initialize=100    // u8
+    "HYST_DOWN":           Initialize=101    // u8
+    "STATE_FLAGS":         Initialize=102    // u8
+    "ARB_REFRESH":         Initialize=103    // u8
+    "SQ_THROTTLE":         Initialize=104    // u32
+    "SQ_THROTTLE_2":       Initialize=108    // u32
+    "MAX_CU":              Initialize=112    // u32
+    "HI_TEMP_VDDC":        Initialize=116    // 4 bytes
+    "LO_TEMP_VDDC":        Initialize=120    // 4 bytes
+    "RESERVED":            Initialize=124    // u32[2] = 8 bytes
+    "DPM2_PERF":           Initialize=132    // 16 bytes
+    "SIZE":                Initialize=148    // total per level (0x94)
+}
+
+// =============================================================================
+// PER-GPU DPM STATE
+// =============================================================================
+FixedPool.DPMField {
+    "ENABLED":             Initialize=0
+    "NUM_LEVELS":          Initialize=8
+    "CURRENT_LEVEL":       Initialize=16
+    "BOOT_LEVEL":          Initialize=24
+    "MAX_LEVEL":           Initialize=32
+    "STATE_TBL_PTR":       Initialize=40     // pointer to host buffer for state table
+    "STATE_TBL_SIZE":      Initialize=48     // size of state table buffer
+    "SMC_STATE_ADDR":      Initialize=56     // SRAM address where state table lives
+    "BOOT_SCLK":           Initialize=64     // boot SCLK in kHz
+    "BOOT_MCLK":           Initialize=72     // boot MCLK in kHz
+    "BOOT_VDDC":           Initialize=80     // boot VDDC in mV
+    "PERF_SCLK":           Initialize=88     // performance SCLK in kHz
+    "PERF_VDDC":           Initialize=96     // performance VDDC in mV
+    "REF_CLK":             Initialize=104    // reference clock in kHz
+    "SOFT_REGS_ADDR":      Initialize=112    // SRAM address of soft registers
+    "ARB_TABLE_ADDR":      Initialize=120    // SRAM address of MC ARB table
+    "DSP":                 Initialize=128    // computed dsp (BSP|BSU for non-last levels)
+    "PSP":                 Initialize=136    // computed psp (BSP|BSU for last level)
+    "SPLL_TABLE_ADDR":     Initialize=144    // SRAM address of SPLL div table
+    "MC_REG_TABLE_ADDR":   Initialize=152    // SRAM address of MC reg table
+    "LEVELS_SCLK":         Initialize=160    // ptr to level SCLK array (kHz)
+    "LEVELS_MCLK":         Initialize=168    // ptr to level MCLK array (kHz)
+    "LEVELS_VDDC":         Initialize=176    // ptr to level VDDC array (mV)
+    "LEVELS_VDDCI":        Initialize=184    // ptr to level VDDCI array (mV)
+    "BOOT_VDDCI":          Initialize=192    // boot VDDCI in mV
+    "ENTRY_SIZE":          Initialize=200
+}
+
+FixedPool.DPMConst {
+    "MAX_LEVELS":          Initialize=5      // SISLANDS_MAX_HARDWARE_POWERLEVELS
+    "MAX_VREG_STEPS":      Initialize=32     // SISLANDS_MAX_NO_VREG_STEPS
+    "DRIVER_STATE_ARB":    Initialize=3      // SISLANDS_DRIVER_STATE_ARB_INDEX
+    "ASI":                 Initialize=1000   // RV770_ASI_DFLT — activity stepping interval
+    "PASI":                Initialize=400000 // CYPRESS_HASI_DFLT — perf activity stepping interval
+}
+
+// =============================================================================
+// MODULE STATE
+// =============================================================================
+FixedPool.DPMSIState {
+    "entries":             Initialize=0, CanChange=True
+    "initialized":         Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// DPM_SI_Init — allocate per-GPU DPM state
+// =============================================================================
+Function.DPM_SI_Init {
+    Body: {
+        IfCondition EqualTo(DPMSIState.initialized, 1) ThenBlock: { ReturnValue(0) }
+        total = Multiply(GPUBarConst.MAX_GPUS, DPMField.ENTRY_SIZE)
+        DPMSIState.entries = Allocate(total)
+        MemorySet(DPMSIState.entries, 0, total)
+        DPMSIState.initialized = 1
+    }
+}
+
+// =============================================================================
+// DPM_SI_GetEntry — return pointer to DPM state for GPU index
+// =============================================================================
+Function.DPM_SI_GetEntry {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(index, GPUBarConst.MAX_GPUS) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Add(DPMSIState.entries, Multiply(index, DPMField.ENTRY_SIZE)))
+    }
+}
+
+// =============================================================================
+// DPM_SI_CalcUP — implements r600_calculate_u_and_p
+//
+// Given an interval 'interval', a reference clock 'ref_clk' (kHz),
+// and a precision limit of 16 bits, computes the u and p parameters
+// for the DPM burst stepping point.
+//
+// Returns packed result: (u << 16) | p
+//
+// Algorithm from kernel r600_dpm.c:
+//   i_c = (interval * ref_clk) / 100
+//   tmp = i_c >> 16
+//   b_c = 0
+//   while (tmp) { b_c++; tmp >>= 1 }
+//   u = (b_c + 1) / 2
+//   p = i_c / (1 << (2 * u))
+// =============================================================================
+Function.DPM_SI_CalcUP {
+    Input: interval: Integer
+    Input: ref_clk: Integer
+    Output: Integer
+    Body: {
+        i_c = Divide(Multiply(interval, ref_clk), 100)
+        tmp = RightShift(i_c, 16)
+        b_c = 0
+        WhileLoop NotEqual(tmp, 0) {
+            b_c = Add(b_c, 1)
+            tmp = RightShift(tmp, 1)
+        }
+        u_val = Divide(Add(b_c, 1), 2)
+        shift = Multiply(2, u_val)
+        p_val = Divide(i_c, LeftShift(1, shift))
+        // Return packed: (u << 16) | p
+        ReturnValue(BitwiseOr(LeftShift(u_val, 16), p_val))
+    }
+}
+
+// =============================================================================
+// DPM_SI_SetupBSP — compute and store burst stepping parameters
+//
+// Implements the kernel's si_setup_bsp():
+//   Computes dsp = BSP(bsp) | BSU(bsu) from ASI and xclk
+//   Computes psp = BSP(pbsp) | BSU(pbsu) from PASI and xclk
+//   Writes CG_BSP hardware register with dsp
+//   Stores dsp/psp in per-GPU DPM state for per-level bSP population
+//
+// BSP(x) = (x << 0), BSU(x) = (x << 16) — same as CalcUP packed format
+// =============================================================================
+Function.DPM_SI_SetupBSP {
+    Input: gpu: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        ref_clk = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
+        IfCondition EqualTo(ref_clk, 0) ThenBlock: { ref_clk = 27000 }
+        // xclk in kHz (same as ref_clk for SI unless special dividers are set)
+        xclk = ref_clk
+
+        // dsp: for all levels except the last
+        // CalcUP returns (u << 16) | p, which is BSU(u) | BSP(p)
+        dsp = DPM_SI_CalcUP(DPMConst.ASI, xclk)
+        StoreValue(Add(dpm, DPMField.DSP), dsp)
+
+        // psp: for the last (performance) level
+        psp = DPM_SI_CalcUP(DPMConst.PASI, xclk)
+        StoreValue(Add(dpm, DPMField.PSP), psp)
+
+        // Write CG_BSP hardware register with dsp
+        GPU_Wr32(gpu, DPMReg.CG_BSP, dsp)
+    }
+}
+
+// =============================================================================
+// DPM_SI_ByteSwap32 — swap endianness for SMC SRAM upload
+//
+// SMC SRAM is big-endian. We write via GPU_Wr32 (little-endian MMIO),
+// and the indirect access hardware swaps LE→BE. So multi-byte fields
+// that should be BE in SRAM must be stored as-is in our host buffer.
+// When we upload via WriteSRAMBlock, the hardware handles the swap.
+//
+// However, for fields that the SMC reads as big-endian u32/u16,
+// we need to byte-swap them before uploading.
+// =============================================================================
+Function.DPM_SI_ByteSwap32 {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        b0 = BitwiseAnd(val, 255)
+        b1 = BitwiseAnd(RightShift(val, 8), 255)
+        b2 = BitwiseAnd(RightShift(val, 16), 255)
+        b3 = BitwiseAnd(RightShift(val, 24), 255)
+        ReturnValue(Add(LeftShift(b0, 24), Add(LeftShift(b1, 16), Add(LeftShift(b2, 8), b3))))
+    }
+}
+
+// =============================================================================
+// DPM_SI_ByteSwap16 — swap endianness for a 16-bit value
+// =============================================================================
+Function.DPM_SI_ByteSwap16 {
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        lo = BitwiseAnd(val, 255)
+        hi = BitwiseAnd(RightShift(val, 8), 255)
+        ReturnValue(Add(LeftShift(lo, 8), hi))
+    }
+}
+
+// =============================================================================
+// DPM_SI_ComputeSPLL — compute SPLL shadow registers for a target SCLK
+//
+// Uses the same 12.14 fixed-point math as the kernel's
+// si_calculate_sclk_params(). Computes FBDIV from:
+//   fbdiv = (sclk * ref_div * post_div * 16384) / ref_clk
+//
+// For Cape Verde at 27MHz ref clock:
+//   ref_div is typically 0 (meaning divider = 1)
+//   post_div depends on VCO frequency range
+//
+// Writes the 6 SPLL register values to the output buffer at
+// the HWLevel.SCLK_CNTL offset.
+// =============================================================================
+Function.DPM_SI_ComputeSPLL {
+    Input: gpu: Integer
+    Input: sclk_khz: Integer
+    Input: out: Address
+    Body: {
+        // Round sclk_khz to nearest multiple of 5120 kHz (= 512 × 10kHz)
+        // so SCLK_VALUE lands on an exact SPLL div table index.
+        // Without this, the SMC looks up a truncated index whose dividers
+        // don't match the FBDIV we compute here → SPLL can't lock → hang.
+        sclk_khz = Multiply(Divide(Add(sclk_khz, 2560), 5120), 5120)
+
+        // Read SPLL register values as base template from BOOT HW registers
+        // This matches the kernel's si_read_clock_registers() approach:
+        // boot-time values are cached and used as template for all DPM levels.
+        // The kernel then clears REF_DIV and PDIV_A, and reprograms them with
+        // values from ATOMBIOS ComputeMemoryEnginePLL. All other bits
+        // (RESET, BYPASS_EN, control bits) are preserved from boot.
+        spll_0 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        spll_2 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        spll_3 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+        spll_4 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_4)
+        spll_ss = GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM)
+        spll_ss2 = GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM_2)
+
+        // Get reference clock
+        ref_khz = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
+        IfCondition EqualTo(ref_khz, 0) ThenBlock: { ref_khz = 27000 }
+
+        // Reference divider: preserve the boot HW value
+        // The SMC firmware may do a "fast relock" when post_div doesn't change:
+        // it only updates FUNC_CNTL_3 (FBDIV) and skips FUNC_CNTL (ref_div/post_div).
+        // In that case, the HW retains the boot ref_div. Our FBDIV must be consistent
+        // with whatever ref_div the HW has, so we extract and use the boot value.
+        ref_div_raw = BitwiseAnd(RightShift(spll_0, SPLLBits.SPLL_REF_DIV_SHIFT), 63)
+        ref_div = Add(ref_div_raw, 1)  // hardware divider = raw + 1
+
+        // Post divider: use the boot HW value for all levels.
+        // The kernel gets post_div from radeon_atom_get_clock_dividers()
+        // (ATOMBIOS COMPUTE_ENGINE_PLL_PARAM command table), but we don't
+        // have that VBIOS command working. Instead, preserve the boot post_div
+        // so the SMC can do "fast relock" (FBDIV-only update) without needing
+        // to do a full PLL bypass/reset cycle to change post_div.
+        //
+        // Boot post_div=3 gives valid VCO for SCLK 216-833 MHz.
+        // For SCLK outside this range, fall back to computed post_div.
+        boot_post_div = BitwiseAnd(RightShift(spll_0, SPLLBits.SPLL_PDIV_A_SHIFT), 127)
+        IfCondition EqualTo(boot_post_div, 0) ThenBlock: { boot_post_div = 3 }
+
+        // Check if boot post_div gives valid VCO for target SCLK
+        // VCO = SCLK * post_div must be >= 648 MHz and <= 2500 MHz
+        vco_test = Multiply(sclk_khz, boot_post_div)
+        IfCondition GreaterEqual(vco_test, 648000) ThenBlock: {
+            IfCondition LessEqual(vco_test, 2500000) ThenBlock: {
+                post_div = boot_post_div
+            }
+            ElseBlock: {
+                // VCO too high, compute minimum valid post_div
+                post_div = Divide(Add(648000, Subtract(sclk_khz, 1)), sclk_khz)
+                IfCondition LessThan(post_div, 1) ThenBlock: { post_div = 1 }
+            }
+        }
+        ElseBlock: {
+            // VCO too low with boot post_div, compute ceil(648000/sclk)
+            post_div = Divide(Add(648000, Subtract(sclk_khz, 1)), sclk_khz)
+            IfCondition LessThan(post_div, 1) ThenBlock: { post_div = 1 }
+            IfCondition GreaterThan(post_div, 12) ThenBlock: { post_div = 12 }
+        }
+
+        // Calculate feedback divider (12.14 fixed-point)
+        // fbdiv = (sclk_khz * ref_div * post_div * 16384) / ref_khz
+        numer = Multiply(Multiply(sclk_khz, ref_div), post_div)
+        fbdiv_int = Divide(numer, ref_khz)
+        fbdiv_rem = Modulo(numer, ref_khz)
+        fbdiv = Add(Multiply(fbdiv_int, 16384), Divide(Multiply(fbdiv_rem, 16384), ref_khz))
+
+        // Build register values
+        // SPLL_FUNC_CNTL: clear PDIV_A [26:20] and REF_DIV [9:4], set new values
+        // The kernel's si_calculate_sclk_params() does exactly this:
+        //   spll_func_cntl &= ~(SPLL_PDIV_A_MASK | SPLL_REF_DIV_MASK);
+        //   spll_func_cntl |= SPLL_REF_DIV(dividers.ref_div);
+        //   spll_func_cntl |= SPLL_PDIV_A(dividers.post_div);
+        // It does NOT touch SPLL_RESET, SPLL_SLEEP, or SPLL_BYPASS_EN.
+        // Those bits are preserved as-is from the boot register snapshot.
+        new_spll_0 = BitwiseAnd(spll_0, BitwiseNot(BitwiseOr(SPLLBits.SPLL_PDIV_A_MASK, SPLLBits.SPLL_REF_DIV_MASK)))
+        new_spll_0 = BitwiseOr(new_spll_0, LeftShift(ref_div_raw, SPLLBits.SPLL_REF_DIV_SHIFT))
+        new_spll_0 = BitwiseOr(new_spll_0, LeftShift(post_div, SPLLBits.SPLL_PDIV_A_SHIFT))
+
+        // SPLL_FUNC_CNTL_2: set SCLK_MUX_SEL = 2 (SPLL output)
+        new_spll_2 = BitwiseAnd(spll_2, BitwiseNot(SPLLBits.SCLK_MUX_SEL_MASK))
+        new_spll_2 = BitwiseOr(new_spll_2, 2)
+
+        // SPLL_FUNC_CNTL_3: set FBDIV
+        new_spll_3 = BitwiseAnd(spll_3, BitwiseNot(SPLLBits.SPLL_FB_DIV_MASK))
+        new_spll_3 = BitwiseOr(new_spll_3, BitwiseAnd(fbdiv, SPLLBits.SPLL_FB_DIV_MASK))
+        // Enable dithering
+        new_spll_3 = BitwiseOr(new_spll_3, SPLLBits.SPLL_DITHEN)
+
+        // Store register shadow values — hardware path handles LE↔BE
+        // so just store native values directly, no ByteSwap32
+        StoreValue(Add(out, HWLevel.SCLK_CNTL), new_spll_0)
+        StoreValue(Add(out, HWLevel.SCLK_CNTL_2), new_spll_2)
+        StoreValue(Add(out, HWLevel.SCLK_CNTL_3), new_spll_3)
+        StoreValue(Add(out, HWLevel.SCLK_CNTL_4), spll_4)
+        StoreValue(Add(out, HWLevel.SCLK_SS), spll_ss)
+        StoreValue(Add(out, HWLevel.SCLK_SS_2), spll_ss2)
+
+        // SCLK value in 10kHz units
+        sclk_10k = Divide(sclk_khz, 10)
+        StoreValue(Add(out, HWLevel.SCLK_VALUE), sclk_10k)
+    }
+}
+
+// =============================================================================
+// DPM_SI_RecoverSPLLAnalog — recover PLL analog config after SBR reset
+//
+// After a Secondary Bus Reset (SBR), the SPLL analog configuration in
+// CG_SPLL_FUNC_CNTL_4 is lost (reverts to 0x800000). This register
+// controls VCO band select, charge pump current, bias control, and other
+// analog parameters that the VBIOS programs during atom_asic_init().
+// Without these settings, the PLL cannot lock.
+//
+// Similarly, SPLL_CNTL_MODE REFCLK_SEL bits (27:26) may revert to 0
+// instead of the VBIOS-programmed value (typically 3).
+//
+// This function detects the SBR-reset state by checking if FUNC_CNTL_4
+// is missing the VTOI_BIAS_CNTL bit (bit 31), then searches for another
+// GPU of the same chip type that has been VBIOS-posted and copies the
+// PLL analog registers from it.
+//
+// This is the same pattern the kernel uses: si_read_clock_registers()
+// reads these values from posted hardware and never computes them.
+// =============================================================================
+Function.DPM_SI_RecoverSPLLAnalog {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        cntl4 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_4)
+
+        // Check bit 31 (VTOI_BIAS_CNTL = 0x80000000). On a VBIOS-posted
+        // GPU this is always set. After SBR it's cleared.
+        has_vtoi = BitwiseAnd(cntl4, 2147483648)
+        IfCondition NotEqual(has_vtoi, 0) ThenBlock: {
+            // PLL analog config looks intact
+            ReturnValue(1)
+        }
+
+        PrintMessage("[DPM_SI] FUNC_CNTL_4=0x")
+        PrintHex(cntl4)
+        PrintMessage(" — missing VTOI_BIAS (SBR-reset detected)\n")
+
+        // Get this GPU's device_id for matching
+        entry_size = 128
+        dev_ptr = Add(GPUDevList.entries, Multiply(gpu, entry_size))
+        my_devid = Dereference(Add(dev_ptr, GPUDevField.DEVICE_ID))
+
+        // Scan all discovered GPUs for a same-chip donor with proper FUNC_CNTL_4
+        total = GPUDevList.count
+        donor = -1
+        scan_i = 0
+        WhileLoop LessThan(scan_i, total) {
+            IfCondition NotEqual(scan_i, gpu) ThenBlock: {
+                other_ptr = Add(GPUDevList.entries, Multiply(scan_i, entry_size))
+                other_devid = Dereference(Add(other_ptr, GPUDevField.DEVICE_ID))
+                IfCondition EqualTo(other_devid, my_devid) ThenBlock: {
+                    // Same chip — check if its FUNC_CNTL_4 has VTOI_BIAS set
+                    other_cntl4 = GPU_Rd32(scan_i, SIReg.CG_SPLL_FUNC_CNTL_4)
+                    other_vtoi = BitwiseAnd(other_cntl4, 2147483648)
+                    IfCondition NotEqual(other_vtoi, 0) ThenBlock: {
+                        donor = scan_i
+                        ExitLoop
+                    }
+                }
+            }
+            scan_i = Add(scan_i, 1)
+        }
+
+        IfCondition EqualTo(donor, -1) ThenBlock: {
+            PrintMessage("[DPM_SI] WARNING: No posted donor GPU found for PLL analog recovery\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[DPM_SI] Cloning PLL analog config from GPU ")
+        PrintNumber(donor)
+        PrintMessage("\n")
+
+        // Copy CG_SPLL_FUNC_CNTL from donor.
+        // The donor PLL is running (RESET=0, BYPASS_EN=0, SLEEP=0).
+        // We copy the full register value including REF_DIV, PDIV_A, and
+        // any undocumented analog control bits (e.g. bit 31 on posted GPU).
+        // Then set RESET + BYPASS_EN since our PLL needs a full init cycle.
+        donor_cntl = GPU_Rd32(donor, SIReg.CG_SPLL_FUNC_CNTL)
+        // Keep donor's analog config, add RESET + BYPASS_EN for init
+        new_cntl = BitwiseOr(donor_cntl, BitwiseOr(SPLLBits.SPLL_RESET, SPLLBits.SPLL_BYPASS_EN))
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL, new_cntl)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        PrintMessage("[DPM_SI]   FUNC_CNTL:   0x")
+        PrintHex(fence)
+        PrintMessage(" (from donor 0x")
+        PrintHex(donor_cntl)
+        PrintMessage(")\n")
+
+        // Copy CG_SPLL_FUNC_CNTL_4 from donor
+        donor_cntl4 = GPU_Rd32(donor, SIReg.CG_SPLL_FUNC_CNTL_4)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_FUNC_CNTL_4, donor_cntl4)
+        fence = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_4)
+        PrintMessage("[DPM_SI]   FUNC_CNTL_4: 0x")
+        PrintHex(fence)
+        PrintMessage("\n")
+
+        // Copy full SPLL_CNTL_MODE from donor (including SW_DIR_CONTROL=0)
+        // SBR leaves SW_DIR_CONTROL=1 which disables HW handshake path
+        // (CTLREQ_CHG/CHG_STATUS), preventing PLL mux transitions.
+        // The donor has SW_DIR_CONTROL=0 — InitSPLL manages this bit explicitly.
+        donor_mode = GPU_Rd32(donor, SIReg.SPLL_CNTL_MODE)
+        GPU_Wr32(gpu, SIReg.SPLL_CNTL_MODE, donor_mode)
+        fence = GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE)
+        PrintMessage("[DPM_SI]   CNTL_MODE:   0x")
+        PrintHex(fence)
+        PrintMessage("\n")
+
+        // Copy CG_SPLL_SPREAD_SPECTRUM from donor
+        donor_ss = GPU_Rd32(donor, SIReg.CG_SPLL_SPREAD_SPECTRUM)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM, donor_ss)
+        donor_ss2 = GPU_Rd32(donor, SIReg.CG_SPLL_SPREAD_SPECTRUM_2)
+        GPU_Wr32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM_2, donor_ss2)
+        PrintMessage("[DPM_SI]   SPREAD_SPEC: 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM))
+        PrintMessage("  SS_2: 0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CG_SPLL_SPREAD_SPECTRUM_2))
+        PrintMessage("\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_InitSPLL — take SPLL out of reset/bypass and lock at boot SCLK
+//
+// At cold boot, the SPLL is in reset/bypass mode:
+//   SPLL_RESET=1, BYPASS_EN=1, MUX_SEL=1
+// The engine clock comes from the bypass path (27 MHz ref or divided).
+// The SMC DPM firmware assumes the PLL is already running and locked
+// when it does level transitions (it only updates FBDIV for fast relock).
+// If the PLL was never started, DPM level transitions silently fail
+// because the PLL can't lock while held in reset.
+//
+// This function programs the PLL at boot SCLK and takes it out of
+// reset/bypass, following the same sequence as si_set_clk_bypass_mode /
+// si_spll_powerdown / si_spll_powerup in the Linux kernel.
+//
+// Must be called BEFORE DPM enable / SMC state switch.
+// =============================================================================
+Function.DPM_SI_InitSPLL {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        // On the display GPU the BIOS already ran ASIC_INIT during POST.
+        // Running it again would reprogram PLLs / MC and kill the display.
+        // Skip if SPLL is already running (= BIOS POSTed this card).
+        cntl = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        spll_status = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+        is_reset = BitwiseAnd(cntl, SPLLBits.SPLL_RESET)
+        is_bypass = BitwiseAnd(cntl, SPLLBits.SPLL_BYPASS_EN)
+
+        // Display GPU: SPLL running, not reset, not bypass → skip ASIC_INIT
+        is_display = GPU_BAR_IsDisplayGPU(gpu)
+        IfCondition EqualTo(is_display, 1) ThenBlock: {
+            PrintMessage("[DPM_SI] display GPU — SPLL already running (STATUS=0x")
+            PrintHex(spll_status)
+            PrintMessage("), skip ASIC_INIT\n")
+            ReturnValue(1)
+        }
+
+        // Un-POSTed GPU: ALWAYS run ASIC_INIT regardless of SPLL state.
+        // ASIC_INIT does far more than SPLL: it programs the entire chip via
+        // the VBIOS command table (the same table the BIOS executes during POST).
+        // On re-runs the SPLL may still be up from a previous execution, but
+        // the rest of the chip state may be stale or corrupted.
+
+        // ---------------------------------------------------------------
+        // MMIO LIVENESS CHECK — if ALL reads return 0xFFFFFFFF the GPU's
+        // BAR is dead (PCI config reset still in flight, or GPU wedged).
+        // Running AtomExec_AsicInit against a dead bus will freeze the
+        // system: the ATOM interpreter writes to PCIe indirect ports
+        // (0x30/0x34) and MC regs, which deadlock the RD990 fabric when
+        // the GPU can't service them.
+        //
+        // The kernel's si_gpu_pci_config_reset polls CONFIG_MEMSIZE via
+        // MMIO until it returns non-0xFFFFFFFF.  We do the same: poll
+        // CONFIG_MEMSIZE (MMIO 0x5428) up to 2 seconds before proceeding.
+        // ---------------------------------------------------------------
+        IfCondition EqualTo(cntl, 4294967295) ThenBlock: {
+            IfCondition EqualTo(spll_status, 4294967295) ThenBlock: {
+                PrintMessage("[DPM_SI] MMIO returning 0xFFFFFFFF — GPU not responsive yet\n")
+                PrintMessage("[DPM_SI] Polling CONFIG_MEMSIZE for GPU recovery (up to 2s)...\n")
+                mmio_poll = 0
+                mmio_alive = 0
+                WhileLoop LessThan(mmio_poll, 20000) {
+                    memsize = GPU_Rd32(gpu, SIReg.CONFIG_MEMSIZE)
+                    IfCondition NotEqual(memsize, 4294967295) ThenBlock: {
+                        IfCondition NotEqual(memsize, 0) ThenBlock: {
+                            PrintMessage("[DPM_SI] GPU alive: CONFIG_MEMSIZE=0x")
+                            PrintHex(memsize)
+                            PrintMessage(" after ")
+                            PrintNumber(mmio_poll)
+                            PrintMessage(" polls\n")
+                            mmio_alive = 1
+                            mmio_poll = 20000
+                        }
+                    }
+                    mmio_poll = Add(mmio_poll, 1)
+                }
+                IfCondition EqualTo(mmio_alive, 0) ThenBlock: {
+                    PrintMessage("[DPM_SI] FATAL: GPU MMIO dead after 2s — cannot run AtomExec_AsicInit\n")
+                    PrintMessage("[DPM_SI] CONFIG_MEMSIZE=0x")
+                    PrintHex(GPU_Rd32(gpu, SIReg.CONFIG_MEMSIZE))
+                    PrintMessage(" SPLL_STATUS=0x")
+                    PrintHex(GPU_Rd32(gpu, SIReg.SPLL_STATUS))
+                    PrintMessage("\n")
+                    PrintMessage("[DPM_SI] Run: sudo ~/Ailang-Self-Hosting-/gpu_reset.sh   (or reboot)\n")
+                    ReturnValue(0)
+                }
+                // Re-read SPLL state now that MMIO is alive
+                cntl = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+                spll_status = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+            }
+        }
+
+        PrintMessage("[DPM_SI] Running AtomExec_AsicInit (SPLL_STATUS=0x")
+        PrintHex(spll_status)
+        PrintMessage(")\n")
+
+        // Dump pre-init state
+        PrintMessage("[DPM_SI] Pre-init: FUNC_CNTL=0x")
+        PrintHex(cntl)
+        PrintMessage(" FUNC_CNTL_3=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3))
+        PrintMessage(" FUNC_CNTL_4=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_4))
+        PrintMessage("\n")
+        PrintMessage("[DPM_SI] Pre-init: SPLL_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPLL_STATUS))
+        PrintMessage(" CNTL_MODE=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE))
+        PrintMessage("\n")
+
+        // Initialize AtomExec interpreter and run ASIC_Init command table.
+        // This is what the kernel does via atom_asic_init() — it runs the
+        // VBIOS bytecode that programs all PLL analog parameters, dividers,
+        // and takes the SPLL out of reset/bypass properly.
+        AtomExec_InitTables()
+        rc = AtomExec_Init(gpu)
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            PrintMessage("[DPM_SI] ERROR: AtomExec_Init failed\n")
+            ReturnValue(0)
+        }
+
+        rc = AtomExec_AsicInit(gpu)
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            // AsicInit may abort due to display power gating poll timeout
+            // (register 0x5DF8 in EnableDispPowerGating sub-table).
+            // This is expected on un-POSTed cards after PCI config reset —
+            // the DCE clock domain is dead. However, the SPLL configuration
+            // happens BEFORE the display block init, so it may already be
+            // locked. Continue to SPLL check instead of aborting immediately.
+            PrintMessage("[DPM_SI] WARNING: AtomExec_AsicInit aborted (display block timeout)\n")
+            PrintMessage("[DPM_SI] Checking if SPLL came up despite abort...\n")
+        }
+
+        // Verify PLL is now running
+        final_cntl = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        final_cntl3 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_3)
+        final_cntl4 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_4)
+        final_status = GPU_Rd32(gpu, SIReg.SPLL_STATUS)
+
+        PrintMessage("[DPM_SI] Post-init: FUNC_CNTL=0x")
+        PrintHex(final_cntl)
+        PrintMessage(" FUNC_CNTL_3=0x")
+        PrintHex(final_cntl3)
+        PrintMessage(" FUNC_CNTL_4=0x")
+        PrintHex(final_cntl4)
+        PrintMessage("\n")
+        PrintMessage("[DPM_SI] Post-init: SPLL_STATUS=0x")
+        PrintHex(final_status)
+        PrintMessage(" CNTL_MODE=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.SPLL_CNTL_MODE))
+        PrintMessage("\n")
+
+        // Check SPLL_STATUS for lock (bit pattern 0x700202 = locked)
+        // Bits [9:8] = 2 means PLL locked and stable
+        // 0xFFFFFFFF = BAR0 not responding — GPU is dead/wedged
+        IfCondition EqualTo(final_status, 4294967295) ThenBlock: {
+            PrintMessage("[DPM_SI] FATAL: SPLL_STATUS=0xFFFFFFFF — GPU not responding\n")
+            ReturnValue(0)
+        }
+        lock_bits = BitwiseAnd(final_status, 768)
+        IfCondition NotEqual(lock_bits, 512) ThenBlock: {
+            PrintMessage("[DPM_SI] FATAL: SPLL not locked — lock_bits=0x")
+            PrintHex(lock_bits)
+            PrintMessage(" SPLL_STATUS=0x")
+            PrintHex(final_status)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+        PrintMessage("[DPM_SI] SPLL locked successfully\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_PopulateVoltage — populate VOLTAGE_VALUE at a buffer offset
+//
+// Packs: u16 value (mV, big-endian) + u8 index + u8 phase_settings
+// =============================================================================
+Function.DPM_SI_PopulateVoltage {
+    Input: gpu: Integer
+    Input: buf: Address
+    Input: offset: Integer
+    Input: vddc_mv: Integer
+    Body: {
+        // Resolve leakage index if needed
+        resolved = Volt_ResolveLeakageVDDC(gpu, vddc_mv)
+
+        // Find index in voltage table
+        idx = Volt_GetVDDCIndex(gpu, resolved)
+        IfCondition LessThan(idx, 0) ThenBlock: { idx = 0 }
+
+        // Get actual voltage at this index
+        mv_buf = Allocate(8)
+        gpio_buf = Allocate(8)
+        rc = Volt_GetVDDCEntry(gpu, idx, mv_buf, gpio_buf)
+        actual_mv = resolved
+        IfCondition EqualTo(rc, 1) ThenBlock: {
+            actual_mv = Dereference(mv_buf)
+        }
+
+        // Phase shedding index
+        phase_idx = Volt_GetPhaseIndex(gpu, resolved)
+
+        // VOLTAGE_VALUE struct: { u16 value(mV, BE), u8 index, u8 phase }
+        // Pack in BE DWORD order: (mv_hi << 24) | (mv_lo << 16) | (idx << 8) | phase
+        // Hardware indirect path handles LE↔BE transparently, so store directly.
+        mv_hi = BitwiseAnd(RightShift(actual_mv, 8), 255)
+        mv_lo = BitwiseAnd(actual_mv, 255)
+        packed = Add(LeftShift(mv_hi, 24), Add(LeftShift(mv_lo, 16), Add(LeftShift(idx, 8), phase_idx)))
+        StoreValue(Add(buf, offset), packed)
+
+        Deallocate(mv_buf, 8)
+        Deallocate(gpio_buf, 8)
+    }
+}
+
+// =============================================================================
+// DPM_SI_PopulateLevel — fill one HW_PERFORMANCE_LEVEL in the state table
+//
+// 6 parameters (AILang ABI limit). The 'extra' parameter packs:
+//   extra = (vddci_mv << 16) | (pcie_gen << 8) | arb_idx
+// =============================================================================
+Function.DPM_SI_PopulateLevel {
+    Input: gpu: Integer
+    Input: level_buf: Address
+    Input: sclk_khz: Integer
+    Input: mclk_khz: Integer
+    Input: vddc_mv: Integer
+    Input: extra: Integer
+    Body: {
+        // Unpack extra: (vddci_mv << 16) | (pcie_gen << 8) | arb_idx
+        vddci_mv = BitwiseAnd(RightShift(extra, 16), 65535)
+        pcie_gen = BitwiseAnd(RightShift(extra, 8), 255)
+        arb_idx = BitwiseAnd(extra, 255)
+
+        // Zero the entire level
+        MemorySet(level_buf, 0, HWLevel.SIZE)
+
+        // -------------------------------------------------------
+        // BYTE ORDERING for SMC SRAM:
+        //
+        // The SRAM indirect access path (IND_INDEX_0 / IND_DATA_0)
+        // handles LE↔BE conversion transparently:
+        //   GPU_Wr32(IND_DATA_0, V) stores V in SRAM as big-endian.
+        //   GPU_Rd32(IND_DATA_0) reads SRAM BE and returns native V.
+        //
+        // For sub-DWORD packed fields, pack in big-endian DWORD order:
+        //   (byte0<<24)|(byte1<<16)|(byte2<<8)|byte3
+        //
+        // StoreValue writes 8 bytes (64-bit). Each call at a 4-byte
+        // offset zeroes the NEXT 4 bytes. All writes must be in
+        // ascending offset order.
+        // -------------------------------------------------------
+
+        // Bytes 0-3: ACIndex(0) | displayWM(0) | gen2PCIE | uvdWM(0)
+        // BE DWORD: (ACIndex<<24) | (displayWM<<16) | (gen2PCIE<<8) | uvdWM
+        dw0 = LeftShift(pcie_gen, 8)
+        StoreValue(Add(level_buf, 0), dw0)
+
+        // Bytes 4-7: vceWM(0) | strobeMode(0) | mcFlags(0) | padding(0) = 0
+        // Already zero from MemorySet, and StoreValue at 0 clobbers 4-7 with 0
+
+        // aT = CG_R(0xffff) | CG_L(0) = 0x0000ffff  (offset 8)
+        StoreValue(Add(level_buf, HWLevel.AT), 65535)
+
+        // bSP (offset 12): Burst stepping parameter for DPM level transitions.
+        // Set to 0 here; the caller overwrites with the proper computed
+        // dsp or psp value from DPM_SI_SetupBSP (si_populate_smc_sp).
+        // Using dword write to avoid clobbering offset 16.
+        StoreValue(Add(level_buf, HWLevel.BSP), 0, "dword")
+
+        // Compute SPLL shadow registers (offsets 16..40, ascending)
+        DPM_SI_ComputeSPLL(gpu, sclk_khz, level_buf)
+
+        // MCLK shadow registers (offsets 44..76, ascending)
+        // For boot MCLK, read current MPLL register values directly.
+        // These are already configured by VBIOS for the boot memory clock.
+        StoreValue(Add(level_buf, HWLevel.MCLK_CNTL), GPU_Rd32(gpu, SIReg.MPLL_FUNC_CNTL))
+        StoreValue(Add(level_buf, HWLevel.MCLK_CNTL_1), GPU_Rd32(gpu, SIReg.MPLL_FUNC_CNTL_1))
+        StoreValue(Add(level_buf, HWLevel.MCLK_CNTL_2), GPU_Rd32(gpu, SIReg.MPLL_FUNC_CNTL_2))
+        StoreValue(Add(level_buf, HWLevel.MCLK_AD_CNTL), GPU_Rd32(gpu, SIReg.MPLL_AD_FUNC_CNTL))
+        StoreValue(Add(level_buf, HWLevel.MCLK_DQ_CNTL), GPU_Rd32(gpu, SIReg.MPLL_DQ_FUNC_CNTL))
+        StoreValue(Add(level_buf, HWLevel.MCLK_PWRMGT), GPU_Rd32(gpu, SIReg.MCLK_PWRMGT_CNTL))
+        StoreValue(Add(level_buf, HWLevel.MCLK_DLL), GPU_Rd32(gpu, SIReg.DLL_CNTL))
+        StoreValue(Add(level_buf, HWLevel.MCLK_SS), GPU_Rd32(gpu, SIReg.MPLL_SS1))
+        StoreValue(Add(level_buf, HWLevel.MCLK_SS_2), GPU_Rd32(gpu, SIReg.MPLL_SS2))
+
+        // MCLK value in 10kHz units (offset 80)
+        mclk_10k = Divide(mclk_khz, 10)
+        StoreValue(Add(level_buf, HWLevel.MCLK_VALUE), mclk_10k)
+
+        // Voltages — ascending offset order:
+        //   VDDC(84) → MVDD(88, skip) → VDDCI(92) → STD_VDDC(96)
+        DPM_SI_PopulateVoltage(gpu, level_buf, HWLevel.VDDC, vddc_mv)
+
+        IfCondition GreaterThan(vddci_mv, 0) ThenBlock: {
+            DPM_SI_PopulateVoltage(gpu, level_buf, HWLevel.VDDCI, vddci_mv)
+        }
+
+        DPM_SI_PopulateVoltage(gpu, level_buf, HWLevel.STD_VDDC, vddc_mv)
+
+        // Bytes 100-103: hystUp(0) | hystDown(0) | stateFlags(0) | arbRefreshRate
+        // BE DWORD: (hystUp<<24) | (hystDown<<16) | (stateFlags<<8) | arbRefresh
+        StoreValue(Add(level_buf, 100), arb_idx)
+
+        // SQ Power Throttle defaults (offsets 104, 108)
+        // MIN_POWER(u16=0) | MAX_POWER(u16=0xffff) = 0x0000ffff
+        StoreValue(Add(level_buf, HWLevel.SQ_THROTTLE), 65535)
+        // MAX_POWER_DELTA(u16=0xffff) | STI_SIZE(u8=0) | LTI_RATIO(u8=0)
+        // BE: (0xffff << 16) | 0 = 0xffff0000
+        StoreValue(Add(level_buf, HWLevel.SQ_THROTTLE_2), 4294901760)
+
+        // MaxPoweredUpCU — 10 CUs for Cape Verde (offset 112)
+        StoreValue(Add(level_buf, HWLevel.MAX_CU), 1023)
+    }
+}
+
+// =============================================================================
+// DPM_SI_BuildStateTable — construct and upload the SMC state table
+//
+// Builds DPM levels from PowerPlay data and voltage tables,
+// constructs the full SISLANDS_SMC_STATETABLE structure,
+// and uploads it to SMC SRAM.
+//
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.DPM_SI_BuildStateTable {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        DPM_SI_Init()
+
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        // Get boot parameters from AtomBIOS
+        boot_sclk = AtomBIOS_GetField(gpu, AtomField.DEF_ENGINE_CLK)
+        boot_mclk = AtomBIOS_GetField(gpu, AtomField.DEF_MEMORY_CLK)
+        boot_vddc = AtomBIOS_GetField(gpu, AtomField.BOOT_VDDC)
+        boot_vddci = AtomBIOS_GetField(gpu, AtomField.BOOT_VDDCI)
+        ref_clk = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
+
+        StoreValue(Add(dpm, DPMField.BOOT_SCLK), boot_sclk)
+        StoreValue(Add(dpm, DPMField.BOOT_MCLK), boot_mclk)
+        StoreValue(Add(dpm, DPMField.BOOT_VDDC), boot_vddc)
+        StoreValue(Add(dpm, DPMField.BOOT_VDDCI), boot_vddci)
+        StoreValue(Add(dpm, DPMField.REF_CLK), ref_clk)
+
+        // Determine DPM levels from PP clock entries
+        // Strategy: Level 0 = boot clocks, then add PP levels sorted by SCLK
+        // Cap VDDC at boot_vddc initially for safety
+        boot_level = 0
+
+        // Build levels array: sclk, mclk, vddc for each level
+        // Maximum 5 levels (SISLANDS_MAX_HARDWARE_POWERLEVELS)
+        levels_sclk = Allocate(40)   // 5 * 8 bytes
+        levels_mclk = Allocate(40)
+        levels_vddc = Allocate(40)
+        levels_vddci = Allocate(40)
+        MemorySet(levels_sclk, 0, 40)
+        MemorySet(levels_mclk, 0, 40)
+        MemorySet(levels_vddc, 0, 40)
+        MemorySet(levels_vddci, 0, 40)
+
+        // Level 0: boot clocks (always present)
+        StoreValue(levels_sclk, boot_sclk)
+        StoreValue(levels_mclk, boot_mclk)
+        StoreValue(levels_vddc, boot_vddc)
+        StoreValue(levels_vddci, boot_vddci)
+        num_levels = 1
+
+        // Scan PP clock entries for valid levels above boot clocks.
+        // Include all levels up to the card's max (5 levels max for SI).
+        // The SMC firmware handles voltage transitions via GPIO — the state
+        // table contains per-level voltage values that the SMC uses directly.
+        pp_count = PP_GetNumClockEntries(gpu)
+        pp_buf = Allocate(PPClkEntry.SIZE)
+
+        pp_i = 0
+        WhileLoop LessThan(pp_i, pp_count) {
+            IfCondition GreaterEqual(num_levels, DPMConst.MAX_LEVELS) ThenBlock: {
+                pp_i = pp_count  // break — hit SI max of 5 levels
+            }
+            ElseBlock: {
+                PP_GetClockEntry(gpu, pp_i, pp_buf)
+                pp_sclk = Dereference(Add(pp_buf, PPClkEntry.SCLK))
+                pp_mclk = Dereference(Add(pp_buf, PPClkEntry.MCLK))
+                pp_vddc = Dereference(Add(pp_buf, PPClkEntry.VDDC))
+                pp_vddci = Dereference(Add(pp_buf, PPClkEntry.VDDCI))
+
+                // Resolve leakage voltage IDs (0xFFxx format) to real mV values
+                pp_vddc = Volt_ResolveLeakageVDDC(gpu, pp_vddc)
+
+                // Only add levels with:
+                //   - SCLK higher than boot (useful DPM level)
+                //   - VDDC > 0 and < 2000 (sane resolved voltage)
+                IfCondition GreaterThan(pp_sclk, boot_sclk) ThenBlock: {
+                    IfCondition GreaterThan(pp_vddc, 0) ThenBlock: {
+                        IfCondition LessThan(pp_vddc, 2000) ThenBlock: {
+                            // Enforce monotonic voltage: each level >= previous level's VDDC
+                            IfCondition GreaterThan(num_levels, 0) ThenBlock: {
+                                prev_vddc = Dereference(Add(levels_vddc, Multiply(Subtract(num_levels, 1), 8)))
+                                IfCondition LessThan(pp_vddc, prev_vddc) ThenBlock: {
+                                    pp_vddc = prev_vddc
+                                }
+                            }
+                            StoreValue(Add(levels_sclk, Multiply(num_levels, 8)), pp_sclk)
+                            // Use boot_mclk for all levels — we don't do MCLK DPM,
+                            // and MPLL shadow registers are not populated, so any MCLK
+                            // change would hang the SMC trying to reprogram MPLL with zeros.
+                            StoreValue(Add(levels_mclk, Multiply(num_levels, 8)), boot_mclk)
+                            StoreValue(Add(levels_vddc, Multiply(num_levels, 8)), pp_vddc)
+                            IfCondition EqualTo(pp_vddci, 0) ThenBlock: { pp_vddci = boot_vddci }
+                            StoreValue(Add(levels_vddci, Multiply(num_levels, 8)), pp_vddci)
+                            num_levels = Add(num_levels, 1)
+                        }
+                    }
+                }
+            }
+            pp_i = Add(pp_i, 1)
+        }
+        Deallocate(pp_buf, PPClkEntry.SIZE)
+
+        // Sort levels 1..N-1 by ascending SCLK (bubble sort on parallel arrays).
+        // Level 0 (boot) stays fixed. SMC auto-throttle and Force HIGH/LOW
+        // require monotonically increasing SCLK across level indices.
+        sort_end = Subtract(num_levels, 1)
+        WhileLoop GreaterThan(sort_end, 1) {
+            si = 1
+            WhileLoop LessThan(si, sort_end) {
+                sj = Add(si, 1)
+                si_off = Multiply(si, 8)
+                sj_off = Multiply(sj, 8)
+                IfCondition GreaterThan(Dereference(Add(levels_sclk, si_off)), Dereference(Add(levels_sclk, sj_off))) ThenBlock: {
+                    // Swap sclk
+                    tmp = Dereference(Add(levels_sclk, si_off))
+                    StoreValue(Add(levels_sclk, si_off), Dereference(Add(levels_sclk, sj_off)))
+                    StoreValue(Add(levels_sclk, sj_off), tmp)
+                    // Swap mclk
+                    tmp = Dereference(Add(levels_mclk, si_off))
+                    StoreValue(Add(levels_mclk, si_off), Dereference(Add(levels_mclk, sj_off)))
+                    StoreValue(Add(levels_mclk, sj_off), tmp)
+                    // Swap vddc
+                    tmp = Dereference(Add(levels_vddc, si_off))
+                    StoreValue(Add(levels_vddc, si_off), Dereference(Add(levels_vddc, sj_off)))
+                    StoreValue(Add(levels_vddc, sj_off), tmp)
+                    // Swap vddci
+                    tmp = Dereference(Add(levels_vddci, si_off))
+                    StoreValue(Add(levels_vddci, si_off), Dereference(Add(levels_vddci, sj_off)))
+                    StoreValue(Add(levels_vddci, sj_off), tmp)
+                }
+                si = Add(si, 1)
+            }
+            sort_end = Subtract(sort_end, 1)
+        }
+
+        PrintMessage("[DPM_SI] Built ")
+        PrintNumber(num_levels)
+        PrintMessage(" DPM levels:\n")
+        li = 0
+        WhileLoop LessThan(li, num_levels) {
+            PrintMessage("  [")
+            PrintNumber(li)
+            PrintMessage("] SCLK=")
+            PrintNumber(Divide(Dereference(Add(levels_sclk, Multiply(li, 8))), 1000))
+            PrintMessage("MHz  MCLK=")
+            PrintNumber(Dereference(Add(levels_mclk, Multiply(li, 8))))
+            PrintMessage("  VDDC=")
+            PrintNumber(Dereference(Add(levels_vddc, Multiply(li, 8))))
+            PrintMessage("mV\n")
+            li = Add(li, 1)
+        }
+
+        StoreValue(Add(dpm, DPMField.NUM_LEVELS), num_levels)
+        StoreValue(Add(dpm, DPMField.BOOT_LEVEL), boot_level)
+        StoreValue(Add(dpm, DPMField.MAX_LEVEL), Subtract(num_levels, 1))
+
+        // Use SRAM offsets from pre-read firmware header (stored in DPM state
+        // by DPM_SI_Enable before stopping the SMC).
+        smc_state_addr = Dereference(Add(dpm, DPMField.SMC_STATE_ADDR))
+        IfCondition EqualTo(smc_state_addr, 0) ThenBlock: {
+            // Fallback: try reading directly (may work if SRAM is accessible)
+            smc_state_addr = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.STATE_TABLE))
+            IfCondition EqualTo(smc_state_addr, 0) ThenBlock: {
+                PrintMessage("[DPM_SI] ERROR: Firmware header has no state table address\n")
+                ReturnValue(0)
+            }
+            StoreValue(Add(dpm, DPMField.SMC_STATE_ADDR), smc_state_addr)
+        }
+
+        soft_regs_addr = Dereference(Add(dpm, DPMField.SOFT_REGS_ADDR))
+        IfCondition EqualTo(soft_regs_addr, 0) ThenBlock: {
+            soft_regs_addr = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.SOFT_REGS))
+            StoreValue(Add(dpm, DPMField.SOFT_REGS_ADDR), soft_regs_addr)
+        }
+
+        // Calculate state table buffer size
+        // Fixed part: 640 bytes (up to driver state header)
+        // Driver state at init: 4 bytes header + 1 level * 148 bytes
+        // (multi-level driverState is uploaded at runtime)
+        tbl_size = Add(644, HWLevel.SIZE)
+        // Round up to 4-byte alignment
+        tbl_size = Multiply(Divide(Add(tbl_size, 3), 4), 4)
+
+        // Allocate host buffer
+        tbl_buf = Allocate(tbl_size)
+        MemorySet(tbl_buf, 0, tbl_size)
+        StoreValue(Add(dpm, DPMField.STATE_TBL_PTR), tbl_buf)
+        StoreValue(Add(dpm, DPMField.STATE_TBL_SIZE), tbl_size)
+
+        // --- Read firmware's existing header + lowSMIO + voltage masks ---
+        // The firmware initializes lowSMIO, voltage masks, and header with correct
+        // values from its internal tables. Rather than rebuilding from scratch
+        // (which may miss MVDD or phase shedding bits), read the firmware's
+        // pre-loaded values and copy them into our buffer.
+        // This ensures we preserve any SMIO patterns we don't know about.
+        //
+        // Save original header DWORD before the bulk read (for fixup later)
+        fw_orig_hdr = SMC_SI_ReadSRAM32_Direct(gpu, smc_state_addr)
+
+        fw_hdr_dwords = Divide(SMCTbl.INITIAL_STATE, 4)  // 184/4 = 46 DWORDs
+        SMC_SI_ReadSRAMBlock(gpu, smc_state_addr, tbl_buf, fw_hdr_dwords)
+
+        // The header region (offsets 0-183) is now in the buffer.
+        // The firmware does NOT populate lowSMIO or voltageMaskTable — that's
+        // the driver's job. Populate them from our parsed voltage data.
+
+        // --- Populate lowSMIO[] with GPIO voltage patterns ---
+        // For GPIO-controlled voltage, each lowSMIO[i] entry holds the GPIO
+        // pin pattern that selects voltage step i. The SMC uses these during
+        // voltage transitions between DPM levels.
+        vddc_mode = Volt_GetMode(gpu)
+        IfCondition EqualTo(vddc_mode, VoltMode.GPIO_LUT) ThenBlock: {
+            vddc_count_v = Dereference(Add(Volt_GetEntry(gpu), VoltField.VDDC_COUNT))
+            IfCondition GreaterThan(vddc_count_v, 32) ThenBlock: { vddc_count_v = 32 }
+
+            vi = 0
+            WhileLoop LessThan(vi, vddc_count_v) {
+                gpio_id = Volt_GetVDDCGPIOID(gpu, vi)
+                // lowSMIO[i] is at tbl_buf + SMCTbl.LOW_SMIO + i*4
+                smio_off = Add(SMCTbl.LOW_SMIO, Multiply(vi, 4))
+                // OR with existing value (firmware may have pre-set bits)
+                existing = Dereference(Add(tbl_buf, smio_off), "dword")
+                StoreValue(Add(tbl_buf, smio_off), BitwiseOr(existing, gpio_id), "dword")
+                vi = Add(vi, 1)
+            }
+
+            // Set voltageMaskTable.lowMask[VDDC] (index 0)
+            // voltageMaskTable is at offset 132, lowMask[0] = first u32
+            vddc_mask = Volt_GetVDDCMask(gpu)
+            StoreValue(Add(tbl_buf, SMCTbl.VOLT_MASK_TBL), vddc_mask, "dword")
+
+            PrintMessage("[DPM_SI] lowSMIO populated: ")
+            PrintNumber(vddc_count_v)
+            PrintMessage(" VDDC entries, mask=0x")
+            PrintHex(vddc_mask)
+            PrintMessage("\n")
+        }
+
+        // VDDCI GPIO patterns (if available)
+        vddci_count_v = Volt_GetVDDCICount(gpu)
+        IfCondition GreaterThan(vddci_count_v, 0) ThenBlock: {
+            IfCondition GreaterThan(vddci_count_v, 32) ThenBlock: { vddci_count_v = 32 }
+
+            vci = 0
+            WhileLoop LessThan(vci, vddci_count_v) {
+                gpio_id_ci = Volt_GetVDDCIGPIOID(gpu, vci)
+                smio_off_ci = Add(SMCTbl.LOW_SMIO, Multiply(vci, 4))
+                existing_ci = Dereference(Add(tbl_buf, smio_off_ci), "dword")
+                StoreValue(Add(tbl_buf, smio_off_ci), BitwiseOr(existing_ci, gpio_id_ci), "dword")
+                vci = Add(vci, 1)
+            }
+
+            // voltageMaskTable.lowMask[VDDCI] (index 2)
+            // VOLT_MASK_TBL + 2*4 = offset 140
+            vddci_mask = Volt_GetVDDCIMask(gpu)
+            StoreValue(Add(tbl_buf, Add(SMCTbl.VOLT_MASK_TBL, 8)), vddci_mask, "dword")
+
+            PrintMessage("[DPM_SI] lowSMIO: ")
+            PrintNumber(vddci_count_v)
+            PrintMessage(" VDDCI entries, mask=0x")
+            PrintHex(vddci_mask)
+            PrintMessage("\n")
+        }
+
+        // Load computed BSP values for si_populate_smc_sp
+        bsp_dsp = Dereference(Add(dpm, DPMField.DSP), "dword")
+        bsp_psp = Dereference(Add(dpm, DPMField.PSP), "dword")
+
+        // --- Populate initialState (SWSTATE_SINGLE at offset 0xB8) ---
+        init_ptr = Add(tbl_buf, SMCTbl.INITIAL_STATE)
+        // SWSHdr BE DWORD: (flags<<24) | (levelCount<<16) | pad | pad
+        // flags: PPSMC_SWSTATE_FLAG_DC = 0x01
+        StoreValue(init_ptr, Add(LeftShift(1, 24), LeftShift(1, 16)))
+
+        init_level = Add(init_ptr, 4)  // skip 4-byte header
+        // extra = (vddci << 16) | (pcie_gen << 8) | arb_idx
+        init_extra = Add(LeftShift(boot_vddci, 16), 0)
+        DPM_SI_PopulateLevel(gpu, init_level, boot_sclk, boot_mclk, boot_vddc, init_extra)
+        // bSP: initialState always gets dsp (single level = non-last)
+        StoreValue(Add(init_level, HWLevel.BSP), bsp_dsp, "dword")
+
+        // --- Populate ACPIState (SWSTATE_SINGLE at offset 0x150) ---
+        acpi_ptr = Add(tbl_buf, SMCTbl.ACPI_STATE)
+        // flags: 0x00 (kernel explicitly clears DC flag for ACPI state)
+        StoreValue(acpi_ptr, LeftShift(1, 16))
+
+        acpi_level = Add(acpi_ptr, 4)
+        // ACPI state: minimal clocks, SCLK mux to bypass
+        acpi_extra = Add(LeftShift(boot_vddci, 16), 1)
+        DPM_SI_PopulateLevel(gpu, acpi_level, boot_sclk, boot_mclk, boot_vddc, acpi_extra)
+        // Override SCLK mux to 4 (bypass SPLL) for ACPI
+        // Write in ascending offset order to avoid StoreValue clobbers
+        spll2_acpi = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL_2)
+        spll2_acpi = BitwiseAnd(spll2_acpi, BitwiseNot(SPLLBits.SCLK_MUX_SEL_MASK))
+        spll2_acpi = BitwiseOr(spll2_acpi, 4)
+        StoreValue(Add(acpi_level, HWLevel.SCLK_CNTL_2), spll2_acpi)
+        // Re-write SCLK_CNTL_3 (clobbered by StoreValue at offset 20)
+        StoreValue(Add(acpi_level, HWLevel.SCLK_CNTL_3), 0)
+        // SCLK_VALUE = 0 for ACPI (bypass mode)
+        StoreValue(Add(acpi_level, HWLevel.SCLK_VALUE), 0)
+        // bSP: ACPIState gets dsp (kernel copies from initialState)
+        StoreValue(Add(acpi_level, HWLevel.BSP), bsp_dsp, "dword")
+
+        // --- Populate ULV State (SWSTATE_SINGLE at offset 0x1E8) ---
+        ulv_ptr = Add(tbl_buf, SMCTbl.ULV_STATE)
+        // flags: PPSMC_SWSTATE_FLAG_DC = 0x01
+        StoreValue(ulv_ptr, Add(LeftShift(1, 24), LeftShift(1, 16)))
+        ulv_level = Add(ulv_ptr, 4)
+        ulv_extra = Add(LeftShift(boot_vddci, 16), 2)
+        DPM_SI_PopulateLevel(gpu, ulv_level, boot_sclk, boot_mclk, boot_vddc, ulv_extra)
+        // bSP: ULVState gets dsp (kernel copies from initialState)
+        StoreValue(Add(ulv_level, HWLevel.BSP), bsp_dsp, "dword")
+
+        // --- Populate driverState (at offset 0x280) ---
+        // Match kernel's si_init_smc_table() lines 4694-4696:
+        //   table->driverState.flags = table->initialState.flags;
+        //   table->driverState.levelCount = table->initialState.levelCount;
+        //   table->driverState.levels[0] = table->initialState.level;
+        //
+        // The kernel ALWAYS initializes driverState with exactly 1 level
+        // (a copy of initialState). Multi-level driverState is ONLY uploaded
+        // at runtime via si_upload_sw_state() during si_dpm_set_power_state().
+        drv_ptr = Add(tbl_buf, SMCTbl.DRIVER_STATE)
+        // Copy initialState header (1 level, flags=DC)
+        init_hdr_val = Dereference(init_ptr, "dword")
+        StoreValue(drv_ptr, init_hdr_val, "dword")
+        // Copy initialState level into driverState level 0
+        drv_level = Add(drv_ptr, 4)
+        ci = 0
+        WhileLoop LessThan(ci, HWLevel.SIZE) {
+            bval = GetByte(init_level, ci)
+            SetByte(drv_level, ci, bval)
+            ci = Add(ci, 1)
+        }
+
+        // Save level arrays in DPM state for runtime upload via DPM_SI_UploadDriverState
+        StoreValue(Add(dpm, DPMField.LEVELS_SCLK), levels_sclk)
+        StoreValue(Add(dpm, DPMField.LEVELS_MCLK), levels_mclk)
+        StoreValue(Add(dpm, DPMField.LEVELS_VDDC), levels_vddc)
+        StoreValue(Add(dpm, DPMField.LEVELS_VDDCI), levels_vddci)
+        // NOTE: Do NOT deallocate level arrays — they're owned by DPM state now
+
+        // --- Upload state table to SMC SRAM ---
+        PrintMessage("[DPM_SI] Uploading state table to SRAM at 0x")
+        PrintHex(smc_state_addr)
+        PrintMessage(" (")
+        PrintNumber(tbl_size)
+        PrintMessage(" bytes, driverState=1 level, ")
+        PrintNumber(num_levels)
+        PrintMessage(" levels available for runtime)\n")
+
+        num_dwords = Divide(tbl_size, 4)
+        SMC_WriteSRAMBlock(gpu, smc_state_addr, tbl_buf, num_dwords)
+
+        PrintMessage("[DPM_SI] State table uploaded\n")
+
+        // --- Fix up header DWORD in SRAM ---
+        // Build systemFlags from platform capabilities (kernel si_populate_smc_initial_state)
+        //   PPSMC_SYSTEMFLAG_GPIO_DC    = 0x01 (ATOM_PP_PLATFORM_CAP_HARDWAREDC = 32)
+        //   PPSMC_SYSTEMFLAG_STEPVDDC   = 0x02 (ATOM_PP_PLATFORM_CAP_STEPVDDC = 128)
+        //   PPSMC_SYSTEMFLAG_GDDR5      = 0x04 (mem_gddr5)
+        vddc_count = Dereference(Add(Volt_GetEntry(gpu), VoltField.VDDC_COUNT))
+        max_vddc_idx = Subtract(vddc_count, 1)
+        IfCondition LessThan(max_vddc_idx, 0) ThenBlock: { max_vddc_idx = 0 }
+
+        pp_entry = PP_GetEntry(gpu)
+        plat_caps = 0
+        IfCondition NotEqual(pp_entry, 0) ThenBlock: {
+            plat_caps = Dereference(Add(pp_entry, PPField.PLATFORM_CAPS))
+        }
+
+        sys_flags = 4  // GDDR5 (0x04) — Cape Verde always uses GDDR5
+        // GPIO_DC: platform has hardware DC voltage control via GPIO
+        IfCondition NotEqual(BitwiseAnd(plat_caps, 32), 0) ThenBlock: {
+            sys_flags = BitwiseOr(sys_flags, 1)
+        }
+        // STEPVDDC: voltage can be stepped (not instant)
+        IfCondition NotEqual(BitwiseAnd(plat_caps, 128), 0) ThenBlock: {
+            sys_flags = BitwiseOr(sys_flags, 2)
+        }
+        hdr_dw = Add(LeftShift(sys_flags, 16), LeftShift(max_vddc_idx, 8))
+        SMC_SI_WriteSRAM32(gpu, smc_state_addr, hdr_dw)
+        PrintMessage("[DPM_SI] Header: systemFlags=0x")
+        PrintHex(sys_flags)
+        PrintMessage(", maxVddcIdx=")
+        PrintNumber(max_vddc_idx)
+        PrintMessage("\n")
+
+        // --- Initialize MC register table ---
+        // The SMC firmware reads the MC register table during state switches
+        // when ACIndex != 0. Even with ACIndex=0, the firmware may validate
+        // the table header. Write last=0 to indicate no MC registers to reprogram.
+        mc_reg_addr = Dereference(Add(dpm, DPMField.MC_REG_TABLE_ADDR))
+        IfCondition EqualTo(mc_reg_addr, 0) ThenBlock: {
+            mc_reg_addr = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.MC_REG_TABLE))
+        }
+        IfCondition NotEqual(mc_reg_addr, 0) ThenBlock: {
+            PrintMessage("[DPM_SI] MC reg table at 0x")
+            PrintHex(mc_reg_addr)
+            PrintMessage(", writing last=0\n")
+            SMC_SI_WriteSRAM32(gpu, mc_reg_addr, 0)
+        }
+
+        // --- Initialize MC ARB DRAM table ---
+        mc_arb_addr = Dereference(Add(dpm, DPMField.ARB_TABLE_ADDR))
+        IfCondition EqualTo(mc_arb_addr, 0) ThenBlock: {
+            mc_arb_addr = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.MC_ARB_TABLE))
+            StoreValue(Add(dpm, DPMField.ARB_TABLE_ADDR), mc_arb_addr)
+        }
+        IfCondition NotEqual(mc_arb_addr, 0) ThenBlock: {
+            PrintMessage("[DPM_SI] MC ARB table at 0x")
+            PrintHex(mc_arb_addr)
+            PrintMessage("\n")
+        }
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_UploadDriverState — build and upload multi-level driverState to SRAM
+//
+// This is the runtime equivalent of the kernel's si_upload_sw_state().
+// Called AFTER DPM is enabled and SMC is halted. Builds a multi-level
+// driverState from the saved level arrays and uploads it to SRAM at the
+// driverState offset. The caller must then Resume + SwitchToSwState.
+//
+// Must be called with SMC halted (after HALT message + WaitInactive).
+//
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.DPM_SI_UploadDriverState {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
+        IfCondition LessThan(num_levels, 1) ThenBlock: { ReturnValue(0) }
+
+        levels_sclk = Dereference(Add(dpm, DPMField.LEVELS_SCLK))
+        levels_mclk = Dereference(Add(dpm, DPMField.LEVELS_MCLK))
+        levels_vddc = Dereference(Add(dpm, DPMField.LEVELS_VDDC))
+        levels_vddci = Dereference(Add(dpm, DPMField.LEVELS_VDDCI))
+        IfCondition EqualTo(levels_sclk, 0) ThenBlock: {
+            PrintMessage("[DPM_SI] ERROR: No saved level data\n")
+            ReturnValue(0)
+        }
+
+        smc_state_addr = Dereference(Add(dpm, DPMField.SMC_STATE_ADDR))
+        drv_sram_addr = Add(smc_state_addr, SMCTbl.DRIVER_STATE)
+
+        bsp_dsp = Dereference(Add(dpm, DPMField.DSP), "dword")
+        bsp_psp = Dereference(Add(dpm, DPMField.PSP), "dword")
+
+        // Allocate buffer for driverState: 4-byte header + num_levels * 148 bytes
+        drv_size = Add(4, Multiply(num_levels, HWLevel.SIZE))
+        drv_buf = Allocate(drv_size)
+        MemorySet(drv_buf, 0, drv_size)
+
+        // SWSHdr BE DWORD: (flags<<24) | (levelCount<<16)
+        // flags: PPSMC_SWSTATE_FLAG_DC = 0x01
+        StoreValue(drv_buf, Add(LeftShift(1, 24), LeftShift(num_levels, 16)), "dword")
+
+        j = 0
+        WhileLoop LessThan(j, num_levels) {
+            lvl_sclk = Dereference(Add(levels_sclk, Multiply(j, 8)))
+            lvl_mclk = Dereference(Add(levels_mclk, Multiply(j, 8)))
+            lvl_vddc = Dereference(Add(levels_vddc, Multiply(j, 8)))
+            lvl_vddci = Dereference(Add(levels_vddci, Multiply(j, 8)))
+
+            lvl_ptr = Add(drv_buf, Add(4, Multiply(j, HWLevel.SIZE)))
+            arb_idx = Add(DPMConst.DRIVER_STATE_ARB, j)
+            lvl_extra = Add(LeftShift(lvl_vddci, 16), arb_idx)
+            DPM_SI_PopulateLevel(gpu, lvl_ptr, lvl_sclk, lvl_mclk, lvl_vddc, lvl_extra)
+
+            // bSP: dsp for all levels except last, psp for last
+            IfCondition EqualTo(j, Subtract(num_levels, 1)) ThenBlock: {
+                StoreValue(Add(lvl_ptr, HWLevel.BSP), bsp_psp, "dword")
+            } ElseBlock: {
+                StoreValue(Add(lvl_ptr, HWLevel.BSP), bsp_dsp, "dword")
+            }
+
+            // aT: level 0 = 0, others = 0x0000FFFF
+            // (simplified — kernel computes precise values via r600_calculate_at)
+            IfCondition EqualTo(j, 0) ThenBlock: {
+                StoreValue(Add(lvl_ptr, HWLevel.AT), 0)
+            }
+
+            j = Add(j, 1)
+        }
+
+        // Upload to SRAM
+        num_dwords = Divide(Add(drv_size, 3), 4)
+        SMC_WriteSRAMBlock(gpu, drv_sram_addr, drv_buf, num_dwords)
+
+        PrintMessage("[DPM_SI] Uploaded driverState: ")
+        PrintNumber(num_levels)
+        PrintMessage(" levels to SRAM 0x")
+        PrintHex(drv_sram_addr)
+        PrintMessage("\n")
+
+        Deallocate(drv_buf, drv_size)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_InitSPLLDivTable — build and upload the SPLL divider lookup table
+//
+// The SMC firmware uses a 256-entry SPLL_DIV_TABLE for fast clock transitions.
+// Each entry contains pre-computed FBDIV and PDIV values for a specific SCLK.
+// The table covers SCLK from 0 to ~1305 MHz in steps of 5.12 MHz (512 * 10kHz).
+//
+// Without this table, the SMC cannot perform DPM level transitions.
+//
+// Structure (from sislands_smc.h):
+//   SMC_SISLANDS_SPLL_DIV_TABLE {
+//     uint32_t freq[256];  // packed: fbdiv[24:0] | pdiv[31:25]
+//     uint32_t ss[256];    // packed: clkv[19:0] | clks[31:20]
+//   }
+//   Total: 2048 bytes (512 DWORDs)
+//
+// Must be called while SMC is STOPPED (during table upload phase).
+// =============================================================================
+Function.DPM_SI_InitSPLLDivTable {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        // Use pre-read SPLL div table SRAM address from DPM state
+        dpm = DPM_SI_GetEntry(gpu)
+        spll_tbl_addr = Dereference(Add(dpm, DPMField.SPLL_TABLE_ADDR))
+        IfCondition EqualTo(spll_tbl_addr, 0) ThenBlock: {
+            // Fallback: try reading from SRAM directly
+            spll_tbl_addr = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.SPLL_TABLE))
+            IfCondition EqualTo(spll_tbl_addr, 0) ThenBlock: {
+                PrintMessage("[DPM_SI] WARNING: No SPLL table address\n")
+                ReturnValue(0)
+            }
+        }
+
+        PrintMessage("[DPM_SI] Building SPLL div table at SRAM 0x")
+        PrintHex(spll_tbl_addr)
+        PrintMessage("\n")
+
+        // Allocate host buffer: 256 freq + 256 ss = 512 DWORDs = 2048 bytes
+        tbl_size = 2048
+        tbl_buf = Allocate(tbl_size)
+        MemorySet(tbl_buf, 0, tbl_size)
+
+        // Read boot SPLL registers as template
+        spll_0 = GPU_Rd32(gpu, SIReg.CG_SPLL_FUNC_CNTL)
+        ref_khz = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
+        IfCondition EqualTo(ref_khz, 0) ThenBlock: { ref_khz = 27000 }
+        ref_div_raw = BitwiseAnd(RightShift(spll_0, SPLLBits.SPLL_REF_DIV_SHIFT), 63)
+        ref_div = Add(ref_div_raw, 1)
+
+        // Extract boot post_div — MUST match ComputeSPLL's strategy exactly.
+        // The kernel calls radeon_atom_get_clock_dividers() for each entry,
+        // which returns matching ref_div/post_div. Since we don't have that
+        // VBIOS command, we preserve boot_post_div when VCO is in range,
+        // same as ComputeSPLL. This ensures div table entries match per-level
+        // shadow registers for any given SCLK.
+        boot_pdiv = BitwiseAnd(RightShift(spll_0, SPLLBits.SPLL_PDIV_A_SHIFT), 127)
+        IfCondition EqualTo(boot_pdiv, 0) ThenBlock: { boot_pdiv = 3 }
+
+        // Build 256 entries: sclk = i * 512 (in 10kHz units)
+        // Entry 0 is sclk=0 (invalid, but firmware skips it)
+        // Entry 58 ≈ 300 MHz, Entry 78 ≈ 400 MHz, etc.
+        di = 0
+        WhileLoop LessThan(di, 256) {
+            sclk_10k = Multiply(di, 512)  // 10kHz units
+
+            IfCondition GreaterThan(sclk_10k, 0) ThenBlock: {
+                sclk_khz = Multiply(sclk_10k, 10)  // convert to kHz
+
+                // Post divider: same logic as ComputeSPLL — prefer boot_pdiv
+                // when VCO = sclk * post_div is in [648, 2500] MHz range
+                vco_t = Multiply(sclk_khz, boot_pdiv)
+                IfCondition GreaterEqual(vco_t, 648000) ThenBlock: {
+                    IfCondition LessEqual(vco_t, 2500000) ThenBlock: {
+                        p_div = boot_pdiv
+                    }
+                    ElseBlock: {
+                        p_div = Divide(Add(648000, Subtract(sclk_khz, 1)), sclk_khz)
+                        IfCondition LessThan(p_div, 1) ThenBlock: { p_div = 1 }
+                    }
+                }
+                ElseBlock: {
+                    p_div = Divide(Add(648000, Subtract(sclk_khz, 1)), sclk_khz)
+                    IfCondition LessThan(p_div, 1) ThenBlock: { p_div = 1 }
+                    IfCondition GreaterThan(p_div, 127) ThenBlock: { p_div = 127 }
+                }
+
+                // Compute FBDIV: (sclk_khz * ref_div * post_div * 16384) / ref_khz
+                numer = Multiply(Multiply(sclk_khz, ref_div), p_div)
+                fb_int = Divide(numer, ref_khz)
+                fb_rem = Modulo(numer, ref_khz)
+                fb_div = Add(Multiply(fb_int, 16384), Divide(Multiply(fb_rem, 16384), ref_khz))
+
+                // Pack for compact table format (kernel si_init_smc_spll_table):
+                //   fb_div = FUNC_CNTL_3 & SPLL_FB_DIV_MASK  (26 bits)
+                //   fb_div &= ~0x1FFF   (clear low 13 fractional bits)
+                //   fb_div >>= 1        (shift down by 1)
+                //   freq[i] = (fb_div & 0x01FFFFFF) | (p_div << 25)
+                fb_trunc = BitwiseAnd(fb_div, 67108863)  // 0x3FFFFFF = full FBDIV from reg
+                fb_trunc = BitwiseAnd(fb_trunc, BitwiseNot(8191))  // clear low 13 bits (~0x1FFF)
+                fb_trunc = RightShift(fb_trunc, 1)       // shift down by 1
+
+                // freq[i] = (fb_trunc & 0x01FFFFFF) | (p_div << 25)
+                fb_packed = BitwiseAnd(fb_trunc, 33554431)   // 0x01FFFFFF
+                freq_entry = BitwiseOr(fb_packed, LeftShift(p_div, 25))
+
+                // Store in freq array (offset = i * 4)
+                StoreValue(Add(tbl_buf, Multiply(di, 4)), freq_entry, "dword")
+            }
+
+            // ss[i] stays 0 (no spread spectrum for now)
+            // ss array starts at offset 1024 (256 * 4)
+
+            di = Add(di, 1)
+        }
+
+        // Upload to SRAM
+        num_dwords = Divide(tbl_size, 4)
+        SMC_WriteSRAMBlock(gpu, spll_tbl_addr, tbl_buf, num_dwords)
+
+        Deallocate(tbl_buf, tbl_size)
+
+        PrintMessage("[DPM_SI] SPLL div table uploaded (256 entries)\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_SwitchArbF0ToF1 — copy MC ARB DRAM timing from F0 to F1
+//
+// The kernel's si_initial_switch_from_arb_f0_to_f1() calls
+// ni_copy_and_switch_arb_sets(rdev, MC_CG_ARB_FREQ_F0, MC_CG_ARB_FREQ_F1).
+//
+// This copies MC ARB DRAM timing parameters from the F0 set (boot default)
+// to the F1 set (used by DPM driver states), then switches the MC arbiter
+// to use F1. Without this, DPM state transitions reference uninitialized
+// timing parameters in F1, causing the SMC to hang.
+//
+// Must be called AFTER firmware upload but BEFORE state table build.
+// =============================================================================
+Function.DPM_SI_SwitchArbF0ToF1 {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        // Read F0 timing registers
+        dram_timing = GPU_Rd32(gpu, DPMReg.MC_ARB_DRAM_TIMING)
+        dram_timing2 = GPU_Rd32(gpu, DPMReg.MC_ARB_DRAM_TIMING2)
+
+        // Read burst time and extract STATE0 field (bits [4:0])
+        burst = GPU_Rd32(gpu, DPMReg.MC_ARB_BURST_TIME)
+        state0_val = BitwiseAnd(burst, 31)  // STATE0_MASK = 0x1F
+
+        // Write to F1 timing registers
+        GPU_Wr32(gpu, DPMReg.MC_ARB_DRAM_TIMING_1, dram_timing)
+        GPU_Wr32(gpu, DPMReg.MC_ARB_DRAM_TIMING2_1, dram_timing2)
+
+        // Write STATE1 field (bits [9:5]) in burst_time, preserving other bits
+        // STATE1_MASK = 0x1F << 5 = 0x3E0
+        burst = BitwiseAnd(burst, BitwiseNot(992))  // clear bits [9:5]
+        burst = BitwiseOr(burst, LeftShift(state0_val, 5))
+        GPU_Wr32(gpu, DPMReg.MC_ARB_BURST_TIME, burst)
+
+        // Set MC_CG_CONFIG |= 0x0000000F
+        mc_cg = GPU_Rd32(gpu, DPMReg.MC_CG_CONFIG)
+        mc_cg = BitwiseOr(mc_cg, 15)
+        GPU_Wr32(gpu, DPMReg.MC_CG_CONFIG, mc_cg)
+
+        // Request switch to F1: MC_ARB_CG = CG_ARB_REQ(MC_CG_ARB_FREQ_F1)
+        // MC_CG_ARB_FREQ_F1 = 0x0B, CG_ARB_REQ_MASK = 0xFF
+        arb_cg = GPU_Rd32(gpu, DPMReg.MC_ARB_CG)
+        arb_cg = BitwiseAnd(arb_cg, BitwiseNot(255))  // clear CG_ARB_REQ_MASK
+        arb_cg = BitwiseOr(arb_cg, 11)  // CG_ARB_REQ(0x0B)
+        GPU_Wr32(gpu, DPMReg.MC_ARB_CG, arb_cg)
+
+        PrintMessage("[DPM_SI] MC ARB F0→F1 switch done\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_InitArbTableIndex — write MC_CG_ARB_FREQ_F1 index to ARB table header
+//
+// The kernel's si_init_arb_table_index() reads the first DWORD of the
+// ARB table in SRAM, clears the top byte, and writes MC_CG_ARB_FREQ_F1
+// (0x0B) into bits [31:24]. This tells the SMC which MC ARB frequency
+// set to use for driver states.
+//
+// Must be called AFTER the SPLL div table init but BEFORE SMC start.
+// =============================================================================
+Function.DPM_SI_InitArbTableIndex {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        // Use pre-read ARB table SRAM address from DPM state
+        dpm = DPM_SI_GetEntry(gpu)
+        arb_tbl_addr = Dereference(Add(dpm, DPMField.ARB_TABLE_ADDR))
+        IfCondition EqualTo(arb_tbl_addr, 0) ThenBlock: {
+            // Fallback: try reading from SRAM directly
+            arb_tbl_addr = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.MC_ARB_TABLE))
+            IfCondition EqualTo(arb_tbl_addr, 0) ThenBlock: {
+                PrintMessage("[DPM_SI] WARNING: No ARB table address\n")
+                ReturnValue(0)
+            }
+        }
+
+        // Read current header DWORD
+        tmp = SMC_SI_ReadSRAM32_Direct(gpu, arb_tbl_addr)
+
+        // Clear top byte, set MC_CG_ARB_FREQ_F1 (0x0B) << 24
+        tmp = BitwiseAnd(tmp, 16777215)  // 0x00FFFFFF — clear top byte
+        tmp = BitwiseOr(tmp, LeftShift(11, 24))  // 0x0B << 24
+
+        // Write back
+        SMC_SI_WriteSRAM32(gpu, arb_tbl_addr, tmp)
+
+        PrintMessage("[DPM_SI] ARB table index set to F1 (0x0B)\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_ProgramMCArbTimingTable — populate MC ARB DRAM timing entries in SRAM
+//
+// The SMC firmware reads MC ARB timing from SRAM during DPM level transitions
+// to configure the memory controller for each clock state. Without valid
+// timing entries, the DPM engine stalls when switching levels because the
+// MC arbiter gets zero timing values and hangs.
+//
+// SRAM layout (SMC_SIslands_MCArbDramTimingRegisters):
+//   offset 0: arb_current (u8) + reserved[3]
+//   offset 4: data[0]  (12 bytes each: mc_arb_dram_timing, mc_arb_dram_timing2,
+//                        mc_arb_rfsh_rate, mc_arb_burst_time, padding[2])
+//   data[i] at offset 4 + i*12
+//
+// Entry indices match arbRefreshState in each HW_PERFORMANCE_LEVEL:
+//   0 = initialState, 1 = ACPI, 2 = ULV, 3+ = driverState levels
+//
+// Since all our levels use the same boot MCLK, all entries get the same
+// timing values read from the current hardware registers.
+// =============================================================================
+Function.DPM_SI_ProgramMCArbTimingTable {
+    Input: gpu: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        arb_addr = Dereference(Add(dpm, DPMField.ARB_TABLE_ADDR))
+        IfCondition EqualTo(arb_addr, 0) ThenBlock: {
+            PrintMessage("[DPM_SI] WARNING: No ARB table address, skipping MC timing\n")
+            ReturnValue(0)
+        }
+
+        // Read current MC ARB timing from hardware (valid for boot MCLK)
+        dram_timing = GPU_Rd32(gpu, DPMReg.MC_ARB_DRAM_TIMING)
+        dram_timing2 = GPU_Rd32(gpu, DPMReg.MC_ARB_DRAM_TIMING2)
+        // Burst time: STATE0 is bits [4:0]
+        burst_raw = GPU_Rd32(gpu, DPMReg.MC_ARB_BURST_TIME)
+        burst_time = BitwiseAnd(burst_raw, 31)
+
+        PrintMessage("[DPM_SI] MC ARB timing: dram=0x")
+        PrintHex(dram_timing)
+        PrintMessage(", dram2=0x")
+        PrintHex(dram_timing2)
+        PrintMessage(", burst=")
+        PrintNumber(burst_time)
+        PrintMessage("\n")
+
+        // Third DWORD of each entry: (rfsh_rate << 24) | (burst_time << 16)
+        // rfsh_rate = 0 (kernel leaves it as zero)
+        dw2 = LeftShift(burst_time, 16)
+
+        // Populate entries 0-4 (initial=0, ACPI=1, ULV=2, driver_0=3, driver_1=4)
+        // data[i] starts at arb_addr + 4 + i*12
+        num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
+        // Total entries needed: 3 (initial/ACPI/ULV) + num_levels (driver state)
+        total_entries = Add(3, num_levels)
+        IfCondition GreaterThan(total_entries, 16) ThenBlock: { total_entries = 16 }
+
+        ei = 0
+        WhileLoop LessThan(ei, total_entries) {
+            entry_addr = Add(arb_addr, Add(4, Multiply(ei, 12)))
+            SMC_SI_WriteSRAM32(gpu, entry_addr, dram_timing)
+            SMC_SI_WriteSRAM32(gpu, Add(entry_addr, 4), dram_timing2)
+            SMC_SI_WriteSRAM32(gpu, Add(entry_addr, 8), dw2)
+            ei = Add(ei, 1)
+        }
+
+        PrintMessage("[DPM_SI] Programmed ")
+        PrintNumber(total_entries)
+        PrintMessage(" MC ARB timing entries in SRAM\n")
+    }
+}
+
+// =============================================================================
+// SMC_SI_ReadSRAM32_Direct — read SRAM without dispatch overhead
+// Used during init before SMC dispatch is fully set up.
+// =============================================================================
+Function.SMC_SI_ReadSRAM32_Direct {
+    Input: gpu: Integer
+    Input: addr: Integer
+    Output: Integer
+    Body: {
+        // Disable auto-increment
+        cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseAnd(cntl, BitwiseNot(SMCAccessBits.AUTO_INCREMENT)))
+        GPU_Wr32(gpu, SMCReg.IND_INDEX_0, addr)
+        ReturnValue(GPU_Rd32(gpu, SMCReg.IND_DATA_0))
+    }
+}
+
+// =============================================================================
+// DPM_SI_WriteSoftReg — write a single soft register in SMC SRAM
+// =============================================================================
+Function.DPM_SI_WriteSoftReg {
+    Input: gpu: Integer
+    Input: reg_offset: Integer
+    Input: value: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+        soft_addr = Dereference(Add(dpm, DPMField.SOFT_REGS_ADDR))
+        IfCondition EqualTo(soft_addr, 0) ThenBlock: { ReturnValue(0) }
+        SMC_SI_WriteSRAM32(gpu, Add(soft_addr, reg_offset), value)
+    }
+}
+
+// =============================================================================
+// DPM_SI_ProgramSoftRegs — write timing-related soft registers
+//
+// These must be written to SRAM before the SMC is started.
+// Values match the kernel's si_program_response_times() defaults.
+// =============================================================================
+Function.DPM_SI_ProgramSoftRegs {
+    Input: gpu: Integer
+    Body: {
+        // Reference clock for timing calculations
+        // xclk = reference_clock / 10 (in 10kHz units)
+        ref_khz = AtomBIOS_GetField(gpu, AtomField.CORE_REF_CLK)
+        IfCondition EqualTo(ref_khz, 0) ThenBlock: { ref_khz = 27000 }
+        // xclk in 10kHz = ref_khz / 10
+        xclk = Divide(ref_khz, 10)
+
+        // ticks_per_us = xclk / 100 (SMC ticks per microsecond)
+        ticks = Divide(xclk, 100)
+        IfCondition EqualTo(ticks, 0) ThenBlock: { ticks = 1 }
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.TICKS_PER_US, ticks)
+
+        // Voltage response times (kernel: si_program_response_times)
+        // delay_vreg = (voltage_response_time * xclk) / 100
+        // voltage_response_time defaults to 1000 in kernel if VBIOS returns 0
+        delay_vreg = Divide(Multiply(1000, xclk), 100)
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.DELAY_VREG, delay_vreg)
+
+        // delay_acpi = (15000 * xclk) / 100 (15ms in SMC ticks)
+        delay_acpi = Divide(Multiply(15000, xclk), 100)
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.DELAY_ACPI, delay_acpi)
+
+        // mclk_chg_timeout = (100000 * xclk) / 100 (100ms VBI timeout)
+        mclk_timeout = Divide(Multiply(100000, xclk), 100)
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.MCLK_CHG_TIMEOUT, mclk_timeout)
+
+        // mc_block_delay = 0xAA (kernel constant)
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.MC_BLOCK_DELAY, 170)
+
+        // mvdd_chg_time = 1 (kernel constant)
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.MVDD_CHG_TIME, 1)
+
+        // seq_index = 1 (kernel: si_populate_mc_reg_table)
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.SEQ_INDEX, 1)
+
+        // CRTC index: 0 = no active displays (compute card)
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.CRTC_INDEX, 0)
+
+        // PCIe link width: x16
+        DPM_SI_WriteSoftReg(gpu, SMCSoftReg.NON_ULV_PCIE_WIDTH, 16)
+
+        PrintMessage("[DPM_SI] Soft registers programmed (ticks_per_us=")
+        PrintNumber(ticks)
+        PrintMessage(")\n")
+    }
+}
+
+// =============================================================================
+// DPM_SI_Enable — execute the DPM enable sequence
+//
+// Follows the kernel's si_dpm_enable() sequence:
+//   Phase 1 (SMC stopped): Enable voltage control, upload firmware,
+//           read firmware header, build + upload state table,
+//           program soft registers
+//   Phase 2: Start the SMC
+//   Phase 3: Send NoDisplay, enable SCLK control, start DPM
+//
+// Prerequisite: SMC firmware must be loaded but SMC must be STOPPED.
+//               (SMC_LoadFirmware loads firmware and starts the SMC.
+//                We stop it, upload tables, then restart.)
+//
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.DPM_SI_Enable {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        DPM_SI_Init()
+
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        IfCondition EqualTo(Dereference(Add(dpm, DPMField.ENABLED)), 1) ThenBlock: {
+            PrintMessage("[DPM_SI] Already enabled\n")
+            ReturnValue(1)
+        }
+
+        // Ensure PP and Voltage are parsed
+        IfCondition EqualTo(PP_GetNumClockEntries(gpu), 0) ThenBlock: {
+            PrintMessage("[DPM_SI] ERROR: PowerPlay not parsed\n")
+            ReturnValue(0)
+        }
+
+        // -------------------------------------------------------
+        // Phase 1: Enable voltage control
+        // -------------------------------------------------------
+        PrintMessage("[DPM_SI] Step 1: Enable voltage control\n")
+        gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+        gen_pwrmgt = BitwiseOr(gen_pwrmgt, PwrMgtBits.VOLT_PWRMGT_EN)
+        GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
+
+        // -------------------------------------------------------
+        // Phase 1b: Program DPM control registers
+        // -------------------------------------------------------
+        // These MMIO registers control the DPM engine's transition behavior.
+        // The kernel's si_dpm_enable() programs all of these before starting DPM.
+        // Missing these causes the SMC to hang during clock transitions.
+        PrintMessage("[DPM_SI] Step 1b: Programming DPM control registers\n")
+
+        // Spread spectrum: do NOT enable DYN_SPREAD_SPECTRUM_EN without
+        // per-level SS parameters populated. The kernel only sets this bit
+        // when sclk_ss is available from AtomBIOS. With SS values = 0,
+        // enabling this causes PLL mux transitions to fail.
+        gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+        gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.DYN_SPREAD_SPECTRUM_EN))
+        // Enable thermal protection (clear the disable bit)
+        gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.THERMAL_PROTECTION_DIS))
+        GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
+
+        // CG_DISPLAY_GAP_CNTL (0x828): Match kernel mmiotrace value
+        // Kernel init writes 0x1D20D320 — bits [3:0] = 0 (VBLANK mode, not IGNORE)
+        // bits [27:24] = 0x0D = VBLANK(1)|(IGNORE(3)<<2)
+        disp_gap = GPU_Rd32(gpu, DPMReg.CG_DISPLAY_GAP_CNTL)
+        disp_gap = BitwiseAnd(disp_gap, BitwiseNot(15))     // clear bits [3:0], leave as 0
+        disp_gap = BitwiseAnd(disp_gap, BitwiseNot(LeftShift(15, 24)))  // clear bits [27:24]
+        disp_gap = BitwiseOr(disp_gap, LeftShift(13, 24))   // VBLANK(1)|(IGNORE(3)<<2) at [27:24]
+        GPU_Wr32(gpu, DPMReg.CG_DISPLAY_GAP_CNTL, disp_gap)
+
+        // CG_TPC (0x784): Throttle Period Counter = 0x200
+        GPU_Wr32(gpu, DPMReg.CG_TPC, 512)
+
+        // CG_BSP (0x7FC): Boot Step Parameters — computed from ASI + xclk
+        DPM_SI_SetupBSP(gpu)
+
+        // CG_GIT (0x804): Graphics Idle Timer — set CG_GICST = 0x200 in low 16 bits
+        git_val = GPU_Rd32(gpu, DPMReg.CG_GIT)
+        git_val = BitwiseAnd(git_val, BitwiseNot(65535))  // clear low 16 bits
+        git_val = BitwiseOr(git_val, 512)                 // CG_GICST = 0x200
+        GPU_Wr32(gpu, DPMReg.CG_GIT, git_val)
+
+        // CG_SSP (0x80C): Step Size Parameters = SST(0xC8) | SSTU(0)
+        GPU_Wr32(gpu, DPMReg.CG_SSP, 200)
+
+        // CG_FTV (0x7BC): Voltage Regulator Control = SISLANDS_VRC_DFLT = 0xC000B3
+        GPU_Wr32(gpu, DPMReg.CG_FTV, 12583091)
+
+        // CG_FFCT_0 (0x7C0): FIR filter coefficients
+        // First entry: UTC=0x24, DTC=0x24 -> (0x24 << 10) | 0x24 = 0x9024
+        GPU_Wr32(gpu, DPMReg.CG_FFCT_0, 36900)
+        // Entries 1-14: UTC=0x22, DTC=0x22 -> (0x22 << 10) | 0x22 = 0x8822
+        ffc_i = 1
+        WhileLoop LessThan(ffc_i, 15) {
+            GPU_Wr32(gpu, Add(DPMReg.CG_FFCT_0, Multiply(ffc_i, 4)), 34850)
+            ffc_i = Add(ffc_i, 1)
+        }
+
+        // SCLK_PWRMGT_CNTL: Clear FIR_FORCE_TREND_SEL (bit 5) for auto trend
+        sclk_pwr = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
+        sclk_pwr = BitwiseAnd(sclk_pwr, BitwiseNot(32))  // clear bit 5
+        GPU_Wr32(gpu, DPMReg.SCLK_PWRMGT_CNTL, sclk_pwr)
+
+        // MISC_CLK_CNTL (0x670): DEEP_SLEEP_CLK_SEL = 1
+        misc_clk = GPU_Rd32(gpu, DPMReg.MISC_CLK_CNTL)
+        misc_clk = BitwiseAnd(misc_clk, BitwiseNot(255))  // clear bits [7:0]
+        misc_clk = BitwiseOr(misc_clk, 1)                 // DEEP_SLEEP_CLK_SEL = 1
+        GPU_Wr32(gpu, DPMReg.MISC_CLK_CNTL, misc_clk)
+
+        // CG_SPLL_AUTOSCALE_CNTL (0x62C): Set AUTOSCALE_ON_SS_CLEAR (bit 9)
+        autoscale = GPU_Rd32(gpu, DPMReg.CG_SPLL_AUTOSCALE_CNTL)
+        autoscale = BitwiseOr(autoscale, 512)  // bit 9
+        GPU_Wr32(gpu, DPMReg.CG_SPLL_AUTOSCALE_CNTL, autoscale)
+
+        // -------------------------------------------------------
+        // Phase 2: Stop SMC, upload tables, start SMC
+        // -------------------------------------------------------
+        // Following the kernel's si_dpm_enable() sequence exactly:
+        //   1. Stop SMC (si_upload_firmware -> si_reset_smc + si_stop_smc_clock)
+        //   2. Upload firmware to SRAM
+        //   3. Process firmware header (read offsets)
+        //   4. Build + upload state table, SPLL table, soft regs to SRAM
+        //   5. Start SMC (si_dpm_start_smc)
+        //
+        // The SMC was started by SMC_LoadFirmware. We stop it, upload
+        // our state table, then restart.
+
+        // Step 2: Read firmware header WHILE SMC is still running,
+        // then stop it for table upload.
+        // The kernel's si_process_firmware_header() reads SRAM addresses
+        // that the firmware populates at startup. We must read these
+        // before stopping the SMC, because SRAM reads may be unreliable
+        // with the SMC in reset state.
+        PrintMessage("[DPM_SI] Step 2: Reading firmware header\n")
+        smc_state_addr_pre = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.STATE_TABLE))
+        smc_soft_regs_pre = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.SOFT_REGS))
+        smc_mc_reg_pre = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.MC_REG_TABLE))
+        smc_mc_arb_pre = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.MC_ARB_TABLE))
+        smc_spll_pre = SMC_SI_ReadSRAM32_Direct(gpu, Add(SMCConst.SI_UCODE_START, SMCFWHdr.SPLL_TABLE))
+
+        PrintMessage("[DPM_SI] FW header: state=0x")
+        PrintHex(smc_state_addr_pre)
+        PrintMessage(" soft=0x")
+        PrintHex(smc_soft_regs_pre)
+        PrintMessage(" mc_reg=0x")
+        PrintHex(smc_mc_reg_pre)
+        PrintMessage(" mc_arb=0x")
+        PrintHex(smc_mc_arb_pre)
+        PrintMessage(" spll=0x")
+        PrintHex(smc_spll_pre)
+        PrintMessage("\n")
+
+        // Store in DPM state for use by BuildStateTable and other functions
+        StoreValue(Add(dpm, DPMField.SMC_STATE_ADDR), smc_state_addr_pre)
+        StoreValue(Add(dpm, DPMField.SOFT_REGS_ADDR), smc_soft_regs_pre)
+        StoreValue(Add(dpm, DPMField.ARB_TABLE_ADDR), smc_mc_arb_pre)
+        StoreValue(Add(dpm, DPMField.SPLL_TABLE_ADDR), smc_spll_pre)
+        StoreValue(Add(dpm, DPMField.MC_REG_TABLE_ADDR), smc_mc_reg_pre)
+
+        PrintMessage("[DPM_SI] Stopping SMC for table upload\n")
+        SMC_StopSMC(gpu)
+
+        // §26: Steps 2b-4 (ARB F0->F1 switch, state table, SPLL table, ARB
+        // index + timing entries, soft registers) are replaced by a verbatim
+        // replay of the kernel's pre-SMC-start window (bus2_all.txt
+        // @455503-463593): every SRAM write (state table @0x1E48C region,
+        // CAC config @0xC0030000, soft regs, mc_reg @0x1C910, SPLL region)
+        // plus the MC ARB timing register writes, with the trace fw's
+        // offsets and known-good contents. Our own builders wrote
+        // disk-fw-header offsets and computed contents — with the trace SMC
+        // fw (see SMC_SI_LoadFirmware) the kernel's own image is the only
+        // proven table set. Expect 0 msgs in this window.
+        PrintMessage("[DPM_SI] Step 3/4 (§26): replaying kernel pre-start tables\n")
+        rp_p_rc = SMC_SI_ReplayTrace(gpu, SMCTracePath.REPLAY_P)
+        IfCondition LessThan(rp_p_rc, 0) ThenBlock: {
+            PrintMessage("[DPM_SI] ERROR: replay P failed to load\n")
+            SMC_StartSMC(gpu)
+            ReturnValue(0)
+        }
+
+        // Step 5: Start the SMC
+        PrintMessage("[DPM_SI] Step 5: Starting SMC\n")
+        SMC_StartSMC(gpu)
+
+        // -------------------------------------------------------
+        // Phase 3: Enable DPM
+        // -------------------------------------------------------
+        // Following the kernel's si_dpm_enable() post-start sequence:
+        //   1. NoDisplay (compute card has no active displays)
+        //   2. Enable SCLK control (clear SCLK_PWRMGT_OFF)
+        //   3. Start DPM (set GLOBAL_PWRMGT_EN)
+        //
+        // NOTE: Do NOT send SwitchToSwState (0x20) here.
+        // The kernel's si_dpm_enable() does NOT call it during initial enable.
+        // The SMC automatically uses the initialState after boot.
+        // SwitchToSwState is only sent during runtime state transitions
+        // in si_dpm_set_power_state().
+
+        // Step 6: Send NoDisplay (compute card, no active displays)
+        PrintMessage("[DPM_SI] Step 6: Sending NoDisplay\n")
+        GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+        resp = SMC_SendMessage(gpu, SMCMsg.NO_DISPLAY)
+        IfCondition NotEqual(resp, SMCResp.OK) ThenBlock: {
+            PrintMessage("[DPM_SI] WARNING: NoDisplay response: 0x")
+            PrintHex(resp)
+            PrintMessage("\n")
+        }
+
+        // Step 7: Enable SCLK control (clear SCLK_PWRMGT_OFF)
+        PrintMessage("[DPM_SI] Step 7: Enable SCLK control\n")
+        sclk_pwr = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
+        sclk_pwr = BitwiseAnd(sclk_pwr, BitwiseNot(SclkPwrBits.SCLK_PWRMGT_OFF))
+        GPU_Wr32(gpu, DPMReg.SCLK_PWRMGT_CNTL, sclk_pwr)
+
+        // Step 8: Start DPM (set GLOBAL_PWRMGT_EN)
+        PrintMessage("[DPM_SI] Step 8: Start DPM (GLOBAL_PWRMGT_EN)\n")
+        gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+        gen_pwrmgt = BitwiseOr(gen_pwrmgt, PwrMgtBits.GLOBAL_PWRMGT_EN)
+        GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
+
+        // Step 9: Enable auto throttle source (DPM_EVENT_SRC)
+        // The kernel's si_enable_auto_throttle_source() is called UNCONDITIONALLY
+        // after si_start_dpm(). It sets DPM_EVENT_SRC in CG_THERMAL_CTRL to tell
+        // the SMC what hardware signal drives the DPM state machine.
+        // Without this, the SMC has no event source and hangs during level transitions.
+        //
+        // DPM_EVENT_SRC_DIGITAL = 2 (from radeon_dpm_event_src enum)
+        // CG_THERMAL_CTRL (0x700): DPM_EVENT_SRC is bits [2:0], mask = 0x7
+        PrintMessage("[DPM_SI] Step 9: Enable auto throttle source (DPM_EVENT_SRC=DIGITAL)\n")
+        therm_ctrl = GPU_Rd32(gpu, DPMReg.CG_THERMAL_CTRL)
+        therm_ctrl = BitwiseAnd(therm_ctrl, BitwiseNot(7))  // clear DPM_EVENT_SRC_MASK bits [2:0]
+        therm_ctrl = BitwiseOr(therm_ctrl, 2)               // DPM_EVENT_SRC_DIGITAL = 2
+        GPU_Wr32(gpu, DPMReg.CG_THERMAL_CTRL, therm_ctrl)
+
+        StoreValue(Add(dpm, DPMField.ENABLED), 1)
+        StoreValue(Add(dpm, DPMField.CURRENT_LEVEL), 0)
+
+        num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
+        PrintMessage("[DPM_SI] DPM enabled with ")
+        PrintNumber(num_levels)
+        PrintMessage(" levels\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_Disable — full DPM teardown matching kernel si_dpm_disable()
+//
+// Sequence (must match kernel order):
+//   1. Disable auto throttle source (set THERMAL_PROTECTION_DIS)
+//   2. Stop DPM (clear GLOBAL_PWRMGT_EN)
+//   3. Disable SCLK control (set SCLK_PWRMGT_OFF)
+//   4. Disable voltage management (clear VOLT_PWRMGT_EN)
+//   5. Send ResetToDefaults to SMC (returns to initial state)
+//   6. Stop SMC (reset + stop clock)
+//   7. Switch MC ARB back to F0
+// =============================================================================
+Function.DPM_SI_Disable {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        IfCondition NotEqual(Dereference(Add(dpm, DPMField.ENABLED)), 1) ThenBlock: {
+            // Even if DPM wasn't enabled, still stop the SMC if it's running
+            // to ensure clean state for next enable cycle
+            SMC_SI_StopSMC(gpu)
+            ReturnValue(1)
+        }
+
+        // Step 1: Disable auto throttle source
+        // Set THERMAL_PROTECTION_DIS in GENERAL_PWRMGT
+        gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+        gen_pwrmgt = BitwiseOr(gen_pwrmgt, PwrMgtBits.THERMAL_PROTECTION_DIS)
+        GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
+
+        // Step 2: Stop DPM — clear GLOBAL_PWRMGT_EN
+        gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+        gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.GLOBAL_PWRMGT_EN))
+        GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
+
+        // Step 3: Disable SCLK control — set SCLK_PWRMGT_OFF
+        sclk_pwr = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
+        sclk_pwr = BitwiseOr(sclk_pwr, SclkPwrBits.SCLK_PWRMGT_OFF)
+        GPU_Wr32(gpu, DPMReg.SCLK_PWRMGT_CNTL, sclk_pwr)
+
+        // Step 4: Disable voltage management — clear VOLT_PWRMGT_EN
+        gen_pwrmgt = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+        gen_pwrmgt = BitwiseAnd(gen_pwrmgt, BitwiseNot(PwrMgtBits.VOLT_PWRMGT_EN))
+        GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gen_pwrmgt)
+
+        // Step 5: Tell SMC to reset to initial state
+        // This must happen while SMC is still running
+        GPU_Wr32(gpu, SMCReg.RESP_0, 0)
+        SMC_SendMessage(gpu, SMCMsg.RESET_TO_DEFAULTS)
+
+        // Step 6: Stop SMC (reset + stop clock)
+        SMC_SI_StopSMC(gpu)
+
+        // Step 7: Switch MC ARB back to F0
+        // Write MC_CG_ARB_FREQ_F0 (0x0A) to CG_ARB_REQ field of MC_ARB_CG
+        arb_cg = GPU_Rd32(gpu, DPMReg.MC_ARB_CG)
+        arb_cg = BitwiseAnd(arb_cg, BitwiseNot(255))  // clear CG_ARB_REQ_MASK
+        arb_cg = BitwiseOr(arb_cg, 10)  // MC_CG_ARB_FREQ_F0 = 0x0A
+        GPU_Wr32(gpu, DPMReg.MC_ARB_CG, arb_cg)
+
+        StoreValue(Add(dpm, DPMField.ENABLED), 0)
+        PrintMessage("[DPM_SI] DPM disabled (full teardown)\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_SetLevel — force a specific DPM level
+//
+// Uses the kernel's SetEnabledLevels + SetForcedLevels protocol:
+//   - SetEnabledLevels(N): restrict to lowest N levels
+//   - SetForcedLevels(N): force to top N of enabled levels (0 = unforce)
+//
+// To force level L (0-based) out of T total levels:
+//   If L == T-1 (highest): SetEnabledLevels(T), SetForcedLevels(1)
+//   If L == 0   (lowest):  SetForcedLevels(0), SetEnabledLevels(1)
+//   Else:                  SetForcedLevels(0), SetEnabledLevels(L+1), SetForcedLevels(1)
+// =============================================================================
+Function.DPM_SI_SetLevel {
+    Input: gpu: Integer
+    Input: level: Integer
+    Output: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        num_levels = Dereference(Add(dpm, DPMField.NUM_LEVELS))
+        IfCondition GreaterEqual(level, num_levels) ThenBlock: { ReturnValue(0) }
+
+        max_level = Subtract(num_levels, 1)
+
+        IfCondition EqualTo(level, max_level) ThenBlock: {
+            // Force HIGH: enable all, then force from top by 1
+            SMC_SendMessageArg(gpu, SMCMsg.SET_ENABLED_LEVELS, num_levels)
+            SMC_SendMessageArg(gpu, SMCMsg.SET_FORCED_LEVELS, 1)
+        }
+        ElseBlock: {
+            IfCondition EqualTo(level, 0) ThenBlock: {
+                // Force LOW: unforce, then enable only 1 level
+                SMC_SendMessageArg(gpu, SMCMsg.SET_FORCED_LEVELS, 0)
+                SMC_SendMessageArg(gpu, SMCMsg.SET_ENABLED_LEVELS, 1)
+            }
+            ElseBlock: {
+                // Force specific intermediate level:
+                // Enable (level+1) levels, then force from top by 1
+                SMC_SendMessageArg(gpu, SMCMsg.SET_FORCED_LEVELS, 0)
+                SMC_SendMessageArg(gpu, SMCMsg.SET_ENABLED_LEVELS, Add(level, 1))
+                SMC_SendMessageArg(gpu, SMCMsg.SET_FORCED_LEVELS, 1)
+            }
+        }
+
+        StoreValue(Add(dpm, DPMField.CURRENT_LEVEL), level)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// DPM_SI_GetCurrentLevel — return current DPM level
+// =============================================================================
+Function.DPM_SI_GetCurrentLevel {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Dereference(Add(dpm, DPMField.CURRENT_LEVEL)))
+    }
+}
+
+// =============================================================================
+// DPM_SI_PrintInfo — print DPM state information
+// =============================================================================
+Function.DPM_SI_PrintInfo {
+    Input: gpu: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        PrintMessage("--- DPM_SI Info ---\n")
+        PrintMessage("  Enabled:       ")
+        PrintNumber(Dereference(Add(dpm, DPMField.ENABLED)))
+        PrintMessage("\n")
+        PrintMessage("  Num levels:    ")
+        PrintNumber(Dereference(Add(dpm, DPMField.NUM_LEVELS)))
+        PrintMessage("\n")
+        PrintMessage("  Boot level:    ")
+        PrintNumber(Dereference(Add(dpm, DPMField.BOOT_LEVEL)))
+        PrintMessage("\n")
+        PrintMessage("  Current level: ")
+        PrintNumber(Dereference(Add(dpm, DPMField.CURRENT_LEVEL)))
+        PrintMessage("\n")
+        PrintMessage("  Boot SCLK:     ")
+        PrintNumber(Divide(Dereference(Add(dpm, DPMField.BOOT_SCLK)), 1000))
+        PrintMessage(" MHz\n")
+        PrintMessage("  Boot MCLK:     ")
+        PrintNumber(Divide(Dereference(Add(dpm, DPMField.BOOT_MCLK)), 1000))
+        PrintMessage(" MHz\n")
+        PrintMessage("  Boot VDDC:     ")
+        PrintNumber(Dereference(Add(dpm, DPMField.BOOT_VDDC)))
+        PrintMessage(" mV\n")
+        PrintMessage("  SMC state addr: 0x")
+        PrintHex(Dereference(Add(dpm, DPMField.SMC_STATE_ADDR)))
+        PrintMessage("\n")
+        PrintMessage("  State tbl size: ")
+        PrintNumber(Dereference(Add(dpm, DPMField.STATE_TBL_SIZE)))
+        PrintMessage(" bytes\n")
+        PrintMessage("--- End DPM_SI Info ---\n")
+    }
+}
+
+// =============================================================================
+// DPM_SI_Shutdown — full shutdown: disable DPM, free buffers
+// =============================================================================
+Function.DPM_SI_Shutdown {
+    Input: gpu: Integer
+    Body: {
+        dpm = DPM_SI_GetEntry(gpu)
+        IfCondition EqualTo(dpm, 0) ThenBlock: { ReturnValue(0) }
+
+        // Disable DPM if enabled
+        IfCondition EqualTo(Dereference(Add(dpm, DPMField.ENABLED)), 1) ThenBlock: {
+            DPM_SI_Disable(gpu)
+        }
+
+        // Free state table buffer
+        tbl_ptr = Dereference(Add(dpm, DPMField.STATE_TBL_PTR))
+        IfCondition NotEqual(tbl_ptr, 0) ThenBlock: {
+            tbl_size = Dereference(Add(dpm, DPMField.STATE_TBL_SIZE))
+            Deallocate(tbl_ptr, tbl_size)
+        }
+
+        MemorySet(dpm, 0, DPMField.ENTRY_SIZE)
+    }
+}

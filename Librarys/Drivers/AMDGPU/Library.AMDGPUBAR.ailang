@@ -20,10 +20,10 @@
 // =============================================================================
 FixedPool.GPUBarConst {
     "MAX_GPUS":       Initialize=8
-    "STATE_SIZE":     Initialize=64    // bytes per GPU BAR state entry
+    "STATE_SIZE":     Initialize=80    // bytes per GPU BAR state entry
 }
 
-// Layout of each 64-byte BAR state entry:
+// Layout of each 80-byte BAR state entry:
 //   +0:  mmio_ptr      (8 bytes) — mmaped MMIO base address (BAR2)
 //   +8:  mmio_size     (8 bytes) — MMIO map size
 //   +16: vram_ptr      (8 bytes) — mmaped VRAM base address (BAR0)
@@ -31,7 +31,9 @@ FixedPool.GPUBarConst {
 //   +32: mmio_fd       (8 bytes) — file descriptor for BAR2
 //   +40: vram_fd       (8 bytes) — file descriptor for BAR0
 //   +48: unbound       (8 bytes) — 1 if driver was unbound
-//   +56: reserved      (8 bytes)
+//   +56: enabled       (8 bytes) — 1 if PCI device enabled via sysfs
+//   +64: saved_cfg     (8 bytes) — ptr to 64-byte saved PCI config
+//   +72: has_saved_cfg (8 bytes) — 1 if config has been saved
 FixedPool.GPUBarField {
     "MMIO_PTR":       Initialize=0
     "MMIO_SIZE":      Initialize=8
@@ -40,11 +42,39 @@ FixedPool.GPUBarField {
     "MMIO_FD":        Initialize=32
     "VRAM_FD":        Initialize=40
     "UNBOUND":        Initialize=48
+    "ENABLED":        Initialize=56
+    "SAVED_CFG":      Initialize=64
+    "HAS_SAVED_CFG":  Initialize=72
 }
 
 FixedPool.GPUBarState {
     "entries":        Initialize=0, CanChange=True   // ptr to allocated buffer
     "initialized":    Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// DISPLAY GPU LOCKOUT — PCI bus 1 (01:00.0) drives the monitor.
+// NEVER map, enable, or write to this GPU from userspace.
+// A bad MMIO write can stall the PCI fabric and hard-lock the system.
+// =============================================================================
+FixedPool.GPUBarLockout {
+    "DISPLAY_BUS":    Initialize=1     // PCI bus of the display GPU (01:00.0)
+    "allow_display":  Initialize=0, CanChange=True   // set to 1 to allow Map ops on display GPU
+}
+
+// GPU_BAR_IsDisplayGPU — returns 1 if GPU index is on the display bus
+Function.GPU_BAR_IsDisplayGPU {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        dev = GPU_GetDevice(index)
+        IfCondition EqualTo(dev, 0) ThenBlock: { ReturnValue(0) }
+        bus = Dereference(Add(dev, GPUDevField.PCI_BUS))
+        IfCondition EqualTo(bus, GPUBarLockout.DISPLAY_BUS) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
 }
 
 // =============================================================================
@@ -156,6 +186,747 @@ Function.GPU_BAR_BuildResPath {
 }
 
 // =============================================================================
+// GPU_BAR_Enable — enable PCI memory space and bus master
+// Writes PCI COMMAND register (config offset 4) directly via sysfs config file.
+// Sets bit 1 (Memory Space Enable) and bit 2 (Bus Master Enable).
+// This bypasses pci_enable_device() which requires a bound kernel driver.
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.GPU_BAR_Enable {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        // LOCKOUT: refuse to enable the display GPU (unless allow_display is set)
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(index), 1) ThenBlock: {
+            IfCondition EqualTo(GPUBarLockout.allow_display, 0) ThenBlock: {
+                PrintMessage("[AMDGPU BAR] LOCKOUT: refusing to enable display GPU (bus 01)\n")
+                ReturnValue(0)
+            }
+        }
+
+        GPU_BAR_Init()
+
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Already enabled?
+        IfCondition EqualTo(Dereference(Add(state, GPUBarField.ENABLED)), 1) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // Open PCI config space via sysfs
+        path = GPU_BAR_BuildResPath(index, "config")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDWR, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            // Try sysfs "enable" file as fallback
+            path = GPU_BAR_BuildResPath(index, "enable")
+            IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+            fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_WRONLY, 0)
+            IfCondition LessThan(fd, 0) ThenBlock: {
+                PrintMessage("[AMDGPU BAR] Cannot open PCI config for GPU ")
+                PrintNumber(index)
+                PrintMessage("\n")
+                ReturnValue(0)
+            }
+            buf = Allocate(8)
+            SetByte(buf, 0, 49)  // '1'
+            SetByte(buf, 1, 10)  // '\n'
+            nw = SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(buf, 8)
+            IfCondition GreaterThan(nw, 0) ThenBlock: {
+                StoreValue(Add(state, GPUBarField.ENABLED), 1)
+                PrintMessage("[AMDGPU BAR] PCI device enabled (sysfs) for GPU ")
+                PrintNumber(index)
+                PrintMessage("\n")
+                ReturnValue(1)
+            }
+            PrintMessage("[AMDGPU BAR] Cannot enable PCI device for GPU ")
+            PrintNumber(index)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        // Read COMMAND register: 2 bytes at config offset 4
+        buf = Allocate(8)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        nr = SystemCall(GPUSys.SYS_READ, fd, buf, 2, 0, 0)
+        IfCondition LessThan(nr, 2) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] Cannot read PCI COMMAND for GPU ")
+            PrintNumber(index)
+            PrintMessage("\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(buf, 8)
+            ReturnValue(0)
+        }
+
+        // Current COMMAND register (little-endian 16-bit)
+        cmd_lo = GetByte(buf, 0)
+        cmd_hi = GetByte(buf, 1)
+
+        PrintMessage("[AMDGPU BAR] GPU ")
+        PrintNumber(index)
+        PrintMessage(" PCI COMMAND before: 0x")
+        PrintHex(Add(cmd_lo, Multiply(cmd_hi, 256)))
+        PrintMessage("\n")
+
+        // Set bit 0 (I/O Space), bit 1 (Memory Space), bit 2 (Bus Master).
+        // I/O bit added §37 (2026-07-02): the working amdgpu boot logs
+        // "enabling device (0006 -> 0007)" — pci_enable_device sets I/O decode
+        // because the card has an I/O BAR. Mirror the kernel exactly; this was
+        // one of the last two config-space divergences (the other is MSI).
+        cmd_lo = BitwiseOr(cmd_lo, 7)
+        SetByte(buf, 0, cmd_lo)
+
+        // Write back COMMAND register at offset 4
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        IfCondition LessThan(nw, 2) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] COMMAND write failed for GPU ")
+            PrintNumber(index)
+            PrintMessage(" (wrote ")
+            PrintNumber(nw)
+            PrintMessage(" bytes)\n")
+            Deallocate(buf, 8)
+            ReturnValue(0)
+        }
+
+        Deallocate(buf, 8)
+
+        // Verify: re-read COMMAND
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDONLY, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            vbuf = Allocate(8)
+            SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+            SystemCall(GPUSys.SYS_READ, fd, vbuf, 2, 0, 0)
+            v_lo = GetByte(vbuf, 0)
+            v_hi = GetByte(vbuf, 1)
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(vbuf, 8)
+
+            cmd_new = Add(v_lo, Multiply(v_hi, 256))
+            PrintMessage("[AMDGPU BAR] GPU ")
+            PrintNumber(index)
+            PrintMessage(" PCI COMMAND after:  0x")
+            PrintHex(cmd_new)
+            PrintMessage("\n")
+
+            // Check Memory Space bit is set
+            IfCondition NotEqual(BitwiseAnd(v_lo, 2), 0) ThenBlock: {
+                StoreValue(Add(state, GPUBarField.ENABLED), 1)
+                ReturnValue(1)
+            }
+
+            PrintMessage("[AMDGPU BAR] Memory Space bit not set after write!\n")
+            ReturnValue(0)
+        }
+
+        // If we can't verify, assume success
+        StoreValue(Add(state, GPUBarField.ENABLED), 1)
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_EnableMSI — §39: mirror the working boot's MSI programming exactly.
+// Captured live 2026-07-02 23:13 (pci_working_boot/gpu_working.txt, amdgpu
+// bound, bringup verified): cap @0xa0, ctrl=0x0081 (Enable, 64-bit),
+// Address=0x00000000FEE15000 (xAPIC dest 0x15 = CPU5 on this FX-8320,
+// no AMD-Vi/IR on RD990), Data=0x0022 (vector 0x22, edge, fixed).
+// COMMAND gains DisINTx (bit 10): working boot = 0x0407, not 0x0007.
+// Write order matches msi_capability_init(): addr/data first, then
+// pci_intx_for_msi(0) (DisINTx), then the MSI enable bit.
+// Call site: A1/A2 boundary of the replay (radeon_irq_kms_init runs after
+// device init, before si_startup). Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.GPU_BAR_EnableMSI {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        // LOCKOUT: never touch the display GPU
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(index), 1) ThenBlock: {
+            IfCondition EqualTo(GPUBarLockout.allow_display, 0) ThenBlock: {
+                PrintMessage("[AMDGPU BAR] LOCKOUT: refusing MSI enable on display GPU (bus 01)\n")
+                ReturnValue(0)
+            }
+        }
+
+        path = GPU_BAR_BuildResPath(index, "config")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDWR, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[§39] Cannot open PCI config for MSI enable\n")
+            ReturnValue(0)
+        }
+
+        buf = Allocate(8)
+
+        // Sanity: cap ID at 0xa0 must be 0x05 (MSI) — abort rather than
+        // scribble on the wrong capability if the card ever differs.
+        SystemCall(GPUSys.SYS_LSEEK, fd, 160, 0, 0, 0)
+        nr = SystemCall(GPUSys.SYS_READ, fd, buf, 4, 0, 0)
+        cap_id = GetByte(buf, 0)
+        ctrl_before = Add(GetByte(buf, 2), Multiply(GetByte(buf, 3), 256))
+        IfCondition NotEqual(cap_id, 5) ThenBlock: {
+            PrintMessage("[§39] ABORT: cap @0xa0 is not MSI (id=0x")
+            PrintHex(cap_id)
+            PrintMessage(")\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(buf, 8)
+            ReturnValue(0)
+        }
+        PrintMessage("[§39] MSI ctrl before: 0x")
+        PrintHex(ctrl_before)
+        PrintMessage("\n")
+
+        // 1) Message address low @0xa4 = 0xFEE15000
+        SetByte(buf, 0, 0)     // 00
+        SetByte(buf, 1, 80)    // 0x50
+        SetByte(buf, 2, 225)   // 0xE1
+        SetByte(buf, 3, 254)   // 0xFE
+        SystemCall(GPUSys.SYS_LSEEK, fd, 164, 0, 0, 0)
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, buf, 4, 0, 0)
+        IfCondition LessThan(nw, 4) ThenBlock: {
+            PrintMessage("[§39] MSI address write failed\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(buf, 8)
+            ReturnValue(0)
+        }
+
+        // 2) Message address high @0xa8 = 0
+        SetByte(buf, 0, 0)
+        SetByte(buf, 1, 0)
+        SetByte(buf, 2, 0)
+        SetByte(buf, 3, 0)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 168, 0, 0, 0)
+        SystemCall(GPUSys.SYS_WRITE, fd, buf, 4, 0, 0)
+
+        // 3) Message data @0xac = 0x0022 (64-bit cap: data at cap+0x0C)
+        SetByte(buf, 0, 34)    // 0x22
+        SetByte(buf, 1, 0)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 172, 0, 0, 0)
+        SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+
+        // 4) COMMAND |= DisINTx (bit 10): 0x0007 -> 0x0407 (working-boot value)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        SystemCall(GPUSys.SYS_READ, fd, buf, 2, 0, 0)
+        SetByte(buf, 1, BitwiseOr(GetByte(buf, 1), 4))   // hi byte bit 2 = bit 10
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+
+        // 5) MSI ctrl @0xa2 = 0x0081 (Enable=1, 64-bit; Count=1)
+        SetByte(buf, 0, 129)   // 0x81
+        SetByte(buf, 1, 0)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 162, 0, 0, 0)
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+        IfCondition LessThan(nw, 2) ThenBlock: {
+            PrintMessage("[§39] MSI ctrl write failed\n")
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+            Deallocate(buf, 8)
+            ReturnValue(0)
+        }
+
+        // Verify: re-read ctrl + COMMAND
+        SystemCall(GPUSys.SYS_LSEEK, fd, 162, 0, 0, 0)
+        SystemCall(GPUSys.SYS_READ, fd, buf, 2, 0, 0)
+        ctrl_after = Add(GetByte(buf, 0), Multiply(GetByte(buf, 1), 256))
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        SystemCall(GPUSys.SYS_READ, fd, buf, 2, 0, 0)
+        cmd_after = Add(GetByte(buf, 0), Multiply(GetByte(buf, 1), 256))
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        Deallocate(buf, 8)
+
+        PrintMessage("[§39] MSI ctrl after: 0x")
+        PrintHex(ctrl_after)
+        PrintMessage("  COMMAND: 0x")
+        PrintHex(cmd_after)
+        PrintMessage(" (want ctrl 0x81, COMMAND 0x407)\n")
+        IfCondition NotEqual(BitwiseAnd(ctrl_after, 1), 1) ThenBlock: {
+            PrintMessage("[§39] MSI enable bit did not stick\n")
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_SaveConfig — save 64 bytes of PCI config space before a reset
+// Must be called BEFORE any SBR/FLR so BARs can be restored after.
+// Equivalent to pci_save_state().
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.GPU_BAR_SaveConfig {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        GPU_BAR_Init()
+
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Allocate save buffer if not already done
+        cfg_ptr = Dereference(Add(state, GPUBarField.SAVED_CFG))
+        IfCondition EqualTo(cfg_ptr, 0) ThenBlock: {
+            cfg_ptr = Allocate(64)
+            MemorySet(cfg_ptr, 0, 64)
+            StoreValue(Add(state, GPUBarField.SAVED_CFG), cfg_ptr)
+        }
+
+        // Open PCI config space
+        path = GPU_BAR_BuildResPath(index, "config")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] SaveConfig: cannot open config\n")
+            ReturnValue(0)
+        }
+
+        // Read 64 bytes from offset 0
+        SystemCall(GPUSys.SYS_LSEEK, fd, 0, 0, 0, 0)
+        nr = SystemCall(GPUSys.SYS_READ, fd, cfg_ptr, 64, 0, 0)
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        IfCondition LessThan(nr, 64) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] SaveConfig: short read (")
+            PrintNumber(nr)
+            PrintMessage(" bytes)\n")
+            ReturnValue(0)
+        }
+
+        StoreValue(Add(state, GPUBarField.HAS_SAVED_CFG), 1)
+
+        // Print what we saved for verification
+        PrintMessage("[AMDGPU BAR] PCI config saved for GPU ")
+        PrintNumber(index)
+        PrintMessage("\n")
+
+        // Show BAR values
+        b0 = GetByte(cfg_ptr, 16)
+        b1 = GetByte(cfg_ptr, 17)
+        b2 = GetByte(cfg_ptr, 18)
+        b3 = GetByte(cfg_ptr, 19)
+        bar0 = BitwiseOr(BitwiseOr(b0, LeftShift(b1, 8)), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24)))
+        PrintMessage("  BAR0: 0x")
+        PrintHex(bar0)
+        PrintMessage("\n")
+
+        b0 = GetByte(cfg_ptr, 24)
+        b1 = GetByte(cfg_ptr, 25)
+        b2 = GetByte(cfg_ptr, 26)
+        b3 = GetByte(cfg_ptr, 27)
+        bar2 = BitwiseOr(BitwiseOr(b0, LeftShift(b1, 8)), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24)))
+        PrintMessage("  BAR2: 0x")
+        PrintHex(bar2)
+        PrintMessage("\n")
+
+        b0 = GetByte(cfg_ptr, 32)
+        b1 = GetByte(cfg_ptr, 33)
+        b2 = GetByte(cfg_ptr, 34)
+        b3 = GetByte(cfg_ptr, 35)
+        bar4 = BitwiseOr(BitwiseOr(b0, LeftShift(b1, 8)), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24)))
+        PrintMessage("  BAR4: 0x")
+        PrintHex(bar4)
+        PrintMessage("\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_RestoreConfig — restore PCI config space after a reset
+// Writes back BARs, Expansion ROM BAR, COMMAND, and Interrupt Line
+// from previously saved config. Equivalent to pci_restore_state().
+// Must disable COMMAND decoding before writing BARs, re-enable after.
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.GPU_BAR_RestoreConfig {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Must have saved config
+        IfCondition NotEqual(Dereference(Add(state, GPUBarField.HAS_SAVED_CFG)), 1) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] RestoreConfig: no saved config for GPU ")
+            PrintNumber(index)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        cfg_ptr = Dereference(Add(state, GPUBarField.SAVED_CFG))
+
+        // Open PCI config space for writing
+        path = GPU_BAR_BuildResPath(index, "config")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDWR, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] RestoreConfig: cannot open config for write\n")
+            ReturnValue(0)
+        }
+
+        // Step 1: Disable Memory Space + Bus Master in COMMAND (offset 0x04)
+        //         This prevents the GPU from decoding while we change BARs.
+        buf = Allocate(8)
+        MemorySet(buf, 0, 8)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+
+        // Step 2: Restore BARs (offsets 0x10 - 0x27 = 24 bytes, 6 DWORDs)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 16, 0, 0, 0)
+        bar_src = Add(cfg_ptr, 16)
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, bar_src, 24, 0, 0)
+        IfCondition LessThan(nw, 24) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] RestoreConfig: BAR write short (")
+            PrintNumber(nw)
+            PrintMessage(" bytes)\n")
+        }
+
+        // Step 3: Restore Expansion ROM BAR (offset 0x30, 4 bytes)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 48, 0, 0, 0)
+        rom_src = Add(cfg_ptr, 48)
+        SystemCall(GPUSys.SYS_WRITE, fd, rom_src, 4, 0, 0)
+
+        // Step 4: Restore Interrupt Line (offset 0x3C, 1 byte)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 60, 0, 0, 0)
+        intline_src = Add(cfg_ptr, 60)
+        SystemCall(GPUSys.SYS_WRITE, fd, intline_src, 1, 0, 0)
+
+        // Step 5: Restore Cache Line Size (offset 0x0C, 1 byte)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 12, 0, 0, 0)
+        cls_src = Add(cfg_ptr, 12)
+        SystemCall(GPUSys.SYS_WRITE, fd, cls_src, 1, 0, 0)
+
+        // Step 6: Restore COMMAND register (offset 0x04) — re-enables decoding
+        cmd_src = Add(cfg_ptr, 4)
+        SystemCall(GPUSys.SYS_LSEEK, fd, 4, 0, 0, 0)
+        SystemCall(GPUSys.SYS_WRITE, fd, cmd_src, 2, 0, 0)
+
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        Deallocate(buf, 8)
+
+        // Verify: re-read BARs
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_RDONLY, 0)
+        IfCondition GreaterEqual(fd, 0) ThenBlock: {
+            vbuf = Allocate(64)
+            SystemCall(GPUSys.SYS_LSEEK, fd, 0, 0, 0, 0)
+            SystemCall(GPUSys.SYS_READ, fd, vbuf, 64, 0, 0)
+            SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+            PrintMessage("[AMDGPU BAR] Config restored for GPU ")
+            PrintNumber(index)
+            PrintMessage("\n")
+
+            b0 = GetByte(vbuf, 16)
+            b1 = GetByte(vbuf, 17)
+            b2 = GetByte(vbuf, 18)
+            b3 = GetByte(vbuf, 19)
+            bar0 = BitwiseOr(BitwiseOr(b0, LeftShift(b1, 8)), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24)))
+            PrintMessage("  BAR0: 0x")
+            PrintHex(bar0)
+
+            // Check if BAR0 was restored correctly
+            s0 = GetByte(cfg_ptr, 16)
+            s1 = GetByte(cfg_ptr, 17)
+            s2 = GetByte(cfg_ptr, 18)
+            s3 = GetByte(cfg_ptr, 19)
+            saved_bar0 = BitwiseOr(BitwiseOr(s0, LeftShift(s1, 8)), BitwiseOr(LeftShift(s2, 16), LeftShift(s3, 24)))
+            IfCondition EqualTo(bar0, saved_bar0) ThenBlock: {
+                PrintMessage(" OK\n")
+            }
+            ElseBlock: {
+                PrintMessage(" MISMATCH (expected 0x")
+                PrintHex(saved_bar0)
+                PrintMessage(")\n")
+            }
+
+            b0 = GetByte(vbuf, 24)
+            b1 = GetByte(vbuf, 25)
+            b2 = GetByte(vbuf, 26)
+            b3 = GetByte(vbuf, 27)
+            bar2 = BitwiseOr(BitwiseOr(b0, LeftShift(b1, 8)), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24)))
+            PrintMessage("  BAR2: 0x")
+            PrintHex(bar2)
+            PrintMessage("\n")
+
+            // COMMAND
+            c0 = GetByte(vbuf, 4)
+            c1 = GetByte(vbuf, 5)
+            cmd = BitwiseOr(c0, LeftShift(c1, 8))
+            PrintMessage("  CMD:  0x")
+            PrintHex(cmd)
+            PrintMessage("\n")
+
+            Deallocate(vbuf, 64)
+        }
+
+        // Clear the enabled flag so GPU_BAR_Enable will re-verify
+        StoreValue(Add(state, GPUBarField.ENABLED), 0)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_Reset — PCI Function Level Reset via sysfs reset file
+// Writes "1" to /sys/bus/pci/devices/.../reset to restore VBIOS POST state.
+// Must be called BEFORE mapping BARs (unmaps first if already mapped).
+// Returns 1 on success, 0 on failure, -1 if reset file not accessible.
+// =============================================================================
+Function.GPU_BAR_Reset {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        // LOCKOUT: refuse to reset the display GPU
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(index), 1) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] LOCKOUT: refusing to reset display GPU (bus 01)\n")
+            ReturnValue(0)
+        }
+
+        GPU_BAR_Init()
+
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        // Save PCI config BEFORE reset — BARs will be wiped
+        GPU_BAR_SaveConfig(index)
+
+        // Unmap BARs — the reset invalidates any existing mappings
+        mmio_ptr = Dereference(Add(state, GPUBarField.MMIO_PTR))
+        IfCondition NotEqual(mmio_ptr, 0) ThenBlock: {
+            GPU_BAR_Unmap(index)
+        }
+
+        // Clear enabled flag — reset may disable Memory Space
+        StoreValue(Add(state, GPUBarField.ENABLED), 0)
+
+        // Open /sys/bus/pci/devices/0000:BB:SS.F/reset
+        path = GPU_BAR_BuildResPath(index, "reset")
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+
+        fd = SystemCall(GPUSys.SYS_OPEN, path, GPUSys.O_WRONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] Cannot open reset file for GPU ")
+            PrintNumber(index)
+            PrintMessage(" (fd=")
+            PrintNumber(fd)
+            PrintMessage(")\n")
+            ReturnValue(-1)
+        }
+
+        // Write "1\n" to trigger FLR
+        buf = Allocate(8)
+        SetByte(buf, 0, 49)  // '1'
+        SetByte(buf, 1, 10)  // '\n'
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, buf, 2, 0, 0)
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+        Deallocate(buf, 8)
+
+        IfCondition LessEqual(nw, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] PCI FLR write failed for GPU ")
+            PrintNumber(index)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[AMDGPU BAR] PCI FLR complete for GPU ")
+        PrintNumber(index)
+        PrintMessage("\n")
+
+        // Wait ~100ms for reset to settle (nanosleep)
+        ts = Allocate(16)
+        StoreValue(ts, 0)
+        StoreValue(Add(ts, 8), 100000000)
+        SystemCall(35, ts, 0, 0, 0, 0, 0)
+        Deallocate(ts, 16)
+
+        // Restore PCI config — this puts BARs and COMMAND back
+        GPU_BAR_RestoreConfig(index)
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_BridgeReset — Reset GPU via PCI bridge subordinate reset
+// Auto-discovers the parent bridge by scanning bus 0 root ports, reading
+// PCI config header type (offset 0x0E) and secondary bus number (offset 0x19)
+// to find the bridge whose secondary bus matches the target GPU.
+// Writes "1" to the bridge's reset_subordinate sysfs file.
+// After reset, restores PCI config, re-enables device, and re-maps MMIO.
+// Returns 1 on success, 0 on failure.
+// =============================================================================
+Function.GPU_BAR_BridgeReset {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        // LOCKOUT: refuse to reset the display GPU
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(index), 1) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] LOCKOUT: refusing bridge reset on display GPU\n")
+            ReturnValue(0)
+        }
+
+        GPU_BAR_Init()
+        dev = GPU_GetDevice(index)
+        IfCondition EqualTo(dev, 0) ThenBlock: { ReturnValue(0) }
+        target_bus = Dereference(Add(dev, GPUDevField.PCI_BUS))
+
+        PrintMessage("[AMDGPU BAR] Bridge reset: finding bridge for bus ")
+        PrintNumber(target_bus)
+        PrintMessage("\n")
+
+        // Save PCI config before reset — BARs and COMMAND will be wiped
+        GPU_BAR_SaveConfig(index)
+
+        // Unmap BARs — reset invalidates existing mappings
+        state = GPU_BAR_GetState(index)
+        IfCondition NotEqual(Dereference(Add(state, GPUBarField.MMIO_PTR)), 0) ThenBlock: {
+            GPU_BAR_Unmap(index)
+        }
+        StoreValue(Add(state, GPUBarField.ENABLED), 0)
+
+        // --- Scan bus 0 for the parent bridge ---
+        // Build path template: /sys/bus/pci/devices/0000:00:SS.F/<suffix>
+        // Positions: 0-28 = prefix, 29-30 = slot hex, 31 = '.', 32 = func, 33 = '/'
+        bpath = Allocate(64)
+        rdbuf = Allocate(4)
+
+        pfx = "/sys/bus/pci/devices/0000:00:"
+        pi = 0
+        WhileLoop NotEqual(GetByte(pfx, pi), 0) {
+            SetByte(bpath, pi, GetByte(pfx, pi))
+            pi = Add(pi, 1)
+        }
+
+        found = 0
+        ss = 0
+        WhileLoop LessThan(ss, 32) {
+            sf = 0
+            WhileLoop LessThan(sf, 8) {
+                // Slot → 2 hex digits at positions 29-30
+                shi = Divide(ss, 16)
+                slo = Modulo(ss, 16)
+                IfCondition LessThan(shi, 10) ThenBlock: { SetByte(bpath, 29, Add(48, shi)) }
+                ElseBlock: { SetByte(bpath, 29, Add(87, shi)) }
+                IfCondition LessThan(slo, 10) ThenBlock: { SetByte(bpath, 30, Add(48, slo)) }
+                ElseBlock: { SetByte(bpath, 30, Add(87, slo)) }
+                SetByte(bpath, 31, 46)
+                SetByte(bpath, 32, Add(48, sf))
+                SetByte(bpath, 33, 47)
+
+                // Append "config\0" at position 34
+                cfgs = "config"
+                ci = 0
+                WhileLoop NotEqual(GetByte(cfgs, ci), 0) {
+                    SetByte(bpath, Add(34, ci), GetByte(cfgs, ci))
+                    ci = Add(ci, 1)
+                }
+                SetByte(bpath, Add(34, ci), 0)
+
+                fd = SystemCall(GPUSys.SYS_OPEN, bpath, GPUSys.O_RDONLY, 0)
+                IfCondition GreaterEqual(fd, 0) ThenBlock: {
+                    // Read header type at config offset 0x0E (1 byte)
+                    SystemCall(GPUSys.SYS_LSEEK, fd, 14, 0, 0, 0)
+                    SystemCall(GPUSys.SYS_READ, fd, rdbuf, 1, 0, 0)
+                    htype = BitwiseAnd(GetByte(rdbuf, 0), 127)
+
+                    IfCondition EqualTo(htype, 1) ThenBlock: {
+                        // PCI-to-PCI bridge — read secondary bus at config offset 0x19
+                        SystemCall(GPUSys.SYS_LSEEK, fd, 25, 0, 0, 0)
+                        SystemCall(GPUSys.SYS_READ, fd, rdbuf, 1, 0, 0)
+                        sec_bus = GetByte(rdbuf, 0)
+                        IfCondition EqualTo(sec_bus, target_bus) ThenBlock: {
+                            found = 1
+                        }
+                    }
+                    SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+                }
+
+                IfCondition EqualTo(found, 1) ThenBlock: { sf = 8 }
+                ElseBlock: { sf = Add(sf, 1) }
+            }
+            IfCondition EqualTo(found, 1) ThenBlock: { ss = 32 }
+            ElseBlock: { ss = Add(ss, 1) }
+        }
+
+        IfCondition EqualTo(found, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] No bridge found for bus ")
+            PrintNumber(target_bus)
+            PrintMessage("\n")
+            Deallocate(rdbuf, 4)
+            Deallocate(bpath, 64)
+            ReturnValue(0)
+        }
+
+        PrintMessage("[AMDGPU BAR] Found parent bridge, triggering subordinate reset\n")
+
+        // Replace suffix with "reset_subordinate\0" — bpath still has correct BDF
+        rsts = "reset_subordinate"
+        ri = 0
+        WhileLoop NotEqual(GetByte(rsts, ri), 0) {
+            SetByte(bpath, Add(34, ri), GetByte(rsts, ri))
+            ri = Add(ri, 1)
+        }
+        SetByte(bpath, Add(34, ri), 0)
+
+        fd = SystemCall(GPUSys.SYS_OPEN, bpath, GPUSys.O_WRONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] Cannot open reset_subordinate (fd=")
+            PrintNumber(fd)
+            PrintMessage(")\n")
+            Deallocate(rdbuf, 4)
+            Deallocate(bpath, 64)
+            ReturnValue(0)
+        }
+
+        SetByte(rdbuf, 0, 49)
+        SetByte(rdbuf, 1, 10)
+        nw = SystemCall(GPUSys.SYS_WRITE, fd, rdbuf, 2, 0, 0)
+        SystemCall(GPUSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        Deallocate(rdbuf, 4)
+        Deallocate(bpath, 64)
+
+        IfCondition LessEqual(nw, 0) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] reset_subordinate write failed\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[AMDGPU BAR] Subordinate bus reset complete\n")
+
+        // Wait 200ms for reset to settle
+        ts = Allocate(16)
+        StoreValue(ts, 0)
+        StoreValue(Add(ts, 8), 200000000)
+        SystemCall(35, ts, 0, 0, 0, 0, 0)
+        Deallocate(ts, 16)
+
+        // Restore PCI config — puts BARs and COMMAND back
+        GPU_BAR_RestoreConfig(index)
+
+        // Re-enable PCI memory space
+        GPU_BAR_Enable(index)
+
+        // Re-map MMIO
+        rc = GPU_BAR_MapMMIO(index)
+        IfCondition EqualTo(rc, 1) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] Bridge reset recovery complete — GPU ready\n")
+        }
+        ElseBlock: {
+            PrintMessage("[AMDGPU BAR] Bridge reset done but MMIO remap failed\n")
+        }
+
+        ReturnValue(rc)
+    }
+}
+
+// =============================================================================
 // GPU_BAR_MapMMIO — mmap the MMIO register BAR (BAR2) for a GPU
 // Returns 1 on success, 0 on failure.
 // =============================================================================
@@ -163,6 +934,15 @@ Function.GPU_BAR_MapMMIO {
     Input: index: Integer
     Output: Integer
     Body: {
+        // LOCKOUT: refuse to map the display GPU (unless allow_display is set)
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(index), 1) ThenBlock: {
+            IfCondition EqualTo(GPUBarLockout.allow_display, 0) ThenBlock: {
+                PrintMessage("[AMDGPU BAR] LOCKOUT: refusing to map MMIO for display GPU (bus 01)\n")
+                ReturnValue(0)
+            }
+            PrintMessage("[AMDGPU BAR] WARNING: mapping MMIO for display GPU (lockout overridden)\n")
+        }
+
         GPU_BAR_Init()
 
         state = GPU_BAR_GetState(index)
@@ -172,6 +952,9 @@ Function.GPU_BAR_MapMMIO {
         IfCondition NotEqual(Dereference(Add(state, GPUBarField.MMIO_PTR)), 0) ThenBlock: {
             ReturnValue(1)
         }
+
+        // Enable PCI device before mapping BARs
+        GPU_BAR_Enable(index)
 
         // Get BAR2 size from device entry
         dev = GPU_GetDevice(index)
@@ -227,6 +1010,15 @@ Function.GPU_BAR_MapVRAM {
     Input: index: Integer
     Output: Integer
     Body: {
+        // LOCKOUT: refuse to map the display GPU (unless allow_display is set)
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(index), 1) ThenBlock: {
+            IfCondition EqualTo(GPUBarLockout.allow_display, 0) ThenBlock: {
+                PrintMessage("[AMDGPU BAR] LOCKOUT: refusing to map VRAM for display GPU (bus 01)\n")
+                ReturnValue(0)
+            }
+            PrintMessage("[AMDGPU BAR] WARNING: mapping VRAM for display GPU (lockout overridden)\n")
+        }
+
         GPU_BAR_Init()
 
         state = GPU_BAR_GetState(index)
@@ -245,11 +1037,15 @@ Function.GPU_BAR_MapVRAM {
             ReturnValue(0)
         }
 
-        // Build path to resource0
+        // Build path to resource0 with O_SYNC (UC mapping).
+        // WC mapping (resource0_wc) hangs the PCI bus on this RD990 chipset
+        // during reads — even 90MB of WC reads stalls the system for 5+ seconds.
+        // UC is safe for reads and writes.  The kernel uses ioremap_wc() but it
+        // runs in kernel space with different PCI config; userspace resource0_wc
+        // is not viable on this platform.
         path = GPU_BAR_BuildResPath(index, "resource0")
         IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
 
-        // Open with O_RDWR | O_SYNC
         flags = Add(GPUSys.O_RDWR, GPUSys.O_SYNC)
         fd = SystemCall(GPUSys.SYS_OPEN, path, flags, 0)
         IfCondition LessThan(fd, 0) ThenBlock: {
@@ -276,6 +1072,59 @@ Function.GPU_BAR_MapVRAM {
         PrintMessage("[AMDGPU BAR] VRAM mapped: ")
         PrintNumber(Divide(bar0_size, 1048576))
         PrintMessage("MB\n")
+
+        // ---------------------------------------------------------------
+        // PAGE-FAULT PRIMING — read one DWORD per 4KB page.
+        //
+        // On non-BIOS-posted GPUs the first CPU *write* to a demand-paged
+        // BAR0 page is silently lost: the kernel page-fault handler
+        // installs the PTE but does not replay the triggering store.
+        // A dummy *read* on each page forces the PTE into existence so
+        // that every subsequent write (MemorySet, MemoryCopy, StoreValue)
+        // lands in VRAM correctly.  This is harmless on GPUs where the
+        // write path already works (e.g. BIOS-posted bus-1 card).
+        // ---------------------------------------------------------------
+        PrintMessage("[AMDGPU BAR] Priming BAR0 pages (")
+        PrintNumber(Divide(bar0_size, 4096))
+        PrintMessage(" pages)...\n")
+        _prime_off = 0
+        WhileLoop LessThan(_prime_off, bar0_size) {
+            _prime_discard = Dereference(Add(ptr, _prime_off), "dword")
+            _prime_off = Add(_prime_off, 4096)
+        }
+        PrintMessage("[AMDGPU BAR] BAR0 page priming complete\n")
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// GPU_BAR_PrimeVRAM — re-prime BAR0 page table entries
+//
+// Must be called after any operation that toggles BIF_FB_EN (e.g., soft reset).
+// BIF_FB_EN=0→3 invalidates the GPU's bus interface state, and the kernel's
+// page fault handler may have cached PTEs that no longer replay writes.
+// A dummy read per 4KB page forces fresh PTEs so subsequent writes land.
+// =============================================================================
+Function.GPU_BAR_PrimeVRAM {
+    Input: index: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+
+        vram_ptr = Dereference(Add(state, GPUBarField.VRAM_PTR))
+        vram_size = Dereference(Add(state, GPUBarField.VRAM_SIZE))
+        IfCondition EqualTo(vram_ptr, 0) ThenBlock: { ReturnValue(0) }
+
+        PrintMessage("[AMDGPU BAR] Re-priming BAR0 pages (")
+        PrintNumber(Divide(vram_size, 4096))
+        PrintMessage(" pages)...\n")
+        _prime_off = 0
+        WhileLoop LessThan(_prime_off, vram_size) {
+            _prime_discard = Dereference(Add(vram_ptr, _prime_off), "dword")
+            _prime_off = Add(_prime_off, 4096)
+        }
+        PrintMessage("[AMDGPU BAR] BAR0 re-priming complete\n")
         ReturnValue(1)
     }
 }
@@ -329,6 +1178,16 @@ Function.GPU_Rd32 {
 }
 
 // =============================================================================
+// MMIO TRACE — log every GPU_Wr32 in kernel mmiotrace format
+// Set GPUBarTrace.enabled = 1 before init to capture all writes.
+// Output: "WR 0xOFFSET = 0xVALUE" one per line to stdout.
+// =============================================================================
+FixedPool.GPUBarTrace {
+    "enabled":   Initialize=1, CanChange=True   // 1 = trace on, 0 = trace off
+    "seq":       Initialize=0, CanChange=True   // sequence counter
+}
+
+// =============================================================================
 // GPU_Wr32 — write a 32-bit MMIO register
 // =============================================================================
 Function.GPU_Wr32 {
@@ -340,6 +1199,19 @@ Function.GPU_Wr32 {
         IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
         mmio = Dereference(Add(state, GPUBarField.MMIO_PTR))
         IfCondition EqualTo(mmio, 0) ThenBlock: { ReturnValue(0) }
+
+        // MMIO trace logging
+        IfCondition EqualTo(GPUBarTrace.enabled, 1) ThenBlock: {
+            GPUBarTrace.seq = Add(GPUBarTrace.seq, 1)
+            PrintMessage("MMIO_WR ")
+            PrintNumber(GPUBarTrace.seq)
+            PrintMessage(" 0x")
+            PrintHex(offset)
+            PrintMessage(" 0x")
+            PrintHex(value)
+            PrintMessage("\n")
+        }
+
         // 32-bit aligned MMIO write — GPU registers require DWORD access.
         // StoreValue (64-bit) would clobber the adjacent register at offset+4.
         StoreValue(Add(mmio, offset), value, "dword")
@@ -381,6 +1253,22 @@ Function.GPU_VramWr32 {
     }
 }
 
+// GPU_VramWr64 — 64-bit VRAM write (mimics kernel writeq for PTEs)
+Function.GPU_VramWr64 {
+    Input: index: Integer
+    Input: offset: Integer
+    Input: value: Integer
+    Body: {
+        state = GPU_BAR_GetState(index)
+        IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
+        vram = Dereference(Add(state, GPUBarField.VRAM_PTR))
+        IfCondition EqualTo(vram, 0) ThenBlock: { ReturnValue(0) }
+        // 64-bit aligned VRAM write + WC drain (single store for PTEs, better for coherency)
+        StoreValue(Add(vram, offset), value, "qword")
+        InlineAsm["0f ae f8"]
+    }
+}
+
 // =============================================================================
 // GPU_BAR_Unbind — unbind the kernel driver from a GPU
 // Writes the PCI BDF to /sys/bus/pci/devices/.../driver/unbind
@@ -392,6 +1280,12 @@ Function.GPU_BAR_Unbind {
     Input: index: Integer
     Output: Integer
     Body: {
+        // LOCKOUT: refuse to unbind the display GPU
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(index), 1) ThenBlock: {
+            PrintMessage("[AMDGPU BAR] LOCKOUT: refusing to unbind display GPU (bus 01)\n")
+            ReturnValue(0)
+        }
+
         state = GPU_BAR_GetState(index)
         IfCondition EqualTo(state, 0) ThenBlock: { ReturnValue(0) }
 

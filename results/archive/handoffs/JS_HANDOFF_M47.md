@@ -1,0 +1,83 @@
+# JS Engine Handoff — M47
+
+**Branch:** `gpu-45-may-baseline-restore`  
+**Hard goal:** **90% full test262 / working JS engine, all features.**  
+**Checkpoints:** language ≥90%, OA/S each ≥90%, then full ≥90%.
+
+## Scores
+
+| Suite | M46 | **M47** | Δ | Need ~**90%** |
+|-------|----:|--------:|--:|-------------:|
+| **Object** | 72.5% | **72.5%** (2464/3411) | 0 | **~606** |
+| **Array** | 68.1% | **68.2%** (2083/3081) | **+4** | **~690** |
+| **String** | 62.2% | **62.2%** (759/1223) | 0 | **~342** |
+
+map **81.0%**, filter **81.8%**. Combined OA/S still ~69.1% aggregate — **gate is per-suite 90%**.
+
+## Goal change
+
+| | Old | **New** |
+|--|----:|--------:|
+| Object | ≥80% | **≥90%** |
+| Array | ≥80% | **≥90%** |
+| String | ≥80% | **≥90%** |
+| Full suite long | ~95% | ~95% |
+
+## What landed M47
+
+1. **Docs/scoreboard** retargeted to **90% each**  
+2. **ArraySpeciesCreate** (ES-correcter):
+   - non-object constructor → TypeError  
+   - **IsConstructor** (natives = CONSTRUCT allowlist only)  
+   - `@@species` undefined/null → ArrayCreate  
+   - built-in Array → empty CreateArray (ArrPush fill)  
+   - +create-species-non-ctor / create-species-undef
+
+## Distance to 90% each
+
+| Suite | Pass | Target 90% | Still need |
+|-------|-----:|-----------:|-----------:|
+| Object | 2464 | 3070 | **606** |
+| Array | 2083 | 2773 | **690** |
+| String | 759 | 1101 | **342** |
+
+## Next big levers
+
+1. **concat** (~25% — array-like rewrite like push)  
+2. **reduce** residual + **sort/splice**  
+3. **String** toLowerCase/indexOf residual + RegExp-free split  
+4. **Object** defineProperty redefine / toString tags  
+
+```bash
+python3 tools/js_midgate.py --rebuild --quick
+python3 tools/test262_runner.py --paths 'built-ins/Object,built-ins/Array,built-ins/String' -j 8
+```
+
+Prefer int. No Temporal/TA/fromAsync.
+
+---
+
+## Language pivot (post full M47)
+
+**Why full needle barely moves:** 1pp full ≈ 500 tests. M37→M47 was +174 (~0.35pp) while OA/S climbed; **language lost ~591** (net −740 regressed / +149 fixed).
+
+**Language M47:** 65.2% (15581/23899). Biggest residual:
+
+| Area | Pass% | Fails | Notes |
+|------|------:|------:|-------|
+| class (stmt+expr) | ~71% | ~2450 | **fn-name dstr** was ~492 of M37→M47 regressions |
+| for-await-of | 45% | 682 | async desert |
+| dynamic-import | 41% | 584 | module desert |
+| async-generator | 33% | 418 | async desert |
+| object expr | 68% | 375 | next after names |
+| for-of | 71% | 217 | iterable |
+| eval-code | 17–22% | ~270 | lower ROI |
+| arguments-object | 45% | 144 | solid ROI |
+
+**M48:** SetFunctionName path fixed (function.name define). Expect large class/dstr reclaim on next language slice / full.
+
+**Plan (updated):** **90% full engine, period.** Language first (names → class → object → for-of → arguments → async/modules) → OA/S 90% each → remaining built-ins → full 90%. See `JS-DEPENDENCY-PLAN.md`.
+
+### Why language regressed on built-ins (M37→M47)
+
+Built-in moles shared VM paths: `function.name` CanAssign fail (~492 class/dstr), CallFunc this-bind, PropTable, species, holes. Built-ins **+759**, language **−591**, full only **+174**. Reclaim language before more OA/S thrash.

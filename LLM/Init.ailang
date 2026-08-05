@@ -1,0 +1,434 @@
+// LLM/Init.ailang
+// Weight initialization: mmap model file, dequantize tensors into per-layer buffers.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+// =============================================================================
+// INIT CARRIER — working state for initialization loops
+// =============================================================================
+FixedPool.InitW {
+    "mmap_ptr":     Initialize=0, CanChange=True   // mmap'd file base address
+    "mmap_size":    Initialize=0, CanChange=True   // file size for mmap
+    "data_base":    Initialize=0, CanChange=True   // mmap_ptr + data_offset
+    "layer_idx":    Initialize=0, CanChange=True   // current layer loop counter
+    "layer_ptr":    Initialize=0, CanChange=True   // pointer to current layer entry
+    "tensor_entry": Initialize=0, CanChange=True   // GGUF_FindTensor result
+    "tensor_type":  Initialize=0, CanChange=True   // GGMLType of current tensor
+    "tensor_ne":    Initialize=0, CanChange=True   // total elements of current tensor
+    "tensor_off":   Initialize=0, CanChange=True   // data offset of current tensor
+    "weight_buf":   Initialize=0, CanChange=True   // allocated weight buffer
+    "field_off":    Initialize=0, CanChange=True   // LLMLayerField offset for current weight
+    "suffix_buf":   Initialize=0, CanChange=True   // scratch for building tensor name suffixes
+}
+
+// =============================================================================
+// LLM_MmapModel — mmap the GGUF file for tensor data access
+// Input: path (string), file_size (from stat or estimate)
+// Returns mmap pointer, or 0 on failure.
+// =============================================================================
+Function.LLM_MmapModel {
+    Input: path: Address
+    Output: Address
+    Body: {
+        // Open file for mmap
+        fd = SystemCall(LLMSys.SYS_OPEN, path, LLMSys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            PrintMessage("[Init] ERROR: cannot open model for mmap\n")
+            ReturnValue(0)
+        }
+
+        // Get file size via fstat (syscall 5)
+        // stat buffer: 144 bytes, size at offset 48
+        stat_buf = Allocate(152)
+        MemorySet(stat_buf, 0, 152)
+        SystemCall(5, fd, stat_buf, 0, 0, 0)
+        InitW.mmap_size = Dereference(Add(stat_buf, 48))
+        Deallocate(stat_buf, 152)
+
+        PrintMessage("[Init] File size: ")
+        PrintNumber(Divide(InitW.mmap_size, 1048576))
+        PrintMessage(" MB\n")
+
+        // mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0)
+        InitW.mmap_ptr = SystemCall(LLMSys.SYS_MMAP, 0, InitW.mmap_size, LLMSys.PROT_READ, LLMSys.MAP_PRIVATE, fd, 0)
+
+        // Close fd — mmap keeps the mapping alive
+        SystemCall(LLMSys.SYS_CLOSE, fd, 0, 0, 0, 0)
+
+        // Check for mmap failure (returns -errno on error, typically very large negative)
+        IfCondition LessThan(InitW.mmap_ptr, 4096) ThenBlock: {
+            PrintMessage("[Init] ERROR: mmap failed\n")
+            ReturnValue(0)
+        }
+
+        // Data region base = mmap base + data_offset from GGUF parse
+        InitW.data_base = Add(InitW.mmap_ptr, LLMConfig.data_offset)
+
+        PrintMessage("[Init] Model mmap'd at ")
+        PrintNumber(InitW.mmap_ptr)
+        PrintMessage(", data region at offset ")
+        PrintNumber(LLMConfig.data_offset)
+        PrintMessage("\n")
+
+        ReturnValue(InitW.mmap_ptr)
+    }
+}
+
+// =============================================================================
+// LLM_DequantOneTensor — find tensor by name, dequant into buffer
+// Sets up DequantW carrier and calls Quant_DequantTensor.
+// Returns allocated buffer pointer, or 0 on failure.
+// =============================================================================
+Function.LLM_DequantOneTensor {
+    Input: name: Address
+    Input: name_len: Integer
+    Output: Address
+    Body: {
+        InitW.tensor_entry = GGUF_FindTensor(name, name_len)
+        IfCondition EqualTo(InitW.tensor_entry, 0) ThenBlock: {
+            PrintMessage("[Init] WARNING: tensor not found: ")
+            PrintString(name)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        InitW.tensor_type = Dereference(Add(InitW.tensor_entry, TensorField.TYPE))
+        InitW.tensor_off  = Dereference(Add(InitW.tensor_entry, TensorField.DATA_OFFSET))
+        InitW.tensor_ne   = Multiply(
+            Dereference(Add(InitW.tensor_entry, TensorField.DIM0)),
+            Dereference(Add(InitW.tensor_entry, TensorField.DIM1))
+        )
+
+        // Allocate output: 8 bytes per element
+        InitW.weight_buf = Allocate(Multiply(InitW.tensor_ne, 8))
+        MemorySet(InitW.weight_buf, 0, Multiply(InitW.tensor_ne, 8))
+
+        // Set up dequant carrier
+        DequantW.src = Add(InitW.data_base, InitW.tensor_off)
+        DequantW.dst = InitW.weight_buf
+        DequantW.n_elements = InitW.tensor_ne
+        DequantW.precision = LLMMode.precision
+
+        Quant_DequantTensor(InitW.tensor_type)
+
+        ReturnValue(InitW.weight_buf)
+    }
+}
+
+// =============================================================================
+// LLM_InitWeights — allocate layer array and dequant all model tensors
+//
+// SmolLM2 / LLaMA tensor naming convention:
+//   token_embd.weight
+//   blk.{N}.attn_q.weight     → WQ
+//   blk.{N}.attn_k.weight     → WK
+//   blk.{N}.attn_v.weight     → WV
+//   blk.{N}.attn_output.weight → WO
+//   blk.{N}.ffn_gate.weight   → W_GATE
+//   blk.{N}.ffn_up.weight     → W_UP
+//   blk.{N}.ffn_down.weight   → W_DOWN
+//   blk.{N}.attn_norm.weight  → ATTN_NORM
+//   blk.{N}.ffn_norm.weight   → FFN_NORM
+//   output_norm.weight
+//   output.weight (may be tied to token_embd)
+// =============================================================================
+Function.LLM_InitWeights {
+    Output: Integer
+    Body: {
+        PrintMessage("[Init] Dequantizing weights (precision=")
+        PrintNumber(LLMMode.precision)
+        IfCondition EqualTo(LLMMode.precision, 0) ThenBlock: {
+            PrintMessage(" int32")
+        }
+        IfCondition EqualTo(LLMMode.precision, 1) ThenBlock: {
+            PrintMessage(" int64-Q20")
+        }
+        PrintMessage(")...\n")
+
+        // Allocate layer pointer array
+        LLMWeights.layers = Allocate(Multiply(LLMConfig.n_layers, LLMLayerConst.ENTRY_SIZE))
+        MemorySet(LLMWeights.layers, 0, Multiply(LLMConfig.n_layers, LLMLayerConst.ENTRY_SIZE))
+
+        // Allocate suffix scratch buffer (64 bytes)
+        InitW.suffix_buf = Allocate(64)
+
+        // ── Token embedding ──
+        PrintMessage("[Init]   token_embd.weight\n")
+        LLMWeights.tok_embd = LLM_DequantOneTensor("token_embd.weight", 17)
+
+        // ── Output norm ──
+        PrintMessage("[Init]   output_norm.weight\n")
+        LLMWeights.output_norm = LLM_DequantOneTensor("output_norm.weight", 18)
+
+        // ── Output projection (lm_head) ──
+        // Some models tie output.weight to token_embd.weight
+        PrintMessage("[Init]   output.weight\n")
+        LLMWeights.output = LLM_DequantOneTensor("output.weight", 13)
+        IfCondition EqualTo(LLMWeights.output, 0) ThenBlock: {
+            PrintMessage("[Init]   output.weight not found, using tied embeddings\n")
+            LLMWeights.output = LLMWeights.tok_embd
+        }
+
+        // ── Per-layer weights ──
+        InitW.layer_idx = 0
+        WhileLoop LessThan(InitW.layer_idx, LLMConfig.n_layers) {
+            InitW.layer_ptr = Add(LLMWeights.layers, Multiply(InitW.layer_idx, LLMLayerConst.ENTRY_SIZE))
+
+            // Build "blk.{N}.attn_q.weight" suffix etc.
+            // We use suffix matching so just search for the unique suffix
+
+            // attn_q — match by suffix ".attn_q.weight" within layer block
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "attn_q.weight", 13)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.WQ), InitW.weight_buf)
+
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "attn_k.weight", 13)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.WK), InitW.weight_buf)
+
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "attn_v.weight", 13)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.WV), InitW.weight_buf)
+
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "attn_output.weight", 18)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.WO), InitW.weight_buf)
+
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "ffn_gate.weight", 15)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.W_GATE), InitW.weight_buf)
+
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "ffn_up.weight", 13)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.W_UP), InitW.weight_buf)
+
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "ffn_down.weight", 15)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.W_DOWN), InitW.weight_buf)
+
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "attn_norm.weight", 16)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.ATTN_NORM), InitW.weight_buf)
+
+            InitW.weight_buf = LLM_FindLayerTensor(InitW.layer_idx, "ffn_norm.weight", 15)
+            StoreValue(Add(InitW.layer_ptr, LLMLayerField.FFN_NORM), InitW.weight_buf)
+
+            LLMWeights.n_loaded = Add(LLMWeights.n_loaded, 1)
+
+            IfCondition EqualTo(Modulo(InitW.layer_idx, 5), 0) ThenBlock: {
+                PrintMessage("[Init]   layer ")
+                PrintNumber(InitW.layer_idx)
+                PrintMessage("/")
+                PrintNumber(LLMConfig.n_layers)
+                PrintMessage(" dequantized\n")
+            }
+
+            InitW.layer_idx = Add(InitW.layer_idx, 1)
+        }
+
+        Deallocate(InitW.suffix_buf, 64)
+
+        PrintMessage("[Init] All ")
+        PrintNumber(LLMWeights.n_loaded)
+        PrintMessage(" layers dequantized.\n")
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_BuildLayerName — build "blk.{N}.{suffix}" in InitW.suffix_buf
+// Returns the total string length.
+// =============================================================================
+FixedPool.FindLayerW {
+    "idx":          Initialize=0, CanChange=True
+    "entry":        Initialize=0, CanChange=True
+    "name_ptr":     Initialize=0, CanChange=True
+    "pos":          Initialize=0, CanChange=True
+    "digit":        Initialize=0, CanChange=True
+    "copy_i":       Initialize=0, CanChange=True
+    "name_len":     Initialize=0, CanChange=True
+}
+
+Function.LLM_BuildLayerName {
+    Input: layer_num: Integer
+    Input: suffix: Address
+    Input: suffix_len: Integer
+    Output: Integer
+    Body: {
+        // Write "blk." prefix
+        SetByte(InitW.suffix_buf, 0, 98)    // 'b'
+        SetByte(InitW.suffix_buf, 1, 108)   // 'l'
+        SetByte(InitW.suffix_buf, 2, 107)   // 'k'
+        SetByte(InitW.suffix_buf, 3, 46)    // '.'
+
+        // Write layer number as decimal digits
+        FindLayerW.pos = 4
+        IfCondition GreaterEqual(layer_num, 10) ThenBlock: {
+            SetByte(InitW.suffix_buf, FindLayerW.pos, Add(48, Divide(layer_num, 10)))
+            FindLayerW.pos = Add(FindLayerW.pos, 1)
+        }
+        SetByte(InitW.suffix_buf, FindLayerW.pos, Add(48, Modulo(layer_num, 10)))
+        FindLayerW.pos = Add(FindLayerW.pos, 1)
+
+        // Write "."
+        SetByte(InitW.suffix_buf, FindLayerW.pos, 46)
+        FindLayerW.pos = Add(FindLayerW.pos, 1)
+
+        // Copy suffix
+        FindLayerW.copy_i = 0
+        WhileLoop LessThan(FindLayerW.copy_i, suffix_len) {
+            SetByte(InitW.suffix_buf, Add(FindLayerW.pos, FindLayerW.copy_i),
+                    GetByte(suffix, FindLayerW.copy_i))
+            FindLayerW.copy_i = Add(FindLayerW.copy_i, 1)
+        }
+
+        // Null terminate
+        FindLayerW.name_len = Add(FindLayerW.pos, suffix_len)
+        SetByte(InitW.suffix_buf, FindLayerW.name_len, 0)
+
+        ReturnValue(FindLayerW.name_len)
+    }
+}
+
+// =============================================================================
+// LLM_FindLayerTensor — find and dequant a per-layer tensor
+// Builds "blk.{N}.{suffix}", finds exact match in tensor directory,
+// dequantizes into new buffer.
+// Returns dequantized buffer pointer, or 0 if not found.
+// =============================================================================
+Function.LLM_FindLayerTensor {
+    Input: layer_num: Integer
+    Input: suffix: Address
+    Input: suffix_len: Integer
+    Output: Address
+    Body: {
+        // Build full tensor name "blk.N.suffix" in InitW.suffix_buf
+        FindLayerW.name_len = LLM_BuildLayerName(layer_num, suffix, suffix_len)
+
+        // Search tensor directory for exact match
+        FindLayerW.idx = 0
+        WhileLoop LessThan(FindLayerW.idx, TensorDir.count) {
+            FindLayerW.entry = Add(TensorDir.entries, Multiply(FindLayerW.idx, TensorDir.ENTRY_SIZE))
+            FindLayerW.name_ptr = Dereference(Add(FindLayerW.entry, TensorField.NAME_PTR))
+
+            IfCondition EqualTo(StringCompare(FindLayerW.name_ptr, InitW.suffix_buf), 0) ThenBlock: {
+                // Found — dequantize
+                InitW.tensor_entry = FindLayerW.entry
+                InitW.tensor_type = Dereference(Add(FindLayerW.entry, TensorField.TYPE))
+                InitW.tensor_off  = Dereference(Add(FindLayerW.entry, TensorField.DATA_OFFSET))
+                InitW.tensor_ne   = Multiply(
+                    Dereference(Add(FindLayerW.entry, TensorField.DIM0)),
+                    Dereference(Add(FindLayerW.entry, TensorField.DIM1))
+                )
+
+                InitW.weight_buf = Allocate(Multiply(InitW.tensor_ne, 8))
+                MemorySet(InitW.weight_buf, 0, Multiply(InitW.tensor_ne, 8))
+
+                DequantW.src = Add(InitW.data_base, InitW.tensor_off)
+                DequantW.dst = InitW.weight_buf
+                DequantW.n_elements = InitW.tensor_ne
+                DequantW.precision = LLMMode.precision
+                Quant_DequantTensor(InitW.tensor_type)
+
+                ReturnValue(InitW.weight_buf)
+            }
+
+            FindLayerW.idx = Add(FindLayerW.idx, 1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_AllocBuffers — allocate forward pass scratch buffers and KV cache
+// Must be called after LLM_InitWeights so LLMConfig is populated.
+// =============================================================================
+Function.LLM_AllocBuffers {
+    Output: Integer
+    Body: {
+        PrintMessage("[Init] Allocating forward pass buffers...\n")
+
+        // Per-token working vectors (d_model elements, 8 bytes each)
+        LLMBuf.x       = Allocate(Multiply(LLMConfig.d_model, 8))
+        LLMBuf.xb      = Allocate(Multiply(LLMConfig.d_model, 8))
+        LLMBuf.xb2     = Allocate(Multiply(LLMConfig.d_model, 8))
+        LLMBuf.q       = Allocate(Multiply(LLMConfig.d_model, 8))
+
+        // K and V are n_kv_heads * head_dim (GQA: fewer KV heads than Q heads)
+        LLMBuf.k       = Allocate(Multiply(Multiply(LLMConfig.n_kv_heads, LLMConfig.head_dim), 8))
+        LLMBuf.v       = Allocate(Multiply(Multiply(LLMConfig.n_kv_heads, LLMConfig.head_dim), 8))
+
+        // Attention scores: n_heads * max_seq (one score per position per head)
+        LLMBuf.att     = Allocate(Multiply(Multiply(LLMConfig.n_heads, LLMMode.max_seq), 8))
+
+        // FFN buffers (d_ff elements)
+        LLMBuf.ffn_gate = Allocate(Multiply(LLMConfig.d_ff, 8))
+        LLMBuf.ffn_up   = Allocate(Multiply(LLMConfig.d_ff, 8))
+        LLMBuf.ffn_down  = Allocate(Multiply(LLMConfig.d_model, 8))
+
+        // Logits (vocab_size elements)
+        LLMBuf.logits   = Allocate(Multiply(LLMConfig.vocab_size, 8))
+
+        // Zero all buffers
+        MemorySet(LLMBuf.x, 0, Multiply(LLMConfig.d_model, 8))
+        MemorySet(LLMBuf.xb, 0, Multiply(LLMConfig.d_model, 8))
+        MemorySet(LLMBuf.xb2, 0, Multiply(LLMConfig.d_model, 8))
+        MemorySet(LLMBuf.q, 0, Multiply(LLMConfig.d_model, 8))
+        MemorySet(LLMBuf.k, 0, Multiply(Multiply(LLMConfig.n_kv_heads, LLMConfig.head_dim), 8))
+        MemorySet(LLMBuf.v, 0, Multiply(Multiply(LLMConfig.n_kv_heads, LLMConfig.head_dim), 8))
+        MemorySet(LLMBuf.att, 0, Multiply(Multiply(LLMConfig.n_heads, LLMMode.max_seq), 8))
+        MemorySet(LLMBuf.ffn_gate, 0, Multiply(LLMConfig.d_ff, 8))
+        MemorySet(LLMBuf.ffn_up, 0, Multiply(LLMConfig.d_ff, 8))
+        MemorySet(LLMBuf.ffn_down, 0, Multiply(LLMConfig.d_model, 8))
+        MemorySet(LLMBuf.logits, 0, Multiply(LLMConfig.vocab_size, 8))
+
+        // KV Cache: [n_layers * max_seq * n_kv_heads * head_dim * 8]
+        // Key and Value each need this much space
+        InitW.tensor_ne = Multiply(Multiply(LLMConfig.n_layers, LLMMode.max_seq),
+                                   Multiply(LLMConfig.n_kv_heads, LLMConfig.head_dim))
+        KVCache.key   = Allocate(Multiply(InitW.tensor_ne, 8))
+        KVCache.value = Allocate(Multiply(InitW.tensor_ne, 8))
+        MemorySet(KVCache.key, 0, Multiply(InitW.tensor_ne, 8))
+        MemorySet(KVCache.value, 0, Multiply(InitW.tensor_ne, 8))
+        KVCache.pos = 0
+        KVCache.allocated = 1
+
+        PrintMessage("[Init] Buffers allocated:\n")
+        PrintMessage("[Init]   x, xb, xb2, q:  ")
+        PrintNumber(Multiply(LLMConfig.d_model, 8))
+        PrintMessage(" bytes each\n")
+        PrintMessage("[Init]   k, v:            ")
+        PrintNumber(Multiply(Multiply(LLMConfig.n_kv_heads, LLMConfig.head_dim), 8))
+        PrintMessage(" bytes each\n")
+        PrintMessage("[Init]   att:             ")
+        PrintNumber(Multiply(Multiply(LLMConfig.n_heads, LLMMode.max_seq), 8))
+        PrintMessage(" bytes\n")
+        PrintMessage("[Init]   KV cache:        ")
+        PrintNumber(Divide(Multiply(Multiply(InitW.tensor_ne, 8), 2), 1048576))
+        PrintMessage(" MB total\n")
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_PrintWeightSummary — print weight loading summary
+// =============================================================================
+Function.LLM_PrintWeightSummary {
+    Body: {
+        PrintMessage("[Init] Weight Summary:\n")
+        PrintMessage("[Init]   tok_embd:    ")
+        IfCondition NotEqual(LLMWeights.tok_embd, 0) ThenBlock: { PrintMessage("loaded") }
+        IfCondition EqualTo(LLMWeights.tok_embd, 0)  ThenBlock: { PrintMessage("MISSING") }
+        PrintMessage("\n")
+
+        PrintMessage("[Init]   output_norm: ")
+        IfCondition NotEqual(LLMWeights.output_norm, 0) ThenBlock: { PrintMessage("loaded") }
+        IfCondition EqualTo(LLMWeights.output_norm, 0)  ThenBlock: { PrintMessage("MISSING") }
+        PrintMessage("\n")
+
+        PrintMessage("[Init]   output:      ")
+        IfCondition NotEqual(LLMWeights.output, 0) ThenBlock: { PrintMessage("loaded") }
+        IfCondition EqualTo(LLMWeights.output, 0)  ThenBlock: { PrintMessage("MISSING") }
+        PrintMessage("\n")
+
+        PrintMessage("[Init]   layers:      ")
+        PrintNumber(LLMWeights.n_loaded)
+        PrintMessage("/")
+        PrintNumber(LLMConfig.n_layers)
+        PrintMessage(" loaded\n")
+    }
+}

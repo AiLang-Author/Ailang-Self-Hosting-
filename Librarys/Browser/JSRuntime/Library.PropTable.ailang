@@ -10,9 +10,14 @@
 // =============================================================================
 FixedPool.PropConst {
     "ENTRY_SIZE":      Initialize=16
-    "MAX_ENTRIES":     Initialize=32
-    "TABLE_SIZE":      Initialize=520
-    "MAX_TABLES":      Initialize=32768
+    // Was 32 → 64 (DOM wrappers). M43: Array.prototype installs ~32 methods
+    // + matching __a_* attr keys + __proto__/symbols → hit 64 hard, so
+    // Array.prototype.foo = … silently dropped (map inherited-index tests).
+    // 128 leaves headroom for builtins + user props on hot prototypes.
+    "MAX_ENTRIES":     Initialize=128
+    // 8-byte count header + 128 * 16-byte entries = 2056
+    "TABLE_SIZE":      Initialize=2056
+    "MAX_TABLES":      Initialize=65536
     "TOMBSTONE":       Initialize=-2
     "GLOBAL_SLOTS":    Initialize=2048
     "GLOBAL_SIZE":     Initialize=32768
@@ -75,18 +80,18 @@ Function.PropTable_Init {
 // OBJECT PROPERTY TABLE — ring buffer allocation
 // =============================================================================
 
-// Allocate a 264-byte property table for an object.
-// Returns address to the table (zeroed). Ring buffer wraps.
+// Allocate a 520-byte property table for an object.
+// Returns address to the table (zeroed), or 0 on exhaustion.
 Function.PropTable_Alloc {
     Output: Address
     Body: {
         idx = PropState.next_slot
+        IfCondition GreaterEqual(idx, PropConst.MAX_TABLES) ThenBlock: {
+            ReturnValue(0)
+        }
         addr = Add(PropState.slab, Multiply(idx, PropConst.TABLE_SIZE))
         MemorySet(addr, 0, PropConst.TABLE_SIZE)
         PropState.next_slot = Add(idx, 1)
-        IfCondition GreaterEqual(PropState.next_slot, PropConst.MAX_TABLES) ThenBlock: {
-            PropState.next_slot = 0
-        }
         ReturnValue(addr)
     }
 }
@@ -130,9 +135,8 @@ Function.PropTable_Lookup {
                     IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
                         ReturnValue(Dereference(Add(PropTmp.addr, 8)))
                     }
-                    // String compare fallback
-                    cmp = StringCompare(PropTmp.ekey, save_key)
-                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    // String compare fallback (M31a: JS UTF-16 or C keys)
+                    IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
                         ReturnValue(Dereference(Add(PropTmp.addr, 8)))
                     }
                     PropTmp.idx = Add(PropTmp.idx, 1)
@@ -184,8 +188,7 @@ Function.PropTable_Insert {
                         ReturnValue(0)
                     }
                     // String compare
-                    cmp = StringCompare(PropTmp.ekey, save_key)
-                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                    IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
                         StoreValue(Add(PropTmp.addr, 8), save_val)
                         ReturnValue(0)
                     }
@@ -262,8 +265,7 @@ Function.PropTable_Delete {
                         found = 1
                     }
                     IfCondition EqualTo(found, 0) ThenBlock: {
-                        cmp = StringCompare(PropTmp.ekey, save_key)
-                        IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
                             found = 1
                         }
                     }
@@ -318,19 +320,20 @@ Function.PropTable_Keys {
 // GLOBAL VARIABLE HASH — open-addressed, linear probing, 2048 slots
 // =============================================================================
 
-// DJB2 hash variant (h = h*31 + byte), mod 2048
+// DJB2 hash variant (h = h*31 + unit), mod 2048
+// M31d: code units so C keys and UTF-16 JS keys with same content hash equal
 Function.GlobalHash__Hash {
     Input: key: Address
     Output: Integer
     Body: {
         save_key = key
         h = 0
+        n = JSRT_StrLen(save_key)
         PropTmp.idx = 0
-        ch = GetByte(save_key, PropTmp.idx)
-        WhileLoop NotEqual(ch, 0) {
+        WhileLoop LessThan(PropTmp.idx, n) {
+            ch = JSRT_StrUnit(save_key, PropTmp.idx)
             h = Add(Multiply(h, 31), ch)
             PropTmp.idx = Add(PropTmp.idx, 1)
-            ch = GetByte(save_key, PropTmp.idx)
         }
         // Make positive
         IfCondition LessThan(h, 0) ThenBlock: {
@@ -362,16 +365,20 @@ Function.GlobalHash_Lookup {
             IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
                 ReturnValue(-1)
             }
-            // Pointer compare
-            IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
-                ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+            // Tombstone — keep probing
+            IfCondition EqualTo(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
+                PropTmp.idx = Add(PropTmp.idx, 1)
+            } ElseBlock: {
+                // Pointer compare
+                IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
+                    ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+                }
+                // String compare
+                IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
+                    ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+                }
+                PropTmp.idx = Add(PropTmp.idx, 1)
             }
-            // String compare
-            cmp = StringCompare(PropTmp.ekey, save_key)
-            IfCondition EqualTo(cmp, 0) ThenBlock: {
-                ReturnValue(Dereference(Add(PropTmp.addr, 8)))
-            }
-            PropTmp.idx = Add(PropTmp.idx, 1)
         }
         ReturnValue(-1)
     }
@@ -391,30 +398,85 @@ Function.GlobalHash_Insert {
         bucket = GlobalHash__Hash(save_key)
         // Linear probe
         PropTmp.idx = 0
+        tomb_addr = 0
         WhileLoop LessThan(PropTmp.idx, PropConst.GLOBAL_SLOTS) {
             slot_idx = BitwiseAnd(Add(bucket, PropTmp.idx), 2047)
             PropTmp.addr = Add(PropState.global_hash, Multiply(slot_idx, PropConst.ENTRY_SIZE))
             PropTmp.ekey = Dereference(PropTmp.addr)
-            // Empty slot — insert here
+            // Empty slot — insert here (or first tombstone)
             IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
-                StoreValue(PropTmp.addr, save_key)
-                StoreValue(Add(PropTmp.addr, 8), save_val)
+                IfCondition NotEqual(tomb_addr, 0) ThenBlock: {
+                    StoreValue(tomb_addr, save_key)
+                    StoreValue(Add(tomb_addr, 8), save_val)
+                } ElseBlock: {
+                    StoreValue(PropTmp.addr, save_key)
+                    StoreValue(Add(PropTmp.addr, 8), save_val)
+                }
                 ReturnValue(1)
             }
-            // Existing key — update value
-            IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
-                StoreValue(Add(PropTmp.addr, 8), save_val)
-                ReturnValue(0)
+            IfCondition EqualTo(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
+                IfCondition EqualTo(tomb_addr, 0) ThenBlock: {
+                    tomb_addr = PropTmp.addr
+                }
+                PropTmp.idx = Add(PropTmp.idx, 1)
+            } ElseBlock: {
+                // Existing key — update value
+                IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
+                    StoreValue(Add(PropTmp.addr, 8), save_val)
+                    ReturnValue(0)
+                }
+                IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
+                    StoreValue(Add(PropTmp.addr, 8), save_val)
+                    ReturnValue(0)
+                }
+                PropTmp.idx = Add(PropTmp.idx, 1)
             }
-            cmp = StringCompare(PropTmp.ekey, save_key)
-            IfCondition EqualTo(cmp, 0) ThenBlock: {
-                StoreValue(Add(PropTmp.addr, 8), save_val)
-                ReturnValue(0)
-            }
-            PropTmp.idx = Add(PropTmp.idx, 1)
         }
-        // Table full
+        // Table full — try tombstone
+        IfCondition NotEqual(tomb_addr, 0) ThenBlock: {
+            StoreValue(tomb_addr, save_key)
+            StoreValue(Add(tomb_addr, 8), save_val)
+            ReturnValue(1)
+        }
         ReturnValue(-1)
+    }
+}
+
+// M128e7aa: remove global binding (tombstone for linear probe)
+Function.GlobalHash_Delete {
+    Input: key: Address
+    Output: Integer
+    Body: {
+        save_key = key
+        IfCondition EqualTo(PropState.global_hash, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        bucket = GlobalHash__Hash(save_key)
+        PropTmp.idx = 0
+        WhileLoop LessThan(PropTmp.idx, PropConst.GLOBAL_SLOTS) {
+            slot_idx = BitwiseAnd(Add(bucket, PropTmp.idx), 2047)
+            PropTmp.addr = Add(PropState.global_hash, Multiply(slot_idx, PropConst.ENTRY_SIZE))
+            PropTmp.ekey = Dereference(PropTmp.addr)
+            IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
+                PropTmp.idx = Add(PropTmp.idx, 1)
+            } ElseBlock: {
+                hit = 0
+                IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: { hit = 1 }
+                IfCondition EqualTo(hit, 0) ThenBlock: {
+                    IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: { hit = 1 }
+                }
+                IfCondition EqualTo(hit, 1) ThenBlock: {
+                    StoreValue(PropTmp.addr, PropConst.TOMBSTONE)
+                    StoreValue(Add(PropTmp.addr, 8), 0)
+                    ReturnValue(1)
+                }
+                PropTmp.idx = Add(PropTmp.idx, 1)
+            }
+        }
+        ReturnValue(0)
     }
 }
 
@@ -437,8 +499,12 @@ Function.GlobalHash_Reset {
 
 // =============================================================================
 // ARRAY NAMED-PROPERTY SIDE TABLE
-// Maps array JSValue pointers to PropTable handles for named properties.
-// Linear scan — 256 entries max. Each: [arr_ptr(8) | ptable_ptr(8)]
+// Maps array *payloads* (XArray handles) to PropTable handles for named props.
+// Keyed by payload — NOT the JSValue wrapper pointer — because SetGlobal /
+// ObjSet copy the 16-byte JSValue into a new slot; the XArray payload is shared,
+// so named props (__proto__, etc.) must follow the payload or they vanish after
+// `var a = []` assignment and break `a instanceof Array`.
+// Linear scan — 256 entries max. Each: [payload(8) | ptable_ptr(8)]
 // =============================================================================
 
 // Look up the PropTable for an array. Returns PropTable address or 0 if none.
@@ -447,11 +513,19 @@ Function.ArrSide_Lookup {
     Output: Address
     Body: {
         save_arr = arr_ptr
+        IfCondition EqualTo(save_arr, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        // Key = XArray payload at JSValue+8
+        save_key = Dereference(Add(save_arr, 8))
+        IfCondition EqualTo(save_key, 0) ThenBlock: {
+            ReturnValue(0)
+        }
         as_i = 0
         WhileLoop LessThan(as_i, PropState.arr_side_count) {
             as_addr = Add(PropState.arr_side, Multiply(as_i, PropConst.ARR_SIDE_ENTRY))
-            as_key = Dereference(as_addr)
-            IfCondition EqualTo(as_key, save_arr) ThenBlock: {
+            as_ent = Dereference(as_addr)
+            IfCondition EqualTo(as_ent, save_key) ThenBlock: {
                 ReturnValue(Dereference(Add(as_addr, 8)))
             }
             as_i = Add(as_i, 1)
@@ -466,7 +540,14 @@ Function.ArrSide_GetOrCreate {
     Output: Address
     Body: {
         save_arr = arr_ptr
-        // Check if already exists
+        IfCondition EqualTo(save_arr, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        save_key = Dereference(Add(save_arr, 8))
+        IfCondition EqualTo(save_key, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        // Check if already exists (by payload)
         existing = ArrSide_Lookup(save_arr)
         IfCondition NotEqual(existing, 0) ThenBlock: {
             ReturnValue(existing)
@@ -478,7 +559,7 @@ Function.ArrSide_GetOrCreate {
             PropState.arr_side_count = 0
         }
         as_addr = Add(PropState.arr_side, Multiply(PropState.arr_side_count, PropConst.ARR_SIDE_ENTRY))
-        StoreValue(as_addr, save_arr)
+        StoreValue(as_addr, save_key)
         StoreValue(Add(as_addr, 8), pt)
         PropState.arr_side_count = Add(PropState.arr_side_count, 1)
         ReturnValue(pt)

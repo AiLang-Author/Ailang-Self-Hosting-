@@ -39,6 +39,7 @@ FixedPool.PM4 {
     "OP_SET_CONFIG_REG":    Initialize=104        // 0x68
     "OP_SET_CONTEXT_REG":   Initialize=105        // 0x69
     "OP_SURFACE_SYNC":      Initialize=67         // 0x43
+    "OP_PREAMBLE_CNTL":     Initialize=74         // 0x4A
     "OP_SET_SH_REG":        Initialize=118        // 0x76
 
     // SET_SH_REG base (DWORD offset subtracted from target register)
@@ -48,6 +49,13 @@ FixedPool.PM4 {
 
     // SHADER_TYPE bit for compute (bit 1 of header)
     "SHADER_TYPE_COMPUTE":  Initialize=2          // 1 << 1
+
+    // PREAMBLE_CNTL body values
+    "PREAMBLE_BEGIN_CLEAR_STATE": Initialize=536870912   // 2 << 28 = 0x20000000
+    "PREAMBLE_END_CLEAR_STATE":   Initialize=805306368   // 3 << 28 = 0x30000000
+
+    // SET_CONTEXT_REG base (DWORD offset subtracted from target register)
+    "CONTEXT_REG_BASE":     Initialize=40960      // 0xA000 (DWORD base = 0x28000 / 4)
 
     // SURFACE_SYNC cache invalidation flags (coher_cntl bits)
     "TCL1_ACTION_ENA":      Initialize=4194304    // 1 << 22
@@ -65,13 +73,17 @@ FixedPool.PM4 {
 FixedPool.RingConf {
     "RING_SIZE_DWORDS":     Initialize=16384      // 64KB ring = 16K DWORDs
     "RING_SIZE_BYTES":      Initialize=65536      // 64KB
-    "RING_LOG2":            Initialize=14         // log2(16384)
+    "RING_LOG2":            Initialize=13         // log2(65536/8) = log2(8192) = 13 (QW units)
     "RING_MASK":            Initialize=16383      // RING_SIZE_DWORDS - 1
-    "PAGE_LOG2":            Initialize=8          // log2(4096/8) = log2(512) ≈ 9, but AMD uses 8
+    "PAGE_LOG2":            Initialize=9          // log2(4096/8) = log2(512) = 9
     "RPTR_WB_OFFSET":       Initialize=65536      // Relative offset from ring start (= ring size bytes)
-    "VRAM_RING_OFFSET":     Initialize=67108864   // Ring starts at 64MB into VRAM (past any framebuffer)
+    "VRAM_RING_OFFSET":     Initialize=100663296  // Ring starts at 96MB into VRAM (past 90MB GART page table)
     "VRAM_TOTAL_ALLOC":     Initialize=69632      // 64KB ring + 4KB writeback area
     "MAX_RINGS":            Initialize=4          // We support up to 4 rings
+    // §44c bisect: 1 = rings + RPTR writeback live in VRAM (the pre-7800e83c
+    // working layout, CP fetch bypasses GART PTEs via the system aperture);
+    // 0 = GART-backed system RAM. IB/data/shader/CSB placement unaffected.
+    "RINGS_IN_VRAM":        Initialize=1
 }
 
 // =============================================================================
@@ -103,11 +115,14 @@ FixedPool.RingField {
     "WPTR":             Initialize=32
     "RPTR_WB_ADDR":     Initialize=40
     "INITIALIZED":      Initialize=48
+    "HOST_PTR":         Initialize=56    // host pointer to GART-backed ring buffer (0 = use VRAM)
     "PKT_BUF":          Initialize=64
     "PKT_POS":          Initialize=72
     "FENCE_VAL":        Initialize=80
     "FENCE_WB_OFF":     Initialize=88
     "HALTED":           Initialize=96
+    "GART_VA":          Initialize=104   // ring's GART VA byte address (for CP_RB*_BASE)
+    "WB_HOST_PTR":      Initialize=112   // host pointer to RPTR writeback location in GART WB page
     "ENTRY_SIZE":       Initialize=128
 }
 
@@ -115,6 +130,8 @@ FixedPool.PM4State {
     "rings":            Initialize=0, CanChange=True   // ptr to ring state array
     "initialized":      Initialize=0, CanChange=True
     "mc_fb_base":       Initialize=0, CanChange=True   // GPU MC address of VRAM start
+    "hdp_hpc_val":      Initialize=0, CanChange=True   // BIOS HDP_HOST_PATH_CNTL (for GPU-side read-cache invalidation)
+    "hdp_misc_val":     Initialize=0, CanChange=True   // BIOS HDP_MISC_CNTL (for GPU-side read-cache flush)
 }
 
 // =============================================================================
@@ -153,18 +170,27 @@ Function.PM4_GetRing {
 Function.PM4_HaltCP {
     Input: gpu: Integer
     Body: {
-        // Halt CE + PFP + ME
-        halt = Add(CPMEBits.CE_HALT, Add(CPMEBits.PFP_HALT, CPMEBits.ME_HALT))
-        GPU_Wr32(gpu, SIReg.CP_ME_CNTL, halt)
-
-        // Brief spin to let CP drain
-        i = 0
-        WhileLoop LessThan(i, 1000) {
-            scratch = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
-            i = Add(i, 1)
+        // DISPLAY GPU GUARD — never halt the CP on the display GPU.
+        // The display GPU's CP is actively used by the radeon driver for
+        // scanout and display engine operations.  Halting it can freeze
+        // or corrupt the VESA framebuffer.
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(gpu), 1) ThenBlock: {
+            PrintMessage("[PM4] HaltCP: REFUSED — display GPU\n")
         }
+        IfCondition EqualTo(GPU_BAR_IsDisplayGPU(gpu), 0) ThenBlock: {
+            // Halt CE + PFP + ME
+            halt = Add(CPMEBits.CE_HALT, Add(CPMEBits.PFP_HALT, CPMEBits.ME_HALT))
+            GPU_Wr32(gpu, SIReg.CP_ME_CNTL, halt)
 
-        //PrintMessage("[PM4] CP halted\n")
+            // Brief spin to let CP drain
+            i = 0
+            WhileLoop LessThan(i, 1000) {
+                scratch = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+                i = Add(i, 1)
+            }
+
+            //PrintMessage("[PM4] CP halted\n")
+        }
     }
 }
 
@@ -198,109 +224,260 @@ Function.PM4_InitMCBase {
         mc_base_units = BitwiseAnd(mc_raw, 65535)
         mc_top_units = BitwiseAnd(RightShift(mc_raw, 16), 65535)
         PM4State.mc_fb_base = LeftShift(mc_base_units, 24)
+
+        // --- HDP non-surface path setup (REVERTED) ---
+        // GPU_Wr32(gpu, SIReg.HDP_HOST_PATH_CNTL, 0)  <-- REMOVED: zeroing this
+        //   register destroys the BIOS-configured HDP routing.  The Linux kernel
+        //   does a read-modify-write on specific bits, never a blind zero.
+        //   Combined with WC BAR0 mapping, this deadlocked the PCI fabric
+        //   and hard-locked the system (Jun 16 2026).
+        // GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_BASE, ...)  <-- REMOVED: keep BIOS
+        //   defaults until we can do a proper read-modify-write sequence.
+        // GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_INFO, ...)
+        // GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_SIZE, ...)
+
+        // HDP snapshots REMOVED — no longer writing HDP regs from dispatch path.
+        // All HDP register writes (CPU or GPU-side) crash the RD990 PCI fabric.
+
+        PrintMessage("[PM4] mc_fb_base=0x")
+        PrintHex(PM4State.mc_fb_base)
+        PrintMessage("\n")
+
         //PrintMessage("[PM4] MC_VM_FB_LOCATION = 0x")
         //PrintHex(mc_raw)
         //PrintMessage("  VRAM GPU base = 0x")
         //PrintHex(PM4State.mc_fb_base)
         //PrintMessage("\n")
 
-        // --- VM setup: configure system aperture so compute shaders can access VRAM ---
-        // Without this, buffer loads/stores go through VM translation and fault.
-        // System aperture defines a GPU address range that bypasses VM page tables.
-        // Addresses are in 4KB pages (addr >> 12).
-        vram_start_page = RightShift(PM4State.mc_fb_base, 12)
-        vram_end_page = RightShift(LeftShift(mc_top_units, 24), 12)
+        // VM/TLB setup moved to PM4_ConfigureVM — must be called AFTER
+        // PM4_SoftResetCP, which wipes VM registers via GRBM/SRBM reset.
+    }
+}
 
-        // Debug: read current VM state
-        //PrintMessage("[PM4] VM_CONTEXT0_CNTL = 0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.VM_CONTEXT0_CNTL))
-        //PrintMessage("\n")
-        //PrintMessage("[PM4] SYSTEM_APERTURE: low=0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR))
-        //PrintMessage(" high=0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR))
-        //PrintMessage(" default=0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR))
-        //PrintMessage("\n")
+// =============================================================================
+// PM4_ConfigureVM — program VM/TLB registers and system aperture
+//
+// Matches kernel gmc_v6_0_mc_program() + gmc_v6_0_gart_enable() EXACTLY.
+// MUST be called AFTER PM4_SoftResetCP and MC_SI_GpuInit.
+//
+// Requires PM4_InitMCBase to have been called first (needs mc_fb_base).
+// =============================================================================
+Function.PM4_ConfigureVM {
+    Input: gpu: Integer
+    Body: {
+        // Re-read MC_VM_FB_LOCATION for aperture bounds
+        mc_raw = GPU_Rd32(gpu, SIReg.MC_VM_FB_LOCATION)
+        mc_base_units = BitwiseAnd(mc_raw, 65535)
+        mc_top_units = BitwiseAnd(RightShift(mc_raw, 16), 65535)
 
-        // Disable VM page table for VMID 0 — use physical addressing
-        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_CNTL, 0)
+        vram_start_page = RightShift(LeftShift(mc_base_units, 24), 12)
+        vram_end_page = Subtract(LeftShift(Add(mc_top_units, 1), 12), 1)
 
-        // --- MC_VM_MX_L1_TLB_CNTL — CRITICAL for compute buffer access ---
-        // This register controls how the L1 TLB routes GPU memory requests.
-        // Without this, the inherited kernel config may have ENABLE_L1_TLB +
-        // ENABLE_ADVANCED_DRIVER_MODEL set, which routes addresses outside the
-        // system aperture through VM page tables — and with VM_CONTEXT0_CNTL=0
-        // (no page table), those accesses silently fault, killing the wavefront.
-        //
-        // si_pcie_gart_disable() pattern from Linux radeon si.c:
-        //   SYSTEM_ACCESS_MODE_NOT_IN_SYS (3 << 3 = 0x18)
-        //     + SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU (1 << 5 = 0x20)
-        //   = 0x38
-        // L1 TLB disabled, no advanced driver model, aperture routing only.
-        //PrintMessage("[PM4] MC_VM_MX_L1_TLB_CNTL before=0x")
-        //PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL))
-        //PrintMessage("\n")
-        // bits: [4:3]=3 (NOT_IN_SYS), [5]=1 (UNMAPPED_ACCESS_PASS_THRU) = 0x38
-        GPU_Wr32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL, 56)
+        // =====================================================================
+        // PART A — gmc_v6_0_mc_program() / si_mc_program()
+        // =====================================================================
 
-        // --- VM L2 cache — disable to avoid stale cached translations ---
-        // si_pcie_gart_disable() pattern: L2 cache OFF, PTE/PDE0 LRU update on,
-        // queue size 7, context1 identity access mode 1.
-        // = ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE (1<<9)    = 512
-        //   + ENABLE_L2_PDE0_CACHE_LRU_UPDATE_BY_WRITE (1<<10) = 1024
-        //   + EFFECTIVE_L2_QUEUE_SIZE(7) = (7<<15)              = 229376
-        //   + CONTEXT1_IDENTITY_ACCESS_MODE(1) = (1<<19)        = 524288
-        //   Total = 755200
-        GPU_Wr32(gpu, SIReg.VM_L2_CNTL, 755200)
-        // L2_CNTL2: clear invalidation bits (no ongoing invalidation)
-        GPU_Wr32(gpu, SIReg.VM_L2_CNTL2, 0)
-        // L2_CNTL3: BIGK associativity + fragment size 0
-        // = L2_CACHE_BIGK_ASSOCIATIVITY (1 << 20) = 1048576
-        GPU_Wr32(gpu, SIReg.VM_L2_CNTL3, 1048576)
-
-        // --- Invalidate all TLB entries to clear stale kernel translations ---
-        GPU_Wr32(gpu, SIReg.VM_INVALIDATE_REQUEST, 1)
-        // Poll for invalidation to complete (bit 0 of RESPONSE = VMID 0)
-        vm_inv_poll = 0
-        WhileLoop LessThan(vm_inv_poll, 1000) {
-            vm_inv_resp = GPU_Rd32(gpu, SIReg.VM_INVALIDATE_RESPONSE)
-            IfCondition NotEqual(BitwiseAnd(vm_inv_resp, 1), 0) ThenBlock: {
-                vm_inv_poll = 1000
-            }
-            vm_inv_poll = Add(vm_inv_poll, 1)
+        // 1. Zero HDP non-surface entries (32 slots × 5 regs each)
+        //    Kernel: for (i=0,j=0; i<32; i++,j+=0x18) WREG32(0x2c14+j, 0)×5
+        //    Byte offsets: 0x2C14=11284, stride=0x18=24, 5 regs per slot
+        hdp_i = 0
+        WhileLoop LessThan(hdp_i, 32) {
+            hdp_base = Add(11284, Multiply(hdp_i, 24))
+            GPU_Wr32(gpu, hdp_base, 0)
+            GPU_Wr32(gpu, Add(hdp_base, 4), 0)
+            GPU_Wr32(gpu, Add(hdp_base, 8), 0)
+            GPU_Wr32(gpu, Add(hdp_base, 12), 0)
+            GPU_Wr32(gpu, Add(hdp_base, 16), 0)
+            hdp_i = Add(hdp_i, 1)
         }
 
-        // Set system aperture to cover entire VRAM range
+        // 2. HDP_REG_COHERENCY_FLUSH_CNTL = 0
+        GPU_Wr32(gpu, SIReg.HDP_REG_COHERENCY_FLUSH_CNTL, 0)
+
+        // 3. VGA_HDP_CONTROL |= VGA_MEMORY_DISABLE (bit 4)
+        //    Lockout access through VGA aperture
+        vga_hdp = GPU_Rd32(gpu, SIReg.VGA_HDP_CONTROL)
+        GPU_Wr32(gpu, SIReg.VGA_HDP_CONTROL, BitwiseOr(vga_hdp, 16))
+
+        // 4. VGA_RENDER_CONTROL &= VGA_VSTATUS_CNTL_MASK (0x30000 = 196608)
+        //    Disable VGA render, keep only VSTATUS_CNTL bits
+        vga_render = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+        GPU_Wr32(gpu, SIReg.VGA_RENDER_CONTROL, BitwiseAnd(vga_render, 196608))
+
+        // 5. System aperture — cover entire VRAM range
         GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR, vram_start_page)
         GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR, vram_end_page)
-        GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, vram_start_page)
+        GPU_Wr32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR, Add(vram_start_page, 512))
 
-        // Readback verify all writes took effect
-        rb_ctx = GPU_Rd32(gpu, SIReg.VM_CONTEXT0_CNTL)
-        rb_l1  = GPU_Rd32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL)
-        rb_lo  = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR)
-        rb_hi  = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR)
-        rb_def = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR)
-        //PrintMessage("[PM4] VM configured: aperture 0x")
-        //PrintHex(PM4State.mc_fb_base)
-        //PrintMessage(" - 0x")
-        //PrintHex(LeftShift(mc_top_units, 24))
-        //PrintMessage(", VM_CONTEXT0_CNTL=")
-        //PrintNumber(rb_ctx)
-        //PrintMessage("\n")
-        //PrintMessage("[PM4] MC_VM_MX_L1_TLB_CNTL=0x")
-        //PrintHex(rb_l1)
-        //PrintMessage("\n")
-        //PrintMessage("[PM4] APERTURE readback: low=0x")
-        //PrintHex(rb_lo)
-        //PrintMessage(" high=0x")
-        //PrintHex(rb_hi)
-        //PrintMessage(" default=0x")
-        //PrintHex(rb_def)
-        //PrintMessage("\n")
-        IfCondition EqualTo(rb_lo, 0) ThenBlock: {
-            PrintMessage("[PM4] WARNING: aperture LOW readback is 0 — MC register write may have failed!\n")
+        // 6. Disable AGP aperture
+        //    Mmiotrace seq 4122-4124: AGP_BASE=0, AGP_TOP=0, AGP_BOT=0x03FFFFFF
+        GPU_Wr32(gpu, SIReg.MC_VM_AGP_BASE, 0)
+        GPU_Wr32(gpu, SIReg.MC_VM_AGP_TOP, 0)                        // 0x00000000
+        GPU_Wr32(gpu, SIReg.MC_VM_AGP_BOT, 67108863)                 // 0x03FFFFFF
+
+        // 7. HDP_NONSURFACE_BASE — mmiotrace seq 2483 = vram_start >> 8
+        //    Required for HDP to route non-surface VRAM access correctly
+        GPU_Wr32(gpu, SIReg.HDP_NONSURFACE_BASE, RightShift(LeftShift(mc_base_units, 24), 8))
+
+        // =====================================================================
+        // PART B — gmc_v6_0_gart_enable() / si_pcie_gart_enable()
+        // =====================================================================
+
+        // 1. L1 TLB control
+        //    MC_VM_MX_L1_TLB_CNTL = 0x055B:
+        //      ENABLE_L1_TLB(bit0) | ENABLE_L1_FRAGMENT_PROCESSING(bit1) |
+        //      SYSTEM_ACCESS_MODE=NOT_IN_SYS(3<<2) |
+        //      ENABLE_ADVANCED_DRIVER_MODEL(bit4) |
+        //      (0xA << 7) | SYSTEM_APERTURE_UNMAPPED_ACCESS_PASS_THRU(0<<5)
+        GPU_Wr32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL, 1371)             // 0x055B
+
+        // 2. L2 cache control
+        //    VM_L2_CNTL = ENABLE_L2_CACHE | ENABLE_L2_FRAGMENT_PROCESSING |
+        //      ENABLE_L2_PTE_CACHE_LRU_UPDATE_BY_WRITE |
+        //      ENABLE_L2_PDE0_CACHE_LRU_UPDATE_BY_WRITE |
+        //      EFFECTIVE_L2_QUEUE_SIZE(7) | CONTEXT1_IDENTITY_ACCESS_MODE(1)
+        GPU_Wr32(gpu, SIReg.VM_L2_CNTL, 755203)                      // 0x000B8603
+
+        //    VM_L2_CNTL2 = INVALIDATE_ALL_L1_TLBS | INVALIDATE_L2_CACHE
+        GPU_Wr32(gpu, SIReg.VM_L2_CNTL2, 3)                          // 0x00000003
+
+        //    VM_L2_CNTL3 = L2_CACHE_BIGK_ASSOCIATIVITY |
+        //      BANK_SELECT(4) | L2_CACHE_BIGK_FRAGMENT_SIZE(4)
+        GPU_Wr32(gpu, SIReg.VM_L2_CNTL3, 1343497)                    // 0x00148009
+
+        // 3. Context 0 setup (VMID 0 — kernel/compute context)
+        //    ORDER MATTERS: set page table addresses BEFORE enabling context
+        //    CTX0 covers the full GART range from VRAM start to 0xFF_3FFF_F000.
+        //    VRAM access bypasses page tables via the system aperture.
+        //    Addresses outside system aperture go through page table lookup.
+        //    Kernel: START_ADDR = gtt_start >> 12 = vram_start_page
+        //    END_ADDR = gtt_end >> 12 = 0x0FF3FFFF
+        //    BASE_ADDR = page table physical location = vram_start_page
+        //    START_ADDR must equal vram_start_page (0x0F400000), NOT the GART VA.
+        //    The page table covers the entire range from VRAM start through GART end.
+        //    VRAM accesses bypass via system aperture; GART accesses use PTEs.
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_PAGE_TABLE_START_ADDR, vram_start_page)  // 0x0F400000
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_PAGE_TABLE_END_ADDR, 267649023)     // 0x0FF3FFFF
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_PAGE_TABLE_BASE_ADDR, vram_start_page)
+
+        //    Protection fault default addr = dummy page in MC address space
+        //    Must match kernel value exactly: 0x000AF50C
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_PROTECTION_FAULT_DEFAULT_ADDR, 718092)
+
+        //    VM_CONTEXT0_CNTL2 = 0
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_CNTL2, 0)
+
+        //    VM_CONTEXT0_CNTL = ENABLE_CONTEXT | PAGE_TABLE_DEPTH(0) |
+        //      RANGE_PROTECTION_FAULT_ENABLE_DEFAULT = 0x11
+        //    Enable LAST after all page table regs are set
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT0_CNTL, 17)                    // 0x00000011
+
+        PrintMessage("\n=== [VM CONFIG] readback ===\n")
+        PrintMessage("[VMDBG] mc_raw=0x")
+        PrintHex(mc_raw)
+        PrintMessage(" vram_start_page=0x")
+        PrintHex(vram_start_page)
+        PrintMessage(" vram_end_page=0x")
+        PrintHex(vram_end_page)
+        PrintMessage("\n")
+        PrintMessage("[VMDBG] APERTURE_LOW=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR))
+        PrintMessage(" APERTURE_HIGH=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR))
+        PrintMessage(" APERTURE_DEFAULT=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_DEFAULT_ADDR))
+        PrintMessage("\n")
+        PrintMessage("[VMDBG] CTX0_START=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.VM_CONTEXT0_PAGE_TABLE_START_ADDR))
+        PrintMessage(" CTX0_END=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.VM_CONTEXT0_PAGE_TABLE_END_ADDR))
+        PrintMessage(" CTX0_BASE=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.VM_CONTEXT0_PAGE_TABLE_BASE_ADDR))
+        PrintMessage("\n")
+        PrintMessage("[VMDBG] CTX0_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.VM_CONTEXT0_CNTL))
+        PrintMessage(" L1_TLB_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.MC_VM_MX_L1_TLB_CNTL))
+        PrintMessage(" L2_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.VM_L2_CNTL))
+        PrintMessage("\n")
+
+        // 4. Mystery registers (unnamed in sid.h, both radeon and amdgpu zero them)
+        //    0x15D4 = 5588, 0x15D8 = 5592, 0x15DC = 5596
+        GPU_Wr32(gpu, 5588, 0)                                        // 0x15D4
+        GPU_Wr32(gpu, 5592, 0)                                        // 0x15D8
+        GPU_Wr32(gpu, 5596, 0)                                        // 0x15DC
+
+        // 5. Context 1-15 setup (user VMIDs)
+        //    Kernel trace: CTX1_START = vram_start_page, CTX1_END = max_pfn
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT1_PAGE_TABLE_START_ADDR, vram_start_page)  // 0x0F400000
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT1_PAGE_TABLE_END_ADDR, 33554431)  // 0x01FFFFFF
+
+        //    Set page table base for VMIDs 1-7 (VM_CONTEXT0_PAGE_TABLE_BASE_ADDR + i*4)
+        //    VMID 1: 0x153C + 4 = 0x1540 = 5440
+        //    VMID 2: 0x153C + 8 = 0x1544 = 5444
+        //    ...
+        //    VMID 7: 0x153C + 28 = 0x1558 = 5464
+        ctx_i = 1
+        WhileLoop LessThan(ctx_i, 8) {
+            ctx_reg = Add(5436, Multiply(ctx_i, 4))
+            GPU_Wr32(gpu, ctx_reg, vram_start_page)
+            ctx_i = Add(ctx_i, 1)
+        }
+
+        //    Set page table base for VMIDs 8-15 (VM_CONTEXT8_PAGE_TABLE_BASE_ADDR + (i-8)*4)
+        //    VMID 8:  0x1438 + 0 = 0x1438 = 5176
+        //    VMID 9:  0x1438 + 4 = 0x143C = 5180
+        //    ...
+        //    VMID 15: 0x1438 + 28 = 0x1454 = 5204
+        ctx_i = 8
+        WhileLoop LessThan(ctx_i, 16) {
+            ctx_reg = Add(5176, Multiply(Subtract(ctx_i, 8), 4))
+            GPU_Wr32(gpu, ctx_reg, vram_start_page)
+            ctx_i = Add(ctx_i, 1)
+        }
+
+        //    Protection fault default addr for contexts 1-15 (match kernel: 0x000AF50C)
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT1_PROTECTION_FAULT_DEFAULT_ADDR, 718092)
+
+        //    VM_CONTEXT1_CNTL2 = 4
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT1_CNTL2, 4)
+
+        //    VM_CONTEXT1_CNTL — kernel writes this twice (seq 12114 then 12116):
+        //    First: 0x01000003 (ENABLE + PAGE_TABLE_DEPTH=1 + PAGE_TABLE_BLOCK_SIZE=1)
+        //    Then:  0x01092493 (full protection fault enables)
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT1_CNTL, 16777219)              // 0x01000003
+        GPU_Wr32(gpu, SIReg.VM_CONTEXT1_CNTL, 17376403)              // 0x01092493
+
+        // 6. TLB flush — si_pcie_gart_tlb_flush() / gmc_v6_0_flush_gpu_tlb()
+        //    HDP flush first, then invalidate all VM contexts
+        GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+        GPU_Wr32(gpu, SIReg.VM_INVALIDATE_REQUEST, 1)
+
+        // 7. SDMA channel config (kernel Phase 9, seq 13828-13839)
+        //    MC_SEQ_IO_DEBUG_INDEX = 0x0B (selects calibration reg)
+        //    Then 6 channel pairs: base=0x154, size=0
+        GPU_Wr32(gpu, 24064, 340)     // 0x5E00 = 0x154
+        GPU_Wr32(gpu, 24068, 0)       // 0x5E04 = 0
+        GPU_Wr32(gpu, 24088, 340)     // 0x5E18 = 0x154
+        GPU_Wr32(gpu, 24092, 0)       // 0x5E1C = 0
+        GPU_Wr32(gpu, 24112, 340)     // 0x5E30 = 0x154
+        GPU_Wr32(gpu, 24116, 0)       // 0x5E34 = 0
+        GPU_Wr32(gpu, 24136, 340)     // 0x5E48 = 0x154
+        GPU_Wr32(gpu, 24140, 0)       // 0x5E4C = 0
+        GPU_Wr32(gpu, 24160, 340)     // 0x5E60 = 0x154
+        GPU_Wr32(gpu, 24164, 0)       // 0x5E64 = 0
+        GPU_Wr32(gpu, 24180, 340)     // 0x5E74 = 0x154
+        GPU_Wr32(gpu, 24184, 0)       // 0x5E78 = 0
+
+        // 8. Additional HDP flush + VM invalidate cycles (kernel does 8+ pairs)
+        GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
+        GPU_Wr32(gpu, SIReg.VM_INVALIDATE_REQUEST, 1)
+
+        // Readback verify
+        rb_hi = GPU_Rd32(gpu, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR)
+        IfCondition EqualTo(rb_hi, 0) ThenBlock: {
+            PrintMessage("[PM4] WARNING: aperture HIGH readback is 0 — MC register write may have failed!\n")
         }
     }
 }
@@ -365,19 +542,56 @@ Function.PM4_SetupRing {
             ReturnValue(0)
         }
 
-        // Zero out the ring area in VRAM
-        vram_state = GPU_BAR_GetState(gpu)
-        vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
-        ring_host_ptr = Add(vram_ptr, vram_offset)
-        MemorySet(ring_host_ptr, 0, RingConf.VRAM_TOTAL_ALLOC)
+        // ---- Pull GART buffer for this ring from GARTState ----
+        // Rings now live in GART-backed system RAM, not VRAM.
+        // Each ring has a host_ptr (mmap'd system RAM) and a GART VA.
+        gart_host = 0
+        gart_va = 0
+        IfCondition EqualTo(ring_idx, 0) ThenBlock: {
+            gart_host = GARTState.cprb0_host_ptr
+            gart_va = BitwiseOr(LeftShift(GARTConf.CPRB0_GPU_VA_HI, 32), GARTConf.CPRB0_GPU_VA_LO)
+        }
+        IfCondition EqualTo(ring_idx, 1) ThenBlock: {
+            gart_host = GARTState.cprb1_host_ptr
+            gart_va = BitwiseOr(LeftShift(GARTConf.CPRB1_GPU_VA_HI, 32), GARTConf.CPRB1_GPU_VA_LO)
+        }
+        IfCondition EqualTo(ring_idx, 2) ThenBlock: {
+            gart_host = GARTState.cprb2_host_ptr
+            gart_va = BitwiseOr(LeftShift(GARTConf.CPRB2_GPU_VA_HI, 32), GARTConf.CPRB2_GPU_VA_LO)
+        }
 
-        // RPTR writeback location: just after the ring buffer in VRAM
-        rptr_wb = Add(vram_offset, RingConf.RPTR_WB_OFFSET)
+        // §44c: VRAM mode — override the GART placement. Ring at vram_offset,
+        // RPTR writeback right after it. MC addresses land inside the system
+        // aperture, so CP fetch/writeback bypass the page table entirely.
+        wb_vram_off = Add(vram_offset, RingConf.RPTR_WB_OFFSET)
+        IfCondition EqualTo(RingConf.RINGS_IN_VRAM, 1) ThenBlock: {
+            gart_host = 0
+            gart_va = PM4_VramToGPU(vram_offset)
+        }
 
-        // Determine which register set to use based on ring_idx
-        // Ring 0: CP_RB0_*
-        // Ring 1: CP_RB1_*
-        // Ring 2: CP_RB2_*
+        // Zero the ring buffer + writeback slot
+        IfCondition NotEqual(gart_host, 0) ThenBlock: {
+            // GART path: host pointer into system RAM
+            MemorySet(gart_host, 0, RingConf.RING_SIZE_BYTES)
+            wb_gart_va = BitwiseOr(LeftShift(GARTConf.CPRB_WB_GPU_VA_HI, 32), Add(GARTConf.CPRB_WB_GPU_VA_LO, Multiply(ring_idx, 256)))
+            wb_host = Add(GARTState.cprb_wb_host_ptr, Multiply(ring_idx, 256))
+            MemorySet(wb_host, 0, 256)
+        }
+        IfCondition EqualTo(gart_host, 0) ThenBlock: {
+            // VRAM path: zero via BAR0
+            z_i = 0
+            WhileLoop LessThan(z_i, RingConf.RING_SIZE_BYTES) {
+                GPU_VramWr32(gpu, Add(vram_offset, z_i), 0)
+                z_i = Add(z_i, 4)
+            }
+            z_i = 0
+            WhileLoop LessThan(z_i, 256) {
+                GPU_VramWr32(gpu, Add(wb_vram_off, z_i), 0)
+                z_i = Add(z_i, 4)
+            }
+            wb_gart_va = PM4_VramToGPU(wb_vram_off)
+            wb_host = 0
+        }
 
         // Select registers
         IfCondition EqualTo(ring_idx, 0) ThenBlock: {
@@ -405,43 +619,51 @@ Function.PM4_SetupRing {
             reg_rptr_addr_hi = SIReg.CP_RB2_RPTR_ADDR_HI
         }
 
-        // --- Begin CP ring programming sequence ---
+        // --- Begin CP ring programming sequence (matches kernel gfx_v6_0_cp_gfx_resume) ---
 
-        // 1. Clear WPTR delay
-        GPU_Wr32(gpu, SIReg.CP_RB_WPTR_DELAY, 0)
+        // 1. Build CNTL value matching kernel per-ring:
+        //    Ring 0: 0x90B (BUFSZ=0xB=11, BLK_SIZE=9<<8=0x900)
+        //    Ring 1/2: 0x90A (BUFSZ=0xA=10, BLK_SIZE=9<<8=0x900)
+        IfCondition EqualTo(ring_idx, 0) ThenBlock: {
+            cntl_val = 2315    // 0x90B
+        }
+        IfCondition NotEqual(ring_idx, 0) ThenBlock: {
+            cntl_val = 2314    // 0x90A
+        }
 
-        // 2. Build CNTL value: RB_BUFSZ = log2(size_in_dwords)
-        //    bits [5:0] = RingConf.RING_LOG2
-        //    bits [13:8] = PAGE_LOG2 (page_size / 8 in log2)
-        cntl_val = Add(RingConf.RING_LOG2, Multiply(RingConf.PAGE_LOG2, 256))
+        // 2. Write CNTL WITHOUT WR_ENA first (kernel step A: latch size config)
+        GPU_Wr32(gpu, reg_cntl, cntl_val)
 
-        // 3. Write CNTL with RB_RPTR_WR_ENA set (enables RPTR write + writeback setup)
+        // 3. Write CNTL WITH RB_RPTR_WR_ENA (enables RPTR write + writeback setup)
         GPU_Wr32(gpu, reg_cntl, Add(cntl_val, CntlBits.RB_RPTR_WR_ENA))
 
-        // 4. Zero BOTH pointers — RPTR must be written while RB_RPTR_WR_ENA is set.
-        //    Without this, a wedged prior run leaves RPTR at a stale value and
-        //    the CP re-executes garbage from the old ring position on wrap.
-        GPU_Wr32(gpu, reg_rptr, 0)
+        // 4. Zero write pointer (kernel writes WPTR=0 here)
         GPU_Wr32(gpu, reg_wptr, 0)
 
-        // 5. Set RPTR writeback address (full byte address, DWORD-aligned)
-        //    Kernel: WREG32(RPTR_ADDR, gpu_addr & 0xFFFFFFFC)
-        //    Kernel: WREG32(RPTR_ADDR_HI, upper_32_bits(gpu_addr) & 0xFF)
-        //    NOTE: RPTR_ADDR is NOT shifted >> 8 (unlike CP_RB_BASE)
-        rptr_wb_full = PM4_VramToGPU(rptr_wb)
-        rptr_wb_lo = BitwiseAnd(rptr_wb_full, 4294967292)     // lower 32 bits, aligned
-        rptr_wb_hi = BitwiseAnd(RightShift(rptr_wb_full, 32), 255)  // upper 8 bits
+        // 5. Set RPTR writeback address — now a GART VA, not VRAM MC address
+        rptr_wb_lo = BitwiseAnd(wb_gart_va, 4294967292)     // lower 32 bits, aligned
+        rptr_wb_hi = BitwiseAnd(RightShift(wb_gart_va, 32), 255)  // upper 8 bits
         GPU_Wr32(gpu, reg_rptr_addr, rptr_wb_lo)
         GPU_Wr32(gpu, reg_rptr_addr_hi, rptr_wb_hi)
 
-        // 6. Write CNTL again WITHOUT RB_RPTR_WR_ENA (lock it in)
+        // 6. SCRATCH_UMSK=0 (kernel does this here)
+        GPU_Wr32(gpu, SIReg.SCRATCH_UMSK, 0)
+
+        // 7. 1ms delay — kernel mdelay(1) lets CP latch RPTR writeback config
+        delay_i = 0
+        WhileLoop LessThan(delay_i, 100000) {
+            GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+            delay_i = Add(delay_i, 1)
+        }
+
+        // 8. Write CNTL again WITHOUT RB_RPTR_WR_ENA (lock it in)
         GPU_Wr32(gpu, reg_cntl, cntl_val)
 
-        // 7. Set ring base address (GPU MC address >> 8)
-        ring_base_gpu = Divide(PM4_VramToGPU(vram_offset), 256)   // >> 8
+        // 9. Set ring base address — GART VA >> 8
+        ring_base_gpu = Divide(gart_va, 256)   // >> 8
         GPU_Wr32(gpu, reg_base, ring_base_gpu)
 
-        // 8. Read back initial RPTR
+        // 10. Read back initial RPTR
         initial_rptr = GPU_Rd32(gpu, reg_rptr)
 
         // --- Store ring state ---
@@ -450,12 +672,22 @@ Function.PM4_SetupRing {
         StoreValue(Add(ring, RingField.VRAM_BASE), vram_offset)
         StoreValue(Add(ring, RingField.RING_SIZE), RingConf.RING_SIZE_DWORDS)
         StoreValue(Add(ring, RingField.WPTR), 0)
-        StoreValue(Add(ring, RingField.RPTR_WB_ADDR), rptr_wb)
+        // RPTR_WB_ADDR: host pointer (GART mode) or VRAM byte offset (VRAM
+        // mode, WB_HOST_PTR==0 selects the GPU_VramRd32 path in ReadRPTR)
+        IfCondition NotEqual(wb_host, 0) ThenBlock: {
+            StoreValue(Add(ring, RingField.RPTR_WB_ADDR), wb_host)
+        }
+        IfCondition EqualTo(wb_host, 0) ThenBlock: {
+            StoreValue(Add(ring, RingField.RPTR_WB_ADDR), wb_vram_off)
+        }
         StoreValue(Add(ring, RingField.FENCE_VAL), 0)
-        // Fence offset must be at least 64 bytes from RPTR writeback —
-        // GPU DMA may write a full cache line for RPTR updates.
-        StoreValue(Add(ring, RingField.FENCE_WB_OFF), Add(rptr_wb, 64))
+        // Fence writeback stays in VRAM (dispatch path uses GPU_VramWr32 + PM4_VramToGPU)
+        // Place it at vram_offset + RING_SIZE_BYTES + 64 (just past where RPTR WB used to be)
+        StoreValue(Add(ring, RingField.FENCE_WB_OFF), Add(vram_offset, Add(RingConf.RPTR_WB_OFFSET, 64)))
         StoreValue(Add(ring, RingField.HALTED), 0)
+        StoreValue(Add(ring, RingField.HOST_PTR), gart_host)
+        StoreValue(Add(ring, RingField.GART_VA), gart_va)
+        StoreValue(Add(ring, RingField.WB_HOST_PTR), wb_host)
         StoreValue(Add(ring, RingField.INITIALIZED), 1)
 
         // Allocate scratch packet buffer (1KB for building PM4 packets)
@@ -464,40 +696,17 @@ Function.PM4_SetupRing {
         StoreValue(Add(ring, RingField.PKT_BUF), pkt_buf)
         StoreValue(Add(ring, RingField.PKT_POS), 0)
 
-        //PrintMessage("[PM4] Ring ")
-        //PrintNumber(ring_idx)
-        //PrintMessage(" configured: ")
-        //PrintNumber(RingConf.RING_SIZE_DWORDS)
-        //PrintMessage(" DWORDs at VRAM+")
-        //PrintHex(vram_offset)
-        //PrintMessage(", initial RPTR=")
-        //PrintNumber(initial_rptr)
-        //PrintMessage("\n")
-
-        // Debug: readback critical ring registers after setup
-        //PrintMessage("[PM4:DBG] readback: CNTL=0x")
-        //PrintHex(GPU_Rd32(gpu, reg_cntl))
-        //PrintMessage(" BASE=0x")
-        //PrintHex(GPU_Rd32(gpu, reg_base))
-        //PrintMessage(" WPTR=")
-        //PrintNumber(GPU_Rd32(gpu, reg_wptr))
-        //PrintMessage(" RPTR=")
-        //PrintNumber(GPU_Rd32(gpu, reg_rptr))
-        //PrintMessage("\n")
-        //PrintMessage("[PM4:DBG] RPTR_ADDR=0x")
-        //PrintHex(GPU_Rd32(gpu, reg_rptr_addr))
-        //PrintMessage(" HI=0x")
-        //PrintHex(GPU_Rd32(gpu, reg_rptr_addr_hi))
-        //PrintMessage(" (expect lo=0x")
-        //PrintHex(rptr_wb_lo)
-        //PrintMessage(" hi=0x")
-        //PrintHex(rptr_wb_hi)
-        //PrintMessage(")\n")
-        //PrintMessage("[PM4:DBG] ring_base_gpu=0x")
-        //PrintHex(ring_base_gpu)
-        //PrintMessage(" cntl_val=0x")
-        //PrintHex(cntl_val)
-        //PrintMessage("\n")
+        PrintMessage("[PM4] Ring ")
+        PrintNumber(ring_idx)
+        PrintMessage(" GART: BASE=0x")
+        PrintHex(ring_base_gpu)
+        PrintMessage(" RPTR_ADDR=0x")
+        PrintHex(rptr_wb_lo)
+        PrintMessage(" HI=0x")
+        PrintHex(rptr_wb_hi)
+        PrintMessage(" CNTL=0x")
+        PrintHex(cntl_val)
+        PrintMessage("\n")
 
         ReturnValue(1)
     }
@@ -515,10 +724,13 @@ Function.PM4_ReadRPTR {
         ring = PM4_GetRing(ring_idx)
         IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
 
-        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+        // GART mode: RPTR_WB_ADDR is a host pointer into the GART WB page.
+        // VRAM mode (WB_HOST_PTR==0): RPTR_WB_ADDR is a VRAM byte offset.
         rptr_wb = Dereference(Add(ring, RingField.RPTR_WB_ADDR))
-
-        // Read RPTR from writeback location in VRAM
+        IfCondition NotEqual(Dereference(Add(ring, RingField.WB_HOST_PTR)), 0) ThenBlock: {
+            ReturnValue(Dereference(rptr_wb, "dword"))
+        }
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
         ReturnValue(GPU_VramRd32(gpu, rptr_wb))
     }
 }
@@ -627,17 +839,24 @@ Function.PM4_EmitDWord {
         ring = PM4_GetRing(ring_idx)
         IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
 
-        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
-        vram_base = Dereference(Add(ring, RingField.VRAM_BASE))
         wptr = Dereference(Add(ring, RingField.WPTR))
         size = Dereference(Add(ring, RingField.RING_SIZE))
 
         // Wrap wptr within ring
         slot = BitwiseAnd(wptr, Subtract(size, 1))
 
-        // Write to VRAM: vram_base + slot * 4
-        offset = Add(vram_base, Multiply(slot, 4))
-        GPU_VramWr32(gpu, offset, value)
+        // Write to GART-backed host memory (system RAM) if HOST_PTR is set
+        host_ptr = Dereference(Add(ring, RingField.HOST_PTR))
+        IfCondition NotEqual(host_ptr, 0) ThenBlock: {
+            StoreValue(Add(host_ptr, Multiply(slot, 4)), value, "dword")
+        }
+        IfCondition EqualTo(host_ptr, 0) ThenBlock: {
+            // Fallback: write to VRAM (legacy path)
+            gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+            vram_base = Dereference(Add(ring, RingField.VRAM_BASE))
+            offset = Add(vram_base, Multiply(slot, 4))
+            GPU_VramWr32(gpu, offset, value)
+        }
 
         // Advance software WPTR (monotonic, wraps via mask on read)
         StoreValue(Add(ring, RingField.WPTR), Add(wptr, 1))

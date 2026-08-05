@@ -1,42 +1,59 @@
 # AILang OS — Build Requirements and Configuration
 
-## QEMU Launch Requirements
+## QEMU Launch
+
+AILang OS uses **EFI boot only**. The kernel has `CONFIG_CMDLINE_OVERRIDE=y` with
+`root=PARTUUID=...` baked in, so direct kernel boot (`-kernel` / `-append`) does
+not work — the QEMU-provided root= is ignored and the PARTUUID won't resolve
+without a GPT partition table.
+
+### Build + boot (recommended)
+
+```bash
+./build_image.sh --qemu
+```
+
+This compiles, builds the rootfs, creates the GPT disk image with EFI partition,
+and launches QEMU.
+
+### Boot from existing disk image
+
+```bash
+~/buildroot/board/ailang_os/run_qemu.sh
+```
+
+### QEMU EFI configuration (what the scripts use)
 
 ```bash
 qemu-system-x86_64 \
-    -cpu max \
-    -kernel /home/bob/buildroot/output/images/bzImage \
-    -drive file=/home/bob/buildroot/output/images/rootfs.ext2,format=raw \
-    -append "root=/dev/sda rw console=ttyS0,115200 net.ifnames=0 init=/sbin/ailang_init" \
-    -m 512M \
-    -netdev user,id=net0,hostfwd=tcp::2222-:22 \
-    -device e1000,netdev=net0 \
-    -serial file:/tmp/qemu_serial.log \
-    -display gtk \
-    -vga virtio \
-    -daemonize
+    -enable-kvm \
+    -m 2G \
+    -drive if=pflash,format=raw,readonly=on,unit=0,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+    -drive if=pflash,format=raw,snapshot=on,unit=1,file=/usr/share/OVMF/OVMF_VARS_4M.fd \
+    -drive file=ailang_os.img,format=raw,if=none,id=disk0,snapshot=on \
+    -device virtio-blk-pci,drive=disk0 \
+    -device virtio-vga,xres=1024,yres=768 \
+    -device qemu-xhci -device usb-kbd -device usb-mouse \
+    -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22,hostfwd=tcp::15432-:5432 \
+    -display gtk
 ```
 
 **Critical flags:**
-- `-cpu max` — Required. The AILang compiler emits SSE2 instructions.
-  QEMU's default `qemu64` CPU causes invalid opcode traps without this.
-- `-vga virtio` — Framebuffer for the display server.
-- `init=/sbin/ailang_init` — Custom init (not /sbin/init).
+- `-enable-kvm` — Required. KVM exposes the host CPU (with SSE2) to the guest.
+  Without KVM, use `-cpu max` to enable SSE2 (AILang emits SSE2 instructions).
+- `pflash unit=0` / `unit=1` — OVMF_CODE is unit 0, OVMF_VARS is unit 1.
+  Omitting units causes "drive with bus=0, unit=0 exists" errors.
+- `virtio-vga` — Framebuffer for the display server.
+- `snapshot=on` on disk0 — Disk image is not modified by QEMU.
 
-For UEFI boot from `ailang_os.img` (full disk image):
-```bash
-qemu-system-x86_64 \
-    -cpu max \
-    -bios /usr/share/ovmf/OVMF.fd \
-    -drive file=ailang_os.img,format=raw,if=none,id=disk0 \
-    -device ahci,id=ahci \
-    -device ide-hd,drive=disk0,bus=ahci.0 \
-    ...
-```
+The kernel is an EFI stub placed on the EFI System Partition as
+`EFI/BOOT/BOOTX64.EFI`. OVMF loads it directly — no bootloader needed.
 
-The UEFI image has `STARTUP.NSH` with:
+### Port forwards
+
 ```
-\EFI\BOOT\BOOTX64.EFI root=/dev/sda2 rw init=/sbin/ailang_init
+Host 2222  -> VM 22   (SSH):  ssh -p 2222 root@localhost (password: ailang)
+Host 15432 -> VM 5432 (PG):   psql -h localhost -p 15432 -U bob ailang_system
 ```
 
 ## Rootfs Overlay Layout
@@ -73,8 +90,9 @@ rootfs_overlay/
       DejaVuSans.vif        — Primary UI font (vector format)
       AlteixSans.vif        — Secondary font
     icons/
-      default.vif           — Default app icon
-      silver_atoms.vif      — System icon set
+      default.vif           — General icons (radix 16x16 pack)
+      app_icons.vif         — Application icons (32x32 tvg pack)
+      silver_atoms.vif      — System widget atoms (silver look)
   config/
     keymap.cfg              — CRITICAL: display server opens "config/keymap.cfg"
                               relative to cwd (which is / on boot).
@@ -128,6 +146,8 @@ on startup via `Schema_Bootstrap()`. Tables:
 | service_status | Runtime PID/state tracking |
 | encryption_keys | Per-service encryption keys |
 | windows | Window geometry persistence |
+| themes | Theme definitions (name, display_name, description) |
+| theme_values | Per-theme key/value overrides for UIConfig (theme_name, key, value) |
 
 ### Seed Data (from Schema_SeedData)
 
@@ -178,7 +198,7 @@ cd /home/bob/buildroot
 cp OUTPUT.x board/ailang_os/rootfs_overlay/system/bin/
 
 # Rebuild rootfs:
-make
+make rootfs-ext2
 
 # Images at output/images/rootfs.ext2 (and rootfs.ext4 symlink)
 ```
@@ -192,6 +212,8 @@ filesystem from the overlay. To preserve PG data across rebuilds, either:
 ## Known Issues
 
 - `config/keymap.cfg` path is relative — must be at `/config/keymap.cfg` on rootfs
-- QEMU default CPU (`qemu64`) lacks SSE2 — use `-cpu max`
+- QEMU without KVM: default CPU (`qemu64`) lacks SSE2 — add `-cpu max`
+- QEMU with KVM: host CPU is used, SSE2 is available, no `-cpu max` needed
+- Direct kernel boot (`-kernel`/`-append`) does NOT work — `CONFIG_CMDLINE_OVERRIDE=y` ignores `-append`. Use EFI boot only.
 - PG data is lost on rootfs rebuild — installer needed to re-bootstrap
 - svc_daemon only seeds 6 services; others must be added via installer or SQL

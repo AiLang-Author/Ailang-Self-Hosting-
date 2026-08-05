@@ -351,6 +351,9 @@ Function.TVG_ScaleX {
     Input:  coord: Integer
     Output: Integer
     Body: {
+        // Header width is unscaled; coordinates are in (value << scale_bits).
+        // ShiftLeft(w, sb) brings the denominator to the same scale as coords.
+        // Result is in 256× fixed-point pixel coordinates.
         w  = TVGParse.width
         sb = TVGParse.scale_bits
         IfCondition EqualTo(w, 0) ThenBlock: { ReturnValue(0) }
@@ -603,22 +606,20 @@ Function.TVG_FlattenCubic {
             md = d1
             IfCondition GreaterThan(d2, md) ThenBlock: { md = d2 }
 
-            // Flatness gate with two tightenings vs. the original:
-            //   depth cap 8 → 12  (up to 4096 segments if genuinely
-            //     needed — small icons can't afford to hit the cap
-            //     and emit a straight line across a gently curving
-            //     spline, which was a visible source of faceting)
-            //   threshold 16384 → 4096  (tighter by 4× in squared
-            //     distance = 2× tighter linear flatness, about
-            //     0.125 pixel²). Subdivision is cheap compared to
-            //     one sloppy-looking curve on every game icon.
+            // Flatness gate:
+            //   depth cap = 14  (up to 16384 segments — subdivision
+            //     is very cheap; hitting the cap on a shallow curve
+            //     at small render size produces visible faceting)
+            //   threshold = 64  in 65536× pixel² units ≈ 0.001 pixel²
+            //     linear flatness ≈ 0.031 pixel.  At 22px body text
+            //     the tilde wave is only ~3.5px tall; we need sub-pixel
+            //     flatness to avoid visible chord cuts.
             //
-            // md is in 65536× fp units (ScaleX/Y 256× × flatten's
-            // internal 256× = 2^16 coord scale, md = diff² = 2^32).
-            // Shift right 16 to bring the comparison back to the
-            // integer-pixel² domain of the original code.
+            // md is in (65536)² units (coords are 256× × internal 256×).
+            // ShiftRight 16 → 65536× pixel² domain.
+            // Threshold 64 in this domain = 64/65536 = ~0.001 pixel².
             md_cmp = ShiftRight(md, 16)
-            IfCondition Or(GreaterEqual(sd, 12), LessThan(md_cmp, 4096)) ThenBlock: {
+            IfCondition Or(GreaterEqual(sd, 14), LessThan(md_cmp, 64)) ThenBlock: {
                 // Flatten output goes to TVG_AddEdge as 256× fp — one
                 // divide by 256 brings the 65536×-internal coords to
                 // the 256× fp units that AddEdge + ScanFill expect.
@@ -790,14 +791,17 @@ Function.TVG_BlendPixel {
 // =============================================================================
 // SCANLINE FILL — with alpha blending
 // =============================================================================
-// TVG_ScanFill — coverage-based horizontal anti-aliasing.
+// TVG_ScanFill — coverage-based anti-aliasing with vertical supersampling.
 //
-// Edge intersections are kept as 256× fixed-point so we don't lose
-// the fractional part at span boundaries. For each fill span the
-// leftmost and rightmost pixels get proportional coverage instead of
-// full opacity; interior pixels get full coverage like before.
-// Sample at pixel center (y = row + 0.5) so edges land consistently
-// relative to the scanline rather than the row's top.
+// Horizontal AA: analytical sub-pixel coverage at span edges (256× fp).
+// Vertical AA:   8 sub-scanlines per pixel row.  Coverage from each
+//                sub-scanline is accumulated into a per-pixel buffer,
+//                then divided by 8 to produce the final output.
+//
+// This matches how production rasterizers (FreeType, Cairo) work:
+// horizontal coverage is exact from edge intersections, vertical
+// coverage is approximated by multiple Y samples.  8 sub-rows give
+// 8 vertical levels × 256 horizontal levels = very smooth output.
 Function.TVG_ScanFill {
     Input: r: Integer
     Input: g: Integer
@@ -825,122 +829,152 @@ Function.TVG_ScanFill {
         use_grad = GradState.active
         sw_fp = Multiply(sw, 256)
 
+        // Per-pixel coverage accumulator: one 8-byte slot per pixel column.
+        // Stores summed coverage (0..2048 = 8 sub-rows × 256 max each).
+        cov_buf_size = Multiply(sw, 8)
+        cov_buf = Allocate(cov_buf_size)
+
         row = 0
         WhileLoop LessThan(row, sh) {
-            xs_buf = Allocate(512)
-            xs_cnt = 0
-            // Sample at row center (row + 0.5) in 256× fixed-point.
-            row_fp = Add(Multiply(row, 256), 128)
-            ei = 0
-            WhileLoop LessThan(ei, ec) {
-                off = Multiply(ei, RastConst.EDGE_SIZE)
-                ep  = Add(edges, off)
-                ex0 = Dereference(Add(ep, RastConst.EDGE_X0_OFS))
-                ey0 = Dereference(Add(ep, RastConst.EDGE_Y0_OFS))
-                ex1 = Dereference(Add(ep, RastConst.EDGE_X1_OFS))
-                ey1 = Dereference(Add(ep, RastConst.EDGE_Y1_OFS))
-                IfCondition GreaterThan(ey0, ey1) ThenBlock: {
-                    tmp = ey0  ey0 = ey1  ey1 = tmp
-                    tmp = ex0  ex0 = ex1  ex1 = tmp
-                }
-                // ey0/ey1/ex0/ex1 are all 256× fixed-point (courtesy
-                // of TVG_ScaleX/Y); row_fp is also 256×, so comparisons
-                // and interpolation stay in fp units throughout.
-                IfCondition And(LessEqual(ey0, row_fp), LessThan(row_fp, ey1)) ThenBlock: {
-                    dy = Subtract(ey1, ey0)
-                    IfCondition NotEqual(dy, 0) ThenBlock: {
-                        dx = Subtract(ex1, ex0)
-                        dr_fp = Subtract(row_fp, ey0)
-                        num = Multiply(dx, dr_fp)
-                        // xi_fp = ex0 + (dx * dr_fp) / dy, all 256× fp.
-                        xi_fp = Add(ex0, Divide(num, dy))
-                        IfCondition LessThan(xs_cnt, 63) ThenBlock: {
-                            off2 = Multiply(xs_cnt, 8)
-                            StoreValue(Add(xs_buf, off2), xi_fp)
-                            xs_cnt = Add(xs_cnt, 1)
-                        }
-                    }
-                }
-                ei = Add(ei, 1)
-            }
-            // Bubble sort intersections (ascending).
-            si = 0
-            WhileLoop LessThan(si, xs_cnt) {
-                sj = Add(si, 1)
-                WhileLoop LessThan(sj, xs_cnt) {
-                    oa = Multiply(si, 8)
-                    ob = Multiply(sj, 8)
-                    va = Dereference(Add(xs_buf, oa))
-                    vb = Dereference(Add(xs_buf, ob))
-                    IfCondition GreaterThan(va, vb) ThenBlock: {
-                        StoreValue(Add(xs_buf, oa), vb)
-                        StoreValue(Add(xs_buf, ob), va)
-                    }
-                    sj = Add(sj, 1)
-                }
-                si = Add(si, 1)
-            }
-            // Fill pairs with coverage at the span boundaries.
-            lim = Subtract(xs_cnt, 1)
-            pi = 0
-            WhileLoop LessThan(pi, lim) {
-                oa = Multiply(pi, 8)
-                pi2 = Add(pi, 1)
-                ob = Multiply(pi2, 8)
-                xa_fp = Dereference(Add(xs_buf, oa))
-                xb_fp = Dereference(Add(xs_buf, ob))
-                IfCondition LessThan(xa_fp, 0) ThenBlock: { xa_fp = 0 }
-                IfCondition GreaterThan(xb_fp, sw_fp) ThenBlock: { xb_fp = sw_fp }
+            // Zero coverage buffer for this row
+            MemorySet(cov_buf, 0, cov_buf_size)
 
-                xa_int = Divide(xa_fp, 256)
-                xa_frac = Subtract(xa_fp, Multiply(xa_int, 256))
-                xb_int = Divide(xb_fp, 256)
-                xb_frac = Subtract(xb_fp, Multiply(xb_int, 256))
+            // Sample 8 sub-scanlines within this pixel row.
+            // Sub-row offsets: 16, 48, 80, 112, 144, 176, 208, 240
+            // (evenly spaced within 0..255 range of the pixel row)
+            sub = 0
+            WhileLoop LessThan(sub, 8) {
+                // sub_off = sub * 32 + 16  (centers of 8 equal bands)
+                sub_off = Add(Multiply(sub, 32), 16)
+                row_fp = Add(Multiply(row, 256), sub_off)
 
-                IfCondition EqualTo(xa_int, xb_int) ThenBlock: {
-                    // Sub-pixel span — one pixel, coverage = width in fracs.
-                    cov = Subtract(xb_frac, xa_frac)
-                    IfCondition GreaterThan(cov, 0) ThenBlock: {
-                        pcolor = color
-                        IfCondition EqualTo(use_grad, 1) ThenBlock: {
-                            pcolor = TVG_GradPixel(xa_int, row)
-                        }
-                        TVG_ScanFill_EmitPixel(surf, xa_int, row, pcolor, a, cov)
+                // Collect edge intersections for this sub-scanline
+                xs_buf = Allocate(512)
+                xs_cnt = 0
+                ei = 0
+                WhileLoop LessThan(ei, ec) {
+                    off = Multiply(ei, RastConst.EDGE_SIZE)
+                    ep  = Add(edges, off)
+                    ex0 = Dereference(Add(ep, RastConst.EDGE_X0_OFS))
+                    ey0 = Dereference(Add(ep, RastConst.EDGE_Y0_OFS))
+                    ex1 = Dereference(Add(ep, RastConst.EDGE_X1_OFS))
+                    ey1 = Dereference(Add(ep, RastConst.EDGE_Y1_OFS))
+                    IfCondition GreaterThan(ey0, ey1) ThenBlock: {
+                        tmp = ey0  ey0 = ey1  ey1 = tmp
+                        tmp = ex0  ex0 = ex1  ex1 = tmp
                     }
-                } ElseBlock: {
-                    // Left boundary pixel: coverage = 256 - xa_frac.
-                    left_cov = Subtract(256, xa_frac)
-                    IfCondition GreaterThan(left_cov, 0) ThenBlock: {
-                        pcolor = color
-                        IfCondition EqualTo(use_grad, 1) ThenBlock: {
-                            pcolor = TVG_GradPixel(xa_int, row)
+                    IfCondition And(LessEqual(ey0, row_fp), LessThan(row_fp, ey1)) ThenBlock: {
+                        dy = Subtract(ey1, ey0)
+                        IfCondition NotEqual(dy, 0) ThenBlock: {
+                            dx = Subtract(ex1, ex0)
+                            dr_fp = Subtract(row_fp, ey0)
+                            num = Multiply(dx, dr_fp)
+                            xi_fp = Add(ex0, Divide(num, dy))
+                            IfCondition LessThan(xs_cnt, 63) ThenBlock: {
+                                off2 = Multiply(xs_cnt, 8)
+                                StoreValue(Add(xs_buf, off2), xi_fp)
+                                xs_cnt = Add(xs_cnt, 1)
+                            }
                         }
-                        TVG_ScanFill_EmitPixel(surf, xa_int, row, pcolor, a, left_cov)
                     }
-                    // Interior pixels: full coverage.
-                    px = Add(xa_int, 1)
-                    WhileLoop LessThan(px, xb_int) {
-                        pcolor = color
-                        IfCondition EqualTo(use_grad, 1) ThenBlock: {
-                            pcolor = TVG_GradPixel(px, row)
-                        }
-                        TVG_ScanFill_EmitPixel(surf, px, row, pcolor, a, 256)
-                        px = Add(px, 1)
-                    }
-                    // Right boundary pixel: coverage = xb_frac.
-                    IfCondition GreaterThan(xb_frac, 0) ThenBlock: {
-                        pcolor = color
-                        IfCondition EqualTo(use_grad, 1) ThenBlock: {
-                            pcolor = TVG_GradPixel(xb_int, row)
-                        }
-                        TVG_ScanFill_EmitPixel(surf, xb_int, row, pcolor, a, xb_frac)
-                    }
+                    ei = Add(ei, 1)
                 }
-                pi = Add(pi, 2)
+
+                // Bubble sort intersections
+                si = 0
+                WhileLoop LessThan(si, xs_cnt) {
+                    sj = Add(si, 1)
+                    WhileLoop LessThan(sj, xs_cnt) {
+                        oa = Multiply(si, 8)
+                        ob = Multiply(sj, 8)
+                        va = Dereference(Add(xs_buf, oa))
+                        vb = Dereference(Add(xs_buf, ob))
+                        IfCondition GreaterThan(va, vb) ThenBlock: {
+                            StoreValue(Add(xs_buf, oa), vb)
+                            StoreValue(Add(xs_buf, ob), va)
+                        }
+                        sj = Add(sj, 1)
+                    }
+                    si = Add(si, 1)
+                }
+
+                // Accumulate coverage from each fill span into cov_buf.
+                lim = Subtract(xs_cnt, 1)
+                pi = 0
+                WhileLoop LessThan(pi, lim) {
+                    oa = Multiply(pi, 8)
+                    pi2 = Add(pi, 1)
+                    ob = Multiply(pi2, 8)
+                    xa_fp = Dereference(Add(xs_buf, oa))
+                    xb_fp = Dereference(Add(xs_buf, ob))
+                    IfCondition LessThan(xa_fp, 0) ThenBlock: { xa_fp = 0 }
+                    IfCondition GreaterThan(xb_fp, sw_fp) ThenBlock: { xb_fp = sw_fp }
+
+                    xa_int = Divide(xa_fp, 256)
+                    xa_frac = Subtract(xa_fp, Multiply(xa_int, 256))
+                    xb_int = Divide(xb_fp, 256)
+                    xb_frac = Subtract(xb_fp, Multiply(xb_int, 256))
+
+                    IfCondition EqualTo(xa_int, xb_int) ThenBlock: {
+                        // Sub-pixel span
+                        cov = Subtract(xb_frac, xa_frac)
+                        IfCondition And(GreaterThan(cov, 0), LessThan(xa_int, sw)) ThenBlock: {
+                            cp = Add(cov_buf, Multiply(xa_int, 8))
+                            old = Dereference(cp)
+                            StoreValue(cp, Add(old, cov))
+                        }
+                    } ElseBlock: {
+                        // Left boundary pixel
+                        left_cov = Subtract(256, xa_frac)
+                        IfCondition And(GreaterThan(left_cov, 0), LessThan(xa_int, sw)) ThenBlock: {
+                            cp = Add(cov_buf, Multiply(xa_int, 8))
+                            old = Dereference(cp)
+                            StoreValue(cp, Add(old, left_cov))
+                        }
+                        // Interior pixels: full coverage (256)
+                        px = Add(xa_int, 1)
+                        WhileLoop LessThan(px, xb_int) {
+                            IfCondition LessThan(px, sw) ThenBlock: {
+                                cp = Add(cov_buf, Multiply(px, 8))
+                                old = Dereference(cp)
+                                StoreValue(cp, Add(old, 256))
+                            }
+                            px = Add(px, 1)
+                        }
+                        // Right boundary pixel
+                        IfCondition And(GreaterThan(xb_frac, 0), LessThan(xb_int, sw)) ThenBlock: {
+                            cp = Add(cov_buf, Multiply(xb_int, 8))
+                            old = Dereference(cp)
+                            StoreValue(cp, Add(old, xb_frac))
+                        }
+                    }
+                    pi = Add(pi, 2)
+                }
+                Deallocate(xs_buf, 512)
+                sub = Add(sub, 1)
             }
-            Deallocate(xs_buf, 512)
+
+            // Emit pixels: coverage is sum of 8 sub-rows, each 0..256.
+            // Divide by 8 to get final coverage 0..256.
+            cx = 0
+            WhileLoop LessThan(cx, sw) {
+                cp = Add(cov_buf, Multiply(cx, 8))
+                total_cov = Dereference(cp)
+                IfCondition GreaterThan(total_cov, 0) ThenBlock: {
+                    final_cov = Divide(total_cov, 8)
+                    IfCondition GreaterThan(final_cov, 256) ThenBlock: { final_cov = 256 }
+                    pcolor = color
+                    IfCondition EqualTo(use_grad, 1) ThenBlock: {
+                        pcolor = TVG_GradPixel(cx, row)
+                    }
+                    TVG_ScanFill_EmitPixel(surf, cx, row, pcolor, a, final_cov)
+                }
+                cx = Add(cx, 1)
+            }
+
             row = Add(row, 1)
         }
+        Deallocate(cov_buf, cov_buf_size)
         ReturnValue(0)
     }
 }

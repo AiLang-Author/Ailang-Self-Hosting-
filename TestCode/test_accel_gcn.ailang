@@ -1,202 +1,251 @@
 // test_accel_gcn.ailang — end-to-end GPU compute test via AccelGCN
-// Build: ./ailang.x TestCode/test_accel_gcn.ailang test_accel_gcn.x
-// Run:   sudo ./test_accel_gcn.x   (needs GPU access, radeon must be unbound)
+// Build: ./ailang.x TestCode/test_accel_gcn.ailang test_accel_gcn
+// Run:   ./test_accel_gcn   (needs GPU access, radeon must be unbound)
 //
-// Tests:
+// Tests BOTH GPUs in sequence:
+//   Bus 1 = display GPU (POSTed, known working baseline)
+//   Bus 2 = compute GPU (un-POSTed, under development)
+//
+// DISPLAY SAFETY: AccelGCN_Init skips MC_SI_LoadMicrocode, MC_SI_Program,
+// and MC_SI_GpuInit on the display GPU (bus 1).  Those functions zero
+// BIF_FB_EN, reprogram MC_VM_FB_LOCATION, and overwrite DMIF_ADDR_CONFIG —
+// all of which kill the VESA framebuffer and blank the screen.  The display
+// GPU is already fully POSTed by the BIOS so MC init is unnecessary.
+//
+// For each GPU:
 //   1. AccelGCN_Init (discover GPU, map BARs, setup ring, ring test)
 //   2. Build CIR kernel: dst[gid] = src[gid] + 42
 //   3. Lower to GCN machine code
-//   4. Upload to VRAM
-//   5. Write test data to VRAM src buffer
-//   6. Dispatch on GPU
-//   7. Read back dst buffer and verify results
-//   8. Shutdown
+//   4. Write test data to VRAM src buffer
+//   5. Dispatch on GPU
+//   6. Read back dst buffer and verify results
+//   7. Shutdown
 
 LibraryImport.Arena
 LibraryImport.Drivers.AMDGPU.AMDGPUFamily
 LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
 LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUGART
 LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
 LibraryImport.Drivers.AMDGPU.GCNEnc
 LibraryImport.Accel.ComputeIR
 LibraryImport.Accel.ComputeIR_GCN
 LibraryImport.Accel.HAL
 LibraryImport.Accel.AccelGCN
 
+// RunOnGPU — run full compute test on a specific PCI bus
+// Returns number of errors (0 = all pass)
+Function.RunOnGPU {
+    Input: target_bus: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("\n========================================\n")
+        PrintMessage("  TESTING GPU ON BUS ")
+        PrintNumber(target_bus)
+        PrintMessage("\n========================================\n\n")
+
+        // --- Init ---
+        AccelGCNCfg.prefer_bus = target_bus
+        rc = AccelGCN_Init()
+        PrintMessage("AccelGCN_Init: ")
+        PrintNumber(rc)
+        PrintMessage("\n\n")
+        IfCondition LessThan(rc, 0) ThenBlock: {
+            PrintMessage("FATAL: AccelGCN init failed on bus ")
+            PrintNumber(target_bus)
+            PrintMessage(", skipping\n")
+            ReturnValue(-1)
+        }
+
+        // --- TASK A isolation kernel: dst[gid] = 42 (no src load) ---
+        // If dst[0]=42 → store+launch+V# work, bug is in src LOAD path.
+        // If dst[0]=0  → store/launch broken. Go to TASK B.
+        rc = CIR_Begin()
+        rc = CIR_SetGroupSize(64, 1, 1)
+        rc = CIR_SetGrid(1, 1, 1)
+        rc = CIR_BindBuffer(0, 0, 256, 4, 1)
+        rc = CIR_BindBuffer(1, 256, 256, 4, 2)
+        v_gid   = CIR_AllocVReg()
+        v_const = CIR_AllocVReg()
+        rc = CIR_Op_GlobalIdX(v_gid)
+        rc = CIR_Op_LoadConst(v_const, 42)
+        rc = CIR_Op_StoreBuf(v_const, 1, v_gid)
+        rc = CIR_Op_WaitCnt(0, 0, 0)
+        rc = CIR_Op_EndPgm()
+        n_insns = CIR_End()
+        mc_bytes = CIR_Lower_GCN()
+        PrintMessage("Kernel: ")
+        PrintNumber(n_insns)
+        PrintMessage(" insns, ")
+        PrintNumber(mc_bytes)
+        PrintMessage(" bytes MC\n")
+
+        // --- GART data buffer write test ---
+        // Data now lives in GART-backed system RAM — test host pointer coherency
+        data_hp = AccelGCNCfg.data_host_ptr
+        StoreValue(data_hp, 3735928559, "dword")
+        PrintMessage("Wr32(0xDEADBEEF) -> Rd32=0x")
+        PrintHex(Dereference(data_hp, "dword"))
+        StoreValue(Add(data_hp, 4), 3405691582, "dword")
+        PrintMessage("  Wr32(0xCAFEBABE) -> Rd32=0x")
+        PrintHex(Dereference(Add(data_hp, 4), "dword"))
+        PrintMessage("\n")
+        StoreValue(data_hp, 0, "dword")
+        StoreValue(Add(data_hp, 4), 0, "dword")
+
+        // --- Write test data: src[i] = i ---
+        host_src = Allocate(256)
+        i = 0
+        WhileLoop LessThan(i, 64) {
+            off = Multiply(i, 4)
+            SetByte(host_src, off, BitwiseAnd(i, 255))
+            SetByte(host_src, Add(off, 1), BitwiseAnd(RightShift(i, 8), 255))
+            SetByte(host_src, Add(off, 2), 0)
+            SetByte(host_src, Add(off, 3), 0)
+            i = Add(i, 1)
+        }
+        discard_wr = AccelGCN_VramWrite(0, host_src, 256)
+
+        // Zero dst buffer
+        host_dst = Allocate(256)
+        MemorySet(host_dst, 0, 256)
+        discard_wr2 = AccelGCN_VramWrite(256, host_dst, 256)
+
+        // --- Pre-dispatch verify (read from GART host ptr) ---
+        gpu_dbg = AccelGCNCfg.gpu_idx
+        data_off = AccelGCNCfg.data_vram
+        pre_hp = AccelGCNCfg.data_host_ptr
+        PrintMessage("Pre-dispatch: src[0]=")
+        PrintNumber(Dereference(pre_hp, "dword"))
+        PrintMessage(" src[1]=")
+        PrintNumber(Dereference(Add(pre_hp, 4), "dword"))
+        PrintMessage(" dst[0]=0x")
+        PrintHex(Dereference(Add(pre_hp, 256), "dword"))
+        PrintMessage("\n")
+        PrintMessage("data_gart_va=0x")
+        PrintHex(AccelGCNCfg.data_gart_va)
+        PrintMessage(" data_host_ptr=0x")
+        PrintHex(pre_hp)
+        PrintMessage("\n")
+
+        // --- Pre-dispatch register dump ---
+        // VM_CONTEXT0_CNTL=0x1410, MC_VM_MX_L1_TLB_CNTL=0x2064, VM_L2_CNTL=0x1400
+        PrintMessage("VM_CONTEXT0_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.VM_CONTEXT0_CNTL))
+        PrintMessage(" L1_TLB_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.MC_VM_MX_L1_TLB_CNTL))
+        PrintMessage(" VM_L2_CNTL=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.VM_L2_CNTL))
+        PrintMessage("\n")
+        // MC_VM_SYSTEM_APERTURE_LOW/HIGH=0x2034/0x2038, MC_VM_FB_LOCATION=0x2024
+        PrintMessage("SYS_APE_LOW=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.MC_VM_SYSTEM_APERTURE_LOW_ADDR))
+        PrintMessage(" SYS_APE_HIGH=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.MC_VM_SYSTEM_APERTURE_HIGH_ADDR))
+        PrintMessage(" MC_VM_FB_LOC=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.MC_VM_FB_LOCATION))
+        PrintMessage("\n")
+        // SH_MEM_CONFIG=0x8C34, SH_MEM_BASES=0x8C28, GRBM_STATUS=0x8010
+        PrintMessage("SH_MEM_CONFIG=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.SH_MEM_CONFIG))
+        PrintMessage(" SH_MEM_BASES=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.SH_MEM_BASES))
+        PrintMessage(" GRBM_STATUS=0x")
+        PrintHex(GPU_Rd32(gpu_dbg, SIReg.GRBM_STATUS))
+        PrintMessage("\n")
+
+        // --- Dispatch ---
+        rc = AccelGCN_Dispatch()
+        PrintMessage("Dispatch rc=")
+        PrintNumber(rc)
+        post_hp = AccelGCNCfg.data_host_ptr
+        PrintMessage("  post: dst[0]=0x")
+        PrintHex(Dereference(Add(post_hp, 256), "dword"))
+        PrintMessage(" dst[1]=0x")
+        PrintHex(Dereference(Add(post_hp, 260), "dword"))
+        PrintMessage("\n")
+
+        // --- Read back and verify ---
+        discard_rd = AccelGCN_VramRead(256, host_dst, 256)
+        errors = 0
+        i = 0
+        WhileLoop LessThan(i, 64) {
+            off = Multiply(i, 4)
+            b0 = GetByte(host_dst, off)
+            b1 = GetByte(host_dst, Add(off, 1))
+            b2 = GetByte(host_dst, Add(off, 2))
+            b3 = GetByte(host_dst, Add(off, 3))
+            got = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+            expected = 42  // TASK A: constant-store kernel, all elements should be 42
+
+            // Print first 4 for spot-check
+            IfCondition LessThan(i, 4) ThenBlock: {
+                PrintMessage("  dst[")
+                PrintNumber(i)
+                PrintMessage("]=")
+                PrintNumber(got)
+                PrintMessage(" (exp ")
+                PrintNumber(expected)
+                PrintMessage(")")
+                IfCondition EqualTo(got, expected) ThenBlock: {
+                    PrintMessage(" OK")
+                }
+                IfCondition NotEqual(got, expected) ThenBlock: {
+                    PrintMessage(" FAIL")
+                }
+                PrintMessage("\n")
+            }
+
+            IfCondition NotEqual(got, expected) ThenBlock: {
+                errors = Add(errors, 1)
+            }
+            i = Add(i, 1)
+        }
+
+        PrintMessage("Results: ")
+        PrintNumber(Subtract(64, errors))
+        PrintMessage("/64 correct, ")
+        PrintNumber(errors)
+        PrintMessage(" errors\n")
+
+        IfCondition EqualTo(errors, 0) ThenBlock: {
+            PrintMessage("*** PASS ***\n")
+        }
+        IfCondition GreaterThan(errors, 0) ThenBlock: {
+            PrintMessage("*** FAIL ***\n")
+        }
+
+        // --- Cleanup ---
+        Deallocate(host_src, 256)
+        Deallocate(host_dst, 256)
+        discard_shut = AccelGCN_Shutdown()
+
+        ReturnValue(errors)
+    }
+}
+
 SubRoutine.Main {
-    PrintMessage("=== AccelGCN End-to-End Test ===\n\n")
+    PrintMessage("=== AccelGCN Compute GPU Test (Bus 2, auto-detect cold/warm) ===\n")
+    PrintMessage("Auto-detect: CONFIG_MEMSIZE=0 → cold init; !=0 → warm (kernel-posted)\n\n")
 
-    // --- Step 1: Initialize AccelGCN ---
-    PrintMessage("--- Step 1: AccelGCN Init ---\n")
-    rc = AccelGCN_Init()
-    PrintMessage("AccelGCN_Init: ")
-    PrintNumber(rc)
-    PrintMessage("\n\n")
-    IfCondition LessThan(rc, 0) ThenBlock: {
-        PrintMessage("FATAL: AccelGCN init failed, aborting\n")
-        SystemCall(60, 1, 0, 0, 0, 0)
+    // Bus 2 — skip_hw_init=0 means auto-detect via CONFIG_MEMSIZE
+    AccelGCNCfg.skip_hw_init = 0
+    err2 = RunOnGPU(2)
+
+    // Summary
+    PrintMessage("\n========================================\n")
+    PrintMessage("  SUMMARY\n")
+    PrintMessage("========================================\n")
+    PrintMessage("Bus 2: ")
+    IfCondition EqualTo(err2, 0) ThenBlock: { PrintMessage("PASS\n") }
+    IfCondition GreaterThan(err2, 0) ThenBlock: {
+        PrintNumber(err2)
+        PrintMessage(" errors\n")
     }
+    IfCondition LessThan(err2, 0) ThenBlock: { PrintMessage("INIT FAILED\n") }
+    PrintMessage("========================================\n")
 
-    // --- Step 2: Build CIR kernel ---
-    // Kernel: dst[global_id] = src[global_id] + 42
-    // 64 elements, 64 threads per workgroup, 1 workgroup
-    PrintMessage("--- Step 2: Build CIR Kernel ---\n")
-    rc = CIR_Begin()
-
-    rc = CIR_SetGroupSize(64, 1, 1)
-    rc = CIR_SetGrid(1, 1, 1)
-
-    // Bind buffers:
-    //   Slot 0 = src (read):  64 elements * 4 bytes = 256 bytes at data offset 0
-    //   Slot 1 = dst (write): 64 elements * 4 bytes = 256 bytes at data offset 256
-    rc = CIR_BindBuffer(0, 0, 256, 4, 1)
-    rc = CIR_BindBuffer(1, 256, 256, 4, 2)
-
-    // Allocate virtual registers
-    v_gid   = CIR_AllocVReg()
-    v_val   = CIR_AllocVReg()
-    v_const = CIR_AllocVReg()
-    v_sum   = CIR_AllocVReg()
-
-    // Emit IR:
-    //   v_gid   = GLOBAL_ID_X
-    //   v_val   = LOAD_BUF(slot=0, index=v_gid)
-    //   WAITCNT(0, 0, 0)
-    //   v_const = 42
-    //   v_sum   = v_val + v_const
-    //   STORE_BUF(v_sum, slot=1, index=v_gid)
-    //   WAITCNT(0, 0, 0)
-    //   END_PGM
-    rc = CIR_Op_GlobalIdX(v_gid)
-    rc = CIR_Op_LoadBuf(v_val, 0, v_gid)
-    rc = CIR_Op_WaitCnt(0, 0, 0)
-    rc = CIR_Op_LoadConst(v_const, 42)
-    rc = CIR_Op_AddU32(v_sum, v_val, v_const)
-    rc = CIR_Op_StoreBuf(v_sum, 1, v_gid)
-    rc = CIR_Op_WaitCnt(0, 0, 0)
-    rc = CIR_Op_EndPgm()
-
-    n_insns = CIR_End()
-    PrintMessage("Instructions: ")
-    PrintNumber(n_insns)
-    PrintMessage("\n")
-
-    // Dump IR
-    rc = CIR_Dump()
-    PrintMessage("\n")
-
-    // --- Step 3: Lower to GCN ---
-    PrintMessage("--- Step 3: Lower to GCN ---\n")
-    mc_bytes = CIR_Lower_GCN()
-    PrintMessage("Machine code: ")
-    PrintNumber(mc_bytes)
-    PrintMessage(" bytes\n\n")
-
-    // --- Step 4: Write test data to VRAM src buffer ---
-    // Fill src[i] = i for i in 0..63
-    PrintMessage("--- Step 4: Write test data ---\n")
-    host_src = Allocate(256)
-    i = 0
-    WhileLoop LessThan(i, 64) {
-        // Write 32-bit value i at offset i*4 (little-endian)
-        off = Multiply(i, 4)
-        SetByte(host_src, off, BitwiseAnd(i, 255))
-        SetByte(host_src, Add(off, 1), BitwiseAnd(RightShift(i, 8), 255))
-        SetByte(host_src, Add(off, 2), 0)
-        SetByte(host_src, Add(off, 3), 0)
-        i = Add(i, 1)
-    }
-    discard_wr = AccelGCN_VramWrite(0, host_src, 256)
-    PrintMessage("Wrote 256 bytes to VRAM data area (src)\n")
-
-    // Zero the dst buffer
-    host_dst = Allocate(256)
-    MemorySet(host_dst, 0, 256)
-    discard_wr2 = AccelGCN_VramWrite(256, host_dst, 256)
-    PrintMessage("Zeroed 256 bytes at VRAM data area (dst)\n\n")
-
-    // --- Step 5: Dispatch ---
-    PrintMessage("--- Step 5: Dispatch ---\n")
-    rc = AccelGCN_Dispatch()
-    PrintMessage("AccelGCN_Dispatch: ")
-    PrintNumber(rc)
-    PrintMessage("\n\n")
-
-    // --- Step 6: Read back and verify ---
-    PrintMessage("--- Step 6: Read back + verify ---\n")
-    discard_rd = AccelGCN_VramRead(256, host_dst, 256)
-
-    errors = 0
-    i = 0
-    WhileLoop LessThan(i, 64) {
-        off = Multiply(i, 4)
-        b0 = GetByte(host_dst, off)
-        b1 = GetByte(host_dst, Add(off, 1))
-        b2 = GetByte(host_dst, Add(off, 2))
-        b3 = GetByte(host_dst, Add(off, 3))
-        got = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
-        expected = Add(i, 42)
-
-        // Print first 8 and last 2 for spot-check
-        IfCondition LessThan(i, 8) ThenBlock: {
-            PrintMessage("  dst[")
-            PrintNumber(i)
-            PrintMessage("] = ")
-            PrintNumber(got)
-            PrintMessage(" (expect ")
-            PrintNumber(expected)
-            PrintMessage(")")
-            IfCondition EqualTo(got, expected) ThenBlock: {
-                PrintMessage(" OK")
-            }
-            IfCondition NotEqual(got, expected) ThenBlock: {
-                PrintMessage(" FAIL")
-            }
-            PrintMessage("\n")
-        }
-        IfCondition GreaterThan(i, 61) ThenBlock: {
-            PrintMessage("  dst[")
-            PrintNumber(i)
-            PrintMessage("] = ")
-            PrintNumber(got)
-            PrintMessage(" (expect ")
-            PrintNumber(expected)
-            PrintMessage(")")
-            IfCondition EqualTo(got, expected) ThenBlock: {
-                PrintMessage(" OK")
-            }
-            IfCondition NotEqual(got, expected) ThenBlock: {
-                PrintMessage(" FAIL")
-            }
-            PrintMessage("\n")
-        }
-
-        IfCondition NotEqual(got, expected) ThenBlock: {
-            errors = Add(errors, 1)
-        }
-        i = Add(i, 1)
-    }
-
-    PrintMessage("\nResults: ")
-    PrintNumber(Subtract(64, errors))
-    PrintMessage("/64 correct, ")
-    PrintNumber(errors)
-    PrintMessage(" errors\n")
-
-    IfCondition EqualTo(errors, 0) ThenBlock: {
-        PrintMessage("\n*** ALL PASS ***\n")
-    }
-    IfCondition GreaterThan(errors, 0) ThenBlock: {
-        PrintMessage("\n*** FAILURES DETECTED ***\n")
-    }
-
-    // --- Cleanup ---
-    PrintMessage("\n--- Cleanup ---\n")
-    Deallocate(host_src, 256)
-    Deallocate(host_dst, 256)
-    discard_shut = AccelGCN_Shutdown()
-
-    PrintMessage("\n=== AccelGCN Test Complete ===\n")
     SystemCall(60, 0, 0, 0, 0, 0)
 }
 

@@ -1,0 +1,368 @@
+// LLM.ailang
+// Entry point for the AILang LLM inference runtime.
+// Standalone accelerator — same pattern as ATTN.ailang.
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+LibraryImport.Arena
+LibraryImport.Hash
+
+LibraryImport.TF.Math
+LibraryImport.TF.Vec
+LibraryImport.TF.Mat
+LibraryImport.TF.Act
+LibraryImport.ThreadPool
+LibraryImport.Accel.HAL
+LibraryImport.LLM.GGUF
+LibraryImport.LLM.Quant
+LibraryImport.LLM.BPE
+
+Import.LLM.State
+Import.LLM.Loader
+Import.LLM.Init
+Import.LLM.Tokenizer
+Import.LLM.Forward
+
+// =============================================================================
+// MODEL PATH — edit this to point at your .gguf file
+// TODO: read from argv once CLI arg parsing is added
+// =============================================================================
+FixedPool.LLMArgs {
+    "model_path": Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// MAIN
+// =============================================================================
+SubRoutine.Main {
+    PrintMessage("======================================================\n")
+    PrintMessage("  AILang LLM Inference Runtime v0.1\n")
+    PrintMessage("  (c) 2026 Sean Collins, 2 Paws Machine and Engineering\n")
+    PrintMessage("  Int32 + Int64 Q20 dual-path integer inference\n")
+    PrintMessage("======================================================\n\n")
+
+    // Model path — set this before compiling, or add argv parsing
+    LLMArgs.model_path = "/home/bob/SmolLM2-135M-Instruct-Q8_0.gguf"
+
+    PrintMessage("[LLM] Loading model: ")
+    PrintString(LLMArgs.model_path)
+    PrintMessage("\n\n")
+
+    // Load and parse GGUF
+    rc = LLM_LoadModel(LLMArgs.model_path)
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[LLM] FATAL: model load failed with code ")
+        PrintNumber(rc)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+
+    // Print model configuration
+    LLM_PrintConfig()
+
+    // Print tensor count
+    PrintMessage("[LLM] Tensor count: ")
+    PrintNumber(TensorDir.count)
+    PrintMessage("\n")
+
+    // Compute memory estimates
+    PrintMessage("[LLM] Memory estimates:\n")
+
+    // Per-layer weight size estimate (rough: 4 matrices of d_model^2 + 3 of d_model*d_ff)
+    // At Q8_0: ~1.0625 bytes/param, at int32: 4 bytes/param, at int64: 8 bytes/param
+    dd = Multiply(LLMConfig.d_model, LLMConfig.d_model)
+    df = Multiply(LLMConfig.d_model, LLMConfig.d_ff)
+    params_per_layer = Add(Multiply(dd, 4), Multiply(df, 3))
+
+    PrintMessage("[LLM]   Params/layer:  ")
+    PrintNumber(params_per_layer)
+    PrintMessage("\n")
+
+    total_params = Multiply(params_per_layer, LLMConfig.n_layers)
+    PrintMessage("[LLM]   Total params:  ~")
+    PrintNumber(Divide(total_params, 1000000))
+    PrintMessage("M\n")
+
+    int32_mb = Divide(Multiply(total_params, 4), 1048576)
+    int64_mb = Divide(Multiply(total_params, 8), 1048576)
+    PrintMessage("[LLM]   Int32 RAM:     ~")
+    PrintNumber(int32_mb)
+    PrintMessage("MB\n")
+    PrintMessage("[LLM]   Int64 Q20 RAM: ~")
+    PrintNumber(int64_mb)
+    PrintMessage("MB\n")
+
+    PrintMessage("\n[LLM] Phase 1 complete — model metadata loaded.\n")
+
+    // ================================================================
+    // PHASE 2: mmap model + dequantize weights
+    // ================================================================
+    PrintMessage("[LLM] Phase 2: weight dequantization\n\n")
+
+    // mmap the model file for direct tensor data access
+    mmap_result = LLM_MmapModel(LLMArgs.model_path)
+    IfCondition EqualTo(mmap_result, 0) ThenBlock: {
+        PrintMessage("[LLM] FATAL: mmap failed\n")
+        ReturnValue(1)
+    }
+
+    // Dequantize all tensors into per-layer weight buffers
+    rc = LLM_InitWeights()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[LLM] FATAL: weight init failed\n")
+        ReturnValue(1)
+    }
+
+    // Print summary
+    LLM_PrintWeightSummary()
+
+    // Print first few values of token embedding as sanity check
+    // token_embd is [vocab_size × d_model], so token 0 = elements [0..575],
+    // token 1 = elements [576..1151], etc.
+    PrintMessage("\n[LLM] Sanity check — token_embd:\n")
+    IfCondition NotEqual(LLMWeights.tok_embd, 0) ThenBlock: {
+        PrintMessage("  token 0, first 16 vals: ")
+        sanity_i = 0
+        WhileLoop LessThan(sanity_i, 16) {
+            PrintNumber(Dereference(Add(LLMWeights.tok_embd, Multiply(sanity_i, 8))))
+            PrintMessage(" ")
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("\n")
+        // Token 1 (offset = d_model * 8 = 576 * 8 = 4608)
+        PrintMessage("  token 1, first 16 vals: ")
+        sanity_i = 0
+        WhileLoop LessThan(sanity_i, 16) {
+            PrintNumber(Dereference(Add(LLMWeights.tok_embd, Add(4608, Multiply(sanity_i, 8)))))
+            PrintMessage(" ")
+            sanity_i = Add(sanity_i, 1)
+        }
+        PrintMessage("\n")
+    }
+
+    // Scan for first zero token and first non-zero token beyond 1
+    PrintMessage("  scanning embedding table...\n")
+    sanity_i = 0
+    sanity_nz = 0
+    sanity_last_nz = 0
+    WhileLoop LessThan(sanity_i, 100) {
+        sanity_off = Multiply(sanity_i, 576)
+        sanity_off = Multiply(sanity_off, 8)
+        sanity_v = Dereference(Add(LLMWeights.tok_embd, sanity_off))
+        IfCondition NotEqual(sanity_v, 0) ThenBlock: {
+            sanity_nz = Add(sanity_nz, 1)
+            sanity_last_nz = sanity_i
+        }
+        sanity_i = Add(sanity_i, 1)
+    }
+    PrintMessage("  tokens 0-99: non-zero count=")
+    PrintNumber(sanity_nz)
+    PrintMessage(" last_nz_tok=")
+    PrintNumber(sanity_last_nz)
+    PrintMessage("\n")
+    // Check element 32 (first element of block 1 for token 0)
+    // token_embd is 49152*576 elements in Q8_0: 49152*576/32 = 884736 blocks
+    // token 0 spans blocks 0..17 (576/32 = 18 blocks per token)
+    // So block 18 starts token 1
+    PrintMessage("  embd elem 32: ")
+    PrintNumber(Dereference(Add(LLMWeights.tok_embd, Multiply(32, 8))))
+    PrintMessage(" elem 576: ")
+    PrintNumber(Dereference(Add(LLMWeights.tok_embd, Multiply(576, 8))))
+    PrintMessage(" elem 577: ")
+    PrintNumber(Dereference(Add(LLMWeights.tok_embd, Multiply(577, 8))))
+    PrintMessage("\n")
+
+    // Also check a layer weight
+    PrintMessage("  blk.0 attn_norm, first 8 vals: ")
+    IfCondition NotEqual(LLMWeights.layers, 0) ThenBlock: {
+        norm_ptr = Dereference(Add(LLMWeights.layers, LLMLayerField.ATTN_NORM))
+        IfCondition NotEqual(norm_ptr, 0) ThenBlock: {
+            sanity_i = 0
+            WhileLoop LessThan(sanity_i, 8) {
+                PrintNumber(Dereference(Add(norm_ptr, Multiply(sanity_i, 8))))
+                PrintMessage(" ")
+                sanity_i = Add(sanity_i, 1)
+            }
+        }
+    }
+    PrintMessage("\n")
+
+    PrintMessage("\n[LLM] Phase 2 complete — weights dequantized.\n")
+
+    // ================================================================
+    // PHASE 3: BPE tokenizer
+    // ================================================================
+    PrintMessage("[LLM] Phase 3: BPE tokenizer\n\n")
+
+    rc = LLM_InitTokenizer()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[LLM] FATAL: tokenizer init failed\n")
+        ReturnValue(1)
+    }
+
+    // Test encode/decode roundtrip
+    PrintMessage("\n[LLM] Tokenizer test:\n")
+
+    // Allocate token ID buffer (max 256 tokens for test)
+    test_ids = Allocate(2048)
+    MemorySet(test_ids, 0, 2048)
+
+    // Test 1: simple text
+    PrintMessage("  Input:   \"Hello, world!\"\n")
+    test_n = LLM_Tokenize("Hello, world!", 13, test_ids, 256)
+    PrintMessage("  Tokens:  ")
+    PrintNumber(test_n)
+    PrintMessage(" IDs: [")
+    sanity_i = 0
+    WhileLoop LessThan(sanity_i, test_n) {
+        IfCondition GreaterThan(sanity_i, 0) ThenBlock: { PrintMessage(", ") }
+        PrintNumber(Dereference(Add(test_ids, Multiply(sanity_i, 8))))
+        sanity_i = Add(sanity_i, 1)
+    }
+    PrintMessage("]\n")
+    PrintMessage("  Decoded: \"")
+    LLM_PrintTokens(test_ids, test_n)
+    PrintMessage("\"\n")
+
+    // Test 2: prompt text
+    PrintMessage("\n  Input:   \"The capital of France is\"\n")
+    test_n = LLM_Tokenize("The capital of France is", 24, test_ids, 256)
+    PrintMessage("  Tokens:  ")
+    PrintNumber(test_n)
+    PrintMessage(" IDs: [")
+    sanity_i = 0
+    WhileLoop LessThan(sanity_i, test_n) {
+        IfCondition GreaterThan(sanity_i, 0) ThenBlock: { PrintMessage(", ") }
+        PrintNumber(Dereference(Add(test_ids, Multiply(sanity_i, 8))))
+        sanity_i = Add(sanity_i, 1)
+    }
+    PrintMessage("]\n")
+    PrintMessage("  Decoded: \"")
+    LLM_PrintTokens(test_ids, test_n)
+    PrintMessage("\"\n")
+
+    Deallocate(test_ids, 2048)
+
+    PrintMessage("\n[LLM] Phase 3 complete — tokenizer ready.\n")
+
+    // ================================================================
+    // PHASE 4: Forward pass setup + text generation
+    // ================================================================
+    PrintMessage("[LLM] Phase 4: forward pass\n\n")
+
+    // Initialize HAL with GCN backend for GPU-accelerated matmul
+    HALCfg.backend = 2
+    rc = HAL_Init()
+    IfCondition LessThan(rc, 0) ThenBlock: {
+        PrintMessage("[LLM] WARNING: GPU init failed (rc=")
+        PrintNumber(rc)
+        PrintMessage("), falling back to CPU\n")
+    }
+
+    // Initialize activation tables (exp table for softmax)
+    TFAct_Init()
+
+    // Allocate forward pass buffers and KV cache
+    LLM_AllocBuffers()
+
+    // Initialize sin/cos, RoPE, and SiLU lookup tables
+    LLM_InitSinTable()
+    LLM_InitRoPETables()
+    LLM_InitSiLU()
+
+    // ── Tokenize prompt ──
+    prompt_ids = Allocate(4096)   // max 512 tokens
+    MemorySet(prompt_ids, 0, 4096)
+
+    prompt_text = "The capital of France is"
+    PrintMessage("\n[LLM] Prompt: \"")
+    PrintString(prompt_text)
+    PrintMessage("\"\n")
+
+    prompt_len = LLM_Tokenize(prompt_text, 24, prompt_ids, 512)
+    PrintMessage("[LLM] Prompt tokens: ")
+    PrintNumber(prompt_len)
+    PrintMessage("\n")
+
+    // ── Prefill: run forward pass on each prompt token ──
+    PrintMessage("[LLM] Prefilling...\n")
+    gen_pos = 0
+    WhileLoop LessThan(gen_pos, prompt_len) {
+        gen_tok = Dereference(Add(prompt_ids, Multiply(gen_pos, 8)))
+        LLM_Forward(gen_tok, gen_pos)
+        gen_pos = Add(gen_pos, 1)
+    }
+    PrintMessage("[LLM] Prefill complete.\n\n")
+
+    // ── Autoregressive generation ──
+    PrintMessage("[LLM] Generating (greedy, max 64 tokens):\n")
+    PrintMessage("  \"")
+    PrintString(prompt_text)
+
+    gen_max = 64
+    gen_count = 0
+
+    // Start timing — clock_gettime(CLOCK_MONOTONIC=1, &ts)
+    ts_start = Allocate(16)
+    SystemCall(228, 1, ts_start, 0, 0, 0, 0)
+    time_start_sec  = Dereference(ts_start)
+    time_start_nsec = Dereference(Add(ts_start, 8))
+    WhileLoop LessThan(gen_count, gen_max) {
+        // Sample next token (greedy argmax)
+        next_tok = TF_VecArgMax(LLMBuf.logits, LLMConfig.vocab_size)
+
+        // Check for EOS
+        IfCondition EqualTo(next_tok, LLMTokenizer.eos_id) ThenBlock: {
+            BreakLoop
+        }
+
+        // Print decoded token
+        LLM_TokenToString(next_tok)
+
+        // Forward pass with new token
+        LLM_Forward(next_tok, gen_pos)
+        gen_pos = Add(gen_pos, 1)
+        gen_count = Add(gen_count, 1)
+    }
+    PrintMessage("\"\n\n")
+
+    // End timing
+    ts_end = Allocate(16)
+    SystemCall(228, 1, ts_end, 0, 0, 0, 0)
+    time_end_sec  = Dereference(ts_end)
+    time_end_nsec = Dereference(Add(ts_end, 8))
+
+    // Compute elapsed milliseconds
+    elapsed_sec  = Subtract(time_end_sec, time_start_sec)
+    elapsed_nsec = Subtract(time_end_nsec, time_start_nsec)
+    IfCondition LessThan(elapsed_nsec, 0) ThenBlock: {
+        elapsed_sec  = Subtract(elapsed_sec, 1)
+        elapsed_nsec = Add(elapsed_nsec, 1000000000)
+    }
+    elapsed_ms = Add(Multiply(elapsed_sec, 1000), Divide(elapsed_nsec, 1000000))
+
+    PrintMessage("[LLM] Generated ")
+    PrintNumber(gen_count)
+    PrintMessage(" tokens in ")
+    PrintNumber(elapsed_ms)
+    PrintMessage(" ms")
+
+    // Tokens per second: gen_count * 1000 / elapsed_ms
+    IfCondition GreaterThan(elapsed_ms, 0) ThenBlock: {
+        toks_per_sec = Divide(Multiply(gen_count, 1000), elapsed_ms)
+        toks_frac = Modulo(Divide(Multiply(gen_count, 10000), elapsed_ms), 10)
+        PrintMessage(" (")
+        PrintNumber(toks_per_sec)
+        PrintMessage(".")
+        PrintNumber(toks_frac)
+        PrintMessage(" tok/s)")
+    }
+    PrintMessage("\n")
+
+    Deallocate(ts_start, 16)
+    Deallocate(ts_end, 16)
+    PrintMessage("[LLM] Done.\n")
+
+    Deallocate(prompt_ids, 4096)
+}
+
+RunTask(Main)

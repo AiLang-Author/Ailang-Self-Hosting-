@@ -9,6 +9,7 @@
 // Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
 
 LibraryImport.Arena
+LibraryImport.Browser.JSRegexPropData
 
 // ============================================================================
 // CONFIGURATION AND CONSTANTS
@@ -22,6 +23,8 @@ FixedPool.JSRxFlags {
     "UNICODE": Initialize=16
     "GLOBAL": Initialize=32
     "STICKY": Initialize=64
+    // M31c P3: unicodeSets (`v` flag). Implies UNICODE for \p and code units.
+    "UNICODE_SETS": Initialize=128
 }
 
 FixedPool.JSRxConstants {
@@ -47,6 +50,9 @@ FixedPool.JSRxStateType {
     "LOOKAHEAD": Initialize=11
     "LOOKBEHIND": Initialize=12
     "BACKREF": Initialize=13
+    // M31b P2: Unicode property escape \p{}/\P{}
+    // data1 = prop_id, data2 = 1 if negated (\P or class-inverted)
+    "PROP": Initialize=14
 }
 
 // ============================================================================
@@ -67,7 +73,24 @@ FixedPool.JSRxCompiler {
     "group_count": Initialize=0
     "flags": Initialize=0
     "error": Initialize=0
+    // M30h: named groups — table of {gnum:8, name_ptr:8} entries
+    "name_count": Initialize=0
+    "name_table": Initialize=0
+    "name_cap": Initialize=32
+    // M31b: class-local property escapes (up to 8)
+    "cls_nprops": Initialize=0
+    "cls_prop0": Initialize=0
+    "cls_prop1": Initialize=0
+    "cls_prop2": Initialize=0
+    "cls_prop3": Initialize=0
+    "cls_prop4": Initialize=0
+    "cls_prop5": Initialize=0
+    "cls_prop6": Initialize=0
+    "cls_prop7": Initialize=0
 }
+
+// Live name-table on compiled regex handle offsets:
+// handle+40 = name_count, handle+48 = name_table ptr
 
 FixedPool.JSRxMatch {
     "text": Initialize=0
@@ -79,6 +102,9 @@ FixedPool.JSRxMatch {
     "next_count": Initialize=0
     "captures": Initialize=0
     "thread_size": Initialize=0
+    "flags": Initialize=0
+    "cur_states": Initialize=0
+    "cur_regex": Initialize=0
 }
 
 // Ring-buffer slot pools for parser AST nodes
@@ -114,6 +140,13 @@ SubRoutine.JSRegex_Initialize {
     JSRxCompiler.group_count = 0
     JSRxCompiler.flags = 0
     JSRxCompiler.error = 0
+    JSRxCompiler.name_count = 0
+    JSRxCompiler.name_table = 0
+    JSRxCompiler.name_cap = 32
+    JSRxCompiler.cls_nprops = 0
+
+    // M31b: BMP property tables for \p/\P
+    JSRx_PropInit()
 
     JSRxMatch.text = 0
     JSRxMatch.text_len = 0
@@ -188,6 +221,201 @@ Function.JSRx_ClassAlloc {
 // PUBLIC API
 // ============================================================================
 
+// Compare name at name_ptr (len bytes) to C-string cstr
+Function.JSRx_NameEq {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Input: cstr: Address
+    Output: Integer
+    Body: {
+        IfCondition Or(EqualTo(name_ptr, 0), EqualTo(cstr, 0)) ThenBlock: {
+            ReturnValue(0)
+        }
+        i = 0
+        WhileLoop LessThan(i, name_len) {
+            IfCondition EqualTo(GetByte(cstr, i), 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            IfCondition NotEqual(GetByte(name_ptr, i), GetByte(cstr, i)) ThenBlock: {
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        IfCondition NotEqual(GetByte(cstr, name_len), 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Lookup named group number by name; 0 if missing
+Function.JSRx_LookupName {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(JSRxCompiler.name_table, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        i = 0
+        WhileLoop LessThan(i, JSRxCompiler.name_count) {
+            ent = Add(JSRxCompiler.name_table, Multiply(i, 16))
+            gnum = Dereference(ent)
+            nptr = Dereference(Add(ent, 8))
+            IfCondition EqualTo(JSRx_NameEq(name_ptr, name_len, nptr), 1) ThenBlock: {
+                ReturnValue(gnum)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Add name→gnum (copies name bytes to owned C-string)
+Function.JSRx_AddName {
+    Input: name_ptr: Address
+    Input: name_len: Integer
+    Input: gnum: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(JSRxCompiler.name_table, 0) ThenBlock: {
+            JSRxCompiler.name_table = Allocate(Multiply(JSRxCompiler.name_cap, 16))
+            IfCondition EqualTo(JSRxCompiler.name_table, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            JSRxCompiler.name_count = 0
+        }
+        IfCondition GreaterEqual(JSRxCompiler.name_count, JSRxCompiler.name_cap) ThenBlock: {
+            ReturnValue(0)
+        }
+        // copy name
+        ncopy = Allocate(Add(name_len, 1))
+        IfCondition EqualTo(ncopy, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition GreaterThan(name_len, 0) ThenBlock: {
+            MemoryCopy(ncopy, name_ptr, name_len)
+        }
+        SetByte(ncopy, name_len, 0)
+        ent = Add(JSRxCompiler.name_table, Multiply(JSRxCompiler.name_count, 16))
+        StoreValue(ent, gnum)
+        StoreValue(Add(ent, 8), ncopy)
+        JSRxCompiler.name_count = Add(JSRxCompiler.name_count, 1)
+        ReturnValue(1)
+    }
+}
+
+// Pre-scan pattern for named groups so \k can forward-ref. Assigns gnums
+// in the same left-to-right order as the real parser.
+Function.JSRx_PrescanNames {
+    Output: Integer
+    Body: {
+        JSRxCompiler.name_count = 0
+        IfCondition EqualTo(JSRxCompiler.name_table, 0) ThenBlock: {
+            JSRxCompiler.name_table = Allocate(Multiply(JSRxCompiler.name_cap, 16))
+        }
+        IfCondition EqualTo(JSRxCompiler.name_table, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        pat = JSRxCompiler.pattern
+        len = JSRxCompiler.len
+        i = 0
+        g = 0
+        WhileLoop LessThan(i, len) {
+            ch = JSRT_StrUnit(pat, i)
+            // skip escapes
+            IfCondition EqualTo(ch, 92) ThenBlock: {
+                i = Add(i, 2)
+            } ElseBlock: {
+                // skip char class
+                IfCondition EqualTo(ch, 91) ThenBlock: {
+                    i = Add(i, 1)
+                    WhileLoop LessThan(i, len) {
+                        c2 = JSRT_StrUnit(pat, i)
+                        IfCondition EqualTo(c2, 92) ThenBlock: {
+                            i = Add(i, 2)
+                        } ElseBlock: {
+                            IfCondition EqualTo(c2, 93) ThenBlock: {
+                                i = Add(i, 1)
+                                BreakLoop
+                            }
+                            i = Add(i, 1)
+                        }
+                    }
+                } ElseBlock: {
+                    IfCondition EqualTo(ch, 40) ThenBlock: {
+                        // group
+                        IfCondition LessThan(Add(i, 1), len) ThenBlock: {
+                            IfCondition EqualTo(JSRT_StrUnit(pat, Add(i, 1)), 63) ThenBlock: {
+                                // (?
+                                IfCondition LessThan(Add(i, 2), len) ThenBlock: {
+                                    q2 = JSRT_StrUnit(pat, Add(i, 2))
+                                    // (?: (?= (?! — non-capturing / lookaround
+                                    IfCondition Or(Or(EqualTo(q2, 58), EqualTo(q2, 61)), EqualTo(q2, 33)) ThenBlock: {
+                                        i = Add(i, 3)
+                                    } ElseBlock: {
+                                        // (?<
+                                        IfCondition EqualTo(q2, 60) ThenBlock: {
+                                            IfCondition LessThan(Add(i, 3), len) ThenBlock: {
+                                                q3 = JSRT_StrUnit(pat, Add(i, 3))
+                                                // (?<= (?<! lookbehind non-capturing
+                                                IfCondition Or(EqualTo(q3, 61), EqualTo(q3, 33)) ThenBlock: {
+                                                    i = Add(i, 4)
+                                                } ElseBlock: {
+                                                    // (?<name>
+                                                    ns = Add(i, 3)
+                                                    ne = ns
+                                                    WhileLoop And(LessThan(ne, len), NotEqual(JSRT_StrUnit(pat, ne), 62)) {
+                                                        ne = Add(ne, 1)
+                                                    }
+                                                    IfCondition LessThan(ne, len) ThenBlock: {
+                                                        g = Add(g, 1)
+                                                        nlen = Subtract(ne, ns)
+                                                        // skip invalid names in prescan (parse will error)
+                                                        ok_nm = 1
+                                                        IfCondition EqualTo(nlen, 0) ThenBlock: { ok_nm = 0 }
+                                                        IfCondition EqualTo(ok_nm, 1) ThenBlock: {
+                                                            fc = JSRT_StrUnit(pat, ns)
+                                                            IfCondition And(GreaterEqual(fc, 48), LessEqual(fc, 57)) ThenBlock: {
+                                                                ok_nm = 0
+                                                            }
+                                                        }
+                                                        IfCondition EqualTo(ok_nm, 1) ThenBlock: {
+                                                            JSRx_AddName(Add(pat, ns), nlen, g)
+                                                        }
+                                                        i = Add(ne, 1)
+                                                    } ElseBlock: {
+                                                        i = Add(i, 1)
+                                                    }
+                                                }
+                                            } ElseBlock: {
+                                                i = Add(i, 1)
+                                            }
+                                        } ElseBlock: {
+                                            i = Add(i, 1)
+                                        }
+                                    }
+                                } ElseBlock: {
+                                    i = Add(i, 1)
+                                }
+                            } ElseBlock: {
+                                // plain capturing (
+                                g = Add(g, 1)
+                                i = Add(i, 1)
+                            }
+                        } ElseBlock: {
+                            i = Add(i, 1)
+                        }
+                    } ElseBlock: {
+                        i = Add(i, 1)
+                    }
+                }
+            }
+        }
+        ReturnValue(1)
+    }
+}
+
 Function.JSRegex_Compile {
     Input: pattern: Address
     Input: flags: Integer
@@ -197,12 +425,27 @@ Function.JSRegex_Compile {
             ReturnValue(0)
         }
 
+        // M31c: u+v together is SyntaxError; v implies unicode mode
+        has_u = BitwiseAnd(flags, JSRxFlags.UNICODE)
+        has_v = BitwiseAnd(flags, JSRxFlags.UNICODE_SETS)
+        IfCondition And(NotEqual(has_u, 0), NotEqual(has_v, 0)) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition NotEqual(has_v, 0) ThenBlock: {
+            flags = BitwiseOr(flags, JSRxFlags.UNICODE)
+        }
+
         JSRxCompiler.pattern = pattern
         JSRxCompiler.pos = 0
-        JSRxCompiler.len = StringLength(pattern)
+        // M31a: patterns are JS UTF-16 strings; length is code units
+        JSRxCompiler.len = JSRT_StrLen(pattern)
         JSRxCompiler.group_count = 0
         JSRxCompiler.flags = flags
         JSRxCompiler.error = 0
+        JSRxCompiler.name_count = 0
+
+        // M30h: pre-scan named groups for \k forward refs
+        JSRx_PrescanNames()
 
         total_size = Multiply(JSRxConstants.MAX_STATES, JSRxConstants.STATE_SIZE)
 
@@ -236,10 +479,16 @@ Function.JSRegex_Compile {
         frag_out = Dereference(Add(start_frag, 8))
         JSRx_PatchList(frag_out, match_state)
 
-        handle = Allocate(32)
+        // M30h: handle 56 bytes — +40 name_count, +48 name_table
+        handle = Allocate(56)
         IfCondition EqualTo(handle, 0) ThenBlock: {
             Deallocate(JSRxState.states, total_size)
             ReturnValue(0)
+        }
+        hi = 0
+        WhileLoop LessThan(hi, 56) {
+            SetByte(handle, hi, 0)
+            hi = Add(hi, 1)
         }
 
         StoreValue(handle, JSRxState.states)
@@ -247,8 +496,55 @@ Function.JSRegex_Compile {
         frag_start = Dereference(start_frag)
         StoreValue(Add(handle, 16), frag_start)
         StoreValue(Add(handle, 24), JSRxCompiler.group_count)
+        // M30e: flags at +32
+        StoreValue(Add(handle, 32), JSRxCompiler.flags)
+        StoreValue(Add(handle, 40), JSRxCompiler.name_count)
+        // only attach name_table if we have names (avoid dangling empty table)
+        IfCondition GreaterThan(JSRxCompiler.name_count, 0) ThenBlock: {
+            StoreValue(Add(handle, 48), JSRxCompiler.name_table)
+        } ElseBlock: {
+            StoreValue(Add(handle, 48), 0)
+        }
+        // detach table from compiler (owned by handle now)
+        JSRxCompiler.name_table = 0
+        JSRxCompiler.name_count = 0
 
         ReturnValue(handle)
+    }
+}
+
+// M30h: name table accessors for match result .groups
+Function.JSRegex_NameCount {
+    Input: regex: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(regex, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(regex, 40)))
+    }
+}
+
+Function.JSRegex_NameAt {
+    Input: regex: Address
+    Input: index: Integer
+    Output: Address
+    Body: {
+        // returns name C-string; gnum via JSRegex_NameGnum
+        IfCondition EqualTo(regex, 0) ThenBlock: { ReturnValue(0) }
+        ntab = Dereference(Add(regex, 48))
+        IfCondition EqualTo(ntab, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(ntab, Add(Multiply(index, 16), 8))))
+    }
+}
+
+Function.JSRegex_NameGnum {
+    Input: regex: Address
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(regex, 0) ThenBlock: { ReturnValue(0) }
+        ntab = Dereference(Add(regex, 48))
+        IfCondition EqualTo(ntab, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(ntab, Multiply(index, 16))))
     }
 }
 
@@ -270,9 +566,12 @@ Function.JSRegex_Match {
         num_states = Dereference(Add(regex, 8))
         start_state = Dereference(Add(regex, 16))
         capture_count = Dereference(Add(regex, 24))
+        JSRxMatch.flags = Dereference(Add(regex, 32))
+        JSRxMatch.cur_states = states
+        JSRxMatch.cur_regex = regex
 
         JSRxMatch.text = text
-        JSRxMatch.text_len = StringLength(text)
+        JSRxMatch.text_len = JSRT_StrLen(text)
         JSRxMatch.pos = start_pos
 
         JSRxMatch.thread_size = 16
@@ -295,67 +594,143 @@ Function.JSRegex_Match {
                 ReturnValue(-1)
             }
         }
+        // Capture slots: 64 ints (32 groups * start/end)
+        IfCondition EqualTo(JSRxMatch.captures, 0) ThenBlock: {
+            JSRxMatch.captures = Allocate(512)
+        }
+        IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+            ci = 0
+            WhileLoop LessThan(ci, 64) {
+                StoreValue(Add(JSRxMatch.captures, Multiply(ci, 8)), -1)
+                ci = Add(ci, 1)
+            }
+        }
+        JSRxResult.ngroups = capture_count
+        JSRxResult.cap_buf = JSRxMatch.captures
 
         JSRxMatch.thread_count = 0
         JSRxMatch.next_count = 0
 
         JSRx_AddThread(start_state, start_pos, 0)
 
-        WhileLoop LessEqual(JSRxMatch.pos, JSRxMatch.text_len) {
-            ch = 0
+        // M30d/f/i: longest match; snapshot captures on best (leftmost among equal)
+        best_len = -1
+        best_caps = 0
+        IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+            best_caps = Allocate(512)
+        }
+        JSRx_DeferClear()
+        steps = 0
+        max_steps = Add(Multiply(Add(JSRxMatch.text_len, 1), 64), 256)
 
-            IfCondition LessThan(JSRxMatch.pos, JSRxMatch.text_len) ThenBlock: {
-                ch = GetByte(text, JSRxMatch.pos)
+        WhileLoop And(Or(GreaterThan(JSRxMatch.thread_count, 0), GreaterThan(JSRxDefer.count, 0)), LessThan(steps, max_steps)) {
+            steps = Add(steps, 1)
+            // M30i: if no live threads, try deferred right-alt
+            IfCondition EqualTo(JSRxMatch.thread_count, 0) ThenBlock: {
+                IfCondition GreaterThan(JSRxDefer.count, 0) ThenBlock: {
+                    // restore parent captures before right branch
+                    IfCondition And(NotEqual(best_caps, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                        // start right alt from clean parent caps snapshot at defer time? use -1 init
+                        // reset captures to unset before right branch of top-level-ish alts
+                        ci = 0
+                        WhileLoop LessThan(ci, 64) {
+                            StoreValue(Add(JSRxMatch.captures, Multiply(ci, 8)), -1)
+                            ci = Add(ci, 1)
+                        }
+                    }
+                    d_sid = JSRx_DeferPopState()
+                    d_pos = JSRx_DeferPopPos()
+                    JSRx_AddThread(d_sid, d_pos, 0)
+                }
             }
-
             JSRxMatch.next_count = 0
             i = 0
             WhileLoop LessThan(i, JSRxMatch.thread_count) {
                 thread = JSRx_GetThread(i)
                 state_id = Dereference(thread)
-
-                result = JSRx_ProcessState(states, state_id, ch, thread)
-
-                IfCondition EqualTo(result, 1) ThenBlock: {
-                    match_len = Subtract(JSRxMatch.pos, start_pos)
-                    ReturnValue(match_len)
+                tpos = Dereference(Add(thread, 8))
+                // drive global pos for SAVE / assertions
+                JSRxMatch.pos = tpos
+                ch = 0
+                IfCondition And(GreaterEqual(tpos, 0), LessThan(tpos, JSRxMatch.text_len)) ThenBlock: {
+                    ch = JSRT_StrUnit(text, tpos)
                 }
-
+                // past end: ch=0; still process epsilon/MATCH/ASSERT_END
+                result = JSRx_ProcessState(states, state_id, ch, thread)
+                IfCondition EqualTo(result, 1) ThenBlock: {
+                    match_len = Subtract(tpos, start_pos)
+                    // Prefer longer; among equal length keep first (left alt wins)
+                    IfCondition GreaterThan(match_len, best_len) ThenBlock: {
+                        best_len = match_len
+                        IfCondition And(NotEqual(best_caps, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                            MemoryCopy(best_caps, JSRxMatch.captures, 512)
+                        }
+                    }
+                }
                 i = Add(i, 1)
             }
-
-            IfCondition LessThan(JSRxMatch.pos, JSRxMatch.text_len) ThenBlock: {
-                temp = JSRxMatch.threads
-                JSRxMatch.threads = JSRxMatch.next_threads
-                JSRxMatch.next_threads = temp
-                JSRxMatch.thread_count = JSRxMatch.next_count
-
-                IfCondition EqualTo(JSRxMatch.thread_count, 0) ThenBlock: {
-                    ReturnValue(-1)
-                }
-            } ElseBlock: {
-                BreakLoop
-            }
-
-            JSRxMatch.pos = Add(JSRxMatch.pos, 1)
+            // swap generations
+            temp = JSRxMatch.threads
+            JSRxMatch.threads = JSRxMatch.next_threads
+            JSRxMatch.next_threads = temp
+            JSRxMatch.thread_count = JSRxMatch.next_count
         }
 
-        // Check final states
-        i = 0
-        WhileLoop LessThan(i, JSRxMatch.thread_count) {
-            thread = JSRx_GetThread(i)
-            state_id = Dereference(thread)
-            state_type = JSRx_GetStateType(states, state_id)
-
-            IfCondition EqualTo(state_type, JSRxStateType.MATCH) ThenBlock: {
-                match_len = Subtract(JSRxMatch.pos, start_pos)
-                ReturnValue(match_len)
-            }
-
-            i = Add(i, 1)
+        IfCondition And(And(NotEqual(best_caps, 0), NotEqual(JSRxMatch.captures, 0)), GreaterEqual(best_len, 0)) ThenBlock: {
+            MemoryCopy(JSRxMatch.captures, best_caps, 512)
         }
+        IfCondition NotEqual(best_caps, 0) ThenBlock: {
+            Deallocate(best_caps, 512)
+        }
+        JSRx_DeferClear()
+        ReturnValue(best_len)
+    }
+}
 
-        ReturnValue(-1)
+// M30i: deferred right-hand alternatives
+Function.JSRx_DeferClear {
+    Body: {
+        JSRxDefer.count = 0
+        IfCondition EqualTo(JSRxDefer.buf, 0) ThenBlock: {
+            JSRxDefer.buf = Allocate(Multiply(JSRxDefer.cap, 16))
+        }
+    }
+}
+
+Function.JSRx_DeferPush {
+    Input: state_id: Integer
+    Input: pos: Integer
+    Body: {
+        IfCondition EqualTo(JSRxDefer.buf, 0) ThenBlock: {
+            JSRx_DeferClear()
+        }
+        IfCondition GreaterEqual(JSRxDefer.count, JSRxDefer.cap) ThenBlock: {
+            ReturnValue(0)
+        }
+        ent = Add(JSRxDefer.buf, Multiply(JSRxDefer.count, 16))
+        StoreValue(ent, state_id)
+        StoreValue(Add(ent, 8), pos)
+        JSRxDefer.count = Add(JSRxDefer.count, 1)
+        ReturnValue(1)
+    }
+}
+
+Function.JSRx_DeferPopState {
+    Output: Integer
+    Body: {
+        IfCondition LessEqual(JSRxDefer.count, 0) ThenBlock: { ReturnValue(-1) }
+        JSRxDefer.count = Subtract(JSRxDefer.count, 1)
+        ent = Add(JSRxDefer.buf, Multiply(JSRxDefer.count, 16))
+        ReturnValue(Dereference(ent))
+    }
+}
+
+Function.JSRx_DeferPopPos {
+    Output: Integer
+    Body: {
+        // call after PopState; count already decremented — read same slot
+        ent = Add(JSRxDefer.buf, Multiply(JSRxDefer.count, 16))
+        ReturnValue(Dereference(Add(ent, 8)))
     }
 }
 
@@ -394,7 +769,7 @@ Function.JSRegex_Search {
         WhileLoop LessEqual(JSRxMatch.pos, JSRxMatch.text_len) {
             ch = 0
             IfCondition LessThan(JSRxMatch.pos, JSRxMatch.text_len) ThenBlock: {
-                ch = GetByte(text, JSRxMatch.pos)
+                ch = JSRT_StrUnit(text, JSRxMatch.pos)
             }
 
             JSRx_AddThread(start_state, JSRxMatch.pos, 0)
@@ -499,7 +874,7 @@ Function.JSRx_ParseAlt {
                 BreakLoop
             }
 
-            ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+            ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
             IfCondition NotEqual(ch, 124) ThenBlock: {
                 BreakLoop
             }
@@ -511,7 +886,8 @@ Function.JSRx_ParseAlt {
                 ReturnValue(0)
             }
 
-            split = JSRx_AddState(JSRxStateType.SPLIT, 0, 0)
+            // data2=1 marks | alternation (vs quantifier SPLIT) for left-first capture
+            split = JSRx_AddState(JSRxStateType.SPLIT, 0, 1)
             left_start = Dereference(left)
             right_start = Dereference(right)
             JSRx_SetStateOut1(split, left_start)
@@ -544,7 +920,7 @@ Function.JSRx_ParseSeq {
                 BreakLoop
             }
 
-            ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+            ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
 
             IfCondition EqualTo(ch, 124) ThenBlock: { BreakLoop }
             IfCondition EqualTo(ch, 41) ThenBlock: { BreakLoop }
@@ -596,7 +972,7 @@ Function.JSRx_ParseAtom {
             ReturnValue(0)
         }
 
-        ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+        ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
 
         IfCondition EqualTo(ch, 46) ThenBlock: {
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
@@ -636,17 +1012,137 @@ Function.JSRx_ParseAtom {
 
         IfCondition EqualTo(ch, 40) ThenBlock: {
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            // M30d/f: (?:) (?=) (?!) ( capturing )
+            is_cap = 1
+            is_la = 0
+            // 0=none, 1=pos, 2=neg
+            IfCondition LessThan(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                IfCondition EqualTo(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 63) ThenBlock: {
+                    IfCondition LessThan(Add(JSRxCompiler.pos, 1), JSRxCompiler.len) ThenBlock: {
+                        q2 = JSRT_StrUnit(JSRxCompiler.pattern, Add(JSRxCompiler.pos, 1))
+                        // (?: non-capturing
+                        IfCondition EqualTo(q2, 58) ThenBlock: {
+                            is_cap = 0
+                            JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
+                        }
+                        // (?= positive lookahead
+                        IfCondition EqualTo(q2, 61) ThenBlock: {
+                            is_cap = 0
+                            is_la = 1
+                            JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
+                        }
+                        // (?! negative lookahead
+                        IfCondition EqualTo(q2, 33) ThenBlock: {
+                            is_cap = 0
+                            is_la = 2
+                            JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
+                        }
+                        // (?<= lookbehind / (?<! / (?<name> named capture
+                        IfCondition EqualTo(q2, 60) ThenBlock: {
+                            IfCondition LessThan(Add(JSRxCompiler.pos, 2), JSRxCompiler.len) ThenBlock: {
+                                q3 = JSRT_StrUnit(JSRxCompiler.pattern, Add(JSRxCompiler.pos, 2))
+                                IfCondition EqualTo(q3, 61) ThenBlock: {
+                                    // (?<=
+                                    is_cap = 0
+                                    is_la = 3
+                                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 3)
+                                }
+                                IfCondition EqualTo(q3, 33) ThenBlock: {
+                                    // (?<!
+                                    is_cap = 0
+                                    is_la = 4
+                                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 3)
+                                }
+                                // M30h/i: (?<name> named capturing group
+                                IfCondition And(NotEqual(q3, 61), NotEqual(q3, 33)) ThenBlock: {
+                                    is_cap = 1
+                                    is_la = 0
+                                    // skip '?<', then name until '>'
+                                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
+                                    ns_chk = JSRxCompiler.pos
+                                    WhileLoop And(LessThan(JSRxCompiler.pos, JSRxCompiler.len), NotEqual(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 62)) {
+                                        JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                                    }
+                                    IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                                        JSRxCompiler.error = 1
+                                        ReturnValue(0)
+                                    }
+                                    nlen_chk = Subtract(JSRxCompiler.pos, ns_chk)
+                                    // M30i: empty name or digit-start → SyntaxError
+                                    IfCondition EqualTo(nlen_chk, 0) ThenBlock: {
+                                        JSRxCompiler.error = 1
+                                        ReturnValue(0)
+                                    }
+                                    fc = JSRT_StrUnit(JSRxCompiler.pattern, ns_chk)
+                                    IfCondition And(GreaterEqual(fc, 48), LessEqual(fc, 57)) ThenBlock: {
+                                        JSRxCompiler.error = 1
+                                        ReturnValue(0)
+                                    }
+                                    // skip '>'
+                                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            gid = 0
+            IfCondition EqualTo(is_cap, 1) ThenBlock: {
+                JSRxCompiler.group_count = Add(JSRxCompiler.group_count, 1)
+                gid = JSRxCompiler.group_count
+            }
             sub = JSRx_ParseAlt()
             IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
                 JSRxCompiler.error = 1
                 ReturnValue(0)
             }
-            ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+            ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
             IfCondition NotEqual(ch, 41) ThenBlock: {
                 JSRxCompiler.error = 1
                 ReturnValue(0)
             }
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            // Lookahead / lookbehind: zero-width assertion
+            // is_la: 1=(?=) 2=(?!) 3=(?<=) 4=(?<!)
+            IfCondition GreaterThan(is_la, 0) ThenBlock: {
+                sub_start = Dereference(sub)
+                match_s = JSRx_AddState(JSRxStateType.MATCH, 0, 0)
+                sub_out = Dereference(Add(sub, 8))
+                JSRx_PatchList(sub_out, match_s)
+                IfCondition Or(EqualTo(is_la, 3), EqualTo(is_la, 4)) ThenBlock: {
+                    // lookbehind
+                    lb_kind = 1
+                    IfCondition EqualTo(is_la, 4) ThenBlock: { lb_kind = 2 }
+                    la_state = JSRx_AddState(JSRxStateType.LOOKBEHIND, sub_start, lb_kind)
+                } ElseBlock: {
+                    la_state = JSRx_AddState(JSRxStateType.LOOKAHEAD, sub_start, is_la)
+                }
+                frag = JSRx_FragAlloc()
+                IfCondition NotEqual(frag, 0) ThenBlock: {
+                    StoreValue(frag, la_state)
+                    list = JSRx_CreateList(la_state)
+                    StoreValue(Add(frag, 8), list)
+                }
+                ReturnValue(JSRx_ParsePost(frag))
+            }
+            // Wrap capturing group with SAVE open/close
+            IfCondition And(EqualTo(is_cap, 1), GreaterThan(gid, 0)) ThenBlock: {
+                open_slot = Multiply(Subtract(gid, 1), 2)
+                close_slot = Add(open_slot, 1)
+                s_open = JSRx_AddState(JSRxStateType.SAVE, open_slot, 0)
+                s_close = JSRx_AddState(JSRxStateType.SAVE, close_slot, 0)
+                sub_start = Dereference(sub)
+                sub_out = Dereference(Add(sub, 8))
+                JSRx_SetStateOut1(s_open, sub_start)
+                JSRx_PatchList(sub_out, s_close)
+                close_list = JSRx_CreateList(s_close)
+                wrapped = JSRx_FragAlloc()
+                IfCondition NotEqual(wrapped, 0) ThenBlock: {
+                    StoreValue(wrapped, s_open)
+                    StoreValue(Add(wrapped, 8), close_list)
+                }
+                ReturnValue(JSRx_ParsePost(wrapped))
+            }
             ReturnValue(JSRx_ParsePost(sub))
         }
 
@@ -660,12 +1156,227 @@ Function.JSRx_ParseAtom {
                 JSRxCompiler.error = 1
                 ReturnValue(0)
             }
-            ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+            ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
 
+            // M30d: class escapes \d \D \w \W \s \S as RANGE bitmaps
+            is_class_esc = 0
+            neg_esc = 0
+            IfCondition EqualTo(ch, 100) ThenBlock: { is_class_esc = 1 } // \d
+            IfCondition EqualTo(ch, 68) ThenBlock: { is_class_esc = 1 neg_esc = 1 } // \D
+            IfCondition EqualTo(ch, 119) ThenBlock: { is_class_esc = 2 } // \w
+            IfCondition EqualTo(ch, 87) ThenBlock: { is_class_esc = 2 neg_esc = 1 } // \W
+            IfCondition EqualTo(ch, 115) ThenBlock: { is_class_esc = 3 } // \s
+            IfCondition EqualTo(ch, 83) ThenBlock: { is_class_esc = 3 neg_esc = 1 } // \S
+            IfCondition EqualTo(ch, 98) ThenBlock: {
+                // \b word boundary
+                state = JSRx_AddState(JSRxStateType.WORD_BOUNDARY, 0, 0)
+                frag = JSRx_FragAlloc()
+                IfCondition NotEqual(frag, 0) ThenBlock: {
+                    StoreValue(frag, state)
+                    list = JSRx_CreateList(state)
+                    StoreValue(Add(frag, 8), list)
+                }
+                ReturnValue(frag)
+            }
+            IfCondition EqualTo(ch, 66) ThenBlock: {
+                // \B
+                state = JSRx_AddState(JSRxStateType.NOT_WORD_BOUNDARY, 0, 0)
+                frag = JSRx_FragAlloc()
+                IfCondition NotEqual(frag, 0) ThenBlock: {
+                    StoreValue(frag, state)
+                    list = JSRx_CreateList(state)
+                    StoreValue(Add(frag, 8), list)
+                }
+                ReturnValue(frag)
+            }
+            // M31b P2: \p{…} / \P{…} Unicode property escapes
+            IfCondition Or(EqualTo(ch, 112), EqualTo(ch, 80)) ThenBlock: {
+                // 'p' or 'P'
+                prop_neg = 0
+                IfCondition EqualTo(ch, 80) ThenBlock: { prop_neg = 1 }
+                IfCondition And(LessThan(JSRxCompiler.pos, JSRxCompiler.len), EqualTo(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 123)) ThenBlock: {
+                    // requires unicode flag
+                    IfCondition EqualTo(BitwiseAnd(JSRxCompiler.flags, JSRxFlags.UNICODE), 0) ThenBlock: {
+                        JSRxCompiler.error = 1
+                        ReturnValue(0)
+                    }
+                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                    ns = JSRxCompiler.pos
+                    WhileLoop And(LessThan(JSRxCompiler.pos, JSRxCompiler.len), NotEqual(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 125)) {
+                        JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                    }
+                    IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                        JSRxCompiler.error = 1
+                        ReturnValue(0)
+                    }
+                    nlen = Subtract(JSRxCompiler.pos, ns)
+                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                    IfCondition EqualTo(nlen, 0) ThenBlock: {
+                        JSRxCompiler.error = 1
+                        ReturnValue(0)
+                    }
+                    // Copy name to temp C buffer (pattern may be C or UTF-16; units are ASCII)
+                    nbuf = Allocate(Add(nlen, 1))
+                    IfCondition EqualTo(nbuf, 0) ThenBlock: {
+                        JSRxCompiler.error = 1
+                        ReturnValue(0)
+                    }
+                    ni = 0
+                    WhileLoop LessThan(ni, nlen) {
+                        SetByte(nbuf, ni, JSRT_StrUnit(JSRxCompiler.pattern, Add(ns, ni)))
+                        ni = Add(ni, 1)
+                    }
+                    SetByte(nbuf, nlen, 0)
+                    // Resolve first (covers General_Category=digit, gc=Nd, loose names).
+                    // Unresolved Name=Value for binary props (ASCII=Y) → SyntaxError.
+                    pid = JSRx_PropResolve(nbuf, nlen)
+                    Deallocate(nbuf, Add(nlen, 1))
+                    IfCondition EqualTo(pid, 0) ThenBlock: {
+                        JSRxCompiler.error = 1
+                        ReturnValue(0)
+                    }
+                    state = JSRx_AddState(JSRxStateType.PROP, pid, prop_neg)
+                    frag = JSRx_FragAlloc()
+                    IfCondition NotEqual(frag, 0) ThenBlock: {
+                        StoreValue(frag, state)
+                        list = JSRx_CreateList(state)
+                        StoreValue(Add(frag, 8), list)
+                    }
+                    ReturnValue(JSRx_ParsePost(frag))
+                }
+                // \p without { — with u is error; without u fall through as literal p
+                IfCondition NotEqual(BitwiseAnd(JSRxCompiler.flags, JSRxFlags.UNICODE), 0) ThenBlock: {
+                    JSRxCompiler.error = 1
+                    ReturnValue(0)
+                }
+            }
+            // M30h: named backref \k<name>
+            IfCondition EqualTo(ch, 107) ThenBlock: {
+                IfCondition And(LessThan(JSRxCompiler.pos, JSRxCompiler.len), EqualTo(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 60)) ThenBlock: {
+                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                    ns = JSRxCompiler.pos
+                    WhileLoop And(LessThan(JSRxCompiler.pos, JSRxCompiler.len), NotEqual(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 62)) {
+                        JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                    }
+                    IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                        JSRxCompiler.error = 1
+                        ReturnValue(0)
+                    }
+                    nlen = Subtract(JSRxCompiler.pos, ns)
+                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                    // M30j: named backref — data2=1 marks multi-name (duplicate groups)
+                    // data1 = first gnum; at match time scan all groups with same name
+                    gnum = JSRx_LookupName(Add(JSRxCompiler.pattern, ns), nlen)
+                    // Store name start/len in a small side table index via data2 high bit?
+                    // Use BACKREF gnum with data2 = name table scan key: 0 = single, >0 = name_idx+1
+                    // Simpler: always multi-scan by name string at match if we keep name on state.
+                    // data1 = packed: store first gnum; data2 = nlen; name bytes copied to class pool
+                    // Even simpler: data2=2 means "named multi"; name ptr in a parallel compile-time
+                    // For now: data1=gnum (first), data2=1 → try all gnums sharing name of gnum
+                    nm_flag = 0
+                    IfCondition GreaterThan(gnum, 0) ThenBlock: { nm_flag = 1 }
+                    state = JSRx_AddState(JSRxStateType.BACKREF, gnum, nm_flag)
+                    frag = JSRx_FragAlloc()
+                    IfCondition NotEqual(frag, 0) ThenBlock: {
+                        StoreValue(frag, state)
+                        list = JSRx_CreateList(state)
+                        StoreValue(Add(frag, 8), list)
+                    }
+                    ReturnValue(JSRx_ParsePost(frag))
+                }
+            }
+            // M30f: backrefs \1..\9 (+ multi-digit if groups allow)
+            IfCondition And(GreaterEqual(ch, 49), LessEqual(ch, 57)) ThenBlock: {
+                gnum = Subtract(ch, 48)
+                WhileLoop LessThan(JSRxCompiler.pos, JSRxCompiler.len) {
+                    nd = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
+                    IfCondition Or(LessThan(nd, 48), GreaterThan(nd, 57)) ThenBlock: {
+                        BreakLoop
+                    }
+                    cand = Add(Multiply(gnum, 10), Subtract(nd, 48))
+                    IfCondition GreaterThan(cand, JSRxCompiler.group_count) ThenBlock: {
+                        BreakLoop
+                    }
+                    IfCondition GreaterThan(cand, 99) ThenBlock: {
+                        BreakLoop
+                    }
+                    gnum = cand
+                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                }
+                state = JSRx_AddState(JSRxStateType.BACKREF, gnum, 0)
+                frag = JSRx_FragAlloc()
+                IfCondition NotEqual(frag, 0) ThenBlock: {
+                    StoreValue(frag, state)
+                    list = JSRx_CreateList(state)
+                    StoreValue(Add(frag, 8), list)
+                }
+                ReturnValue(JSRx_ParsePost(frag))
+            }
+            IfCondition GreaterThan(is_class_esc, 0) ThenBlock: {
+                bitmap = JSRx_ClassAlloc()
+                IfCondition EqualTo(bitmap, 0) ThenBlock: {
+                    JSRxCompiler.error = 1
+                    ReturnValue(0)
+                }
+                bi = 0
+                WhileLoop LessThan(bi, 32) {
+                    SetByte(bitmap, bi, 0)
+                    bi = Add(bi, 1)
+                }
+                IfCondition EqualTo(is_class_esc, 1) ThenBlock: {
+                    // digits 0-9
+                    dj = 48
+                    WhileLoop LessEqual(dj, 57) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                }
+                IfCondition EqualTo(is_class_esc, 2) ThenBlock: {
+                    // word: A-Z a-z 0-9 _
+                    dj = 65
+                    WhileLoop LessEqual(dj, 90) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    dj = 97
+                    WhileLoop LessEqual(dj, 122) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    dj = 48
+                    WhileLoop LessEqual(dj, 57) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    JSRx_SetBit(bitmap, 95)
+                }
+                IfCondition EqualTo(is_class_esc, 3) ThenBlock: {
+                    // whitespace: tab LF VT FF CR space
+                    JSRx_SetBit(bitmap, 9)
+                    JSRx_SetBit(bitmap, 10)
+                    JSRx_SetBit(bitmap, 11)
+                    JSRx_SetBit(bitmap, 12)
+                    JSRx_SetBit(bitmap, 13)
+                    JSRx_SetBit(bitmap, 32)
+                    JSRx_SetBit(bitmap, 160)
+                }
+                state = JSRx_AddState(JSRxStateType.RANGE, bitmap, neg_esc)
+                frag = JSRx_FragAlloc()
+                IfCondition NotEqual(frag, 0) ThenBlock: {
+                    StoreValue(frag, state)
+                    list = JSRx_CreateList(state)
+                    StoreValue(Add(frag, 8), list)
+                }
+                ReturnValue(JSRx_ParsePost(frag))
+            }
+
+            // single-char escapes
             IfCondition EqualTo(ch, 110) ThenBlock: { ch = 10 }
             IfCondition EqualTo(ch, 114) ThenBlock: { ch = 13 }
             IfCondition EqualTo(ch, 116) ThenBlock: { ch = 9 }
+            IfCondition EqualTo(ch, 102) ThenBlock: { ch = 12 }
+            IfCondition EqualTo(ch, 118) ThenBlock: { ch = 11 }
 
             state = JSRx_AddState(JSRxStateType.CHAR, ch, 0)
             frag = JSRx_FragAlloc()
@@ -702,7 +1413,7 @@ Function.JSRx_ParsePost {
             ReturnValue(atom)
         }
 
-        ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+        ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
 
         IfCondition EqualTo(ch, 42) ThenBlock: {
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
@@ -746,6 +1457,7 @@ Function.JSRx_ParsePost {
 
         IfCondition EqualTo(ch, 63) ThenBlock: {
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            // trailing ? after quantifier = lazy — ignore (treat greedy)
             split = JSRx_AddState(JSRxStateType.SPLIT, 0, 0)
             atom_start = Dereference(atom)
             JSRx_SetStateOut1(split, atom_start)
@@ -765,7 +1477,343 @@ Function.JSRx_ParsePost {
             ReturnValue(result)
         }
 
+        // M30e: {n} {n,} {n,m} brace quantifiers
+        IfCondition EqualTo(ch, 123) ThenBlock: {
+            // Save pos in case not a valid quantifier
+            save_pos = JSRxCompiler.pos
+            JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            // parse min digits
+            min_n = 0
+            has_digit = 0
+            WhileLoop LessThan(JSRxCompiler.pos, JSRxCompiler.len) {
+                dc = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
+                IfCondition Or(LessThan(dc, 48), GreaterThan(dc, 57)) ThenBlock: {
+                    BreakLoop
+                }
+                has_digit = 1
+                min_n = Add(Multiply(min_n, 10), Subtract(dc, 48))
+                JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                // cap absurd
+                IfCondition GreaterThan(min_n, 100) ThenBlock: { min_n = 100 }
+            }
+            IfCondition EqualTo(has_digit, 0) ThenBlock: {
+                // not a quantifier — restore, treat as literal later
+                JSRxCompiler.pos = save_pos
+                ReturnValue(atom)
+            }
+            max_n = min_n
+            unbounded = 0
+            IfCondition LessThan(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                IfCondition EqualTo(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 44) ThenBlock: {
+                    // comma present
+                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                    // optional max
+                    has_max = 0
+                    max_n = 0
+                    WhileLoop LessThan(JSRxCompiler.pos, JSRxCompiler.len) {
+                        dc = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
+                        IfCondition Or(LessThan(dc, 48), GreaterThan(dc, 57)) ThenBlock: {
+                            BreakLoop
+                        }
+                        has_max = 1
+                        max_n = Add(Multiply(max_n, 10), Subtract(dc, 48))
+                        JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                        IfCondition GreaterThan(max_n, 100) ThenBlock: { max_n = 100 }
+                    }
+                    IfCondition EqualTo(has_max, 0) ThenBlock: {
+                        unbounded = 1
+                        max_n = min_n
+                    }
+                }
+            }
+            // expect }
+            IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                JSRxCompiler.pos = save_pos
+                ReturnValue(atom)
+            }
+            IfCondition NotEqual(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 125) ThenBlock: {
+                JSRxCompiler.pos = save_pos
+                ReturnValue(atom)
+            }
+            JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            // skip lazy ?
+            IfCondition LessThan(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                IfCondition EqualTo(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 63) ThenBlock: {
+                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                }
+            }
+            // invalid range
+            IfCondition And(EqualTo(unbounded, 0), LessThan(max_n, min_n)) ThenBlock: {
+                JSRxCompiler.error = 1
+                ReturnValue(0)
+            }
+            // Build: atom repeated min_n times, then optional up to (max-min) or star if unbounded
+            // {0} → empty
+            IfCondition EqualTo(min_n, 0) ThenBlock: {
+                IfCondition EqualTo(unbounded, 1) ThenBlock: {
+                    // {0,} = *
+                    ReturnValue(JSRx_ApplyStar(atom))
+                }
+                IfCondition EqualTo(max_n, 0) ThenBlock: {
+                    empty = JSRx_AddState(JSRxStateType.EMPTY, 0, 0)
+                    result = JSRx_FragAlloc()
+                    IfCondition NotEqual(result, 0) ThenBlock: {
+                        StoreValue(result, empty)
+                        list = JSRx_CreateList(empty)
+                        StoreValue(Add(result, 8), list)
+                    }
+                    ReturnValue(result)
+                }
+                // {0,m} = optional chain of m atoms
+                result = atom
+                // first optional
+                result = JSRx_ApplyQuestion(result)
+                oi = 1
+                WhileLoop LessThan(oi, max_n) {
+                    // need another optional atom copy — re-parse impossible; use star-limited via nested ?
+                    // approximate: for {0,m} use (atom?){m} via repeated optional concat of SAME atom states
+                    // (sharing atom is wrong for backtracking but OK for pure NFA char matches)
+                    // Safer: apply nested optionals: a(a(a)?)?)?
+                    result = JSRx_ConcatOptional(atom, result)
+                    oi = Add(oi, 1)
+                }
+                ReturnValue(result)
+            }
+            // min_n >= 1: always clone so original atom outs stay unpatched
+            result = JSRx_CloneFrag(atom)
+            IfCondition EqualTo(result, 0) ThenBlock: {
+                result = atom
+            }
+            ci = 1
+            WhileLoop LessThan(ci, min_n) {
+                clone = JSRx_CloneFrag(atom)
+                IfCondition EqualTo(clone, 0) ThenBlock: {
+                    JSRxCompiler.error = 1
+                    ReturnValue(0)
+                }
+                result = JSRx_ConcatFrag(result, clone)
+                ci = Add(ci, 1)
+            }
+            IfCondition EqualTo(unbounded, 1) ThenBlock: {
+                // {n,} = required n then *
+                star_atom = JSRx_CloneFrag(atom)
+                IfCondition EqualTo(star_atom, 0) ThenBlock: {
+                    ReturnValue(result)
+                }
+                star_atom = JSRx_ApplyStar(star_atom)
+                result = JSRx_ConcatFrag(result, star_atom)
+                ReturnValue(result)
+            }
+            // {n,m}: add (m-n) optional atoms
+            extra = Subtract(max_n, min_n)
+            ei = 0
+            WhileLoop LessThan(ei, extra) {
+                opt = JSRx_CloneFrag(atom)
+                IfCondition EqualTo(opt, 0) ThenBlock: {
+                    BreakLoop
+                }
+                opt = JSRx_ApplyQuestion(opt)
+                result = JSRx_ConcatFrag(result, opt)
+                ei = Add(ei, 1)
+            }
+            ReturnValue(result)
+        }
+
         ReturnValue(atom)
+    }
+}
+
+// ─── Frag helpers for brace quantifiers ───
+Function.JSRx_ApplyStar {
+    Input: atom: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(atom, 0) ThenBlock: { ReturnValue(0) }
+        split = JSRx_AddState(JSRxStateType.SPLIT, 0, 0)
+        atom_start = Dereference(atom)
+        JSRx_SetStateOut1(split, atom_start)
+        atom_out = Dereference(Add(atom, 8))
+        JSRx_PatchList(atom_out, split)
+        out = JSRx_CreateList(split)
+        JSRx_SetListNext(out, 1)
+        result = JSRx_FragAlloc()
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            StoreValue(result, split)
+            StoreValue(Add(result, 8), out)
+        }
+        ReturnValue(result)
+    }
+}
+
+Function.JSRx_ApplyQuestion {
+    Input: atom: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(atom, 0) ThenBlock: { ReturnValue(0) }
+        split = JSRx_AddState(JSRxStateType.SPLIT, 0, 0)
+        atom_start = Dereference(atom)
+        JSRx_SetStateOut1(split, atom_start)
+        atom_out = Dereference(Add(atom, 8))
+        split_out = JSRx_CreateList(split)
+        JSRx_SetListNext(split_out, 1)
+        out_list = JSRx_MergeLists(atom_out, split_out)
+        result = JSRx_FragAlloc()
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            StoreValue(result, split)
+            StoreValue(Add(result, 8), out_list)
+        }
+        ReturnValue(result)
+    }
+}
+
+Function.JSRx_ConcatFrag {
+    Input: left: Address
+    Input: right: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(left, 0) ThenBlock: { ReturnValue(right) }
+        IfCondition EqualTo(right, 0) ThenBlock: { ReturnValue(left) }
+        left_out = Dereference(Add(left, 8))
+        right_start = Dereference(right)
+        JSRx_PatchList(left_out, right_start)
+        result = JSRx_FragAlloc()
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            StoreValue(result, Dereference(left))
+            StoreValue(Add(result, 8), Dereference(Add(right, 8)))
+        }
+        ReturnValue(result)
+    }
+}
+
+// For {0,m} nesting: outer optional of atom then inner result
+Function.JSRx_ConcatOptional {
+    Input: atom: Address
+    Input: inner: Address
+    Output: Address
+    Body: {
+        // atom then inner, all optional: (atom inner)?
+        // Actually for {0,m} greedy: a(a(a)?)?)?
+        // Build: atom + inner, then ?
+        joined = JSRx_ConcatFrag(atom, inner)
+        ReturnValue(JSRx_ApplyQuestion(joined))
+    }
+}
+
+// Clone a fragment's NFA states (for brace unrolling)
+Function.JSRx_CloneFrag {
+    Input: frag: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(frag, 0) ThenBlock: { ReturnValue(0) }
+        // Map old state id → new state id for all states reachable from frag
+        // Simple approach: clone ALL states created after a watermark is hard.
+        // Instead: walk BFS from start through out1/out2, clone each once.
+        old_start = Dereference(frag)
+        IfCondition LessThan(old_start, 0) ThenBlock: { ReturnValue(0) }
+        // id map array (max states) on heap
+        map_sz = Multiply(JSRxConstants.MAX_STATES, 8)
+        idmap = Allocate(map_sz)
+        IfCondition EqualTo(idmap, 0) ThenBlock: { ReturnValue(0) }
+        mi = 0
+        WhileLoop LessThan(mi, JSRxConstants.MAX_STATES) {
+            StoreValue(Add(idmap, Multiply(mi, 8)), -1)
+            mi = Add(mi, 1)
+        }
+        // work stack of old ids
+        stack = Allocate(Multiply(JSRxConstants.MAX_STATES, 8))
+        IfCondition EqualTo(stack, 0) ThenBlock: {
+            Deallocate(idmap, map_sz)
+            ReturnValue(0)
+        }
+        sp = 0
+        StoreValue(stack, old_start)
+        sp = 1
+        states = JSRxState.states
+        WhileLoop GreaterThan(sp, 0) {
+            sp = Subtract(sp, 1)
+            oid = Dereference(Add(stack, Multiply(sp, 8)))
+            IfCondition Or(LessThan(oid, 0), GreaterEqual(oid, JSRxState.num_states)) ThenBlock: {
+                ContinueLoop
+            }
+            IfCondition NotEqual(Dereference(Add(idmap, Multiply(oid, 8))), -1) ThenBlock: {
+                ContinueLoop
+            }
+            // clone state
+            off = Multiply(oid, JSRxConstants.STATE_SIZE)
+            base = Add(states, off)
+            typ = Dereference(base)
+            d1 = Dereference(Add(base, 8))
+            d2 = Dereference(Add(base, 16))
+            // RANGE bitmaps: share pointer (read-only after compile)
+            nid = JSRx_AddState(typ, d1, d2)
+            StoreValue(Add(idmap, Multiply(oid, 8)), nid)
+            o1 = Dereference(Add(base, 24))
+            o2 = Dereference(Add(base, 32))
+            IfCondition GreaterEqual(o1, 0) ThenBlock: {
+                StoreValue(Add(stack, Multiply(sp, 8)), o1)
+                sp = Add(sp, 1)
+            }
+            IfCondition GreaterEqual(o2, 0) ThenBlock: {
+                StoreValue(Add(stack, Multiply(sp, 8)), o2)
+                sp = Add(sp, 1)
+            }
+        }
+        // second pass: wire outs
+        mi = 0
+        WhileLoop LessThan(mi, JSRxState.num_states) {
+            nid = Dereference(Add(idmap, Multiply(mi, 8)))
+            IfCondition NotEqual(nid, -1) ThenBlock: {
+                off = Multiply(mi, JSRxConstants.STATE_SIZE)
+                base = Add(states, off)
+                o1 = Dereference(Add(base, 24))
+                o2 = Dereference(Add(base, 32))
+                IfCondition GreaterEqual(o1, 0) ThenBlock: {
+                    n1 = Dereference(Add(idmap, Multiply(o1, 8)))
+                    IfCondition GreaterEqual(n1, 0) ThenBlock: {
+                        JSRx_SetStateOut1(nid, n1)
+                    }
+                }
+                IfCondition GreaterEqual(o2, 0) ThenBlock: {
+                    n2 = Dereference(Add(idmap, Multiply(o2, 8)))
+                    IfCondition GreaterEqual(n2, 0) ThenBlock: {
+                        JSRx_SetStateOut2(nid, n2)
+                    }
+                }
+            }
+            mi = Add(mi, 1)
+        }
+        // new start
+        new_start = Dereference(Add(idmap, Multiply(old_start, 8)))
+        // out list: map each old out entry
+        // list node: +0 state_id, +8 next, +16 is_out2
+        old_out = Dereference(Add(frag, 8))
+        new_out = 0
+        cur = old_out
+        hops = 0
+        WhileLoop And(NotEqual(cur, 0), LessThan(hops, 256)) {
+            hops = Add(hops, 1)
+            os = Dereference(cur)
+            is2 = Dereference(Add(cur, 16))
+            ns = Dereference(Add(idmap, Multiply(os, 8)))
+            IfCondition NotEqual(ns, -1) ThenBlock: {
+                node = JSRx_CreateList(ns)
+                JSRx_SetListNext(node, is2)
+                IfCondition EqualTo(new_out, 0) ThenBlock: {
+                    new_out = node
+                } ElseBlock: {
+                    new_out = JSRx_MergeLists(new_out, node)
+                }
+            }
+            cur = Dereference(Add(cur, 8))
+        }
+        Deallocate(stack, Multiply(JSRxConstants.MAX_STATES, 8))
+        Deallocate(idmap, map_sz)
+        result = JSRx_FragAlloc()
+        IfCondition NotEqual(result, 0) ThenBlock: {
+            StoreValue(result, new_start)
+            StoreValue(Add(result, 8), new_out)
+        }
+        ReturnValue(result)
     }
 }
 
@@ -775,7 +1823,7 @@ Function.JSRx_ParseClass {
         JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
 
         negated = 0
-        ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+        ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
         IfCondition EqualTo(ch, 94) ThenBlock: {
             negated = 1
             JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
@@ -793,6 +1841,16 @@ Function.JSRx_ParseClass {
             SetByte(bitmap, i, 0)
             i = Add(i, 1)
         }
+        // M31b: property escapes collected for SPLIT/PROP class alts
+        JSRxCompiler.cls_nprops = 0
+        has_any_bit = 0
+        // M31c: v-mode set ops — 0=union, 1=intersect, 2=subtract
+        v_mode = 0
+        IfCondition NotEqual(BitwiseAnd(JSRxCompiler.flags, JSRxFlags.UNICODE_SETS), 0) ThenBlock: {
+            v_mode = 1
+        }
+        set_op = 0
+        have_left = 0
 
         WhileLoop 1 {
             IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
@@ -800,23 +1858,288 @@ Function.JSRx_ParseClass {
                 ReturnValue(0)
             }
 
-            ch = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+            ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
 
             IfCondition EqualTo(ch, 93) ThenBlock: {
                 JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
                 BreakLoop
             }
 
-            JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            // M31c unicodeSets: && intersection, -- difference
+            IfCondition EqualTo(v_mode, 1) ThenBlock: {
+                IfCondition EqualTo(ch, 38) ThenBlock: {
+                    // '&'
+                    IfCondition And(LessThan(Add(JSRxCompiler.pos, 1), JSRxCompiler.len), EqualTo(JSRT_StrUnit(JSRxCompiler.pattern, Add(JSRxCompiler.pos, 1)), 38)) ThenBlock: {
+                        JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
+                        set_op = 1
+                        ContinueLoop
+                    }
+                }
+                IfCondition EqualTo(ch, 45) ThenBlock: {
+                    // '--' difference (not range)
+                    IfCondition And(LessThan(Add(JSRxCompiler.pos, 1), JSRxCompiler.len), EqualTo(JSRT_StrUnit(JSRxCompiler.pattern, Add(JSRxCompiler.pos, 1)), 45)) ThenBlock: {
+                        JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
+                        set_op = 2
+                        ContinueLoop
+                    }
+                }
+                // Nested class [[...]]
+                IfCondition EqualTo(ch, 91) ThenBlock: {
+                    nest_frag = JSRx_ParseClass()
+                    IfCondition Or(EqualTo(nest_frag, 0), EqualTo(JSRxCompiler.error, 1)) ThenBlock: {
+                        ReturnValue(0)
+                    }
+                    // Extract RANGE bitmap from nested frag start state if present
+                    nest_st = Dereference(nest_frag)
+                    nest_bmp = 0
+                    IfCondition GreaterEqual(nest_st, 0) ThenBlock: {
+                        soff = Multiply(nest_st, JSRxConstants.STATE_SIZE)
+                        st_addr = Add(JSRxState.states, soff)
+                        st_type = Dereference(st_addr)
+                        IfCondition EqualTo(st_type, JSRxStateType.RANGE) ThenBlock: {
+                            nest_bmp = Dereference(Add(st_addr, 8))
+                            nest_neg = Dereference(Add(st_addr, 16))
+                            // Apply nest_bmp into our bitmap with set_op
+                            bi = 0
+                            WhileLoop LessThan(bi, 256) {
+                                hit = JSRx_TestBit(nest_bmp, bi)
+                                IfCondition EqualTo(nest_neg, 1) ThenBlock: {
+                                    hit = JSRx_Not2(hit)
+                                }
+                                IfCondition EqualTo(set_op, 0) ThenBlock: {
+                                    // union
+                                    IfCondition NotEqual(hit, 0) ThenBlock: {
+                                        JSRx_SetBit(bitmap, bi)
+                                        has_any_bit = 1
+                                    }
+                                }
+                                IfCondition EqualTo(set_op, 1) ThenBlock: {
+                                    // intersect: clear bits not in nest
+                                    IfCondition EqualTo(hit, 0) ThenBlock: {
+                                        // clear bit bi in bitmap
+                                        byte_offset = Divide(bi, 8)
+                                        bit_offset = Modulo(bi, 8)
+                                        bv = GetByte(bitmap, byte_offset)
+                                        mask = LeftShift(1, bit_offset)
+                                        // clear: bv & ~mask
+                                        inv = Subtract(255, mask)
+                                        // careful: mask may be >255 for bit_offset issues - bit 0-7 only
+                                        IfCondition EqualTo(bit_offset, 0) ThenBlock: { inv = 254 }
+                                        IfCondition EqualTo(bit_offset, 1) ThenBlock: { inv = 253 }
+                                        IfCondition EqualTo(bit_offset, 2) ThenBlock: { inv = 251 }
+                                        IfCondition EqualTo(bit_offset, 3) ThenBlock: { inv = 247 }
+                                        IfCondition EqualTo(bit_offset, 4) ThenBlock: { inv = 239 }
+                                        IfCondition EqualTo(bit_offset, 5) ThenBlock: { inv = 223 }
+                                        IfCondition EqualTo(bit_offset, 6) ThenBlock: { inv = 191 }
+                                        IfCondition EqualTo(bit_offset, 7) ThenBlock: { inv = 127 }
+                                        SetByte(bitmap, byte_offset, BitwiseAnd(bv, inv))
+                                    }
+                                }
+                                IfCondition EqualTo(set_op, 2) ThenBlock: {
+                                    // subtract: clear bits in nest
+                                    IfCondition NotEqual(hit, 0) ThenBlock: {
+                                        byte_offset = Divide(bi, 8)
+                                        bit_offset = Modulo(bi, 8)
+                                        bv = GetByte(bitmap, byte_offset)
+                                        IfCondition EqualTo(bit_offset, 0) ThenBlock: { inv = 254 }
+                                        IfCondition EqualTo(bit_offset, 1) ThenBlock: { inv = 253 }
+                                        IfCondition EqualTo(bit_offset, 2) ThenBlock: { inv = 251 }
+                                        IfCondition EqualTo(bit_offset, 3) ThenBlock: { inv = 247 }
+                                        IfCondition EqualTo(bit_offset, 4) ThenBlock: { inv = 239 }
+                                        IfCondition EqualTo(bit_offset, 5) ThenBlock: { inv = 223 }
+                                        IfCondition EqualTo(bit_offset, 6) ThenBlock: { inv = 191 }
+                                        IfCondition EqualTo(bit_offset, 7) ThenBlock: { inv = 127 }
+                                        SetByte(bitmap, byte_offset, BitwiseAnd(bv, inv))
+                                    }
+                                }
+                                bi = Add(bi, 1)
+                            }
+                            have_left = 1
+                            set_op = 0
+                        }
+                    }
+                    ContinueLoop
+                }
+            }
+
+            // M30e: escapes inside class \d \D \w \W \s \S and \n etc.
+            IfCondition EqualTo(ch, 92) ThenBlock: {
+                JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                    BreakLoop
+                }
+                esc = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
+                JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                // M31b: \p{}/\P{} inside class
+                IfCondition Or(EqualTo(esc, 112), EqualTo(esc, 80)) ThenBlock: {
+                    prop_neg = 0
+                    IfCondition EqualTo(esc, 80) ThenBlock: { prop_neg = 1 }
+                    IfCondition And(LessThan(JSRxCompiler.pos, JSRxCompiler.len), EqualTo(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 123)) ThenBlock: {
+                        IfCondition EqualTo(BitwiseAnd(JSRxCompiler.flags, JSRxFlags.UNICODE), 0) ThenBlock: {
+                            JSRxCompiler.error = 1
+                            ReturnValue(0)
+                        }
+                        JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                        ns = JSRxCompiler.pos
+                        WhileLoop And(LessThan(JSRxCompiler.pos, JSRxCompiler.len), NotEqual(JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos), 125)) {
+                            JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                        }
+                        IfCondition GreaterEqual(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                            JSRxCompiler.error = 1
+                            ReturnValue(0)
+                        }
+                        nlen = Subtract(JSRxCompiler.pos, ns)
+                        JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                        IfCondition EqualTo(nlen, 0) ThenBlock: {
+                            JSRxCompiler.error = 1
+                            ReturnValue(0)
+                        }
+                        nbuf = Allocate(Add(nlen, 1))
+                        IfCondition EqualTo(nbuf, 0) ThenBlock: {
+                            JSRxCompiler.error = 1
+                            ReturnValue(0)
+                        }
+                        ni = 0
+                        WhileLoop LessThan(ni, nlen) {
+                            SetByte(nbuf, ni, JSRT_StrUnit(JSRxCompiler.pattern, Add(ns, ni)))
+                            ni = Add(ni, 1)
+                        }
+                        SetByte(nbuf, nlen, 0)
+                        // Resolve (loose + Name=Value for GC); unknown → SyntaxError
+                        pid = JSRx_PropResolve(nbuf, nlen)
+                        Deallocate(nbuf, Add(nlen, 1))
+                        IfCondition EqualTo(pid, 0) ThenBlock: {
+                            JSRxCompiler.error = 1
+                            ReturnValue(0)
+                        }
+                        // pack prop: low 16 = pid, bit16 = prop_neg
+                        packed = pid
+                        IfCondition EqualTo(prop_neg, 1) ThenBlock: {
+                            packed = Add(packed, 65536)
+                        }
+                        np = JSRxCompiler.cls_nprops
+                        IfCondition EqualTo(np, 0) ThenBlock: { JSRxCompiler.cls_prop0 = packed }
+                        IfCondition EqualTo(np, 1) ThenBlock: { JSRxCompiler.cls_prop1 = packed }
+                        IfCondition EqualTo(np, 2) ThenBlock: { JSRxCompiler.cls_prop2 = packed }
+                        IfCondition EqualTo(np, 3) ThenBlock: { JSRxCompiler.cls_prop3 = packed }
+                        IfCondition EqualTo(np, 4) ThenBlock: { JSRxCompiler.cls_prop4 = packed }
+                        IfCondition EqualTo(np, 5) ThenBlock: { JSRxCompiler.cls_prop5 = packed }
+                        IfCondition EqualTo(np, 6) ThenBlock: { JSRxCompiler.cls_prop6 = packed }
+                        IfCondition EqualTo(np, 7) ThenBlock: { JSRxCompiler.cls_prop7 = packed }
+                        IfCondition LessThan(np, 8) ThenBlock: {
+                            JSRxCompiler.cls_nprops = Add(np, 1)
+                        }
+                        ContinueLoop
+                    }
+                }
+                IfCondition EqualTo(esc, 100) ThenBlock: {
+                    // \d
+                    dj = 48
+                    WhileLoop LessEqual(dj, 57) {
+                        JSRx_SetBit(bitmap, dj)
+                        has_any_bit = 1
+                        dj = Add(dj, 1)
+                    }
+                    ContinueLoop
+                }
+                IfCondition EqualTo(esc, 68) ThenBlock: {
+                    // \D — all non-digits
+                    dj = 0
+                    WhileLoop LessThan(dj, 256) {
+                        IfCondition Or(LessThan(dj, 48), GreaterThan(dj, 57)) ThenBlock: {
+                            JSRx_SetBit(bitmap, dj)
+                        }
+                        dj = Add(dj, 1)
+                    }
+                    ContinueLoop
+                }
+                IfCondition EqualTo(esc, 119) ThenBlock: {
+                    dj = 65
+                    WhileLoop LessEqual(dj, 90) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    dj = 97
+                    WhileLoop LessEqual(dj, 122) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    dj = 48
+                    WhileLoop LessEqual(dj, 57) {
+                        JSRx_SetBit(bitmap, dj)
+                        dj = Add(dj, 1)
+                    }
+                    JSRx_SetBit(bitmap, 95)
+                    ContinueLoop
+                }
+                IfCondition EqualTo(esc, 87) ThenBlock: {
+                    dj = 0
+                    WhileLoop LessThan(dj, 256) {
+                        is_w = 0
+                        IfCondition And(GreaterEqual(dj, 48), LessEqual(dj, 57)) ThenBlock: { is_w = 1 }
+                        IfCondition And(GreaterEqual(dj, 65), LessEqual(dj, 90)) ThenBlock: { is_w = 1 }
+                        IfCondition And(GreaterEqual(dj, 97), LessEqual(dj, 122)) ThenBlock: { is_w = 1 }
+                        IfCondition EqualTo(dj, 95) ThenBlock: { is_w = 1 }
+                        IfCondition EqualTo(is_w, 0) ThenBlock: {
+                            JSRx_SetBit(bitmap, dj)
+                        }
+                        dj = Add(dj, 1)
+                    }
+                    ContinueLoop
+                }
+                IfCondition EqualTo(esc, 115) ThenBlock: {
+                    JSRx_SetBit(bitmap, 9)
+                    JSRx_SetBit(bitmap, 10)
+                    JSRx_SetBit(bitmap, 11)
+                    JSRx_SetBit(bitmap, 12)
+                    JSRx_SetBit(bitmap, 13)
+                    JSRx_SetBit(bitmap, 32)
+                    JSRx_SetBit(bitmap, 160)
+                    ContinueLoop
+                }
+                IfCondition EqualTo(esc, 83) ThenBlock: {
+                    dj = 0
+                    WhileLoop LessThan(dj, 256) {
+                        is_s = 0
+                        IfCondition EqualTo(dj, 9) ThenBlock: { is_s = 1 }
+                        IfCondition EqualTo(dj, 10) ThenBlock: { is_s = 1 }
+                        IfCondition EqualTo(dj, 11) ThenBlock: { is_s = 1 }
+                        IfCondition EqualTo(dj, 12) ThenBlock: { is_s = 1 }
+                        IfCondition EqualTo(dj, 13) ThenBlock: { is_s = 1 }
+                        IfCondition EqualTo(dj, 32) ThenBlock: { is_s = 1 }
+                        IfCondition EqualTo(dj, 160) ThenBlock: { is_s = 1 }
+                        IfCondition EqualTo(is_s, 0) ThenBlock: {
+                            JSRx_SetBit(bitmap, dj)
+                        }
+                        dj = Add(dj, 1)
+                    }
+                    ContinueLoop
+                }
+                // single-char escape as literal in class
+                IfCondition EqualTo(esc, 110) ThenBlock: { esc = 10 }
+                IfCondition EqualTo(esc, 114) ThenBlock: { esc = 13 }
+                IfCondition EqualTo(esc, 116) ThenBlock: { esc = 9 }
+                ch = esc
+                // fall through to range/literal handling with ch set; don't re-advance
+            } ElseBlock: {
+                JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+            }
 
             // Peek: is this the start of a range (X-Y)?
             IfCondition LessThan(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
-                peek = GetByte(JSRxCompiler.pattern, JSRxCompiler.pos)
+                peek = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
                 IfCondition EqualTo(peek, 45) ThenBlock: {
                     IfCondition LessThan(Add(JSRxCompiler.pos, 1), JSRxCompiler.len) ThenBlock: {
-                        end_ch = GetByte(JSRxCompiler.pattern, Add(JSRxCompiler.pos, 1))
+                        end_ch = JSRT_StrUnit(JSRxCompiler.pattern, Add(JSRxCompiler.pos, 1))
                         IfCondition NotEqual(end_ch, 93) ThenBlock: {
                             JSRxCompiler.pos = Add(JSRxCompiler.pos, 2)
+                            // end may be escape — simple: if end is backslash, take next
+                            IfCondition EqualTo(end_ch, 92) ThenBlock: {
+                                IfCondition LessThan(JSRxCompiler.pos, JSRxCompiler.len) ThenBlock: {
+                                    end_ch = JSRT_StrUnit(JSRxCompiler.pattern, JSRxCompiler.pos)
+                                    JSRxCompiler.pos = Add(JSRxCompiler.pos, 1)
+                                }
+                            }
                             IfCondition LessEqual(ch, end_ch) ThenBlock: {
                                 j = ch
                                 WhileLoop LessEqual(j, end_ch) {
@@ -833,8 +2156,112 @@ Function.JSRx_ParseClass {
                 }
             }
 
-            // Not a range — literal byte.
-            JSRx_SetBit(bitmap, ch)
+            // Not a range — literal byte (M31c: honor v-mode set_op)
+            IfCondition EqualTo(set_op, 1) ThenBlock: {
+                // intersect with {ch}
+                was = JSRx_TestBit(bitmap, ch)
+                bi = 0
+                WhileLoop LessThan(bi, 32) {
+                    SetByte(bitmap, bi, 0)
+                    bi = Add(bi, 1)
+                }
+                IfCondition NotEqual(was, 0) ThenBlock: {
+                    JSRx_SetBit(bitmap, ch)
+                    has_any_bit = 1
+                } ElseBlock: {
+                    has_any_bit = 0
+                }
+                set_op = 0
+            } ElseBlock: {
+                IfCondition EqualTo(set_op, 2) ThenBlock: {
+                    // subtract {ch}: clear that bit
+                    byte_offset = Divide(ch, 8)
+                    bit_offset = Modulo(ch, 8)
+                    bv = GetByte(bitmap, byte_offset)
+                    IfCondition EqualTo(bit_offset, 0) ThenBlock: { inv = 254 }
+                    IfCondition EqualTo(bit_offset, 1) ThenBlock: { inv = 253 }
+                    IfCondition EqualTo(bit_offset, 2) ThenBlock: { inv = 251 }
+                    IfCondition EqualTo(bit_offset, 3) ThenBlock: { inv = 247 }
+                    IfCondition EqualTo(bit_offset, 4) ThenBlock: { inv = 239 }
+                    IfCondition EqualTo(bit_offset, 5) ThenBlock: { inv = 223 }
+                    IfCondition EqualTo(bit_offset, 6) ThenBlock: { inv = 191 }
+                    IfCondition EqualTo(bit_offset, 7) ThenBlock: { inv = 127 }
+                    IfCondition And(GreaterEqual(ch, 0), LessThan(ch, 256)) ThenBlock: {
+                        SetByte(bitmap, byte_offset, BitwiseAnd(bv, inv))
+                    }
+                    set_op = 0
+                } ElseBlock: {
+                    JSRx_SetBit(bitmap, ch)
+                    has_any_bit = 1
+                }
+            }
+        }
+
+        // M31b: property escapes → SPLIT of PROP (+ optional RANGE for latin-1 bits)
+        // Fragment start = SPLIT tree; out-list = all consuming leaves (PROP/RANGE).
+        nprops = JSRxCompiler.cls_nprops
+        IfCondition GreaterThan(nprops, 0) ThenBlock: {
+            start_s = -1
+            out_list = 0
+            pi = 0
+            WhileLoop LessThan(pi, nprops) {
+                packed = JSRxCompiler.cls_prop0
+                IfCondition EqualTo(pi, 1) ThenBlock: { packed = JSRxCompiler.cls_prop1 }
+                IfCondition EqualTo(pi, 2) ThenBlock: { packed = JSRxCompiler.cls_prop2 }
+                IfCondition EqualTo(pi, 3) ThenBlock: { packed = JSRxCompiler.cls_prop3 }
+                IfCondition EqualTo(pi, 4) ThenBlock: { packed = JSRxCompiler.cls_prop4 }
+                IfCondition EqualTo(pi, 5) ThenBlock: { packed = JSRxCompiler.cls_prop5 }
+                IfCondition EqualTo(pi, 6) ThenBlock: { packed = JSRxCompiler.cls_prop6 }
+                IfCondition EqualTo(pi, 7) ThenBlock: { packed = JSRxCompiler.cls_prop7 }
+                pid = packed
+                pneg = 0
+                IfCondition GreaterEqual(packed, 65536) ThenBlock: {
+                    pid = Subtract(packed, 65536)
+                    pneg = 1
+                }
+                // class-level ^ flips property sense (correct for single-alt; multi-neg incomplete)
+                IfCondition EqualTo(negated, 1) ThenBlock: {
+                    pneg = JSRx_Not2(pneg)
+                }
+                st = JSRx_AddState(JSRxStateType.PROP, pid, pneg)
+                leaf = JSRx_CreateList(st)
+                IfCondition EqualTo(start_s, -1) ThenBlock: {
+                    start_s = st
+                    out_list = leaf
+                } ElseBlock: {
+                    sp = JSRx_AddState(JSRxStateType.SPLIT, 0, 0)
+                    JSRx_SetStateOut1(sp, start_s)
+                    JSRx_SetStateOut2(sp, st)
+                    start_s = sp
+                    out_list = JSRx_MergeLists(out_list, leaf)
+                }
+                pi = Add(pi, 1)
+            }
+            IfCondition EqualTo(has_any_bit, 1) ThenBlock: {
+                // Bits: only apply class-neg on RANGE when no props would make multi-neg wrong;
+                // with props present and class-neg, RANGE should also be inverted for single-path
+                rneg = 0
+                IfCondition EqualTo(negated, 1) ThenBlock: { rneg = 1 }
+                st_r = JSRx_AddState(JSRxStateType.RANGE, bitmap, rneg)
+                leaf_r = JSRx_CreateList(st_r)
+                IfCondition EqualTo(start_s, -1) ThenBlock: {
+                    start_s = st_r
+                    out_list = leaf_r
+                } ElseBlock: {
+                    sp = JSRx_AddState(JSRxStateType.SPLIT, 0, 0)
+                    JSRx_SetStateOut1(sp, start_s)
+                    JSRx_SetStateOut2(sp, st_r)
+                    start_s = sp
+                    out_list = JSRx_MergeLists(out_list, leaf_r)
+                }
+            }
+            frag = JSRx_FragAlloc()
+            IfCondition NotEqual(frag, 0) ThenBlock: {
+                StoreValue(frag, start_s)
+                StoreValue(Add(frag, 8), out_list)
+            }
+            JSRxCompiler.cls_nprops = 0
+            ReturnValue(JSRx_ParsePost(frag))
         }
 
         state = JSRx_AddState(JSRxStateType.RANGE, bitmap, negated)
@@ -1011,12 +2438,14 @@ Function.JSRx_AddThread {
             ReturnValue(0)
         }
 
-        // Check for duplicate threads
+        // Duplicate = same state at same pos
         i = 0
         WhileLoop LessThan(i, JSRxMatch.thread_count) {
             thread = JSRx_GetThread(i)
             IfCondition EqualTo(Dereference(thread), state_id) ThenBlock: {
-                ReturnValue(0)
+                IfCondition EqualTo(Dereference(Add(thread, 8)), pos) ThenBlock: {
+                    ReturnValue(0)
+                }
             }
             i = Add(i, 1)
         }
@@ -1059,35 +2488,102 @@ Function.JSRx_ProcessState {
         out1 = Dereference(Add(state, 24))
         out2 = Dereference(Add(state, 32))
 
+        // Per-thread position (supports multi-char backrefs)
+        tpos = Dereference(Add(thread, 8))
+
         IfCondition EqualTo(type, JSRxStateType.CHAR) ThenBlock: {
-            IfCondition EqualTo(data1, ch) ThenBlock: {
-                JSRx_AddNextThread(out1, Add(JSRxMatch.pos, 1), thread)
+            // need a real char at tpos
+            IfCondition GreaterEqual(tpos, JSRxMatch.text_len) ThenBlock: {
+                ReturnValue(0)
+            }
+            match_c = 0
+            IfCondition EqualTo(data1, ch) ThenBlock: { match_c = 1 }
+            IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.CASE_INSENSITIVE), JSRxFlags.CASE_INSENSITIVE) ThenBlock: {
+                IfCondition EqualTo(JSRx_ToLower(data1), JSRx_ToLower(ch)) ThenBlock: {
+                    match_c = 1
+                }
+            }
+            IfCondition EqualTo(match_c, 1) ThenBlock: {
+                JSRx_AddNextThread(out1, Add(tpos, 1), thread)
             }
             ReturnValue(0)
         }
 
         IfCondition EqualTo(type, JSRxStateType.RANGE) ThenBlock: {
+            IfCondition GreaterEqual(tpos, JSRxMatch.text_len) ThenBlock: {
+                ReturnValue(0)
+            }
             hit = JSRx_TestBit(data1, ch)
+            IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.CASE_INSENSITIVE), JSRxFlags.CASE_INSENSITIVE) ThenBlock: {
+                ch2 = JSRx_ToLower(ch)
+                IfCondition NotEqual(ch2, ch) ThenBlock: {
+                    IfCondition NotEqual(JSRx_TestBit(data1, ch2), 0) ThenBlock: { hit = 1 }
+                }
+                ch3 = JSRx_ToUpper(ch)
+                IfCondition NotEqual(ch3, ch) ThenBlock: {
+                    IfCondition NotEqual(JSRx_TestBit(data1, ch3), 0) ThenBlock: { hit = 1 }
+                }
+            }
             IfCondition EqualTo(data2, 1) ThenBlock: {
                 hit = JSRx_Not2(hit)
             }
             IfCondition NotEqual(hit, 0) ThenBlock: {
-                JSRx_AddNextThread(out1, Add(JSRxMatch.pos, 1), thread)
+                JSRx_AddNextThread(out1, Add(tpos, 1), thread)
+            }
+            ReturnValue(0)
+        }
+
+        // M31b P2: \p{}/\P{} — data1=prop_id, data2=negated
+        IfCondition EqualTo(type, JSRxStateType.PROP) ThenBlock: {
+            IfCondition GreaterEqual(tpos, JSRxMatch.text_len) ThenBlock: {
+                ReturnValue(0)
+            }
+            hit = JSRx_PropMatch(data1, ch)
+            IfCondition EqualTo(data2, 1) ThenBlock: {
+                hit = JSRx_Not2(hit)
+            }
+            IfCondition NotEqual(hit, 0) ThenBlock: {
+                JSRx_AddNextThread(out1, Add(tpos, 1), thread)
             }
             ReturnValue(0)
         }
 
         IfCondition EqualTo(type, JSRxStateType.DOT) ThenBlock: {
-            IfCondition NotEqual(ch, 10) ThenBlock: {
-                JSRx_AddNextThread(out1, Add(JSRxMatch.pos, 1), thread)
+            IfCondition GreaterEqual(tpos, JSRxMatch.text_len) ThenBlock: {
+                ReturnValue(0)
+            }
+            ok_dot = 1
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                ok_dot = 0
+                IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.DOTALL), JSRxFlags.DOTALL) ThenBlock: {
+                    ok_dot = 1
+                }
+            }
+            IfCondition EqualTo(ch, 13) ThenBlock: {
+                ok_dot = 0
+                IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.DOTALL), JSRxFlags.DOTALL) ThenBlock: {
+                    ok_dot = 1
+                }
+            }
+            IfCondition EqualTo(ok_dot, 1) ThenBlock: {
+                JSRx_AddNextThread(out1, Add(tpos, 1), thread)
             }
             ReturnValue(0)
         }
 
         IfCondition EqualTo(type, JSRxStateType.SPLIT) ThenBlock: {
-            JSRx_AddThread(out1, JSRxMatch.pos, thread)
-            IfCondition NotEqual(out2, -1) ThenBlock: {
-                JSRx_AddThread(out2, JSRxMatch.pos, thread)
+            // data2=1: | alternation → left-first (defer right for captures)
+            // data2=0: quantifier SPLIT → both edges eagerly (Thompson)
+            IfCondition EqualTo(data2, 1) ThenBlock: {
+                JSRx_AddThread(out1, tpos, thread)
+                IfCondition NotEqual(out2, -1) ThenBlock: {
+                    JSRx_DeferPush(out2, tpos)
+                }
+            } ElseBlock: {
+                JSRx_AddThread(out1, tpos, thread)
+                IfCondition NotEqual(out2, -1) ThenBlock: {
+                    JSRx_AddThread(out2, tpos, thread)
+                }
             }
             ReturnValue(0)
         }
@@ -1097,25 +2593,306 @@ Function.JSRx_ProcessState {
         }
 
         IfCondition EqualTo(type, JSRxStateType.EMPTY) ThenBlock: {
-            JSRx_AddThread(out1, JSRxMatch.pos, thread)
+            JSRx_AddThread(out1, tpos, thread)
+            ReturnValue(0)
+        }
+
+        IfCondition EqualTo(type, JSRxStateType.SAVE) ThenBlock: {
+            IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+                IfCondition And(GreaterEqual(data1, 0), LessThan(data1, 64)) ThenBlock: {
+                    StoreValue(Add(JSRxMatch.captures, Multiply(data1, 8)), tpos)
+                }
+            }
+            JSRx_AddThread(out1, tpos, thread)
             ReturnValue(0)
         }
 
         IfCondition EqualTo(type, JSRxStateType.ASSERT_START) ThenBlock: {
-            IfCondition EqualTo(JSRxMatch.pos, 0) ThenBlock: {
-                JSRx_AddThread(out1, JSRxMatch.pos, thread)
+            ok_s = 0
+            IfCondition EqualTo(tpos, 0) ThenBlock: { ok_s = 1 }
+            IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.MULTILINE), JSRxFlags.MULTILINE) ThenBlock: {
+                IfCondition GreaterThan(tpos, 0) ThenBlock: {
+                    IfCondition EqualTo(JSRT_StrUnit(JSRxMatch.text, Subtract(tpos, 1)), 10) ThenBlock: {
+                        ok_s = 1
+                    }
+                }
+            }
+            IfCondition EqualTo(ok_s, 1) ThenBlock: {
+                JSRx_AddThread(out1, tpos, thread)
             }
             ReturnValue(0)
         }
 
         IfCondition EqualTo(type, JSRxStateType.ASSERT_END) ThenBlock: {
-            IfCondition EqualTo(JSRxMatch.pos, JSRxMatch.text_len) ThenBlock: {
+            ok_e = 0
+            IfCondition EqualTo(tpos, JSRxMatch.text_len) ThenBlock: { ok_e = 1 }
+            IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.MULTILINE), JSRxFlags.MULTILINE) ThenBlock: {
+                IfCondition LessThan(tpos, JSRxMatch.text_len) ThenBlock: {
+                    IfCondition EqualTo(JSRT_StrUnit(JSRxMatch.text, tpos), 10) ThenBlock: {
+                        ok_e = 1
+                    }
+                }
+            }
+            IfCondition EqualTo(ok_e, 1) ThenBlock: {
+                JSRx_AddThread(out1, tpos, thread)
+            }
+            ReturnValue(0)
+        }
+
+        // M30f/j: backreference \n or \k<name> (data2=1 → all groups sharing that name)
+        IfCondition EqualTo(type, JSRxStateType.BACKREF) ThenBlock: {
+            gnum = data1
+            multi = data2
+            tried = 0
+            any_defined = 0
+            // Resolve candidate gnums: primary, or all with same name when multi
+            // Use a small fixed list of up to 8 candidates on the stack via loop
+            ni = 0
+            nmax = 1
+            // If multi + regex has name table, collect all gnums with same name as gnum
+            IfCondition And(EqualTo(multi, 1), NotEqual(JSRxMatch.cur_regex, 0)) ThenBlock: {
+                // find name string for gnum
+                n_name = 0
+                nc = JSRegex_NameCount(JSRxMatch.cur_regex)
+                ii = 0
+                WhileLoop LessThan(ii, nc) {
+                    IfCondition EqualTo(JSRegex_NameGnum(JSRxMatch.cur_regex, ii), gnum) ThenBlock: {
+                        n_name = JSRegex_NameAt(JSRxMatch.cur_regex, ii)
+                        ii = nc
+                    }
+                    ii = Add(ii, 1)
+                }
+                IfCondition NotEqual(n_name, 0) ThenBlock: {
+                    // count same-name entries → try each (reuse loop below over table)
+                    nmax = 0
+                    // we'll iterate name table directly instead of gnum list
+                    ii = 0
+                    WhileLoop LessThan(ii, nc) {
+                        np = JSRegex_NameAt(JSRxMatch.cur_regex, ii)
+                        // strcmp name
+                        same = 1
+                        IfCondition EqualTo(np, 0) ThenBlock: { same = 0 }
+                        IfCondition EqualTo(same, 1) ThenBlock: {
+                            ci = 0
+                            WhileLoop 1 {
+                                a = GetByte(n_name, ci)
+                                b = GetByte(np, ci)
+                                IfCondition NotEqual(a, b) ThenBlock: {
+                                    same = 0
+                                    BreakLoop
+                                }
+                                IfCondition EqualTo(a, 0) ThenBlock: {
+                                    BreakLoop
+                                }
+                                ci = Add(ci, 1)
+                                IfCondition GreaterThan(ci, 256) ThenBlock: { BreakLoop }
+                            }
+                        }
+                        IfCondition EqualTo(same, 1) ThenBlock: {
+                            gn = JSRegex_NameGnum(JSRxMatch.cur_regex, ii)
+                            cs = -1
+                            ce = -1
+                            IfCondition And(NotEqual(JSRxMatch.captures, 0), GreaterThan(gn, 0)) ThenBlock: {
+                                slot = Multiply(Subtract(gn, 1), 2)
+                                IfCondition LessThan(slot, 64) ThenBlock: {
+                                    cs = Dereference(Add(JSRxMatch.captures, Multiply(slot, 8)))
+                                    ce = Dereference(Add(JSRxMatch.captures, Multiply(Add(slot, 1), 8)))
+                                }
+                            }
+                            IfCondition And(GreaterEqual(cs, 0), GreaterEqual(ce, cs)) ThenBlock: {
+                                any_defined = 1
+                                clen = Subtract(ce, cs)
+                                IfCondition LessEqual(Add(tpos, clen), JSRxMatch.text_len) ThenBlock: {
+                                    ok_br = 1
+                                    bi = 0
+                                    WhileLoop LessThan(bi, clen) {
+                                        c1 = JSRT_StrUnit(JSRxMatch.text, Add(cs, bi))
+                                        c2 = JSRT_StrUnit(JSRxMatch.text, Add(tpos, bi))
+                                        IfCondition NotEqual(c1, c2) ThenBlock: {
+                                            ok_br = 0
+                                            IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.CASE_INSENSITIVE), JSRxFlags.CASE_INSENSITIVE) ThenBlock: {
+                                                IfCondition EqualTo(JSRx_ToLower(c1), JSRx_ToLower(c2)) ThenBlock: {
+                                                    ok_br = 1
+                                                }
+                                            }
+                                            IfCondition EqualTo(ok_br, 0) ThenBlock: { bi = clen }
+                                        }
+                                        bi = Add(bi, 1)
+                                    }
+                                    IfCondition EqualTo(ok_br, 1) ThenBlock: {
+                                        IfCondition EqualTo(clen, 0) ThenBlock: {
+                                            JSRx_AddThread(out1, tpos, thread)
+                                        } ElseBlock: {
+                                            JSRx_AddNextThread(out1, Add(tpos, clen), thread)
+                                        }
+                                        tried = 1
+                                        ii = nc
+                                    }
+                                }
+                            }
+                        }
+                        ii = Add(ii, 1)
+                    }
+                } ElseBlock: {
+                    multi = 0
+                }
+            }
+            IfCondition EqualTo(multi, 0) ThenBlock: {
+                // classic \n single group
+                cs = -1
+                ce = -1
+                IfCondition And(NotEqual(JSRxMatch.captures, 0), GreaterThan(gnum, 0)) ThenBlock: {
+                    slot = Multiply(Subtract(gnum, 1), 2)
+                    IfCondition LessThan(slot, 64) ThenBlock: {
+                        cs = Dereference(Add(JSRxMatch.captures, Multiply(slot, 8)))
+                        ce = Dereference(Add(JSRxMatch.captures, Multiply(Add(slot, 1), 8)))
+                    }
+                }
+                IfCondition Or(LessThan(cs, 0), LessThan(ce, cs)) ThenBlock: {
+                    JSRx_AddThread(out1, tpos, thread)
+                    ReturnValue(0)
+                }
+                any_defined = 1
+                clen = Subtract(ce, cs)
+                IfCondition GreaterThan(Add(tpos, clen), JSRxMatch.text_len) ThenBlock: {
+                    ReturnValue(0)
+                }
+                ok_br = 1
+                bi = 0
+                WhileLoop LessThan(bi, clen) {
+                    c1 = JSRT_StrUnit(JSRxMatch.text, Add(cs, bi))
+                    c2 = JSRT_StrUnit(JSRxMatch.text, Add(tpos, bi))
+                    IfCondition NotEqual(c1, c2) ThenBlock: {
+                        ok_br = 0
+                        IfCondition EqualTo(BitwiseAnd(JSRxMatch.flags, JSRxFlags.CASE_INSENSITIVE), JSRxFlags.CASE_INSENSITIVE) ThenBlock: {
+                            IfCondition EqualTo(JSRx_ToLower(c1), JSRx_ToLower(c2)) ThenBlock: {
+                                ok_br = 1
+                            }
+                        }
+                        IfCondition EqualTo(ok_br, 0) ThenBlock: { bi = clen }
+                    }
+                    bi = Add(bi, 1)
+                }
+                IfCondition EqualTo(ok_br, 1) ThenBlock: {
+                    IfCondition EqualTo(clen, 0) ThenBlock: {
+                        JSRx_AddThread(out1, tpos, thread)
+                    } ElseBlock: {
+                        JSRx_AddNextThread(out1, Add(tpos, clen), thread)
+                    }
+                    tried = 1
+                }
+            }
+            // unmatched named multi with no defined slots → empty success
+            IfCondition And(EqualTo(tried, 0), EqualTo(any_defined, 0)) ThenBlock: {
+                IfCondition EqualTo(multi, 1) ThenBlock: {
+                    JSRx_AddThread(out1, tpos, thread)
+                }
+            }
+            ReturnValue(0)
+        }
+
+        IfCondition EqualTo(type, JSRxStateType.LOOKAHEAD) ThenBlock: {
+            sub_ok = JSRx_TryLookahead(data1, tpos)
+            want = 1
+            IfCondition EqualTo(data2, 2) ThenBlock: { want = 0 }
+            IfCondition EqualTo(sub_ok, want) ThenBlock: {
+                JSRx_AddThread(out1, tpos, thread)
+            }
+            ReturnValue(0)
+        }
+
+        // M30g/i: lookbehind (?<=)/(?<!) — sub must match ending at tpos
+        IfCondition EqualTo(type, JSRxStateType.LOOKBEHIND) ThenBlock: {
+            // Snapshot parent captures so (?!) success path doesn't leak sub captures
+            lb_save = 0
+            IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+                lb_save = Allocate(512)
+                IfCondition NotEqual(lb_save, 0) ThenBlock: {
+                    MemoryCopy(lb_save, JSRxMatch.captures, 512)
+                }
+            }
+            sub_ok = JSRx_TryLookbehind(data1, tpos)
+            want = 1
+            IfCondition EqualTo(data2, 2) ThenBlock: { want = 0 }
+            IfCondition EqualTo(sub_ok, want) ThenBlock: {
+                // positive lookbehind keeps sub captures; negative keeps parent
+                IfCondition EqualTo(data2, 2) ThenBlock: {
+                    IfCondition And(NotEqual(lb_save, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                        MemoryCopy(JSRxMatch.captures, lb_save, 512)
+                    }
+                }
+                JSRx_AddThread(out1, tpos, thread)
+            } ElseBlock: {
+                // assertion failed — restore parent captures
+                IfCondition And(NotEqual(lb_save, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                    MemoryCopy(JSRxMatch.captures, lb_save, 512)
+                }
+            }
+            IfCondition NotEqual(lb_save, 0) ThenBlock: {
+                Deallocate(lb_save, 512)
+            }
+            ReturnValue(0)
+        }
+
+        // \b / \B word boundary
+        IfCondition Or(EqualTo(type, JSRxStateType.WORD_BOUNDARY), EqualTo(type, JSRxStateType.NOT_WORD_BOUNDARY)) ThenBlock: {
+            prev_w = 0
+            cur_w = 0
+            IfCondition GreaterThan(tpos, 0) ThenBlock: {
+                pc = JSRT_StrUnit(JSRxMatch.text, Subtract(tpos, 1))
+                prev_w = JSRx_IsWordChar(pc)
+            }
+            IfCondition LessThan(tpos, JSRxMatch.text_len) ThenBlock: {
+                cc = JSRT_StrUnit(JSRxMatch.text, tpos)
+                cur_w = JSRx_IsWordChar(cc)
+            }
+            is_bound = 0
+            IfCondition NotEqual(prev_w, cur_w) ThenBlock: { is_bound = 1 }
+            ok = is_bound
+            IfCondition EqualTo(type, JSRxStateType.NOT_WORD_BOUNDARY) ThenBlock: {
+                IfCondition EqualTo(is_bound, 0) ThenBlock: { ok = 1 } ElseBlock: { ok = 0 }
+            }
+            IfCondition EqualTo(ok, 1) ThenBlock: {
                 JSRx_AddThread(out1, JSRxMatch.pos, thread)
             }
             ReturnValue(0)
         }
 
         ReturnValue(0)
+    }
+}
+
+Function.JSRx_IsWordChar {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 48), LessEqual(ch, 57)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: { ReturnValue(1) }
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(ch, 95) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.JSRx_ToLower {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 65), LessEqual(ch, 90)) ThenBlock: {
+            ReturnValue(Add(ch, 32))
+        }
+        ReturnValue(ch)
+    }
+}
+
+Function.JSRx_ToUpper {
+    Input: ch: Integer
+    Output: Integer
+    Body: {
+        IfCondition And(GreaterEqual(ch, 97), LessEqual(ch, 122)) ThenBlock: {
+            ReturnValue(Subtract(ch, 32))
+        }
+        ReturnValue(ch)
     }
 }
 
@@ -1128,12 +2905,13 @@ Function.JSRx_AddNextThread {
             ReturnValue(0)
         }
 
-        // Check for duplicate threads
         i = 0
         WhileLoop LessThan(i, JSRxMatch.next_count) {
             thread = JSRx_GetNextThread(i)
             IfCondition EqualTo(Dereference(thread), state_id) ThenBlock: {
-                ReturnValue(0)
+                IfCondition EqualTo(Dereference(Add(thread, 8)), pos) ThenBlock: {
+                    ReturnValue(0)
+                }
             }
             i = Add(i, 1)
         }
@@ -1144,6 +2922,297 @@ Function.JSRx_AddNextThread {
 
         JSRxMatch.next_count = Add(JSRxMatch.next_count, 1)
         ReturnValue(1)
+    }
+}
+
+// Nested lookahead runner — match sub-NFA from pos without consuming
+// Returns 1 if sub reaches MATCH, 0 otherwise.
+Function.JSRx_TryLookahead {
+    Input: sub_start: Integer
+    Input: from_pos: Integer
+    Output: Integer
+    Body: {
+        save_tc = JSRxMatch.thread_count
+        save_nc = JSRxMatch.next_count
+        save_pos = JSRxMatch.pos
+        save_def = JSRxDefer.count
+        tsize = Multiply(JSRxConstants.MAX_THREADS, JSRxMatch.thread_size)
+        save_th = Allocate(tsize)
+        save_nx = Allocate(tsize)
+        IfCondition And(NotEqual(save_th, 0), NotEqual(save_nx, 0)) ThenBlock: {
+            MemoryCopy(save_th, JSRxMatch.threads, tsize)
+            MemoryCopy(save_nx, JSRxMatch.next_threads, tsize)
+        }
+        JSRxMatch.thread_count = 0
+        JSRxMatch.next_count = 0
+        JSRxDefer.count = 0
+        JSRx_AddThread(sub_start, from_pos, 0)
+        steps = 0
+        max_s = Add(Multiply(Add(JSRxMatch.text_len, 1), 32), 64)
+        found = 0
+        states = JSRxMatch.cur_states
+        IfCondition EqualTo(states, 0) ThenBlock: {
+            states = JSRxState.states
+        }
+        WhileLoop And(And(GreaterThan(JSRxMatch.thread_count, 0), EqualTo(found, 0)), LessThan(steps, max_s)) {
+            steps = Add(steps, 1)
+            JSRxMatch.next_count = 0
+            i = 0
+            WhileLoop LessThan(i, JSRxMatch.thread_count) {
+                th = JSRx_GetThread(i)
+                sid = Dereference(th)
+                tp = Dereference(Add(th, 8))
+                JSRxMatch.pos = tp
+                ch = 0
+                IfCondition LessThan(tp, JSRxMatch.text_len) ThenBlock: {
+                    ch = JSRT_StrUnit(JSRxMatch.text, tp)
+                }
+                // Nested lookaround via ProcessState (threads snapshotted by each try)
+                r = JSRx_ProcessState(states, sid, ch, th)
+                IfCondition EqualTo(r, 1) ThenBlock: {
+                    found = 1
+                    i = JSRxMatch.thread_count
+                }
+                i = Add(i, 1)
+            }
+            IfCondition EqualTo(found, 0) ThenBlock: {
+                tmp = JSRxMatch.threads
+                JSRxMatch.threads = JSRxMatch.next_threads
+                JSRxMatch.next_threads = tmp
+                JSRxMatch.thread_count = JSRxMatch.next_count
+            }
+        }
+        IfCondition And(NotEqual(save_th, 0), NotEqual(save_nx, 0)) ThenBlock: {
+            MemoryCopy(JSRxMatch.threads, save_th, tsize)
+            MemoryCopy(JSRxMatch.next_threads, save_nx, tsize)
+            Deallocate(save_th, tsize)
+            Deallocate(save_nx, tsize)
+        }
+        JSRxMatch.thread_count = save_tc
+        JSRxMatch.next_count = save_nc
+        JSRxMatch.pos = save_pos
+        JSRxDefer.count = save_def
+        ReturnValue(found)
+    }
+}
+
+// Lookbehind: sub-NFA must match some [start, end_pos) ending exactly at end_pos
+// Captures from a successful sub-match are kept (groups inside (?<=...)).
+// M30j: start selection approximates ES reverse matching:
+//   - top-level | alternation (SPLIT data2=1): shortest success (LTR reverse alts)
+//   - else: longest success (reverse-greedy quantifiers)
+Function.JSRx_TryLookbehind {
+    Input: sub_start: Integer
+    Input: end_pos: Integer
+    Output: Integer
+    Body: {
+        save_caps = 0
+        IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+            save_caps = Allocate(512)
+            IfCondition NotEqual(save_caps, 0) ThenBlock: {
+                MemoryCopy(save_caps, JSRxMatch.captures, 512)
+            }
+        }
+        // Prefer shortest (max s) when lookbehind body reaches a | alternation
+        // within a few epsilon/SAVE hops (covers (?<=(..|...)) wrapped in captures).
+        prefer_short = 0
+        states = JSRxMatch.cur_states
+        IfCondition EqualTo(states, 0) ThenBlock: { states = JSRxState.states }
+        IfCondition NotEqual(states, 0) ThenBlock: {
+            scan_id = sub_start
+            hops = 0
+            WhileLoop And(LessThan(hops, 8), GreaterEqual(scan_id, 0)) {
+                st_ty = JSRx_GetStateType(states, scan_id)
+                st_base = Add(states, Multiply(scan_id, JSRxConstants.STATE_SIZE))
+                IfCondition EqualTo(st_ty, JSRxStateType.SPLIT) ThenBlock: {
+                    IfCondition EqualTo(Dereference(Add(st_base, 16)), 1) ThenBlock: {
+                        prefer_short = 1
+                        hops = 8
+                    } ElseBlock: {
+                        hops = 8
+                    }
+                } ElseBlock: {
+                    // follow single out1 for SAVE/EMPTY/MATCH skip
+                    IfCondition Or(EqualTo(st_ty, JSRxStateType.SAVE), EqualTo(st_ty, JSRxStateType.EMPTY)) ThenBlock: {
+                        scan_id = Dereference(Add(st_base, 24))
+                        hops = Add(hops, 1)
+                    } ElseBlock: {
+                        hops = 8
+                    }
+                }
+            }
+        }
+        best_s = -1
+        best_cap_snap = 0
+        IfCondition NotEqual(JSRxMatch.captures, 0) ThenBlock: {
+            best_cap_snap = Allocate(512)
+        }
+        s = 0
+        WhileLoop LessEqual(s, end_pos) {
+            IfCondition And(NotEqual(save_caps, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                MemoryCopy(JSRxMatch.captures, save_caps, 512)
+            }
+            ok = JSRx_TryMatchEndsAt(sub_start, s, end_pos)
+            IfCondition EqualTo(ok, 1) ThenBlock: {
+                take = 0
+                IfCondition EqualTo(best_s, -1) ThenBlock: {
+                    take = 1
+                } ElseBlock: {
+                    IfCondition EqualTo(prefer_short, 1) ThenBlock: {
+                        // prefer larger s (shorter span)
+                        IfCondition GreaterThan(s, best_s) ThenBlock: { take = 1 }
+                    } ElseBlock: {
+                        // prefer smaller s (longer span) — first success is already longest
+                        // keep first (longest) only
+                        take = 0
+                    }
+                }
+                IfCondition EqualTo(take, 1) ThenBlock: {
+                    best_s = s
+                    IfCondition And(NotEqual(best_cap_snap, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                        MemoryCopy(best_cap_snap, JSRxMatch.captures, 512)
+                    }
+                }
+                // longest mode: stop at first success (s walks 0..end)
+                IfCondition EqualTo(prefer_short, 0) ThenBlock: {
+                    s = Add(end_pos, 1)
+                } ElseBlock: {
+                    s = Add(s, 1)
+                }
+            } ElseBlock: {
+                s = Add(s, 1)
+            }
+        }
+        IfCondition LessThan(best_s, 0) ThenBlock: {
+            IfCondition And(NotEqual(save_caps, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+                MemoryCopy(JSRxMatch.captures, save_caps, 512)
+            }
+            IfCondition NotEqual(save_caps, 0) ThenBlock: { Deallocate(save_caps, 512) }
+            IfCondition NotEqual(best_cap_snap, 0) ThenBlock: { Deallocate(best_cap_snap, 512) }
+            ReturnValue(0)
+        }
+        // restore winning captures
+        IfCondition And(NotEqual(best_cap_snap, 0), NotEqual(JSRxMatch.captures, 0)) ThenBlock: {
+            MemoryCopy(JSRxMatch.captures, best_cap_snap, 512)
+        }
+        // reverse-direction capture for quantified single-char groups (non-alt)
+        IfCondition EqualTo(prefer_short, 0) ThenBlock: {
+            IfCondition And(NotEqual(JSRxMatch.captures, 0), GreaterThan(Subtract(end_pos, best_s), 1)) ThenBlock: {
+                set_count = 0
+                only_gi = -1
+                only_cs = -1
+                only_ce = -1
+                gi = 0
+                WhileLoop LessThan(gi, 32) {
+                    cs = Dereference(Add(JSRxMatch.captures, Multiply(Multiply(gi, 2), 8)))
+                    ce = Dereference(Add(JSRxMatch.captures, Multiply(Add(Multiply(gi, 2), 1), 8)))
+                    IfCondition And(GreaterEqual(cs, 0), GreaterEqual(ce, cs)) ThenBlock: {
+                        set_count = Add(set_count, 1)
+                        only_gi = gi
+                        only_cs = cs
+                        only_ce = ce
+                    }
+                    gi = Add(gi, 1)
+                }
+                IfCondition EqualTo(set_count, 1) ThenBlock: {
+                    IfCondition EqualTo(Subtract(only_ce, only_cs), 1) ThenBlock: {
+                        IfCondition EqualTo(only_cs, Subtract(end_pos, 1)) ThenBlock: {
+                            StoreValue(Add(JSRxMatch.captures, Multiply(Multiply(only_gi, 2), 8)), best_s)
+                            StoreValue(Add(JSRxMatch.captures, Multiply(Add(Multiply(only_gi, 2), 1), 8)), Add(best_s, 1))
+                        }
+                    }
+                }
+            }
+        }
+        IfCondition NotEqual(save_caps, 0) ThenBlock: { Deallocate(save_caps, 512) }
+        IfCondition NotEqual(best_cap_snap, 0) ThenBlock: { Deallocate(best_cap_snap, 512) }
+        ReturnValue(1)
+    }
+}
+
+// Match sub from start_pos; return 1 if any MATCH occurs at exact end_pos
+Function.JSRx_TryMatchEndsAt {
+    Input: sub_start: Integer
+    Input: start_pos: Integer
+    Input: end_pos: Integer
+    Output: Integer
+    Body: {
+        save_tc = JSRxMatch.thread_count
+        save_nc = JSRxMatch.next_count
+        save_pos = JSRxMatch.pos
+        save_def = JSRxDefer.count
+        tsize = Multiply(JSRxConstants.MAX_THREADS, JSRxMatch.thread_size)
+        save_th = Allocate(tsize)
+        save_nx = Allocate(tsize)
+        IfCondition And(NotEqual(save_th, 0), NotEqual(save_nx, 0)) ThenBlock: {
+            MemoryCopy(save_th, JSRxMatch.threads, tsize)
+            MemoryCopy(save_nx, JSRxMatch.next_threads, tsize)
+        }
+        JSRxMatch.thread_count = 0
+        JSRxMatch.next_count = 0
+        JSRxDefer.count = 0
+        JSRx_AddThread(sub_start, start_pos, 0)
+        steps = 0
+        max_s = Add(Multiply(Add(JSRxMatch.text_len, 1), 32), 64)
+        found = 0
+        states = JSRxMatch.cur_states
+        IfCondition EqualTo(states, 0) ThenBlock: {
+            states = JSRxState.states
+        }
+        WhileLoop And(And(Or(GreaterThan(JSRxMatch.thread_count, 0), GreaterThan(JSRxDefer.count, 0)), EqualTo(found, 0)), LessThan(steps, max_s)) {
+            steps = Add(steps, 1)
+            IfCondition EqualTo(JSRxMatch.thread_count, 0) ThenBlock: {
+                IfCondition GreaterThan(JSRxDefer.count, 0) ThenBlock: {
+                    d_sid = JSRx_DeferPopState()
+                    d_pos = JSRx_DeferPopPos()
+                    JSRx_AddThread(d_sid, d_pos, 0)
+                }
+            }
+            JSRxMatch.next_count = 0
+            i = 0
+            WhileLoop LessThan(i, JSRxMatch.thread_count) {
+                th = JSRx_GetThread(i)
+                sid = Dereference(th)
+                tp = Dereference(Add(th, 8))
+                // prune paths past end_pos
+                IfCondition GreaterThan(tp, end_pos) ThenBlock: {
+                    i = Add(i, 1)
+                } ElseBlock: {
+                    JSRxMatch.pos = tp
+                    ch = 0
+                    IfCondition LessThan(tp, JSRxMatch.text_len) ThenBlock: {
+                        ch = JSRT_StrUnit(JSRxMatch.text, tp)
+                    }
+                    // Nested lookaround allowed via ProcessState (depth-limited by step cap)
+                    r = JSRx_ProcessState(states, sid, ch, th)
+                    IfCondition EqualTo(r, 1) ThenBlock: {
+                        // MATCH at tp — success only if tp == end_pos
+                        IfCondition EqualTo(tp, end_pos) ThenBlock: {
+                            found = 1
+                            i = JSRxMatch.thread_count
+                        }
+                    }
+                    i = Add(i, 1)
+                }
+            }
+            IfCondition EqualTo(found, 0) ThenBlock: {
+                tmp = JSRxMatch.threads
+                JSRxMatch.threads = JSRxMatch.next_threads
+                JSRxMatch.next_threads = tmp
+                JSRxMatch.thread_count = JSRxMatch.next_count
+            }
+        }
+        IfCondition And(NotEqual(save_th, 0), NotEqual(save_nx, 0)) ThenBlock: {
+            MemoryCopy(JSRxMatch.threads, save_th, tsize)
+            MemoryCopy(JSRxMatch.next_threads, save_nx, tsize)
+            Deallocate(save_th, tsize)
+            Deallocate(save_nx, tsize)
+        }
+        JSRxMatch.thread_count = save_tc
+        JSRxMatch.next_count = save_nc
+        JSRxMatch.pos = save_pos
+        JSRxDefer.count = save_def
+        ReturnValue(found)
     }
 }
 
@@ -1218,6 +3287,16 @@ Function.JSRx_Not2 {
 FixedPool.JSRxResult {
     "pos":    Initialize=-1
     "len":    Initialize=-1
+    "ngroups": Initialize=0
+    // captures[i*2]=start, captures[i*2+1]=end for group i+1; main match is pos/len
+    "cap_buf": Initialize=0
+}
+
+// M30i: deferred right-alts for ordered alternation (left-first captures)
+FixedPool.JSRxDefer {
+    "buf":   Initialize=0
+    "count": Initialize=0
+    "cap":   Initialize=256
 }
 
 // Search for regex anywhere in text, returning position and length.
@@ -1228,9 +3307,23 @@ Function.JSRegex_SearchPosLen {
     Input: text_len: Integer
     Output: Integer
     Body: {
+        ReturnValue(JSRegex_SearchPosLenFrom(regex, text, text_len, 0))
+    }
+}
+
+// M30c/g: search from start_from; sticky flag = only try at start_from
+Function.JSRegex_SearchPosLenFrom {
+    Input: regex: Address
+    Input: text: Address
+    Input: text_len: Integer
+    Input: start_from: Integer
+    Output: Integer
+    Body: {
         save_regex = regex
         save_text = text
         save_len = text_len
+        i = start_from
+        IfCondition LessThan(i, 0) ThenBlock: { i = 0 }
         IfCondition EqualTo(save_regex, 0) ThenBlock: {
             JSRxResult.pos = -1
             JSRxResult.len = -1
@@ -1241,7 +3334,28 @@ Function.JSRegex_SearchPosLen {
             JSRxResult.len = -1
             ReturnValue(0)
         }
-        i = 0
+        // sticky (flag bit 64): only match at exact index
+        sticky = 0
+        fl = Dereference(Add(save_regex, 32))
+        IfCondition EqualTo(BitwiseAnd(fl, 64), 64) ThenBlock: {
+            sticky = 1
+        }
+        IfCondition EqualTo(sticky, 1) ThenBlock: {
+            IfCondition GreaterThan(i, save_len) ThenBlock: {
+                JSRxResult.pos = -1
+                JSRxResult.len = -1
+                ReturnValue(0)
+            }
+            match_len = JSRegex_Match(save_regex, save_text, i)
+            IfCondition GreaterEqual(match_len, 0) ThenBlock: {
+                JSRxResult.pos = i
+                JSRxResult.len = match_len
+                ReturnValue(1)
+            }
+            JSRxResult.pos = -1
+            JSRxResult.len = -1
+            ReturnValue(0)
+        }
         WhileLoop LessEqual(i, save_len) {
             match_len = JSRegex_Match(save_regex, save_text, i)
             IfCondition GreaterEqual(match_len, 0) ThenBlock: {

@@ -1,0 +1,830 @@
+// LLM/Forward.ailang
+// Transformer forward pass for LLaMA/SmolLM2 architecture.
+// Single-token incremental inference with KV cache.
+// Integer arithmetic only — Q20 fixed-point throughout (int64).
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+// =============================================================================
+// FORWARD PASS CARRIER — working state for the forward pass
+// =============================================================================
+FixedPool.FwdW {
+    "layer_idx":    Initialize=0, CanChange=True   // current layer
+    "layer_ptr":    Initialize=0, CanChange=True   // pointer to current layer entry
+    "head":         Initialize=0, CanChange=True   // current attention head
+    "kv_head":      Initialize=0, CanChange=True   // which KV head this Q head maps to
+    "pos":          Initialize=0, CanChange=True   // current position in sequence
+    "idx":          Initialize=0, CanChange=True   // general loop counter
+    "idx2":         Initialize=0, CanChange=True   // inner loop counter
+    "sum":          Initialize=0, CanChange=True   // accumulator
+    "rms":          Initialize=0, CanChange=True   // RMS value
+    "val":          Initialize=0, CanChange=True   // temp value
+    "val2":         Initialize=0, CanChange=True   // temp value 2
+    "ptr":          Initialize=0, CanChange=True   // temp pointer
+    "ptr2":         Initialize=0, CanChange=True   // temp pointer 2
+    "kv_dim":       Initialize=0, CanChange=True   // n_kv_heads * head_dim
+    "kv_stride":    Initialize=0, CanChange=True   // KV cache stride per layer
+    "q_per_kv":     Initialize=0, CanChange=True   // n_heads / n_kv_heads (GQA ratio)
+    "head_off":     Initialize=0, CanChange=True   // byte offset for current head in Q/K/V
+    "score":        Initialize=0, CanChange=True   // attention score
+    "best":         Initialize=0, CanChange=True   // best score / max value
+}
+
+// =============================================================================
+// ROPE STATE — frequency table for on-the-fly sin/cos computation
+// =============================================================================
+FixedPool.RoPETbl {
+    "freq_tbl":     Initialize=0, CanChange=True   // [half_dim] frequency divisors
+    "initialized":  Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// SILU LOOKUP TABLE — x * sigmoid(x) approximation
+// 512 entries covering input range [-4194304..+4194304] (Q20 ≈ ±4.0)
+// mapped to indices [0..511]. Output in Q20 fixed-point.
+// =============================================================================
+FixedPool.SiLUTbl {
+    "tbl":          Initialize=0, CanChange=True   // 512 entries * 8 bytes
+    "initialized":  Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// LLM_InitRoPE — precompute sin/cos tables for rotary embeddings
+// RoPE formula: freq[i] = 1 / (theta^(2i/d)) where theta = 10000 (default)
+// For position p and dimension pair i:
+//   angle = p * freq[i]
+//   sin(angle), cos(angle) applied as rotation
+//
+// We precompute using integer approximation:
+//   freq_inv[i] = theta_inv * (dim / (2*i))  (inverted scale)
+//   For each position, compute angle mod 2π using integer trig table
+//
+// For integer sin/cos: use a 256-entry quarter-wave table, Q8 output.
+// sin(x) where x is in [0, 1024) representing [0, 2π):
+//   quadrant = x / 256, position = x % 256
+// =============================================================================
+
+// Quarter-wave sin table: 65 entries for [0, π/2]
+// SIN_Q8[i] = sin(i * π/128) * 256, for i in [0..64]
+FixedPool.SinQ8 {
+    "s00": Initialize=0    "s01": Initialize=6    "s02": Initialize=13   "s03": Initialize=19
+    "s04": Initialize=25   "s05": Initialize=31   "s06": Initialize=37   "s07": Initialize=44
+    "s08": Initialize=50   "s09": Initialize=56   "s10": Initialize=62   "s11": Initialize=68
+    "s12": Initialize=74   "s13": Initialize=79   "s14": Initialize=85   "s15": Initialize=91
+    "s16": Initialize=97   "s17": Initialize=102  "s18": Initialize=108  "s19": Initialize=113
+    "s20": Initialize=118  "s21": Initialize=124  "s22": Initialize=129  "s23": Initialize=134
+    "s24": Initialize=139  "s25": Initialize=143  "s26": Initialize=148  "s27": Initialize=152
+    "s28": Initialize=157  "s29": Initialize=161  "s30": Initialize=165  "s31": Initialize=169
+    "s32": Initialize=173  "s33": Initialize=177  "s34": Initialize=181  "s35": Initialize=185
+    "s36": Initialize=188  "s37": Initialize=191  "s38": Initialize=195  "s39": Initialize=198
+    "s40": Initialize=201  "s41": Initialize=203  "s42": Initialize=206  "s43": Initialize=208
+    "s44": Initialize=211  "s45": Initialize=213  "s46": Initialize=215  "s47": Initialize=217
+    "s48": Initialize=219  "s49": Initialize=221  "s50": Initialize=223  "s51": Initialize=224
+    "s52": Initialize=226  "s53": Initialize=227  "s54": Initialize=228  "s55": Initialize=229
+    "s56": Initialize=230  "s57": Initialize=231  "s58": Initialize=232  "s59": Initialize=233
+    "s60": Initialize=234  "s61": Initialize=234  "s62": Initialize=235  "s63": Initialize=235
+    "s64": Initialize=256
+}
+
+// =============================================================================
+// SIN TABLE RUNTIME — allocated array populated from FixedPool values
+// =============================================================================
+FixedPool.SinTblState {
+    "tbl":          Initialize=0, CanChange=True   // 65 entries * 8 bytes
+    "initialized":  Initialize=0, CanChange=True
+    "sa":           Initialize=0, CanChange=True   // sin working: normalized angle
+    "sq":           Initialize=0, CanChange=True   // sin working: quadrant
+    "si":           Initialize=0, CanChange=True   // sin working: table index
+}
+
+// =============================================================================
+// LLM_InitSinTable — copy quarter-wave sin values to runtime array
+// =============================================================================
+Function.LLM_InitSinTable {
+    Body: {
+        IfCondition EqualTo(SinTblState.initialized, 1) ThenBlock: { ReturnValue(0) }
+        SinTblState.tbl = Allocate(528)   // 66 * 8
+        MemorySet(SinTblState.tbl, 0, 528)
+
+        StoreValue(Add(SinTblState.tbl, 0),   SinQ8.s00)
+        StoreValue(Add(SinTblState.tbl, 8),   SinQ8.s01)
+        StoreValue(Add(SinTblState.tbl, 16),  SinQ8.s02)
+        StoreValue(Add(SinTblState.tbl, 24),  SinQ8.s03)
+        StoreValue(Add(SinTblState.tbl, 32),  SinQ8.s04)
+        StoreValue(Add(SinTblState.tbl, 40),  SinQ8.s05)
+        StoreValue(Add(SinTblState.tbl, 48),  SinQ8.s06)
+        StoreValue(Add(SinTblState.tbl, 56),  SinQ8.s07)
+        StoreValue(Add(SinTblState.tbl, 64),  SinQ8.s08)
+        StoreValue(Add(SinTblState.tbl, 72),  SinQ8.s09)
+        StoreValue(Add(SinTblState.tbl, 80),  SinQ8.s10)
+        StoreValue(Add(SinTblState.tbl, 88),  SinQ8.s11)
+        StoreValue(Add(SinTblState.tbl, 96),  SinQ8.s12)
+        StoreValue(Add(SinTblState.tbl, 104), SinQ8.s13)
+        StoreValue(Add(SinTblState.tbl, 112), SinQ8.s14)
+        StoreValue(Add(SinTblState.tbl, 120), SinQ8.s15)
+        StoreValue(Add(SinTblState.tbl, 128), SinQ8.s16)
+        StoreValue(Add(SinTblState.tbl, 136), SinQ8.s17)
+        StoreValue(Add(SinTblState.tbl, 144), SinQ8.s18)
+        StoreValue(Add(SinTblState.tbl, 152), SinQ8.s19)
+        StoreValue(Add(SinTblState.tbl, 160), SinQ8.s20)
+        StoreValue(Add(SinTblState.tbl, 168), SinQ8.s21)
+        StoreValue(Add(SinTblState.tbl, 176), SinQ8.s22)
+        StoreValue(Add(SinTblState.tbl, 184), SinQ8.s23)
+        StoreValue(Add(SinTblState.tbl, 192), SinQ8.s24)
+        StoreValue(Add(SinTblState.tbl, 200), SinQ8.s25)
+        StoreValue(Add(SinTblState.tbl, 208), SinQ8.s26)
+        StoreValue(Add(SinTblState.tbl, 216), SinQ8.s27)
+        StoreValue(Add(SinTblState.tbl, 224), SinQ8.s28)
+        StoreValue(Add(SinTblState.tbl, 232), SinQ8.s29)
+        StoreValue(Add(SinTblState.tbl, 240), SinQ8.s30)
+        StoreValue(Add(SinTblState.tbl, 248), SinQ8.s31)
+        StoreValue(Add(SinTblState.tbl, 256), SinQ8.s32)
+        StoreValue(Add(SinTblState.tbl, 264), SinQ8.s33)
+        StoreValue(Add(SinTblState.tbl, 272), SinQ8.s34)
+        StoreValue(Add(SinTblState.tbl, 280), SinQ8.s35)
+        StoreValue(Add(SinTblState.tbl, 288), SinQ8.s36)
+        StoreValue(Add(SinTblState.tbl, 296), SinQ8.s37)
+        StoreValue(Add(SinTblState.tbl, 304), SinQ8.s38)
+        StoreValue(Add(SinTblState.tbl, 312), SinQ8.s39)
+        StoreValue(Add(SinTblState.tbl, 320), SinQ8.s40)
+        StoreValue(Add(SinTblState.tbl, 328), SinQ8.s41)
+        StoreValue(Add(SinTblState.tbl, 336), SinQ8.s42)
+        StoreValue(Add(SinTblState.tbl, 344), SinQ8.s43)
+        StoreValue(Add(SinTblState.tbl, 352), SinQ8.s44)
+        StoreValue(Add(SinTblState.tbl, 360), SinQ8.s45)
+        StoreValue(Add(SinTblState.tbl, 368), SinQ8.s46)
+        StoreValue(Add(SinTblState.tbl, 376), SinQ8.s47)
+        StoreValue(Add(SinTblState.tbl, 384), SinQ8.s48)
+        StoreValue(Add(SinTblState.tbl, 392), SinQ8.s49)
+        StoreValue(Add(SinTblState.tbl, 400), SinQ8.s50)
+        StoreValue(Add(SinTblState.tbl, 408), SinQ8.s51)
+        StoreValue(Add(SinTblState.tbl, 416), SinQ8.s52)
+        StoreValue(Add(SinTblState.tbl, 424), SinQ8.s53)
+        StoreValue(Add(SinTblState.tbl, 432), SinQ8.s54)
+        StoreValue(Add(SinTblState.tbl, 440), SinQ8.s55)
+        StoreValue(Add(SinTblState.tbl, 448), SinQ8.s56)
+        StoreValue(Add(SinTblState.tbl, 456), SinQ8.s57)
+        StoreValue(Add(SinTblState.tbl, 464), SinQ8.s58)
+        StoreValue(Add(SinTblState.tbl, 472), SinQ8.s59)
+        StoreValue(Add(SinTblState.tbl, 480), SinQ8.s60)
+        StoreValue(Add(SinTblState.tbl, 488), SinQ8.s61)
+        StoreValue(Add(SinTblState.tbl, 496), SinQ8.s62)
+        StoreValue(Add(SinTblState.tbl, 504), SinQ8.s63)
+        StoreValue(Add(SinTblState.tbl, 512), SinQ8.s64)
+
+        SinTblState.initialized = 1
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_SinQ8 — integer sin from quarter-wave table
+// Input: angle in arbitrary integer units, period = 131072 = 2^17
+//        (131072 units = full circle = 2π radians)
+// Output: sin(angle) * 256 (Q8, range -256..+256)
+// =============================================================================
+Function.LLM_SinQ8 {
+    Input: angle: Integer
+    Output: Integer
+    Body: {
+        // Uses SinTblState.sa/sq/si to avoid clobbering FwdW fields
+
+        // Normalize to [0, 131072)
+        SinTblState.sa = Modulo(angle, 131072)
+        IfCondition LessThan(SinTblState.sa, 0) ThenBlock: {
+            SinTblState.sa = Add(SinTblState.sa, 131072)
+        }
+
+        // Determine quadrant (0-3), each quadrant = 32768
+        SinTblState.sq = Divide(SinTblState.sa, 32768)
+
+        // Position within quadrant [0..32767] → table index [0..64]
+        SinTblState.si = Modulo(SinTblState.sa, 32768)
+        SinTblState.si = Divide(SinTblState.si, 512)
+
+        // Q0: sin ascending (0→1), use table directly
+        IfCondition EqualTo(SinTblState.sq, 0) ThenBlock: {
+            ReturnValue(Dereference(Add(SinTblState.tbl, Multiply(SinTblState.si, 8))))
+        }
+        // Q1: sin descending (1→0), read table backwards
+        IfCondition EqualTo(SinTblState.sq, 1) ThenBlock: {
+            ReturnValue(Dereference(Add(SinTblState.tbl, Multiply(Subtract(64, SinTblState.si), 8))))
+        }
+        // Q2: sin ascending negative (0→-1)
+        IfCondition EqualTo(SinTblState.sq, 2) ThenBlock: {
+            ReturnValue(Subtract(0, Dereference(Add(SinTblState.tbl, Multiply(SinTblState.si, 8)))))
+        }
+        // Q3: sin descending negative (-1→0)
+        ReturnValue(Subtract(0, Dereference(Add(SinTblState.tbl, Multiply(Subtract(64, SinTblState.si), 8)))))
+    }
+}
+
+// =============================================================================
+// LLM_CosQ8 — integer cos from sin table
+// cos(x) = sin(x + π/2) = sin(x + 32768)   (quarter period = 32768)
+// =============================================================================
+Function.LLM_CosQ8 {
+    Input: angle: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(LLM_SinQ8(Add(angle, 32768)))
+    }
+}
+
+// =============================================================================
+// LLM_InitRoPETables — precompute angle-per-position multipliers (32 values)
+//
+// RoPE formula: angle_rad(pos, i) = pos / theta^(2i/dim)
+// where theta = 10000.0, dim = rope_dim (64)
+//
+// We store: freq_tbl[i] = 131072 / (2π * theta^(2i/dim))
+//                        ≈ 20861 / theta^(2i/dim)
+//
+// Then: angle_units = pos * freq_tbl[i]  (period = 131072 = full circle)
+//
+// theta^(2i/dim) for dim=64:
+//   i=0:  10000^(0/64)    = 1.0        → scale = 20861
+//   i=1:  10000^(2/64)    = 1.389      → scale = 15019
+//   i=2:  10000^(4/64)    = 1.930      → scale = 10808
+//   ...
+//   i=31: 10000^(62/64)   = 8540       → scale = 2
+//
+// We use iterative computation: each step divides by theta^(2/dim) ≈ 1.389
+// Approximation: multiply by 1000 then divide by 1389
+// =============================================================================
+Function.LLM_InitRoPETables {
+    Body: {
+        IfCondition EqualTo(RoPETbl.initialized, 1) ThenBlock: { ReturnValue(0) }
+
+        FwdW.val = Divide(LLMConfig.rope_dim, 2)   // half_dim = 32
+        RoPETbl.freq_tbl = Allocate(Multiply(FwdW.val, 8))
+
+        // scale[0] = 20861 (≈ 131072 / 2π)
+        StoreValue(RoPETbl.freq_tbl, 20861)
+        FwdW.idx = 1
+        WhileLoop LessThan(FwdW.idx, FwdW.val) {
+            FwdW.val2 = Dereference(Add(RoPETbl.freq_tbl, Multiply(Subtract(FwdW.idx, 1), 8)))
+            // Divide by theta^(2/dim) ≈ 1.389: multiply by 1000, divide by 1389
+            FwdW.val2 = Divide(Multiply(FwdW.val2, 1000), 1389)
+            IfCondition LessThan(FwdW.val2, 1) ThenBlock: { FwdW.val2 = 1 }
+            StoreValue(Add(RoPETbl.freq_tbl, Multiply(FwdW.idx, 8)), FwdW.val2)
+            FwdW.idx = Add(FwdW.idx, 1)
+        }
+
+        RoPETbl.initialized = 1
+        PrintMessage("[Forward] RoPE frequency table initialized\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_InitSiLU — precompute SiLU lookup table
+// SiLU(x) = x * sigmoid(x) = x * (1 / (1 + exp(-x)))
+// Table covers input range: index [0..511] maps to x in [-1024..+1024]
+// Input x is Q8, output is Q8.
+// SiLU(x) for x>>0 ≈ x, for x<<0 ≈ 0, for x≈0 ≈ x/2
+// =============================================================================
+Function.LLM_InitSiLU {
+    Body: {
+        IfCondition EqualTo(SiLUTbl.initialized, 1) ThenBlock: { ReturnValue(0) }
+
+        SiLUTbl.tbl = Allocate(4096)   // 512 * 8
+        MemorySet(SiLUTbl.tbl, 0, 4096)
+
+        // For each entry i in [0, 512):
+        //   x = (i - 256) * 4   (range -1024 to +1020, Q0 representation of Q8 input / 256)
+        //   sigmoid(x) = 1 / (1 + exp(-x))
+        //   Using our exp table: exp(-x) when x>0 → small, sigmoid→1
+        //                        exp(-x) when x<0 → exp(|x|) → large, sigmoid→0
+        //   SiLU(x) = x * sigmoid(x)
+        //
+        // For integer computation:
+        //   sig_q8 = 256 / (1 + exp(-x_scaled))
+        //   where x_scaled = |x| / 8 (to index into EXPTBL)
+        //   exp_val = EXPTBL[x_scaled] (Q8)
+        //   if x >= 0: sigmoid = 256 * 256 / (256 + exp_val)
+        //   if x < 0:  sigmoid = 256 * exp_val / (256 + exp_val)  ... wait
+        //
+        // Actually: sigmoid(x) = exp(x) / (exp(x) + 1)
+        //   if x >= 0: sigmoid = 256 / (256 + EXPTBL[x/8])  ... no
+        //
+        // Let me think again. EXPTBL[i] = exp(-i/32) * 256.
+        //   sigmoid(x) = 1 / (1 + exp(-x))
+        //   If x >= 0: exp(-x) = EXPTBL[x * 32 / 256] ... we need to map x to table index
+        //     sig = 256 / (1 + exp(-x)) = 256 * 256 / (256 + EXPTBL[idx])
+        //   If x < 0: exp(-x) = exp(|x|), which is 1/EXPTBL[|x|*...]
+        //     Easier: sigmoid(-|x|) = 1 - sigmoid(|x|)
+        //
+        // Simple approach: for each table entry, compute SiLU directly
+        // Q20 SiLU table: 512 entries
+        // index i → x_q20 = (i - 256) * 16384   (float range -4.0 to +4.0)
+        // Table index = (x_q20 + 4194304) / 16384, clamped to [0, 511]
+        // EXPTBL[i] = exp(-i/32) * 256 (Q8).
+        // To get exp(-float_x): float_x = x_q20 / 1048576
+        //   table index = float_x * 32 = x_q20 / 32768
+        FwdW.idx = 0
+        WhileLoop LessThan(FwdW.idx, 512) {
+            FwdW.val = Multiply(Subtract(FwdW.idx, 256), 16384)   // x_q20
+
+            IfCondition GreaterEqual(FwdW.val, 0) ThenBlock: {
+                FwdW.val2 = TF_Clamp(Divide(FwdW.val, 32768), 0, 255)
+                FwdW.score = TFAct_Exp(FwdW.val2)
+                // sigmoid_q8 = 256 * 256 / (256 + exp_val)
+                FwdW.score = Divide(65536, Add(256, FwdW.score))
+                // SiLU_q20 = x_q20 * sigmoid_q8 / 256
+                FwdW.val2 = Divide(Multiply(FwdW.val, FwdW.score), 256)
+            }
+            IfCondition LessThan(FwdW.val, 0) ThenBlock: {
+                FwdW.val2 = TF_Clamp(Divide(Subtract(0, FwdW.val), 32768), 0, 255)
+                FwdW.score = TFAct_Exp(FwdW.val2)
+                FwdW.score = Divide(Multiply(256, FwdW.score), Add(256, FwdW.score))
+                // SiLU_q20 = x_q20 * sigmoid_q8 / 256
+                FwdW.val2 = Divide(Multiply(FwdW.val, FwdW.score), 256)
+            }
+
+            StoreValue(Add(SiLUTbl.tbl, Multiply(FwdW.idx, 8)), FwdW.val2)
+            FwdW.idx = Add(FwdW.idx, 1)
+        }
+
+        SiLUTbl.initialized = 1
+        PrintMessage("[Forward] SiLU table initialized\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_SiLU — apply SiLU activation via lookup
+// Input: x (Q20 fixed-point value)
+// Output: SiLU(x) (Q20 fixed-point)
+// =============================================================================
+Function.LLM_SiLU {
+    Input: x: Integer
+    Output: Integer
+    Body: {
+        // Map x_q20 to table index: idx = (x + 4194304) / 16384, clamped to [0, 511]
+        FwdW.val = TF_Clamp(Divide(Add(x, 4194304), 16384), 0, 511)
+        ReturnValue(Dereference(Add(SiLUTbl.tbl, Multiply(FwdW.val, 8))))
+    }
+}
+
+// =============================================================================
+// LLM_RMSNorm — RMS normalization (LLaMA uses RMSNorm, not LayerNorm)
+//
+// RMSNorm(x, gamma) = (x / RMS(x)) * gamma
+// where RMS(x) = sqrt(mean(x^2))
+//
+// In Q20 integer math (int64):
+//   1. Compute sum of squares: sum(x[i]^2) for i in [0, dim)
+//   2. mean_sq = sum / dim
+//   3. rms = isqrt(mean_sq)
+//   4. out[i] = x[i] * gamma[i] / rms
+//
+// x is Q20, so x^2 is Q40. Sum of Q40 over dim 576 fits int64 easily.
+// mean_sq is Q40. sqrt(Q40) → Q20. Good.
+// x[i] * gamma[i] is Q40. Divide by rms (Q20) → Q20 output.
+//
+// dst and src may alias (in-place).
+// =============================================================================
+Function.LLM_RMSNorm {
+    Input: dst: Address
+    Input: src: Address
+    Input: gamma: Address
+    Input: dim: Integer
+    Body: {
+        // Step 1: sum of squares
+        FwdW.sum = 0
+        FwdW.idx = 0
+        WhileLoop LessThan(FwdW.idx, dim) {
+            FwdW.val = Dereference(Add(src, Multiply(FwdW.idx, 8)))
+            FwdW.sum = Add(FwdW.sum, Multiply(FwdW.val, FwdW.val))
+            FwdW.idx = Add(FwdW.idx, 1)
+        }
+
+        // Step 2: mean and RMS
+        // mean_sq = sum / dim (Q40)
+        // rms = sqrt(mean_sq) (Q20)
+        FwdW.rms = TF_ISqrt(Divide(FwdW.sum, dim))
+        IfCondition EqualTo(FwdW.rms, 0) ThenBlock: { FwdW.rms = 1 }
+
+        // Step 3: normalize and scale
+        // out[i] = x[i] * gamma[i] / rms
+        // x is Q20, gamma is Q20, product is Q40, divide by rms (Q20) → Q20
+        FwdW.idx = 0
+        WhileLoop LessThan(FwdW.idx, dim) {
+            FwdW.val = Dereference(Add(src, Multiply(FwdW.idx, 8)))
+            FwdW.val2 = Dereference(Add(gamma, Multiply(FwdW.idx, 8)))
+            StoreValue(Add(dst, Multiply(FwdW.idx, 8)),
+                       Divide(Multiply(FwdW.val, FwdW.val2), FwdW.rms))
+            FwdW.idx = Add(FwdW.idx, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_SoftmaxQ20 — softmax over Q20 input values
+// Input scores are Q20, output is Q8 probabilities (0-256 = 0.0-1.0)
+//
+// Same as TFAct_Softmax but with Q20-appropriate diff scaling:
+//   EXPTBL[i] = exp(-i/32) * 256 (Q8)
+//   For Q20 diff: float_diff = diff_q20 / 1048576
+//   Table index = float_diff * 32 = diff_q20 / 32768
+// =============================================================================
+Function.LLM_SoftmaxQ20 {
+    Input: dst: Integer
+    Input: src: Integer
+    Input: len: Integer
+    Body: {
+        // Step 1: find max
+        sm_max = Dereference(src)
+        sm_i = 1
+        WhileLoop LessThan(sm_i, len) {
+            sm_v = Dereference(Add(src, Multiply(sm_i, 8)))
+            IfCondition GreaterThan(sm_v, sm_max) ThenBlock: { sm_max = sm_v }
+            sm_i = Add(sm_i, 1)
+        }
+
+        // Step 2: compute exp values via table
+        // diff_q20 / 32768 maps to exp table index
+        sm_i = 0
+        WhileLoop LessThan(sm_i, len) {
+            sm_diff = Subtract(sm_max, Dereference(Add(src, Multiply(sm_i, 8))))
+            sm_idx = TF_Clamp(Divide(sm_diff, 32768), 0, 255)
+            StoreValue(Add(dst, Multiply(sm_i, 8)), TFAct_Exp(sm_idx))
+            sm_i = Add(sm_i, 1)
+        }
+
+        // Step 3: sum
+        sm_total = 0
+        sm_i = 0
+        WhileLoop LessThan(sm_i, len) {
+            sm_total = Add(sm_total, Dereference(Add(dst, Multiply(sm_i, 8))))
+            sm_i = Add(sm_i, 1)
+        }
+        IfCondition EqualTo(sm_total, 0) ThenBlock: { sm_total = 1 }
+
+        // Step 4: normalize → Q8 output (0-256)
+        sm_i = 0
+        WhileLoop LessThan(sm_i, len) {
+            sm_v = Dereference(Add(dst, Multiply(sm_i, 8)))
+            StoreValue(Add(dst, Multiply(sm_i, 8)), Divide(Multiply(sm_v, 256), sm_total))
+            sm_i = Add(sm_i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_ApplyRoPE — apply rotary position embeddings to Q and K vectors
+//
+// For each dimension pair (2i, 2i+1) in each head:
+//   q_new[2i]   = q[2i]   * cos - q[2i+1] * sin
+//   q_new[2i+1] = q[2i]   * sin + q[2i+1] * cos
+// Same for K (but only n_kv_heads heads).
+//
+// cos/sin values are Q8 (±256). Q/K values are Q20.
+// Product is Q28, divide by 256 → Q20.
+// =============================================================================
+Function.LLM_ApplyRoPE {
+    Input: q_vec: Address
+    Input: k_vec: Address
+    Input: pos: Integer
+    Body: {
+        // Apply to all Q heads — compute sin/cos on-the-fly from freq_tbl
+        // freq_tbl[i] = angle multiplier per position (period 131072 = 2π)
+        // angle = pos * freq_tbl[idx]
+        FwdW.head = 0
+        WhileLoop LessThan(FwdW.head, LLMConfig.n_heads) {
+            FwdW.head_off = Multiply(Multiply(FwdW.head, LLMConfig.head_dim), 8)
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, Divide(LLMConfig.head_dim, 2)) {
+                // Read pair
+                FwdW.val  = Dereference(Add(q_vec, Add(FwdW.head_off, Multiply(Multiply(FwdW.idx, 2), 8))))
+                FwdW.val2 = Dereference(Add(q_vec, Add(FwdW.head_off, Multiply(Add(Multiply(FwdW.idx, 2), 1), 8))))
+
+                // Compute angle: angle = pos * freq_tbl[idx]
+                FwdW.ptr = Multiply(pos, Dereference(Add(RoPETbl.freq_tbl, Multiply(FwdW.idx, 8))))
+
+                // Compute sin/cos via lookup
+                FwdW.score = LLM_SinQ8(FwdW.ptr)   // sin
+                FwdW.best  = LLM_CosQ8(FwdW.ptr)   // cos
+
+                // Rotate: new_re = re*cos - im*sin, new_im = re*sin + im*cos
+                StoreValue(Add(q_vec, Add(FwdW.head_off, Multiply(Multiply(FwdW.idx, 2), 8))),
+                    Divide(Subtract(Multiply(FwdW.val, FwdW.best), Multiply(FwdW.val2, FwdW.score)), 256))
+                StoreValue(Add(q_vec, Add(FwdW.head_off, Multiply(Add(Multiply(FwdW.idx, 2), 1), 8))),
+                    Divide(Add(Multiply(FwdW.val, FwdW.score), Multiply(FwdW.val2, FwdW.best)), 256))
+
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+            FwdW.head = Add(FwdW.head, 1)
+        }
+
+        // Apply to all KV heads
+        FwdW.head = 0
+        WhileLoop LessThan(FwdW.head, LLMConfig.n_kv_heads) {
+            FwdW.head_off = Multiply(Multiply(FwdW.head, LLMConfig.head_dim), 8)
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, Divide(LLMConfig.head_dim, 2)) {
+                FwdW.val  = Dereference(Add(k_vec, Add(FwdW.head_off, Multiply(Multiply(FwdW.idx, 2), 8))))
+                FwdW.val2 = Dereference(Add(k_vec, Add(FwdW.head_off, Multiply(Add(Multiply(FwdW.idx, 2), 1), 8))))
+
+                FwdW.ptr = Multiply(pos, Dereference(Add(RoPETbl.freq_tbl, Multiply(FwdW.idx, 8))))
+
+                FwdW.score = LLM_SinQ8(FwdW.ptr)
+                FwdW.best  = LLM_CosQ8(FwdW.ptr)
+
+                StoreValue(Add(k_vec, Add(FwdW.head_off, Multiply(Multiply(FwdW.idx, 2), 8))),
+                    Divide(Subtract(Multiply(FwdW.val, FwdW.best), Multiply(FwdW.val2, FwdW.score)), 256))
+                StoreValue(Add(k_vec, Add(FwdW.head_off, Multiply(Add(Multiply(FwdW.idx, 2), 1), 8))),
+                    Divide(Add(Multiply(FwdW.val, FwdW.score), Multiply(FwdW.val2, FwdW.best)), 256))
+
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+            FwdW.head = Add(FwdW.head, 1)
+        }
+
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LLM_Forward — single-token forward pass through all layers
+//
+// Input: token_id, pos (position in sequence)
+// Output: populates LLMBuf.logits with output logits
+//
+// Steps per layer:
+//   1. RMSNorm (pre-attention)
+//   2. QKV projection (MatVecMul)
+//   3. RoPE on Q and K
+//   4. Store K,V in cache
+//   5. For each Q head: compute attention scores against all cached K
+//   6. Softmax attention scores
+//   7. Weighted sum of cached V using attention weights
+//   8. Output projection (Wo)
+//   9. Residual connection
+//  10. RMSNorm (pre-FFN)
+//  11. FFN: gate + up projections, SiLU, element-wise multiply, down projection
+//  12. Residual connection
+// After all layers:
+//  13. Final RMSNorm
+//  14. Output projection → logits
+// =============================================================================
+Function.LLM_Forward {
+    Input: token_id: Integer
+    Input: pos: Integer
+    Body: {
+        // Precompute GQA ratio and KV dimension
+        FwdW.kv_dim = Multiply(LLMConfig.n_kv_heads, LLMConfig.head_dim)
+        FwdW.q_per_kv = Divide(LLMConfig.n_heads, LLMConfig.n_kv_heads)
+        // KV cache stride per layer = max_seq * kv_dim
+        FwdW.kv_stride = Multiply(LLMMode.max_seq, FwdW.kv_dim)
+
+        // ── Token embedding lookup ──
+        // tok_embd is [vocab_size × d_model], each element 8 bytes
+        // Copy row for token_id into x
+        FwdW.val = Multiply(token_id, LLMConfig.d_model)
+        FwdW.val = Multiply(FwdW.val, 8)
+        FwdW.ptr = Add(LLMWeights.tok_embd, FwdW.val)
+        FwdW.idx = 0
+        WhileLoop LessThan(FwdW.idx, LLMConfig.d_model) {
+            StoreValue(Add(LLMBuf.x, Multiply(FwdW.idx, 8)),
+                       Dereference(Add(FwdW.ptr, Multiply(FwdW.idx, 8))))
+            FwdW.idx = Add(FwdW.idx, 1)
+        }
+
+        // ── Layer loop ──
+        FwdW.layer_idx = 0
+        WhileLoop LessThan(FwdW.layer_idx, LLMConfig.n_layers) {
+
+            FwdW.layer_ptr = Add(LLMWeights.layers,
+                                 Multiply(FwdW.layer_idx, LLMLayerConst.ENTRY_SIZE))
+
+            // ── 1. Pre-attention RMSNorm ──
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.ATTN_NORM))
+            LLM_RMSNorm(LLMBuf.xb, LLMBuf.x, FwdW.ptr, LLMConfig.d_model)
+
+            // ── 2. QKV projections (dispatched via HAL → GPU) ──
+            // Q: [d_model × d_model] * xb → q
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.WQ))
+            TF_MatVecMul(LLMBuf.q, FwdW.ptr, LLMBuf.xb, LLMConfig.d_model, LLMConfig.d_model)
+
+            // Descale Q20×Q20=Q40 → Q20
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, LLMConfig.d_model) {
+                StoreValue(Add(LLMBuf.q, Multiply(FwdW.idx, 8)),
+                           Divide(Dereference(Add(LLMBuf.q, Multiply(FwdW.idx, 8))), 1048576))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // K: [kv_dim × d_model] * xb → k
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.WK))
+            TF_MatVecMul(LLMBuf.k, FwdW.ptr, LLMBuf.xb, FwdW.kv_dim, LLMConfig.d_model)
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, FwdW.kv_dim) {
+                StoreValue(Add(LLMBuf.k, Multiply(FwdW.idx, 8)),
+                           Divide(Dereference(Add(LLMBuf.k, Multiply(FwdW.idx, 8))), 1048576))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // V: [kv_dim × d_model] * xb → v
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.WV))
+            TF_MatVecMul(LLMBuf.v, FwdW.ptr, LLMBuf.xb, FwdW.kv_dim, LLMConfig.d_model)
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, FwdW.kv_dim) {
+                StoreValue(Add(LLMBuf.v, Multiply(FwdW.idx, 8)),
+                           Divide(Dereference(Add(LLMBuf.v, Multiply(FwdW.idx, 8))), 1048576))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // ── 3. Apply RoPE to Q and K ──
+            LLM_ApplyRoPE(LLMBuf.q, LLMBuf.k, pos)
+
+            // ── 4. Store K,V in cache ──
+            // Cache layout: [n_layers][max_seq][kv_dim]
+            // key_cache[layer][pos] = k
+            FwdW.ptr = Add(KVCache.key,
+                Multiply(Add(Multiply(FwdW.layer_idx, FwdW.kv_stride), Multiply(pos, FwdW.kv_dim)), 8))
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, FwdW.kv_dim) {
+                StoreValue(Add(FwdW.ptr, Multiply(FwdW.idx, 8)),
+                           Dereference(Add(LLMBuf.k, Multiply(FwdW.idx, 8))))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+            // value_cache[layer][pos] = v
+            FwdW.ptr = Add(KVCache.value,
+                Multiply(Add(Multiply(FwdW.layer_idx, FwdW.kv_stride), Multiply(pos, FwdW.kv_dim)), 8))
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, FwdW.kv_dim) {
+                StoreValue(Add(FwdW.ptr, Multiply(FwdW.idx, 8)),
+                           Dereference(Add(LLMBuf.v, Multiply(FwdW.idx, 8))))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // ── 5-7. Multi-head attention with GQA ──
+            // Zero the output accumulator (xb will hold the attention output)
+            MemorySet(LLMBuf.xb, 0, Multiply(LLMConfig.d_model, 8))
+
+            FwdW.head = 0
+            WhileLoop LessThan(FwdW.head, LLMConfig.n_heads) {
+                // Which KV head does this Q head map to? (GQA)
+                FwdW.kv_head = Divide(FwdW.head, FwdW.q_per_kv)
+
+                // Q head slice: q[head * head_dim .. (head+1) * head_dim]
+                FwdW.head_off = Multiply(Multiply(FwdW.head, LLMConfig.head_dim), 8)
+
+                // ── 5. Compute attention scores against all cached K ──
+                // For each past position t in [0, pos]:
+                //   score[t] = dot(q_head, k_cached[layer][t][kv_head]) / sqrt(head_dim)
+                FwdW.idx = 0
+                WhileLoop LessEqual(FwdW.idx, pos) {
+                    // Get cached K for this position and KV head
+                    FwdW.ptr = Add(KVCache.key,
+                        Multiply(Add(Multiply(FwdW.layer_idx, FwdW.kv_stride),
+                                     Add(Multiply(FwdW.idx, FwdW.kv_dim),
+                                         Multiply(FwdW.kv_head, LLMConfig.head_dim))), 8))
+
+                    // Dot product: q_head · k_cached
+                    FwdW.score = 0
+                    FwdW.idx2 = 0
+                    WhileLoop LessThan(FwdW.idx2, LLMConfig.head_dim) {
+                        FwdW.score = Add(FwdW.score,
+                            Multiply(Dereference(Add(LLMBuf.q, Add(FwdW.head_off, Multiply(FwdW.idx2, 8)))),
+                                     Dereference(Add(FwdW.ptr, Multiply(FwdW.idx2, 8)))))
+                        FwdW.idx2 = Add(FwdW.idx2, 1)
+                    }
+
+                    // Scale by 1/sqrt(head_dim) and descale Q40→Q20
+                    // dot product is Q20*Q20=Q40 summed over head_dim
+                    // Divide by 1048576 (Q40→Q20) and by sqrt(64)=8
+                    // Combined: divide by 8388608
+                    FwdW.score = Divide(FwdW.score, 8388608)
+
+                    // Store attention score for this position
+                    // att[head * max_seq + t]
+                    StoreValue(Add(LLMBuf.att,
+                        Multiply(Add(Multiply(FwdW.head, LLMMode.max_seq), FwdW.idx), 8)),
+                        FwdW.score)
+
+                    FwdW.idx = Add(FwdW.idx, 1)
+                }
+
+                // ── 6. Softmax over attention scores [0..pos] ──
+                // Q20-adapted softmax for attention scores
+                FwdW.ptr = Add(LLMBuf.att, Multiply(Multiply(FwdW.head, LLMMode.max_seq), 8))
+                LLM_SoftmaxQ20(FwdW.ptr, FwdW.ptr, Add(pos, 1))
+
+                // ── 7. Weighted sum of cached V using attention weights ──
+                // xb[head_slice] = sum over t: att[t] * v_cache[layer][t][kv_head_slice]
+                FwdW.idx = 0
+                WhileLoop LessEqual(FwdW.idx, pos) {
+                    // Attention weight for position t (Q8: 0-256 represents 0-1)
+                    FwdW.val = Dereference(Add(LLMBuf.att,
+                        Multiply(Add(Multiply(FwdW.head, LLMMode.max_seq), FwdW.idx), 8)))
+
+                    // Get cached V for this position and KV head
+                    FwdW.ptr2 = Add(KVCache.value,
+                        Multiply(Add(Multiply(FwdW.layer_idx, FwdW.kv_stride),
+                                     Add(Multiply(FwdW.idx, FwdW.kv_dim),
+                                         Multiply(FwdW.kv_head, LLMConfig.head_dim))), 8))
+
+                    // Accumulate: xb[head*head_dim + d] += att_weight * v[d] / 256
+                    FwdW.idx2 = 0
+                    WhileLoop LessThan(FwdW.idx2, LLMConfig.head_dim) {
+                        FwdW.val2 = Dereference(Add(FwdW.ptr2, Multiply(FwdW.idx2, 8)))
+                        FwdW.ptr = Add(LLMBuf.xb, Add(FwdW.head_off, Multiply(FwdW.idx2, 8)))
+                        StoreValue(FwdW.ptr,
+                            Add(Dereference(FwdW.ptr),
+                                Divide(Multiply(FwdW.val, FwdW.val2), 256)))
+                        FwdW.idx2 = Add(FwdW.idx2, 1)
+                    }
+                    FwdW.idx = Add(FwdW.idx, 1)
+                }
+
+                FwdW.head = Add(FwdW.head, 1)
+            }
+
+            // ── 8. Output projection: Wo * attention_output → xb2 ──
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.WO))
+            TF_MatVecMul(LLMBuf.xb2, FwdW.ptr, LLMBuf.xb, LLMConfig.d_model, LLMConfig.d_model)
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, LLMConfig.d_model) {
+                StoreValue(Add(LLMBuf.xb2, Multiply(FwdW.idx, 8)),
+                           Divide(Dereference(Add(LLMBuf.xb2, Multiply(FwdW.idx, 8))), 1048576))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // ── 9. Residual connection: x = x + attn_output ──
+            TF_VecAdd(LLMBuf.x, LLMBuf.x, LLMBuf.xb2, LLMConfig.d_model)
+
+            // ── 10. Pre-FFN RMSNorm ──
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.FFN_NORM))
+            LLM_RMSNorm(LLMBuf.xb, LLMBuf.x, FwdW.ptr, LLMConfig.d_model)
+
+            // ── 11. SwiGLU FFN ──
+            // gate = W_gate * xb   [d_ff × d_model] → [d_ff]
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.W_GATE))
+            TF_MatVecMul(LLMBuf.ffn_gate, FwdW.ptr, LLMBuf.xb, LLMConfig.d_ff, LLMConfig.d_model)
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, LLMConfig.d_ff) {
+                StoreValue(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8)),
+                           Divide(Dereference(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8))), 1048576))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // up = W_up * xb   [d_ff × d_model] → [d_ff]
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.W_UP))
+            TF_MatVecMul(LLMBuf.ffn_up, FwdW.ptr, LLMBuf.xb, LLMConfig.d_ff, LLMConfig.d_model)
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, LLMConfig.d_ff) {
+                StoreValue(Add(LLMBuf.ffn_up, Multiply(FwdW.idx, 8)),
+                           Divide(Dereference(Add(LLMBuf.ffn_up, Multiply(FwdW.idx, 8))), 1048576))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // SwiGLU: hidden = SiLU(gate) * up
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, LLMConfig.d_ff) {
+                FwdW.val = LLM_SiLU(Dereference(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8))))
+                FwdW.val2 = Dereference(Add(LLMBuf.ffn_up, Multiply(FwdW.idx, 8)))
+                // SiLU output is Q20, up is Q20, product is Q40, /1048576 → Q20
+                StoreValue(Add(LLMBuf.ffn_gate, Multiply(FwdW.idx, 8)),
+                           Divide(Multiply(FwdW.val, FwdW.val2), 1048576))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // down = W_down * hidden   [d_model × d_ff] → [d_model]
+            FwdW.ptr = Dereference(Add(FwdW.layer_ptr, LLMLayerField.W_DOWN))
+            TF_MatVecMul(LLMBuf.ffn_down, FwdW.ptr, LLMBuf.ffn_gate, LLMConfig.d_model, LLMConfig.d_ff)
+            FwdW.idx = 0
+            WhileLoop LessThan(FwdW.idx, LLMConfig.d_model) {
+                StoreValue(Add(LLMBuf.ffn_down, Multiply(FwdW.idx, 8)),
+                           Divide(Dereference(Add(LLMBuf.ffn_down, Multiply(FwdW.idx, 8))), 1048576))
+                FwdW.idx = Add(FwdW.idx, 1)
+            }
+
+            // ── 12. Residual connection: x = x + ffn_output ──
+            TF_VecAdd(LLMBuf.x, LLMBuf.x, LLMBuf.ffn_down, LLMConfig.d_model)
+
+            FwdW.layer_idx = Add(FwdW.layer_idx, 1)
+        }
+
+        // ── 13. Final RMSNorm ──
+        LLM_RMSNorm(LLMBuf.x, LLMBuf.x, LLMWeights.output_norm, LLMConfig.d_model)
+
+        // ── 14. Output projection → logits ──
+        // logits projection (CPU fallback for vocab-sized matrix)
+        // output is [vocab_size × d_model], x is [d_model], logits is [vocab_size]
+        TF_MatVecMul(LLMBuf.logits, LLMWeights.output, LLMBuf.x,
+                     LLMConfig.vocab_size, LLMConfig.d_model)
+
+        // Descale Q20×Q20=Q40 → Q20 logits
+        FwdW.idx = 0
+        WhileLoop LessThan(FwdW.idx, LLMConfig.vocab_size) {
+            StoreValue(Add(LLMBuf.logits, Multiply(FwdW.idx, 8)),
+                       Divide(Dereference(Add(LLMBuf.logits, Multiply(FwdW.idx, 8))), 1048576))
+            FwdW.idx = Add(FwdW.idx, 1)
+        }
+        ReturnValue(0)
+    }
+}

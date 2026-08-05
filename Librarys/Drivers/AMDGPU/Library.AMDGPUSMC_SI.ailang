@@ -1,0 +1,742 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUSMC_SI.ailang
+//
+// Southern Islands (GCN 1.0) SMC backend.
+// Implements SMC SRAM access, firmware loading, start/stop, and message
+// protocol for the ARM-derived System Management Controller on SI GPUs
+// (Tahiti, Pitcairn, Verde, Oland, Hainan).
+//
+// The SMC runs autonomously on the GPU die. It manages clocks, voltages,
+// thermal sensors, and DPM state transitions. The host CPU communicates
+// with it by:
+//   1. Writing firmware to SMC SRAM via indirect registers
+//   2. Starting the SMC clock/deassert reset
+//   3. Sending PPSMC messages via MESSAGE_0/RESP_0
+//
+// All SMC SRAM data is BIG ENDIAN. PCI MMIO writes are little-endian.
+// The indirect access hardware byte-swaps LE→BE when writing to SRAM.
+// Therefore firmware words from the .bin file (which are stored BE) must
+// be byte-swapped to LE before GPU_Wr32, matching PM4_LoadUcodeFile.
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUSMC_SI
+//
+// DEPENDS
+//   LibraryImport.Arena
+//   LibraryImport.Drivers.AMDGPU.AMDGPUSMCRegs
+//   LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+//   LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+
+// =============================================================================
+// PER-GPU SMC STATE
+// =============================================================================
+FixedPool.SMCField {
+    "FW_PTR":           Initialize=0     // pointer to loaded firmware buffer
+    "FW_SIZE":          Initialize=8     // firmware file size in bytes
+    "FW_LOADED":        Initialize=16    // 1 if firmware uploaded to SRAM
+    "FW_RUNNING":       Initialize=24    // 1 if SMC clock is enabled
+    "SRAM_END":         Initialize=32    // end address of firmware in SRAM
+    "STATE_TBL_ADDR":   Initialize=40    // SRAM address of state table
+    "SOFT_REG_ADDR":    Initialize=48    // SRAM address of soft registers
+    "ENTRY_SIZE":       Initialize=64    // bytes per entry
+}
+
+FixedPool.SMCState {
+    "entries":          Initialize=0, CanChange=True
+    "initialized":      Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// SMC_SI_Init — allocate per-GPU SMC state array
+// =============================================================================
+Function.SMC_SI_Init {
+    Body: {
+        IfCondition EqualTo(SMCState.initialized, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        total = Multiply(GPUBarConst.MAX_GPUS, SMCField.ENTRY_SIZE)
+        SMCState.entries = Allocate(total)
+        MemorySet(SMCState.entries, 0, total)
+        SMCState.initialized = 1
+    }
+}
+
+// =============================================================================
+// SMC_SI_GetEntry — return pointer to SMC state for GPU index
+// =============================================================================
+Function.SMC_SI_GetEntry {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(index, GPUBarConst.MAX_GPUS) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(Add(SMCState.entries, Multiply(index, SMCField.ENTRY_SIZE)))
+    }
+}
+
+// =============================================================================
+// SMC INDIRECT REGISTER ACCESS
+// =============================================================================
+// SMC syscon registers live at addresses >= 0x80000000 and must be accessed
+// via the IND_INDEX_0/IND_DATA_0 indirect path. This is the same mechanism
+// used for SRAM access but with addresses in the syscon range.
+
+// SMC_SI_IndRd32 — read an SMC indirect register
+Function.SMC_SI_IndRd32 {
+    Input: gpu: Integer
+    Input: smc_addr: Integer
+    Output: Integer
+    Body: {
+        GPU_Wr32(gpu, SMCReg.IND_INDEX_0, smc_addr)
+        ReturnValue(GPU_Rd32(gpu, SMCReg.IND_DATA_0))
+    }
+}
+
+// SMC_SI_IndWr32 — write an SMC indirect register
+Function.SMC_SI_IndWr32 {
+    Input: gpu: Integer
+    Input: smc_addr: Integer
+    Input: value: Integer
+    Body: {
+        GPU_Wr32(gpu, SMCReg.IND_INDEX_0, smc_addr)
+        GPU_Wr32(gpu, SMCReg.IND_DATA_0, value)
+    }
+}
+
+// =============================================================================
+// SMC SRAM ACCESS
+// =============================================================================
+// SMC SRAM occupies addresses 0x00000 - 0x20000 (128KB).
+// Data in SRAM is big-endian. The indirect access hardware byte-swaps
+// LE↔BE between PCI MMIO and SRAM, so no explicit swap needed for
+// single-dword SRAM reads/writes (the hardware handles it).
+//
+// For firmware loading however, the .bin file contains BE words that
+// must be byte-swapped to LE before GPU_Wr32 (since the hardware will
+// swap them back to BE in SRAM).
+
+// SMC_SI_ReadSRAM32 — read a 32-bit word from SMC SRAM
+// addr must be 4-byte aligned and < 0x20000
+Function.SMC_SI_ReadSRAM32 {
+    Input: gpu: Integer
+    Input: addr: Integer
+    Output: Integer
+    Body: {
+        // Disable auto-increment for single read
+        acc_cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseAnd(acc_cntl, BitwiseNot(SMCAccessBits.AUTO_INCREMENT)))
+        GPU_Wr32(gpu, SMCReg.IND_INDEX_0, addr)
+        ReturnValue(GPU_Rd32(gpu, SMCReg.IND_DATA_0))
+    }
+}
+
+// SMC_SI_WriteSRAM32 — write a 32-bit word to SMC SRAM
+// addr must be 4-byte aligned and < 0x20000
+Function.SMC_SI_WriteSRAM32 {
+    Input: gpu: Integer
+    Input: addr: Integer
+    Input: value: Integer
+    Body: {
+        // Disable auto-increment for single write
+        acc_cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseAnd(acc_cntl, BitwiseNot(SMCAccessBits.AUTO_INCREMENT)))
+        GPU_Wr32(gpu, SMCReg.IND_INDEX_0, addr)
+        GPU_Wr32(gpu, SMCReg.IND_DATA_0, value)
+    }
+}
+
+// SMC_SI_WriteSRAMBlock — bulk write DWORDs to SMC SRAM using auto-increment
+// addr: starting SRAM address (must be 4-byte aligned)
+// src_ptr: pointer to source data in host memory (native byte order)
+// num_dwords: number of 32-bit words to write
+//
+// The hardware auto-increments the SRAM address by 4 after each write.
+// Data is written in native (LE) byte order — hardware swaps to BE in SRAM.
+Function.SMC_SI_WriteSRAMBlock {
+    Input: gpu: Integer
+    Input: addr: Integer
+    Input: src_ptr: Address
+    Input: num_dwords: Integer
+    Body: {
+        // Enable auto-increment
+        acc_cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseOr(acc_cntl, SMCAccessBits.AUTO_INCREMENT))
+
+        // Set starting address
+        GPU_Wr32(gpu, SMCReg.IND_INDEX_0, addr)
+
+        // Stream data — hardware auto-increments addr by 4 each write
+        i = 0
+        WhileLoop LessThan(i, num_dwords) {
+            word = Dereference(Add(src_ptr, Multiply(i, 4)), "dword")
+            GPU_Wr32(gpu, SMCReg.IND_DATA_0, word)
+            i = Add(i, 1)
+        }
+
+        // Disable auto-increment
+        acc_cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseAnd(acc_cntl, BitwiseNot(SMCAccessBits.AUTO_INCREMENT)))
+    }
+}
+
+// SMC_SI_ReadSRAMBlock — bulk read DWORDs from SMC SRAM using auto-increment
+Function.SMC_SI_ReadSRAMBlock {
+    Input: gpu: Integer
+    Input: addr: Integer
+    Input: dst_ptr: Address
+    Input: num_dwords: Integer
+    Body: {
+        // Enable auto-increment
+        acc_cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseOr(acc_cntl, SMCAccessBits.AUTO_INCREMENT))
+
+        // Set starting address
+        GPU_Wr32(gpu, SMCReg.IND_INDEX_0, addr)
+
+        // Read data — hardware auto-increments
+        i = 0
+        WhileLoop LessThan(i, num_dwords) {
+            word = GPU_Rd32(gpu, SMCReg.IND_DATA_0)
+            StoreValue(Add(dst_ptr, Multiply(i, 4)), word, "dword")
+            i = Add(i, 1)
+        }
+
+        // Disable auto-increment
+        acc_cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseAnd(acc_cntl, BitwiseNot(SMCAccessBits.AUTO_INCREMENT)))
+    }
+}
+
+// =============================================================================
+// SMC START / STOP / RESET
+// =============================================================================
+// These follow the kernel's si_smc.c exactly:
+//   si_stop_smc_clock() → CK_DISABLE in CLOCK_CNTL_0
+//   si_start_smc_clock() → clear CK_DISABLE
+//   si_reset_smc() → dummy reads + assert RST_REG
+//   si_start_smc() → clear RST_REG
+
+// SMC_SI_StopClock — disable SMC clock (CK_DISABLE=1 in CLOCK_CNTL_0)
+Function.SMC_SI_StopClock {
+    Input: gpu: Integer
+    Body: {
+        val = SMC_SI_IndRd32(gpu, SMCSyscon.CLOCK_CNTL_0)
+        val = BitwiseOr(val, SMCSysconBits.CK_DISABLE)
+        SMC_SI_IndWr32(gpu, SMCSyscon.CLOCK_CNTL_0, val)
+    }
+}
+
+// SMC_SI_StartClock — enable SMC clock (clear CK_DISABLE in CLOCK_CNTL_0)
+Function.SMC_SI_StartClock {
+    Input: gpu: Integer
+    Body: {
+        val = SMC_SI_IndRd32(gpu, SMCSyscon.CLOCK_CNTL_0)
+        val = BitwiseAnd(val, BitwiseNot(SMCSysconBits.CK_DISABLE))
+        SMC_SI_IndWr32(gpu, SMCSyscon.CLOCK_CNTL_0, val)
+    }
+}
+
+// SMC_SI_Reset — assert SMC reset (4 dummy reads + RST_REG=1)
+Function.SMC_SI_Reset {
+    Input: gpu: Integer
+    Body: {
+        // 4 dummy reads of CB_CGTT_SCLK_CTRL (direct MMIO, per kernel)
+        flush = GPU_Rd32(gpu, SMCReg.CB_CGTT_SCLK_CTRL)
+        flush = GPU_Rd32(gpu, SMCReg.CB_CGTT_SCLK_CTRL)
+        flush = GPU_Rd32(gpu, SMCReg.CB_CGTT_SCLK_CTRL)
+        flush = GPU_Rd32(gpu, SMCReg.CB_CGTT_SCLK_CTRL)
+
+        // Assert reset
+        val = SMC_SI_IndRd32(gpu, SMCSyscon.RESET_CNTL)
+        val = BitwiseOr(val, SMCSysconBits.RST_REG)
+        SMC_SI_IndWr32(gpu, SMCSyscon.RESET_CNTL, val)
+    }
+}
+
+// SMC_SI_Unreset — deassert SMC reset (clear RST_REG)
+Function.SMC_SI_Unreset {
+    Input: gpu: Integer
+    Body: {
+        val = SMC_SI_IndRd32(gpu, SMCSyscon.RESET_CNTL)
+        val = BitwiseAnd(val, BitwiseNot(SMCSysconBits.RST_REG))
+        SMC_SI_IndWr32(gpu, SMCSyscon.RESET_CNTL, val)
+    }
+}
+
+// SMC_SI_StopSMC — full stop: disable clock + assert reset
+Function.SMC_SI_StopSMC {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        SMC_SI_StopClock(gpu)
+        SMC_SI_Reset(gpu)
+        entry = SMC_SI_GetEntry(gpu)
+        IfCondition NotEqual(entry, 0) ThenBlock: {
+            StoreValue(Add(entry, SMCField.FW_RUNNING), 0)
+        }
+        ReturnValue(1)
+    }
+}
+
+// SMC_SI_StartSMC — full start: write bootstrap + deassert reset + enable clock
+// Matches the kernel's si_dpm_start_smc() which calls:
+//   si_program_jump_on_start(rdev)  ← re-write bootstrap
+//   si_start_smc(rdev)              ← clear RST_REG
+//   si_start_smc_clock(rdev)        ← clear CK_DISABLE
+Function.SMC_SI_StartSMC {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        // Re-write bootstrap jump instruction at SRAM address 0
+        // The kernel does this every time before starting the SMC
+        // (si_program_jump_on_start writes {0x0E,0x00,0x40,0x40} at addr 0).
+        // This ensures the reset vector is intact after table uploads.
+        SMC_SI_WriteSRAM32(gpu, 0, SMCConst.BOOTSTRAP_INST)
+
+        SMC_SI_Unreset(gpu)
+        SMC_SI_StartClock(gpu)
+        entry = SMC_SI_GetEntry(gpu)
+        IfCondition NotEqual(entry, 0) ThenBlock: {
+            StoreValue(Add(entry, SMCField.FW_RUNNING), 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// SMC_SI_IsRunning — check if SMC is alive (not in reset, clock enabled)
+Function.SMC_SI_IsRunning {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        rst = SMC_SI_IndRd32(gpu, SMCSyscon.RESET_CNTL)
+        clk = SMC_SI_IndRd32(gpu, SMCSyscon.CLOCK_CNTL_0)
+        // Running = RST_REG clear AND CK_DISABLE clear
+        IfCondition EqualTo(BitwiseAnd(rst, SMCSysconBits.RST_REG), 0) ThenBlock: {
+            IfCondition EqualTo(BitwiseAnd(clk, SMCSysconBits.CK_DISABLE), 0) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// FIRMWARE PATH SELECTION
+// =============================================================================
+// SMC_SI_GetFirmwarePath — return firmware path string for a SI chip
+Function.SMC_SI_GetFirmwarePath {
+    Input: chip: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(chip, GPUChip.VERDE) ThenBlock: {
+            ReturnValue(SMCFWPath.VERDE)
+        }
+        IfCondition EqualTo(chip, GPUChip.TAHITI) ThenBlock: {
+            ReturnValue(SMCFWPath.TAHITI)
+        }
+        IfCondition EqualTo(chip, GPUChip.PITCAIRN) ThenBlock: {
+            ReturnValue(SMCFWPath.PITCAIRN)
+        }
+        IfCondition EqualTo(chip, GPUChip.OLAND) ThenBlock: {
+            ReturnValue(SMCFWPath.OLAND)
+        }
+        IfCondition EqualTo(chip, GPUChip.HAINAN) ThenBlock: {
+            ReturnValue(SMCFWPath.HAINAN)
+        }
+        PrintMessage("[SMC_SI] Unknown chip ID: ")
+        PrintNumber(chip)
+        PrintMessage("\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// SMC_SI_LoadFirmware — load SMC firmware from disk and upload to SRAM
+// =============================================================================
+// Follows the kernel's si_load_smc_ucode() sequence:
+//   1. Stop SMC clock
+//   2. Assert SMC reset
+//   3. Write bootstrap jump instruction at SRAM address 0
+//   4. Enable auto-increment, set start address, stream firmware words
+//   5. Disable auto-increment
+//   6. Deassert reset, enable clock
+//
+// The firmware .bin file contains big-endian 32-bit words.
+// We byte-swap each word to little-endian before GPU_Wr32 because the
+// indirect access hardware swaps LE→BE when storing to SRAM.
+//
+// Returns 1 on success, negative on error.
+Function.SMC_SI_LoadFirmware {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        SMC_SI_Init()
+        entry = SMC_SI_GetEntry(gpu)
+        IfCondition EqualTo(entry, 0) ThenBlock: {
+            PrintMessage("[SMC_SI] Invalid GPU index\n")
+            ReturnValue(-1)
+        }
+
+        // §26: load the traced working boot's SMC firmware, NOT disk
+        // VERDE_smc.bin. The disk file is a different fw version (15097 vs
+        // 15380 dwords; header table offsets differ: disk state=0x1E020 vs
+        // trace state=0x1E48C) — same failure class as the §21 CP ucode
+        // mismatch. TRACE_VERDE_smc.bin is stored big-endian, so the
+        // existing byte-swap upload loop reproduces the kernel's exact
+        // written values. The image includes the fw's default data tables
+        // (upload runs to 0x1F050; the disk image ends at 0x1EBE4 and
+        // leaves the state-table region uncovered).
+        fw_path = SMCTracePath.SMC
+
+        PrintMessage("[SMC_SI] Loading firmware: ")
+        // Print path (up to 60 chars)
+        pi = 0
+        WhileLoop LessThan(pi, 60) {
+            pch = GetByte(fw_path, pi)
+            IfCondition EqualTo(pch, 0) ThenBlock: { ExitLoop }
+            PrintChar(pch)
+            pi = Add(pi, 1)
+        }
+        PrintMessage("\n")
+
+        // Open firmware file
+        fw_fd = SystemCall(2, fw_path, 0, 0)    // open(path, O_RDONLY)
+        IfCondition LessThan(fw_fd, 0) ThenBlock: {
+            PrintMessage("[SMC_SI] Cannot open firmware file\n")
+            ReturnValue(-3)
+        }
+
+        // Get file size via lseek
+        fw_size = SystemCall(8, fw_fd, 0, 2)     // lseek(fd, 0, SEEK_END)
+        SystemCall(8, fw_fd, 0, 0)                // lseek(fd, 0, SEEK_SET)
+        IfCondition LessThan(fw_size, 256) ThenBlock: {
+            PrintMessage("[SMC_SI] Firmware too small: ")
+            PrintNumber(fw_size)
+            PrintMessage(" bytes\n")
+            SystemCall(3, fw_fd)                   // close(fd)
+            ReturnValue(-4)
+        }
+        PrintMessage("[SMC_SI] Firmware size: ")
+        PrintNumber(fw_size)
+        PrintMessage(" bytes\n")
+
+        // Allocate and read firmware into buffer
+        fw_buf = Allocate(fw_size)
+        IfCondition EqualTo(fw_buf, 0) ThenBlock: {
+            PrintMessage("[SMC_SI] Firmware alloc failed\n")
+            SystemCall(3, fw_fd)
+            ReturnValue(-5)
+        }
+        fw_got = SystemCall(0, fw_fd, fw_buf, fw_size)  // read(fd, buf, size)
+        SystemCall(3, fw_fd)                              // close(fd)
+        IfCondition NotEqual(fw_got, fw_size) ThenBlock: {
+            PrintMessage("[SMC_SI] Firmware read incomplete: got ")
+            PrintNumber(fw_got)
+            PrintMessage("\n")
+            Deallocate(fw_buf, fw_size)
+            ReturnValue(-6)
+        }
+
+        // Store firmware buffer in per-GPU state
+        StoreValue(Add(entry, SMCField.FW_PTR), fw_buf)
+        StoreValue(Add(entry, SMCField.FW_SIZE), fw_size)
+
+        // --- Pre-condition: disable DPM/voltage control before firmware load ---
+        // SMC firmware checks GENERAL_PWRMGT on init. If VOLT_PWRMGT_EN (bit 10)
+        // is set, the firmware enters an unexpected state and won't process messages.
+        // Clear all DPM-related control bits to ensure a clean start.
+        gp_val = GPU_Rd32(gpu, DPMReg.GENERAL_PWRMGT)
+        gp_val = BitwiseAnd(gp_val, BitwiseNot(PwrMgtBits.GLOBAL_PWRMGT_EN))
+        gp_val = BitwiseAnd(gp_val, BitwiseNot(PwrMgtBits.VOLT_PWRMGT_EN))
+        GPU_Wr32(gpu, DPMReg.GENERAL_PWRMGT, gp_val)
+        sp_val = GPU_Rd32(gpu, DPMReg.SCLK_PWRMGT_CNTL)
+        sp_val = BitwiseOr(sp_val, SclkPwrBits.SCLK_PWRMGT_OFF)
+        GPU_Wr32(gpu, DPMReg.SCLK_PWRMGT_CNTL, sp_val)
+
+        // --- Step 1-2: Stop SMC clock + assert reset ---
+        SMC_SI_StopClock(gpu)
+        SMC_SI_Reset(gpu)
+        PrintMessage("[SMC_SI] SMC stopped and reset\n")
+
+        // --- Step 3: Write bootstrap jump instruction at SRAM address 0 ---
+        // The bootstrap instruction {0x0E, 0x00, 0x40, 0x40} is written at
+        // SRAM address 0 (reset vector). It's a Thumb branch that directs
+        // the SMC to the firmware entry point.
+        //
+        // The kernel's si_copy_bytes_to_smc() reads the 4 BE source bytes
+        // and assembles them as (b0<<24)|(b1<<16)|(b2<<8)|b3 = 0x0E004040,
+        // then writes via WREG32 (LE MMIO). The indirect hardware swaps
+        // LE→BE when storing to SRAM, so SRAM gets {0x0E,0x00,0x40,0x40}.
+        //
+        // SMCConst.BOOTSTRAP_INST = 0x0E004040 — write directly via GPU_Wr32.
+        SMC_SI_WriteSRAM32(gpu, 0, SMCConst.BOOTSTRAP_INST)
+        PrintMessage("[SMC_SI] Bootstrap instruction written\n")
+
+        // --- Step 4: Enable auto-increment and stream firmware ---
+        // Enable auto-increment for sequential writes
+        acc_cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseOr(acc_cntl, SMCAccessBits.AUTO_INCREMENT))
+
+        // Set starting SRAM address for firmware code.
+        // All SI chips use ucode_start_address = 0x10000 (VERDE/TAHITI/PITCAIRN/OLAND/HAINAN).
+        // SRAM layout: 0x0 = bootstrap jump, 0x4-0xFFFF = data tables, 0x10000+ = firmware code.
+        // The bootstrap at addr 0 branches to the firmware entry point at 0x10000.
+        fw_start_addr = SMCConst.SI_UCODE_START
+        GPU_Wr32(gpu, SMCReg.IND_INDEX_0, fw_start_addr)
+
+        // Stream firmware words with byte-swap from BE to LE
+        // (same pattern as PM4_LoadUcodeFile)
+        fw_dwords = Divide(fw_size, 4)
+        fi = 0
+        WhileLoop LessThan(fi, fw_dwords) {
+            fo = Multiply(fi, 4)
+            fb0 = GetByte(fw_buf, fo)
+            fb1 = GetByte(fw_buf, Add(fo, 1))
+            fb2 = GetByte(fw_buf, Add(fo, 2))
+            fb3 = GetByte(fw_buf, Add(fo, 3))
+            // Byte-swap BE → LE: (b0<<24)|(b1<<16)|(b2<<8)|b3 → (b3<<24)|(b2<<16)|(b1<<8)|b0
+            fw_word = Add(LeftShift(fb0, 24), Add(LeftShift(fb1, 16), Add(LeftShift(fb2, 8), fb3)))
+            GPU_Wr32(gpu, SMCReg.IND_DATA_0, fw_word)
+            fi = Add(fi, 1)
+        }
+
+        // Disable auto-increment
+        acc_cntl = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseAnd(acc_cntl, BitwiseNot(SMCAccessBits.AUTO_INCREMENT)))
+
+        PrintMessage("[SMC_SI] Firmware uploaded: ")
+        PrintNumber(fw_dwords)
+        PrintMessage(" DWORDs to SRAM at 0x")
+        PrintHex(fw_start_addr)
+        PrintMessage("\n")
+
+        // Store firmware end address
+        fw_end = Add(fw_start_addr, fw_size)
+        StoreValue(Add(entry, SMCField.SRAM_END), fw_end)
+        StoreValue(Add(entry, SMCField.FW_LOADED), 1)
+
+        // --- Step 5-6: Deassert reset + enable clock ---
+        SMC_SI_Unreset(gpu)
+        SMC_SI_StartClock(gpu)
+        StoreValue(Add(entry, SMCField.FW_RUNNING), 1)
+
+        PrintMessage("[SMC_SI] SMC started\n")
+
+        // Verify SMC is running
+        IfCondition EqualTo(SMC_SI_IsRunning(gpu), 1) ThenBlock: {
+            PrintMessage("[SMC_SI] SMC is running\n")
+        }
+        ElseBlock: {
+            PrintMessage("[SMC_SI] WARNING: SMC not detected as running!\n")
+        }
+
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SMC MESSAGE PROTOCOL
+// =============================================================================
+// The SMC message interface uses two direct MMIO registers:
+//   MESSAGE_0 (0x22C): write PPSMC command here
+//   RESP_0   (0x230): poll until non-zero, then read response
+//
+// Response: 1 = OK (SMCResp.OK), 0xFF = failed (SMCResp.FAILED)
+
+// SMC_SI_SendMessage — send a command to SMC and wait for response
+// Returns response code (1=OK, 0xFF=failed, 0=timeout)
+Function.SMC_SI_SendMessage {
+    Input: gpu: Integer
+    Input: msg: Integer
+    Output: Integer
+    Body: {
+        // Verify SMC is running
+        IfCondition EqualTo(SMC_SI_IsRunning(gpu), 0) ThenBlock: {
+            PrintMessage("[SMC_SI] SendMessage: SMC not running!\n")
+            ReturnValue(SMCResp.FAILED)
+        }
+
+        // Write command — SMC firmware clears RESP_0 when it starts processing
+        GPU_Wr32(gpu, SMCReg.MESSAGE_0, msg)
+
+        // Poll RESP_0 until non-zero (timeout after ~2s)
+        // SetForcedLevels, SetEnabledLevels, SwitchToSwState need up to 1s on SI.
+        // The kernel increased its timeout for these messages specifically.
+        // 10M iterations with MMIO read per iteration gives generous margin.
+        resp = 0
+        poll_i = 0
+        WhileLoop LessThan(poll_i, 10000000) {
+            resp = GPU_Rd32(gpu, SMCReg.RESP_0)
+            IfCondition NotEqual(resp, 0) ThenBlock: {
+                ExitLoop
+            }
+            poll_i = Add(poll_i, 1)
+        }
+
+        IfCondition EqualTo(resp, 0) ThenBlock: {
+            PrintMessage("[SMC_SI] SendMessage TIMEOUT for msg 0x")
+            PrintHex(msg)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        IfCondition NotEqual(resp, SMCResp.OK) ThenBlock: {
+            PrintMessage("[SMC_SI] SendMessage msg 0x")
+            PrintHex(msg)
+            PrintMessage(" response: 0x")
+            PrintHex(resp)
+            PrintMessage(" (expected 0x01)\n")
+        }
+
+        ReturnValue(resp)
+    }
+}
+
+// SMC_SI_SendMessageArg — send a command with a parameter via SCRATCH0
+// The parameter is written to SMC_SCRATCH0 (direct MMIO at 0x884)
+// before sending the message.
+Function.SMC_SI_SendMessageArg {
+    Input: gpu: Integer
+    Input: msg: Integer
+    Input: arg: Integer
+    Output: Integer
+    Body: {
+        GPU_Wr32(gpu, SMCReg.SCRATCH0, arg)
+        ReturnValue(SMC_SI_SendMessage(gpu, msg))
+    }
+}
+
+// =============================================================================
+// SMC_SI_ReplayTrace — §26: replay a kernel DPM/SMC write sequence
+// =============================================================================
+// Executes a replay table extracted from bus2_all.txt by
+// fw_trace/extract_dpm_replay.py. Each record is 12 bytes little-endian:
+//   op u32:   1 = REG_WR  direct MMIO write (addr, val)
+//             2 = SRAM_WR SMC indirect (IND_INDEX_0=addr, IND_DATA_0=val)
+//             3 = MSG     write MESSAGE_0=addr, poll RESP_0 until non-zero
+//   addr u32, val u32
+// Message-argument writes (0x884) are plain REG_WR records preceding their
+// MSG, exactly as in the trace. No IsRunning gate: the kernel sends 0x80 and
+// Resume(0x11) while the SMC is halted, so the gate would refuse them.
+// Returns the number of failed/timed-out messages, or -1 on file error.
+Function.SMC_SI_ReplayTrace {
+    Input: gpu: Integer
+    Input: path: Integer
+    Output: Integer
+    Body: {
+        rp_fd = SystemCall(2, path, 0, 0)
+        IfCondition LessThan(rp_fd, 0) ThenBlock: {
+            PrintMessage("[§26] cannot open replay file\n")
+            ReturnValue(-1)
+        }
+        rp_size = SystemCall(8, rp_fd, 0, 2)
+        SystemCall(8, rp_fd, 0, 0)
+        IfCondition LessThan(rp_size, 12) ThenBlock: {
+            SystemCall(3, rp_fd)
+            PrintMessage("[§26] replay file too small\n")
+            ReturnValue(-1)
+        }
+        rp_buf = Allocate(rp_size)
+        IfCondition EqualTo(rp_buf, 0) ThenBlock: {
+            SystemCall(3, rp_fd)
+            PrintMessage("[§26] replay alloc failed\n")
+            ReturnValue(-1)
+        }
+        rp_got = SystemCall(0, rp_fd, rp_buf, rp_size)
+        SystemCall(3, rp_fd)
+        IfCondition NotEqual(rp_got, rp_size) ThenBlock: {
+            Deallocate(rp_buf, rp_size)
+            PrintMessage("[§26] replay read incomplete\n")
+            ReturnValue(-1)
+        }
+
+        // Auto-increment OFF: every SRAM_WR record carries its own index
+        rp_acc = GPU_Rd32(gpu, SMCReg.IND_ACCESS_CNTL)
+        GPU_Wr32(gpu, SMCReg.IND_ACCESS_CNTL, BitwiseAnd(rp_acc, BitwiseNot(SMCAccessBits.AUTO_INCREMENT)))
+
+        rp_n = Divide(rp_size, 12)
+        rp_i = 0
+        rp_msgs = 0
+        rp_fail = 0
+        WhileLoop LessThan(rp_i, rp_n) {
+            rp_off = Multiply(rp_i, 12)
+            rp_op = Add(GetByte(rp_buf, rp_off), Add(LeftShift(GetByte(rp_buf, Add(rp_off, 1)), 8), Add(LeftShift(GetByte(rp_buf, Add(rp_off, 2)), 16), LeftShift(GetByte(rp_buf, Add(rp_off, 3)), 24))))
+            rp_a0 = Add(rp_off, 4)
+            rp_addr = Add(GetByte(rp_buf, rp_a0), Add(LeftShift(GetByte(rp_buf, Add(rp_a0, 1)), 8), Add(LeftShift(GetByte(rp_buf, Add(rp_a0, 2)), 16), LeftShift(GetByte(rp_buf, Add(rp_a0, 3)), 24))))
+            rp_v0 = Add(rp_off, 8)
+            rp_val = Add(GetByte(rp_buf, rp_v0), Add(LeftShift(GetByte(rp_buf, Add(rp_v0, 1)), 8), Add(LeftShift(GetByte(rp_buf, Add(rp_v0, 2)), 16), LeftShift(GetByte(rp_buf, Add(rp_v0, 3)), 24))))
+
+            IfCondition EqualTo(rp_op, 1) ThenBlock: {
+                GPU_Wr32(gpu, rp_addr, rp_val)
+            }
+            IfCondition EqualTo(rp_op, 2) ThenBlock: {
+                GPU_Wr32(gpu, SMCReg.IND_INDEX_0, rp_addr)
+                GPU_Wr32(gpu, SMCReg.IND_DATA_0, rp_val)
+            }
+            IfCondition EqualTo(rp_op, 3) ThenBlock: {
+                rp_msgs = Add(rp_msgs, 1)
+                GPU_Wr32(gpu, SMCReg.MESSAGE_0, rp_addr)
+                // Trace-faithful poll: one discard read (SMC clears RESP_0
+                // when it starts processing), then poll until non-zero.
+                rp_resp = GPU_Rd32(gpu, SMCReg.RESP_0)
+                rp_resp = 0
+                rp_p = 0
+                WhileLoop LessThan(rp_p, 2000000) {
+                    rp_resp = GPU_Rd32(gpu, SMCReg.RESP_0)
+                    IfCondition NotEqual(rp_resp, 0) ThenBlock: {
+                        ExitLoop
+                    }
+                    rp_p = Add(rp_p, 1)
+                }
+                PrintMessage("[§26] msg 0x")
+                PrintHex(rp_addr)
+                PrintMessage(" resp 0x")
+                PrintHex(rp_resp)
+                PrintMessage("\n")
+                IfCondition NotEqual(rp_resp, SMCResp.OK) ThenBlock: {
+                    rp_fail = Add(rp_fail, 1)
+                }
+            }
+            rp_i = Add(rp_i, 1)
+        }
+
+        PrintMessage("[§26] replay done: ")
+        PrintNumber(rp_n)
+        PrintMessage(" records, ")
+        PrintNumber(rp_msgs)
+        PrintMessage(" msgs, ")
+        PrintNumber(rp_fail)
+        PrintMessage(" failed\n")
+        Deallocate(rp_buf, rp_size)
+        ReturnValue(rp_fail)
+    }
+}
+
+// =============================================================================
+// SMC_SI_WaitInactive — wait for SMC to become inactive after HALT
+// =============================================================================
+// After sending HALT, the SMC may still be executing. This waits for
+// CKEN (bit 24) in CLOCK_CNTL_0 to clear, indicating the SMC has stopped.
+Function.SMC_SI_WaitInactive {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(SMC_SI_IsRunning(gpu), 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        wi = 0
+        WhileLoop LessThan(wi, 500000) {
+            clk = SMC_SI_IndRd32(gpu, SMCSyscon.CLOCK_CNTL_0)
+            IfCondition EqualTo(BitwiseAnd(clk, SMCSysconBits.CKEN), 0) ThenBlock: {
+                ReturnValue(1)
+            }
+            wi = Add(wi, 1)
+        }
+        PrintMessage("[SMC_SI] WaitInactive: timeout\n")
+        ReturnValue(0)
+    }
+}

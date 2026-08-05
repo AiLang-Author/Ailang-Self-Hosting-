@@ -1,0 +1,248 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUReplay.ailang
+//
+// §30 full-trace replay engine. Executes a table extracted verbatim from the
+// kernel mmiotrace (fw_trace/extract_full_replay.py) and uses every kernel
+// READ as an oracle: our hardware's answer is compared against the value the
+// working boot's hardware returned at the same point in the sequence. The
+// first mismatch localizes cold-init divergence mechanically — no hypothesis.
+//
+// Record format (16 bytes LE): op u32, addr u32, val u32, seq u32
+//   op 1 = REG_WR     MMIO write addr=val (indirect ports replay raw)
+//   op 4 = RD_ORACLE  read addr once; log mismatch vs val; continue
+//   op 5 = POLL       read addr until == val (2M reads); log timeout; continue
+//   op 6 = SKIP_NOTE  forbidden reg intentionally skipped (gpu-crash.md RULE 1)
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUReplay
+//
+// DEPENDS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+
+// =============================================================================
+// GPU_ReplayFull — execute one replay table, report divergence.
+// Returns: -1 file error, else oracle mismatch count (0 = hardware state
+// matched the working boot at every kernel read point).
+// =============================================================================
+Function.GPU_ReplayFull {
+    Input: gpu: Integer
+    Input: path: Integer
+    Input: depace_lo: Integer
+    Input: depace_hi: Integer
+    Output: Integer
+    Body: {
+        rf_fd = SystemCall(2, path, 0, 0)
+        IfCondition LessThan(rf_fd, 0) ThenBlock: {
+            PrintMessage("[§30] cannot open replay table\n")
+            ReturnValue(-1)
+        }
+        rf_size = SystemCall(8, rf_fd, 0, 2)
+        SystemCall(8, rf_fd, 0, 0)
+        IfCondition LessThan(rf_size, 16) ThenBlock: {
+            SystemCall(3, rf_fd)
+            PrintMessage("[§30] replay table too small\n")
+            ReturnValue(-1)
+        }
+        rf_buf = Allocate(rf_size)
+        IfCondition EqualTo(rf_buf, 0) ThenBlock: {
+            SystemCall(3, rf_fd)
+            PrintMessage("[§30] replay alloc failed\n")
+            ReturnValue(-1)
+        }
+        rf_got = SystemCall(0, rf_fd, rf_buf, rf_size)
+        SystemCall(3, rf_fd)
+        IfCondition NotEqual(rf_got, rf_size) ThenBlock: {
+            Deallocate(rf_buf, rf_size)
+            PrintMessage("[§30] replay read incomplete\n")
+            ReturnValue(-1)
+        }
+
+        rf_n = Divide(rf_size, 16)
+        PrintMessage("[§30] replay start: ")
+        PrintNumber(rf_n)
+        PrintMessage(" records (paced: 1ms/write; breadcrumb every 100)\n")
+        IfCondition NotEqual(depace_hi, 0) ThenBlock: {
+            PrintMessage("[§40] de-pace window for this table: seq ")
+            PrintNumber(depace_lo)
+            PrintMessage("-")
+            PrintNumber(depace_hi)
+            PrintMessage(" (no write pacing, MMIO_WR log suppressed in-window)\n")
+        }
+
+        // §32: 1ms settle after every write. The kernel's inter-write delays
+        // (ATOM DELAY opcodes, udelay) are invisible to the seq-only table;
+        // the timestamped radeon raw log was overwritten 2026-07-02.
+        rf_ts = Allocate(16)
+        StoreValue(rf_ts, 0)
+        StoreValue(Add(rf_ts, 8), 1000000)
+
+        // §33: pace POLL reads 15us each (2M reads ≈ 33s max). The 16:42 run's
+        // unpaced 2M-read poll ≈ 3s wall-clock, but the kernel's 300k-read
+        // RLC_STAT boot poll ran under mmiotrace (page fault per access) —
+        // plausibly 10x longer. A timeout must mean "never", not "too soon".
+        rf_ts2 = Allocate(16)
+        StoreValue(rf_ts2, 0)
+        StoreValue(Add(rf_ts2, 8), 15000)
+
+        rf_i = 0
+        rf_bc = 0
+        rf_depace = 0
+        rf_wr = 0
+        rf_orc = 0
+        rf_mis = 0
+        rf_polls = 0
+        rf_ptmo = 0
+        rf_first_mis_seq = 0
+        WhileLoop LessThan(rf_i, rf_n) {
+            rf_off = Multiply(rf_i, 16)
+            rf_op   = Dereference(Add(rf_buf, rf_off), "dword")
+            rf_addr = Dereference(Add(rf_buf, Add(rf_off, 4)), "dword")
+            rf_val  = Dereference(Add(rf_buf, Add(rf_off, 8)), "dword")
+            rf_seq  = Dereference(Add(rf_buf, Add(rf_off, 12)), "dword")
+
+            // §40: de-pace window (trace-seq gated; depace_hi=0 disables).
+            // In-window: skip the 1ms write pacing AND suppress per-write
+            // MMIO_WR lines — the fsync-per-line runner would otherwise
+            // re-pace the writes at fsync speed via pipe backpressure.
+            IfCondition NotEqual(depace_hi, 0) ThenBlock: {
+                rf_inwin = 0
+                IfCondition GreaterEqual(rf_seq, depace_lo) ThenBlock: {
+                    IfCondition LessEqual(rf_seq, depace_hi) ThenBlock: {
+                        rf_inwin = 1
+                    }
+                }
+                IfCondition GreaterThan(rf_inwin, rf_depace) ThenBlock: {
+                    PrintMessage("[§40] de-pace ON i=")
+                    PrintNumber(rf_i)
+                    PrintMessage(" seq=")
+                    PrintNumber(rf_seq)
+                    PrintMessage("\n")
+                    GPUBarTrace.enabled = 0
+                    rf_depace = 1
+                }
+                IfCondition LessThan(rf_inwin, rf_depace) ThenBlock: {
+                    GPUBarTrace.enabled = 1
+                    PrintMessage("[§40] de-pace OFF i=")
+                    PrintNumber(rf_i)
+                    PrintMessage(" seq=")
+                    PrintNumber(rf_seq)
+                    PrintMessage("\n")
+                    rf_depace = 0
+                }
+            }
+
+            // §32 breadcrumb: printed BEFORE executing, so on a hard freeze
+            // the wedge record is within 100 records after the last line seen.
+            IfCondition EqualTo(rf_bc, 0) ThenBlock: {
+                PrintMessage("[§30-AT] i=")
+                PrintNumber(rf_i)
+                PrintMessage(" seq=")
+                PrintNumber(rf_seq)
+                PrintMessage(" next=0x")
+                PrintHex(rf_addr)
+                PrintMessage("\n")
+                rf_bc = 100
+            }
+            rf_bc = Subtract(rf_bc, 1)
+
+            IfCondition EqualTo(rf_op, 1) ThenBlock: {
+                GPU_Wr32(gpu, rf_addr, rf_val)
+                rf_wr = Add(rf_wr, 1)
+                IfCondition EqualTo(rf_depace, 0) ThenBlock: {
+                    SystemCall(35, rf_ts, 0, 0, 0, 0, 0)
+                }
+            }
+            IfCondition EqualTo(rf_op, 4) ThenBlock: {
+                rf_orc = Add(rf_orc, 1)
+                rf_got4 = GPU_Rd32(gpu, rf_addr)
+                IfCondition NotEqual(rf_got4, rf_val) ThenBlock: {
+                    rf_mis = Add(rf_mis, 1)
+                    IfCondition EqualTo(rf_first_mis_seq, 0) ThenBlock: {
+                        rf_first_mis_seq = rf_seq
+                    }
+                    // Print the first 40 mismatches in full
+                    IfCondition LessThan(rf_mis, 41) ThenBlock: {
+                        PrintMessage("[§30-MIS] seq=")
+                        PrintNumber(rf_seq)
+                        PrintMessage(" reg=0x")
+                        PrintHex(rf_addr)
+                        PrintMessage(" kernel=0x")
+                        PrintHex(rf_val)
+                        PrintMessage(" ours=0x")
+                        PrintHex(rf_got4)
+                        PrintMessage("\n")
+                    }
+                }
+            }
+            IfCondition EqualTo(rf_op, 5) ThenBlock: {
+                rf_polls = Add(rf_polls, 1)
+                rf_pv = 0
+                rf_pi = 0
+                rf_hit = 0
+                WhileLoop LessThan(rf_pi, 2000000) {
+                    rf_pv = GPU_Rd32(gpu, rf_addr)
+                    IfCondition EqualTo(rf_pv, rf_val) ThenBlock: {
+                        rf_hit = 1
+                        ExitLoop
+                    }
+                    SystemCall(35, rf_ts2, 0, 0, 0, 0, 0)
+                    rf_pi = Add(rf_pi, 1)
+                }
+                PrintMessage("[§30-POLL] seq=")
+                PrintNumber(rf_seq)
+                PrintMessage(" reg=0x")
+                PrintHex(rf_addr)
+                PrintMessage(" want=0x")
+                PrintHex(rf_val)
+                PrintMessage(" got=0x")
+                PrintHex(rf_pv)
+                PrintMessage(" hit=")
+                PrintNumber(rf_hit)
+                PrintMessage(" reads=")
+                PrintNumber(rf_pi)
+                PrintMessage("\n")
+                IfCondition EqualTo(rf_hit, 0) ThenBlock: {
+                    rf_ptmo = Add(rf_ptmo, 1)
+                    IfCondition EqualTo(rf_first_mis_seq, 0) ThenBlock: {
+                        rf_first_mis_seq = rf_seq
+                    }
+                }
+            }
+            IfCondition EqualTo(rf_op, 6) ThenBlock: {
+                PrintMessage("[§30-SKIP] seq=")
+                PrintNumber(rf_seq)
+                PrintMessage(" reg=0x")
+                PrintHex(rf_addr)
+                PrintMessage(" (forbidden, RULE 1)\n")
+            }
+            rf_i = Add(rf_i, 1)
+        }
+
+        // §40: restore write logging if the window ran to the table's end
+        IfCondition EqualTo(rf_depace, 1) ThenBlock: {
+            GPUBarTrace.enabled = 1
+            PrintMessage("[§40] de-pace OFF (table end)\n")
+            rf_depace = 0
+        }
+
+        PrintMessage("[§30] replay done: wr=")
+        PrintNumber(rf_wr)
+        PrintMessage(" oracles=")
+        PrintNumber(rf_orc)
+        PrintMessage(" MISMATCHES=")
+        PrintNumber(rf_mis)
+        PrintMessage(" polls=")
+        PrintNumber(rf_polls)
+        PrintMessage(" poll_timeouts=")
+        PrintNumber(rf_ptmo)
+        PrintMessage(" first_divergence_seq=")
+        PrintNumber(rf_first_mis_seq)
+        PrintMessage("\n")
+        Deallocate(rf_ts, 16)
+        Deallocate(rf_ts2, 16)
+        Deallocate(rf_buf, rf_size)
+        ReturnValue(rf_mis)
+    }
+}

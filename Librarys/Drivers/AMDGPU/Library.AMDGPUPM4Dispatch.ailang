@@ -33,7 +33,9 @@ FixedPool.PM4Dispatch {
     "grid_z":       Initialize=1, CanChange=True   // number of thread groups Z
     "buf_vram_off": Initialize=0, CanChange=True   // VRAM offset of combined data buffer
     "buf_total_size": Initialize=0, CanChange=True // total byte size of combined data buffer
-    "ib_vram_off":  Initialize=0, CanChange=True   // VRAM offset of IB scratch area (≥32 bytes)
+    "ib_vram_off":  Initialize=0, CanChange=True   // VRAM offset of IB scratch area (legacy)
+    "ib_host_ptr":  Initialize=0, CanChange=True   // host pointer to GART-backed IB page
+    "ib_gart_va":   Initialize=0, CanChange=True   // GPU GART VA of IB page
 }
 
 // -----------------------------------------------------------------------------
@@ -68,6 +70,8 @@ Function.PM4_SubmitCompute {
         buf_vram_off   = PM4Dispatch.buf_vram_off
         buf_total_size = PM4Dispatch.buf_total_size
         ib_vram_off    = PM4Dispatch.ib_vram_off
+        ib_host_ptr    = PM4Dispatch.ib_host_ptr
+        ib_gart_va     = PM4Dispatch.ib_gart_va
 
         // Calculate total packet DWORDs needed:
         //   SET_CONFIG_REG for CP_COHER_CNTL2 (3 DWORDs)
@@ -86,14 +90,12 @@ Function.PM4_SubmitCompute {
         // Pre-read fence_off for breadcrumb WRITE_DATA packets
         bc_off = Dereference(Add(ring, RingField.FENCE_WB_OFF))
 
-        needed = 140  // base + BC0-BC4 breadcrumbs + full SYNC + double EOP fence
+        needed = 110
 
         IfCondition EqualTo(PM4_WaitForSpace(ring_idx, needed), 0) ThenBlock: {
             PrintMessage("[PM4] No ring space for compute dispatch\n")
             ReturnValue(0)
         }
-
-        // FIX A1: CONTEXT_CONTROL — REMOVED — confirmed no effect (BC5 fired, wall stayed at 25)
 
         // --- Cache invalidation ---
         // Invalidate I$ + K$ only.  No TC/TCL1 — GLC=1 on all shader MUBUF
@@ -112,113 +114,73 @@ Function.PM4_SubmitCompute {
         pgm_lo = BitwiseAnd(pgm_shifted, 4294967295)
         pgm_hi = Divide(pgm_shifted, 4294967296)
 
+        // --- All SET_SH_REGs batched (old working pattern, no intermediate commits) ---
+        // GCN1/SI has no MCE — compute goes through the single GFX ME on ring 0.
+        // SHADER_TYPE_COMPUTE is a routing hint, not a context switch.
+        // No compute CLEAR_STATE here — SI kernel never does it, and the old
+        // working code (ba44626e) didn't either.
+
         PM4_EmitSetSHRegPair(ring_idx, SICompute.PGM_LO, pgm_lo, pgm_hi, PM4.SHADER_TYPE_COMPUTE)
 
         // --- Build PGM_RSRC1 ---
-        // bits [5:0] = (num_vgprs / 4) - 1  (granularity 4 for GCN1)
-        // bits [9:6] = (num_sgprs / 8) - 1  (granularity 8 for GCN1)
-        // For simplicity: float_mode = 0 (default), no DX10 clamp, no IEEE
         vgpr_field = Subtract(Divide(num_vgprs, 4), 1)
         IfCondition LessThan(vgpr_field, 0) ThenBlock: { vgpr_field = 0 }
         sgpr_field = Subtract(Divide(num_sgprs, 8), 1)
         IfCondition LessThan(sgpr_field, 0) ThenBlock: { sgpr_field = 0 }
 
-        rsrc1 = Add(vgpr_field, Multiply(sgpr_field, 64))   // sgpr at bits [9:6]
+        rsrc1 = Add(vgpr_field, Multiply(sgpr_field, 64))
         PM4_EmitSetSHReg(ring_idx, SICompute.PGM_RSRC1, rsrc1, PM4.SHADER_TYPE_COMPUTE)
 
         // --- Build PGM_RSRC2 ---
-        // bit 0:      SCRATCH_EN (0 = no scratch)
-        // bits [5:1]:  USER_SGPR count (number of USER_DATA SGPRs)
-        // bit 6:      TRAP_PRESENT (0 = no trap handler)
-        // bit 7:      TGID_X_EN (1 = load thread group ID X into SGPR)
-        // bit 8:      TGID_Y_EN
-        // bit 9:      TGID_Z_EN
-        // bit 10:     TG_SIZE_EN (1 = load total TG size into SGPR)
-        // bits[12:11]: TIDIG_COMP_CNT (0 = X only, 1 = X+Y, 2 = X+Y+Z)
-        // bits [17:12]: LDS_SIZE (in 256-byte units)
         rsrc2 = 0
         rsrc2 = Add(rsrc2, Multiply(4, 2))    // USER_SGPR = 4, at bits [5:1] (s[0:3] = V#)
-        // bit 6 = TRAP_PRESENT — leave 0 (no trap handler)
         rsrc2 = Add(rsrc2, 128)                // TGID_X_EN (bit 7)
         PM4_EmitSetSHReg(ring_idx, SICompute.PGM_RSRC2, rsrc2, PM4.SHADER_TYPE_COMPUTE)
 
-        // --- COMPUTE_VMID — use VMID 0 (physical/system aperture addressing) ---
         PM4_EmitSetSHReg(ring_idx, SICompute.VMID, 0, PM4.SHADER_TYPE_COMPUTE)
-
-        // --- RESOURCE_LIMITS (0xB854) ---
-        // bit 0     = FORCE_SIMD_DIST (1 = force uniform wavefront distribution)
-        // bits[5:1] = WAVES_PER_SH (0 = no limit; nonzero = max waves per SH)
-        // Mesa sets FORCE_SIMD_DIST=1 to keep the SPI dispatch tracker from
-        // over-allocating tracking slots. Without it, the HW dispatch FIFO
-        // may leak entries after ~25 dispatches on the GFX ring.
-        // Cape Verde: 10 CUs, 40 wave slots each = 400 total.
-        // Set WAVES_PER_SH=2 (very conservative, 1 wave per SH × 2 SH) in bits[5:1]
-        // plus FORCE_SIMD_DIST=1 at bit 0. Value = (2 << 1) | 1 = 5.
-        // Actually, keep WAVES_PER_SH=0 (no limit) + FORCE_SIMD_DIST=1 → value = 1.
         PM4_EmitSetSHReg(ring_idx, SICompute.RESOURCE_LIMITS, 1, PM4.SHADER_TYPE_COMPUTE)
 
-        // --- STATIC_THREAD_MGMT — enable all CUs for compute ---
-        // 0xFFFFFFFF = all CU thread slots enabled on each shader engine
-        // Without these, no CUs are assigned to compute and the wavefront hangs.
         PM4_EmitSetSHReg(ring_idx, SICompute.STATIC_THREAD_MGMT_SE0, 4294967295, PM4.SHADER_TYPE_COMPUTE)
         PM4_EmitSetSHReg(ring_idx, SICompute.STATIC_THREAD_MGMT_SE1, 4294967295, PM4.SHADER_TYPE_COMPUTE)
 
-        // --- TMPRING_SIZE — scratch ring size (0 = no scratch) ---
         PM4_EmitSetSHReg(ring_idx, SICompute.TMPRING_SIZE, 0, PM4.SHADER_TYPE_COMPUTE)
 
-        // --- COMPUTE_START_X/Y/Z — must be zeroed (work-group grid origin) ---
         PM4_EmitSetSHReg(ring_idx, SICompute.START_X, 0, PM4.SHADER_TYPE_COMPUTE)
         PM4_EmitSetSHReg(ring_idx, SICompute.START_Y, 0, PM4.SHADER_TYPE_COMPUTE)
         PM4_EmitSetSHReg(ring_idx, SICompute.START_Z, 0, PM4.SHADER_TYPE_COMPUTE)
 
-        // --- Thread group dimensions ---
         PM4_EmitSetSHReg(ring_idx, SICompute.NUM_THREAD_X, tg_size_x, PM4.SHADER_TYPE_COMPUTE)
         PM4_EmitSetSHReg(ring_idx, SICompute.NUM_THREAD_Y, tg_size_y, PM4.SHADER_TYPE_COMPUTE)
         PM4_EmitSetSHReg(ring_idx, SICompute.NUM_THREAD_Z, tg_size_z, PM4.SHADER_TYPE_COMPUTE)
 
-        // FIX A3: DISPATCH_ID reset — REMOVED — confirmed no effect (BC7 fired, wall stayed at 25)
-
         // --- Dispatch via Indirect Buffer (IB) ---
-        // The kernel driver wraps DISPATCH_DIRECT inside an IB.
-        //
-        // IB content (7 DWORDs, written to VRAM via CPU):
-        //   [0] DISPATCH_DIRECT header
-        //   [1] grid_x
-        //   [2] grid_y
-        //   [3] grid_z
-        //   [4] initiator (COMPUTE_SHADER_EN=1)
-        //   [5] CS_PARTIAL_FLUSH header (EVENT_WRITE)
-        //   [6] event_type=7 | event_index=4<<8 = 0x407
-
-        gpu_ib = Dereference(Add(ring, RingField.GPU_INDEX))
-
-        // Build DISPATCH_DIRECT header: opcode=0x15, count=4, shader_type=compute
+        // IB in GART-backed system RAM (7 DWORDs):
+        //   DISPATCH_DIRECT(5) + CS_PARTIAL_FLUSH(2)
         ib_disp_hdr = PM4_BuildHeader(PM4.OP_DISPATCH_DIRECT, 4, PM4.SHADER_TYPE_COMPUTE)
-
-        // Build CS_PARTIAL_FLUSH header: EVENT_WRITE, count=1, shader_type=0
         ib_flush_hdr = PM4_BuildHeader(PM4.OP_EVENT_WRITE, 1, 0)
         ib_flush_body = Add(7, Multiply(4, 256))   // event_type=7, event_index=4
 
-        // Write 7 DWORDs to IB VRAM area
-        GPU_VramWr32(gpu_ib, ib_vram_off, ib_disp_hdr)
-        GPU_VramWr32(gpu_ib, Add(ib_vram_off, 4), grid_x)
-        GPU_VramWr32(gpu_ib, Add(ib_vram_off, 8), grid_y)
-        GPU_VramWr32(gpu_ib, Add(ib_vram_off, 12), grid_z)
-        GPU_VramWr32(gpu_ib, Add(ib_vram_off, 16), 1)
-        GPU_VramWr32(gpu_ib, Add(ib_vram_off, 20), ib_flush_hdr)
-        GPU_VramWr32(gpu_ib, Add(ib_vram_off, 24), ib_flush_body)
+        StoreValue(ib_host_ptr, ib_disp_hdr, "dword")
+        StoreValue(Add(ib_host_ptr, 4), grid_x, "dword")
+        StoreValue(Add(ib_host_ptr, 8), grid_y, "dword")
+        StoreValue(Add(ib_host_ptr, 12), grid_z, "dword")
+        StoreValue(Add(ib_host_ptr, 16), 1, "dword")
+        StoreValue(Add(ib_host_ptr, 20), ib_flush_hdr, "dword")
+        StoreValue(Add(ib_host_ptr, 24), ib_flush_body, "dword")
 
-        // Emit INDIRECT_BUFFER on the ring pointing to IB
-        ib_gpu_addr = PM4_VramToGPU(ib_vram_off)
-        ib_addr_lo = BitwiseAnd(ib_gpu_addr, 4294967295)
-        ib_addr_hi = BitwiseAnd(Divide(ib_gpu_addr, 4294967296), 255)
-        ib_size_dw = 7   // DISPATCH_DIRECT(5) + CS_PARTIAL_FLUSH(2) = 7 DWORDs
+        // sfence to ensure all stores are visible before GPU fetches
+        InlineAsm["0f ae f8"]
+
+        // Emit INDIRECT_BUFFER on the ring pointing to IB in GART
+        ib_addr_lo = BitwiseAnd(ib_gart_va, 4294967295)
+        ib_addr_hi = BitwiseAnd(Divide(ib_gart_va, 4294967296), 255)
+        ib_size_dw = 7
 
         ib_hdr = PM4_BuildHeader(PM4.OP_INDIRECT_BUFFER, 3, 0)
         PM4_EmitDWord(ring_idx, ib_hdr)
         PM4_EmitDWord(ring_idx, ib_addr_lo)
         PM4_EmitDWord(ring_idx, ib_addr_hi)
-        PM4_EmitDWord(ring_idx, ib_size_dw)   // VMID=0, size=7
+        PM4_EmitDWord(ring_idx, ib_size_dw)
 
         PM4_EmitWriteDataVRAM(ring_idx, Add(bc_off, 24), 2)   // BC2: after IB (dispatch+flush)
         PM4_EmitWriteDataVRAM(ring_idx, Add(bc_off, 28), 3)   // BC3: after IB return
@@ -242,6 +204,11 @@ Function.PM4_SubmitCompute {
         coher_all = Add(PM4.TCL1_ACTION_ENA, Add(PM4.TC_ACTION_ENA, Add(PM4.SH_KCACHE_ACTION_ENA, PM4.SH_ICACHE_ACTION_ENA)))
         PM4_EmitSurfaceSync(ring_idx, coher_all, 4294967295, 0, 10)
         PM4_EmitWriteDataVRAM(ring_idx, Add(bc_off, 32), 4)   // BC4: after full SURFACE_SYNC
+
+        // HDP invalidation REMOVED — all HDP register writes (CPU or GPU-side)
+        // crash the RD990 PCI fabric.  Keep only the write-cache flush at 0x5480
+        // which is in a different register block and has never caused a crash.
+        PM4_EmitWriteDataReg(ring_idx, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)
 
         // Step 3: Double EVENT_WRITE_EOP workaround (Mesa eop_bug pattern)
         // "Two EOP events are required to make all engines go idle (and
@@ -472,6 +439,64 @@ Function.PM4_WaitFenceVRAM {
 // PM4_RingTest — basic ring test: submit a NOP and verify GPU consumes it
 // Returns 1 if the ring is working.
 // =============================================================================
+// =============================================================================
+// PM4_ScratchProbe — §29 through-ring ME-execution probe (kernel ring_test,
+// bus2_all.txt seqs 439967-439972: MMIO scratch=CAFEDEAD, ring SET_CONFIG_REG
+// scratch=DEADBEEF, poll — kernel's ME lands it within 3 polls).
+// RPTR==WPTR only proves FETCH (§28); this is direct proof of ME retirement.
+// Placed as breadcrumbs through the stream, the first probe that does NOT
+// land fingers the wedge packet class exactly. Returns 1 if marker landed.
+// =============================================================================
+Function.PM4_ScratchProbe {
+    Input: ring_idx: Integer
+    Input: marker: Integer
+    Input: tag: Integer
+    Output: Integer
+    Body: {
+        ring = PM4_GetRing(ring_idx)
+        IfCondition EqualTo(ring, 0) ThenBlock: { ReturnValue(0) }
+        gpu = Dereference(Add(ring, RingField.GPU_INDEX))
+
+        GPU_Wr32(gpu, SIReg.SCRATCH_REG0, 3405700781)   // 0xCAFEDEAD preset
+        IfCondition EqualTo(PM4_WaitForSpace(ring_idx, 4), 0) ThenBlock: {
+            PrintMessage("[§29] scratch probe: no ring space\n")
+            ReturnValue(0)
+        }
+        PM4_EmitSetConfigReg(ring_idx, SIReg.SCRATCH_REG0, marker)
+        PM4_Commit(ring_idx)
+
+        landed = 0
+        polls_used = 0
+        sc = 0
+        polls = 0
+        WhileLoop LessThan(polls, 200000) {
+            sc = GPU_Rd32(gpu, SIReg.SCRATCH_REG0)
+            IfCondition EqualTo(sc, marker) ThenBlock: {
+                landed = 1
+                polls_used = polls
+                polls = 200000
+            }
+            polls = Add(polls, 1)
+        }
+        PrintMessage("[§29-")
+        PrintNumber(tag)
+        PrintMessage("] scratch: landed=")
+        PrintNumber(landed)
+        PrintMessage(" rb=0x")
+        PrintHex(sc)
+        PrintMessage(" polls=")
+        PrintNumber(polls_used)
+        PrintMessage(" CP_STAT=0x")
+        PrintHex(GPU_Rd32(gpu, SIReg.CP_STAT))
+        PrintMessage(" RPTR=")
+        PrintNumber(PM4_ReadRPTR_MMIO(ring_idx))
+        PrintMessage(" WPTR=")
+        PrintNumber(Dereference(Add(ring, RingField.WPTR)))
+        PrintMessage("\n")
+        ReturnValue(landed)
+    }
+}
+
 Function.PM4_RingTest {
     Input: ring_idx: Integer
     Output: Integer
@@ -507,65 +532,51 @@ Function.PM4_RingTest {
 // =============================================================================
 // PM4_CPStart — initialize CP micro-engine and clear compute context
 //
-// Matches the Linux kernel si_cp_start() sequence:
-//   1. ME_INITIALIZE: set max_hw_contexts=7 (8-1), device_id=1
-//   2. SET_BASE: CE partition base (0xC000..0xE000)
-//   3. Commit + unhalt CP → CP processes ME_INITIALIZE
-//   4. CLEAR_STATE with SHADER_TYPE=compute → clears compute register state
-//   5. Commit → CP processes CLEAR_STATE
+// Sequence adjusted to better match kernel mmiotrace phase 16 (ring setup already done
+// in PM4_SetupRing; here: unhalt early, emit ME_INIT+SET_BASE to ring, commit WPTR bump,
+// wait, then the GFX+compute CLEAR_STATE + CONTEXT_CONTROL + brackets).
+// Removed prior duplicate ME_INIT/SET_BASE (pre + post unhalt) that was left from reorder edit.
 //
-// Must be called AFTER PM4_SetupRing and BEFORE any compute dispatch.
-// The ring must be set up but CP must still be HALTED when this is called.
+// Must be called AFTER PM4_SetupRing and before compute dispatch.
 // =============================================================================
 Function.PM4_CPStart {
     Input: gpu: Integer
     Input: ring_idx: Integer
     Output: Integer
     Body: {
-        // ---- Phase 1: ME_INITIALIZE (CP still halted) ----
-        // This packet MUST be consumed first — it initializes the ME's context
-        // management.  Without this, SET_SH_REG with SHADER_TYPE=compute may
-        // be silently dropped.
+        // CPStart: kernel order (gfx_v6_0_cp_gfx_start + bus2 trace seqs 439962-439964):
+        // ME_INIT + SET_BASE are committed to the ring — including the MMIO WPTR
+        // write — while the CP is still HALTED, and only then CP_ME_CNTL=0.
+        // (Trace: WR CP_RB0_WPTR=0x100 at seq 439962, WR CP_ME_CNTL=0 at 439964.)
+        // The earlier "unhalt first" reading of the trace was wrong.
+        // The ring setup (PM4_SetupRing) has already done BASE/CNTL/RPTR_ADDR.
         IfCondition EqualTo(PM4_WaitForSpace(ring_idx, 16), 0) ThenBlock: {
             PrintMessage("[PM4] CPStart: no ring space\n")
             ReturnValue(0)
         }
-
-        // ME_INITIALIZE: header + 6 body DWORDs = 7 DWORDs total
-        // Kernel: PACKET3(ME_INITIALIZE, 5) → n=5 → 6 body DWORDs
-        // Our PM4_BuildHeader(op, count) puts (count-1) in header → count=6
         hdr_me = PM4_BuildHeader(PM4.OP_ME_INITIALIZE, 6, 0)
         PM4_EmitDWord(ring_idx, hdr_me)
-        PM4_EmitDWord(ring_idx, 1)           // ME_INITIALIZE.header = 1
-        PM4_EmitDWord(ring_idx, 0)           // reserved
-        PM4_EmitDWord(ring_idx, 7)           // max_hw_contexts - 1 = 8 - 1 = 7
-        PM4_EmitDWord(ring_idx, 65536)       // DEVICE_ID(1) = 1 << 16
-        PM4_EmitDWord(ring_idx, 0)           // reserved
-        PM4_EmitDWord(ring_idx, 0)           // reserved
+        PM4_EmitDWord(ring_idx, 1)
+        PM4_EmitDWord(ring_idx, 0)
+        PM4_EmitDWord(ring_idx, 7)
+        PM4_EmitDWord(ring_idx, 65536)
+        PM4_EmitDWord(ring_idx, 0)
+        PM4_EmitDWord(ring_idx, 0)
 
-        // SET_BASE: CE partition — header + 3 body DWORDs = 4 DWORDs total
-        // Kernel: PACKET3(SET_BASE, 2) → n=2 → 3 body DWORDs
-        // Our PM4_BuildHeader: count=3
+        // SET_BASE for CE
         hdr_sb = PM4_BuildHeader(PM4.OP_SET_BASE, 3, 0)
         PM4_EmitDWord(ring_idx, hdr_sb)
-        PM4_EmitDWord(ring_idx, 3)           // CE_PARTITION_BASE = 3
-        PM4_EmitDWord(ring_idx, 49152)       // 0xC000
-        // Note: kernel sends 0xE000 as a 4th DWORD but SET_BASE count=2 means only 2 body.
-        // Actually kernel uses count=2 → 3 DWORDs total: header, BASE_INDEX, addr.
-        // Hmm, let me re-check... PACKET3(PACKET3_SET_BASE, 2) = count=2 → 3 body DWORDs.
-        // kernel: radeon_ring_write(ring, PACKET3_BASE_INDEX(CE_PARTITION_BASE));
-        //         radeon_ring_write(ring, 0xc000);
-        //         radeon_ring_write(ring, 0xe000);
-        PM4_EmitDWord(ring_idx, 57344)       // 0xE000
+        PM4_EmitDWord(ring_idx, 3)
+        PM4_EmitDWord(ring_idx, 49152)
+        PM4_EmitDWord(ring_idx, 57344)
 
-        // Commit WPTR — CP is still halted, so this just bumps the MMIO WPTR.
-        // The packets sit in the ring waiting.
+        // Commit WPTR while still halted (packets sit in ring)
         PM4_Commit(ring_idx)
 
-        // ---- Unhalt CP — it starts processing ME_INITIALIZE ----
+        // ---- Unhalt: CP fetches the pending ME_INIT immediately ----
         PM4_UnhaltCP(gpu)
 
-        // Brief delay to let ME_INITIALIZE be consumed
+        // udelay(50)-ish settle after unhalt (kernel cp_gfx_enable)
         di = 0
         WhileLoop LessThan(di, 2000) {
             scratch = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
@@ -577,33 +588,35 @@ Function.PM4_CPStart {
             PrintMessage("[PM4] CPStart: ME_INITIALIZE not consumed\n")
             ReturnValue(0)
         }
-        // PrintMessage("[PM4] ME_INITIALIZE consumed OK\n")
 
-        // ---- Phase 2: GFX + Compute CLEAR_STATE ----
+        // §44 fork probe: is ME alive BEFORE CLEAR_STATE? Pure register path
+        // (MMIO preload + ring SET_CONFIG_REG + MMIO poll), UMSK-independent.
+        // landed=1 here + landed=0 after → CLEAR_STATE (CSB fetch) wedges ME.
+        // landed=0 here → ME never executed anything post-unhalt.
+        PM4_ScratchProbe(ring_idx, 2835349510, 6)   // 0xA9000006: post-ME_INIT, pre-CLEAR_STATE
+
+        // ---- Phase 2: GFX + Compute CLEAR_STATE (ba44626e pattern) ----
         IfCondition EqualTo(PM4_WaitForSpace(ring_idx, 8), 0) ThenBlock: {
             PrintMessage("[PM4] CPStart: no ring space for CLEAR_STATE\n")
             ReturnValue(0)
         }
 
-        // GFX CLEAR_STATE (SHADER_TYPE=0, matching kernel's si_cp_start)
         hdr_gfx = PM4_BuildHeader(PM4.OP_CLEAR_STATE, 1, 0)
         PM4_EmitDWord(ring_idx, hdr_gfx)
         PM4_EmitDWord(ring_idx, 0)
 
-        // Compute CLEAR_STATE (SHADER_TYPE=compute)
-        // kernel: PACKET3_COMPUTE(PACKET3_CLEAR_STATE, 0)
         hdr_cs = PM4_BuildHeader(PM4.OP_CLEAR_STATE, 1, PM4.SHADER_TYPE_COMPUTE)
         PM4_EmitDWord(ring_idx, hdr_cs)
         PM4_EmitDWord(ring_idx, 0)
 
         PM4_Commit(ring_idx)
 
-        // Wait for both CLEAR_STATE packets to be consumed
         IfCondition EqualTo(PM4_WaitIdle(ring_idx), 0) ThenBlock: {
             PrintMessage("[PM4] CPStart: CLEAR_STATE not consumed\n")
             ReturnValue(0)
         }
-        // PrintMessage("[PM4] GFX+Compute CLEAR_STATE consumed OK\n")
+
+        PM4_ScratchProbe(ring_idx, 2835349511, 7)   // 0xA9000007: post-CLEAR_STATE
 
         ReturnValue(1)
     }

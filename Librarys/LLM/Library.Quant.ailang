@@ -1,0 +1,316 @@
+// Library.Quant.ailang
+// Dequantization routines for GGUF quantized tensor data.
+// Converts Q8_0, Q4_0, F16, F32 blocks → int32 or int64 Q20 values.
+// All dequantized values stored as 8-byte integers (TFElem.Size).
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.
+
+// =============================================================================
+// DEQUANT CARRIER — working state for dequantization loops
+// Avoids local variables surviving across function calls.
+// =============================================================================
+FixedPool.DequantW {
+    "src":          Initialize=0, CanChange=True   // source pointer (mmap'd data)
+    "dst":          Initialize=0, CanChange=True   // destination buffer
+    "n_elements":   Initialize=0, CanChange=True   // total elements to dequant
+    "precision":    Initialize=0, CanChange=True   // 0=int32, 1=int64 Q20
+    "blk":          Initialize=0, CanChange=True   // current block index
+    "n_blocks":     Initialize=0, CanChange=True   // total blocks
+    "blk_ptr":      Initialize=0, CanChange=True   // pointer to current block
+    "dst_ptr":      Initialize=0, CanChange=True   // pointer to current output position
+    "scale_bits":   Initialize=0, CanChange=True   // f16 scale bits
+    "scale_int":    Initialize=0, CanChange=True   // integer scale value
+    "elem":         Initialize=0, CanChange=True   // element index within block
+    "raw":          Initialize=0, CanChange=True   // raw byte or value
+    "val":          Initialize=0, CanChange=True   // computed value
+    "byte_val":     Initialize=0, CanChange=True   // byte read from source
+    "hi":           Initialize=0, CanChange=True   // high nibble
+    "lo":           Initialize=0, CanChange=True   // low nibble
+}
+
+// =============================================================================
+// F16_TO_INT — convert IEEE 754 half-float (16-bit) to integer
+// Returns the floating-point value scaled by 256 (Q8 fixed-point)
+// to preserve sub-integer precision for scale factors.
+//
+// f16 layout: [sign:1][exp:5][mantissa:10]
+// We compute: (-1)^sign * 2^(exp-15) * (1 + mantissa/1024) scaled to Q8
+// =============================================================================
+Function.Quant_F16ToInt {
+    Input: bits: Integer
+    Output: Integer
+    Body: {
+        // Extract fields
+        sign = BitwiseAnd(ShiftRight(bits, 15), 1)
+        exp  = BitwiseAnd(ShiftRight(bits, 10), 31)
+        mant = BitwiseAnd(bits, 1023)
+
+        // Zero / denorm → 0
+        IfCondition EqualTo(exp, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Inf/NaN → large value
+        IfCondition EqualTo(exp, 31) ThenBlock: {
+            IfCondition EqualTo(sign, 1) ThenBlock: {
+                ReturnValue(-32767)
+            }
+            ReturnValue(32767)
+        }
+
+        // Normal: value = (1024 + mant) * 2^(exp - 15 - 10) in integer math
+        // We want value * 1048576 (Q20) for sufficient precision on small scales:
+        //   result = (1024 + mant) * 2^(exp - 15 - 10 + 20)
+        //          = (1024 + mant) * 2^(exp - 5)
+        frac = Add(1024, mant)
+        shift = Subtract(exp, 5)
+
+        IfCondition GreaterEqual(shift, 0) ThenBlock: {
+            result = ShiftLeft(frac, shift)
+        }
+        IfCondition LessThan(shift, 0) ThenBlock: {
+            result = ShiftRight(frac, Subtract(0, shift))
+        }
+
+        IfCondition EqualTo(sign, 1) ThenBlock: {
+            result = Subtract(0, result)
+        }
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// DEQUANT_Q8_0_BLOCK — dequantize one Q8_0 block (34 bytes → 32 elements)
+//
+// Q8_0 block layout:
+//   [f16 scale: 2 bytes][int8 values: 32 bytes]
+//
+// For int32 mode:  out[i] = int8_val * scale_q8   (stays Q8, range ~±330)
+// For int64 Q20:   out[i] = (int8_val * scale_q8) << 12   (Q8 → Q20)
+//
+// Int32 Q8: dot product of dim 576 → max ~62M, fits int32 (2G).
+// Forward pass divides by 256 once after each matmul to stay in range.
+//
+// DequantW.blk_ptr must point to block start
+// DequantW.dst_ptr must point to output position
+// DequantW.precision selects int32 (0) or int64 Q20 (1)
+// =============================================================================
+Function.Quant_DequantQ8Block {
+    Body: {
+        // Read f16 scale (2 bytes, little-endian)
+        DequantW.scale_bits = Add(
+            GetByte(DequantW.blk_ptr, 0),
+            ShiftLeft(GetByte(DequantW.blk_ptr, 1), 8)
+        )
+        DequantW.scale_int = Quant_F16ToInt(DequantW.scale_bits)
+
+        // Dequant 32 int8 values
+        DequantW.elem = 0
+        WhileLoop LessThan(DequantW.elem, 32) {
+            // Read signed int8 (offset +2 from block start)
+            DequantW.byte_val = GetByte(DequantW.blk_ptr, Add(2, DequantW.elem))
+            // Sign-extend int8 → signed integer
+            IfCondition GreaterEqual(DequantW.byte_val, 128) ThenBlock: {
+                DequantW.byte_val = Subtract(DequantW.byte_val, 256)
+            }
+
+            // scale_int is Q20, byte_val is plain int8
+            // product = byte_val * scale_int → Q20 (value × 2^20)
+            // Keep full Q20 precision — int64 has plenty of range
+            DequantW.val = Multiply(DequantW.byte_val, DequantW.scale_int)
+
+            // Store as 8-byte integer
+            StoreValue(Add(DequantW.dst_ptr, Multiply(DequantW.elem, 8)), DequantW.val)
+            DequantW.elem = Add(DequantW.elem, 1)
+        }
+    }
+}
+
+// =============================================================================
+// DEQUANT_Q4_0_BLOCK — dequantize one Q4_0 block (18 bytes → 32 elements)
+//
+// Q4_0 block layout:
+//   [f16 scale: 2 bytes][4-bit values: 16 bytes (32 nibbles)]
+//
+// Each byte holds two 4-bit unsigned values, stored as (val - 8) to center.
+// Nibble 0 in low bits, nibble 1 in high bits.
+// =============================================================================
+Function.Quant_DequantQ4Block {
+    Body: {
+        // Read f16 scale (2 bytes, little-endian)
+        DequantW.scale_bits = Add(
+            GetByte(DequantW.blk_ptr, 0),
+            ShiftLeft(GetByte(DequantW.blk_ptr, 1), 8)
+        )
+        DequantW.scale_int = Quant_F16ToInt(DequantW.scale_bits)
+
+        // Dequant 32 elements from 16 bytes
+        DequantW.elem = 0
+        WhileLoop LessThan(DequantW.elem, 16) {
+            DequantW.raw = GetByte(DequantW.blk_ptr, Add(2, DequantW.elem))
+
+            // Low nibble → element [elem*2]
+            DequantW.lo = Subtract(BitwiseAnd(DequantW.raw, 15), 8)
+            DequantW.val = Multiply(DequantW.lo, DequantW.scale_int)
+            StoreValue(Add(DequantW.dst_ptr, Multiply(Multiply(DequantW.elem, 2), 8)), DequantW.val)
+
+            // High nibble → element [elem*2 + 1]
+            DequantW.hi = Subtract(BitwiseAnd(ShiftRight(DequantW.raw, 4), 15), 8)
+            DequantW.val = Multiply(DequantW.hi, DequantW.scale_int)
+            StoreValue(Add(DequantW.dst_ptr, Multiply(Add(Multiply(DequantW.elem, 2), 1), 8)), DequantW.val)
+
+            DequantW.elem = Add(DequantW.elem, 1)
+        }
+    }
+}
+
+// =============================================================================
+// DEQUANT_F16_BLOCK — dequantize F16 values (2 bytes → 1 element each)
+// =============================================================================
+Function.Quant_DequantF16Block {
+    Body: {
+        DequantW.elem = 0
+        WhileLoop LessThan(DequantW.elem, DequantW.n_elements) {
+            DequantW.scale_bits = Add(
+                GetByte(DequantW.src, Multiply(DequantW.elem, 2)),
+                ShiftLeft(GetByte(DequantW.src, Add(Multiply(DequantW.elem, 2), 1)), 8)
+            )
+            DequantW.val = Quant_F16ToInt(DequantW.scale_bits)
+            // F16ToInt returns Q20 — keep full precision
+
+            StoreValue(Add(DequantW.dst, Multiply(DequantW.elem, 8)), DequantW.val)
+            DequantW.elem = Add(DequantW.elem, 1)
+        }
+    }
+}
+
+// =============================================================================
+// DEQUANT_F32_BLOCK — dequantize F32 values (4 bytes → 1 element each)
+// We extract the integer part only (truncate fractional bits).
+// F32: [sign:1][exp:8][mantissa:23]
+// =============================================================================
+Function.Quant_F32ToInt {
+    Input: bits: Integer
+    Output: Integer
+    Body: {
+        sign = BitwiseAnd(ShiftRight(bits, 31), 1)
+        exp  = BitwiseAnd(ShiftRight(bits, 23), 255)
+        mant = BitwiseAnd(bits, 8388607)
+
+        IfCondition EqualTo(exp, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(exp, 255) ThenBlock: {
+            IfCondition EqualTo(sign, 1) ThenBlock: {
+                ReturnValue(-2147483647)
+            }
+            ReturnValue(2147483647)
+        }
+
+        // Normal: value = (1 + mant/2^23) * 2^(exp - 127)
+        // We want value * 1048576 (Q20) for consistency with F16ToInt:
+        //   result = (2^23 + mant) * 2^(exp - 127 - 23 + 20)
+        //          = (2^23 + mant) * 2^(exp - 130)
+        frac = Add(8388608, mant)
+        shift = Subtract(exp, 130)
+
+        IfCondition GreaterEqual(shift, 0) ThenBlock: {
+            IfCondition GreaterThan(shift, 40) ThenBlock: {
+                shift = 40
+            }
+            result = ShiftLeft(frac, shift)
+        }
+        IfCondition LessThan(shift, 0) ThenBlock: {
+            neg_shift = Subtract(0, shift)
+            IfCondition GreaterThan(neg_shift, 40) ThenBlock: {
+                ReturnValue(0)
+            }
+            result = ShiftRight(frac, neg_shift)
+        }
+
+        IfCondition EqualTo(sign, 1) ThenBlock: {
+            result = Subtract(0, result)
+        }
+        ReturnValue(result)
+    }
+}
+
+// =============================================================================
+// QUANT_DEQUANT_TENSOR — dequantize an entire tensor
+//
+// Inputs via DequantW carrier:
+//   DequantW.src        = pointer to raw quantized data (mmap'd)
+//   DequantW.dst        = pointer to output buffer (pre-allocated, 8 bytes/elem)
+//   DequantW.n_elements = total elements in tensor
+//   DequantW.precision  = 0 (int32) or 1 (int64 Q20)
+//
+// Input parameter:
+//   qtype = GGMLType constant
+//
+// Returns 0 on success, -1 on unsupported type.
+// =============================================================================
+Function.Quant_DequantTensor {
+    Input: qtype: Integer
+    Output: Integer
+    Body: {
+        // Q8_0: 32 elements per block, 34 bytes per block
+        IfCondition EqualTo(qtype, GGMLType.Q8_0) ThenBlock: {
+            DequantW.n_blocks = Divide(DequantW.n_elements, 32)
+            DequantW.blk = 0
+            WhileLoop LessThan(DequantW.blk, DequantW.n_blocks) {
+                DequantW.blk_ptr = Add(DequantW.src, Multiply(DequantW.blk, 34))
+                DequantW.dst_ptr = Add(DequantW.dst, Multiply(DequantW.blk, Multiply(32, 8)))
+                Quant_DequantQ8Block()
+                DequantW.blk = Add(DequantW.blk, 1)
+            }
+            ReturnValue(0)
+        }
+
+        // Q4_0: 32 elements per block, 18 bytes per block
+        IfCondition EqualTo(qtype, GGMLType.Q4_0) ThenBlock: {
+            DequantW.n_blocks = Divide(DequantW.n_elements, 32)
+            DequantW.blk = 0
+            WhileLoop LessThan(DequantW.blk, DequantW.n_blocks) {
+                DequantW.blk_ptr = Add(DequantW.src, Multiply(DequantW.blk, 18))
+                DequantW.dst_ptr = Add(DequantW.dst, Multiply(DequantW.blk, Multiply(32, 8)))
+                Quant_DequantQ4Block()
+                DequantW.blk = Add(DequantW.blk, 1)
+            }
+            ReturnValue(0)
+        }
+
+        // F16: 2 bytes per element, no blocks
+        IfCondition EqualTo(qtype, GGMLType.F16) ThenBlock: {
+            Quant_DequantF16Block()
+            ReturnValue(0)
+        }
+
+        // F32: 4 bytes per element — read and convert
+        IfCondition EqualTo(qtype, GGMLType.F32) ThenBlock: {
+            DequantW.elem = 0
+            WhileLoop LessThan(DequantW.elem, DequantW.n_elements) {
+                DequantW.raw = Add(
+                    Add(
+                        GetByte(DequantW.src, Multiply(DequantW.elem, 4)),
+                        ShiftLeft(GetByte(DequantW.src, Add(Multiply(DequantW.elem, 4), 1)), 8)
+                    ),
+                    Add(
+                        ShiftLeft(GetByte(DequantW.src, Add(Multiply(DequantW.elem, 4), 2)), 16),
+                        ShiftLeft(GetByte(DequantW.src, Add(Multiply(DequantW.elem, 4), 3)), 24)
+                    )
+                )
+                DequantW.val = Quant_F32ToInt(DequantW.raw)
+                // F32ToInt returns Q20 — keep full precision
+
+                StoreValue(Add(DequantW.dst, Multiply(DequantW.elem, 8)), DequantW.val)
+                DequantW.elem = Add(DequantW.elem, 1)
+            }
+            ReturnValue(0)
+        }
+
+        // Unsupported type
+        PrintMessage("[Quant] ERROR: unsupported quant type ")
+        PrintNumber(qtype)
+        PrintMessage("\n")
+        ReturnValue(-1)
+    }
+}

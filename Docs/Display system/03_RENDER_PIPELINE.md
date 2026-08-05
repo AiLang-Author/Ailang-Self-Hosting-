@@ -307,10 +307,10 @@ VIcon manages icon packs loaded from VIF files:
 
 ```
 IconTier:
-    WIDGETS    — UI widget icons (buttons, checkboxes, tabs, etc.)
-    APPS       — Application icons
-    MIME       — File type icons
-    ACTIONS    — Action/symbol icons
+    DEFAULT    — General icons (radix-style symbols, 16x16)
+    WIDGETS    — UI widget atoms (silver_system_atoms.vif)
+    APP        — Application icons (32x32 tvg for terminal, calc, folder, etc.)
+    CUSTOM     — Per-application or runtime loaded icons
 ```
 
 | Function | Description |

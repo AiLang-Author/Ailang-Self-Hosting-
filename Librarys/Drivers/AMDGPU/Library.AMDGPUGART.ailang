@@ -1,0 +1,1007 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUGART.ailang
+//
+// GART (Graphics Address Remapping Table) implementation for SI (Southern Islands).
+// Allocates system RAM for IH ring, WPTR writeback, and dummy page, then maps
+// them through the GART page table in VRAM — exactly matching the Linux kernel's
+// gmc_v6_0_gart_enable() design.
+//
+// The page table occupies the first 90MB of VRAM (11,796,480 × 8-byte PTEs).
+// It covers GPU VA range 0xF4_0000_0000 to 0xFF_3FFF_F000.
+// Addresses within the system aperture (VRAM) bypass the page table.
+// Addresses outside the system aperture go through PTE lookup → system RAM.
+//
+// PTE format (64-bit):
+//   Bit 0: VALID
+//   Bit 1: SYSTEM (1=PCIe/system memory)
+//   Bit 2: SNOOPED (CPU cache coherent)
+//   Bit 5: READABLE  (kernel sets on every GTT PTE — amdgpu_ttm_tt_pte_flags)
+//   Bit 6: WRITEABLE (kernel sets on every GTT PTE; without it the MC drops
+//                     all GPU-side writes to the page: writeback, fences, dst)
+//   Bits 12-39: Physical page frame number (phys_addr >> 12)
+//
+// USAGE
+//   LibraryImport.Drivers.AMDGPU.AMDGPUGART
+//
+// DEPENDS
+//   LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+//   LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+
+// =============================================================================
+// GART CONSTANTS
+// =============================================================================
+FixedPool.GARTConf {
+    "PAGE_TABLE_SIZE":    Initialize=94371840,  CanChange=False   // 0x5A00000 = 90MB
+    "NUM_PTES":           Initialize=11796480,  CanChange=False   // 0xB40000
+    "GART_START_PAGE":    Initialize=267386880, CanChange=False   // 0x0FF00000
+    "GART_END_PAGE":      Initialize=267649023, CanChange=False   // 0x0FF3FFFF
+    "IH_RING_SIZE":       Initialize=65536,     CanChange=False   // 64KB
+    "IH_WB_SIZE":         Initialize=4096,      CanChange=False   // 4KB
+    "DUMMY_SIZE":         Initialize=4096,      CanChange=False   // 4KB
+    // GPU VA assignments for GART-mapped system RAM buffers
+    // Placed just past the system aperture end (0xF4_4000_0000)
+    "IH_RING_GPU_VA_HI":  Initialize=244,      CanChange=False   // 0xF4 (upper 8 bits)
+    "IH_RING_GPU_VA_LO":  Initialize=1073741824, CanChange=False // 0x40000000
+    // IH_RING_GPU_VA = 0xF4_4000_0000
+    "IH_WB_GPU_VA_HI":    Initialize=244,      CanChange=False   // 0xF4
+    "IH_WB_GPU_VA_LO":    Initialize=1073807360, CanChange=False // 0x40010000
+    // IH_WB_GPU_VA = 0xF4_4001_0000
+    "IH_RING_PTE_IDX":    Initialize=262144,   CanChange=False   // 0x40000 (page - start)
+    "IH_WB_PTE_IDX":      Initialize=262160,   CanChange=False   // 0x40010
+    // DMA engine ring buffers — 8KB each (rb_bufsz=11, 2048 dwords)
+    // DMA0 ring at GPU VA 0xF4_4002_0000, DMA1 ring at 0xF4_4004_0000
+    // DMA0 RPTR WB at GPU VA 0xF4_4006_0000, DMA1 RPTR WB at 0xF4_4006_1000
+    "DMA_RING_SIZE":      Initialize=8192,     CanChange=False   // 8KB per ring
+    "DMA_WB_SIZE":        Initialize=4096,     CanChange=False   // 4KB per WB page
+    "DMA0_RING_GPU_VA_HI": Initialize=244,     CanChange=False   // 0xF4
+    "DMA0_RING_GPU_VA_LO": Initialize=1073872896, CanChange=False // 0x40020000
+    "DMA1_RING_GPU_VA_HI": Initialize=244,     CanChange=False   // 0xF4
+    "DMA1_RING_GPU_VA_LO": Initialize=1074003968, CanChange=False // 0x40040000
+    "DMA0_WB_GPU_VA_HI":  Initialize=244,      CanChange=False   // 0xF4
+    "DMA0_WB_GPU_VA_LO":  Initialize=1074135040, CanChange=False  // 0x40060000
+    "DMA1_WB_GPU_VA_HI":  Initialize=244,      CanChange=False   // 0xF4
+    "DMA1_WB_GPU_VA_LO":  Initialize=1074139136, CanChange=False  // 0x40061000
+    // PTE indices: (GPU_VA_LO / 4096) offset from IH ring
+    "DMA0_RING_PTE_IDX":  Initialize=262176,   CanChange=False   // 0x40020
+    "DMA1_RING_PTE_IDX":  Initialize=262208,   CanChange=False   // 0x40040
+    "DMA0_WB_PTE_IDX":    Initialize=262240,   CanChange=False   // 0x40060
+    "DMA1_WB_PTE_IDX":    Initialize=262241,   CanChange=False   // 0x40061
+    // CP ring buffers — 3 rings × 64KB each, plus 4KB writeback page
+    // Placed above existing DMA allocations (free space starts at 0x40070000)
+    "CPRB_RING_SIZE":     Initialize=65536,    CanChange=False   // 64KB per ring
+    "CPRB_WB_SIZE":       Initialize=4096,     CanChange=False   // 4KB writeback page
+    "CPRB0_GPU_VA_HI":    Initialize=244,      CanChange=False   // 0xF4
+    "CPRB0_GPU_VA_LO":    Initialize=1074200576, CanChange=False // 0x40070000
+    "CPRB1_GPU_VA_HI":    Initialize=244,      CanChange=False   // 0xF4
+    "CPRB1_GPU_VA_LO":    Initialize=1074331648, CanChange=False // 0x40090000
+    "CPRB2_GPU_VA_HI":    Initialize=244,      CanChange=False   // 0xF4
+    "CPRB2_GPU_VA_LO":    Initialize=1074462720, CanChange=False // 0x400B0000
+    "CPRB_WB_GPU_VA_HI":  Initialize=244,      CanChange=False   // 0xF4
+    "CPRB_WB_GPU_VA_LO":  Initialize=1074593792, CanChange=False // 0x400D0000
+    // PTE indices = GPU_VA_LO / 4096
+    "CPRB0_PTE_IDX":      Initialize=262256,   CanChange=False   // 0x40070000/4096
+    "CPRB1_PTE_IDX":      Initialize=262288,   CanChange=False   // 0x40090000/4096
+    "CPRB2_PTE_IDX":      Initialize=262320,   CanChange=False   // 0x400B0000/4096
+    "CPRB_WB_PTE_IDX":    Initialize=262352,   CanChange=False   // 0x400D0000/4096
+    // RLC save/restore list + clear-state buffer — 4KB each, in GART system RAM
+    // (§23: CPU BAR0 writes to VRAM are unreliable on cold boot, so the old VRAM
+    // copies at 0x6034000/0x6038000 were garbage GPU-side. GART is the proven path.)
+    // Placed in the free gap between DMA1 WB (0x40061000) and CP RB0 (0x40070000).
+    "RLC_SR_GPU_VA_HI":   Initialize=244,      CanChange=False   // 0xF4
+    "RLC_SR_GPU_VA_LO":   Initialize=1074143232, CanChange=False // 0x40062000
+    "RLC_CS_GPU_VA_HI":   Initialize=244,      CanChange=False   // 0xF4
+    "RLC_CS_GPU_VA_LO":   Initialize=1074147328, CanChange=False // 0x40063000
+    "RLC_SR_PTE_IDX":     Initialize=262242,   CanChange=False   // 0x40062000/4096
+    "RLC_CS_PTE_IDX":     Initialize=262243,   CanChange=False   // 0x40063000/4096
+    "RLC_BUF_SIZE":       Initialize=4096,     CanChange=False   // 4KB each
+    // IB (Indirect Buffer) scratch — 4KB (1 page) for DISPATCH_DIRECT + CS_PARTIAL_FLUSH
+    // Placed above CP WB at GPU VA 0xF4_400E_0000
+    "IB_GPU_VA_HI":       Initialize=244,      CanChange=False   // 0xF4
+    "IB_GPU_VA_LO":       Initialize=1074659328, CanChange=False // 0x400E0000
+    "IB_PTE_IDX":         Initialize=262368,   CanChange=False   // 0x400E0000/4096
+    "IB_SIZE":            Initialize=4096,     CanChange=False   // 4KB (1 page)
+    // Compute data buffer (src/dst) — size computed at runtime from BAR0 size
+    // Placed above IB at GPU VA 0xF4_400F_0000
+    "DATA_BUF_GPU_VA_HI": Initialize=244,      CanChange=False   // 0xF4
+    "DATA_BUF_GPU_VA_LO": Initialize=1074724864, CanChange=False // 0x400F0000
+    "DATA_BUF_PTE_IDX":   Initialize=262384,   CanChange=False   // 0x400F0000/4096
+    // Shader code buffer — 64KB (16 pages) in GART-backed system RAM
+    // Placed dynamically above the data buffer (PTE_IDX computed at runtime)
+    "SHADER_SIZE":        Initialize=65536,    CanChange=False   // 64KB
+    "SHADER_PAGES":       Initialize=16,       CanChange=False   // 64KB / 4096
+    // Syscall constants not in GPUSys
+    "SYS_MLOCK":          Initialize=149,      CanChange=False
+    "MAP_ANONYMOUS":      Initialize=32,       CanChange=False   // 0x20
+    "MAP_PRIVATE":        Initialize=2,        CanChange=False   // 0x02
+    "MAP_ANON_PRIV":      Initialize=34,       CanChange=False   // 0x22
+    "SEEK_SET":           Initialize=0,        CanChange=False
+    "PTE_FLAGS":          Initialize=103,      CanChange=False   // 0x67 VALID|SYSTEM|SNOOPED|READABLE|WRITEABLE (kernel amdgpu_ttm_tt_pte_flags: GTT PTEs always get R|W; without W all GPU writes to GART are dropped, without R fetches may return default-page zeros)
+    "PFN_MASK":           Initialize=36028797018963967, CanChange=False  // 0x7FFFFFFFFFFFFF — bits 0-54 per pagemap
+}
+
+// =============================================================================
+// GART STATE
+// =============================================================================
+FixedPool.GARTState {
+    "ih_ring_host_ptr":   Initialize=0, CanChange=True  // mmap'd IH ring (64KB)
+    "ih_wb_host_ptr":     Initialize=0, CanChange=True  // mmap'd WPTR writeback (4KB)
+    "dummy_host_ptr":     Initialize=0, CanChange=True  // mmap'd dummy page (4KB)
+    "ih_ring_phys":       Initialize=0, CanChange=True  // physical addr of IH ring
+    "ih_wb_phys":         Initialize=0, CanChange=True  // physical addr of WPTR wb
+    "dummy_phys":         Initialize=0, CanChange=True  // physical addr of dummy page
+    // DMA engine ring buffers (allocated in system RAM, mapped via GART)
+    "dma0_ring_host_ptr": Initialize=0, CanChange=True  // mmap'd DMA0 ring (8KB)
+    "dma1_ring_host_ptr": Initialize=0, CanChange=True  // mmap'd DMA1 ring (8KB)
+    "dma0_wb_host_ptr":   Initialize=0, CanChange=True  // mmap'd DMA0 RPTR WB (4KB)
+    "dma1_wb_host_ptr":   Initialize=0, CanChange=True  // mmap'd DMA1 RPTR WB (4KB)
+    "dma0_ring_phys":     Initialize=0, CanChange=True  // physical addr of DMA0 ring
+    "dma1_ring_phys":     Initialize=0, CanChange=True  // physical addr of DMA1 ring
+    "dma0_wb_phys":       Initialize=0, CanChange=True  // physical addr of DMA0 WB
+    "dma1_wb_phys":       Initialize=0, CanChange=True  // physical addr of DMA1 WB
+    // CP ring buffers (allocated in system RAM, mapped via GART)
+    "cprb0_host_ptr":     Initialize=0, CanChange=True  // mmap'd CP RB0 ring (64KB)
+    "cprb1_host_ptr":     Initialize=0, CanChange=True  // mmap'd CP RB1 ring (64KB)
+    "cprb2_host_ptr":     Initialize=0, CanChange=True  // mmap'd CP RB2 ring (64KB)
+    "cprb_wb_host_ptr":   Initialize=0, CanChange=True  // mmap'd CP RPTR writeback (4KB)
+    "cprb0_phys":         Initialize=0, CanChange=True  // physical addr of CP RB0 page 0
+    "cprb1_phys":         Initialize=0, CanChange=True  // physical addr of CP RB1 page 0
+    "cprb2_phys":         Initialize=0, CanChange=True  // physical addr of CP RB2 page 0
+    "cprb_wb_phys":       Initialize=0, CanChange=True  // physical addr of CP WB page
+    // RLC save/restore + clear-state buffers in GART-backed system RAM (§23)
+    "rlc_sr_host_ptr":    Initialize=0, CanChange=True  // mmap'd RLC SR list page (4KB)
+    "rlc_cs_host_ptr":    Initialize=0, CanChange=True  // mmap'd RLC CSB page (4KB)
+    // IB (Indirect Buffer) scratch in GART-backed system RAM
+    "ib_host_ptr":        Initialize=0, CanChange=True  // mmap'd IB page (4KB)
+    "ib_phys":            Initialize=0, CanChange=True  // physical addr of IB page
+    "ib_gart_va":         Initialize=0, CanChange=True  // full 40-bit GART VA (0xF4_400E_0000)
+    // Compute data buffer (shader src/dst) in GART-backed system RAM
+    "data_buf_host_ptr":  Initialize=0, CanChange=True  // mmap'd data buffer base
+    "data_buf_size":      Initialize=0, CanChange=True  // actual allocated size (bytes)
+    "data_buf_gart_va":   Initialize=0, CanChange=True  // full 40-bit GART VA (0xF4_400F_0000)
+    // Shader code buffer in GART-backed system RAM (placed after data buffer)
+    "shader_host_ptr":    Initialize=0, CanChange=True  // mmap'd shader buffer (64KB)
+    "shader_gart_va":     Initialize=0, CanChange=True  // full 40-bit GART VA (dynamic)
+    "initialized":        Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// GART_GetPhysAddr — get physical address of a virtual address via pagemap
+//
+// Opens /proc/self/pagemap, seeks to the entry for the given virtual page,
+// reads 8 bytes, extracts PFN (bits 0-54), returns PFN * 4096.
+// Requires CAP_SYS_ADMIN (root).
+// =============================================================================
+Function.GART_GetPhysAddr {
+    Input: virt_addr: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[GART] GetPhysAddr called for VA=0x")
+        PrintHex(virt_addr)
+        PrintMessage("\n")
+
+        // Open /proc/self/pagemap
+        pm_path = "/proc/self/pagemap"
+        pm_fd = SystemCall(GPUSys.SYS_OPEN, pm_path, GPUSys.O_RDONLY, 0)
+        PrintMessage("[GART] pagemap fd=")
+        PrintNumber(pm_fd)
+        PrintMessage(" offset=")
+        PrintNumber(Multiply(Divide(virt_addr, 4096), 8))
+        PrintMessage("\n")
+        IfCondition LessThan(pm_fd, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: Cannot open /proc/self/pagemap (fd=")
+            PrintNumber(pm_fd)
+            PrintMessage("). Need root.\n")
+            ReturnValue(0)
+        }
+
+        // Compute offset: (virt_addr / 4096) * 8
+        page_idx = Divide(virt_addr, 4096)
+        pm_offset = Multiply(page_idx, 8)
+
+        // Seek to the entry
+        SystemCall(GPUSys.SYS_LSEEK, pm_fd, pm_offset, GARTConf.SEEK_SET, 0, 0)
+
+        // Read 8 bytes into a buffer
+        rd_buf = Allocate(8)
+        MemorySet(rd_buf, 0, 8)
+        nr = SystemCall(GPUSys.SYS_READ, pm_fd, rd_buf, 8, 0, 0)
+        SystemCall(GPUSys.SYS_CLOSE, pm_fd, 0, 0, 0, 0)
+
+        IfCondition NotEqual(nr, 8) ThenBlock: {
+            PrintMessage("[GART] ERROR: pagemap read failed (")
+            PrintNumber(nr)
+            PrintMessage(" bytes)\n")
+            Deallocate(rd_buf, 8)
+            ReturnValue(0)
+        }
+
+        // Parse 64-bit little-endian pagemap entry
+        // Bits 0-54 = PFN, Bit 63 = present
+        b0 = GetByte(rd_buf, 0)
+        b1 = GetByte(rd_buf, 1)
+        b2 = GetByte(rd_buf, 2)
+        b3 = GetByte(rd_buf, 3)
+        b4 = GetByte(rd_buf, 4)
+        b5 = GetByte(rd_buf, 5)
+        b6 = GetByte(rd_buf, 6)
+        b7 = GetByte(rd_buf, 7)
+
+        // Reconstruct 64-bit value
+        lo32 = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+        hi32 = BitwiseOr(b4, BitwiseOr(LeftShift(b5, 8), BitwiseOr(LeftShift(b6, 16), LeftShift(b7, 24))))
+        entry = BitwiseOr(lo32, LeftShift(hi32, 32))
+
+        Deallocate(rd_buf, 8)
+
+        // Debug: print raw pagemap entry
+        PrintMessage("[GART] pagemap: VA=0x")
+        PrintHex(virt_addr)
+        PrintMessage(" entry=0x")
+        PrintHex(entry)
+        PrintMessage(" hi=0x")
+        PrintHex(hi32)
+        PrintMessage(" lo=0x")
+        PrintHex(lo32)
+        PrintMessage("\n")
+
+        // Check present bit (bit 63)
+        present = BitwiseAnd(RightShift(entry, 63), 1)
+        IfCondition EqualTo(present, 0) ThenBlock: {
+            PrintMessage("[GART] WARNING: page not present for VA 0x")
+            PrintHex(virt_addr)
+            PrintMessage("\n")
+            ReturnValue(0)
+        }
+
+        // Extract PFN (bits 0-54) per Linux /proc/pid/pagemap format + GARTConf.PFN_MASK.
+        // Mask off bits 55+ (soft-dirty etc.). Old 50-bit mask was the bug.
+        pfn = BitwiseAnd(entry, GARTConf.PFN_MASK)
+        phys_addr = Multiply(pfn, 4096)
+
+        IfCondition EqualTo(pfn, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: PFN resolved to 0 despite present bit (sudo run). Check: mmap offset passed correctly? Pages touched after mlock? PTEs will point to page 0 (bad).\n")
+            ReturnValue(0)
+        }
+
+        PrintMessage("[GART] PFN=0x")
+        PrintHex(pfn)
+        PrintMessage(" phys=0x")
+        PrintHex(phys_addr)
+        PrintMessage("\n")
+
+        ReturnValue(phys_addr)
+    }
+}
+
+// =============================================================================
+// GART_WritePTE — write a single 64-bit PTE into the VRAM page table
+//
+// pte_index: index into the page table (0 .. NUM_PTES-1)
+// phys_addr: physical address to map to
+// gpu: GPU index (for BAR access)
+// =============================================================================
+Function.GART_WritePTE {
+    Input: gpu: Integer
+    Input: pte_index: Integer
+    Input: phys_addr: Integer
+    Body: {
+        // PTE VRAM offset = pte_index * 8
+        pte_vram_off = Multiply(pte_index, 8)
+
+        // Build full 64-bit PTE value (mimics kernel writeq in amdgpu_gmc_set_pte_pde)
+        pte_lo = BitwiseOr(BitwiseAnd(phys_addr, 4294963200), GARTConf.PTE_FLAGS)
+        pte_hi = BitwiseAnd(RightShift(phys_addr, 32), 255)
+        // Combine into one 64-bit value for single store (helps WC coherency vs two separate dwords)
+        full_pte = BitwiseOr(pte_lo, LeftShift(pte_hi, 32))
+
+        // Write directly to VRAM via BAR0 using 64-bit (qword) store
+        GPU_VramWr64(gpu, pte_vram_off, full_pte)
+    }
+}
+
+// =============================================================================
+// GART_Init — allocate system RAM, get physical addresses, write PTEs
+//
+// Must be called AFTER GPU_BAR_MapVRAM (need BAR0 access for PTE writes)
+// and BEFORE PM4_ConfigureVM (which enables the page table).
+// =============================================================================
+Function.GART_Init {
+    Input: gpu: Integer
+    Output: Integer
+    Body: {
+        PrintMessage("[GART] Initializing GART page table...\n")
+
+        // Ensure process is dumpable so /proc/self/pagemap is accessible
+        // even when running with file capabilities (setcap).
+        // prctl(PR_SET_DUMPABLE=4, 1) = syscall 157
+        SystemCall(157, 4, 1, 0, 0, 0)
+
+        // =================================================================
+        // Step 1: Allocate system RAM for IH ring, writeback, dummy page
+        // mmap(NULL, size, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0)
+        // =================================================================
+        prot = Add(GPUSys.PROT_READ, GPUSys.PROT_WRITE)   // 3
+
+        // IH ring: 64KB
+        ih_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.IH_RING_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(ih_ptr, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: mmap IH ring failed\n")
+            ReturnValue(-1)
+        }
+
+        // WPTR writeback: 4KB
+        wb_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.IH_WB_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(wb_ptr, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: mmap WPTR writeback failed\n")
+            SystemCall(GPUSys.SYS_MUNMAP, ih_ptr, GARTConf.IH_RING_SIZE, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        // Dummy page: 4KB
+        dummy_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.DUMMY_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(dummy_ptr, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: mmap dummy page failed\n")
+            SystemCall(GPUSys.SYS_MUNMAP, ih_ptr, GARTConf.IH_RING_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, wb_ptr, GARTConf.IH_WB_SIZE, 0, 0, 0)
+            ReturnValue(-1)
+        }
+
+        // =================================================================
+        // Step 2: Lock pages in RAM and touch them to force PTE creation
+        // =================================================================
+        SystemCall(GARTConf.SYS_MLOCK, ih_ptr, GARTConf.IH_RING_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, wb_ptr, GARTConf.IH_WB_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, dummy_ptr, GARTConf.DUMMY_SIZE, 0, 0, 0)
+
+        // Zero and touch all pages (forces kernel page allocation)
+        MemorySet(ih_ptr, 0, GARTConf.IH_RING_SIZE)
+        MemorySet(wb_ptr, 0, GARTConf.IH_WB_SIZE)
+        MemorySet(dummy_ptr, 0, GARTConf.DUMMY_SIZE)
+
+        // =================================================================
+        // Step 3: Get physical addresses via /proc/self/pagemap
+        // =================================================================
+        ih_phys = GART_GetPhysAddr(ih_ptr)
+        wb_phys = GART_GetPhysAddr(wb_ptr)
+        dm_phys = GART_GetPhysAddr(dummy_ptr)
+
+        IfCondition EqualTo(ih_phys, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: cannot resolve IH ring physical address\n")
+            ReturnValue(-2)
+        }
+        IfCondition EqualTo(wb_phys, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: cannot resolve WPTR writeback physical address\n")
+            ReturnValue(-2)
+        }
+        IfCondition EqualTo(dm_phys, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: cannot resolve dummy page physical address\n")
+            ReturnValue(-2)
+        }
+
+        PrintMessage("[GART] IH ring phys=0x")
+        PrintHex(ih_phys)
+        PrintMessage(" wb phys=0x")
+        PrintHex(wb_phys)
+        PrintMessage(" dummy phys=0x")
+        PrintHex(dm_phys)
+        PrintMessage("\n")
+
+        // =================================================================
+        // Step 4: Fill ENTIRE page table with dummy page PTEs
+        //
+        // The kernel (radeon_gart_table_vram_pin) fills every PTE slot
+        // with the dummy page entry before enabling the GART.  This
+        // ensures any unmapped GART VA resolves to a harmless page
+        // instead of causing undefined TLB behaviour.
+        //
+        // PTE format: lo32 = (phys & 0xFFFFF000) | VALID|SYSTEM|SNOOPED
+        //             hi32 = (phys >> 32) & 0xFF
+        // =================================================================
+        vram_state = GPU_BAR_GetState(gpu)
+        vram_ptr = Dereference(Add(vram_state, GPUBarField.VRAM_PTR))
+
+        // Mimic kernel behavior (amdgpu_gart_table_vram_alloc + gart_map / set_pte_pde):
+        // Kernel does a bulk memset_io of the table (to gart_pte_flags=0 for v6), then
+        // only "binds" (writes) PTEs for the actually used ranges via writeq to the
+        // CPU-mapped VRAM BO ptr.
+        // We skip the 11.8M bulk dummy fill entirely here. It (even with per-write sfence
+        // + our added periodic HDP drains) causes WC/PCI posted-write overflow on RD990
+        // in cold state, leading to FFFF/garbage on later readbacks and "corruption" of
+        // earlier PTEs (as seen in the 2026-07-01 run after reboot).
+        // Instead, we only write the PTEs for the buffers we actually allocate/use
+        // (IH+WB, DMA rings+WB, CP rings+WB, IB, data buffer, shader). This is the
+        // "bind used" part, proven correct by kernel and by working on BIOS-posted cards
+        // (which use similar StoreValue/MemCopy paths once coherency is there).
+        // Unused slots in the 90MB table stay as power-on values (0/FFFF/random); this is
+        // fine because our driver only ever uses the specific GART VAs for the allocated
+        // rings/IB/data/shader (we control all accesses). If future code touches other
+        // GART VAs, we may need a safe bulk init (e.g. after CP up, or via smaller
+        // chunks + more aggressive per-page drains/reads).
+        PrintMessage("[GART] Skipping bulk 11.8M dummy PTE fill (mimicking kernel 'memset + bind-used' to avoid cold WC overflow on RD990)\n")
+        PrintMessage("[GART] Will only write PTEs for actually used buffers (IH/DMA/CP/IB/data/shader)\n")
+
+        // =================================================================
+        // Step 5: Overwrite specific PTEs for IH ring and writeback
+        // IH ring = 16 contiguous pages starting at PTE index 0x40000
+        // =================================================================
+        pte_i = 0
+        WhileLoop LessThan(pte_i, 16) {
+            page_phys = Add(ih_phys, Multiply(pte_i, 4096))
+            pte_idx = Add(GARTConf.IH_RING_PTE_IDX, pte_i)
+            GART_WritePTE(gpu, pte_idx, page_phys)
+            pte_i = Add(pte_i, 1)
+        }
+
+        // WPTR writeback = 1 page at PTE index 0x40010
+        GART_WritePTE(gpu, GARTConf.IH_WB_PTE_IDX, wb_phys)
+
+        // =================================================================
+        // Step 5b: Allocate DMA engine ring buffers + writeback (system RAM)
+        //
+        // DMA0 ring = 8KB (2 pages) at GPU VA 0xF4_4002_0000
+        // DMA1 ring = 8KB (2 pages) at GPU VA 0xF4_4004_0000
+        // DMA0 RPTR WB = 4KB (1 page) at GPU VA 0xF4_4006_0000
+        // DMA1 RPTR WB = 4KB (1 page) at GPU VA 0xF4_4006_1000
+        // =================================================================
+        dma0_ring_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.DMA_RING_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        dma1_ring_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.DMA_RING_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        dma0_wb_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.DMA_WB_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        dma1_wb_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.DMA_WB_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+
+        // Lock + touch
+        SystemCall(GARTConf.SYS_MLOCK, dma0_ring_ptr, GARTConf.DMA_RING_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, dma1_ring_ptr, GARTConf.DMA_RING_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, dma0_wb_ptr, GARTConf.DMA_WB_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, dma1_wb_ptr, GARTConf.DMA_WB_SIZE, 0, 0, 0)
+        MemorySet(dma0_ring_ptr, 0, GARTConf.DMA_RING_SIZE)
+        MemorySet(dma1_ring_ptr, 0, GARTConf.DMA_RING_SIZE)
+        MemorySet(dma0_wb_ptr, 0, GARTConf.DMA_WB_SIZE)
+        MemorySet(dma1_wb_ptr, 0, GARTConf.DMA_WB_SIZE)
+
+        // Get physical addresses
+        dma0_ring_phys = GART_GetPhysAddr(dma0_ring_ptr)
+        dma1_ring_phys = GART_GetPhysAddr(dma1_ring_ptr)
+        dma0_wb_phys = GART_GetPhysAddr(dma0_wb_ptr)
+        dma1_wb_phys = GART_GetPhysAddr(dma1_wb_ptr)
+
+        PrintMessage("[GART] DMA0 ring phys=0x")
+        PrintHex(dma0_ring_phys)
+        PrintMessage(" DMA1 ring phys=0x")
+        PrintHex(dma1_ring_phys)
+        PrintMessage("\n")
+        PrintMessage("[GART] DMA0 WB phys=0x")
+        PrintHex(dma0_wb_phys)
+        PrintMessage(" DMA1 WB phys=0x")
+        PrintHex(dma1_wb_phys)
+        PrintMessage("\n")
+
+        // Write DMA0 ring PTEs (2 pages)
+        GART_WritePTE(gpu, GARTConf.DMA0_RING_PTE_IDX, dma0_ring_phys)
+        GART_WritePTE(gpu, Add(GARTConf.DMA0_RING_PTE_IDX, 1), Add(dma0_ring_phys, 4096))
+
+        // Write DMA1 ring PTEs (2 pages)
+        GART_WritePTE(gpu, GARTConf.DMA1_RING_PTE_IDX, dma1_ring_phys)
+        GART_WritePTE(gpu, Add(GARTConf.DMA1_RING_PTE_IDX, 1), Add(dma1_ring_phys, 4096))
+
+        // Write DMA0/DMA1 writeback PTEs (1 page each)
+        GART_WritePTE(gpu, GARTConf.DMA0_WB_PTE_IDX, dma0_wb_phys)
+        GART_WritePTE(gpu, GARTConf.DMA1_WB_PTE_IDX, dma1_wb_phys)
+
+        // =================================================================
+        // Step 5c: Allocate CP ring buffers + writeback (system RAM)
+        //
+        // CP RB0 = 64KB (16 pages) at GPU VA 0xF4_4007_0000
+        // CP RB1 = 64KB (16 pages) at GPU VA 0xF4_4009_0000
+        // CP RB2 = 64KB (16 pages) at GPU VA 0xF4_400B_0000
+        // CP WB  = 4KB  (1 page)   at GPU VA 0xF4_400D_0000
+        // =================================================================
+        cprb0_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.CPRB_RING_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        cprb1_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.CPRB_RING_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        cprb2_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.CPRB_RING_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        cprb_wb_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.CPRB_WB_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+
+        // Lock + touch
+        SystemCall(GARTConf.SYS_MLOCK, cprb0_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, cprb1_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, cprb2_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, cprb_wb_ptr, GARTConf.CPRB_WB_SIZE, 0, 0, 0)
+        MemorySet(cprb0_ptr, 0, GARTConf.CPRB_RING_SIZE)
+        MemorySet(cprb1_ptr, 0, GARTConf.CPRB_RING_SIZE)
+        MemorySet(cprb2_ptr, 0, GARTConf.CPRB_RING_SIZE)
+        MemorySet(cprb_wb_ptr, 0, GARTConf.CPRB_WB_SIZE)
+
+        // Write CP RB0 PTEs (16 pages — anonymous mmap is not physically contiguous)
+        cprb_pg = 0
+        WhileLoop LessThan(cprb_pg, 16) {
+            pg_phys = GART_GetPhysAddr(Add(cprb0_ptr, Multiply(cprb_pg, 4096)))
+            GART_WritePTE(gpu, Add(GARTConf.CPRB0_PTE_IDX, cprb_pg), pg_phys)
+            cprb_pg = Add(cprb_pg, 1)
+        }
+
+        // Write CP RB1 PTEs (16 pages)
+        cprb_pg = 0
+        WhileLoop LessThan(cprb_pg, 16) {
+            pg_phys = GART_GetPhysAddr(Add(cprb1_ptr, Multiply(cprb_pg, 4096)))
+            GART_WritePTE(gpu, Add(GARTConf.CPRB1_PTE_IDX, cprb_pg), pg_phys)
+            cprb_pg = Add(cprb_pg, 1)
+        }
+
+        // Write CP RB2 PTEs (16 pages)
+        cprb_pg = 0
+        WhileLoop LessThan(cprb_pg, 16) {
+            pg_phys = GART_GetPhysAddr(Add(cprb2_ptr, Multiply(cprb_pg, 4096)))
+            GART_WritePTE(gpu, Add(GARTConf.CPRB2_PTE_IDX, cprb_pg), pg_phys)
+            cprb_pg = Add(cprb_pg, 1)
+        }
+
+        // Write CP WB PTE (1 page)
+        cprb_wb_phys = GART_GetPhysAddr(cprb_wb_ptr)
+        GART_WritePTE(gpu, GARTConf.CPRB_WB_PTE_IDX, cprb_wb_phys)
+
+        // =================================================================
+        // Step 5c1b: RLC save/restore list + clear-state buffer (§23)
+        //
+        // SR  = 4KB (1 page) at GPU VA 0xF4_4006_2000
+        // CSB = 4KB (1 page) at GPU VA 0xF4_4006_3000
+        // Must be in GART — VRAM has cold-boot CPU write reliability issues,
+        // and the RLC/CP read these via VM (same path as the CP rings).
+        // =================================================================
+        rlc_sr_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.RLC_BUF_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        rlc_cs_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.RLC_BUF_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        SystemCall(GARTConf.SYS_MLOCK, rlc_sr_ptr, GARTConf.RLC_BUF_SIZE, 0, 0, 0)
+        SystemCall(GARTConf.SYS_MLOCK, rlc_cs_ptr, GARTConf.RLC_BUF_SIZE, 0, 0, 0)
+        MemorySet(rlc_sr_ptr, 0, GARTConf.RLC_BUF_SIZE)
+        MemorySet(rlc_cs_ptr, 0, GARTConf.RLC_BUF_SIZE)
+        rlc_sr_phys = GART_GetPhysAddr(rlc_sr_ptr)
+        GART_WritePTE(gpu, GARTConf.RLC_SR_PTE_IDX, rlc_sr_phys)
+        rlc_cs_phys = GART_GetPhysAddr(rlc_cs_ptr)
+        GART_WritePTE(gpu, GARTConf.RLC_CS_PTE_IDX, rlc_cs_phys)
+        PrintMessage("[GART] RLC SR/CSB pages mapped: SR host=0x")
+        PrintHex(rlc_sr_ptr)
+        PrintMessage(" CSB host=0x")
+        PrintHex(rlc_cs_ptr)
+        PrintMessage("\n")
+
+        PrintMessage("[GART] CP rings: RB0=0x")
+        PrintHex(cprb0_ptr)
+        PrintMessage(" RB1=0x")
+        PrintHex(cprb1_ptr)
+        PrintMessage(" RB2=0x")
+        PrintHex(cprb2_ptr)
+        PrintMessage(" WB=0x")
+        PrintHex(cprb_wb_ptr)
+        PrintMessage("\n")
+
+        // =================================================================
+        // Step 5c2: Allocate IB (Indirect Buffer) scratch in GART
+        //
+        // IB = 4KB (1 page) at GPU VA 0xF4_400E_0000
+        // Used by PM4_SubmitCompute to hold DISPATCH_DIRECT + CS_PARTIAL_FLUSH.
+        // Must be in GART — VRAM has cold-boot write coherency issues.
+        // =================================================================
+        ib_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.IB_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(ib_ptr, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: mmap IB page failed\n")
+            ReturnValue(-1)
+        }
+        SystemCall(GARTConf.SYS_MLOCK, ib_ptr, GARTConf.IB_SIZE, 0, 0, 0)
+        MemorySet(ib_ptr, 0, GARTConf.IB_SIZE)
+
+        ib_phys = GART_GetPhysAddr(ib_ptr)
+        GART_WritePTE(gpu, GARTConf.IB_PTE_IDX, ib_phys)
+
+        ib_gart_va = BitwiseOr(LeftShift(GARTConf.IB_GPU_VA_HI, 32), GARTConf.IB_GPU_VA_LO)
+        PrintMessage("[GART] IB: host=0x")
+        PrintHex(ib_ptr)
+        PrintMessage(" GART_VA=0x")
+        PrintHex(ib_gart_va)
+        PrintMessage(" phys=0x")
+        PrintHex(ib_phys)
+        PrintMessage("\n")
+
+        // =================================================================
+        // Step 5d: Allocate compute data buffer (shader src/dst) in GART
+        //
+        // Size = BAR0_size - DATA_OFFSET (0x607E000 = 101179392).
+        // This matches the VRAM data region so the full data area is
+        // available through GART-backed coherent system RAM, bypassing
+        // the cold-boot VRAM write-coherency bug.
+        // =================================================================
+        data_bar_state = GPU_BAR_GetState(gpu)
+        data_bar_size = Dereference(Add(data_bar_state, GPUBarField.VRAM_SIZE))
+        data_buf_size = Subtract(data_bar_size, 101179392)
+        data_buf_pages = Divide(data_buf_size, 4096)
+
+        PrintMessage("[GART] Data buffer: BAR0=")
+        PrintNumber(Divide(data_bar_size, 1048576))
+        PrintMessage("MB DATA_OFFSET=0x607E000 data_buf=")
+        PrintNumber(Divide(data_buf_size, 1048576))
+        PrintMessage("MB (")
+        PrintNumber(data_buf_pages)
+        PrintMessage(" pages)\n")
+
+        // mmap + mlock the data buffer
+        data_buf_ptr = SystemCall(GPUSys.SYS_MMAP, 0, data_buf_size, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(data_buf_ptr, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: mmap data buffer failed\n")
+            ReturnValue(-1)
+        }
+        SystemCall(GARTConf.SYS_MLOCK, data_buf_ptr, data_buf_size, 0, 0, 0)
+        MemorySet(data_buf_ptr, 0, data_buf_size)
+
+        // Write PTEs for every page of the data buffer
+        // Anonymous mmap is not physically contiguous — each page needs
+        // its own pagemap lookup + PTE entry.
+        // OPTIMIZATION for 40k+ pages: open pagemap ONCE to avoid 40k open/close syscalls
+        // (which were causing bog/slowdown/hang in previous runs). Use single fd + lseek/read per page.
+        pm_fd = SystemCall(GPUSys.SYS_OPEN, "/proc/self/pagemap", GPUSys.O_RDONLY, 0)
+        IfCondition LessThan(pm_fd, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: open pagemap for data buffer failed\n")
+            // fall back to per-call (slow)
+            data_pg = 0
+            WhileLoop LessThan(data_pg, data_buf_pages) {
+                pg_phys = GART_GetPhysAddr(Add(data_buf_ptr, Multiply(data_pg, 4096)))
+                GART_WritePTE(gpu, Add(GARTConf.DATA_BUF_PTE_IDX, data_pg), pg_phys)
+                data_pg = Add(data_pg, 1)
+            }
+        } ElseBlock: {
+            data_pg = 0
+            WhileLoop LessThan(data_pg, data_buf_pages) {
+                page_va = Add(data_buf_ptr, Multiply(data_pg, 4096))
+                page_idx = Divide(page_va, 4096)
+                pm_offset = Multiply(page_idx, 8)
+                SystemCall(GPUSys.SYS_LSEEK, pm_fd, pm_offset, GARTConf.SEEK_SET, 0, 0)
+                rd_buf = Allocate(8)
+                MemorySet(rd_buf, 0, 8)
+                nr = SystemCall(GPUSys.SYS_READ, pm_fd, rd_buf, 8, 0, 0)
+                IfCondition NotEqual(nr, 8) ThenBlock: {
+                    // fallback phys=0 , will fail later
+                    pg_phys = 0
+                } ElseBlock: {
+                    b0 = GetByte(rd_buf, 0)
+                    b1 = GetByte(rd_buf, 1)
+                    b2 = GetByte(rd_buf, 2)
+                    b3 = GetByte(rd_buf, 3)
+                    b4 = GetByte(rd_buf, 4)
+                    b5 = GetByte(rd_buf, 5)
+                    b6 = GetByte(rd_buf, 6)
+                    b7 = GetByte(rd_buf, 7)
+                    lo32 = BitwiseOr(b0, BitwiseOr(LeftShift(b1, 8), BitwiseOr(LeftShift(b2, 16), LeftShift(b3, 24))))
+                    hi32 = BitwiseOr(b4, BitwiseOr(LeftShift(b5, 8), BitwiseOr(LeftShift(b6, 16), LeftShift(b7, 24))))
+                    entry = BitwiseOr(lo32, LeftShift(hi32, 32))
+                    present = BitwiseAnd(RightShift(entry, 63), 1)
+                    IfCondition EqualTo(present, 0) ThenBlock: {
+                        pg_phys = 0
+                    } ElseBlock: {
+                        pfn = BitwiseAnd(entry, 36028797018963967)  // 0x7F.. bits 0-54
+                        pg_phys = Multiply(pfn, 4096)
+                    }
+                }
+                Deallocate(rd_buf, 8)
+                GART_WritePTE(gpu, Add(GARTConf.DATA_BUF_PTE_IDX, data_pg), pg_phys)
+                data_pg = Add(data_pg, 1)
+            }
+            SystemCall(GPUSys.SYS_CLOSE, pm_fd, 0, 0, 0, 0)
+        }
+
+        data_gart_va = BitwiseOr(LeftShift(GARTConf.DATA_BUF_GPU_VA_HI, 32), GARTConf.DATA_BUF_GPU_VA_LO)
+        PrintMessage("[GART] Data buffer: host=0x")
+        PrintHex(data_buf_ptr)
+        PrintMessage(" GART_VA=0x")
+        PrintHex(data_gart_va)
+        PrintMessage(" pages=")
+        PrintNumber(data_buf_pages)
+        PrintMessage("\n")
+
+        // =================================================================
+        // Step 5b: Shader code buffer (64KB, 16 pages) — placed after data buffer
+        // =================================================================
+        shader_pte_idx = Add(GARTConf.DATA_BUF_PTE_IDX, data_buf_pages)
+        shader_va_lo = Multiply(shader_pte_idx, 4096)
+        shader_gart_va = BitwiseOr(LeftShift(244, 32), shader_va_lo)
+
+        shader_ptr = SystemCall(GPUSys.SYS_MMAP, 0, GARTConf.SHADER_SIZE, prot, GARTConf.MAP_ANON_PRIV, -1, 0)
+        IfCondition LessThan(shader_ptr, 0) ThenBlock: {
+            PrintMessage("[GART] ERROR: mmap shader buffer failed\n")
+            ReturnValue(-1)
+        }
+        SystemCall(GARTConf.SYS_MLOCK, shader_ptr, GARTConf.SHADER_SIZE, 0, 0, 0)
+        MemorySet(shader_ptr, 0, GARTConf.SHADER_SIZE)
+
+        // Write PTEs for shader pages
+        shader_pg = 0
+        WhileLoop LessThan(shader_pg, GARTConf.SHADER_PAGES) {
+            pg_phys = GART_GetPhysAddr(Add(shader_ptr, Multiply(shader_pg, 4096)))
+            GART_WritePTE(gpu, Add(shader_pte_idx, shader_pg), pg_phys)
+            shader_pg = Add(shader_pg, 1)
+        }
+
+        PrintMessage("[GART] Shader buffer: host=0x")
+        PrintHex(shader_ptr)
+        PrintMessage(" GART_VA=0x")
+        PrintHex(shader_gart_va)
+        PrintMessage(" PTE_IDX=")
+        PrintNumber(shader_pte_idx)
+        PrintMessage(" (16 pages)\n")
+
+        // --- PCI posted-write drain (after specific PTE writes) ---
+        // Same logic as the post-dummy-fill drain: the specific PTE writes
+        // go through WC-mapped BAR0, and we must guarantee they have reached
+        // VRAM before verification reads them back.  Without this, a read
+        // can return stale VRAM content (the old dummy-fill value) if the
+        // write is still in the PCI posted-write queue.
+        InlineAsm["0f ae f8"]                                           // sfence
+        InlineAsm["0f ae f0"]                                           // mfence
+        GPU_Wr32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL, 1)          // HDP flush
+        pci_drain3 = GPU_Rd32(gpu, SIReg.HDP_MEM_COHERENCY_FLUSH_CNTL) // PCI read fence
+        InlineAsm["0f ae f0"]                                           // mfence
+        // Read back last shader PTE to force all prior writes through
+        pci_drain4 = GPU_VramRd32(gpu, Multiply(Add(shader_pte_idx, Subtract(GARTConf.SHADER_PAGES, 1)), 8))
+        PrintMessage("[GART] PCI write drain #2 complete (specific PTEs flushed)\n")
+
+        all_pte_total = Add(73, Add(data_buf_pages, GARTConf.SHADER_PAGES))
+        PrintMessage("[GART] Wrote PTEs: IH(17) + DMA(6) + CP(49) + IB(1) + DATA(")
+        PrintNumber(data_buf_pages)
+        PrintMessage(") + SHADER(16) = ")
+        PrintNumber(all_pte_total)
+        PrintMessage("\n")
+
+        // =================================================================
+        // Step 5e: Readback-verify critical PTEs
+        //
+        // After all PTE writes + sfence, read back the most important PTEs
+        // to confirm they actually landed in VRAM.  If any mismatch, retry
+        // the write up to 3 times before reporting failure.
+        // Verifies: IH[0], CPRB0[0], IB, DATA[0], SHADER[0]
+        // =================================================================
+        PrintMessage("[GART] Verifying critical PTEs...\n")
+        gart_verify_fail = 0
+
+        // --- Verify IH ring PTE[0] ---
+        v_off = Multiply(GARTConf.IH_RING_PTE_IDX, 8)
+        v_expect_lo = BitwiseOr(BitwiseAnd(ih_phys, 4294963200), GARTConf.PTE_FLAGS)
+        v_expect_hi = BitwiseAnd(RightShift(ih_phys, 32), 255)
+        v_retry = 0
+        v_lo = GPU_VramRd32(gpu, v_off)
+        v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+        WhileLoop BitwiseAnd(BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)), LessThan(v_retry, 3)) {
+            PrintMessage("[GART] IH PTE[0] mismatch, retry ")
+            PrintNumber(v_retry)
+            PrintMessage(": got lo=0x")
+            PrintHex(v_lo)
+            PrintMessage(" hi=0x")
+            PrintHex(v_hi)
+            PrintMessage("\n")
+            // 64-bit write for PTE (mimic kernel)
+            full_pte = BitwiseOr(v_expect_lo, LeftShift(v_expect_hi, 32))
+            GPU_VramWr64(gpu, v_off, full_pte)
+            InlineAsm["0f ae f8"]
+            v_lo = GPU_VramRd32(gpu, v_off)
+            v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+            v_retry = Add(v_retry, 1)
+        }
+        IfCondition BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)) ThenBlock: {
+            PrintMessage("[GART] *** FAIL: IH PTE[0] verify failed after 3 retries\n")
+            gart_verify_fail = Add(gart_verify_fail, 1)
+        }
+
+        // --- Verify CPRB0 PTE[0] ---
+        cprb0_pg0_phys = GART_GetPhysAddr(cprb0_ptr)
+        v_off = Multiply(GARTConf.CPRB0_PTE_IDX, 8)
+        v_expect_lo = BitwiseOr(BitwiseAnd(cprb0_pg0_phys, 4294963200), GARTConf.PTE_FLAGS)
+        v_expect_hi = BitwiseAnd(RightShift(cprb0_pg0_phys, 32), 255)
+        v_retry = 0
+        v_lo = GPU_VramRd32(gpu, v_off)
+        v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+        WhileLoop BitwiseAnd(BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)), LessThan(v_retry, 3)) {
+            PrintMessage("[GART] CPRB0 PTE[0] mismatch, retry ")
+            PrintNumber(v_retry)
+            PrintMessage(": got lo=0x")
+            PrintHex(v_lo)
+            PrintMessage(" hi=0x")
+            PrintHex(v_hi)
+            PrintMessage("\n")
+            // 64-bit write for PTE (mimic kernel)
+            full_pte = BitwiseOr(v_expect_lo, LeftShift(v_expect_hi, 32))
+            GPU_VramWr64(gpu, v_off, full_pte)
+            InlineAsm["0f ae f8"]
+            v_lo = GPU_VramRd32(gpu, v_off)
+            v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+            v_retry = Add(v_retry, 1)
+        }
+        IfCondition BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)) ThenBlock: {
+            PrintMessage("[GART] *** FAIL: CPRB0 PTE[0] verify failed after 3 retries\n")
+            gart_verify_fail = Add(gart_verify_fail, 1)
+        }
+
+        // --- Verify IB PTE ---
+        v_off = Multiply(GARTConf.IB_PTE_IDX, 8)
+        v_expect_lo = BitwiseOr(BitwiseAnd(ib_phys, 4294963200), GARTConf.PTE_FLAGS)
+        v_expect_hi = BitwiseAnd(RightShift(ib_phys, 32), 255)
+        v_retry = 0
+        v_lo = GPU_VramRd32(gpu, v_off)
+        v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+        WhileLoop BitwiseAnd(BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)), LessThan(v_retry, 3)) {
+            PrintMessage("[GART] IB PTE mismatch, retry ")
+            PrintNumber(v_retry)
+            PrintMessage(": got lo=0x")
+            PrintHex(v_lo)
+            PrintMessage(" hi=0x")
+            PrintHex(v_hi)
+            PrintMessage("\n")
+            // 64-bit write for PTE (mimic kernel)
+            full_pte = BitwiseOr(v_expect_lo, LeftShift(v_expect_hi, 32))
+            GPU_VramWr64(gpu, v_off, full_pte)
+            InlineAsm["0f ae f8"]
+            v_lo = GPU_VramRd32(gpu, v_off)
+            v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+            v_retry = Add(v_retry, 1)
+        }
+        IfCondition BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)) ThenBlock: {
+            PrintMessage("[GART] *** FAIL: IB PTE verify failed after 3 retries\n")
+            gart_verify_fail = Add(gart_verify_fail, 1)
+        }
+
+        // --- Verify DATA[0] PTE ---
+        data_pg0_phys = GART_GetPhysAddr(data_buf_ptr)
+        v_off = Multiply(GARTConf.DATA_BUF_PTE_IDX, 8)
+        v_expect_lo = BitwiseOr(BitwiseAnd(data_pg0_phys, 4294963200), GARTConf.PTE_FLAGS)
+        v_expect_hi = BitwiseAnd(RightShift(data_pg0_phys, 32), 255)
+        v_retry = 0
+        v_lo = GPU_VramRd32(gpu, v_off)
+        v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+        WhileLoop BitwiseAnd(BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)), LessThan(v_retry, 3)) {
+            PrintMessage("[GART] DATA PTE[0] mismatch, retry ")
+            PrintNumber(v_retry)
+            PrintMessage(": got lo=0x")
+            PrintHex(v_lo)
+            PrintMessage(" hi=0x")
+            PrintHex(v_hi)
+            PrintMessage("\n")
+            // 64-bit write for PTE (mimic kernel)
+            full_pte = BitwiseOr(v_expect_lo, LeftShift(v_expect_hi, 32))
+            GPU_VramWr64(gpu, v_off, full_pte)
+            InlineAsm["0f ae f8"]
+            v_lo = GPU_VramRd32(gpu, v_off)
+            v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+            v_retry = Add(v_retry, 1)
+        }
+        IfCondition BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)) ThenBlock: {
+            PrintMessage("[GART] *** FAIL: DATA PTE[0] verify failed after 3 retries\n")
+            gart_verify_fail = Add(gart_verify_fail, 1)
+        }
+
+        // --- Verify SHADER[0] PTE ---
+        shader_pg0_phys = GART_GetPhysAddr(shader_ptr)
+        v_off = Multiply(shader_pte_idx, 8)
+        v_expect_lo = BitwiseOr(BitwiseAnd(shader_pg0_phys, 4294963200), GARTConf.PTE_FLAGS)
+        v_expect_hi = BitwiseAnd(RightShift(shader_pg0_phys, 32), 255)
+        v_retry = 0
+        v_lo = GPU_VramRd32(gpu, v_off)
+        v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+        WhileLoop BitwiseAnd(BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)), LessThan(v_retry, 3)) {
+            PrintMessage("[GART] SHADER PTE[0] mismatch, retry ")
+            PrintNumber(v_retry)
+            PrintMessage(": got lo=0x")
+            PrintHex(v_lo)
+            PrintMessage(" hi=0x")
+            PrintHex(v_hi)
+            PrintMessage("\n")
+            // 64-bit write for PTE (mimic kernel)
+            full_pte = BitwiseOr(v_expect_lo, LeftShift(v_expect_hi, 32))
+            GPU_VramWr64(gpu, v_off, full_pte)
+            InlineAsm["0f ae f8"]
+            v_lo = GPU_VramRd32(gpu, v_off)
+            v_hi = GPU_VramRd32(gpu, Add(v_off, 4))
+            v_retry = Add(v_retry, 1)
+        }
+        IfCondition BitwiseOr(NotEqual(v_lo, v_expect_lo), NotEqual(v_hi, v_expect_hi)) ThenBlock: {
+            PrintMessage("[GART] *** FAIL: SHADER PTE[0] verify failed after 3 retries\n")
+            gart_verify_fail = Add(gart_verify_fail, 1)
+        }
+
+        // No bulk dummy fill anymore (skipped to mimic kernel "bind used only" and avoid cold WC issues),
+        // so no dummy PTE[0] check here. Unused table slots are left as power-on values.
+
+        PrintMessage("[GART] PTE verification complete: ")
+        PrintNumber(gart_verify_fail)
+        PrintMessage(" failures\n")
+
+        IfCondition GreaterThan(gart_verify_fail, 0) ThenBlock: {
+            PrintMessage("[GART] *** CRITICAL: PTE verification failed (")
+            PrintNumber(gart_verify_fail)
+            PrintMessage(" failures) — aborting GART init\n")
+            PrintMessage("[GART] Cannot proceed with corrupt page tables. Ring/IB/data fetches would read garbage.\n")
+            // Clean up allocations before returning error
+            SystemCall(GPUSys.SYS_MUNMAP, ih_ptr, GARTConf.IH_RING_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, wb_ptr, GARTConf.IH_WB_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, dummy_ptr, GARTConf.DUMMY_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, dma0_ring_ptr, GARTConf.DMA_RING_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, dma1_ring_ptr, GARTConf.DMA_RING_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, dma0_wb_ptr, GARTConf.DMA_WB_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, dma1_wb_ptr, GARTConf.DMA_WB_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, cprb0_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, cprb1_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, cprb2_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, cprb_wb_ptr, GARTConf.CPRB_WB_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, ib_ptr, GARTConf.IB_SIZE, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, data_buf_ptr, data_buf_size, 0, 0, 0)
+            SystemCall(GPUSys.SYS_MUNMAP, shader_ptr, GARTConf.SHADER_SIZE, 0, 0, 0)
+            ReturnValue(Negate(3))
+        }
+
+        // =================================================================
+        // Step 6: Store state
+        // =================================================================
+        GARTState.ih_ring_host_ptr = ih_ptr
+        GARTState.ih_wb_host_ptr = wb_ptr
+        GARTState.dummy_host_ptr = dummy_ptr
+        GARTState.ih_ring_phys = ih_phys
+        GARTState.ih_wb_phys = wb_phys
+        GARTState.dummy_phys = dm_phys
+        GARTState.dma0_ring_host_ptr = dma0_ring_ptr
+        GARTState.dma1_ring_host_ptr = dma1_ring_ptr
+        GARTState.dma0_wb_host_ptr = dma0_wb_ptr
+        GARTState.dma1_wb_host_ptr = dma1_wb_ptr
+        GARTState.dma0_ring_phys = dma0_ring_phys
+        GARTState.dma1_ring_phys = dma1_ring_phys
+        GARTState.dma0_wb_phys = dma0_wb_phys
+        GARTState.dma1_wb_phys = dma1_wb_phys
+        GARTState.cprb0_host_ptr = cprb0_ptr
+        GARTState.cprb1_host_ptr = cprb1_ptr
+        GARTState.cprb2_host_ptr = cprb2_ptr
+        GARTState.cprb_wb_host_ptr = cprb_wb_ptr
+        GARTState.cprb0_phys = GART_GetPhysAddr(cprb0_ptr)
+        GARTState.cprb1_phys = GART_GetPhysAddr(cprb1_ptr)
+        GARTState.cprb2_phys = GART_GetPhysAddr(cprb2_ptr)
+        GARTState.cprb_wb_phys = cprb_wb_phys
+        GARTState.rlc_sr_host_ptr = rlc_sr_ptr
+        GARTState.rlc_cs_host_ptr = rlc_cs_ptr
+        GARTState.ib_host_ptr = ib_ptr
+        GARTState.ib_phys = ib_phys
+        GARTState.ib_gart_va = ib_gart_va
+        GARTState.data_buf_host_ptr = data_buf_ptr
+        GARTState.data_buf_size = data_buf_size
+        GARTState.data_buf_gart_va = data_gart_va
+        GARTState.shader_host_ptr = shader_ptr
+        GARTState.shader_gart_va = shader_gart_va
+        GARTState.initialized = 1
+
+        PrintMessage("[GART] GART initialized: IH=0xF440000000 DMA0=0xF440020000 DMA1=0xF440040000 CPRB0=0xF440070000 DATA=0xF4400F0000\n")
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// GART_Shutdown — unmap system RAM allocations
+// =============================================================================
+Function.GART_Shutdown {
+    Body: {
+        IfCondition EqualTo(GARTState.initialized, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.ih_ring_host_ptr, GARTConf.IH_RING_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.ih_wb_host_ptr, GARTConf.IH_WB_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.dummy_host_ptr, GARTConf.DUMMY_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.dma0_ring_host_ptr, GARTConf.DMA_RING_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.dma1_ring_host_ptr, GARTConf.DMA_RING_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.dma0_wb_host_ptr, GARTConf.DMA_WB_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.dma1_wb_host_ptr, GARTConf.DMA_WB_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.cprb0_host_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.cprb1_host_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.cprb2_host_ptr, GARTConf.CPRB_RING_SIZE, 0, 0, 0)
+        SystemCall(GPUSys.SYS_MUNMAP, GARTState.cprb_wb_host_ptr, GARTConf.CPRB_WB_SIZE, 0, 0, 0)
+        IfCondition NotEqual(GARTState.ib_host_ptr, 0) ThenBlock: {
+            SystemCall(GPUSys.SYS_MUNMAP, GARTState.ib_host_ptr, GARTConf.IB_SIZE, 0, 0, 0)
+        }
+        IfCondition NotEqual(GARTState.data_buf_host_ptr, 0) ThenBlock: {
+            SystemCall(GPUSys.SYS_MUNMAP, GARTState.data_buf_host_ptr, GARTState.data_buf_size, 0, 0, 0)
+        }
+        IfCondition NotEqual(GARTState.shader_host_ptr, 0) ThenBlock: {
+            SystemCall(GPUSys.SYS_MUNMAP, GARTState.shader_host_ptr, GARTConf.SHADER_SIZE, 0, 0, 0)
+        }
+        GARTState.initialized = 0
+    }
+}

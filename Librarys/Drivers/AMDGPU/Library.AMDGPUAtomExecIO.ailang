@@ -1,0 +1,255 @@
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+// Licensed under the Sean Collins Software License (SCSL).
+//
+// Library.AMDGPUAtomExecIO.ailang — ATOM BIOS I/O callbacks + IIO interpreter
+
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomBIOS
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.AMDGPUAtomExec
+
+// =============================================================================
+// AE_RegRead — read register via MMIO or IIO
+// ATOM uses word-indexed registers; GPU_Rd32 takes byte offsets, so multiply by 4
+// =============================================================================
+Function.AE_RegRead {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        ctx = AtomExec_GetCtx(gpu)
+        io_mode = Dereference(Add(ctx, AEField.IO_MODE))
+
+        // Track last register read for stuck-loop diagnostics
+        StoreValue(Add(ctx, AEField.LAST_REG_READ), Multiply(idx, 4))
+
+        IfCondition EqualTo(io_mode, AtomIO.MM) ThenBlock: {
+            rd_val = GPU_Rd32(gpu, Multiply(idx, 4))
+            StoreValue(Add(ctx, AEField.LAST_REG_READ_VAL), rd_val)
+            ReturnValue(rd_val)
+        }
+        ElseBlock: {
+            IfCondition GreaterEqual(io_mode, AtomIO.IIO) ThenBlock: {
+                iio_tbl = Dereference(Add(ctx, AEField.IIO_PTR))
+                IfCondition NotEqual(iio_tbl, 0) ThenBlock: {
+                    port = BitwiseAnd(io_mode, 127)
+                    iio_base = Dereference(Add(iio_tbl, Multiply(port, 8)))
+                    rom = Dereference(Add(ctx, AEField.ROM_PTR))
+                    iio_val = AE_IIO_Execute(gpu, rom, iio_base, idx, 0)
+                    StoreValue(Add(ctx, AEField.LAST_REG_READ_VAL), iio_val)
+                    ReturnValue(iio_val)
+                }
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// AE_RegWrite — write register via MMIO or IIO
+// Special case: index 0 shifts value left by 2 (kernel behavior)
+// =============================================================================
+Function.AE_RegWrite {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        ctx = AtomExec_GetCtx(gpu)
+        io_mode = Dereference(Add(ctx, AEField.IO_MODE))
+
+        IfCondition EqualTo(io_mode, AtomIO.MM) ThenBlock: {
+            PrintMessage("[ATOM-WR] reg=0x")
+            PrintHex(Multiply(idx, 4))
+            PrintMessage(" val=0x")
+            PrintHex(val)
+            PrintMessage("\n")
+            IfCondition EqualTo(idx, 0) ThenBlock: {
+                GPU_Wr32(gpu, 0, ShiftLeft(val, 2))
+            }
+            ElseBlock: {
+                GPU_Wr32(gpu, Multiply(idx, 4), val)
+            }
+        }
+        ElseBlock: {
+            IfCondition GreaterEqual(io_mode, AtomIO.IIO) ThenBlock: {
+                iio_tbl = Dereference(Add(ctx, AEField.IIO_PTR))
+                IfCondition NotEqual(iio_tbl, 0) ThenBlock: {
+                    port = BitwiseAnd(io_mode, 127)
+                    iio_base = Dereference(Add(iio_tbl, Multiply(port, 8)))
+                    rom = Dereference(Add(ctx, AEField.ROM_PTR))
+                    AE_IIO_Execute(gpu, rom, iio_base, idx, val)
+                }
+            }
+        }
+    }
+}
+
+// =============================================================================
+// AE_MCRead / AE_MCWrite — MC indirect via INDEX(0x70=112)/DATA(0x74=116)
+// Read: set bit 23 (0x7F0000), Write: set bit 24 (0xFF0000)
+// =============================================================================
+Function.AE_MCRead {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        GPU_Wr32(gpu, 112, BitwiseOr(8323072, BitwiseAnd(idx, 65535)))
+        val = GPU_Rd32(gpu, 116)
+        GPU_Wr32(gpu, 112, 0)
+        ReturnValue(val)
+    }
+}
+
+Function.AE_MCWrite {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        GPU_Wr32(gpu, 112, BitwiseOr(16711680, BitwiseAnd(idx, 65535)))
+        GPU_Wr32(gpu, 116, val)
+        GPU_Wr32(gpu, 112, 0)
+    }
+}
+
+// =============================================================================
+// AE_PLLRead / AE_PLLWrite — SI uses direct MMIO (PLL INDEX/DATA is pre-R600)
+// =============================================================================
+Function.AE_PLLRead {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(GPU_Rd32(gpu, Multiply(idx, 4)))
+    }
+}
+
+Function.AE_PLLWrite {
+    Input: gpu: Integer
+    Input: idx: Integer
+    Input: val: Integer
+    Body: {
+        GPU_Wr32(gpu, Multiply(idx, 4), val)
+    }
+}
+
+// =============================================================================
+// AE_IIO_Execute — IIO mini-interpreter
+//
+// Executes an IIO program from ROM starting at 'base'.
+// IIO opcodes: 0=NOP, 2=READ, 3=WRITE, 4=CLEAR, 5=SET,
+//              6=MOVE_INDEX, 7=MOVE_ATTR, 8=MOVE_DATA, 9=END
+// =============================================================================
+Function.AE_IIO_Execute {
+    Input: gpu: Integer
+    Input: rom: Address
+    Input: base: Integer
+    Input: index: Integer
+    Input: data: Integer
+    Output: Integer
+    Body: {
+        ctx = AtomExec_GetCtx(gpu)
+        temp = 3452816845
+
+        safety = 0
+        done = 0
+        WhileLoop EqualTo(done, 0) {
+            iio_op = GetByte(rom, base)
+
+            IfCondition EqualTo(iio_op, 0) ThenBlock: {
+                base = Add(base, 1)
+            }
+            ElseBlock: {
+            IfCondition EqualTo(iio_op, 2) ThenBlock: {
+                reg_idx = AtomBIOS_ReadU16(rom, Add(base, 1))
+                temp = GPU_Rd32(gpu, Multiply(reg_idx, 4))
+                base = Add(base, 3)
+            }
+            ElseBlock: {
+            IfCondition EqualTo(iio_op, 3) ThenBlock: {
+                reg_idx = AtomBIOS_ReadU16(rom, Add(base, 1))
+                GPU_Wr32(gpu, Multiply(reg_idx, 4), temp)
+                base = Add(base, 3)
+            }
+            ElseBlock: {
+            IfCondition EqualTo(iio_op, 4) ThenBlock: {
+                width = GetByte(rom, Add(base, 1))
+                shift_amt = GetByte(rom, Add(base, 2))
+                mask = Subtract(ShiftLeft(1, width), 1)
+                temp = BitwiseAnd(temp, BitwiseNot(ShiftLeft(mask, shift_amt)))
+                base = Add(base, 3)
+            }
+            ElseBlock: {
+            IfCondition EqualTo(iio_op, 5) ThenBlock: {
+                width = GetByte(rom, Add(base, 1))
+                shift_amt = GetByte(rom, Add(base, 2))
+                mask = Subtract(ShiftLeft(1, width), 1)
+                temp = BitwiseOr(temp, ShiftLeft(mask, shift_amt))
+                base = Add(base, 3)
+            }
+            ElseBlock: {
+            IfCondition EqualTo(iio_op, 6) ThenBlock: {
+                width = GetByte(rom, Add(base, 1))
+                src_shift = GetByte(rom, Add(base, 2))
+                dst_shift = GetByte(rom, Add(base, 3))
+                mask = Subtract(ShiftLeft(1, width), 1)
+                temp = BitwiseAnd(temp, BitwiseNot(ShiftLeft(mask, dst_shift)))
+                bits = BitwiseAnd(ShiftRight(index, src_shift), mask)
+                temp = BitwiseOr(temp, ShiftLeft(bits, dst_shift))
+                base = Add(base, 4)
+            }
+            ElseBlock: {
+            IfCondition EqualTo(iio_op, 7) ThenBlock: {
+                // MOVE_ATTR (ATOM_IIO_MOVE_ATTR=7): extract bits from io_attr
+                io_attr = Dereference(Add(ctx, AEField.IO_ATTR))
+                width = GetByte(rom, Add(base, 1))
+                src_shift = GetByte(rom, Add(base, 2))
+                dst_shift = GetByte(rom, Add(base, 3))
+                mask = Subtract(ShiftLeft(1, width), 1)
+                temp = BitwiseAnd(temp, BitwiseNot(ShiftLeft(mask, dst_shift)))
+                bits = BitwiseAnd(ShiftRight(io_attr, src_shift), mask)
+                temp = BitwiseOr(temp, ShiftLeft(bits, dst_shift))
+                base = Add(base, 4)
+            }
+            ElseBlock: {
+            IfCondition EqualTo(iio_op, 8) ThenBlock: {
+                // MOVE_DATA (ATOM_IIO_MOVE_DATA=8): extract bits from 'data' parameter
+                width = GetByte(rom, Add(base, 1))
+                src_shift = GetByte(rom, Add(base, 2))
+                dst_shift = GetByte(rom, Add(base, 3))
+                mask = Subtract(ShiftLeft(1, width), 1)
+                temp = BitwiseAnd(temp, BitwiseNot(ShiftLeft(mask, dst_shift)))
+                bits = BitwiseAnd(ShiftRight(data, src_shift), mask)
+                temp = BitwiseOr(temp, ShiftLeft(bits, dst_shift))
+                base = Add(base, 4)
+            }
+            ElseBlock: {
+            IfCondition EqualTo(iio_op, 9) ThenBlock: {
+                done = 1
+            }
+            ElseBlock: {
+                PrintMessage("AtomExec: Unknown IIO opcode ")
+                PrintNumber(iio_op)
+                PrintMessage("\n")
+                done = 1
+            }
+            }
+            }
+            }
+            }
+            }
+            }
+            }
+            }
+
+            safety = Add(safety, 1)
+            IfCondition GreaterThan(safety, 1000) ThenBlock: {
+                PrintMessage("AtomExec: IIO execution limit exceeded\n")
+                done = 1
+            }
+        }
+
+        ReturnValue(temp)
+    }
+}
