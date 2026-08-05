@@ -196,7 +196,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J1.7 | `TranslateSolid` + hole (cx,cy) placement | **done** |
 | J2.2 | Analytic isect + LineCylinder + PlaneCylinder (horiz) | **done** |
 | J2.3–J2.4 | Plate hole: offset + **partial depth** blind pocket | **done** |
-| J2.5 | Multi-hole: Difference(kind3,cyl) append; mesh+STEP | **done** |
+| J2.5 | Multi-hole: Difference(kind3,cyl) append; analytic STEP | **done** |
+| J2.6 | PlaneCylinder general (circle/gens/ellipse) + LineSphere | **done** |
+| J2.7 | `RotateSolidZ` + counterbore STEP look-at | **done** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -229,8 +231,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | prior | Multi-hole append (max 5) — grid mesh was wrong | red |
 | 2026-08-05 | prior | Multi-hole earclip STL broken (missing pocket / face distortion) | red |
 | 2026-08-05 | prior | Multi-hole STL grind abandoned (inferior format) | — |
-| 2026-08-05 | *(this)* | **STEP-first policy**: demos export STEP only; STL not look-at | green |
-| | | *next: richer STEP/bool/isect; sketch deferred; no STL dual grind* | |
+| 2026-08-05 | `b6a59f52` | **STEP-first policy**: demos export STEP only | green |
+| 2026-08-05 | *(this)* | PlaneCyl general + LineSphere; RotateSolidZ; counterbore STEP | green |
+| | | *next: box–box / side-axis cuts / richer bool; sketch deferred* | |
 
 ---
 
