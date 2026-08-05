@@ -188,10 +188,10 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 
 | ID | Task | Status |
 |----|------|--------|
-| J1.5 | Sphere solid + tess + STEP | **active** |
-| J1.7 | `TranslateSolid` (box, cyl placement, plate, sphere) | **active** |
-| J2.2 | Analytic isect subset | pending |
-| J2.3–J2.4 | Restricted plate hole | **done** |
+| J1.5 | Sphere solid + tess + STEP | **done** |
+| J1.7 | `TranslateSolid` + hole (cx,cy) placement | **done** |
+| J2.2 | Analytic isect LinePlane/PlanePlane/LineLine/CircleCircle | **done** |
+| J2.3–J2.4 | Restricted plate hole + offset hole | **done** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -216,8 +216,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | `35c73cb4` | J1.4 analytic cyl STEP | green |
 | 2026-08-05 | `8bc64a77` | J1.2+J1.3 exact cyl B-Rep + surface mesh | green |
 | 2026-08-05 | `3c5e7b1b` | Fusion map; cut tool path | green |
-| 2026-08-05 | *(this)* | Restricted Difference → plate **with hole** STL | green |
-| | | *next: STEP with inner CIRCLE; general isect/bool* | |
+| 2026-08-05 | `c11d2960`/`9dd4e73b` | Plate with hole mesh+STEP | green |
+| 2026-08-05 | *(this)* | Kernel-first locked; sphere + TranslateSolid | green |
+| | | *next: isect + richer bool; sketch still deferred* | |
 
 ---
 
