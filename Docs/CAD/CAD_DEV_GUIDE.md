@@ -196,6 +196,7 @@ export special cases.
 ./ailang.x CAD/demo_blind_hole.ailang -o /tmp/demo_blind && /tmp/demo_blind
 ./ailang.x CAD/demo_multi_hole.ailang -o /tmp/demo_mh && /tmp/demo_mh
 ./ailang.x CAD/demo_counterbore.ailang -o /tmp/demo_cb && /tmp/demo_cb
+./ailang.x CAD/demo_rect_pocket.ailang -o /tmp/demo_rp && /tmp/demo_rp
 # FreeCAD: test-stl/cad_*.stp only
 ```
 
@@ -207,6 +208,11 @@ export special cases.
   pilot wall only below floor — no thin septum wall.
 - `AppendBoxHole` / first cut rebuild shell after param write.
 
+**Rect pocket (box − box)**
+
+- `MakeBoxRectPocketSolid` + `CAD_Feat.CreateRectPocket` / `Difference` kind0−kind0
+  when tool cuts from body top (axis-aligned). Blind or through. Kind 0 shell walk.
+
 **Next (geometry spine for real STEP + features)**
 
 1. [x] Store-backed `CAD_Geom` records (`MakeLine` / `MakePlane*`) + wire into topo
@@ -215,10 +221,11 @@ export special cases.
 3b. [x] Tess segments from chordal deflection `CircleSegCount(r,δ)` — not fixed n
 4. [x] Walk-based poly STEP (`WritePolySolidSTEP`); no kind recipes
 5. [x] Hole shells: through / blind / multi / nested counterbore (Topo)
-6. [ ] Richer Bool/Isect; side-axis tools; general B-Rep cut
-7. [ ] Fillet/chamfer after offset surfaces exist
-8. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
-9. [ ] Viewport/Vulkan **after** tess emits real buffers
+6. [x] Rect pocket box−box; PlaneSphere isect
+7. [ ] Side-axis tools; Union fuse; general B-Rep cut
+8. [ ] Fillet/chamfer after offset surfaces exist
+9. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
+10. [ ] Viewport/Vulkan **after** tess emits real buffers
 
 ---
 

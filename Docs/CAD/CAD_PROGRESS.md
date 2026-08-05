@@ -101,7 +101,7 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 - Exact-cyl B-Rep is CIRCLE/CYL; prism path still n-gon.
 - `CreateHole` = restricted Bool (box−cyl → kind-3 plate; append ≤5 holes), not general B-Rep.
 - Plate shells cover Z-axis holes; side-axis / freeform cuts still TODO.
-- Sphere shell is octahedron (faceted walk); analytic sphere surface later.
+- Sphere solid = two hemispheres + equator CIRCLE on SPHERICAL_SURFACE (walk).
 - Sketch_0 / Feat regen / PG product path not implemented.
 
 ---
@@ -207,7 +207,8 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J2.7 | `RotateSolidZ` (kernel) | **done** |
 | J2.8 | **Kill STEP recipes**; Export = `WritePolySolidSTEP` only | **done** |
 | J2.9 | Multi / blind / nested hole **shells** (Topo, not export) | **done** |
-| J2.10 | Richer Bool/Isect; side-axis tools; general B-Rep cut | **next** |
+| J2.10 | Rect pocket (box−box) + PlaneSphere; side-axis next | **partial** |
+| J2.11 | Side-axis tools; Union fuse; general B-Rep cut | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -244,8 +245,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | prior | PlaneCyl + LineSphere; RotateSolidZ; bad rot45 demo | mixed |
 | 2026-08-05 | prior | Counterbore STEP recipe (temporary) | mixed |
 | 2026-08-05 | `5fbf4901` | **Delete all STEP recipes**; ExportSTEP = B-Rep walk only | green |
-| 2026-08-05 | *(this)* | **J2.9** `BuildPlateHoleShell`: multi/blind/nested counterbore; demos STEP walk | green |
-| | | *next: richer bool/isect; no new STEP recipes* | |
+| 2026-08-05 | `392e786e` | **J2.9** `BuildPlateHoleShell`: multi/blind/nested counterbore | green |
+| 2026-08-05 | *(this)* | Exact sphere B-Rep: SPHERICAL_SURFACE + two hemispheres (walk) | green |
+| | | *next: counterbore look-at fix if still weird; richer bool; no recipes* | |
 
 ---
 
