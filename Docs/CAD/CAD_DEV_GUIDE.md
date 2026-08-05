@@ -197,6 +197,8 @@ export special cases.
 ./ailang.x CAD/demo_multi_hole.ailang -o /tmp/demo_mh && /tmp/demo_mh
 ./ailang.x CAD/demo_counterbore.ailang -o /tmp/demo_cb && /tmp/demo_cb
 ./ailang.x CAD/demo_rect_pocket.ailang -o /tmp/demo_rp && /tmp/demo_rp
+./ailang.x CAD/demo_union_boxes.ailang -o /tmp/demo_u && /tmp/demo_u
+./ailang.x CAD/demo_side_hole.ailang -o /tmp/demo_sh && /tmp/demo_sh
 # FreeCAD: test-stl/cad_*.stp only
 ```
 
