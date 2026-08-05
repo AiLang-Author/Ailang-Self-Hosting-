@@ -232,7 +232,8 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | prior | Multi-hole earclip STL broken (missing pocket / face distortion) | red |
 | 2026-08-05 | prior | Multi-hole STL grind abandoned (inferior format) | — |
 | 2026-08-05 | `b6a59f52` | **STEP-first policy**: demos export STEP only | green |
-| 2026-08-05 | *(this)* | PlaneCyl general + LineSphere; RotateSolidZ; counterbore STEP | green |
+| 2026-08-05 | prior | PlaneCyl + LineSphere; RotateSolidZ; bad rot45 demo | mixed |
+| 2026-08-05 | *(this)* | Counterbore nested STEP (annular floor); drop rot45 look-at | green |
 | | | *next: box–box / side-axis cuts / richer bool; sketch deferred* | |
 
 ---
