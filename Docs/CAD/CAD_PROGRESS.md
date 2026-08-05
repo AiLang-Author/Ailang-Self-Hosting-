@@ -223,7 +223,8 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | prior | LineCyl/PlaneCyl; blind pocket mesh depth; offset hole | green |
 | 2026-08-05 | `ced6d052` | Blind STEP: z_floor cyl + solid bottom + floor disk | green |
 | 2026-08-05 | prior | Multi-hole append (max 5) — grid mesh was wrong | red |
-| 2026-08-05 | *(this)* | Multi-hole: bridge+earclip circular rims; analytic multi STEP | green |
+| 2026-08-05 | prior | Multi-hole earclip STL broken (missing pocket / face distortion) | red |
+| 2026-08-05 | *(this)* | Multi-hole STL: dual annulus + hole-center reject; STEP still analytic | green |
 | | | *next: general plane–cyl isect / richer bool; sketch deferred* | |
 
 ---
