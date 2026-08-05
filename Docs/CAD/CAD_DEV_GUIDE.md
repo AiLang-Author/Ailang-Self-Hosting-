@@ -133,21 +133,29 @@ From design doc §3–§5, abbreviated:
 
 ## 7. Immediate backlog (P0 housekeeping → P1 substrate)
 
-**Done in this pass**
+**Done**
 
 - [x] Design doc in `Docs/CAD/`, bumped to **v3.1** (`.cadx` out, PG SoR)
 - [x] Gemini CAD notes under `Docs/CAD/notes/`
 - [x] All `CAD/*.py` removed
+- [x] **Tranche 1 substrate (2026-08):** real `CAD_Store` slabs (StoreValue/Dereference;
+      not ArrayGet — those assume +8 header and corrupt bulk slabs), free list + gen,
+      `CAD_Num` dense LU/LinSolve + V3Add/Sub/Scale, dotted dual modules removed,
+      `CAD/test_num.ailang` hard gate **18/18 PASS**
 
-**Next (recommended order)**
+**Coding note — raw memory**
 
-1. [ ] Create `fixtures/cad/{dxf,stl,step}/` and `git mv` existing fixtures
-2. [ ] Merge dual `CAD_Num` / `CAD_Store` / `CAD_Sys` to one import path
-3. [ ] Implement real `CAD_Store` slab allocator + field access
-4. [ ] Harden `CAD_Num` + add dense LA; make `test_num` a hard gate
-5. [ ] Flesh `CAD_Geom` analytics with derivative/project tests
-6. [ ] Repo schema migration script (SQL) aligned with §7.3 — can draft early
-7. [ ] Only then Topo / NURBS / Isect tracks in parallel
+- `ArrayGet`/`ArraySet` use offset `index*8+8` (array object header).
+- Kernel slabs and bulk tables must use `StoreValue(addr, v)` / `Dereference(addr)`
+  with `addr = base + word_index*8`.
+
+**Next**
+
+1. [ ] Analytic `CAD_Geom` (eval + d1 + project) on Store-backed records
+2. [ ] Real NURBS curve eval (Cox–de Boor)
+3. [ ] Linked `CAD_Topo` + Euler
+4. [ ] Fixtures dir layout
+5. [ ] Viewport/Vulkan **after** tess emits real buffers
 
 ---
 
