@@ -87,6 +87,9 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `test-stl/cad_counterbore.stp` | nested annular floor (walk) |
 | `test-stl/cad_plate_rect_pocket.stp` | blind rect pocket (box−box) |
 | `test-stl/cad_plate_rect_through.stp` | through rect pocket |
+| `test-stl/cad_union_boxes.stp` | face-adjacent box fuse |
+| `test-stl/cad_side_hole_through.stp` | hole axis +X through |
+| `test-stl/cad_side_hole_blind.stp` | hole axis +X blind |
 
 ### Gates (must stay green)
 
@@ -211,7 +214,8 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J2.9 | Multi / blind / nested hole **shells** (Topo, not export) | **done** |
 | J2.10 | Rect pocket (box−box) + PlaneSphere | **done** |
 | J2.11 | Side-hole +X; AABB box Union fuse | **done** |
-| J2.12 | Side +Y; general B-Rep cut; richer Union | **next** |
+| J2.12 | Side-hole +Y; demo_regen_all fixtures | **done** |
+| J2.13 | General B-Rep cut; richer Union; Sketch deferred | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -251,8 +255,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | `392e786e` | **J2.9** `BuildPlateHoleShell`: multi/blind/nested counterbore | green |
 | 2026-08-05 | `49323305` | Exact sphere B-Rep: SPHERICAL_SURFACE + two hemispheres | green |
 | 2026-08-05 | `af55187e` | Counterbore wall coedge senses (no vanishing cyl) | green |
-| 2026-08-05 | *(this)* | Rect pocket box−box Bool + PlaneSphere; STEP walk demos | green |
-| | | *next: side-axis tools; Union; general B-Rep cut* | |
+| 2026-08-05 | `02721f84` | Rect pocket box−box Bool + PlaneSphere | green |
+| 2026-08-05 | *(this)* | Side-hole +X + box Union fuse (AABB when solid) | green |
+| | | *next: side +Y; general B-Rep; Sketch deferred* | |
 
 ---
 

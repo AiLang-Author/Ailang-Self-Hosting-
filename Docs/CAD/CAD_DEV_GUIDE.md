@@ -199,6 +199,8 @@ export special cases.
 ./ailang.x CAD/demo_rect_pocket.ailang -o /tmp/demo_rp && /tmp/demo_rp
 ./ailang.x CAD/demo_union_boxes.ailang -o /tmp/demo_u && /tmp/demo_u
 ./ailang.x CAD/demo_side_hole.ailang -o /tmp/demo_sh && /tmp/demo_sh
+# after deleting old models — regenerate everything:
+./ailang.x CAD/demo_regen_all.ailang -o /tmp/regen && /tmp/regen
 # FreeCAD: test-stl/cad_*.stp only
 ```
 
@@ -224,10 +226,11 @@ export special cases.
 4. [x] Walk-based poly STEP (`WritePolySolidSTEP`); no kind recipes
 5. [x] Hole shells: through / blind / multi / nested counterbore (Topo)
 6. [x] Rect pocket box−box; PlaneSphere isect
-7. [ ] Side-axis tools; Union fuse; general B-Rep cut
-8. [ ] Fillet/chamfer after offset surfaces exist
-9. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
-10. [ ] Viewport/Vulkan **after** tess emits real buffers
+7. [x] Side-hole +X; AABB box Union fuse (adjacent/overlap/contain)
+8. [ ] Side +Y; general B-Rep cut; non-box Union
+9. [ ] Fillet/chamfer after offset surfaces exist
+10. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
+11. [ ] Viewport/Vulkan **after** tess emits real buffers
 
 ---
 
