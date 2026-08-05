@@ -1,3 +1,5 @@
+> **ARCHIVED 2026-08-05.** Canonical: [`Docs/Browser/JS_ENGINE_MASTER.md`](./Docs/Browser/JS_ENGINE_MASTER.md)
+
 # Browser JS Engine — Usability Plan
 
 **Date:** 2026-07-12 (baseline) · **Updated:** 2026-07-16  

@@ -1,6 +1,6 @@
 # Knockout list — M128e7bb (language residuals)
 
-Tip `6dbf7744` · language residual **2,956** (fail+error+timeout) · G2 gap **1,775**
+Tip `f93ecba2` · language residual **2,956** (fail+error+timeout) · G2 gap **1,775**
 
 ## Priority bands
 

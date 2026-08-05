@@ -1,3 +1,5 @@
+> **ARCHIVED 2026-08-05.** Canonical: [`Docs/Browser/JS_ENGINE_MASTER.md`](./Docs/Browser/JS_ENGINE_MASTER.md)
+
 # Test262 100% Conformance Plan — AILang JS Engine
 
 > **Superseded for day-to-day grind:** use [`BROWSER_CONFORMANCE.md`](./BROWSER_CONFORMANCE.md) (product bars + scoreboard) and [`JS-DEPENDENCY-PLAN.md`](./JS-DEPENDENCY-PLAN.md) (moles).  

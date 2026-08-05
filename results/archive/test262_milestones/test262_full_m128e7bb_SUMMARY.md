@@ -1,10 +1,10 @@
 # Full test262 regression — M128e7bb
 
-**Tip:** `6dbf7744`  
+**Tip:** `f93ecba2`  
 **Harness:** test262_harness_batch.x  
 **JSON:** `results/test262_full_m128e7bb.json`  
 **Wall time:** 2936.2s (~**48.9 min**)  
-**Generated:** 2026-08-01T01:19:04.798843+00:00  
+**Generated:** 2026-08-01T20:27:08.646802+00:00  
 
 ---
 
@@ -141,30 +141,3 @@
 | statements/await-using | 81 | 13 | 94 | 86.2% |
 | expressions/assignment | 471 | 14 | 485 | 97.1% |
 
-## Files
-
-| Artifact | Path |
-|----------|------|
-| Raw JSON | `results/test262_full_m128e7bb.json` |
-| Stats | `results/test262_full_m128e7bb_STATS.json` |
-| Knockout list | `results/test262_full_m128e7bb_KNOCKOUT.md` |
-| Regression watch | `results/test262_full_m128e7bb_REGRESSION.md` |
-| Regression JSON | `results/test262_full_m128e7bb_REGRESSION.json` |
-| Log | `results/test262_full_m128e7bb.log` |
-
-## Notes
-
-- Mode: **batch** harness (`-j 8`, timeout 12s). Some fails re-pass in isolation (batch pollution / harness_eof).
-- Isolation recheck of 40 random language “regressed” paths: **8 PASS / 32 FAIL** → majority are real fails, not only flakes.
-- vs e7x (`a7cefc59`): net language **−928** pass; fixed 800 language, regressed 1784 language.
-- Known session wins that stay green in full suite: `in` private-in, `instanceof` samples, `concatenation` S9.8_A5_T2, optional-chaining short-circuit family.
-- **Do not treat overall 58.65% as “worse engine only”** without triage: class/private bulk + Array method edges dominate residual; batch noise adds margin.
-
-## Command to regenerate
-
-```bash
-python3 tools/test262_runner.py --full --timeout 12 -j 8 \
-  --output-json results/test262_full_m128e7bb.json
-python3 tools/test262_baseline_report.py results/test262_full_m128e7bb.json \
-  --prior results/test262_full_m128e7x.json --label M128e7bb --tip $(git rev-parse --short HEAD)
-```

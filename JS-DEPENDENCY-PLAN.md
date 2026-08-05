@@ -1,3 +1,5 @@
+> **ARCHIVED 2026-08-05.** Canonical: [`Docs/Browser/JS_ENGINE_MASTER.md`](./Docs/Browser/JS_ENGINE_MASTER.md)
+
 # JS Engine — Plan to **90%** (full suite, all features)
 
 > **HISTORICAL (language march archive).**  

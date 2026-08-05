@@ -1,6 +1,6 @@
 # Regression watch — M128e7bb vs prior
 
-**New:** `test262_full_m128e7bb.json` tip `6dbf7744` · **Prior:** `test262_full_m128e7x.json`
+**New:** `test262_full_m128e7bb.json` tip `f93ecba2` · **Prior:** `test262_full_m128e7x.json`
 
 ## Headline delta
 

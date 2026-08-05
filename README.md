@@ -9,7 +9,7 @@ This is the official self-hosting repository for **AILang**, featuring:
 - **Ultra-efficient compiler** (760 KB) — Self-hosted, generates highly optimized native binaries
 - **57 POSIX CoreUtils** — reimplementation of essential Unix utilities with custom regex engine, in development
 - **Complete windowing system** (800 KB) — Full display server with window manager, compositor, and UI framework
-- **In development web browser** (2.3 MB) — Built-in JavaScript JVM with 92.7% ECMAScript compliance, plus ongoing HTML/CSS development
+- **In development web browser** — Pure-Ailang JS VM (~69% full test262, language G2 ~96% primary metric, TypedArray desert ~72%); HTML/CSS stack in progress. See `Docs/Browser/JS_ENGINE_MASTER.md`
 - **GPU computing** — Native GCN driver with compute fixes for legacy cards (GCN 1.0 / HD7750+), in development
 - **Kernel module layer** — Direct OS integration (in development)
 - **Motion control library** — CNC machine programming and trajectory planning
@@ -24,7 +24,7 @@ This is the official self-hosting repository for **AILang**, featuring:
 ### Extreme Efficiency
 - **Compiler:** 760 KB (no bloat, no runtime overhead)
 - **Window System:** 800 KB (full-featured desktop environment)
-- **Browser:** 2.3 MB with JavaScript JVM (92.7% ECMAScript compliance)
+- **Browser:** JS VM + HTML/CSS in development (see Docs/Browser/JS_ENGINE_MASTER.md for live scores)
 - **CoreUtils:** 57 utilities, custom-built from scratch (50-71% smaller than GNU equivalents)
 - **Generated Binaries:** Tiny, non-bloated executables optimized for speed and size
 - **Zero Dependencies:** Self-contained toolchain, no external runtimes or libraries
@@ -531,7 +531,7 @@ The AILang compiler, language server, and all `.ailang` source code remain under
 
 - **Compiler:** 760 KB (self-hosted, 43,000+ lines of AILang code)
 - **Display System:** 800 KB (full-featured windowing system)
-- **Browser:** 2.3 MB with JavaScript JVM (92.7% ECMAScript compliance)
+- **Browser:** JS VM + HTML/CSS in development (see Docs/Browser/JS_ENGINE_MASTER.md for live scores)
 - **CoreUtils:** 57 production utilities (50-71% smaller than GNU)
 - **Generated Code:** Non-bloated, highly optimized binaries
 - **String Methods:** 22 built-in, mostly SSE2-backed
