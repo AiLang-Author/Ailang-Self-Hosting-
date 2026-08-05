@@ -183,6 +183,11 @@ Design v3 already scopes OpenCASCADE-class L0–L6. Terminology we use:
 **Policy: STEP-first.** Do not dual-export STL for FreeCAD look-at. Industry
 interchange is STEP; STL is a faceted dump for printers — not kernel proof.
 
+**Policy: no STEP recipes / kind matchers.** `ExportSTEP` only walks
+`solid.shell` (B-Rep). Hole/counterbore/sphere “pretty” writers are deleted.
+If a solid has no shell, export fails — build topology in Topo/Bool, don’t add
+export special cases.
+
 **Look-at outputs (regenerate anytime)**
 
 ```bash

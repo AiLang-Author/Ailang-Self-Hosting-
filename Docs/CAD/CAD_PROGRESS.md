@@ -198,7 +198,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J2.3–J2.4 | Plate hole: offset + **partial depth** blind pocket | **done** |
 | J2.5 | Multi-hole: Difference(kind3,cyl) append; analytic STEP | **done** |
 | J2.6 | PlaneCylinder general (circle/gens/ellipse) + LineSphere | **done** |
-| J2.7 | `RotateSolidZ` (kernel); counterbore **nested** STEP B-Rep | **done** |
+| J2.7 | `RotateSolidZ` (kernel) | **done** |
+| J2.8 | **Kill STEP recipes**; Export = `WritePolySolidSTEP` only | **done** |
+| J2.9 | Multi / blind / nested hole **shells** (not export matchers) | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -233,8 +235,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | prior | Multi-hole STL grind abandoned (inferior format) | — |
 | 2026-08-05 | `b6a59f52` | **STEP-first policy**: demos export STEP only | green |
 | 2026-08-05 | prior | PlaneCyl + LineSphere; RotateSolidZ; bad rot45 demo | mixed |
-| 2026-08-05 | *(this)* | Counterbore nested STEP (annular floor); drop rot45 look-at | green |
-| | | *next: box–box / side-axis cuts / richer bool; sketch deferred* | |
+| 2026-08-05 | prior | Counterbore STEP recipe (temporary) | mixed |
+| 2026-08-05 | *(this)* | **Delete all STEP recipes**; ExportSTEP = B-Rep walk only | green |
+| | | *next: multi/blind/nested hole shells; richer bool; no new recipes* | |
 
 ---
 
