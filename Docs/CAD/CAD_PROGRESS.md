@@ -80,7 +80,7 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `test-stl/cad_box_10x20x30.stp` | box mm |
 | `test-stl/cad_box_unit.stp` | 1 mm cube |
 | `test-stl/cad_cylinder_r10_h30.stp` | analytic CIRCLE + CYL |
-| `test-stl/cad_sphere_r10.stp` | octahedron shell (walk) |
+| `test-stl/cad_sphere_r10.stp` | analytic SPHERICAL_SURFACE + equator (walk) |
 | `test-stl/cad_plate_hole_offset.stp` | single through hole (walk) |
 | `test-stl/cad_plate_blind_pocket.stp` | blind floor disk (walk) |
 | `test-stl/cad_plate_multi_hole.stp` | through + blind independent (walk) |
