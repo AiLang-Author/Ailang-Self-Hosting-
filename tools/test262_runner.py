@@ -459,14 +459,24 @@ function verifyNotWritable(obj, name, verifyProp, value) {
     try { obj[name] = oldValue; } catch (e2) {}
   }
 }
+// M128e7e1: use hasOwnProperty after delete — reading obj[name] walks the
+// prototype chain (Uint8Array.prototype.constructor inherits from
+// %TypedArray%.prototype.constructor) so `!== undefined` was a false fail.
 function verifyConfigurable(obj, name) {
-  var old = obj[name]; delete obj[name];
-  if (obj[name] !== undefined) { __test262_failed = 1; }
-  obj[name] = old;
+  var desc = Object.getOwnPropertyDescriptor(obj, name);
+  try { delete obj[name]; } catch (e) { __test262_failed = 1; return; }
+  if (Object.prototype.hasOwnProperty.call(obj, name)) { __test262_failed = 1; }
+  if (desc !== undefined) {
+    try { Object.defineProperty(obj, name, desc); } catch (e2) {}
+  }
 }
 function verifyNotConfigurable(obj, name) {
-  var old = obj[name]; delete obj[name];
-  if (obj[name] === undefined && old !== undefined) { __test262_failed = 1; }
+  var desc = Object.getOwnPropertyDescriptor(obj, name);
+  try { delete obj[name]; } catch (e) { /* non-configurable may throw */ }
+  if (!Object.prototype.hasOwnProperty.call(obj, name) && desc !== undefined) {
+    __test262_failed = 1;
+    try { Object.defineProperty(obj, name, desc); } catch (e2) {}
+  }
 }
 function isConstructor(f) { try { new f(); return true; } catch(e) { return false; } }
 function compareArray(a, b) {
