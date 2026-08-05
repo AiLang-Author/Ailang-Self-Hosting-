@@ -107,16 +107,17 @@ Make **exact** geometry the solid truth; mesh and STEP **derive** from it.
 | ID | Task | Status |
 |----|------|--------|
 | J1.1 | Progress/plan doc + commit discipline | **done** |
-| J1.2 | Exact topo: 2 verts + CIRCLE×2 + LINE + 3 faces | pending |
-| J1.3 | Tess: sample CIRCLE / CYL by deflection | pending |
-| J1.4 | STEP: CIRCLE + CYLINDRICAL_SURFACE (+ solid kind=1 r,h) | **done** (export path; topo still n-gon for mesh) |
+| J1.2 | Exact topo: 2V + CIRCLE×2 + LINE + 3 faces | **done** |
+| J1.3 | Tess: `MeshCylinderAnalytic` samples by deflection | **done** |
+| J1.4 | STEP: CIRCLE + CYLINDRICAL_SURFACE | **done** |
 | J1.5 | Sphere solid (analytic) + look-at STL/STEP | pending |
-| J1.6 | Keep n-gon path as fallback / debug | partial (n-gon still builds mesh) |
+| J1.6 | `MakeCylinderPrismSolid` n-gon debug path | **done** |
 
 ### 4.3 Exit criteria Jump 1
 
-- [x] FreeCAD STEP cylinder uses **CIRCLE + CYLINDRICAL_SURFACE** (re-open `cad_cylinder_r10_h30.stp`)  
-- [ ] STL still faceted but generated from surface sampling (not only n-gon walk)  
+- [x] FreeCAD STEP cylinder uses **CIRCLE + CYLINDRICAL_SURFACE**  
+- [x] STL faceted from **surface sampling** (kind=1), not n-gon topo walk  
+- [x] Exact solid Euler **2−3+3=2**, F=3  
 - [x] `test_cylinder` + `demo_primitives` green  
 - [x] Progress doc updated; local commit per task
 
