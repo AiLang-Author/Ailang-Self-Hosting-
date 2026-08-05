@@ -1,7 +1,7 @@
 # CAD Kernel — Development Guide
 
 **Status:** living process doc (pairs with `CAD_Kernel_Design_v3.md` v3.1)  
-**Last updated:** 2026-08-04
+**Last updated:** 2026-08-05
 
 ---
 
@@ -142,6 +142,12 @@ From design doc §3–§5, abbreviated:
       not ArrayGet — those assume +8 header and corrupt bulk slabs), free list + gen,
       `CAD_Num` dense LU/LinSolve + V3Add/Sub/Scale, dotted dual modules removed,
       `CAD/test_num.ailang` hard gate **18/18 PASS**
+- [x] Analytic `CAD_Geom` eval (line/circle/plane/cyl/sphere + project) + trig poly
+- [x] `CAD_BSpline` Cox–de Boor curve/surface eval (arity-packed)
+- [x] Linked `CAD_Topo` half-edge + `MakeBoxSolid` / triangle; Euler checks
+- [x] STL path for box + FreeCAD-visible STEP box-from-AABB (`CAD_IO.ExportSTEP`)
+- [x] **§1.4 product model frozen:** Sketch_0 = part root/origin; later sketches use
+      relative plane recipes; ordered feature tree in Postgres; B-Rep/STEP derived
 
 **Coding note — raw memory**
 
@@ -149,13 +155,53 @@ From design doc §3–§5, abbreviated:
 - Kernel slabs and bulk tables must use `StoreValue(addr, v)` / `Dereference(addr)`
   with `addr = base + word_index*8`.
 
-**Next**
+**Product model (normative — design §1.4)**
 
-1. [ ] Analytic `CAD_Geom` (eval + d1 + project) on Store-backed records
-2. [ ] Real NURBS curve eval (Cox–de Boor)
-3. [ ] Linked `CAD_Topo` + Euler
-4. [ ] Fixtures dir layout
-5. [ ] Viewport/Vulkan **after** tess emits real buffers
+- Sketch_0 is the part origin. Reordering the root breaks models (industry-wide).
+- Construction planes = recipes (offset/angle/distance/on-face) from parents.
+- Sketch data is UV-only; world comes from evaluated plane frames.
+- Postgres owns ordered `feature_tree` / `feat_index` + params; arena regenerates.
+- Prefer feature provenance over “face index after boolean” (TNP).
+
+**Capability target (full CAD kernel — not a mesher)**
+
+Design v3 already scopes OpenCASCADE-class L0–L6. Terminology we use:
+
+| User word | Kernel meaning | Module |
+|-----------|----------------|--------|
+| Hole | Subtractive **boolean cut** (tool solid, usually cylinder) | `CAD_Bool.Difference` + Feat |
+| Pocket / cut | Same family: difference | Bool + Feat |
+| Fuse / join | Union | `CAD_Bool.Union` |
+| Fillet / round | Edge blend (constant/variable radius) | `CAD_Blend` (needs offset/isect) |
+| Chamfer | Edge blend (plane strip) | `CAD_Blend` |
+| Pad / extrude | Sketch profile → solid | Feat + Topo |
+| STEP | Exact B-Rep interchange | `CAD_IO` |
+
+`CreateHole` (not “drill” as the primary name) is the high-level cut API.
+`DrillHole` is an alias only. Do not green-light hole tests until Difference is real.
+
+**Look-at outputs (regenerate anytime)**
+
+```bash
+./ailang.x CAD/demo_primitives.ailang -o /tmp/demo_prim && /tmp/demo_prim
+# FreeCAD:
+#   test-stl/cad_box_10x20x30.stl|.stp
+#   test-stl/cad_box_unit.stl|.stp
+#   test-stl/cad_cylinder_r10_h30.stl|.stp
+```
+
+**Next (geometry spine for real STEP + features)**
+
+1. [x] Store-backed `CAD_Geom` records (`MakeLine` / `MakePlane*`) + wire into topo
+2. [x] `MakeBoxSolid` edges/faces carry real curve/surface handles (not null)
+3. [x] `MakeCylinderSolid` (n-gon + circle/cyl analytic handles) + tess n-gon fan
+3b. [x] Tess segments from chordal deflection `CircleSegCount(r,δ)` — not fixed n
+4. [x] Walk-based poly STEP (`WritePolySolidSTEP`); AABB box only as fallback
+5. [ ] Sphere solid; better cylinder STEP (not AABB box)
+6. [ ] `CAD_Isect` analytic then `CAD_Bool` Difference (holes become real)
+7. [ ] Fillet/chamfer after offset surfaces exist
+8. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
+9. [ ] Viewport/Vulkan **after** tess emits real buffers
 
 ---
 
@@ -163,8 +209,11 @@ From design doc §3–§5, abbreviated:
 
 | Doc | Role |
 |-----|------|
+| `Docs/CAD/CAD_PROGRESS.md` | **Living plan + turn log** (update every grind turn) |
 | `Docs/CAD/CAD_Kernel_Design_v3.md` | Normative architecture & contracts |
 | `Docs/CAD/plane_coordinate_tree_spec.md` | Workplane / plane feature tree |
 | `Docs/CAD/notes/*` | Historical; not binding |
 | `Librarys/Cad/*` | Implementation |
 | `CAD/test_*.ailang` | Phase gates (to be made real) |
+
+**Grind rule:** update `CAD_PROGRESS.md`, run gates, **local commit** each turn (CAD paths only).

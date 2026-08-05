@@ -114,6 +114,80 @@ PDM search — that is free relational value, not runtime topology.
 L0–L6 geometry, but open/save, sessions, and multi-user work go through it.
 There is no `.cadx` fallback.
 
+### 1.4 Part root, Sketch_0, plane recipes, and ordered trees (normative)
+
+This section freezes the **product coordinate and dependency model**. It is why
+PostgreSQL is the system of record, and why FreeCAD-style topological naming
+rot is treated as a data-model problem rather than a mesh problem.
+
+**Sketch_0 is the part root.**
+
+- Every part has exactly one **root sketch** (`Sketch_0`). It defines the part
+  origin and the home construction plane (typically world XY at `(0,0,0)`).
+- Sketch geometry is always **local UV** on its plane. World XYZ is obtained only
+  by evaluating `world = PlaneTransform(plane) × (u, v, 0)`.
+- All subsequent sketches and construction planes are **relative recipes** that
+  ultimately hang off Sketch_0 (or bodies/features grown from it): offset,
+  angle, distance, plane-on-face-of-feature, flip normal, local Δu/Δv, etc.
+- Reordering or orphaning the root sketch **breaks the model** in every major
+  CAD system. That is not a bug to paper over. Root reorder is unsupported
+  (or a deliberate break-and-rebind tool), never a silent renumber.
+
+**Planes are recipes, not free-floating matrices.**
+
+| Object | Role | Authoritative? |
+|--------|------|----------------|
+| Construction plane / plane feature | Origin ref + construction mode + modifiers (see `plane_coordinate_tree_spec.md`) | Yes (feature tree) |
+| Evaluated frame (origin, X, Y, Z) | Cache for eval / sketch embed | No (derived) |
+| B-Rep planar face | Topology after solid ops; may back a construction plane | Derived solid |
+| Sketch | 2D entities in UV of its plane handle | Yes (under its plane) |
+
+When the user draws on a face, the system creates a **plane feature** parented to
+that face (or its supporting surface / generating feature), with a known list of
+offset / angle / distance parameters from the lineage rooted at Sketch_0. If a
+body changes height or a parent face moves, dependent planes re-evaluate, then
+sketches re-embed, then child features regenerate. Absolute vertex soup is never
+the source of truth.
+
+**Ordered tree lives in Postgres.**
+
+- Authoritative layout is an **ordered feature/sketch DAG**: `feat_index`,
+  parent links, plane recipes, parameters, sketch payloads.
+- `cad_revision.feature_tree` (JSONB) and/or normalized `cad_feature` rows with
+  stable order make recovery, history, multi-user checkout, and agent jobs
+  boring SQL problems — not a proprietary document fight.
+- In-memory arena loads a revision, regenerates derived B-Rep/mesh, and exports
+  STEP/STL/DXF. Hot geometry loops never query Postgres per edge.
+
+```
+Postgres:  ordered feature DAG + params + Sketch_0 root + plane recipes
+    ↓ open / commit
+Memory:    eval plane frames → sketch UV → solid B-Rep (derived)
+    ↓ interchange only
+STEP/STL:  snapshot of derived geometry
+```
+
+**Persistent naming (TNP) policy.**
+
+- Do **not** store “face index after last boolean” as the long-term reference.
+- Prefer **provenance**: Sketch_0 → pad/extrude → end/side face of that feature;
+  or construction plane with parent feature id + geometric recipe.
+- `Feat_Pid` (`origin_feat`, `origin_kind`, `source_*`) resolves regen against
+  that lineage. Geometric fallback is last resort and must fail loud when
+  ambiguous.
+- Relative coordinates from Sketch_0 collapse most TNP surface area; they do not
+  remove the need for provenance on generated faces — they make that provenance
+  start from a stable root instead of ephemeral B-Rep renumbering.
+
+**Invariants (product model).**
+
+1. Exactly one root sketch per part; it is feature index 0 in the ordered tree.
+2. No feature is parentless except Sketch_0 (and optional world datums under the part).
+3. Sketch plane = evaluated frame from parent recipe; sketch data is UV only.
+4. Tree order + parent links in Postgres are authoritative; memory mirrors them.
+5. B-Rep, tessellation, and STEP/STL are caches with content hash + kernel version.
+6. Changing a dimension is param edit + regenerate the DAG, not edit absolute coords.
+
 ---
 
 ## 2. Design Principles
@@ -2548,7 +2622,8 @@ notified.
 
 | Date | Library | Change | Reason | Notified |
 |---|---|---|---|---|
-| — | — | *(none yet — contracts not frozen)* | — | — |
+| 2026-08-05 | Product model | §1.4 Sketch_0 root, plane recipes, PG ordered tree, TNP policy | Freeze coordinate/dependency model before Feat/Sketch grind | Feat, Sketch, Repo, Geom, Topo, IO |
+| — | — | *(contracts not fully frozen)* | — | — |
 
 ---
 
