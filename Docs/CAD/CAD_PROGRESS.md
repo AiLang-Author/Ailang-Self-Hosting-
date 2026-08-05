@@ -175,11 +175,11 @@ Sketch_0  (part root / origin plane)
 | ID | Task | Status |
 |----|------|--------|
 | J2.0 | Document Fusion feature map (this §) | **done** |
-| J2.1 | `MakeCutToolCylinder` / `CreateHole` tool path + look-at plate+tool | **done** |
+| J2.1 | `MakeCutToolCylinder` / `CreateHole` tool path | **done** |
 | J2.2 | Analytic isect subset (plane–plane, line–plane, …) | pending |
-| J2.3 | `Bool.Difference` on restricted domain (box − cyl) | pending |
-| J2.4 | Look-at: `cad_box_with_hole.stl` / `.stp` | pending |
-| J2.5 | Feat: Pad/Pocket/Hole as thin wrappers (no fake green) | pending |
+| J2.3 | `Bool.Difference` restricted: box − cyl → kind3 through-hole | **done** |
+| J2.4 | Look-at: `cad_plate_with_hole.stl` (hole visible); STEP outer-only TODO | **partial** |
+| J2.5 | Feat wrappers honest | **done** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
 
@@ -203,8 +203,9 @@ Sketch_0  (part root / origin plane)
 | 2026-08-05 | `7282e993` | Jump 0: n-gon cyl, poly STEP, fixtures | green |
 | 2026-08-05 | `35c73cb4` | J1.4 analytic cyl STEP | green |
 | 2026-08-05 | `8bc64a77` | J1.2+J1.3 exact cyl B-Rep + surface mesh | green |
-| 2026-08-05 | *(this)* | Fusion feature map locked; hole = cut tool path | — |
-| | | *next: J2.1 cut tool + J2.2/J2.3 isect/bool* | |
+| 2026-08-05 | `3c5e7b1b` | Fusion map; cut tool path | green |
+| 2026-08-05 | *(this)* | Restricted Difference → plate **with hole** STL | green |
+| | | *next: STEP with inner CIRCLE; general isect/bool* | |
 
 ---
 
