@@ -192,6 +192,7 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J1.7 | `TranslateSolid` + hole (cx,cy) placement | **done** |
 | J2.2 | Analytic isect + LineCylinder + PlaneCylinder (horiz) | **done** |
 | J2.3–J2.4 | Plate hole: offset + **partial depth** blind pocket | **done** |
+| J2.5 | Multi-hole: Difference(kind3,cyl) append; mesh+STEP | **done** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -220,8 +221,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | `d0cc8981`/`942bf429` | Analytic 8-octant sphere STEP | green |
 | 2026-08-05 | `e97d29b0` | Placement + base Isect | green |
 | 2026-08-05 | prior | LineCyl/PlaneCyl; blind pocket mesh depth; offset hole | green |
-| 2026-08-05 | *(this)* | Blind STEP: z_floor cyl + solid bottom + floor disk (STL already OK) | green |
-| | | *next: more isect (plane–cyl general) / multi-hole; sketch deferred* | |
+| 2026-08-05 | `ced6d052` | Blind STEP: z_floor cyl + solid bottom + floor disk | green |
+| 2026-08-05 | *(this)* | Multi-hole append (max 5); grid mesh; faceted multi STEP | green |
+| | | *next: general plane–cyl isect / richer bool; sketch deferred* | |
 
 ---
 
