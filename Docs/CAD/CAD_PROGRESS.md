@@ -127,29 +127,88 @@ Make **exact** geometry the solid truth; mesh and STEP **derive** from it.
 
 ---
 
-## 5. Backlog (ordered after Jump 1)
+## 5. Mission target — Fusion-shaped features (normative intent)
 
-1. Jump 2: analytic isect subset → `Bool.Difference` → box-with-hole fixture  
-2. Jump 3: plane feature + Sketch_0 + CreatePad → memory feature list  
-3. Repo: `feature_tree` JSONB commit/open  
-4. Jump 4: blend, STEP import, viewport  
+Kernel geometry is not the product UI; **features** are how users build parts.
+Target mental model matches Fusion 360 / mainstream parametric CAD:
+
+### 5.1 How solids grow
+
+| Feature | User action | Kernel meaning |
+|---------|-------------|----------------|
+| **Pad / Extrude (join)** | Sketch closed profile on a plane → extrude | Profile → solid; **Union** with body (or new body) |
+| **Pocket / Extrude (cut)** | Sketch on face/plane → extrude **into** solid | Profile → tool solid; **Difference**(body, tool) |
+| **Revolve (join/cut)** | Sketch profile + axis → revolve | Sweep profile about axis; union or difference |
+| **Hole / Drill** | Place **circle on a face** → depth/through | Convenience cut: circle → tool **cylinder** → **Difference** |
+
+All of these are the **same two engines**:
+1. **Profile → solid** (extrude or revolve of sketch geometry)  
+2. **Boolean** (union / difference / intersect)
+
+“Drill” is not a third geometry kernel — it is **circle on plane + extrude cut** with hole UI defaults (through, countersink later).
+
+### 5.2 Coordinate story (already frozen §1.4 design)
+
+```
+Sketch_0  (part root / origin plane)
+   └── Pad  → body
+         └── plane-on-face / offset plane
+               └── Sketch_N  (circle for hole)
+                     └── Pocket/Hole  → Difference(body, tool_cyl)
+```
+
+- Sketches live in **plane UV**  
+- Planes are **recipes** from Sketch_0 / faces  
+- B-Rep / STEP / STL are **derived** after regen  
+
+### 5.3 Jump map vs Fusion paths
+
+| Jump | Delivers |
+|-----:|----------|
+| **1** (cyl exact) | Tool bodies for holes exist as real cylinders ✓ |
+| **2** | `Isect` + `Bool.Difference` → **visible hole** in box |
+| **3** | Sketch_0 + plane + **Pad** + **Pocket/Hole** feature records + regen |
+| **4** | Fillet on edges, import, viewport |
+
+### 5.4 Jump 2 plan (next engine work)
+
+| ID | Task | Status |
+|----|------|--------|
+| J2.0 | Document Fusion feature map (this §) | **done** |
+| J2.1 | `MakeCutToolCylinder` / `CreateHole` tool path + look-at plate+tool | **done** |
+| J2.2 | Analytic isect subset (plane–plane, line–plane, …) | pending |
+| J2.3 | `Bool.Difference` on restricted domain (box − cyl) | pending |
+| J2.4 | Look-at: `cad_box_with_hole.stl` / `.stp` | pending |
+| J2.5 | Feat: Pad/Pocket/Hole as thin wrappers (no fake green) | pending |
+
+**Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
 
 ---
 
-## 6. Turn log
+## 6. Backlog (after Jump 2)
+
+1. Jump 3: Sketch_0 + plane handle + CreatePad (rect → box) + ordered feature list  
+2. Repo: `feature_tree` JSONB commit/open  
+3. Jump 4: blend, STEP import, viewport  
+4. Optional J1.5: sphere solid (same pattern as cylinder)  
+
+---
+
+## 7. Turn log
 
 | Date | Commit / turn | What | Gates |
 |------|---------------|------|-------|
 | 2026-08-05 | prior commits | Store, Num, Topo box, tess STL | green |
-| 2026-08-05 | *(this session)* | Geom records, n-gon cyl, poly STEP, ID fix, Sketch_0 §1.4 | green |
 | 2026-08-05 | `15d7f053` | `CAD_PROGRESS.md` + Sketch_0 §1.4 | — |
 | 2026-08-05 | `7282e993` | Jump 0: n-gon cyl, poly STEP, fixtures | green |
-| 2026-08-05 | *(this)* | J1.4 analytic cyl STEP (`WriteCylinderAnalyticSTEP`, solid kind=1) | green |
-| | | *next: J1.2/J1.3 exact topo + surface tess; or hole jump* | |
+| 2026-08-05 | `35c73cb4` | J1.4 analytic cyl STEP | green |
+| 2026-08-05 | `8bc64a77` | J1.2+J1.3 exact cyl B-Rep + surface mesh | green |
+| 2026-08-05 | *(this)* | Fusion feature map locked; hole = cut tool path | — |
+| | | *next: J2.1 cut tool + J2.2/J2.3 isect/bool* | |
 
 ---
 
-## 7. Process (every turn)
+## 8. Process (every turn)
 
 1. Update **§6 Turn log** + task status in §4.2  
 2. Implement smallest vertical slice with **look-at or gate**  
