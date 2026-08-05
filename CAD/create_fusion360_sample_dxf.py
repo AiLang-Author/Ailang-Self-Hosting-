@@ -1,0 +1,109 @@
+#!/usr/bin/env python3
+import os
+
+dxf_content = """0
+SECTION
+2
+HEADER
+9
+$ACADVER
+1
+AC1015
+0
+ENDSEC
+0
+SECTION
+2
+ENTITIES
+0
+LINE
+8
+0
+10
+0.0
+20
+0.0
+30
+0.0
+11
+120.0
+21
+0.0
+31
+0.0
+0
+LINE
+8
+0
+10
+120.0
+20
+0.0
+30
+0.0
+11
+120.0
+21
+60.0
+31
+0.0
+0
+LINE
+8
+0
+10
+120.0
+20
+60.0
+30
+0.0
+11
+0.0
+21
+60.0
+31
+0.0
+0
+LINE
+8
+0
+10
+0.0
+20
+60.0
+30
+0.0
+11
+0.0
+21
+0.0
+31
+0.0
+0
+CIRCLE
+8
+0
+10
+60.0
+20
+30.0
+30
+0.0
+40
+15.0
+0
+ENDSEC
+0
+EOF
+"""
+
+out_paths = [
+    '/mnt/c/Users/Sean/Documents/AILangSH/test-stl/sample_fusion_sketch.dxf',
+    '/mnt/c/Users/Sean/Documents/AILangSH/sample_fusion_sketch.dxf',
+    '/home/sean/sample_fusion_sketch.dxf'
+]
+
+for p in out_paths:
+    with open(p, 'w') as f:
+        f.write(dxf_content)
+    print(f"Created Fusion 360 sample DXF: {p}")
