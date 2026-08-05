@@ -106,19 +106,21 @@ Make **exact** geometry the solid truth; mesh and STEP **derive** from it.
 
 | ID | Task | Status |
 |----|------|--------|
-| J1.1 | Progress/plan doc + commit discipline | **done** (this file) |
-| J1.2 | `MakeCylinderSolid` exact: 2 verts (seam), CIRCLE×2 + LINE generator, 3 faces (bot/top plane, side cyl) | pending |
-| J1.3 | Tess: sample CIRCLE edges / CYLINDER faces by deflection | pending |
-| J1.4 | STEP: emit CIRCLE + CYLINDRICAL_SURFACE + planar caps (not n-gon only) | pending |
+| ID | Task | Status |
+|----|------|--------|
+| J1.1 | Progress/plan doc + commit discipline | **done** |
+| J1.2 | Exact topo: 2 verts + CIRCLE×2 + LINE + 3 faces | pending |
+| J1.3 | Tess: sample CIRCLE / CYL by deflection | pending |
+| J1.4 | STEP: CIRCLE + CYLINDRICAL_SURFACE (+ solid kind=1 r,h) | **done** (export path; topo still n-gon for mesh) |
 | J1.5 | Sphere solid (analytic) + look-at STL/STEP | pending |
-| J1.6 | Keep n-gon path as `MakeCylinderSolidN` fallback / debug | pending |
+| J1.6 | Keep n-gon path as fallback / debug | partial (n-gon still builds mesh) |
 
 ### 4.3 Exit criteria Jump 1
 
-- [ ] FreeCAD STEP of cylinder shows **one cylindrical side** (or continuous circle caps) — not 90 planar strips as the only representation  
-- [ ] STL still faceted but generated from surface sampling  
-- [ ] `test_cylinder` + `demo_primitives` green  
-- [ ] Progress doc updated; local commit per task  
+- [x] FreeCAD STEP cylinder uses **CIRCLE + CYLINDRICAL_SURFACE** (re-open `cad_cylinder_r10_h30.stp`)  
+- [ ] STL still faceted but generated from surface sampling (not only n-gon walk)  
+- [x] `test_cylinder` + `demo_primitives` green  
+- [x] Progress doc updated; local commit per task
 
 ### 4.4 Non-goals Jump 1
 
