@@ -12,7 +12,7 @@
 
 Pure-AILang CAD/CAM **kernel** (not FreeCAD glue):
 
-- Exact B-Rep in memory → **STEP** (interchange) + **STL** (mesh)
+- Exact B-Rep in memory → **STEP** (primary interchange). STL optional/not look-at.
 - Parametric product model: **Sketch_0 root**, plane recipes, ordered tree in **Postgres**
 - Capability target: box/cyl/sphere → **holes (boolean cut)** → pad/pocket → fillet → import
 
@@ -24,9 +24,9 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 
 | Jump | Name | Exit criteria (look-at / gate) |
 |-----:|------|--------------------------------|
-| **0** | Bones | Box + faceted cyl open in FreeCAD (STL/STEP); measures work |
-| **1** | Analytic B-Rep | Cylinder = CIRCLE edges + CYL surface; STEP continuous; tess samples surfaces |
-| **2** | Isect + Bool | `CreateHole` cuts a real hole; box-with-hole STL/STEP |
+| **0** | Bones | Box + faceted cyl open in FreeCAD (**STEP**); measures work |
+| **1** | Analytic B-Rep | Cylinder = CIRCLE edges + CYL surface; STEP continuous |
+| **2** | Isect + Bool | `CreateHole` cuts a real hole; box-with-hole **STEP** |
 | **3** | Features + Sketch_0 | Pad from sketch; height edit regenerates; tree order in memory then PG |
 | **4** | Blend + import + UI | Fillet/chamfer; STEP import subset; viewport later |
 
@@ -60,22 +60,26 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `CAD_Geom` eval + MakeLine/Plane/Circle/CylSurf | `test_geom` |
 | `CAD_Topo` half-edge, MakeBoxSolid (line+plane) | `test_topo` |
 | `MakeCylinderSolid` n-gon prism + analytic handles (decorative) | `test_cylinder` |
-| Tess n-gon fan, 3-decimal STL, CircleSegCount(r,δ) + visual floor | STL look-at |
 | Walk STEP polyhedra; high entity IDs (no #100 collision) | FreeCAD opens box + cyl STEP |
+| **Policy: STEP = look-at truth** (STL not dual-export / not ground) | demos STEP-only |
 | Design §1.4 Sketch_0 / plane recipes / PG order | design doc |
 | Hole terminology = boolean cut (`CreateHole`) | Script + DEV_GUIDE |
 
-### Look-at fixtures (regenerate)
+### Look-at fixtures (STEP only — regenerate)
 
 ```bash
 ./ailang.x CAD/demo_primitives.ailang -o /tmp/demo_prim && /tmp/demo_prim
+./ailang.x CAD/demo_hole_intent.ailang -o /tmp/demo_hole && /tmp/demo_hole
+./ailang.x CAD/demo_multi_hole.ailang -o /tmp/demo_mh && /tmp/demo_mh
 ```
 
 | File | Notes |
 |------|--------|
-| `test-stl/cad_box_10x20x30.stl/.stp` | box mm |
-| `test-stl/cad_box_unit.stl/.stp` | 1 mm cube |
-| `test-stl/cad_cylinder_r10_h30.stl/.stp` | **faceted** cylinder (n-gon truth) |
+| `test-stl/cad_box_10x20x30.stp` | box mm |
+| `test-stl/cad_box_unit.stp` | 1 mm cube |
+| `test-stl/cad_cylinder_r10_h30.stp` | analytic CIRCLE + CYL |
+| `test-stl/cad_sphere_r10.stp` | analytic 8-octant sphere |
+| `test-stl/cad_plate_*.stp` | hole / blind / multi-hole |
 
 ### Gates (must stay green)
 
@@ -100,7 +104,7 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 
 ### 4.1 Intent
 
-Make **exact** geometry the solid truth; mesh and STEP **derive** from it.
+Make **exact** geometry the solid truth; **STEP derives** from it (mesh optional).
 
 ### 4.2 Tasks
 
@@ -159,7 +163,7 @@ Sketch_0  (part root / origin plane)
 
 - Sketches live in **plane UV**  
 - Planes are **recipes** from Sketch_0 / faces  
-- B-Rep / STEP / STL are **derived** after regen  
+- B-Rep / **STEP** are **derived** after regen (STL not required)  
 
 ### 5.3 Priority order (locked 2026-08-05)
 
@@ -224,8 +228,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | `ced6d052` | Blind STEP: z_floor cyl + solid bottom + floor disk | green |
 | 2026-08-05 | prior | Multi-hole append (max 5) — grid mesh was wrong | red |
 | 2026-08-05 | prior | Multi-hole earclip STL broken (missing pocket / face distortion) | red |
-| 2026-08-05 | *(this)* | Multi-hole STL: dual annulus + hole-center reject; STEP still analytic | green |
-| | | *next: general plane–cyl isect / richer bool; sketch deferred* | |
+| 2026-08-05 | prior | Multi-hole STL grind abandoned (inferior format) | — |
+| 2026-08-05 | *(this)* | **STEP-first policy**: demos export STEP only; STL not look-at | green |
+| | | *next: richer STEP/bool/isect; sketch deferred; no STL dual grind* | |
 
 ---
 

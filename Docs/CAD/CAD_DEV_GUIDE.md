@@ -21,7 +21,7 @@ AILang or it is lying.
 | Critical hole | `CAD_Store.Alloc` does not store entity payloads — handles without memory |
 | Dual files | `CAD_Num`/`CAD.Num`, `CAD_Store`/`CAD.Store`, `CAD_Sys`/`CAD.Sys` — pick one |
 | Persistence | **v3.1:** Postgres = system of record; `.cadx` abandoned |
-| Interchange | STEP / STL / DXF only |
+| Interchange | **STEP** primary (B-Rep); DXF sketches; STL optional not look-at |
 | Competitive target | OpenCASCADE-class **kernel** (L0–L6), not FreeCAD UI glue |
 
 **Rule:** if a demo “works” without a solid gate test that can fail on wrong
@@ -46,7 +46,7 @@ numbers, it is not done. Smoke paths that always print VERIFIED are not gates.
                             │ import / export only
                             ▼
 ┌─────────────────────────────────────────────────────────┐
-│  Neutral files: STEP, STL, DXF                          │
+│  Neutral files: STEP (primary), DXF; STL optional       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -175,19 +175,21 @@ Design v3 already scopes OpenCASCADE-class L0–L6. Terminology we use:
 | Fillet / round | Edge blend (constant/variable radius) | `CAD_Blend` (needs offset/isect) |
 | Chamfer | Edge blend (plane strip) | `CAD_Blend` |
 | Pad / extrude | Sketch profile → solid | Feat + Topo |
-| STEP | Exact B-Rep interchange | `CAD_IO` |
+| STEP | Exact B-Rep interchange (**look-at truth**) | `CAD_IO` |
 
 `CreateHole` (not “drill” as the primary name) is the high-level cut API.
 `DrillHole` is an alias only. Do not green-light hole tests until Difference is real.
+
+**Policy: STEP-first.** Do not dual-export STL for FreeCAD look-at. Industry
+interchange is STEP; STL is a faceted dump for printers — not kernel proof.
 
 **Look-at outputs (regenerate anytime)**
 
 ```bash
 ./ailang.x CAD/demo_primitives.ailang -o /tmp/demo_prim && /tmp/demo_prim
-# FreeCAD:
-#   test-stl/cad_box_10x20x30.stl|.stp
-#   test-stl/cad_box_unit.stl|.stp
-#   test-stl/cad_cylinder_r10_h30.stl|.stp
+./ailang.x CAD/demo_hole_intent.ailang -o /tmp/demo_hole && /tmp/demo_hole
+./ailang.x CAD/demo_multi_hole.ailang -o /tmp/demo_mh && /tmp/demo_mh
+# FreeCAD: test-stl/cad_*.stp only
 ```
 
 **Next (geometry spine for real STEP + features)**
