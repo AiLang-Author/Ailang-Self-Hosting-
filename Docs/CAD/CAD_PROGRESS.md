@@ -198,7 +198,7 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J2.3–J2.4 | Plate hole: offset + **partial depth** blind pocket | **done** |
 | J2.5 | Multi-hole: Difference(kind3,cyl) append; analytic STEP | **done** |
 | J2.6 | PlaneCylinder general (circle/gens/ellipse) + LineSphere | **done** |
-| J2.7 | `RotateSolidZ` + counterbore STEP look-at | **done** |
+| J2.7 | `RotateSolidZ` (kernel); counterbore **nested** STEP B-Rep | **done** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
