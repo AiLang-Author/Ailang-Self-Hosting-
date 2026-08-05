@@ -106,8 +106,6 @@ Make **exact** geometry the solid truth; mesh and STEP **derive** from it.
 
 | ID | Task | Status |
 |----|------|--------|
-| ID | Task | Status |
-|----|------|--------|
 | J1.1 | Progress/plan doc + commit discipline | **done** |
 | J1.2 | Exact topo: 2 verts + CIRCLE×2 + LINE + 3 faces | pending |
 | J1.3 | Tess: sample CIRCLE / CYL by deflection | pending |
@@ -143,8 +141,10 @@ Make **exact** geometry the solid truth; mesh and STEP **derive** from it.
 |------|---------------|------|-------|
 | 2026-08-05 | prior commits | Store, Num, Topo box, tess STL | green |
 | 2026-08-05 | *(this session)* | Geom records, n-gon cyl, poly STEP, ID fix, Sketch_0 §1.4 | green |
-| 2026-08-05 | plan doc | `CAD_PROGRESS.md` + grind process | — |
-| | | *next: J1.2 analytic cylinder solid* | |
+| 2026-08-05 | `15d7f053` | `CAD_PROGRESS.md` + Sketch_0 §1.4 | — |
+| 2026-08-05 | `7282e993` | Jump 0: n-gon cyl, poly STEP, fixtures | green |
+| 2026-08-05 | *(this)* | J1.4 analytic cyl STEP (`WriteCylinderAnalyticSTEP`, solid kind=1) | green |
+| | | *next: J1.2/J1.3 exact topo + surface tess; or hole jump* | |
 
 ---
 
