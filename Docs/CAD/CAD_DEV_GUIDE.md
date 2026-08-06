@@ -234,9 +234,9 @@ export special cases.
 8. [x] Side-hole +Y; demo_regen_all for fresh fixtures
 9. [x] Box Intersection; ClassifyPoint (AABB/cyl/sphere); rect notch +X
 10. [x] Pad boss stepped shell; kind-3 ClassifyPoint subtracts Z-holes
-11. [x] **General `FilletEdge` plane–plane** (`FilletPlanePlaneEdge` + edge queries)
-12. [ ] Multi-edge / rim loops; plane–cyl / cone; vertex sphere
-13. [ ] Chamfer strip on same spine
+11. [x] **General `FilletEdge` plane–plane** (vertical + horizontal + multi-edge)
+12. [ ] Top-rim (4 edges) + vertex spheres; chamfer strip
+13. [ ] Plane–cyl / plane–cone edge blend
 14. [ ] General B-Rep cut / shell hollow
 15. [ ] Sketch_0 / extrude / revolve (**after** blend spine)
 16. [ ] Viewport/Vulkan **after** tess emits real buffers

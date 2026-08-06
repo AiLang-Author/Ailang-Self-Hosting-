@@ -226,9 +226,10 @@ until rounds and richer solids are real.
 | J2.13 | Intersection boxes; ClassifyPoint; side rect notch | **done** |
 | J2.14 | Pad boss shell; kind-3 hole ClassifyPoint | **done** |
 | J2.15 | Shape-specific box fillets | **deleted** |
-| J2.16 | **General `FilletEdge` plane–plane** (edge-based) | **done** (v1) |
-| J2.17 | Robust multi-edge / end-face arcs; plane–cyl | **next** |
-| J2.18 | Chamfer strip on same spine | **next** |
+| J2.16 | **General `FilletEdge` plane–plane** (edge-based) | **done** |
+| J2.17 | Multi-edge verticals + horizontal top edge | **done** |
+| J2.18 | Top-rim loop (4 horiz + vertex spheres); chamfer | **next** |
+| J2.19 | Plane–cyl edge blend | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred until blend spine** |
 
 ### 5.6 Fillet / chamfer architecture (locked — no shape recipes)
