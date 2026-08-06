@@ -233,10 +233,16 @@ export special cases.
 7. [x] Side-hole +X; AABB box Union fuse (adjacent/overlap/contain)
 8. [x] Side-hole +Y; demo_regen_all for fresh fixtures
 9. [x] Box Intersection; ClassifyPoint (AABB/cyl/sphere); rect notch +X
-10. [ ] General B-Rep cut; non-box Union
-11. [ ] Fillet/chamfer after offset surfaces exist
-12. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
-13. [ ] Viewport/Vulkan **after** tess emits real buffers
+10. [x] Pad boss stepped shell; kind-3 ClassifyPoint subtracts Z-holes
+11. [x] Constant-R **vertical** box fillets (`MakeBoxVerticalFilletsSolid` / `FilletBoxVertical`)
+12. [ ] Chamfer; single-edge / horizontal fillets; plane offset gates
+13. [ ] General B-Rep cut / shell hollow
+14. [ ] Sketch_0 / extrude / revolve (**after** blend spine)
+14. [ ] Viewport/Vulkan **after** tess emits real buffers
+
+**Priority (2026-08):** solid modelling geometry (fillet, chamfer, offset, richer
+bool) before sketch-driven features. No silent fake fillets (Blend stubs must
+return failure or real geometry).
 
 ---
 

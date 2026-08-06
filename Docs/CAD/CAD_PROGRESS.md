@@ -94,6 +94,7 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `test-stl/cad_side_hole_y_blind.stp` | hole axis +Y blind |
 | `test-stl/cad_intersect_boxes.stp` | AABB box ∩ box |
 | `test-stl/cad_rect_notch_x.stp` | rectangular notch on −X face |
+| `test-stl/cad_pad_boss.stp` | plate + rectangular boss (step) |
 
 ### Gates (must stay green)
 
@@ -180,19 +181,21 @@ Sketch_0  (part root / origin plane)
 - Planes are **recipes** from Sketch_0 / faces  
 - B-Rep / **STEP** are **derived** after regen (STL not required)  
 
-### 5.3 Priority order (locked 2026-08-05)
+### 5.3 Priority order (locked 2026-08-05, reaffirmed for blend)
 
-**Kernel geometry engine first. Sketch-driven solids wait.**
+**Core solid-modelling B-Rep first. Sketch-driven authoring waits.**
 
-Sketch → pad/revolve is the Fusion *control panel*; cart-before-horse if the solid
-engine is incomplete. Ailang function layers make features easy to hang on later.
+Fillet/chamfer/shell need offset + isect + topology edits — that is the next
+kernel spine. Sketch → extrude/revolve is the Fusion *control panel*; cart-before-horse
+until rounds and richer solids are real.
 
 | Order | Work | Why |
 |------:|------|-----|
-| 1 | Analytic solids (box, cyl, **sphere**) | Exact B-Rep truth |
-| 2 | **Transforms** (translate, later rotate) | Place tools / holes not only at origin |
-| 3 | **Bool** expand + **Isect** | Real cuts beyond plate−cyl special case |
-| 4 | Then Sketch_0 + pad/pocket/revolve | Authoring on top of working solids |
+| 1 | Analytic solids (box, cyl, sphere) | Exact B-Rep truth ✓ |
+| 2 | Transforms + restricted Bool/Isect | Holes, pockets, pad boss ✓ |
+| 3 | **Offset surfaces** | Thin-wall / blend substrate |
+| 4 | **Fillet / chamfer** (constant-R edge first) | Standard solid modelling |
+| 5 | Then Sketch_0 + pad/pocket/revolve | Authoring on working solids |
 
 ### 5.4 Jump map
 
@@ -221,7 +224,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J2.12 | Side-hole +Y; demo_regen_all fixtures | **done** |
 | J2.13 | Intersection boxes; ClassifyPoint; side rect notch | **done** |
 | J2.14 | Pad boss shell; kind-3 hole ClassifyPoint | **done** |
-| J2.15 | General B-Rep cut; Sketch_0 / extrude profile | **next** |
+| J2.15 | **Core B-Rep:** constant-R vertical fillets on box | **done** (first slice) |
+| J2.16 | Chamfer; single-edge fillet; plane offset gates | **next** |
+| J3.* | Sketch_0 / extrude / revolve | **deferred until blend spine** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -264,8 +269,9 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | `02721f84` | Rect pocket box−box Bool + PlaneSphere | green |
 | 2026-08-05 | `c2fb33df` | Side-hole +X + box Union fuse | green |
 | 2026-08-05 | `9d778a11` | Side-hole +Y; `demo_regen_all` | green |
-| 2026-08-05 | *(this)* | Box Intersection; ClassifyPoint; rect notch +X | green |
-| | | *next: general B-Rep cut* | |
+| 2026-08-05 | `00f5af08` | Box Intersection; ClassifyPoint; rect notch +X | green |
+| 2026-08-05 | *(this)* | Pad boss stepped B-Rep; kind-3 ClassifyPoint holes | green |
+| | | *next: Sketch_0 / extrude profile; general B-Rep* | |
 
 ---
 
