@@ -90,6 +90,8 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `test-stl/cad_union_boxes.stp` | face-adjacent box fuse |
 | `test-stl/cad_side_hole_through.stp` | hole axis +X through |
 | `test-stl/cad_side_hole_blind.stp` | hole axis +X blind |
+| `test-stl/cad_side_hole_y_through.stp` | hole axis +Y through |
+| `test-stl/cad_side_hole_y_blind.stp` | hole axis +Y blind |
 
 ### Gates (must stay green)
 
@@ -215,7 +217,8 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J2.10 | Rect pocket (box−box) + PlaneSphere | **done** |
 | J2.11 | Side-hole +X; AABB box Union fuse | **done** |
 | J2.12 | Side-hole +Y; demo_regen_all fixtures | **done** |
-| J2.13 | General B-Rep cut; richer Union; Sketch deferred | **next** |
+| J2.13 | Intersection boxes; ClassifyPoint; side rect notch | **done** |
+| J2.14 | General B-Rep cut; Sketch deferred | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -256,8 +259,10 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | 2026-08-05 | `49323305` | Exact sphere B-Rep: SPHERICAL_SURFACE + two hemispheres | green |
 | 2026-08-05 | `af55187e` | Counterbore wall coedge senses (no vanishing cyl) | green |
 | 2026-08-05 | `02721f84` | Rect pocket box−box Bool + PlaneSphere | green |
-| 2026-08-05 | *(this)* | Side-hole +X + box Union fuse (AABB when solid) | green |
-| | | *next: side +Y; general B-Rep; Sketch deferred* | |
+| 2026-08-05 | `c2fb33df` | Side-hole +X + box Union fuse | green |
+| 2026-08-05 | `9d778a11` | Side-hole +Y; `demo_regen_all` | green |
+| 2026-08-05 | *(this)* | Box Intersection; ClassifyPoint; rect notch +X | green |
+| | | *next: general B-Rep cut* | |
 
 ---
 

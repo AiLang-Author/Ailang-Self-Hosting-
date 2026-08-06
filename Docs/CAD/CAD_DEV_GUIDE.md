@@ -201,7 +201,9 @@ export special cases.
 ./ailang.x CAD/demo_side_hole.ailang -o /tmp/demo_sh && /tmp/demo_sh
 # after deleting old models — regenerate everything:
 ./ailang.x CAD/demo_regen_all.ailang -o /tmp/regen && /tmp/regen
+./ailang.x CAD/demo_bool_ops.ailang -o /tmp/dbo && /tmp/dbo
 # FreeCAD: test-stl/cad_*.stp only
+# Note: side holes/notches open on vertical faces — look from the side, not top.
 ```
 
 **Plate-hole shells (Topo, not STEP recipes)**
@@ -227,10 +229,12 @@ export special cases.
 5. [x] Hole shells: through / blind / multi / nested counterbore (Topo)
 6. [x] Rect pocket box−box; PlaneSphere isect
 7. [x] Side-hole +X; AABB box Union fuse (adjacent/overlap/contain)
-8. [ ] Side +Y; general B-Rep cut; non-box Union
-9. [ ] Fillet/chamfer after offset surfaces exist
-10. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
-11. [ ] Viewport/Vulkan **after** tess emits real buffers
+8. [x] Side-hole +Y; demo_regen_all for fresh fixtures
+9. [x] Box Intersection; ClassifyPoint (AABB/cyl/sphere); rect notch +X
+10. [ ] General B-Rep cut; non-box Union
+11. [ ] Fillet/chamfer after offset surfaces exist
+12. [ ] Sketch_0 + plane handle (in-memory first; PG order later)
+13. [ ] Viewport/Vulkan **after** tess emits real buffers
 
 ---
 
