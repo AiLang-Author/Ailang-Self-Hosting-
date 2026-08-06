@@ -202,8 +202,10 @@ export special cases.
 # after deleting old models — regenerate everything:
 ./ailang.x CAD/demo_regen_all.ailang -o /tmp/regen && /tmp/regen
 ./ailang.x CAD/demo_bool_ops.ailang -o /tmp/dbo && /tmp/dbo
+./ailang.x CAD/demo_pad_boss.ailang -o /tmp/dpad && /tmp/dpad
 # FreeCAD: test-stl/cad_*.stp only
 # Note: side holes/notches open on vertical faces — look from the side, not top.
+# Pad boss = stepped solid on top of plate (not a Union of two floating boxes).
 ```
 
 **Plate-hole shells (Topo, not STEP recipes)**

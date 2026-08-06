@@ -92,6 +92,8 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `test-stl/cad_side_hole_blind.stp` | hole axis +X blind |
 | `test-stl/cad_side_hole_y_through.stp` | hole axis +Y through |
 | `test-stl/cad_side_hole_y_blind.stp` | hole axis +Y blind |
+| `test-stl/cad_intersect_boxes.stp` | AABB box ∩ box |
+| `test-stl/cad_rect_notch_x.stp` | rectangular notch on −X face |
 
 ### Gates (must stay green)
 
@@ -218,7 +220,8 @@ engine is incomplete. Ailang function layers make features easy to hang on later
 | J2.11 | Side-hole +X; AABB box Union fuse | **done** |
 | J2.12 | Side-hole +Y; demo_regen_all fixtures | **done** |
 | J2.13 | Intersection boxes; ClassifyPoint; side rect notch | **done** |
-| J2.14 | General B-Rep cut; Sketch deferred | **next** |
+| J2.14 | Pad boss shell; kind-3 hole ClassifyPoint | **done** |
+| J2.15 | General B-Rep cut; Sketch_0 / extrude profile | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
