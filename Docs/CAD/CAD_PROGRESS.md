@@ -95,7 +95,7 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `test-stl/cad_intersect_boxes.stp` | AABB box ∩ box |
 | `test-stl/cad_rect_notch_x.stp` | rectangular notch on −X face |
 | `test-stl/cad_pad_boss.stp` | plate + rectangular boss (step) |
-| `test-stl/cad_fillet_box_vert.stp` | box + R vertical corner fillets |
+| `test-stl/cad_fillet_edge.stp` | general FilletEdge plane–plane |
 
 ### Gates (must stay green)
 
@@ -225,10 +225,10 @@ until rounds and richer solids are real.
 | J2.12 | Side-hole +Y; demo_regen_all fixtures | **done** |
 | J2.13 | Intersection boxes; ClassifyPoint; side rect notch | **done** |
 | J2.14 | Pad boss shell; kind-3 hole ClassifyPoint | **done** |
-| J2.15 | Box vertical fillets demo only (NOT the architecture) | **demo debt** |
-| J2.16 | **General edge blend spine** (plane–plane first) | **active** |
-| J2.17 | Plane–cyl / plane–cone edge blend; vertex sphere | **next** |
-| J2.18 | Chamfer as planar strip on same spine | **next** |
+| J2.15 | Shape-specific box fillets | **deleted** |
+| J2.16 | **General `FilletEdge` plane–plane** (edge-based) | **done** (v1) |
+| J2.17 | Robust multi-edge / end-face arcs; plane–cyl | **next** |
+| J2.18 | Chamfer strip on same spine | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred until blend spine** |
 
 ### 5.6 Fillet / chamfer architecture (locked — no shape recipes)
@@ -260,7 +260,7 @@ CAD_Blend.ChamferEdge(solid, edge_handle, dist [, angle]) → new solid | 0
 
 Chamfer reuses the same topology edit path with a **planar** blend strip instead of a cylinder/sphere.
 
-`MakeBoxVerticalFilletsSolid` remains a **look-at demo only** until `FilletEdge` can rebuild the same solid from edge handles — then demos call the general API.
+Shape-specific fillet builders **removed**. Use `CAD_Blend.FilletEdge(solid, edge, R)`.
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -305,9 +305,9 @@ Chamfer reuses the same topology edit path with a **planar** blend strip instead
 | 2026-08-05 | `9d778a11` | Side-hole +Y; `demo_regen_all` | green |
 | 2026-08-05 | `00f5af08` | Box Intersection; ClassifyPoint; rect notch +X | green |
 | 2026-08-05 | `2ec3ef81` | Pad boss; kind-3 ClassifyPoint holes | green |
-| 2026-08-05 | `067816d1` | Vertical box fillets STEP (demo only; shape-specific) | green |
-| 2026-08-05 | *(this)* | **Policy:** general edge blend, not shape recipes; plane–plane first | — |
-| | | *next: OffsetPlane/Cyl + FilletEdge(plane–plane) on any poly solid* | |
+| 2026-08-05 | `dd389f76` | Policy: general edge blend, not shape recipes | — |
+| 2026-08-05 | *(this)* | Delete shape fillets; `FilletEdge` plane–plane edge-based | green |
+| | | *next: multi-edge robustness; chamfer; plane–cyl* | |
 
 ---
 
