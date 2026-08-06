@@ -234,15 +234,20 @@ export special cases.
 8. [x] Side-hole +Y; demo_regen_all for fresh fixtures
 9. [x] Box Intersection; ClassifyPoint (AABB/cyl/sphere); rect notch +X
 10. [x] Pad boss stepped shell; kind-3 ClassifyPoint subtracts Z-holes
-11. [x] Constant-R **vertical** box fillets (`MakeBoxVerticalFilletsSolid` / `FilletBoxVertical`)
-12. [ ] Chamfer; single-edge / horizontal fillets; plane offset gates
-13. [ ] General B-Rep cut / shell hollow
-14. [ ] Sketch_0 / extrude / revolve (**after** blend spine)
-14. [ ] Viewport/Vulkan **after** tess emits real buffers
+11. [~] Vertical box fillets = **demo debt only** (shape-specific; not product API)
+12. [ ] **General `FilletEdge`:** plane–plane edge first (any faceted solid)
+13. [ ] Plane–cyl / plane–cone edge blend; vertex sphere; then chamfer strip
+14. [ ] General B-Rep cut / shell hollow
+15. [ ] Sketch_0 / extrude / revolve (**after** blend spine)
+16. [ ] Viewport/Vulkan **after** tess emits real buffers
 
-**Priority (2026-08):** solid modelling geometry (fillet, chamfer, offset, richer
-bool) before sketch-driven features. No silent fake fillets (Blend stubs must
-return failure or real geometry).
+**Priority (2026-08):** solid modelling geometry before sketch.
+
+**Fillet policy — no shape recipes.** Do not add top-rim-of-box / cone-bottom /
+triangle-only builders. Implement **edge-based** blend: offset supports → isect
+spine → blend face → topology edit. Domain grows by **surface pair type**
+(plane–plane → plane–cyl → plane–cone → …), not by solid kind. Unsupported
+edge returns **0**, never an empty solid.
 
 ---
 

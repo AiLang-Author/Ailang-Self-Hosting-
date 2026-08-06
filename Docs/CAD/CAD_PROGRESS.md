@@ -95,6 +95,7 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 | `test-stl/cad_intersect_boxes.stp` | AABB box ∩ box |
 | `test-stl/cad_rect_notch_x.stp` | rectangular notch on −X face |
 | `test-stl/cad_pad_boss.stp` | plate + rectangular boss (step) |
+| `test-stl/cad_fillet_box_vert.stp` | box + R vertical corner fillets |
 
 ### Gates (must stay green)
 
@@ -224,9 +225,42 @@ until rounds and richer solids are real.
 | J2.12 | Side-hole +Y; demo_regen_all fixtures | **done** |
 | J2.13 | Intersection boxes; ClassifyPoint; side rect notch | **done** |
 | J2.14 | Pad boss shell; kind-3 hole ClassifyPoint | **done** |
-| J2.15 | **Core B-Rep:** constant-R vertical fillets on box | **done** (first slice) |
-| J2.16 | Chamfer; single-edge fillet; plane offset gates | **next** |
+| J2.15 | Box vertical fillets demo only (NOT the architecture) | **demo debt** |
+| J2.16 | **General edge blend spine** (plane–plane first) | **active** |
+| J2.17 | Plane–cyl / plane–cone edge blend; vertex sphere | **next** |
+| J2.18 | Chamfer as planar strip on same spine | **next** |
 | J3.* | Sketch_0 / extrude / revolve | **deferred until blend spine** |
+
+### 5.6 Fillet / chamfer architecture (locked — no shape recipes)
+
+**Do not** write `MakeBoxTopRimFillets` / cone-bottom specials / triangle specials.
+Those do not scale to “any edge on any solid.”
+
+**Target API (feature-level):**
+```
+CAD_Blend.FilletEdge(solid, edge_handle, radius) → new solid | 0
+CAD_Blend.ChamferEdge(solid, edge_handle, dist [, angle]) → new solid | 0
+```
+
+**Kernel sequence for one constant-R edge fillet:**
+1. Resolve edge → two support faces + shared curve  
+2. **Offset** each support surface by ±R (analytic when plane/cyl/cone/sphere)  
+3. **Isect** offset surfaces → spine (rail) curve  
+4. Build blend surface (rolling-ball envelope / pipe)  
+5. Trim supports; insert blend face; fix coedges  
+6. At vertices where N edges meet: vertex blend (equal-R → sphere sector on planes)
+
+**Order of support-surface pairs (honest domain growth):**
+| # | Face pair | Why |
+|--:|-----------|-----|
+| 1 | **Plane–plane** | Any polyhedron edge (box, triangle prism, free faceted body) |
+| 2 | Plane–cylinder | Fillet onto holes / side walls |
+| 3 | Plane–cone | Cone base / draft |
+| 4 | Cylinder–cylinder / sphere… | Later |
+
+Chamfer reuses the same topology edit path with a **planar** blend strip instead of a cylinder/sphere.
+
+`MakeBoxVerticalFilletsSolid` remains a **look-at demo only** until `FilletEdge` can rebuild the same solid from edge handles — then demos call the general API.
 | J3.* | Sketch_0 / extrude / revolve | **deferred** |
 
 **Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
@@ -270,8 +304,10 @@ until rounds and richer solids are real.
 | 2026-08-05 | `c2fb33df` | Side-hole +X + box Union fuse | green |
 | 2026-08-05 | `9d778a11` | Side-hole +Y; `demo_regen_all` | green |
 | 2026-08-05 | `00f5af08` | Box Intersection; ClassifyPoint; rect notch +X | green |
-| 2026-08-05 | *(this)* | Pad boss stepped B-Rep; kind-3 ClassifyPoint holes | green |
-| | | *next: Sketch_0 / extrude profile; general B-Rep* | |
+| 2026-08-05 | `2ec3ef81` | Pad boss; kind-3 ClassifyPoint holes | green |
+| 2026-08-05 | `067816d1` | Vertical box fillets STEP (demo only; shape-specific) | green |
+| 2026-08-05 | *(this)* | **Policy:** general edge blend, not shape recipes; plane–plane first | — |
+| | | *next: OffsetPlane/Cyl + FilletEdge(plane–plane) on any poly solid* | |
 
 ---
 
