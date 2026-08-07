@@ -3,8 +3,9 @@
 **Living document.** Update every grind turn. Pair with `CAD_DEV_GUIDE.md` (process) and `CAD_Kernel_Design_v3.md` (normative).  
 **Rule:** local commit after each meaningful turn so regressions are git-bisectable.
 
-**Last updated:** 2026-08-05  
-**Branch:** `master` (local; push when ready)
+**Last updated:** 2026-08-07 (loft / sweep / non-box pattern via CloneKind0)  
+**Branch:** `master` (local; push when ready)  
+**Strategy:** `Docs/CAD/CAD_CORE_COMPETITIVE_PLAN.md` · Phase A: `CAD_PHASE_A_SKETCH.md`
 
 ---
 
@@ -12,90 +13,67 @@
 
 Pure-AILang CAD/CAM **kernel** (not FreeCAD glue):
 
-- Exact B-Rep in memory → **STEP** (primary interchange). STL optional/not look-at.
-- Parametric product model: **Sketch_0 root**, plane recipes, ordered tree in **Postgres**
-- Capability target: box/cyl/sphere → **holes (boolean cut)** → pad/pocket → fillet → import
-
-Proof that this class of work is doable: JS JVM track. CAD should move faster with clearer geometry milestones.
+- Exact B-Rep in memory → **STEP** (primary interchange). STL optional / not look-at.
+- Parametric product model later: **Sketch_0 root**, plane recipes, ordered tree in **Postgres**
+- Capability path: analytic solids → restricted bool/holes → **edge blend (fillet digon)** → sketch-driven features → import/UI
 
 ---
 
-## 2. Jump map (here → real CAD)
+## 2. Jump map
 
-| Jump | Name | Exit criteria (look-at / gate) |
-|-----:|------|--------------------------------|
-| **0** | Bones | Box + faceted cyl open in FreeCAD (**STEP**); measures work |
-| **1** | Analytic B-Rep | Cylinder = CIRCLE edges + CYL surface; STEP continuous |
-| **2** | Isect + Bool | `CreateHole` cuts a real hole; box-with-hole **STEP** |
-| **3** | Features + Sketch_0 | Pad from sketch; height edit regenerates; tree order in memory then PG |
-| **4** | Blend + import + UI | Fillet/chamfer; STEP import subset; viewport later |
+| Jump | Name | Status |
+|-----:|------|--------|
+| **0** | Bones (box, poly STEP) | **done** |
+| **1** | Analytic B-Rep (CIRCLE/CYL/SPHERE) | **done** |
+| **2** | Isect + restricted Bool/holes/pad | **done** (restricted domain) |
+| **2b** | Plane–plane edge blend + equal-R digon | **done** (this tranche) |
+| **3** | DXF/sketch completeness (Phase A) | **done** LWPOLY+multi-loop+export |
+| **3b** | Sketch→solid Pad/Cut/Revolve (Phase B) | **B2–B4 done**; B5 partial; B6 open |
+| **4** | Solid tools Phase C | **C4 chamfer, C5 cyl−cyl, C6 rotate**; C3 open |
 
 ```
-[Jump 0 — DONE]
-  Store · Num · eval · box · n-gon cyl · poly STEP · FreeCAD open/measure
+[Jump 0–2 DONE]  →  [Jump 2b fillet digon DONE]
         │
-        ▼  Jump 1  ← ACTIVE
-  Analytic cylinder/sphere · tess from surfaces · STEP CIRCLE/CYL
-        │
-        ▼  Jump 2
-  Isect → Bool.Difference → hole
-        │
-        ▼  Jump 3
-  Sketch_0 · planes · pad · PG feature_tree
+        ▼  Jump 3  ← ACTIVE
+  DXF LINE import → closed loop → ExtrudeProfile → STEP  ✓ rect + diamond
+  next: CIRCLE/ARC, revolve, draft, hole-from-circle, Sketch_0 constraints
         │
         ▼  Jump 4
-  Fillet · import · Vulkan
+  Chamfer · plane–cyl · unequal-R ball corner · STEP body import · Vulkan
 ```
 
 ---
 
-## 3. Current status (Jump 0 complete)
+## 3. Current status snapshot
 
-### Done
+### Kernel solid / bool (earlier jumps)
 
 | Item | Evidence |
 |------|----------|
-| `CAD_Store` slabs + handles | `test_num` / topo gates |
-| `CAD_Num` tol, V3, LU, Orient* | hard gates |
-| `CAD_Geom` eval + MakeLine/Plane/Circle/CylSurf | `test_geom` |
-| `CAD_Topo` half-edge, MakeBoxSolid (line+plane) | `test_topo` |
-| `MakeCylinderSolid` n-gon prism + analytic handles (decorative) | `test_cylinder` |
-| Walk STEP polyhedra; high entity IDs (no #100 collision) | FreeCAD opens box + cyl STEP |
-| **Policy: STEP = look-at truth** (STL not dual-export / not ground) | demos STEP-only |
-| Design §1.4 Sketch_0 / plane recipes / PG order | design doc |
-| Hole terminology = boolean cut (`CreateHole`) | Script + DEV_GUIDE |
+| `CAD_Store` / `CAD_Num` / `CAD_Geom` | gates `test_num`, `test_geom` |
+| Box / cyl / sphere analytic + walk STEP | `demo_primitives` |
+| Restricted hole/pocket/union/pad shells | demos under `test-stl/cad_plate_*`, etc. |
+| STEP-first, **no export recipes** | `ExportSTEP` shell walk only |
 
-### Look-at fixtures (STEP only — regenerate)
+### Fillet / digon tranche (2026-08-06) — look-at fixtures
 
 ```bash
-./ailang.x CAD/demo_primitives.ailang -o /tmp/demo_prim && /tmp/demo_prim
-./ailang.x CAD/demo_hole_intent.ailang -o /tmp/demo_hole && /tmp/demo_hole
-./ailang.x CAD/demo_blind_hole.ailang -o /tmp/demo_blind && /tmp/demo_blind
-./ailang.x CAD/demo_multi_hole.ailang -o /tmp/demo_mh && /tmp/demo_mh
-./ailang.x CAD/demo_counterbore.ailang -o /tmp/demo_cb && /tmp/demo_cb
+./ailang.x CAD/demo_fillet_edge.ailang      -o /tmp/d && /tmp/d   # R=5 one vertical
+./ailang.x CAD/demo_fillet_horiz.ailang     -o /tmp/d && /tmp/d   # R=5 top front
+./ailang.x CAD/demo_fillet_verticals.ailang -o /tmp/d && /tmp/d   # R=4 ×4 verts
+./ailang.x CAD/demo_fillet_edges.ailang     -o /tmp/d && /tmp/d   # R=4 box top digon
+./ailang.x CAD/demo_fillet_wedge.ailang     -o /tmp/d && /tmp/d   # R=3 apex 31° digon
+./ailang.x CAD/demo_fillet_roof.ailang      -o /tmp/d && /tmp/d   # R=2.5 planes 15° digon
 ```
 
-| File | Notes |
-|------|--------|
-| `test-stl/cad_box_10x20x30.stp` | box mm |
-| `test-stl/cad_box_unit.stp` | 1 mm cube |
-| `test-stl/cad_cylinder_r10_h30.stp` | analytic CIRCLE + CYL |
-| `test-stl/cad_sphere_r10.stp` | analytic SPHERICAL_SURFACE + equator (walk) |
-| `test-stl/cad_plate_hole_offset.stp` | single through hole (walk) |
-| `test-stl/cad_plate_blind_pocket.stp` | blind floor disk (walk) |
-| `test-stl/cad_plate_multi_hole.stp` | through + blind independent (walk) |
-| `test-stl/cad_counterbore.stp` | nested annular floor (walk) |
-| `test-stl/cad_plate_rect_pocket.stp` | blind rect pocket (box−box) |
-| `test-stl/cad_plate_rect_through.stp` | through rect pocket |
-| `test-stl/cad_union_boxes.stp` | face-adjacent box fuse |
-| `test-stl/cad_side_hole_through.stp` | hole axis +X through |
-| `test-stl/cad_side_hole_blind.stp` | hole axis +X blind |
-| `test-stl/cad_side_hole_y_through.stp` | hole axis +Y through |
-| `test-stl/cad_side_hole_y_blind.stp` | hole axis +Y blind |
-| `test-stl/cad_intersect_boxes.stp` | AABB box ∩ box |
-| `test-stl/cad_rect_notch_x.stp` | rectangular notch on −X face |
-| `test-stl/cad_pad_boss.stp` | plate + rectangular boss (step) |
-| `test-stl/cad_fillet_edge.stp` | general FilletEdge plane–plane |
+| File | What it proves |
+|------|----------------|
+| `test-stl/cad_fillet_edge.stp` | Single plane–plane `FilletEdge` (vertical) |
+| `test-stl/cad_fillet_horiz.stp` | Single plane–plane horizontal |
+| `test-stl/cad_fillet_verticals.stp` | Sequential multi-edge (disjoint verts) |
+| `test-stl/cad_fillet_edges.stp` | **Equal-R digon** top cycle box 90° (4 CYL + 4 ELLIPSE, 0 sphere) |
+| `test-stl/cad_fillet_wedge.stp` | Digon on **31°** wedge prism (3 CYL + 3 ELLIPSE) |
+| `test-stl/cad_fillet_roof.stp` | Digon **shallow 15°** plane angle / 165° solid apex, R=2.5 |
 
 ### Gates (must stay green)
 
@@ -109,229 +87,247 @@ Proof that this class of work is doable: JS JVM track. CAD should move faster wi
 
 ### Known limitations (honest)
 
-- Exact-cyl B-Rep is CIRCLE/CYL; prism path still n-gon.
-- `CreateHole` = restricted Bool (box−cyl → kind-3 plate; append ≤5 holes), not general B-Rep.
-- Plate shells cover Z-axis holes; side-axis / freeform cuts still TODO.
-- Sphere solid = two hemispheres + equator CIRCLE on SPHERICAL_SURFACE (walk).
-- Sketch_0 / Feat regen / PG product path not implemented.
+- `CreateHole` / plate shells = **restricted** bool domain, not general B-Rep cut.
+- Fillet = **plane–plane** only; no plane–cyl / cone / cyl–cyl yet.
+- Equal-R **digon** at shared vertices (cylinders + Steinmetz ellipses). **No sphere face** on that path.
+- Unequal-R “ball corner”, chamfer, variable-R: **not built**.
+- Sketch constraints / Solve2D / PG product path: **not implemented**.
+- DXF: **LINE only** (z≈0); no LWPOLYLINE/ARC/CIRCLE yet; no revolve/draft.
+- AILang stack: Address locals clobber across nested calls — digon pins state on `digon_S` heap.
 
 ---
 
-## 4. Active plan — Jump 1 (Analytic B-Rep)
+## 3b. Implemented vs not — DXF → extrude tranche (2026-08-06)
 
-### 4.1 Intent
+### Implemented ✓
 
-Make **exact** geometry the solid truth; **STEP derives** from it (mesh optional).
+| Capability | Locus | Notes |
+|------------|--------|--------|
+| ASCII DXF **LINE** parse | `CAD_DXF.ImportFile` | ENTITIES section; 2D (z≈0) only |
+| ASCII DXF **CIRCLE** | `CAD_DXF.ImportFile` | Pure-circle sketch → analytic cylinder extrude |
+| ASCII DXF **ARC** | `CAD_Sketch.AddArc` / `TessellateArcs` | Slot/capsule profiles; tess → LINEs |
+| Sketch line/circle storage + **closed loop chain** | `CAD_Sketch.*` / `BuildClosedLoop` / `TessellateCircles` | Real Store-backed profile |
+| **Extrude** closed loop +Z | `CAD_Feat.ExtrudeProfile` | AABB rect → box; poly → `MakePolyPrism` (≤64); pure CIRCLE → cyl |
+| Poly prism solid | `CAD_Topo.MakePolyPrism` | Non-rect profiles (diamond, keyhole) |
+| **Plate + through poly hole** | `MakePlateThroughPolyHole` / `ExtrudePlateThroughHole` | Outer rect + inner poly (escutcheon) |
+| **Path → solid (no fixtures)** | `CAD_IO.LoadDXFExtrude` / `LoadDXFPlateHole` | Arbitrary DXF path → solid |
+| **CLI loader + pipe** | `CAD/cad_load.ailang` → `cad_load.x` | files or `stdin DXF → stdout STEP` (`-` default) |
+| DXF from fd/buffer | `CAD_DXF.ImportFd` / `ImportBuffer` | pipe-safe ReadAllFd |
+| STEP to fd | `CAD_IO.ExportSTEPFd` | stdout without closing |
+| **Software viewport** | `CAD_View` + `cad_view.x` | Tess → headless FB → BMP; optional host `eog` |
+| Screenshots for agents | `CAD_View.SaveFBToBMP` / `--shot` | no FreeCAD required |
+| Multi-loop face tess | `MeshFaceLoopsXY` (bridge + ear-clip) | plate holes visible in view |
+| Edge overlay + face tint | `CAD_View.DrawMesh` | axis-tinted shade + wire edges |
+| Smoke | `CAD/smoke_view.sh` | square / keyhole / diamond / escutcheon / slot / top |
+| View presets | `--view 0\|1\|2` iso/top/front; `--wire`; `--defl` | daily look-ats without FreeCAD |
+| **CLI contract v1** | `Docs/CAD/CAD_CLI.md` | frozen `cad_load` / `cad_view` + scripts |
+| DXF demos | cube / diamond / keyhole / circle / **escutcheon** | `cad_dxf_*.stp` under `test-stl/` |
+| Format choice | DXF bootstrap | STEP = solid interchange; SVG available later for 2D UI |
 
-### 4.2 Tasks
+### Not implemented ✗ (DXF / sketch spine)
+
+| Capability | Notes |
+|------------|--------|
+| DXF **LWPOLYLINE** | ARC done; polyline still open |
+| **Revolve** profile | Still stub |
+| **Revolve** profile | Feature stub only |
+| **Draft** (taper) | Not started |
+| General pocket/cut from DXF tool solid | Restricted Difference only; plate-through-poly is explicit topology |
+| Multi-hole nested loops in one ExtrudeProfile | Two-sketch plate+hole path exists |
+| Sketch constraints / DOF solve | `CAD_Solve2D` theater |
+| Sketch_0 plane recipes + Feat tree | Product model |
+| DXF units / layers / blocks | Minimal path only |
+
+```bash
+./ailang.x CAD/demo_dxf_extrude.ailang -o /tmp/d && /tmp/d       # rect 40×30 → h=15
+./ailang.x CAD/demo_dxf_diamond.ailang -o /tmp/d && /tmp/d      # diamond poly prism
+./ailang.x CAD/demo_dxf_keyhole.ailang -o /tmp/d && /tmp/d      # solid keyhole pad
+./ailang.x CAD/demo_dxf_circle.ailang -o /tmp/d && /tmp/d       # analytic cylinder
+./ailang.x CAD/demo_dxf_escutcheon.ailang -o /tmp/d && /tmp/d   # plate + flared keyhole through
+./ailang.x CAD/cad_load.ailang -o cad_load.x
+./cad_load.x --in any.dxf --out out.stp --height 10
+./cad_load.x --in plate.dxf --hole hole.dxf --out esc.stp -H 4
+cat any.dxf | ./cad_load.x -H 10 > out.stp   # full pipe
+```
+
+---
+
+## 4. Implemented vs not — fillet / digon tranche
+
+Tracking for this grind arc only (edge blend + corners). Update ticks when status changes.
+
+### Implemented ✓
+
+| Capability | API / locus | Notes |
+|------------|-------------|--------|
+| Plane–plane constant-R edge fillet | `CAD_Blend.FilletEdge` → `FilletPlanePlaneEdge` | Cylinder strip + minor end arcs; rebuild planar faces |
+| Multi-edge sequential (no shared verts) | `FilletPlaneEdges` | e.g. four verticals |
+| Equal-R **digon** multi-edge cycle | `FilletPlaneEdges` → `FilletPlaneEdgesDigon` | Shared verts refused for sequential; digon path |
+| Digon cylinders + **ellipse** corners | `DigonCyl*`, `MakeEqualRDigonEdge` | OCC-style: **no globe** when R equal |
+| General dihedral equal-R corner points | `DigonEqualRSolve` / `DigonSolve3` | Any angle (31°, 15° plane, 90°, …) via 3 offset planes |
+| Digon ellipse from actual points | `Cs`, `P_ww`, `P_cap` axes | Not horizontal false Steinmetz |
+| Manifold wall/cap rebuild | `DigonMapVert` + edge registry | Shared verts/edges across faces |
+| Minor-arc end circles on single fillet | `MakeMinorArcEdge` | Avoids folded-in FreeCAD arcs |
+| Wedge / roof test solids | `MakeWedgePrism` | Non-ortho digon demos |
+| STEP walk export of ELLIPSE + CYL | `CAD_IO` | Look-at FreeCAD |
+
+### Not implemented ✗ (this tranche / next)
+
+| Capability | Why it matters | Notes |
+|------------|----------------|--------|
+| **Unequal-R corner (sphere / rolling-ball “globe”)** | Only place globe is *correct* by default | Digon dies when radii differ |
+| **Chamfer** (planar blend strip) | Same topology edit, flat face | Not started |
+| **Plane–cylinder** edge blend | Fillet into hole walls | Needs offset/isect on cyl |
+| **Plane–cone / cyl–cyl** blends | Draft, pipes | Later |
+| **3-edge vertex full network** beyond top cycle digon | Freeform polyhedron corners | Digon cycle covers coplanar-cap loops |
+| Variable-R / G2 blend | Styling | Far |
+| General B-Rep shell edit after blend on non-plane supports | Robustness | Walls currently plane rebuild |
+| Feature-level history (fillet as Feat node) | Parametric edit | Kernel ops only today |
+| Chamfer + digon mix | Production modelling | — |
+
+### Policy (locked)
+
+1. **No shape recipes** (`MakeBoxTopRimFillets` etc. deleted). API is edge-based.
+2. **Equal R on meeting edges → digon (ellipse), not sphere.**
+3. **Sphere / globe corner only** when radii differ or explicit ball-corner is requested (future).
+4. Unsupported support pair → **return 0**, never silent wrong geometry.
+
+### Architecture (what we actually ship)
+
+```
+FilletEdge(solid, edge, R)
+  → plane–plane supports only
+  → cylinder blend + minor arcs + face rebuild
+
+FilletEdges(solid, edges[], n, R)
+  → if edges share vertices and n≥3 (or shared): FilletPlaneEdgesDigon
+  → else sequential FilletPlanePlaneEdge
+
+Digon (equal R):
+  orient outward normals → EqualR corner (P_ww, P_cap, Cs)
+  → ellipse digon edges → cylinder faces per cycle edge
+  → new cap + rebuild other plane faces (shared vert map)
+```
+
+Historic design note “equal-R → sphere sector” is **superseded** for the equal-R multi-edge path: digon matches look-at (no glob) and OCC-style edge network.
+
+---
+
+## 5. Mission target — Fusion-shaped features (unchanged intent)
+
+| Feature | Kernel meaning | Status |
+|---------|----------------|--------|
+| Pad / extrude join | Profile → solid ∪ body | **partial** (pad boss shell only) |
+| Pocket / cut | Profile → tool → Difference | **restricted** rect/hole |
+| Hole | Circle → cyl → Difference | **restricted** plate/side |
+| Revolve | Profile about axis | **done** full 360° rect → cyl/annulus |
+| Fillet | Edge blend | **plane–plane + equal-R digon ✓** |
+| Chamfer | Planar strip | **box corner vertical ✓** |
+| Loft | Two profiles → ruled solid | **done** `LoftProfiles` / `MakeRuledSolid` |
+| Sweep | Profile + path | **done** `SweepProfile` / `MakePathSweepSolid` (Z-changing path) |
+| Pattern / mirror | Clone + transform | **done** kind-0 any poly (not only AABB box) |
+
+### Part Design deeper parity (2026-08-07)
+
+| API | Domain |
+|-----|--------|
+| `CAD_Topo.CloneKind0` | First shell, plane faces + line edges; seed-safe after CompoundAdd |
+| `CAD_Topo.MakeRuledSolid` | Two XY n-gons at z_bot/z_top, n 3..64 |
+| `CAD_Topo.MakePathSweepSolid` | XY profile + path XYZ; Z must change between samples |
+| `CAD_Feat.LoftProfiles` | Two sketches, same loop count, zpack |
+| `CAD_Feat.SweepProfile` | Sketch + path array |
+| `CAD_Feat.LinearPattern` | CloneKind0 + Translate, compound multi-shell |
+| `CAD_Feat.CircularPattern` | Clone + rotate about AABB center |
+| `CAD_Feat.Mirror` | Clone + ReflectSolid about AABB mid plane |
+
+```bash
+./CAD/smoke_part_design.sh
+# fixtures: cad_loft.stp, cad_sweep.stp, cad_pattern_diamond*.stp, cad_pattern_linear.stp, …
+```
+
+**Priority reaffirm (2026-08-07):**
+
+| Order | Work | Status |
+|------:|------|--------|
+| 1 | Analytic solids | ✓ |
+| 2 | Transforms + restricted Bool | ✓ |
+| 3 | Plane–plane fillet + equal-R digon | ✓ |
+| 4 | **DXF → extrude** (LINE/CIRCLE/ARC/LWPOLY) | ✓ |
+| 5 | Revolve, draft, pad/cut, Part Design pattern | ✓ |
+| 6 | Loft / sweep / non-box pattern | ✓ |
+| 7 | Chamfer general, plane–cyl, unequal-R globe, general cut | open |
+
+DXF chosen as profile bootstrap (not STEP — STEP is solid interchange). SVG remains available for 2D image work outside the solid kernel.
+
+---
+
+## 6. Jump task board (condensed)
 
 | ID | Task | Status |
 |----|------|--------|
-| J1.1 | Progress/plan doc + commit discipline | **done** |
-| J1.2 | Exact topo: 2V + CIRCLE×2 + LINE + 3 faces | **done** |
-| J1.3 | Tess: `MeshCylinderAnalytic` samples by deflection | **done** |
-| J1.4 | STEP: CIRCLE + CYLINDRICAL_SURFACE | **done** |
-| J1.5 | Sphere solid (analytic) + look-at STL/STEP | **done** |
-| J1.6 | `MakeCylinderPrismSolid` n-gon debug path | **done** |
-
-### 4.3 Exit criteria Jump 1
-
-- [x] FreeCAD STEP cylinder uses **CIRCLE + CYLINDRICAL_SURFACE**  
-- [x] STL faceted from **surface sampling** (kind=1), not n-gon topo walk  
-- [x] Exact solid Euler **2−3+3=2**, F=3  
-- [x] `test_cylinder` + `demo_primitives` green  
-- [x] Progress doc updated; local commit per task
-
-### 4.4 Non-goals Jump 1
-
-- Holes, fillets, sketch solver, PG open/save, Vulkan
+| J1.* | Analytic cyl/sphere/tess/STEP | **done** |
+| J2.1–J2.14 | Bool/hole/pad/isect spine | **done** (restricted) |
+| J2.15 | Shape-specific fillets | **deleted** (policy) |
+| J2.16 | General plane–plane `FilletEdge` | **done** |
+| J2.17 | Multi-edge verticals + horizontal | **done** |
+| J2.18 | Equal-R digon cycle + non-ortho (31° / 15°) | **done** |
+| J2.19 | Chamfer strip | **next** |
+| J2.20 | Plane–cyl edge blend | **next** |
+| J2.21 | Unequal-R ball corner (globe when needed) | **next** |
+| J3.1 | DXF LINE import + closed loop | **done** |
+| J3.2 | ExtrudeProfile → solid (rect + poly ≤8) | **done** |
+| J3.3 | DXF CIRCLE/ARC/LWPOLYLINE | **next** |
+| J3.4 | Revolve profile | **next** |
+| J3.5 | Draft / pocket-from-DXF | **next** |
+| J3.6 | Sketch_0 constraints + plane recipes | open |
 
 ---
 
-## 5. Mission target — Fusion-shaped features (normative intent)
+## 7. Other look-at fixtures (earlier jumps)
 
-Kernel geometry is not the product UI; **features** are how users build parts.
-Target mental model matches Fusion 360 / mainstream parametric CAD:
+Regenerate via individual demos or `CAD/demo_regen_all.ailang` where listed.
 
-### 5.1 How solids grow
-
-| Feature | User action | Kernel meaning |
-|---------|-------------|----------------|
-| **Pad / Extrude (join)** | Sketch closed profile on a plane → extrude | Profile → solid; **Union** with body (or new body) |
-| **Pocket / Extrude (cut)** | Sketch on face/plane → extrude **into** solid | Profile → tool solid; **Difference**(body, tool) |
-| **Revolve (join/cut)** | Sketch profile + axis → revolve | Sweep profile about axis; union or difference |
-| **Hole / Drill** | Place **circle on a face** → depth/through | Convenience cut: circle → tool **cylinder** → **Difference** |
-
-All of these are the **same two engines**:
-1. **Profile → solid** (extrude or revolve of sketch geometry)  
-2. **Boolean** (union / difference / intersect)
-
-“Drill” is not a third geometry kernel — it is **circle on plane + extrude cut** with hole UI defaults (through, countersink later).
-
-### 5.2 Coordinate story (already frozen §1.4 design)
-
-```
-Sketch_0  (part root / origin plane)
-   └── Pad  → body
-         └── plane-on-face / offset plane
-               └── Sketch_N  (circle for hole)
-                     └── Pocket/Hole  → Difference(body, tool_cyl)
-```
-
-- Sketches live in **plane UV**  
-- Planes are **recipes** from Sketch_0 / faces  
-- B-Rep / **STEP** are **derived** after regen (STL not required)  
-
-### 5.3 Priority order (locked 2026-08-05, reaffirmed for blend)
-
-**Core solid-modelling B-Rep first. Sketch-driven authoring waits.**
-
-Fillet/chamfer/shell need offset + isect + topology edits — that is the next
-kernel spine. Sketch → extrude/revolve is the Fusion *control panel*; cart-before-horse
-until rounds and richer solids are real.
-
-| Order | Work | Why |
-|------:|------|-----|
-| 1 | Analytic solids (box, cyl, sphere) | Exact B-Rep truth ✓ |
-| 2 | Transforms + restricted Bool/Isect | Holes, pockets, pad boss ✓ |
-| 3 | **Offset surfaces** | Thin-wall / blend substrate |
-| 4 | **Fillet / chamfer** (constant-R edge first) | Standard solid modelling |
-| 5 | Then Sketch_0 + pad/pocket/revolve | Authoring on working solids |
-
-### 5.4 Jump map
-
-| Jump | Delivers |
-|-----:|----------|
-| **1** | Exact cyl ✓ · sphere · transforms |
-| **2** | Restricted hole ✓ · richer bool/isect |
-| **3** | Sketch_0 + Pad/Hole **(deferred until kernel solid)** |
-| **4** | Fillet, import, viewport |
-
-### 5.5 Jump 1b / 2 remaining (active)
-
-| ID | Task | Status |
-|----|------|--------|
-| J1.5 | Sphere solid + tess + STEP | **done** |
-| J1.7 | `TranslateSolid` + hole (cx,cy) placement | **done** |
-| J2.2 | Analytic isect + LineCylinder + PlaneCylinder (horiz) | **done** |
-| J2.3–J2.4 | Plate hole: offset + **partial depth** blind pocket | **done** |
-| J2.5 | Multi-hole: Difference(kind3,cyl) append; analytic STEP | **done** |
-| J2.6 | PlaneCylinder general (circle/gens/ellipse) + LineSphere | **done** |
-| J2.7 | `RotateSolidZ` (kernel) | **done** |
-| J2.8 | **Kill STEP recipes**; Export = `WritePolySolidSTEP` only | **done** |
-| J2.9 | Multi / blind / nested hole **shells** (Topo, not export) | **done** |
-| J2.10 | Rect pocket (box−box) + PlaneSphere | **done** |
-| J2.11 | Side-hole +X; AABB box Union fuse | **done** |
-| J2.12 | Side-hole +Y; demo_regen_all fixtures | **done** |
-| J2.13 | Intersection boxes; ClassifyPoint; side rect notch | **done** |
-| J2.14 | Pad boss shell; kind-3 hole ClassifyPoint | **done** |
-| J2.15 | Shape-specific box fillets | **deleted** |
-| J2.16 | **General `FilletEdge` plane–plane** (edge-based) | **done** |
-| J2.17 | Multi-edge verticals + horizontal top edge | **done** |
-| J2.18 | Top-rim loop (4 horiz + vertex spheres); chamfer | **next** |
-| J2.19 | Plane–cyl edge blend | **next** |
-| J3.* | Sketch_0 / extrude / revolve | **deferred until blend spine** |
-
-### 5.6 Fillet / chamfer architecture (locked — no shape recipes)
-
-**Do not** write `MakeBoxTopRimFillets` / cone-bottom specials / triangle specials.
-Those do not scale to “any edge on any solid.”
-
-**Target API (feature-level):**
-```
-CAD_Blend.FilletEdge(solid, edge_handle, radius) → new solid | 0
-CAD_Blend.ChamferEdge(solid, edge_handle, dist [, angle]) → new solid | 0
-```
-
-**Kernel sequence for one constant-R edge fillet:**
-1. Resolve edge → two support faces + shared curve  
-2. **Offset** each support surface by ±R (analytic when plane/cyl/cone/sphere)  
-3. **Isect** offset surfaces → spine (rail) curve  
-4. Build blend surface (rolling-ball envelope / pipe)  
-5. Trim supports; insert blend face; fix coedges  
-6. At vertices where N edges meet: vertex blend (equal-R → sphere sector on planes)
-
-**Order of support-surface pairs (honest domain growth):**
-| # | Face pair | Why |
-|--:|-----------|-----|
-| 1 | **Plane–plane** | Any polyhedron edge (box, triangle prism, free faceted body) |
-| 2 | Plane–cylinder | Fillet onto holes / side walls |
-| 3 | Plane–cone | Cone base / draft |
-| 4 | Cylinder–cylinder / sphere… | Later |
-
-Chamfer reuses the same topology edit path with a **planar** blend strip instead of a cylinder/sphere.
-
-Shape-specific fillet builders **removed**. Use `CAD_Blend.FilletEdge(solid, edge, R)`.
-| J3.* | Sketch_0 / extrude / revolve | **deferred** |
-
-**Honesty rule:** do not mark hole/pad green until boolean or extrude produces wrong-on-fail geometry.
+| File | Notes |
+|------|--------|
+| `cad_box_*`, `cad_cylinder_*`, `cad_sphere_*` | primitives |
+| `cad_plate_hole_*`, `cad_counterbore.stp` | holes |
+| `cad_plate_rect_*`, `cad_union_boxes.stp` | pocket / union |
+| `cad_side_hole_*`, `cad_rect_notch_x.stp` | side cuts |
+| `cad_intersect_boxes.stp`, `cad_pad_boss.stp` | bool / pad |
 
 ---
 
-## 6. Backlog (after solid engine)
+## 8. Turn log
 
-1. Sketch_0 + pad + circle hole (thin feature spine)  
-2. Repo `feature_tree` JSONB  
-3. Fillet / blend, STEP import, viewport  
-
----
-
-## 7. Turn log
-
-| Date | Commit / turn | What | Gates |
-|------|---------------|------|-------|
-| 2026-08-05 | prior commits | Store, Num, Topo box, tess STL | green |
-| 2026-08-05 | `15d7f053` | `CAD_PROGRESS.md` + Sketch_0 §1.4 | — |
-| 2026-08-05 | `7282e993` | Jump 0: n-gon cyl, poly STEP, fixtures | green |
-| 2026-08-05 | `35c73cb4` | J1.4 analytic cyl STEP | green |
-| 2026-08-05 | `8bc64a77` | J1.2+J1.3 exact cyl B-Rep + surface mesh | green |
-| 2026-08-05 | `3c5e7b1b` | Fusion map; cut tool path | green |
-| 2026-08-05 | `c11d2960`/`9dd4e73b` | Plate with hole mesh+STEP | green |
-| 2026-08-05 | `d0cc8981`/`942bf429` | Analytic 8-octant sphere STEP | green |
-| 2026-08-05 | `e97d29b0` | Placement + base Isect | green |
-| 2026-08-05 | prior | LineCyl/PlaneCyl; blind pocket mesh depth; offset hole | green |
-| 2026-08-05 | `ced6d052` | Blind STEP: z_floor cyl + solid bottom + floor disk | green |
-| 2026-08-05 | prior | Multi-hole append (max 5) — grid mesh was wrong | red |
-| 2026-08-05 | prior | Multi-hole earclip STL broken (missing pocket / face distortion) | red |
-| 2026-08-05 | prior | Multi-hole STL grind abandoned (inferior format) | — |
-| 2026-08-05 | `b6a59f52` | **STEP-first policy**: demos export STEP only | green |
-| 2026-08-05 | prior | PlaneCyl + LineSphere; RotateSolidZ; bad rot45 demo | mixed |
-| 2026-08-05 | prior | Counterbore STEP recipe (temporary) | mixed |
-| 2026-08-05 | `5fbf4901` | **Delete all STEP recipes**; ExportSTEP = B-Rep walk only | green |
-| 2026-08-05 | `392e786e` | **J2.9** `BuildPlateHoleShell`: multi/blind/nested counterbore | green |
-| 2026-08-05 | `49323305` | Exact sphere B-Rep: SPHERICAL_SURFACE + two hemispheres | green |
-| 2026-08-05 | `af55187e` | Counterbore wall coedge senses (no vanishing cyl) | green |
-| 2026-08-05 | `02721f84` | Rect pocket box−box Bool + PlaneSphere | green |
-| 2026-08-05 | `c2fb33df` | Side-hole +X + box Union fuse | green |
-| 2026-08-05 | `9d778a11` | Side-hole +Y; `demo_regen_all` | green |
-| 2026-08-05 | `00f5af08` | Box Intersection; ClassifyPoint; rect notch +X | green |
-| 2026-08-05 | `2ec3ef81` | Pad boss; kind-3 ClassifyPoint holes | green |
-| 2026-08-05 | `dd389f76` | Policy: general edge blend, not shape recipes | — |
-| 2026-08-05 | *(this)* | Delete shape fillets; `FilletEdge` plane–plane edge-based | green |
-| | | *next: multi-edge robustness; chamfer; plane–cyl* | |
+| Date | What | Gates / look-at |
+|------|------|-----------------|
+| 2026-08-05 | Jumps 0–2: analytic solids, restricted bool, STEP walk | green |
+| 2026-08-05 | Policy: general edge blend, kill shape recipes | — |
+| 2026-08-05 | FilletEdge vertical + horizontal + multi-vertical | green |
+| 2026-08-06 | Minor-arc fix (no folded fillets); digon equal-R top cycle | green FreeCAD |
+| 2026-08-06 | digon_S sizing, manifold rebuild, ellipse from Cs/P_ww/P_cap | green |
+| 2026-08-06 | General-angle EqualR (`DigonSolve3`); wedge 31° + roof 15° demos | green |
+| 2026-08-06 | Docs: implemented vs not for blend tranche; sketch next | — |
+| 2026-08-06 | Real DXF LINE parser; sketch loop; ExtrudeProfile; poly prism; demos | green |
+| 2026-08-07 | Phase A/B/C + Part Design pattern/mirror/shell | smoke green |
+| 2026-08-07 | CloneKind0; Loft/Sweep; pattern of diamond (non-box) | `smoke_part_design` green |
 
 ---
 
-## 8. Process (every turn)
+## 9. Process (every turn)
 
-1. Update **§6 Turn log** + task status in §4.2  
-2. Implement smallest vertical slice with **look-at or gate**  
-3. Run relevant gates  
-4. **`git commit`** only CAD-related paths (do not mix unrelated tree wipes)  
-5. If red: fix or revert before next feature  
-
-### Commit scope hygiene
-
-- Include: `Librarys/Cad/`, `CAD/`, `Docs/CAD/`, `test-stl/cad_*`  
-- Exclude unless intentional: mass `TestCode/` deletes, binaries, screenshots, JS JVM paths  
+1. Update this file (status + turn log + implemented table)  
+2. Smallest vertical slice with look-at or gate  
+3. Run gates  
+4. `git commit` CAD paths only (`Librarys/Cad/`, `CAD/`, `Docs/CAD/`, `test-stl/cad_*`)  
 
 ---
 
-## 8. Related
+## 10. Related
 
 | Doc | Role |
 |-----|------|
-| `CAD_Kernel_Design_v3.md` | Normative (incl. §1.4 product model) |
+| `CAD_Kernel_Design_v3.md` | Normative architecture |
 | `CAD_DEV_GUIDE.md` | Day-to-day process + look-at commands |
 | `plane_coordinate_tree_spec.md` | Plane feature tree |
-| `CAD_PROGRESS.md` | **This file** — plan + progress |
+| `CAD_PROGRESS.md` | **This file** |
