@@ -10,7 +10,7 @@
 | **C1** | Hole tool (existing CreateHole) | done earlier |
 | **C2** | Poly pocket / through cut | B2 ExtrudeCut poly |
 | **C3** | Plane–cyl fillet | open |
-| **C4** | Chamfer vertical box corner | **done** `ChamferEdge` |
+| **C4** | Chamfer vertical (general prism) | **done** `ChamferEdge` / `ChamferEdges` |
 | **C5** | Bool domain: coaxial cyl−cyl | **done** → annulus |
 | **C6** | Rigid transform | **done** Translate + `RotateSolidZ` + multi-shell walk |
 | **C7** | Clone + pattern of non-box | **done** `CloneKind0`, Linear/CircularPattern, Mirror |
@@ -20,7 +20,7 @@
 
 | Op | Domain |
 |----|--------|
-| ChamferEdge | kind-0 box, full-height vertical **corner** edge, equal setback D → 5-gon prism |
+| ChamferEdge / ChamferEdges | kind-0 **prism** (box/poly/prior chamfer); full-height vertical edges; equal setback D along base edges; rebuild `MakePolyPrism` |
 | Difference cyl−cyl | coaxial, same height/base, ra>rb → MakeAnnulusPrism |
 | RotateSolidZ | kind 0 verts (all shells); kind 1/2 axis; kind 3 plate; kind 4 sphere |
 | CloneKind0 | first shell only; plane faces + line edges; ≤256 verts |

@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# Phase C gates: chamfer (single + multi/general), rotate, cyl-cyl tube
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+mkdir -p test-stl
+
+echo "[phase_c] chamfer single corner"
+./ailang.x CAD/demo_chamfer.ailang -o /tmp/dch && /tmp/dch
+test -s test-stl/cad_chamfer_edge.stp
+# 5-gon prism: 2 caps + 5 sides = 7
+test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_edge.stp)" -eq 7
+
+echo "[phase_c] chamfer multi / general vertical"
+./ailang.x CAD/demo_chamfer_multi.ailang -o /tmp/dcm && /tmp/dcm
+# 4 corners → 8-gon: 2+8 = 10 faces
+test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_4corners.stp)" -eq 10
+# sequential two corners → 6-gon: 2+6 = 8
+test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_seq.stp)" -eq 8
+# diamond one corner: 4→5 verts → 7 faces
+test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_diamond.stp)" -eq 7
+
+echo "[phase_c] rotate"
+./ailang.x CAD/demo_rotate.ailang -o /tmp/drot && /tmp/drot
+test -s test-stl/cad_rotate_z.stp
+
+echo "[phase_c] revolve tube (cyl−cyl bool path)"
+./ailang.x CAD/demo_revolve.ailang -o /tmp/drev && /tmp/drev
+test -s test-stl/cad_revolve_tube.stp
+
+echo "[phase_c] ALL OK"

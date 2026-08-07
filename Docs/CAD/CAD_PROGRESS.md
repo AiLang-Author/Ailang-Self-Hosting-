@@ -222,7 +222,7 @@ Historic design note “equal-R → sphere sector” is **superseded** for the e
 | Hole | Circle → cyl → Difference | **restricted** plate/side |
 | Revolve | Profile about axis | **done** full 360° rect → cyl/annulus |
 | Fillet | Edge blend | **plane–plane + equal-R digon ✓** |
-| Chamfer | Planar strip | **box corner vertical ✓** |
+| Chamfer | Vertical equal-setback | **general prism** `ChamferEdge(s)` ✓; horizontal open |
 | Loft | Two profiles → ruled solid | **done** `LoftProfiles` / `MakeRuledSolid` |
 | Sweep | Profile + path | **done** `SweepProfile` / `MakePathSweepSolid` (Z-changing path) |
 | Pattern / mirror | Clone + transform | **done** kind-0 any poly (not only AABB box) |
@@ -255,7 +255,8 @@ Historic design note “equal-R → sphere sector” is **superseded** for the e
 | 4 | **DXF → extrude** (LINE/CIRCLE/ARC/LWPOLY) | ✓ |
 | 5 | Revolve, draft, pad/cut, Part Design pattern | ✓ |
 | 6 | Loft / sweep / non-box pattern | ✓ |
-| 7 | Chamfer general, plane–cyl, unequal-R globe, general cut | open |
+| 7 | Vertical chamfer general prism | ✓ |
+| 8 | Plane–cyl fillet, horizontal chamfer, unequal-R globe | open |
 
 DXF chosen as profile bootstrap (not STEP — STEP is solid interchange). SVG remains available for 2D image work outside the solid kernel.
 
