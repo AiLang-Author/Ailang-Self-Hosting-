@@ -311,6 +311,7 @@ Regenerate via individual demos or `CAD/demo_regen_all.ailang` where listed.
 | 2026-08-06 | Real DXF LINE parser; sketch loop; ExtrudeProfile; poly prism; demos | green |
 | 2026-08-07 | Phase A/B/C + Part Design pattern/mirror/shell | smoke green |
 | 2026-08-07 | CloneKind0; Loft/Sweep; pattern of diamond (non-box) | `smoke_part_design` green |
+| 2026-08-07 | PD edge/negative honesty (`demo_pd_edges`) | refuse paths + multi-seg/mirror diamond |
 
 ---
 

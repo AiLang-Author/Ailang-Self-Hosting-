@@ -34,5 +34,18 @@
 
 ```bash
 ./CAD/smoke_phase_c.sh
-./CAD/smoke_part_design.sh   # pattern + loft + sweep + diamond pattern
+./CAD/smoke_part_design.sh   # pattern + loft + sweep + diamond + edges/negatives
 ```
+
+### Edge / negative honesty (`demo_pd_edges`)
+
+| Case | Expected |
+|------|----------|
+| Loft unequal n / equal Z / null sketch | 0 |
+| Sweep npath&lt;2 / flat Z / null | 0 |
+| Pattern count&lt;1 / null / kind-1 cyl | 0 |
+| Mirror null / kind-1 | 0 |
+| CloneKind0 null / kind-1 | 0 |
+| Pattern count=1 | identity handle |
+| Sweep 3-segment path | solid, 12 faces (2 shells) |
+| Mirror diamond | solid, 12 faces |

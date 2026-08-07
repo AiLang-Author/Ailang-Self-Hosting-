@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
-# Part Design parity: pattern, mirror, shell, loft, sweep, non-box pattern
+# Part Design parity: pattern, mirror, shell, loft, sweep, non-box pattern,
+# plus edge/negative honesty gates. Regenerates fixtures under test-stl/.
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"
+mkdir -p test-stl
 
 echo "[part_design] pattern/mirror/shell"
 ./ailang.x CAD/demo_part_design.ailang -o /tmp/dpd && /tmp/dpd
@@ -21,5 +23,15 @@ test "$(grep -c ADVANCED_FACE test-stl/cad_sweep.stp)" -eq 6
 test "$(grep -c ADVANCED_FACE test-stl/cad_pattern_diamond.stp)" -eq 24
 # diamond circular ×5: 6 × 5
 test "$(grep -c ADVANCED_FACE test-stl/cad_pattern_diamond_circ.stp)" -eq 30
+
+echo "[part_design] edges + negatives"
+./ailang.x CAD/demo_pd_edges.ailang -o /tmp/dpe && /tmp/dpe
+# multi-seg sweep = 2 ruled segments compound → 12 faces
+test "$(grep -c ADVANCED_FACE test-stl/cad_sweep_3seg.stp)" -eq 12
+# mirror diamond: original + clone = 12 faces
+test "$(grep -c ADVANCED_FACE test-stl/cad_mirror_diamond.stp)" -eq 12
+# clone alone: 6 faces
+test "$(grep -c ADVANCED_FACE test-stl/cad_clone_kind0.stp)" -eq 6
+test "$(grep -c ADVANCED_FACE test-stl/cad_loft_edge.stp)" -eq 6
 
 echo "[part_design] ALL OK"
