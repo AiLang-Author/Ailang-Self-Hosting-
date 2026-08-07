@@ -257,8 +257,10 @@ Historic design note “equal-R → sphere sector” is **superseded** for the e
 | 6 | Loft / sweep / non-box pattern | ✓ |
 | 7 | Vertical chamfer general prism | ✓ |
 | 8 | Horizontal box chamfer | ✓ |
-| 9 | Plane–cyl fillet cyl top rim | ✓ |
-| 10 | Hole rim (concave) plane–cyl, unequal-R globe | open |
+| 9 | Plane–cyl fillet cyl top + bottom rim | ✓ |
+| 10 | Washer (round) hole top inner fillet | ✓ |
+| 11 | Rect plate kind-3 hole rim; analytic torus | open |
+| 12 | **Working draw app** (see `CAD_APP_PATH.md`) | next product |
 
 DXF chosen as profile bootstrap (not STEP — STEP is solid interchange). SVG remains available for 2D image work outside the solid kernel.
 

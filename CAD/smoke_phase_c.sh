@@ -34,6 +34,13 @@ test -s test-stl/cad_fillet_cyl_direct.stp
 # lathe: n_rings=8 (2+6), n_ang=24 → caps 2 + sides 7*24 = 2+168 = 170 faces
 test "$(grep -c ADVANCED_FACE test-stl/cad_fillet_cyl_direct.stp)" -eq 170
 
+echo "[phase_c] plane-cyl bottom + washer hole rim"
+./ailang.x CAD/demo_fillet_cyl_more.ailang -o /tmp/dfcm && /tmp/dfcm
+test -s test-stl/cad_fillet_cyl_bot.stp
+test -s test-stl/cad_fillet_washer_hole.stp
+# washer closed lathe: n_prof=4+6=10, faces = 10*24 = 240
+test "$(grep -c ADVANCED_FACE test-stl/cad_fillet_washer_hole.stp)" -eq 240
+
 echo "[phase_c] rotate"
 ./ailang.x CAD/demo_rotate.ailang -o /tmp/drot && /tmp/drot
 test -s test-stl/cad_rotate_z.stp

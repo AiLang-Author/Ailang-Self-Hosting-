@@ -21,8 +21,9 @@
 | Op | Domain |
 |----|--------|
 | ChamferEdge / ChamferEdges | **Vertical:** kind-0 prism full-height edges → base-loop cut + `MakePolyPrism`. **Horizontal:** AABB box full-span top/bottom edge → YZ/XZ profile extrude + axis remap + `RebuildKind0Planes` |
-| FilletEdge plane–cyl | kind-1 cylinder **top circular rim** only; R&lt;r and R&lt;h → `MakeCylinderTopFillet` (lathe RZ, kind-0). Bottom rim / hole (concave) open |
-| MakeLatheSolid | RZ profile × n_ang revolution shell |
+| FilletEdge plane–cyl | kind-1 **top or bottom** circular rim → lathe rebuild. **Washer hole top** via `FilletWasherHoleTop` / `MakeWasherTopInnerFillet` (closed lathe). Rect plate kind-3 hole rim still open |
+| MakeLatheSolid | open RZ profile + caps |
+| MakeLatheClosed | closed RZ profile (washer / tube of revolution) |
 | Difference cyl−cyl | coaxial, same height/base, ra>rb → MakeAnnulusPrism |
 | RotateSolidZ | kind 0 verts (all shells); kind 1/2 axis; kind 3 plate; kind 4 sphere |
 | CloneKind0 | first shell only; plane faces + line edges; ≤256 verts |
