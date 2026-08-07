@@ -1,15 +1,13 @@
-/* cad_host_x11 — present ARGB frames from cad_app, send key commands back.
+/* cad_host_x11 — present ARGB frames; keys + mouse → cmd.txt
  *
- * Protocol (state directory, default /tmp/cad_app):
- *   meta.bin   3× int32 LE: width, height, pitch
- *   frame.raw  pitch*height bytes ARGB (or XRGB) little-endian
- *   gen.txt    integer generation counter (app writes after each frame)
- *   cmd.txt    host writes one-line command, app reads & truncates
- *   status.txt app writes status line for window title
+ * Protocol (/tmp/cad_app by default):
+ *   meta.bin frame.raw gen.txt cmd.txt status.txt
  *
- * Keys → cmd:
- *   q/Esc quit | r repad | w wire | 1/2/3 view | [ ] height
- *   s save STEP | b save BMP | +/- height fine
+ * Keys:
+ *   q quit | r pad/repad | w wire | 1/2/3 view | [ ] height
+ *   s STEP | b BMP | m sketch/3d mode | l line | e rect | c circle | n new sketch
+ *   x export DXF
+ * Mouse LMB: click <px> <py>  (window coords; app maps to sketch/view)
  *
  * Build: cc -O2 -o cad_host_x11 cad_host_x11.c -lX11
  */
@@ -23,7 +21,6 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <stdint.h>
-#include <errno.h>
 
 static char g_dir[512];
 static char path_meta[600], path_frame[600], path_gen[600], path_cmd[600], path_status[600];
@@ -110,7 +107,7 @@ int main(int argc, char **argv) {
     Window win = XCreateSimpleWindow(dpy, root, 40, 40, win_w, win_h, 1,
                                      BlackPixel(dpy, screen), BlackPixel(dpy, screen));
     XStoreName(dpy, win, "AILang CAD");
-    XSelectInput(dpy, win, ExposureMask | KeyPressMask | StructureNotifyMask);
+    XSelectInput(dpy, win, ExposureMask | KeyPressMask | ButtonPressMask | StructureNotifyMask);
     XMapWindow(dpy, win);
 
     GC gc = DefaultGC(dpy, screen);
@@ -119,8 +116,13 @@ int main(int argc, char **argv) {
     int fw = 0, fh = 0, pitch = 0;
     int last_gen = -1;
     int running = 1;
+    int ox = 0, oy = 0;
 
-    fprintf(stderr, "cad_host_x11: watching %s  (q quit, r repad, [/] height, w wire, 1-3 view, s STEP, b BMP)\n", dir);
+    fprintf(stderr,
+        "cad_host_x11: %s\n"
+        "  q quit | m mode | l line | e rect | c circle | n new | r pad\n"
+        "  w wire | 1-3 view | [ ] height | s STEP | b BMP | x DXF export\n"
+        "  LMB click in sketch mode to place points\n", dir);
 
     while (running) {
         while (XPending(dpy)) {
@@ -129,15 +131,32 @@ int main(int argc, char **argv) {
             if (ev.type == KeyPress) {
                 KeySym ks = XLookupKeysym(&ev.xkey, 0);
                 if (ks == XK_q || ks == XK_Escape) { write_cmd("quit"); running = 0; }
-                else if (ks == XK_r || ks == XK_R) write_cmd("repad");
+                else if (ks == XK_r || ks == XK_R || ks == XK_Return) write_cmd("repad");
                 else if (ks == XK_w || ks == XK_W) write_cmd("wire");
                 else if (ks == XK_s || ks == XK_S) write_cmd("step");
                 else if (ks == XK_b || ks == XK_B) write_cmd("bmp");
+                else if (ks == XK_m || ks == XK_M || ks == XK_Tab) write_cmd("mode");
+                else if (ks == XK_l || ks == XK_L) write_cmd("tool_line");
+                else if (ks == XK_e || ks == XK_E) write_cmd("tool_rect");
+                else if (ks == XK_c || ks == XK_C) write_cmd("tool_circ");
+                else if (ks == XK_n || ks == XK_N) write_cmd("new");
+                else if (ks == XK_x || ks == XK_X) write_cmd("dxf");
                 else if (ks == XK_1) write_cmd("view0");
                 else if (ks == XK_2) write_cmd("view1");
                 else if (ks == XK_3) write_cmd("view2");
                 else if (ks == XK_bracketleft || ks == XK_minus) write_cmd("hdec");
                 else if (ks == XK_bracketright || ks == XK_plus || ks == XK_equal) write_cmd("hinc");
+            } else if (ev.type == ButtonPress && ev.xbutton.button == Button1) {
+                int mx = ev.xbutton.x;
+                int my = ev.xbutton.y;
+                /* map window click → frame pixel (account for centering) */
+                int fx = mx - ox;
+                int fy = my - oy;
+                if (fx >= 0 && fy >= 0 && fx < fw && fy < fh) {
+                    char cmd[64];
+                    snprintf(cmd, sizeof cmd, "click %d %d", fx, fy);
+                    write_cmd(cmd);
+                }
             } else if (ev.type == ConfigureNotify) {
                 win_w = ev.xconfigure.width;
                 win_h = ev.xconfigure.height;
@@ -154,7 +173,6 @@ int main(int argc, char **argv) {
                 fw = nw; fh = nh; pitch = npitch;
                 last_gen = gen;
                 if (ximg) { ximg->data = NULL; XDestroyImage(ximg); ximg = NULL; }
-                /* X11 wants ZPixmap 32bpp; our buffer is BGRA/ARGB little-endian on LE */
                 ximg = XCreateImage(dpy, DefaultVisual(dpy, screen), 24, ZPixmap, 0,
                                     (char *)pix, fw, fh, 32, pitch);
                 if (ximg) {
@@ -173,9 +191,8 @@ int main(int argc, char **argv) {
         }
 
         if (ximg && pix) {
-            /* center if window larger */
-            int ox = (win_w - fw) / 2;
-            int oy = (win_h - fh) / 2;
+            ox = (win_w - fw) / 2;
+            oy = (win_h - fh) / 2;
             if (ox < 0) ox = 0;
             if (oy < 0) oy = 0;
             XPutImage(dpy, win, gc, ximg, 0, 0, ox, oy, fw, fh);

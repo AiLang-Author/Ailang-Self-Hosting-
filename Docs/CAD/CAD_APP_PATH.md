@@ -22,12 +22,10 @@ Kernel fills an ARGB buffer; host window blits it. AOS is a later presenter.
 
 | ID | Deliverable |
 |----|-------------|
-| **M-B** | Hosted window, load DXF, pad, live redraw, export STEP |
-| **M-C** | In-window sketch edit → re-pad |
-| **M-D** | LMB orbit, scroll zoom, **nav cube** |
-| **M-E** | Pocket / edge fillet-chamfer pick |
-
-Order: **B → C → D** (edit loop before fancy nav). Orbit/cube can start after B3.
+| **M-B** | Hosted window, load DXF, pad, live redraw, export STEP | **done** |
+| **M-C** | In-window sketch edit → re-pad | **done** |
+| **M-D** | LMB orbit, scroll zoom, **nav cube** | next |
+| **M-E** | Pocket / edge fillet-chamfer pick | later |
 
 ---
 
@@ -62,4 +60,4 @@ cc -O2 -o CAD/host/cad_host_x11 CAD/host/cad_host_x11.c -lX11
 
 ## Next
 
-**M-C** sketch edit in window · **M-D** orbit + nav cube (see `CAD_APP_PLAN.md`).
+**M-D** orbit + scroll zoom + nav cube (see `CAD_APP_PLAN.md`).

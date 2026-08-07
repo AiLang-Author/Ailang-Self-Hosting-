@@ -5,14 +5,15 @@
 **Headless BMP** = bootstrap / CI / agents only, not the daily path.  
 **Pairs with:** `CAD_APP_PATH.md`, `CAD_CLI.md`, `CAD_OCC_CAPABILITY_AUDIT.md`.
 
-### M-B shipped
+### M-B + M-C shipped
 
 | Piece | Path |
 |-------|------|
 | Buffer render | `CAD_View.RenderSolidToFB` / `WriteFBRaw` |
 | App | `cad_app.x` / `CAD/cad_app.ailang` |
-| Host presenter | `CAD/host/cad_host_x11` (X11 blit + keys → `/tmp/cad_app/cmd.txt`) |
-| Headless gate | `./CAD/smoke_app.sh` |
+| Host presenter | `CAD/host/cad_host_x11` (blit + keys + **LMB click**) |
+| Sketch edit | mode `m`, tools `l`/`e`/`c`, pad `r`, new `n`, export DXF `x` |
+| Headless gate | `./CAD/smoke_app.sh` (includes `--sketch-demo`) |
 
 ```bash
 # CI
@@ -22,7 +23,7 @@
 cc -O2 -o CAD/host/cad_host_x11 CAD/host/cad_host_x11.c -lX11
 ./ailang.x CAD/cad_app.ailang -o cad_app.x
 ./cad_app.x -i test-stl/test-dxf-files/cube.dxf -H 10
-# keys in host: q r w 1 2 3 [ ] s b
+# m sketch | l line e rect c circle | LMB place | r pad | 1-3 view | [ ] H | s/b/x export
 ```
 
 ---
