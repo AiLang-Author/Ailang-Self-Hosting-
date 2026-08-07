@@ -222,7 +222,7 @@ Historic design note “equal-R → sphere sector” is **superseded** for the e
 | Hole | Circle → cyl → Difference | **restricted** plate/side |
 | Revolve | Profile about axis | **done** full 360° rect → cyl/annulus |
 | Fillet | Edge blend | **plane–plane + equal-R digon ✓** |
-| Chamfer | Vertical equal-setback | **general prism** `ChamferEdge(s)` ✓; horizontal open |
+| Chamfer | Equal-setback strip | **vertical** general prism ✓; **horizontal** AABB box top/bottom ✓ |
 | Loft | Two profiles → ruled solid | **done** `LoftProfiles` / `MakeRuledSolid` |
 | Sweep | Profile + path | **done** `SweepProfile` / `MakePathSweepSolid` (Z-changing path) |
 | Pattern / mirror | Clone + transform | **done** kind-0 any poly (not only AABB box) |
@@ -256,7 +256,8 @@ Historic design note “equal-R → sphere sector” is **superseded** for the e
 | 5 | Revolve, draft, pad/cut, Part Design pattern | ✓ |
 | 6 | Loft / sweep / non-box pattern | ✓ |
 | 7 | Vertical chamfer general prism | ✓ |
-| 8 | Plane–cyl fillet, horizontal chamfer, unequal-R globe | open |
+| 8 | Horizontal box chamfer | ✓ |
+| 9 | Plane–cyl fillet, unequal-R globe | open |
 
 DXF chosen as profile bootstrap (not STEP — STEP is solid interchange). SVG remains available for 2D image work outside the solid kernel.
 
@@ -313,6 +314,8 @@ Regenerate via individual demos or `CAD/demo_regen_all.ailang` where listed.
 | 2026-08-07 | Phase A/B/C + Part Design pattern/mirror/shell | smoke green |
 | 2026-08-07 | CloneKind0; Loft/Sweep; pattern of diamond (non-box) | `smoke_part_design` green |
 | 2026-08-07 | PD edge/negative honesty (`demo_pd_edges`) | refuse paths + multi-seg/mirror diamond |
+| 2026-08-07 | General vertical chamfer (`ChamferEdges`, diamond, multi) | `smoke_phase_c` green |
+| 2026-08-07 | Horizontal box chamfer (top/bot X and Y edges) | `demo_chamfer_horiz` green |
 
 ---
 

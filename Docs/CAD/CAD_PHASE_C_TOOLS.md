@@ -20,7 +20,7 @@
 
 | Op | Domain |
 |----|--------|
-| ChamferEdge / ChamferEdges | kind-0 **prism** (box/poly/prior chamfer); full-height vertical edges; equal setback D along base edges; rebuild `MakePolyPrism` |
+| ChamferEdge / ChamferEdges | **Vertical:** kind-0 prism full-height edges → base-loop cut + `MakePolyPrism`. **Horizontal:** AABB box full-span top/bottom edge → YZ/XZ profile extrude + axis remap + `RebuildKind0Planes` |
 | Difference cyl−cyl | coaxial, same height/base, ra>rb → MakeAnnulusPrism |
 | RotateSolidZ | kind 0 verts (all shells); kind 1/2 axis; kind 3 plate; kind 4 sphere |
 | CloneKind0 | first shell only; plane faces + line edges; ≤256 verts |

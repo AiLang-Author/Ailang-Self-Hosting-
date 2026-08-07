@@ -20,6 +20,13 @@ test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_seq.stp)" -eq 8
 # diamond one corner: 4→5 verts → 7 faces
 test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_diamond.stp)" -eq 7
 
+echo "[phase_c] chamfer horizontal box"
+./ailang.x CAD/demo_chamfer_horiz.ailang -o /tmp/dchh && /tmp/dchh
+# 5-gon profile extruded: 2+5 = 7 faces each
+test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_horiz.stp)" -eq 7
+test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_horiz_y.stp)" -eq 7
+test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_horiz_bot.stp)" -eq 7
+
 echo "[phase_c] rotate"
 ./ailang.x CAD/demo_rotate.ailang -o /tmp/drot && /tmp/drot
 test -s test-stl/cad_rotate_z.stp
