@@ -257,7 +257,8 @@ Historic design note “equal-R → sphere sector” is **superseded** for the e
 | 6 | Loft / sweep / non-box pattern | ✓ |
 | 7 | Vertical chamfer general prism | ✓ |
 | 8 | Horizontal box chamfer | ✓ |
-| 9 | Plane–cyl fillet, unequal-R globe | open |
+| 9 | Plane–cyl fillet cyl top rim | ✓ |
+| 10 | Hole rim (concave) plane–cyl, unequal-R globe | open |
 
 DXF chosen as profile bootstrap (not STEP — STEP is solid interchange). SVG remains available for 2D image work outside the solid kernel.
 
@@ -316,6 +317,7 @@ Regenerate via individual demos or `CAD/demo_regen_all.ailang` where listed.
 | 2026-08-07 | PD edge/negative honesty (`demo_pd_edges`) | refuse paths + multi-seg/mirror diamond |
 | 2026-08-07 | General vertical chamfer (`ChamferEdges`, diamond, multi) | `smoke_phase_c` green |
 | 2026-08-07 | Horizontal box chamfer (top/bot X and Y edges) | `demo_chamfer_horiz` green |
+| 2026-08-07 | Plane–cyl fillet: cyl top rim via MakeLatheSolid | `demo_fillet_cyl` green |
 
 ---
 

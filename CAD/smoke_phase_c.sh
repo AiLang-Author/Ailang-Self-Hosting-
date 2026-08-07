@@ -27,6 +27,13 @@ test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_horiz.stp)" -eq 7
 test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_horiz_y.stp)" -eq 7
 test "$(grep -c ADVANCED_FACE test-stl/cad_chamfer_horiz_bot.stp)" -eq 7
 
+echo "[phase_c] plane-cyl fillet (cyl top rim)"
+./ailang.x CAD/demo_fillet_cyl.ailang -o /tmp/dfc && /tmp/dfc
+test -s test-stl/cad_fillet_cyl_top.stp
+test -s test-stl/cad_fillet_cyl_direct.stp
+# lathe: n_rings=8 (2+6), n_ang=24 → caps 2 + sides 7*24 = 2+168 = 170 faces
+test "$(grep -c ADVANCED_FACE test-stl/cad_fillet_cyl_direct.stp)" -eq 170
+
 echo "[phase_c] rotate"
 ./ailang.x CAD/demo_rotate.ailang -o /tmp/drot && /tmp/drot
 test -s test-stl/cad_rotate_z.stp

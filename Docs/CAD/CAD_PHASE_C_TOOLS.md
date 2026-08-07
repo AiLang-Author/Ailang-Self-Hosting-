@@ -9,7 +9,7 @@
 |-----|------|--------|
 | **C1** | Hole tool (existing CreateHole) | done earlier |
 | **C2** | Poly pocket / through cut | B2 ExtrudeCut poly |
-| **C3** | Plane–cyl fillet | open |
+| **C3** | Plane–cyl fillet (cyl top rim) | **done** `FilletCylTopRim` / lathe |
 | **C4** | Chamfer vertical (general prism) | **done** `ChamferEdge` / `ChamferEdges` |
 | **C5** | Bool domain: coaxial cyl−cyl | **done** → annulus |
 | **C6** | Rigid transform | **done** Translate + `RotateSolidZ` + multi-shell walk |
@@ -21,6 +21,8 @@
 | Op | Domain |
 |----|--------|
 | ChamferEdge / ChamferEdges | **Vertical:** kind-0 prism full-height edges → base-loop cut + `MakePolyPrism`. **Horizontal:** AABB box full-span top/bottom edge → YZ/XZ profile extrude + axis remap + `RebuildKind0Planes` |
+| FilletEdge plane–cyl | kind-1 cylinder **top circular rim** only; R&lt;r and R&lt;h → `MakeCylinderTopFillet` (lathe RZ, kind-0). Bottom rim / hole (concave) open |
+| MakeLatheSolid | RZ profile × n_ang revolution shell |
 | Difference cyl−cyl | coaxial, same height/base, ra>rb → MakeAnnulusPrism |
 | RotateSolidZ | kind 0 verts (all shells); kind 1/2 axis; kind 3 plate; kind 4 sphere |
 | CloneKind0 | first shell only; plane faces + line edges; ≤256 verts |
