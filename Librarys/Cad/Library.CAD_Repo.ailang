@@ -1,23 +1,241 @@
-// CAD Kernel — Clean-Sheet Geometric Engine in AILang
-// Layer 7: CAD.Repo — PostgreSQL system of record (design v3.1; no .cadx)
-// Product open/save/session/revision path. Hot geometry stays in CAD_Store slabs.
+// CAD.Repo — PostgreSQL system of record (design v3.1; no .cadx)
+// Driver: Library.PostgreSQL_Complete (wire protocol v3, Unix + TCP).
+//
+// Orthogonal model:
+//   cad_document  → identity (name, kind, meta JSONB)
+//   cad_revision  → history (feature_tree JSONB, params JSONB, message)
+//   cad_asset     → role-tagged payloads (profile_dxf, hole_dxf, step_cache, …)
+// Hot geometry stays in CAD_Store; PG is open/save/list for the product.
+// New feature kinds / caches = new asset roles or JSON keys — not new tables.
 
 LibraryImport.PostgreSQL_Complete
-LibraryImport.CAD_Sys
-LibraryImport.CAD_Store
+LibraryImport.StringUtils
+LibraryImport.Arrays
+LibraryImport.Hash
+LibraryImport.Cad.CAD_Sys
+LibraryImport.Cad.CAD_Store
+LibraryImport.Cad.CAD_Num
+LibraryImport.Cad.CAD_DXF
+LibraryImport.Cad.CAD_Feat
+LibraryImport.Cad.CAD_IO
 
 FixedPool.CAD_Repo_State {
-    "db_connected": Initialize=0
-    "part_count":   Initialize=0
-    "feat_count":   Initialize=0
-    "rev_count":    Initialize=0
-    "plugin_count": Initialize=0
-    "wb_count":     Initialize=0
-    "last_conn_fd": Initialize=0
+    "db_connected": Initialize=0, CanChange=True
+    "part_count":   Initialize=0, CanChange=True
+    "feat_count":   Initialize=0, CanChange=True
+    "rev_count":    Initialize=0, CanChange=True
+    "plugin_count": Initialize=0, CanChange=True
+    "wb_count":     Initialize=0, CanChange=True
+    "last_conn":    Initialize=0, CanChange=True
+    "last_error":   Initialize=0, CanChange=True
+    "last_doc_id":  Initialize=0, CanChange=True
+    "last_rev":     Initialize=0, CanChange=True
+    "session_id":   Initialize=0, CanChange=True
 }
 
 // -------------------------------------------------------------------------
-// 1. Connection Engine (Unix Domain Socket & TCP Support)
+// Helpers
+// -------------------------------------------------------------------------
+
+Function.CAD_Repo.IsSafeName {
+    Input: name_addr: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name_addr, 0) ThenBlock: { ReturnValue(0) }
+        n = StringLength(name_addr)
+        IfCondition LessThan(n, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(n, 64) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            c = GetByte(name_addr, i)
+            ok = 0
+            IfCondition GreaterEqual(c, 48) ThenBlock: {
+                IfCondition LessEqual(c, 57) ThenBlock: { ok = 1 }
+            }
+            IfCondition GreaterEqual(c, 65) ThenBlock: {
+                IfCondition LessEqual(c, 90) ThenBlock: { ok = 1 }
+            }
+            IfCondition GreaterEqual(c, 97) ThenBlock: {
+                IfCondition LessEqual(c, 122) ThenBlock: { ok = 1 }
+            }
+            IfCondition EqualTo(c, 95) ThenBlock: { ok = 1 }
+            IfCondition EqualTo(c, 45) ThenBlock: { ok = 1 }
+            IfCondition EqualTo(c, 46) ThenBlock: { ok = 1 }
+            IfCondition EqualTo(ok, 0) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.CAD_Repo.AppendStr {
+    Input: dst: Address
+    Input: pos: Integer
+    Input: src: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(pos) }
+        i = 0
+        WhileLoop NotEqual(GetByte(src, i), 0) {
+            SetByte(dst, pos, GetByte(src, i))
+            pos = Add(pos, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(pos)
+    }
+}
+
+Function.CAD_Repo.AppendInt {
+    Input: dst: Address
+    Input: pos: Integer
+    Input: val: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(val, 0) ThenBlock: {
+            SetByte(dst, pos, 45)
+            pos = Add(pos, 1)
+            val = Subtract(0, val)
+        }
+        IfCondition EqualTo(val, 0) ThenBlock: {
+            SetByte(dst, pos, 48)
+            ReturnValue(Add(pos, 1))
+        }
+        tmp = Allocate(24)
+        n = 0
+        WhileLoop GreaterThan(val, 0) {
+            SetByte(tmp, n, Add(48, Modulo(val, 10)))
+            val = Divide(val, 10)
+            n = Add(n, 1)
+        }
+        i = Subtract(n, 1)
+        WhileLoop GreaterEqual(i, 0) {
+            SetByte(dst, pos, GetByte(tmp, i))
+            pos = Add(pos, 1)
+            i = Subtract(i, 1)
+        }
+        Deallocate(tmp, 24)
+        ReturnValue(pos)
+    }
+}
+
+// Dollar-quote body: $c$ … $c$
+Function.CAD_Repo.AppendDollar {
+    Input: dst: Address
+    Input: pos: Integer
+    Input: body: Address
+    Output: Integer
+    Body: {
+        SetByte(dst, pos, 36)
+        SetByte(dst, Add(pos, 1), 99)
+        SetByte(dst, Add(pos, 2), 36)
+        pos = Add(pos, 3)
+        IfCondition NotEqual(body, 0) ThenBlock: {
+            i = 0
+            WhileLoop NotEqual(GetByte(body, i), 0) {
+                SetByte(dst, pos, GetByte(body, i))
+                pos = Add(pos, 1)
+                i = Add(i, 1)
+            }
+        }
+        SetByte(dst, pos, 36)
+        SetByte(dst, Add(pos, 1), 99)
+        SetByte(dst, Add(pos, 2), 36)
+        ReturnValue(Add(pos, 3))
+    }
+}
+
+// Parse decimal digits from C-string → Integer (0 if empty/bad).
+Function.CAD_Repo.ParseIntStr {
+    Input: s: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(s, 0) ThenBlock: { ReturnValue(0) }
+        v = 0
+        i = 0
+        got = 0
+        WhileLoop NotEqual(GetByte(s, i), 0) {
+            ch = GetByte(s, i)
+            IfCondition GreaterEqual(ch, 48) ThenBlock: {
+                IfCondition LessEqual(ch, 57) ThenBlock: {
+                    v = Add(Multiply(v, 10), Subtract(ch, 48))
+                    got = 1
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(got, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(v)
+    }
+}
+
+Function.CAD_Repo.ReadFileAll {
+    Input: path: Address
+    Input: out_addr: Address
+    Input: max_cap: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(-1) }
+        fd = CAD_Sys.Open(path, 0, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(-1) }
+        buf = Allocate(max_cap)
+        n = CAD_Sys.Read(fd, buf, Subtract(max_cap, 1))
+        CAD_Sys.Close(fd)
+        IfCondition LessThan(n, 0) ThenBlock: {
+            Deallocate(buf, max_cap)
+            ReturnValue(-1)
+        }
+        SetByte(buf, n, 0)
+        ArraySet(out_addr, 0, buf)
+        ReturnValue(n)
+    }
+}
+
+// Exec SQL that returns no useful rows (DDL / INSERT). 0 = ok.
+Function.CAD_Repo.Exec {
+    Input: sql: Address
+    Output: Integer
+    Body: {
+        conn = CAD_Repo_State.last_conn
+        IfCondition EqualTo(conn, 0) ThenBlock: {
+            CAD_Repo_State.last_error = -1
+            ReturnValue(-1)
+        }
+        res = PG_Query(conn, sql)
+        IfCondition EqualTo(res, 0) ThenBlock: {
+            CAD_Repo_State.last_error = -2
+            ReturnValue(-2)
+        }
+        PG_DestroyResult(res)
+        CAD_Repo_State.last_error = 0
+        ReturnValue(0)
+    }
+}
+
+// Query one integer column from first row. Returns value or -1 on fail.
+// col_name is SQL alias string e.g. "id"
+Function.CAD_Repo.QueryInt1 {
+    Input: sql: Address
+    Input: col_name: Address
+    Output: Integer
+    Body: {
+        conn = CAD_Repo_State.last_conn
+        IfCondition EqualTo(conn, 0) ThenBlock: { ReturnValue(-1) }
+        res = PG_Query(conn, sql)
+        IfCondition EqualTo(res, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition LessThan(Array.Size(res), 1) ThenBlock: {
+            PG_DestroyResult(res)
+            ReturnValue(-1)
+        }
+        row = Array.Get(res, 0)
+        s = Hash.Get(row, col_name)
+        v = CAD_Repo.ParseIntStr(s)
+        PG_DestroyResult(res)
+        ReturnValue(v)
+    }
+}
+
+// -------------------------------------------------------------------------
+// Connection (PostgreSQL_Complete)
 // -------------------------------------------------------------------------
 
 Function.CAD_Repo.Connect {
@@ -28,40 +246,671 @@ Function.CAD_Repo.Connect {
     Input: pass_addr: Address
     Output: Integer
     Body: {
-        IfCondition EqualTo(port, 0) ThenBlock: {
-            port = 5432
-        }
-
-        // Try Unix domain socket connection first (/var/run/postgresql or /tmp)
+        IfCondition EqualTo(port, 0) ThenBlock: { port = 5432 }
+        IfCondition EqualTo(db_name_addr, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(user_addr, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(pass_addr, 0) ThenBlock: { pass_addr = "" }
         conn = PG_ConnectUnix("/var/run/postgresql", port, db_name_addr, user_addr, pass_addr)
         IfCondition EqualTo(conn, 0) ThenBlock: {
             conn = PG_ConnectUnix("/tmp", port, db_name_addr, user_addr, pass_addr)
         }
-
-        IfCondition LessEqual(conn, 0) ThenBlock: {
-            ReturnValue(-16) // CAD_E_IO
+        IfCondition EqualTo(conn, 0) ThenBlock: {
+            IfCondition NotEqual(host_addr, 0) ThenBlock: {
+                conn = PG_Connect(host_addr, port, db_name_addr, user_addr, pass_addr)
+            }
         }
-
-        CAD_Repo_State.last_conn_fd = conn
+        IfCondition EqualTo(conn, 0) ThenBlock: {
+            CAD_Repo_State.db_connected = 0
+            CAD_Repo_State.last_conn = 0
+            CAD_Repo_State.last_error = -16
+            ReturnValue(-16)
+        }
+        CAD_Repo_State.last_conn = conn
         CAD_Repo_State.db_connected = 1
-        ReturnValue(0) // CAD_OK
+        CAD_Repo_State.last_error = 0
+        ReturnValue(0)
     }
 }
 
+Function.CAD_Repo.ConnectLocal {
+    Output: Integer
+    Body: {
+        ReturnValue(CAD_Repo.Connect("127.0.0.1", 5432, "cad_db", "bob", ""))
+    }
+}
+
+Function.CAD_Repo.Disconnect {
+    Output: Integer
+    Body: {
+        IfCondition NotEqual(CAD_Repo_State.last_conn, 0) ThenBlock: {
+            PG_Disconnect(CAD_Repo_State.last_conn)
+        }
+        CAD_Repo_State.last_conn = 0
+        CAD_Repo_State.db_connected = 0
+        CAD_Repo_State.session_id = 0
+        ReturnValue(0)
+    }
+}
+
+// Idempotent orthogonal schema (subset of CAD/sql/cad_schema.sql).
 Function.CAD_Repo.InitSchema {
     Input: conn_fd: Integer
     Output: Integer
     Body: {
-        IfCondition EqualTo(conn_fd, 0) ThenBlock: {
-            conn_fd = CAD_Repo_State.last_conn_fd
+        IfCondition EqualTo(CAD_Repo_State.last_conn, 0) ThenBlock: {
+            IfCondition NotEqual(conn_fd, 0) ThenBlock: {
+                CAD_Repo_State.last_conn = conn_fd
+                CAD_Repo_State.db_connected = 1
+            }
         }
-        IfCondition EqualTo(conn_fd, 0) ThenBlock: {
-            ReturnValue(0)
-        }
-
-        ReturnValue(0) // CAD_OK
+        IfCondition EqualTo(CAD_Repo_State.last_conn, 0) ThenBlock: { ReturnValue(-1) }
+        sql = Allocate(4096)
+        pos = 0
+        pos = CAD_Repo.AppendStr(sql, pos, "CREATE TABLE IF NOT EXISTS cad_project (")
+        pos = CAD_Repo.AppendStr(sql, pos, "id BIGSERIAL PRIMARY KEY,name TEXT NOT NULL UNIQUE,")
+        pos = CAD_Repo.AppendStr(sql, pos, "meta JSONB NOT NULL DEFAULT '{}',created_at TIMESTAMPTZ NOT NULL DEFAULT now());")
+        pos = CAD_Repo.AppendStr(sql, pos, "CREATE TABLE IF NOT EXISTS cad_document (")
+        pos = CAD_Repo.AppendStr(sql, pos, "id BIGSERIAL PRIMARY KEY,project_id BIGINT,")
+        pos = CAD_Repo.AppendStr(sql, pos, "name TEXT NOT NULL UNIQUE,kind TEXT NOT NULL DEFAULT 'part',")
+        pos = CAD_Repo.AppendStr(sql, pos, "meta JSONB NOT NULL DEFAULT '{}',latest_rev INTEGER NOT NULL DEFAULT 0,")
+        pos = CAD_Repo.AppendStr(sql, pos, "created_at TIMESTAMPTZ NOT NULL DEFAULT now(),")
+        pos = CAD_Repo.AppendStr(sql, pos, "updated_at TIMESTAMPTZ NOT NULL DEFAULT now());")
+        pos = CAD_Repo.AppendStr(sql, pos, "CREATE TABLE IF NOT EXISTS cad_revision (")
+        pos = CAD_Repo.AppendStr(sql, pos, "id BIGSERIAL PRIMARY KEY,doc_id BIGINT NOT NULL REFERENCES cad_document(id) ON DELETE CASCADE,")
+        pos = CAD_Repo.AppendStr(sql, pos, "rev INTEGER NOT NULL,parent_rev INTEGER,message TEXT NOT NULL DEFAULT '',")
+        pos = CAD_Repo.AppendStr(sql, pos, "author TEXT NOT NULL DEFAULT '',feature_tree JSONB NOT NULL DEFAULT '[]',")
+        pos = CAD_Repo.AppendStr(sql, pos, "params JSONB NOT NULL DEFAULT '{}',created_at TIMESTAMPTZ NOT NULL DEFAULT now(),")
+        pos = CAD_Repo.AppendStr(sql, pos, "UNIQUE(doc_id,rev));")
+        pos = CAD_Repo.AppendStr(sql, pos, "CREATE TABLE IF NOT EXISTS cad_asset (")
+        pos = CAD_Repo.AppendStr(sql, pos, "id BIGSERIAL PRIMARY KEY,rev_id BIGINT NOT NULL REFERENCES cad_revision(id) ON DELETE CASCADE,")
+        pos = CAD_Repo.AppendStr(sql, pos, "role TEXT NOT NULL,media_type TEXT NOT NULL DEFAULT 'text/plain',")
+        pos = CAD_Repo.AppendStr(sql, pos, "payload_text TEXT,payload_bytea BYTEA,meta JSONB NOT NULL DEFAULT '{}',")
+        pos = CAD_Repo.AppendStr(sql, pos, "UNIQUE(rev_id,role));")
+        pos = CAD_Repo.AppendStr(sql, pos, "CREATE TABLE IF NOT EXISTS cad_session (")
+        pos = CAD_Repo.AppendStr(sql, pos, "id BIGSERIAL PRIMARY KEY,user_name TEXT NOT NULL,")
+        pos = CAD_Repo.AppendStr(sql, pos, "started_at TIMESTAMPTZ NOT NULL DEFAULT now(),ended_at TIMESTAMPTZ,")
+        pos = CAD_Repo.AppendStr(sql, pos, "status TEXT NOT NULL DEFAULT 'active',meta JSONB NOT NULL DEFAULT '{}');")
+        pos = CAD_Repo.AppendStr(sql, pos, "CREATE TABLE IF NOT EXISTS cad_checkout (")
+        pos = CAD_Repo.AppendStr(sql, pos, "doc_id BIGINT PRIMARY KEY REFERENCES cad_document(id) ON DELETE CASCADE,")
+        pos = CAD_Repo.AppendStr(sql, pos, "session_id BIGINT,owner TEXT NOT NULL,acquired_at TIMESTAMPTZ NOT NULL DEFAULT now());")
+        pos = CAD_Repo.AppendStr(sql, pos, "CREATE TABLE IF NOT EXISTS cad_feature (")
+        pos = CAD_Repo.AppendStr(sql, pos, "id BIGSERIAL PRIMARY KEY,rev_id BIGINT NOT NULL REFERENCES cad_revision(id) ON DELETE CASCADE,")
+        pos = CAD_Repo.AppendStr(sql, pos, "feat_index INTEGER NOT NULL,kind TEXT NOT NULL,params JSONB NOT NULL DEFAULT '{}',")
+        pos = CAD_Repo.AppendStr(sql, pos, "suppressed BOOLEAN NOT NULL DEFAULT false,UNIQUE(rev_id,feat_index));")
+        pos = CAD_Repo.AppendStr(sql, pos, "INSERT INTO cad_project (name) VALUES ('default') ON CONFLICT (name) DO NOTHING;")
+        SetByte(sql, pos, 0)
+        rc = CAD_Repo.Exec(sql)
+        Deallocate(sql, 4096)
+        ReturnValue(rc)
     }
 }
+
+// -------------------------------------------------------------------------
+// Documents / revisions / assets
+// -------------------------------------------------------------------------
+
+// Ensure document row exists; set last_doc_id. Returns doc id or -1.
+Function.CAD_Repo.EnsureDocument {
+    Input: name_addr: Address
+    Input: height_i: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CAD_Repo.IsSafeName(name_addr), 0) ThenBlock: { ReturnValue(-1) }
+        q = Allocate(512)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "INSERT INTO cad_document (name,kind,meta) VALUES ('")
+        pos = CAD_Repo.AppendStr(q, pos, name_addr)
+        pos = CAD_Repo.AppendStr(q, pos, "','part','{\"height_mm\":")
+        pos = CAD_Repo.AppendInt(q, pos, height_i)
+        pos = CAD_Repo.AppendStr(q, pos, "}') ON CONFLICT (name) DO UPDATE SET meta=jsonb_set(COALESCE(cad_document.meta,'{}'),'{height_mm}',to_jsonb(")
+        pos = CAD_Repo.AppendInt(q, pos, height_i)
+        pos = CAD_Repo.AppendStr(q, pos, "),true),updated_at=now();")
+        SetByte(q, pos, 0)
+        CAD_Repo.Exec(q)
+        // SELECT id
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "SELECT id FROM cad_document WHERE name='")
+        pos = CAD_Repo.AppendStr(q, pos, name_addr)
+        pos = CAD_Repo.AppendStr(q, pos, "' LIMIT 1;")
+        SetByte(q, pos, 0)
+        id = CAD_Repo.QueryInt1(q, "id")
+        Deallocate(q, 512)
+        IfCondition LessThan(id, 1) ThenBlock: { ReturnValue(-1) }
+        CAD_Repo_State.last_doc_id = id
+        ReturnValue(id)
+    }
+}
+
+// Put text asset on revision (role open vocabulary).
+Function.CAD_Repo.PutAssetText {
+    Input: rev_id: Integer
+    Input: role: Address
+    Input: media: Address
+    Input: body: Address
+    Output: Integer
+    Body: {
+        IfCondition LessThan(rev_id, 1) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(role, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(media, 0) ThenBlock: { media = "text/plain" }
+        blen = StringLength(body)
+        qcap = Add(blen, 1024)
+        q = Allocate(qcap)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "INSERT INTO cad_asset (rev_id,role,media_type,payload_text) VALUES (")
+        pos = CAD_Repo.AppendInt(q, pos, rev_id)
+        pos = CAD_Repo.AppendStr(q, pos, ",'")
+        pos = CAD_Repo.AppendStr(q, pos, role)
+        pos = CAD_Repo.AppendStr(q, pos, "','")
+        pos = CAD_Repo.AppendStr(q, pos, media)
+        pos = CAD_Repo.AppendStr(q, pos, "',")
+        pos = CAD_Repo.AppendDollar(q, pos, body)
+        pos = CAD_Repo.AppendStr(q, pos, ") ON CONFLICT (rev_id,role) DO UPDATE SET payload_text=EXCLUDED.payload_text,media_type=EXCLUDED.media_type;")
+        SetByte(q, pos, 0)
+        rc = CAD_Repo.Exec(q)
+        Deallocate(q, qcap)
+        ReturnValue(rc)
+    }
+}
+
+// Fetch asset text for (doc name, rev, role) into /tmp path. Returns 0 ok.
+// rev<=0 means latest_rev on document.
+Function.CAD_Repo.FetchAssetToFile {
+    Input: name_addr: Address
+    Input: rev: Integer
+    Input: role: Address
+    Input: path: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CAD_Repo.IsSafeName(name_addr), 0) ThenBlock: { ReturnValue(-1) }
+        q = Allocate(768)
+        pos = 0
+        IfCondition GreaterThan(rev, 0) ThenBlock: {
+            pos = CAD_Repo.AppendStr(q, pos, "SELECT a.payload_text AS payload_text FROM cad_asset a ")
+            pos = CAD_Repo.AppendStr(q, pos, "JOIN cad_revision r ON r.id=a.rev_id JOIN cad_document d ON d.id=r.doc_id ")
+            pos = CAD_Repo.AppendStr(q, pos, "WHERE d.name='")
+            pos = CAD_Repo.AppendStr(q, pos, name_addr)
+            pos = CAD_Repo.AppendStr(q, pos, "' AND r.rev=")
+            pos = CAD_Repo.AppendInt(q, pos, rev)
+            pos = CAD_Repo.AppendStr(q, pos, " AND a.role='")
+            pos = CAD_Repo.AppendStr(q, pos, role)
+            pos = CAD_Repo.AppendStr(q, pos, "' LIMIT 1;")
+        }
+        IfCondition LessEqual(rev, 0) ThenBlock: {
+            pos = CAD_Repo.AppendStr(q, pos, "SELECT a.payload_text AS payload_text FROM cad_asset a ")
+            pos = CAD_Repo.AppendStr(q, pos, "JOIN cad_revision r ON r.id=a.rev_id JOIN cad_document d ON d.id=r.doc_id ")
+            pos = CAD_Repo.AppendStr(q, pos, "WHERE d.name='")
+            pos = CAD_Repo.AppendStr(q, pos, name_addr)
+            pos = CAD_Repo.AppendStr(q, pos, "' AND r.rev=d.latest_rev AND a.role='")
+            pos = CAD_Repo.AppendStr(q, pos, role)
+            pos = CAD_Repo.AppendStr(q, pos, "' LIMIT 1;")
+        }
+        SetByte(q, pos, 0)
+        res = PG_Query(CAD_Repo_State.last_conn, q)
+        Deallocate(q, 768)
+        IfCondition EqualTo(res, 0) ThenBlock: { ReturnValue(-2) }
+        IfCondition LessThan(Array.Size(res), 1) ThenBlock: {
+            PG_DestroyResult(res)
+            ReturnValue(-7)
+        }
+        row = Array.Get(res, 0)
+        body = Hash.Get(row, "payload_text")
+        IfCondition EqualTo(body, 0) ThenBlock: {
+            PG_DestroyResult(res)
+            ReturnValue(-8)
+        }
+        blen = StringLength(body)
+        copy = Allocate(Add(blen, 1))
+        i = 0
+        WhileLoop LessEqual(i, blen) {
+            SetByte(copy, i, GetByte(body, i))
+            i = Add(i, 1)
+        }
+        PG_DestroyResult(res)
+        fd = CAD_Sys.Open(path, 577, 420)
+        IfCondition LessThan(fd, 0) ThenBlock: {
+            Deallocate(copy, Add(blen, 1))
+            ReturnValue(-9)
+        }
+        CAD_Sys.Write(fd, copy, blen)
+        CAD_Sys.Close(fd)
+        Deallocate(copy, Add(blen, 1))
+        ReturnValue(0)
+    }
+}
+
+// Core save: new revision + assets. message may be empty.
+// pack_in unused; SysV 5-arg limit → hole_sk is 5th.
+Function.CAD_Repo.SavePartMsg {
+    Input: name_addr: Address
+    Input: sketch_handle: Integer
+    Input: solid_handle: Integer
+    Input: height_i: Integer
+    Input: hole_sk: Integer
+    Output: Integer
+    Body: {
+        // message stored as empty here; use SavePartWithMessage for text via temp later
+        ReturnValue(CAD_Repo.SavePartCore(name_addr, sketch_handle, solid_handle, height_i, hole_sk))
+    }
+}
+
+// Internal: create revision with assets. Message always '' for 5-arg path.
+Function.CAD_Repo.SavePartCore {
+    Input: name_addr: Address
+    Input: sketch_handle: Integer
+    Input: solid_handle: Integer
+    Input: height_i: Integer
+    Input: hole_sk: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CAD_Repo_State.last_conn, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(-4) }
+        IfCondition LessEqual(height_i, 0) ThenBlock: { height_i = 10 }
+        doc_id = CAD_Repo.EnsureDocument(name_addr, height_i)
+        IfCondition LessThan(doc_id, 1) ThenBlock: { ReturnValue(-3) }
+
+        // next rev
+        q = Allocate(256)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "SELECT COALESCE(MAX(rev),0)+1 AS n FROM cad_revision WHERE doc_id=")
+        pos = CAD_Repo.AppendInt(q, pos, doc_id)
+        pos = CAD_Repo.AppendStr(q, pos, ";")
+        SetByte(q, pos, 0)
+        new_rev = CAD_Repo.QueryInt1(q, "n")
+        IfCondition LessThan(new_rev, 1) ThenBlock: { new_rev = 1 }
+        parent = Subtract(new_rev, 1)
+
+        // INSERT revision with feature_tree JSON
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "INSERT INTO cad_revision (doc_id,rev,parent_rev,message,author,feature_tree,params) VALUES (")
+        pos = CAD_Repo.AppendInt(q, pos, doc_id)
+        pos = CAD_Repo.AppendStr(q, pos, ",")
+        pos = CAD_Repo.AppendInt(q, pos, new_rev)
+        pos = CAD_Repo.AppendStr(q, pos, ",")
+        IfCondition GreaterThan(parent, 0) ThenBlock: {
+            pos = CAD_Repo.AppendInt(q, pos, parent)
+        }
+        IfCondition LessEqual(parent, 0) ThenBlock: {
+            pos = CAD_Repo.AppendStr(q, pos, "NULL")
+        }
+        pos = CAD_Repo.AppendStr(q, pos, ",'','bob','[{\"op\":\"pad\",\"h\":")
+        pos = CAD_Repo.AppendInt(q, pos, height_i)
+        pos = CAD_Repo.AppendStr(q, pos, "}")
+        IfCondition NotEqual(hole_sk, 0) ThenBlock: {
+            pos = CAD_Repo.AppendStr(q, pos, ",{\"op\":\"through_hole\",\"asset\":\"hole_dxf\"}")
+        }
+        pos = CAD_Repo.AppendStr(q, pos, "]','{\"height_mm\":")
+        pos = CAD_Repo.AppendInt(q, pos, height_i)
+        pos = CAD_Repo.AppendStr(q, pos, "}');")
+        SetByte(q, pos, 0)
+        IfCondition NotEqual(CAD_Repo.Exec(q), 0) ThenBlock: {
+            Deallocate(q, 256)
+            ReturnValue(-5)
+        }
+        // revision id
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "SELECT id FROM cad_revision WHERE doc_id=")
+        pos = CAD_Repo.AppendInt(q, pos, doc_id)
+        pos = CAD_Repo.AppendStr(q, pos, " AND rev=")
+        pos = CAD_Repo.AppendInt(q, pos, new_rev)
+        pos = CAD_Repo.AppendStr(q, pos, " LIMIT 1;")
+        SetByte(q, pos, 0)
+        rev_id = CAD_Repo.QueryInt1(q, "id")
+        Deallocate(q, 256)
+        IfCondition LessThan(rev_id, 1) ThenBlock: { ReturnValue(-6) }
+
+        // bump document.latest_rev
+        q = Allocate(256)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "UPDATE cad_document SET latest_rev=")
+        pos = CAD_Repo.AppendInt(q, pos, new_rev)
+        pos = CAD_Repo.AppendStr(q, pos, ",updated_at=now() WHERE id=")
+        pos = CAD_Repo.AppendInt(q, pos, doc_id)
+        pos = CAD_Repo.AppendStr(q, pos, ";")
+        SetByte(q, pos, 0)
+        CAD_Repo.Exec(q)
+        Deallocate(q, 256)
+
+        // Export + put assets
+        slot = Allocate(16)
+        IfCondition NotEqual(CAD_DXF.ExportSketch(sketch_handle, "/tmp/cad_repo_part.dxf"), 0) ThenBlock: {
+            Deallocate(slot, 16)
+            ReturnValue(-7)
+        }
+        n_dxf = CAD_Repo.ReadFileAll("/tmp/cad_repo_part.dxf", slot, 262144)
+        IfCondition LessThan(n_dxf, 1) ThenBlock: {
+            Deallocate(slot, 16)
+            ReturnValue(-8)
+        }
+        dxf_buf = ArrayGet(slot, 0)
+        CAD_Repo.PutAssetText(rev_id, "profile_dxf", "application/dxf", dxf_buf)
+        Deallocate(dxf_buf, 262144)
+
+        IfCondition NotEqual(hole_sk, 0) ThenBlock: {
+            IfCondition EqualTo(CAD_DXF.ExportSketch(hole_sk, "/tmp/cad_repo_hole.dxf"), 0) ThenBlock: {
+                n_h = CAD_Repo.ReadFileAll("/tmp/cad_repo_hole.dxf", slot, 262144)
+                IfCondition GreaterThan(n_h, 0) ThenBlock: {
+                    hbuf = ArrayGet(slot, 0)
+                    CAD_Repo.PutAssetText(rev_id, "hole_dxf", "application/dxf", hbuf)
+                    Deallocate(hbuf, 262144)
+                }
+            }
+        }
+        IfCondition NotEqual(solid_handle, 0) ThenBlock: {
+            IfCondition EqualTo(CAD_IO.ExportSTEP(solid_handle, "/tmp/cad_repo_part.stp"), 0) ThenBlock: {
+                n_s = CAD_Repo.ReadFileAll("/tmp/cad_repo_part.stp", slot, 1048576)
+                IfCondition GreaterThan(n_s, 0) ThenBlock: {
+                    sbuf = ArrayGet(slot, 0)
+                    CAD_Repo.PutAssetText(rev_id, "step_cache", "model/step", sbuf)
+                    Deallocate(sbuf, 1048576)
+                }
+            }
+        }
+        Deallocate(slot, 16)
+
+        // optional normalized feature rows (searchable)
+        q = Allocate(512)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "INSERT INTO cad_feature (rev_id,feat_index,kind,params) VALUES (")
+        pos = CAD_Repo.AppendInt(q, pos, rev_id)
+        pos = CAD_Repo.AppendStr(q, pos, ",0,'pad','{\"height_mm\":")
+        pos = CAD_Repo.AppendInt(q, pos, height_i)
+        pos = CAD_Repo.AppendStr(q, pos, "}');")
+        SetByte(q, pos, 0)
+        CAD_Repo.Exec(q)
+        IfCondition NotEqual(hole_sk, 0) ThenBlock: {
+            pos = 0
+            pos = CAD_Repo.AppendStr(q, pos, "INSERT INTO cad_feature (rev_id,feat_index,kind,params) VALUES (")
+            pos = CAD_Repo.AppendInt(q, pos, rev_id)
+            pos = CAD_Repo.AppendStr(q, pos, ",1,'through_hole','{\"asset\":\"hole_dxf\"}');")
+            SetByte(q, pos, 0)
+            CAD_Repo.Exec(q)
+        }
+        Deallocate(q, 512)
+
+        CAD_Repo_State.last_rev = new_rev
+        CAD_Repo_State.part_count = Add(CAD_Repo_State.part_count, 1)
+        CAD_Repo_State.rev_count = Add(CAD_Repo_State.rev_count, 1)
+        CAD_Repo_State.feat_count = Add(CAD_Repo_State.feat_count, 1)
+        ReturnValue(0)
+    }
+}
+
+// Public save (compat)
+Function.CAD_Repo.SavePart {
+    Input: name_addr: Address
+    Input: sketch_handle: Integer
+    Input: solid_handle: Integer
+    Input: height_i: Integer
+    Input: hole_sk: Integer
+    Output: Integer
+    Body: {
+        ReturnValue(CAD_Repo.SavePartCore(name_addr, sketch_handle, solid_handle, height_i, hole_sk))
+    }
+}
+
+// Load latest (or specific rev if pack[4] preset — use rev<=0 for latest).
+// out_pack: [0]sketch [1]solid [2]height [3]hole_sk
+Function.CAD_Repo.LoadPart {
+    Input: name_addr: Address
+    Input: out_pack: Address
+    Output: Integer
+    Body: {
+        ReturnValue(CAD_Repo.LoadPartRev(name_addr, 0, out_pack))
+    }
+}
+
+Function.CAD_Repo.LoadPartRev {
+    Input: name_addr: Address
+    Input: rev: Integer
+    Input: out_pack: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CAD_Repo_State.last_conn, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(CAD_Repo.IsSafeName(name_addr), 0) ThenBlock: { ReturnValue(-3) }
+        IfCondition EqualTo(out_pack, 0) ThenBlock: { ReturnValue(-4) }
+
+        // Resolve rev + height from revision.params (historical), fallback doc.meta
+        q = Allocate(768)
+        pos = 0
+        IfCondition GreaterThan(rev, 0) ThenBlock: {
+            pos = CAD_Repo.AppendStr(q, pos, "SELECT COALESCE((r.params->>'height_mm')::int,(d.meta->>'height_mm')::int,10) AS height_mm,")
+            pos = CAD_Repo.AppendStr(q, pos, "r.rev AS rev FROM cad_revision r JOIN cad_document d ON d.id=r.doc_id WHERE d.name='")
+            pos = CAD_Repo.AppendStr(q, pos, name_addr)
+            pos = CAD_Repo.AppendStr(q, pos, "' AND r.rev=")
+            pos = CAD_Repo.AppendInt(q, pos, rev)
+            pos = CAD_Repo.AppendStr(q, pos, " LIMIT 1;")
+        }
+        IfCondition LessEqual(rev, 0) ThenBlock: {
+            pos = CAD_Repo.AppendStr(q, pos, "SELECT COALESCE((r.params->>'height_mm')::int,(d.meta->>'height_mm')::int,10) AS height_mm,")
+            pos = CAD_Repo.AppendStr(q, pos, "r.rev AS rev FROM cad_revision r JOIN cad_document d ON d.id=r.doc_id WHERE d.name='")
+            pos = CAD_Repo.AppendStr(q, pos, name_addr)
+            pos = CAD_Repo.AppendStr(q, pos, "' AND r.rev=d.latest_rev LIMIT 1;")
+        }
+        SetByte(q, pos, 0)
+        res = PG_Query(CAD_Repo_State.last_conn, q)
+        Deallocate(q, 768)
+        IfCondition EqualTo(res, 0) ThenBlock: { ReturnValue(-2) }
+        IfCondition LessThan(Array.Size(res), 1) ThenBlock: {
+            PG_DestroyResult(res)
+            ReturnValue(-7)
+        }
+        row = Array.Get(res, 0)
+        height_i = CAD_Repo.ParseIntStr(Hash.Get(row, "height_mm"))
+        rev = CAD_Repo.ParseIntStr(Hash.Get(row, "rev"))
+        PG_DestroyResult(res)
+        IfCondition EqualTo(height_i, 0) ThenBlock: { height_i = 10 }
+        IfCondition LessThan(rev, 1) ThenBlock: { ReturnValue(-7) }
+        CAD_Repo_State.last_rev = rev
+
+        // profile
+        IfCondition NotEqual(CAD_Repo.FetchAssetToFile(name_addr, rev, "profile_dxf", "/tmp/cad_repo_load.dxf"), 0) ThenBlock: {
+            ReturnValue(-10)
+        }
+        out_sk = Allocate(16)
+        rc = CAD_DXF.ImportFile("/tmp/cad_repo_load.dxf", out_sk)
+        IfCondition NotEqual(rc, 0) ThenBlock: {
+            Deallocate(out_sk, 16)
+            ReturnValue(-10)
+        }
+        h_sk = ArrayGet(out_sk, 0)
+        h_hole = 0
+        IfCondition EqualTo(CAD_Repo.FetchAssetToFile(name_addr, rev, "hole_dxf", "/tmp/cad_repo_load_hole.dxf"), 0) ThenBlock: {
+            rc = CAD_DXF.ImportFile("/tmp/cad_repo_load_hole.dxf", out_sk)
+            IfCondition EqualTo(rc, 0) ThenBlock: {
+                h_hole = ArrayGet(out_sk, 0)
+            }
+        }
+        Deallocate(out_sk, 16)
+
+        hgt = Float_FromInt(height_i)
+        h_solid = 0
+        IfCondition NotEqual(h_hole, 0) ThenBlock: {
+            h_solid = CAD_Feat.ExtrudePlateThroughHole(h_sk, h_hole, hgt)
+        }
+        IfCondition EqualTo(h_solid, 0) ThenBlock: {
+            h_solid = CAD_Feat.ExtrudeProfile(h_sk, hgt)
+        }
+        IfCondition EqualTo(h_solid, 0) ThenBlock: { ReturnValue(-11) }
+
+        ArraySet(out_pack, 0, h_sk)
+        ArraySet(out_pack, 1, h_solid)
+        ArraySet(out_pack, 2, height_i)
+        ArraySet(out_pack, 3, h_hole)
+        CAD_Repo_State.part_count = Add(CAD_Repo_State.part_count, 1)
+        ReturnValue(0)
+    }
+}
+
+// List document names (newline-separated). Returns count.
+Function.CAD_Repo.ListParts {
+    Input: out_buf: Address
+    Input: max_n: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CAD_Repo_State.last_conn, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(out_buf, 0) ThenBlock: { ReturnValue(-1) }
+        res = PG_Query(CAD_Repo_State.last_conn, "SELECT name FROM cad_document ORDER BY updated_at DESC LIMIT 50;")
+        IfCondition EqualTo(res, 0) ThenBlock: { ReturnValue(-2) }
+        nrows = Array.Size(res)
+        pos = 0
+        i = 0
+        WhileLoop LessThan(i, nrows) {
+            row = Array.Get(res, i)
+            nm = Hash.Get(row, "name")
+            IfCondition NotEqual(nm, 0) ThenBlock: {
+                j = 0
+                WhileLoop NotEqual(GetByte(nm, j), 0) {
+                    IfCondition LessThan(pos, Subtract(max_n, 2)) ThenBlock: {
+                        SetByte(out_buf, pos, GetByte(nm, j))
+                        pos = Add(pos, 1)
+                    }
+                    j = Add(j, 1)
+                }
+                IfCondition LessThan(pos, Subtract(max_n, 1)) ThenBlock: {
+                    SetByte(out_buf, pos, 10)
+                    pos = Add(pos, 1)
+                }
+            }
+            i = Add(i, 1)
+        }
+        SetByte(out_buf, pos, 0)
+        PG_DestroyResult(res)
+        ReturnValue(nrows)
+    }
+}
+
+// List revisions for a part: lines "rev message" into out_buf. Returns count.
+Function.CAD_Repo.ListRevisions {
+    Input: name_addr: Address
+    Input: out_buf: Address
+    Input: max_n: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CAD_Repo_State.last_conn, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(CAD_Repo.IsSafeName(name_addr), 0) ThenBlock: { ReturnValue(-3) }
+        q = Allocate(512)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "SELECT r.rev::text AS rev, COALESCE(r.message,'') AS message FROM cad_revision r ")
+        pos = CAD_Repo.AppendStr(q, pos, "JOIN cad_document d ON d.id=r.doc_id WHERE d.name='")
+        pos = CAD_Repo.AppendStr(q, pos, name_addr)
+        pos = CAD_Repo.AppendStr(q, pos, "' ORDER BY r.rev DESC LIMIT 50;")
+        SetByte(q, pos, 0)
+        res = PG_Query(CAD_Repo_State.last_conn, q)
+        Deallocate(q, 512)
+        IfCondition EqualTo(res, 0) ThenBlock: { ReturnValue(-2) }
+        nrows = Array.Size(res)
+        pos = 0
+        i = 0
+        WhileLoop LessThan(i, nrows) {
+            row = Array.Get(res, i)
+            rv = Hash.Get(row, "rev")
+            msg = Hash.Get(row, "message")
+            IfCondition NotEqual(rv, 0) ThenBlock: {
+                j = 0
+                WhileLoop NotEqual(GetByte(rv, j), 0) {
+                    IfCondition LessThan(pos, Subtract(max_n, 3)) ThenBlock: {
+                        SetByte(out_buf, pos, GetByte(rv, j))
+                        pos = Add(pos, 1)
+                    }
+                    j = Add(j, 1)
+                }
+                IfCondition LessThan(pos, Subtract(max_n, 2)) ThenBlock: {
+                    SetByte(out_buf, pos, 32)
+                    pos = Add(pos, 1)
+                }
+            }
+            IfCondition NotEqual(msg, 0) ThenBlock: {
+                j = 0
+                WhileLoop NotEqual(GetByte(msg, j), 0) {
+                    IfCondition LessThan(pos, Subtract(max_n, 2)) ThenBlock: {
+                        SetByte(out_buf, pos, GetByte(msg, j))
+                        pos = Add(pos, 1)
+                    }
+                    j = Add(j, 1)
+                }
+            }
+            IfCondition LessThan(pos, Subtract(max_n, 1)) ThenBlock: {
+                SetByte(out_buf, pos, 10)
+                pos = Add(pos, 1)
+            }
+            i = Add(i, 1)
+        }
+        SetByte(out_buf, pos, 0)
+        PG_DestroyResult(res)
+        ReturnValue(nrows)
+    }
+}
+
+// Set commit message on latest revision (after SavePart).
+Function.CAD_Repo.SetLastMessage {
+    Input: name_addr: Address
+    Input: msg: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CAD_Repo.IsSafeName(name_addr), 0) ThenBlock: { ReturnValue(-3) }
+        IfCondition EqualTo(msg, 0) ThenBlock: { msg = "" }
+        // only safe alnum/space/._- in message for v1
+        q = Allocate(1024)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "UPDATE cad_revision r SET message=")
+        pos = CAD_Repo.AppendDollar(q, pos, msg)
+        pos = CAD_Repo.AppendStr(q, pos, " FROM cad_document d WHERE r.doc_id=d.id AND d.name='")
+        pos = CAD_Repo.AppendStr(q, pos, name_addr)
+        pos = CAD_Repo.AppendStr(q, pos, "' AND r.rev=d.latest_rev;")
+        SetByte(q, pos, 0)
+        rc = CAD_Repo.Exec(q)
+        Deallocate(q, 1024)
+        ReturnValue(rc)
+    }
+}
+
+// Session stubs
+Function.CAD_Repo.BeginSession {
+    Input: user_addr: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(CAD_Repo_State.last_conn, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(user_addr, 0) ThenBlock: { user_addr = "bob" }
+        q = Allocate(256)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "INSERT INTO cad_session (user_name) VALUES ('")
+        pos = CAD_Repo.AppendStr(q, pos, user_addr)
+        pos = CAD_Repo.AppendStr(q, pos, "');")
+        SetByte(q, pos, 0)
+        CAD_Repo.Exec(q)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "SELECT id FROM cad_session WHERE user_name='")
+        pos = CAD_Repo.AppendStr(q, pos, user_addr)
+        pos = CAD_Repo.AppendStr(q, pos, "' ORDER BY id DESC LIMIT 1;")
+        SetByte(q, pos, 0)
+        sid = CAD_Repo.QueryInt1(q, "id")
+        Deallocate(q, 256)
+        CAD_Repo_State.session_id = sid
+        ReturnValue(sid)
+    }
+}
+
+Function.CAD_Repo.EndSession {
+    Output: Integer
+    Body: {
+        IfCondition LessThan(CAD_Repo_State.session_id, 1) ThenBlock: { ReturnValue(0) }
+        q = Allocate(128)
+        pos = 0
+        pos = CAD_Repo.AppendStr(q, pos, "UPDATE cad_session SET ended_at=now(),status='ended' WHERE id=")
+        pos = CAD_Repo.AppendInt(q, pos, CAD_Repo_State.session_id)
+        pos = CAD_Repo.AppendStr(q, pos, ";")
+        SetByte(q, pos, 0)
+        CAD_Repo.Exec(q)
+        Deallocate(q, 128)
+        CAD_Repo_State.session_id = 0
+        ReturnValue(0)
+    }
+}
+
+// -------------------------------------------------------------------------
+// Legacy demo stubs
+// -------------------------------------------------------------------------
 
 Function.CAD_Repo.CreateWorkbench {
     Input: name_addr: Address
@@ -101,8 +950,9 @@ Function.CAD_Repo.FetchRevision {
     Input: out_solid_addr: Address
     Output: Integer
     Body: {
-        h_solid = CAD_Store.Alloc(7, 4)
-        ArraySet(out_solid_addr, 0, h_solid)
-        ReturnValue(0)
+        IfCondition NotEqual(out_solid_addr, 0) ThenBlock: {
+            ArraySet(out_solid_addr, 0, 0)
+        }
+        ReturnValue(-1)
     }
 }

@@ -1,8 +1,17 @@
-// CAD Kernel — Clean-Sheet Geometric Engine in AILang
-// Layer 3: CAD.Sketch — 2D Plane Sketcher, Variational Constraints & Fusion 360 Snap Engine (§7.3)
+// CAD.Sketch — 2D UV profile IR (Phase A).
+// Tag 10, stride 20 — see Docs/CAD/CAD_PHASE_A_SKETCH.md
+//   0 n_lines  1 lines  2 n_loop(primary)  3 loop_addr(primary)
+//   4 workplane  5 cap_lines  6 cap_loop_pts
+//   7 n_circles  8 circs  9 cap_circles
+//  10 n_arcs  11 arcs
+//  12 n_profiles  13 profile_meta [n,start]×  14 loop_pool  15 cap_profiles
+//  16 n_pts  17 pts_addr (x,y anchors)  18 cap_pts  19 reserved
+// Anchors = graph vertices at ends, crossings, T-touches — NOT welding of lines.
+// Verbs: Create/Add/Get/Build/Tessellate/Validate — no Topo/Feat/IO.
 
 LibraryImport.Cad.CAD_Store
 LibraryImport.Cad.CAD_Num
+LibraryImport.Cad.CAD_Geom
 
 FixedPool.CAD_Sketch_State {
     "sketch_count":     Initialize=0
@@ -17,15 +26,461 @@ Function.CAD_Sketch.CreateSketch {
     Input: workplane_id: Integer
     Output: Integer
     Body: {
-        h_sketch = CAD_Store.Alloc(10, 4) // Tag 10=Sketch
+        h = CAD_Store.Alloc(10, 20)
+        IfCondition EqualTo(h, 0) ThenBlock: { ReturnValue(0) }
+        lines = Allocate(16384)
+        // primary loop: up to 4096 verts (dense tessellated outer envelopes)
+        loop = Allocate(65536)
+        circs = Allocate(512)
+        arcs = Allocate(2048)
+        pmeta = Allocate(256)
+        // multi-profile pool: ~8192 verts total across faces
+        pool = Allocate(131072)
+        pts = Allocate(8192)
+        CAD_Store.Write(h, 0, 0)
+        CAD_Store.Write(h, 1, lines)
+        CAD_Store.Write(h, 2, 0)
+        CAD_Store.Write(h, 3, loop)
+        CAD_Store.Write(h, 4, workplane_id)
+        CAD_Store.Write(h, 5, 512)
+        CAD_Store.Write(h, 6, 4096)
+        CAD_Store.Write(h, 7, 0)
+        CAD_Store.Write(h, 8, circs)
+        CAD_Store.Write(h, 9, 16)
+        CAD_Store.Write(h, 10, 0)
+        CAD_Store.Write(h, 11, arcs)
+        CAD_Store.Write(h, 12, 0)
+        CAD_Store.Write(h, 13, pmeta)
+        CAD_Store.Write(h, 14, pool)
+        // multi-face sketches (circle×chords, freehand) need more than 8 profiles
+        CAD_Store.Write(h, 15, 32)
+        CAD_Store.Write(h, 16, 0)
+        CAD_Store.Write(h, 17, pts)
+        CAD_Store.Write(h, 18, 512)
+        CAD_Store.Write(h, 19, 0)
         CAD_Sketch_State.sketch_count = Add(CAD_Sketch_State.sketch_count, 1)
-        ReturnValue(h_sketch)
+        ReturnValue(h)
     }
 }
 
-// -------------------------------------------------------------------------
-// 1. Primitive Sketch Entities (Line, Circle, Arc, Rectangle, Square, Polyline, BSpline)
-// -------------------------------------------------------------------------
+// Add or merge an anchor point. Does not move lines — only the point cloud.
+// Returns point index (0-based) or -1.
+Function.CAD_Sketch.AddPoint {
+    Input: sketch_handle: Integer
+    Input: x_r: Integer
+    Input: y_r: Integer
+    Input: merge_tol_r: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(-1) }
+        n = CAD_Store.Read(sketch_handle, 16)
+        cap = CAD_Store.Read(sketch_handle, 18)
+        pts = CAD_Store.Read(sketch_handle, 17)
+        IfCondition EqualTo(pts, 0) ThenBlock: { ReturnValue(-1) }
+        tol = merge_tol_r
+        IfCondition EqualTo(tol, 0) ThenBlock: { tol = 0x3F50624DD2F1A9FC }
+        tol2 = Float_Mul(tol, tol)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            px = ArrayGet(pts, Multiply(i, 2))
+            py = ArrayGet(pts, Add(Multiply(i, 2), 1))
+            dx = Float_Sub(px, x_r)
+            dy = Float_Sub(py, y_r)
+            IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy)), tol2), 1) ThenBlock: {
+                ReturnValue(i)
+            }
+            i = Add(i, 1)
+        }
+        IfCondition GreaterEqual(n, cap) ThenBlock: { ReturnValue(-1) }
+        ArraySet(pts, Multiply(n, 2), x_r)
+        ArraySet(pts, Add(Multiply(n, 2), 1), y_r)
+        CAD_Store.Write(sketch_handle, 16, Add(n, 1))
+        ReturnValue(n)
+    }
+}
+
+Function.CAD_Sketch.GetPointCount {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(CAD_Store.Read(sketch_handle, 16))
+    }
+}
+
+// Clear and rebuild anchors: every line end + every crossing + every T-touch.
+// Does NOT alter line coordinates — only the anchor point list.
+// Returns n_pts.
+Function.CAD_Sketch.RebuildAnchors {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        CAD_Store.Write(sketch_handle, 16, 0)
+        nl = CAD_Store.Read(sketch_handle, 0)
+        IfCondition EqualTo(nl, 0) ThenBlock: {
+            // still process arcs/circles (circle×circle anchors need no lines)
+            na = CAD_Store.Read(sketch_handle, 10)
+            nc0 = CAD_Store.Read(sketch_handle, 7)
+            IfCondition EqualTo(na, 0) ThenBlock: {
+                IfCondition EqualTo(nc0, 0) ThenBlock: { ReturnValue(0) }
+            }
+        }
+        lines = CAD_Store.Read(sketch_handle, 1)
+        // join/merge tol from sketch AABB (lines + arc/circle extents)
+        xmin = 0
+        ymin = 0
+        xmax = 0
+        ymax = 0
+        first = 1
+        i = 0
+        WhileLoop LessThan(i, nl) {
+            b = Multiply(i, 4)
+            x = ArrayGet(lines, b)
+            y = ArrayGet(lines, Add(b, 1))
+            IfCondition EqualTo(first, 1) ThenBlock: {
+                xmin = x
+                ymin = y
+                xmax = x
+                ymax = y
+                first = 0
+            }
+            IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+            IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+            IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+            IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+            x = ArrayGet(lines, Add(b, 2))
+            y = ArrayGet(lines, Add(b, 3))
+            IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+            IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+            IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+            IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+            i = Add(i, 1)
+        }
+        // expand AABB by circles/arcs so mtol is sensible when arcs dominate
+        na_pre = CAD_Store.Read(sketch_handle, 10)
+        arcs_pre = CAD_Store.Read(sketch_handle, 11)
+        i = 0
+        WhileLoop LessThan(i, na_pre) {
+            base = Multiply(i, 5)
+            cx = ArrayGet(arcs_pre, base)
+            cy = ArrayGet(arcs_pre, Add(base, 1))
+            rad = ArrayGet(arcs_pre, Add(base, 2))
+            IfCondition EqualTo(first, 1) ThenBlock: {
+                xmin = Float_Sub(cx, rad)
+                ymin = Float_Sub(cy, rad)
+                xmax = Float_Add(cx, rad)
+                ymax = Float_Add(cy, rad)
+                first = 0
+            }
+            IfCondition EqualTo(Float_Le(Float_Sub(cx, rad), xmin), 1) ThenBlock: { xmin = Float_Sub(cx, rad) }
+            IfCondition EqualTo(Float_Le(xmax, Float_Add(cx, rad)), 1) ThenBlock: { xmax = Float_Add(cx, rad) }
+            IfCondition EqualTo(Float_Le(Float_Sub(cy, rad), ymin), 1) ThenBlock: { ymin = Float_Sub(cy, rad) }
+            IfCondition EqualTo(Float_Le(ymax, Float_Add(cy, rad)), 1) ThenBlock: { ymax = Float_Add(cy, rad) }
+            i = Add(i, 1)
+        }
+        nc_pre = CAD_Store.Read(sketch_handle, 7)
+        circs_pre = CAD_Store.Read(sketch_handle, 8)
+        i = 0
+        WhileLoop LessThan(i, nc_pre) {
+            base = Multiply(i, 3)
+            cx = ArrayGet(circs_pre, base)
+            cy = ArrayGet(circs_pre, Add(base, 1))
+            rad = ArrayGet(circs_pre, Add(base, 2))
+            IfCondition EqualTo(first, 1) ThenBlock: {
+                xmin = Float_Sub(cx, rad)
+                ymin = Float_Sub(cy, rad)
+                xmax = Float_Add(cx, rad)
+                ymax = Float_Add(cy, rad)
+                first = 0
+            }
+            IfCondition EqualTo(Float_Le(Float_Sub(cx, rad), xmin), 1) ThenBlock: { xmin = Float_Sub(cx, rad) }
+            IfCondition EqualTo(Float_Le(xmax, Float_Add(cx, rad)), 1) ThenBlock: { xmax = Float_Add(cx, rad) }
+            IfCondition EqualTo(Float_Le(Float_Sub(cy, rad), ymin), 1) ThenBlock: { ymin = Float_Sub(cy, rad) }
+            IfCondition EqualTo(Float_Le(ymax, Float_Add(cy, rad)), 1) ThenBlock: { ymax = Float_Add(cy, rad) }
+            i = Add(i, 1)
+        }
+        dxb = Float_Sub(xmax, xmin)
+        dyb = Float_Sub(ymax, ymin)
+        diag = CAD_Num.Sqrt(Float_Add(Float_Mul(dxb, dxb), Float_Mul(dyb, dyb)))
+        // 1% diag for freehand meet/cross (anchor merge only)
+        mtol = Float_Mul(diag, 0x3F847AE147AE147B)
+        floort = 0x3F50624DD2F1A9FC
+        IfCondition EqualTo(Float_Le(mtol, floort), 1) ThenBlock: { mtol = floort }
+        mtol2 = Float_Mul(mtol, mtol)
+        // 1) every line endpoint is an anchor
+        i = 0
+        WhileLoop LessThan(i, nl) {
+            b = Multiply(i, 4)
+            CAD_Sketch.AddPoint(sketch_handle, ArrayGet(lines, b), ArrayGet(lines, Add(b, 1)), mtol)
+            CAD_Sketch.AddPoint(sketch_handle, ArrayGet(lines, Add(b, 2)), ArrayGet(lines, Add(b, 3)), mtol)
+            i = Add(i, 1)
+        }
+        // 2) arc endpoints
+        na = CAD_Store.Read(sketch_handle, 10)
+        arcs = CAD_Store.Read(sketch_handle, 11)
+        i = 0
+        WhileLoop LessThan(i, na) {
+            base = Multiply(i, 5)
+            cx = ArrayGet(arcs, base)
+            cy = ArrayGet(arcs, Add(base, 1))
+            rad = ArrayGet(arcs, Add(base, 2))
+            a0 = ArrayGet(arcs, Add(base, 3))
+            a1 = ArrayGet(arcs, Add(base, 4))
+            CAD_Sketch.AddPoint(sketch_handle, Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(a0))), Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(a0))), mtol)
+            CAD_Sketch.AddPoint(sketch_handle, Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(a1))), Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(a1))), mtol)
+            i = Add(i, 1)
+        }
+        // 3) proper crossings + T-touches between every pair of lines
+        i = 0
+        WhileLoop LessThan(i, nl) {
+            bi = Multiply(i, 4)
+            ax0 = ArrayGet(lines, bi)
+            ay0 = ArrayGet(lines, Add(bi, 1))
+            ax1 = ArrayGet(lines, Add(bi, 2))
+            ay1 = ArrayGet(lines, Add(bi, 3))
+            adx = Float_Sub(ax1, ax0)
+            ady = Float_Sub(ay1, ay0)
+            alen2 = Float_Add(Float_Mul(adx, adx), Float_Mul(ady, ady))
+            j = Add(i, 1)
+            WhileLoop LessThan(j, nl) {
+                bj = Multiply(j, 4)
+                bx0 = ArrayGet(lines, bj)
+                by0 = ArrayGet(lines, Add(bj, 1))
+                bx1 = ArrayGet(lines, Add(bj, 2))
+                by1 = ArrayGet(lines, Add(bj, 3))
+                bdx = Float_Sub(bx1, bx0)
+                bdy = Float_Sub(by1, by0)
+                den = Float_Sub(Float_Mul(adx, bdy), Float_Mul(ady, bdx))
+                IfCondition EqualTo(CAD_Num.IsZero(den, 0), 0) ThenBlock: {
+                    t = Float_Div(Float_Sub(Float_Mul(Float_Sub(bx0, ax0), bdy), Float_Mul(Float_Sub(by0, ay0), bdx)), den)
+                    u = Float_Div(Float_Sub(Float_Mul(Float_Sub(bx0, ax0), ady), Float_Mul(Float_Sub(by0, ay0), adx)), den)
+                    one = 0x3FF0000000000000
+                    ok_t = 1
+                    ok_u = 1
+                    IfCondition EqualTo(Float_Le(t, 0), 1) ThenBlock: {
+                        IfCondition EqualTo(Float_Le(Float_Sub(0, t), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok_t = 0 }
+                    }
+                    IfCondition EqualTo(Float_Le(one, t), 1) ThenBlock: {
+                        IfCondition EqualTo(Float_Le(Float_Sub(t, one), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok_t = 0 }
+                    }
+                    IfCondition EqualTo(Float_Le(u, 0), 1) ThenBlock: {
+                        IfCondition EqualTo(Float_Le(Float_Sub(0, u), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok_u = 0 }
+                    }
+                    IfCondition EqualTo(Float_Le(one, u), 1) ThenBlock: {
+                        IfCondition EqualTo(Float_Le(Float_Sub(u, one), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok_u = 0 }
+                    }
+                    IfCondition EqualTo(ok_t, 1) ThenBlock: {
+                        IfCondition EqualTo(ok_u, 1) ThenBlock: {
+                            px = Float_Add(ax0, Float_Mul(t, adx))
+                            py = Float_Add(ay0, Float_Mul(t, ady))
+                            CAD_Sketch.AddPoint(sketch_handle, px, py, mtol)
+                        }
+                    }
+                }
+                // T: endpoints of j near line i
+                IfCondition EqualTo(CAD_Num.IsZero(alen2, 0), 0) ThenBlock: {
+                    t = Float_Div(Float_Add(Float_Mul(Float_Sub(bx0, ax0), adx), Float_Mul(Float_Sub(by0, ay0), ady)), alen2)
+                    IfCondition EqualTo(Float_Le(t, 0), 0) ThenBlock: {
+                        IfCondition EqualTo(Float_Le(0x3FF0000000000000, t), 0) ThenBlock: {
+                            px = Float_Add(ax0, Float_Mul(t, adx))
+                            py = Float_Add(ay0, Float_Mul(t, ady))
+                            ddx = Float_Sub(px, bx0)
+                            ddy = Float_Sub(py, by0)
+                            IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), mtol2), 1) ThenBlock: {
+                                CAD_Sketch.AddPoint(sketch_handle, px, py, mtol)
+                            }
+                        }
+                    }
+                    t = Float_Div(Float_Add(Float_Mul(Float_Sub(bx1, ax0), adx), Float_Mul(Float_Sub(by1, ay0), ady)), alen2)
+                    IfCondition EqualTo(Float_Le(t, 0), 0) ThenBlock: {
+                        IfCondition EqualTo(Float_Le(0x3FF0000000000000, t), 0) ThenBlock: {
+                            px = Float_Add(ax0, Float_Mul(t, adx))
+                            py = Float_Add(ay0, Float_Mul(t, ady))
+                            ddx = Float_Sub(px, bx1)
+                            ddy = Float_Sub(py, by1)
+                            IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), mtol2), 1) ThenBlock: {
+                                CAD_Sketch.AddPoint(sketch_handle, px, py, mtol)
+                            }
+                        }
+                    }
+                }
+                j = Add(j, 1)
+            }
+            i = Add(i, 1)
+        }
+        // 4) line × arc and line × circle crossings (anchors on the arc/rim)
+        two_pi = 0x401921FB54442D18
+        ai = 0
+        WhileLoop LessThan(ai, na) {
+            base = Multiply(ai, 5)
+            cx = ArrayGet(arcs, base)
+            cy = ArrayGet(arcs, Add(base, 1))
+            rad = ArrayGet(arcs, Add(base, 2))
+            a0 = ArrayGet(arcs, Add(base, 3))
+            a1 = ArrayGet(arcs, Add(base, 4))
+            span = Float_Sub(a1, a0)
+            IfCondition EqualTo(Float_Le(span, 0), 1) ThenBlock: {
+                span = Float_Add(span, two_pi)
+            }
+            li = 0
+            WhileLoop LessThan(li, nl) {
+                b = Multiply(li, 4)
+                x0 = ArrayGet(lines, b)
+                y0 = ArrayGet(lines, Add(b, 1))
+                x1 = ArrayGet(lines, Add(b, 2))
+                y1 = ArrayGet(lines, Add(b, 3))
+                dx = Float_Sub(x1, x0)
+                dy = Float_Sub(y1, y0)
+                // |P + t D - C|^2 = r^2
+                fx = Float_Sub(x0, cx)
+                fy = Float_Sub(y0, cy)
+                aa = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                IfCondition EqualTo(CAD_Num.IsZero(aa, 0), 0) ThenBlock: {
+                    bb = Float_Mul(0x4000000000000000, Float_Add(Float_Mul(fx, dx), Float_Mul(fy, dy)))
+                    cc = Float_Sub(Float_Add(Float_Mul(fx, fx), Float_Mul(fy, fy)), Float_Mul(rad, rad))
+                    disc = Float_Sub(Float_Mul(bb, bb), Float_Mul(Float_Mul(0x4010000000000000, aa), cc))
+                    IfCondition EqualTo(Float_Le(disc, 0), 0) ThenBlock: {
+                        s = CAD_Num.Sqrt(disc)
+                        two_a = Float_Mul(0x4000000000000000, aa)
+                        t0 = Float_Div(Float_Sub(Float_Sub(0, bb), s), two_a)
+                        t1 = Float_Div(Float_Add(Float_Sub(0, bb), s), two_a)
+                        hi = 0
+                        WhileLoop LessThan(hi, 2) {
+                            t = t0
+                            IfCondition EqualTo(hi, 1) ThenBlock: { t = t1 }
+                            // t in [0,1]
+                            one = 0x3FF0000000000000
+                            ok = 1
+                            IfCondition EqualTo(Float_Le(t, 0), 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(Float_Sub(0, t), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok = 0 }
+                            }
+                            IfCondition EqualTo(Float_Le(one, t), 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(Float_Sub(t, one), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok = 0 }
+                            }
+                            IfCondition EqualTo(ok, 1) ThenBlock: {
+                                px = Float_Add(x0, Float_Mul(t, dx))
+                                py = Float_Add(y0, Float_Mul(t, dy))
+                                // angle on arc span CCW a0 → a1
+                                ang = CAD_Geom.Atan2(Float_Sub(py, cy), Float_Sub(px, cx))
+                                dang = Float_Sub(ang, a0)
+                                IfCondition EqualTo(Float_Le(dang, 0), 1) ThenBlock: {
+                                    // dang <= 0: if not tiny, wrap
+                                    IfCondition EqualTo(Float_Le(Float_Sub(0, dang), 0x3F50624DD2F1A9FC), 0) ThenBlock: {
+                                        dang = Float_Add(dang, two_pi)
+                                    }
+                                }
+                                // on arc if 0 <= dang <= span (+eps)
+                                IfCondition EqualTo(Float_Le(dang, Float_Add(span, 0x3F50624DD2F1A9FC)), 1) ThenBlock: {
+                                    CAD_Sketch.AddPoint(sketch_handle, px, py, mtol)
+                                }
+                            }
+                            hi = Add(hi, 1)
+                        }
+                    }
+                }
+                li = Add(li, 1)
+            }
+            ai = Add(ai, 1)
+        }
+        // 5) line × full circle crossings
+        nc = CAD_Store.Read(sketch_handle, 7)
+        circs = CAD_Store.Read(sketch_handle, 8)
+        ci = 0
+        WhileLoop LessThan(ci, nc) {
+            base = Multiply(ci, 3)
+            cx = ArrayGet(circs, base)
+            cy = ArrayGet(circs, Add(base, 1))
+            rad = ArrayGet(circs, Add(base, 2))
+            li = 0
+            WhileLoop LessThan(li, nl) {
+                b = Multiply(li, 4)
+                x0 = ArrayGet(lines, b)
+                y0 = ArrayGet(lines, Add(b, 1))
+                x1 = ArrayGet(lines, Add(b, 2))
+                y1 = ArrayGet(lines, Add(b, 3))
+                dx = Float_Sub(x1, x0)
+                dy = Float_Sub(y1, y0)
+                fx = Float_Sub(x0, cx)
+                fy = Float_Sub(y0, cy)
+                aa = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                IfCondition EqualTo(CAD_Num.IsZero(aa, 0), 0) ThenBlock: {
+                    bb = Float_Mul(0x4000000000000000, Float_Add(Float_Mul(fx, dx), Float_Mul(fy, dy)))
+                    cc = Float_Sub(Float_Add(Float_Mul(fx, fx), Float_Mul(fy, fy)), Float_Mul(rad, rad))
+                    disc = Float_Sub(Float_Mul(bb, bb), Float_Mul(Float_Mul(0x4010000000000000, aa), cc))
+                    IfCondition EqualTo(Float_Le(disc, 0), 0) ThenBlock: {
+                        s = CAD_Num.Sqrt(disc)
+                        two_a = Float_Mul(0x4000000000000000, aa)
+                        t0 = Float_Div(Float_Sub(Float_Sub(0, bb), s), two_a)
+                        t1 = Float_Div(Float_Add(Float_Sub(0, bb), s), two_a)
+                        hi = 0
+                        WhileLoop LessThan(hi, 2) {
+                            t = t0
+                            IfCondition EqualTo(hi, 1) ThenBlock: { t = t1 }
+                            one = 0x3FF0000000000000
+                            ok = 1
+                            IfCondition EqualTo(Float_Le(t, 0), 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(Float_Sub(0, t), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok = 0 }
+                            }
+                            IfCondition EqualTo(Float_Le(one, t), 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(Float_Sub(t, one), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok = 0 }
+                            }
+                            IfCondition EqualTo(ok, 1) ThenBlock: {
+                                px = Float_Add(x0, Float_Mul(t, dx))
+                                py = Float_Add(y0, Float_Mul(t, dy))
+                                CAD_Sketch.AddPoint(sketch_handle, px, py, mtol)
+                            }
+                            hi = Add(hi, 1)
+                        }
+                    }
+                }
+                li = Add(li, 1)
+            }
+            ci = Add(ci, 1)
+        }
+        // 6) circle × circle crossings (anchors at real T/X of multi-circle sketches)
+        ci = 0
+        WhileLoop LessThan(ci, nc) {
+            base = Multiply(ci, 3)
+            cx = ArrayGet(circs, base)
+            cy = ArrayGet(circs, Add(base, 1))
+            rad = ArrayGet(circs, Add(base, 2))
+            cj = Add(ci, 1)
+            WhileLoop LessThan(cj, nc) {
+                bj = Multiply(cj, 3)
+                ox = ArrayGet(circs, bj)
+                oy = ArrayGet(circs, Add(bj, 1))
+                orad = ArrayGet(circs, Add(bj, 2))
+                dx = Float_Sub(ox, cx)
+                dy = Float_Sub(oy, cy)
+                d2 = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                d = CAD_Num.Sqrt(d2)
+                okc = 1
+                IfCondition EqualTo(CAD_Num.IsZero(d, 0), 1) ThenBlock: { okc = 0 }
+                IfCondition EqualTo(Float_Le(Float_Add(rad, orad), d), 1) ThenBlock: { okc = 0 }
+                dr = Float_Sub(rad, orad)
+                IfCondition EqualTo(Float_Le(dr, 0), 1) ThenBlock: { dr = Float_Sub(0, dr) }
+                IfCondition EqualTo(Float_Le(d, dr), 1) ThenBlock: { okc = 0 }
+                IfCondition EqualTo(okc, 1) ThenBlock: {
+                    a = Float_Div(Float_Add(Float_Sub(Float_Mul(rad, rad), Float_Mul(orad, orad)), d2), Float_Mul(0x4000000000000000, d))
+                    h2 = Float_Sub(Float_Mul(rad, rad), Float_Mul(a, a))
+                    IfCondition EqualTo(Float_Le(h2, 0), 0) ThenBlock: {
+                        h = CAD_Num.Sqrt(h2)
+                        mx = Float_Add(cx, Float_Mul(a, Float_Div(dx, d)))
+                        my = Float_Add(cy, Float_Mul(a, Float_Div(dy, d)))
+                        rx = Float_Mul(h, Float_Div(dy, d))
+                        ry = Float_Mul(h, Float_Div(dx, d))
+                        CAD_Sketch.AddPoint(sketch_handle, Float_Add(mx, rx), Float_Sub(my, ry), mtol)
+                        CAD_Sketch.AddPoint(sketch_handle, Float_Sub(mx, rx), Float_Add(my, ry), mtol)
+                    }
+                }
+                cj = Add(cj, 1)
+            }
+            ci = Add(ci, 1)
+        }
+        ReturnValue(CAD_Store.Read(sketch_handle, 16))
+    }
+}
 
 Function.CAD_Sketch.AddLine {
     Input: sketch_handle: Integer
@@ -36,8 +491,247 @@ Function.CAD_Sketch.AddLine {
     Output: Integer
     Body: {
         IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        n = CAD_Store.Read(sketch_handle, 0)
+        cap = CAD_Store.Read(sketch_handle, 5)
+        IfCondition GreaterEqual(n, cap) ThenBlock: { ReturnValue(0) }
+        lines = CAD_Store.Read(sketch_handle, 1)
+        base = Multiply(n, 4)
+        ArraySet(lines, base, x1_r)
+        ArraySet(lines, Add(base, 1), y1_r)
+        ArraySet(lines, Add(base, 2), x2_r)
+        ArraySet(lines, Add(base, 3), y2_r)
+        CAD_Store.Write(sketch_handle, 0, Add(n, 1))
         CAD_Sketch_State.entity_count = Add(CAD_Sketch_State.entity_count, 1)
-        ReturnValue(CAD_Sketch_State.entity_count)
+        // every line end is an anchor (merge if near existing)
+        CAD_Sketch.AddPoint(sketch_handle, x1_r, y1_r, 0)
+        CAD_Sketch.AddPoint(sketch_handle, x2_r, y2_r, 0)
+        ReturnValue(Add(n, 1))
+    }
+}
+
+Function.CAD_Sketch.GetLineCount {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(CAD_Store.Read(sketch_handle, 0))
+    }
+}
+
+// Delete line i (swap with last). Clears profile cache. Returns new count or -1.
+Function.CAD_Sketch.DeleteLine {
+    Input: sketch_handle: Integer
+    Input: line_i: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(-1) }
+        n = CAD_Store.Read(sketch_handle, 0)
+        IfCondition LessThan(line_i, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition GreaterEqual(line_i, n) ThenBlock: { ReturnValue(-1) }
+        lines = CAD_Store.Read(sketch_handle, 1)
+        last = Subtract(n, 1)
+        IfCondition NotEqual(line_i, last) ThenBlock: {
+            b = Multiply(line_i, 4)
+            lb = Multiply(last, 4)
+            ArraySet(lines, b, ArrayGet(lines, lb))
+            ArraySet(lines, Add(b, 1), ArrayGet(lines, Add(lb, 1)))
+            ArraySet(lines, Add(b, 2), ArrayGet(lines, Add(lb, 2)))
+            ArraySet(lines, Add(b, 3), ArrayGet(lines, Add(lb, 3)))
+        }
+        CAD_Store.Write(sketch_handle, 0, last)
+        CAD_Store.Write(sketch_handle, 2, 0)
+        CAD_Store.Write(sketch_handle, 12, 0)
+        ReturnValue(last)
+    }
+}
+
+// Rewrite endpoints of line i. Returns 1 ok, 0 fail.
+Function.CAD_Sketch.SetLine {
+    Input: sketch_handle: Integer
+    Input: line_i: Integer
+    Input: x1_r: Integer
+    Input: y1_r: Integer
+    Input: x2_r: Integer
+    Input: y2_r: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        n = CAD_Store.Read(sketch_handle, 0)
+        IfCondition LessThan(line_i, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(line_i, n) ThenBlock: { ReturnValue(0) }
+        lines = CAD_Store.Read(sketch_handle, 1)
+        b = Multiply(line_i, 4)
+        ArraySet(lines, b, x1_r)
+        ArraySet(lines, Add(b, 1), y1_r)
+        ArraySet(lines, Add(b, 2), x2_r)
+        ArraySet(lines, Add(b, 3), y2_r)
+        CAD_Store.Write(sketch_handle, 2, 0)
+        CAD_Store.Write(sketch_handle, 12, 0)
+        ReturnValue(1)
+    }
+}
+
+// Delete circle i (swap with last). Returns new count or -1.
+Function.CAD_Sketch.DeleteCircle {
+    Input: sketch_handle: Integer
+    Input: circ_i: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(-1) }
+        n = CAD_Store.Read(sketch_handle, 7)
+        IfCondition LessThan(circ_i, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition GreaterEqual(circ_i, n) ThenBlock: { ReturnValue(-1) }
+        circs = CAD_Store.Read(sketch_handle, 8)
+        last = Subtract(n, 1)
+        IfCondition NotEqual(circ_i, last) ThenBlock: {
+            b = Multiply(circ_i, 3)
+            lb = Multiply(last, 3)
+            ArraySet(circs, b, ArrayGet(circs, lb))
+            ArraySet(circs, Add(b, 1), ArrayGet(circs, Add(lb, 1)))
+            ArraySet(circs, Add(b, 2), ArrayGet(circs, Add(lb, 2)))
+        }
+        CAD_Store.Write(sketch_handle, 7, last)
+        CAD_Store.Write(sketch_handle, 2, 0)
+        CAD_Store.Write(sketch_handle, 12, 0)
+        ReturnValue(last)
+    }
+}
+
+// Delete arc i (swap with last). Clears profile cache. Returns new count or -1.
+Function.CAD_Sketch.DeleteArc {
+    Input: sketch_handle: Integer
+    Input: arc_i: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(-1) }
+        n = CAD_Store.Read(sketch_handle, 10)
+        IfCondition LessThan(arc_i, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition GreaterEqual(arc_i, n) ThenBlock: { ReturnValue(-1) }
+        arcs = CAD_Store.Read(sketch_handle, 11)
+        last = Subtract(n, 1)
+        IfCondition NotEqual(arc_i, last) ThenBlock: {
+            b = Multiply(arc_i, 5)
+            lb = Multiply(last, 5)
+            ArraySet(arcs, b, ArrayGet(arcs, lb))
+            ArraySet(arcs, Add(b, 1), ArrayGet(arcs, Add(lb, 1)))
+            ArraySet(arcs, Add(b, 2), ArrayGet(arcs, Add(lb, 2)))
+            ArraySet(arcs, Add(b, 3), ArrayGet(arcs, Add(lb, 3)))
+            ArraySet(arcs, Add(b, 4), ArrayGet(arcs, Add(lb, 4)))
+        }
+        CAD_Store.Write(sketch_handle, 10, last)
+        CAD_Store.Write(sketch_handle, 2, 0)
+        CAD_Store.Write(sketch_handle, 12, 0)
+        ReturnValue(last)
+    }
+}
+
+Function.CAD_Sketch.GetLoopCount {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(CAD_Store.Read(sketch_handle, 2))
+    }
+}
+
+// Chain LINEs into ordered closed loop (xy pairs in loop_addr).
+// Returns n_loop or 0 on failure.
+Function.CAD_Sketch.BuildClosedLoop {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        n = CAD_Store.Read(sketch_handle, 0)
+        IfCondition LessThan(n, 3) ThenBlock: { ReturnValue(0) }
+        lines = CAD_Store.Read(sketch_handle, 1)
+        loop = CAD_Store.Read(sketch_handle, 3)
+        // used flags (one word per line)
+        used = Allocate(1024)
+        ui = 0
+        WhileLoop LessThan(ui, n) {
+            ArraySet(used, ui, 0)
+            ui = Add(ui, 1)
+        }
+        // start with line 0: x1,y1 then walk
+        ArraySet(loop, 0, ArrayGet(lines, 0))
+        ArraySet(loop, 1, ArrayGet(lines, 1))
+        tipx = ArrayGet(lines, 2)
+        tipy = ArrayGet(lines, 3)
+        ArraySet(loop, 2, tipx)
+        ArraySet(loop, 3, tipy)
+        ArraySet(used, 0, 1)
+        nn = 2
+        startx = ArrayGet(lines, 0)
+        starty = ArrayGet(lines, 1)
+        guard = 0
+        WhileLoop LessThan(guard, 256) {
+            guard = Add(guard, 1)
+            // closed?
+            IfCondition EqualTo(CAD_Num.IsEqual(tipx, startx, 0), 1) ThenBlock: {
+                IfCondition EqualTo(CAD_Num.IsEqual(tipy, starty, 0), 1) ThenBlock: {
+                    // drop duplicate closing point
+                    nn = Subtract(nn, 1)
+                    guard = 256
+                }
+            }
+            IfCondition LessThan(guard, 256) ThenBlock: {
+                found = -1
+                rev = 0
+                j = 0
+                WhileLoop LessThan(j, n) {
+                    IfCondition EqualTo(ArrayGet(used, j), 0) ThenBlock: {
+                        base = Multiply(j, 4)
+                        ax = ArrayGet(lines, base)
+                        ay = ArrayGet(lines, Add(base, 1))
+                        bx = ArrayGet(lines, Add(base, 2))
+                        by = ArrayGet(lines, Add(base, 3))
+                        IfCondition EqualTo(CAD_Num.IsEqual(ax, tipx, 0), 1) ThenBlock: {
+                            IfCondition EqualTo(CAD_Num.IsEqual(ay, tipy, 0), 1) ThenBlock: {
+                                found = j
+                                rev = 0
+                                j = n
+                            }
+                        }
+                        IfCondition EqualTo(found, -1) ThenBlock: {
+                            IfCondition EqualTo(CAD_Num.IsEqual(bx, tipx, 0), 1) ThenBlock: {
+                                IfCondition EqualTo(CAD_Num.IsEqual(by, tipy, 0), 1) ThenBlock: {
+                                    found = j
+                                    rev = 1
+                                    j = n
+                                }
+                            }
+                        }
+                    }
+                    j = Add(j, 1)
+                }
+                IfCondition EqualTo(found, -1) ThenBlock: {
+                    // open chain fail
+                    Deallocate(used, 1024)
+                    CAD_Store.Write(sketch_handle, 2, 0)
+                    ReturnValue(0)
+                }
+                ArraySet(used, found, 1)
+                base = Multiply(found, 4)
+                IfCondition EqualTo(rev, 0) ThenBlock: {
+                    tipx = ArrayGet(lines, Add(base, 2))
+                    tipy = ArrayGet(lines, Add(base, 3))
+                }
+                IfCondition EqualTo(rev, 1) ThenBlock: {
+                    tipx = ArrayGet(lines, base)
+                    tipy = ArrayGet(lines, Add(base, 1))
+                }
+                ArraySet(loop, Multiply(nn, 2), tipx)
+                ArraySet(loop, Add(Multiply(nn, 2), 1), tipy)
+                nn = Add(nn, 1)
+            }
+        }
+        Deallocate(used, 1024)
+        IfCondition LessThan(nn, 3) ThenBlock: {
+            CAD_Store.Write(sketch_handle, 2, 0)
+            ReturnValue(0)
+        }
+        CAD_Store.Write(sketch_handle, 2, nn)
+        ReturnValue(nn)
     }
 }
 
@@ -49,21 +743,1470 @@ Function.CAD_Sketch.AddCircle {
     Output: Integer
     Body: {
         IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(CAD_Num.IsZero(rad_r, 0), 1) ThenBlock: { ReturnValue(0) }
+        n = CAD_Store.Read(sketch_handle, 7)
+        cap = CAD_Store.Read(sketch_handle, 9)
+        IfCondition GreaterEqual(n, cap) ThenBlock: { ReturnValue(0) }
+        circs = CAD_Store.Read(sketch_handle, 8)
+        base = Multiply(n, 3)
+        ArraySet(circs, base, cx_r)
+        ArraySet(circs, Add(base, 1), cy_r)
+        ArraySet(circs, Add(base, 2), rad_r)
+        CAD_Store.Write(sketch_handle, 7, Add(n, 1))
         CAD_Sketch_State.entity_count = Add(CAD_Sketch_State.entity_count, 1)
-        ReturnValue(CAD_Sketch_State.entity_count)
+        ReturnValue(Add(n, 1))
     }
 }
 
-// params_addr: [cx, cy, rad, start_angle, end_angle] — ≤2 Inputs + sketch
-Function.CAD_Sketch.AddArc {
+Function.CAD_Sketch.GetCircleCount {
     Input: sketch_handle: Integer
-    Input: params_addr: Address
     Output: Integer
     Body: {
         IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
-        IfCondition EqualTo(params_addr, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(CAD_Store.Read(sketch_handle, 7))
+    }
+}
+
+// Expand each circle into LINE segs. FORCES vertices at:
+//   • uniform samples
+//   • every line×circle hit
+//   • every circle×circle hit  (3-circle overlap / dogbone / Venn — THE bug)
+// so polylines meet at real T/X junctions after SplitAtIntersections.
+// Does NOT clear circle count — caller may zero slot 7.
+Function.CAD_Sketch.TessellateCircles {
+    Input: sketch_handle: Integer
+    Input: nseg: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(nseg, 8) ThenBlock: { nseg = 32 }
+        nc = CAD_Store.Read(sketch_handle, 7)
+        IfCondition EqualTo(nc, 0) ThenBlock: { ReturnValue(0) }
+        circs = CAD_Store.Read(sketch_handle, 8)
+        lines = CAD_Store.Read(sketch_handle, 1)
+        nl = CAD_Store.Read(sketch_handle, 0)
+        two_pi = 0x401921FB54442D18
+        // relative angles in [0, 2π) for one circle
+        angs = Allocate(512)
+        ci = 0
+        WhileLoop LessThan(ci, nc) {
+            base = Multiply(ci, 3)
+            cx = ArrayGet(circs, base)
+            cy = ArrayGet(circs, Add(base, 1))
+            rad = ArrayGet(circs, Add(base, 2))
+            // seed uniform samples
+            nang = 0
+            i = 0
+            WhileLoop LessThan(i, nseg) {
+                ArraySet(angs, nang, Float_Mul(two_pi, Float_Div(Float_FromInt(i), Float_FromInt(nseg))))
+                nang = Add(nang, 1)
+                i = Add(i, 1)
+            }
+            // force 0 so ring closes cleanly (also at 2π via last→first)
+            // line × circle hits
+            li = 0
+            WhileLoop LessThan(li, nl) {
+                b = Multiply(li, 4)
+                x0 = ArrayGet(lines, b)
+                y0 = ArrayGet(lines, Add(b, 1))
+                x1 = ArrayGet(lines, Add(b, 2))
+                y1 = ArrayGet(lines, Add(b, 3))
+                dx = Float_Sub(x1, x0)
+                dy = Float_Sub(y1, y0)
+                fx = Float_Sub(x0, cx)
+                fy = Float_Sub(y0, cy)
+                aa = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                IfCondition EqualTo(CAD_Num.IsZero(aa, 0), 0) ThenBlock: {
+                    bb = Float_Mul(0x4000000000000000, Float_Add(Float_Mul(fx, dx), Float_Mul(fy, dy)))
+                    cc = Float_Sub(Float_Add(Float_Mul(fx, fx), Float_Mul(fy, fy)), Float_Mul(rad, rad))
+                    disc = Float_Sub(Float_Mul(bb, bb), Float_Mul(Float_Mul(0x4010000000000000, aa), cc))
+                    IfCondition EqualTo(Float_Le(disc, 0), 0) ThenBlock: {
+                        s = CAD_Num.Sqrt(disc)
+                        two_a = Float_Mul(0x4000000000000000, aa)
+                        t0 = Float_Div(Float_Sub(Float_Sub(0, bb), s), two_a)
+                        t1 = Float_Div(Float_Add(Float_Sub(0, bb), s), two_a)
+                        hi = 0
+                        WhileLoop LessThan(hi, 2) {
+                            t = t0
+                            IfCondition EqualTo(hi, 1) ThenBlock: { t = t1 }
+                            one = 0x3FF0000000000000
+                            ok = 1
+                            IfCondition EqualTo(Float_Le(t, 0), 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(Float_Sub(0, t), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok = 0 }
+                            }
+                            IfCondition EqualTo(Float_Le(one, t), 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(Float_Sub(t, one), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok = 0 }
+                            }
+                            IfCondition EqualTo(ok, 1) ThenBlock: {
+                                px = Float_Add(x0, Float_Mul(t, dx))
+                                py = Float_Add(y0, Float_Mul(t, dy))
+                                ang = CAD_Geom.Atan2(Float_Sub(py, cy), Float_Sub(px, cx))
+                                // normalize to [0, 2π)
+                                IfCondition EqualTo(Float_Le(ang, 0), 1) ThenBlock: {
+                                    IfCondition EqualTo(Float_Le(Float_Sub(0, ang), 0x3F50624DD2F1A9FC), 0) ThenBlock: {
+                                        ang = Float_Add(ang, two_pi)
+                                    }
+                                }
+                                IfCondition EqualTo(Float_Le(two_pi, ang), 1) ThenBlock: {
+                                    ang = Float_Sub(ang, two_pi)
+                                }
+                                IfCondition LessThan(nang, 500) ThenBlock: {
+                                    ArraySet(angs, nang, ang)
+                                    nang = Add(nang, 1)
+                                }
+                            }
+                            hi = Add(hi, 1)
+                        }
+                    }
+                }
+                li = Add(li, 1)
+            }
+            // circle × circle hits (critical for multi-circle T-junctions)
+            cj = 0
+            WhileLoop LessThan(cj, nc) {
+                IfCondition NotEqual(cj, ci) ThenBlock: {
+                    bj = Multiply(cj, 3)
+                    ox = ArrayGet(circs, bj)
+                    oy = ArrayGet(circs, Add(bj, 1))
+                    orad = ArrayGet(circs, Add(bj, 2))
+                    dx = Float_Sub(ox, cx)
+                    dy = Float_Sub(oy, cy)
+                    d2 = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                    d = CAD_Num.Sqrt(d2)
+                    // valid intersection: |r1-r2| < d < r1+r2 and d > 0
+                    okc = 1
+                    IfCondition EqualTo(CAD_Num.IsZero(d, 0), 1) ThenBlock: { okc = 0 }
+                    IfCondition EqualTo(Float_Le(Float_Add(rad, orad), d), 1) ThenBlock: { okc = 0 }
+                    dr = Float_Sub(rad, orad)
+                    IfCondition EqualTo(Float_Le(dr, 0), 1) ThenBlock: { dr = Float_Sub(0, dr) }
+                    IfCondition EqualTo(Float_Le(d, dr), 1) ThenBlock: { okc = 0 }
+                    IfCondition EqualTo(okc, 1) ThenBlock: {
+                        // a = (r1^2 - r2^2 + d^2) / (2d)
+                        a = Float_Div(Float_Add(Float_Sub(Float_Mul(rad, rad), Float_Mul(orad, orad)), d2), Float_Mul(0x4000000000000000, d))
+                        h2 = Float_Sub(Float_Mul(rad, rad), Float_Mul(a, a))
+                        IfCondition EqualTo(Float_Le(h2, 0), 0) ThenBlock: {
+                            h = CAD_Num.Sqrt(h2)
+                            // midpoint along centers: C + a*(O-C)/d
+                            mx = Float_Add(cx, Float_Mul(a, Float_Div(dx, d)))
+                            my = Float_Add(cy, Float_Mul(a, Float_Div(dy, d)))
+                            // perpendicular offset
+                            rx = Float_Mul(h, Float_Div(dy, d))
+                            ry = Float_Mul(h, Float_Div(dx, d))
+                            // two points
+                            hi = 0
+                            WhileLoop LessThan(hi, 2) {
+                                IfCondition EqualTo(hi, 0) ThenBlock: {
+                                    px = Float_Add(mx, rx)
+                                    py = Float_Sub(my, ry)
+                                }
+                                IfCondition EqualTo(hi, 1) ThenBlock: {
+                                    px = Float_Sub(mx, rx)
+                                    py = Float_Add(my, ry)
+                                }
+                                ang = CAD_Geom.Atan2(Float_Sub(py, cy), Float_Sub(px, cx))
+                                IfCondition EqualTo(Float_Le(ang, 0), 1) ThenBlock: {
+                                    IfCondition EqualTo(Float_Le(Float_Sub(0, ang), 0x3F50624DD2F1A9FC), 0) ThenBlock: {
+                                        ang = Float_Add(ang, two_pi)
+                                    }
+                                }
+                                IfCondition EqualTo(Float_Le(two_pi, ang), 1) ThenBlock: {
+                                    ang = Float_Sub(ang, two_pi)
+                                }
+                                IfCondition LessThan(nang, 500) ThenBlock: {
+                                    ArraySet(angs, nang, ang)
+                                    nang = Add(nang, 1)
+                                }
+                                hi = Add(hi, 1)
+                            }
+                        }
+                    }
+                }
+                cj = Add(cj, 1)
+            }
+            // bubble-sort angles ascending
+            a = 0
+            WhileLoop LessThan(a, nang) {
+                bb = Add(a, 1)
+                WhileLoop LessThan(bb, nang) {
+                    va = ArrayGet(angs, a)
+                    vb = ArrayGet(angs, bb)
+                    IfCondition EqualTo(Float_Le(vb, va), 1) ThenBlock: {
+                        ArraySet(angs, a, vb)
+                        ArraySet(angs, bb, va)
+                    }
+                    bb = Add(bb, 1)
+                }
+                a = Add(a, 1)
+            }
+            // emit unique consecutive + wrap last→first
+            IfCondition GreaterThan(nang, 0) ThenBlock: {
+                prev = ArrayGet(angs, 0)
+                k = 1
+                WhileLoop LessThan(k, nang) {
+                    cur = ArrayGet(angs, k)
+                    dt = Float_Sub(cur, prev)
+                    // skip near-duplicates (slightly looser for angle merge)
+                    IfCondition EqualTo(Float_Le(dt, 0x3F50624DD2F1A9FC), 0) ThenBlock: {
+                        x0 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(prev)))
+                        y0 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(prev)))
+                        x1 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(cur)))
+                        y1 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(cur)))
+                        CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1)
+                        prev = cur
+                    }
+                    k = Add(k, 1)
+                }
+                first = ArrayGet(angs, 0)
+                x0 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(prev)))
+                y0 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(prev)))
+                x1 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(first)))
+                y1 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(first)))
+                CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1)
+            }
+            ci = Add(ci, 1)
+        }
+        Deallocate(angs, 512)
+        ReturnValue(CAD_Store.Read(sketch_handle, 0))
+    }
+}
+
+// Prepare sketch for extrude: merge open line-chains onto circles (clip arc),
+// then tessellate remaining full circles. FreeCAD-like "box on circle" pad.
+// Mutates sketch (adds LINE segs). Clears profile cache.
+// Returns n_profiles after BuildAllClosedLoops, or 0.
+// IMPORTANT: never promote a pure-circle pad when the sketch still has user
+// lines that did not join any closed loop (that was the "circle always wins" bug).
+Function.CAD_Sketch.PrepareExtrude {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        // clear cached loops
+        CAD_Store.Write(sketch_handle, 2, 0)
+        CAD_Store.Write(sketch_handle, 12, 0)
+        IfCondition GreaterThan(CAD_Store.Read(sketch_handle, 10), 0) ThenBlock: {
+            CAD_Sketch.TessellateArcs(sketch_handle, 32)
+        }
+        nl0 = CAD_Store.Read(sketch_handle, 0)
+        nc = CAD_Store.Read(sketch_handle, 7)
+        // pure circles only
+        IfCondition EqualTo(nl0, 0) ThenBlock: {
+            IfCondition GreaterThan(nc, 0) ThenBlock: {
+                CAD_Sketch.TessellateCircles(sketch_handle, 32)
+            }
+            ReturnValue(CAD_Sketch.BuildAllClosedLoops(sketch_handle))
+        }
+        IfCondition EqualTo(nc, 0) ThenBlock: {
+            ReturnValue(CAD_Sketch.BuildAllClosedLoops(sketch_handle))
+        }
+        circs = CAD_Store.Read(sketch_handle, 8)
+        lines = CAD_Store.Read(sketch_handle, 1)
+        two_pi = 0x401921FB54442D18
+        // freehand chain join tol (world units) — looser than Num_Tol.linear
+        chain_tol = 0x3F50624DD2F1A9FC
+        chain_tol2 = Float_Mul(chain_tol, chain_tol)
+        // Pre-project only FREE tips (valence 1) onto circle rim.
+        // Projecting ALL near-rim points destroyed closed rects near circles.
+        li = 0
+        WhileLoop LessThan(li, nl0) {
+            b = Multiply(li, 4)
+            ei = 0
+            WhileLoop LessThan(ei, 2) {
+                IfCondition EqualTo(ei, 0) ThenBlock: {
+                    px = ArrayGet(lines, b)
+                    py = ArrayGet(lines, Add(b, 1))
+                }
+                IfCondition EqualTo(ei, 1) ThenBlock: {
+                    px = ArrayGet(lines, Add(b, 2))
+                    py = ArrayGet(lines, Add(b, 3))
+                }
+                // valence = how many other endpoints coincide with this tip
+                valence = 0
+                lj = 0
+                WhileLoop LessThan(lj, nl0) {
+                    bj = Multiply(lj, 4)
+                    ej = 0
+                    WhileLoop LessThan(ej, 2) {
+                        skip = 0
+                        IfCondition EqualTo(lj, li) ThenBlock: {
+                            IfCondition EqualTo(ej, ei) ThenBlock: { skip = 1 }
+                        }
+                        IfCondition EqualTo(skip, 0) ThenBlock: {
+                            IfCondition EqualTo(ej, 0) ThenBlock: {
+                                qx = ArrayGet(lines, bj)
+                                qy = ArrayGet(lines, Add(bj, 1))
+                            }
+                            IfCondition EqualTo(ej, 1) ThenBlock: {
+                                qx = ArrayGet(lines, Add(bj, 2))
+                                qy = ArrayGet(lines, Add(bj, 3))
+                            }
+                            dx = Float_Sub(px, qx)
+                            dy = Float_Sub(py, qy)
+                            d2 = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                            IfCondition EqualTo(Float_Le(d2, chain_tol2), 1) ThenBlock: {
+                                valence = Add(valence, 1)
+                            }
+                        }
+                        ej = Add(ej, 1)
+                    }
+                    lj = Add(lj, 1)
+                }
+                // only free chain tips
+                IfCondition EqualTo(valence, 0) ThenBlock: {
+                    best_dd = 0
+                    best_ok = 0
+                    bcx = 0
+                    bcy = 0
+                    brad = 0
+                    ci = 0
+                    WhileLoop LessThan(ci, nc) {
+                        base = Multiply(ci, 3)
+                        cx = ArrayGet(circs, base)
+                        cy = ArrayGet(circs, Add(base, 1))
+                        rad = ArrayGet(circs, Add(base, 2))
+                        d = CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(px, cx), Float_Sub(px, cx)), Float_Mul(Float_Sub(py, cy), Float_Sub(py, cy))))
+                        dd = Float_Sub(d, rad)
+                        IfCondition EqualTo(Float_Le(dd, 0), 1) ThenBlock: { dd = Float_Sub(0, dd) }
+                        // |d-rad| <= 40% of radius
+                        tol = Float_Mul(rad, 0x3FD999999999999A)
+                        IfCondition EqualTo(Float_Le(dd, tol), 1) ThenBlock: {
+                            IfCondition EqualTo(best_ok, 0) ThenBlock: {
+                                best_ok = 1
+                                best_dd = dd
+                                bcx = cx
+                                bcy = cy
+                                brad = rad
+                            }
+                            IfCondition EqualTo(best_ok, 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(dd, best_dd), 1) ThenBlock: {
+                                    best_dd = dd
+                                    bcx = cx
+                                    bcy = cy
+                                    brad = rad
+                                }
+                            }
+                        }
+                        ci = Add(ci, 1)
+                    }
+                    IfCondition EqualTo(best_ok, 1) ThenBlock: {
+                        d = CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(px, bcx), Float_Sub(px, bcx)), Float_Mul(Float_Sub(py, bcy), Float_Sub(py, bcy))))
+                        IfCondition EqualTo(CAD_Num.IsZero(d, 0), 0) ThenBlock: {
+                            px = Float_Add(bcx, Float_Mul(brad, Float_Div(Float_Sub(px, bcx), d)))
+                            py = Float_Add(bcy, Float_Mul(brad, Float_Div(Float_Sub(py, bcy), d)))
+                            IfCondition EqualTo(ei, 0) ThenBlock: {
+                                ArraySet(lines, b, px)
+                                ArraySet(lines, Add(b, 1), py)
+                            }
+                            IfCondition EqualTo(ei, 1) ThenBlock: {
+                                ArraySet(lines, Add(b, 2), px)
+                                ArraySet(lines, Add(b, 3), py)
+                            }
+                        }
+                    }
+                }
+                ei = Add(ei, 1)
+            }
+            li = Add(li, 1)
+        }
+        // consumed circles
+        usedc = Allocate(64)
+        ci = 0
+        WhileLoop LessThan(ci, nc) {
+            ArraySet(usedc, ci, 0)
+            ci = Add(ci, 1)
+        }
+        n_attached = 0
+        // line-used flags for chain walk (only original lines 0..nl0-1)
+        usedl = Allocate(1024)
+        li = 0
+        WhileLoop LessThan(li, nl0) {
+            ArraySet(usedl, li, 0)
+            li = Add(li, 1)
+        }
+        // grow chains from each unused line
+        seed = 0
+        WhileLoop LessThan(seed, nl0) {
+            IfCondition EqualTo(ArrayGet(usedl, seed), 0) ThenBlock: {
+                // start chain at seed: tip = end of seed, start = begin
+                ArraySet(usedl, seed, 1)
+                // ordered points buffer
+                pts = Allocate(4096)
+                np = 0
+                sx = ArrayGet(lines, Multiply(seed, 4))
+                sy = ArrayGet(lines, Add(Multiply(seed, 4), 1))
+                ex = ArrayGet(lines, Add(Multiply(seed, 4), 2))
+                ey = ArrayGet(lines, Add(Multiply(seed, 4), 3))
+                ArraySet(pts, 0, sx)
+                ArraySet(pts, 1, sy)
+                ArraySet(pts, 2, ex)
+                ArraySet(pts, 3, ey)
+                np = 2
+                tipx = ex
+                tipy = ey
+                // extend forward (distance join, not only exact IsEqual)
+                guard = 0
+                WhileLoop LessThan(guard, 256) {
+                    guard = Add(guard, 1)
+                    found = -1
+                    rev = 0
+                    best_d2 = chain_tol2
+                    j = 0
+                    WhileLoop LessThan(j, nl0) {
+                        IfCondition EqualTo(ArrayGet(usedl, j), 0) ThenBlock: {
+                            b = Multiply(j, 4)
+                            ax = ArrayGet(lines, b)
+                            ay = ArrayGet(lines, Add(b, 1))
+                            bx = ArrayGet(lines, Add(b, 2))
+                            by = ArrayGet(lines, Add(b, 3))
+                            dx = Float_Sub(ax, tipx)
+                            dy = Float_Sub(ay, tipy)
+                            d2 = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                            IfCondition EqualTo(Float_Le(d2, best_d2), 1) ThenBlock: {
+                                best_d2 = d2
+                                found = j
+                                rev = 0
+                            }
+                            dx = Float_Sub(bx, tipx)
+                            dy = Float_Sub(by, tipy)
+                            d2 = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                            IfCondition EqualTo(Float_Le(d2, best_d2), 1) ThenBlock: {
+                                best_d2 = d2
+                                found = j
+                                rev = 1
+                            }
+                        }
+                        j = Add(j, 1)
+                    }
+                    IfCondition EqualTo(found, -1) ThenBlock: {
+                        guard = 256
+                    }
+                    IfCondition GreaterEqual(found, 0) ThenBlock: {
+                        ArraySet(usedl, found, 1)
+                        b = Multiply(found, 4)
+                        IfCondition EqualTo(rev, 0) ThenBlock: {
+                            // snap join point so later BuildAllClosedLoops chains cleanly
+                            ArraySet(lines, b, tipx)
+                            ArraySet(lines, Add(b, 1), tipy)
+                            tipx = ArrayGet(lines, Add(b, 2))
+                            tipy = ArrayGet(lines, Add(b, 3))
+                        }
+                        IfCondition EqualTo(rev, 1) ThenBlock: {
+                            ArraySet(lines, Add(b, 2), tipx)
+                            ArraySet(lines, Add(b, 3), tipy)
+                            tipx = ArrayGet(lines, b)
+                            tipy = ArrayGet(lines, Add(b, 1))
+                        }
+                        ArraySet(pts, Multiply(np, 2), tipx)
+                        ArraySet(pts, Add(Multiply(np, 2), 1), tipy)
+                        np = Add(np, 1)
+                    }
+                }
+                // also extend backward from sx,sy
+                tipx = sx
+                tipy = sy
+                guard = 0
+                WhileLoop LessThan(guard, 256) {
+                    guard = Add(guard, 1)
+                    found = -1
+                    rev = 0
+                    best_d2 = chain_tol2
+                    j = 0
+                    WhileLoop LessThan(j, nl0) {
+                        IfCondition EqualTo(ArrayGet(usedl, j), 0) ThenBlock: {
+                            b = Multiply(j, 4)
+                            ax = ArrayGet(lines, b)
+                            ay = ArrayGet(lines, Add(b, 1))
+                            bx = ArrayGet(lines, Add(b, 2))
+                            by = ArrayGet(lines, Add(b, 3))
+                            dx = Float_Sub(ax, tipx)
+                            dy = Float_Sub(ay, tipy)
+                            d2 = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                            IfCondition EqualTo(Float_Le(d2, best_d2), 1) ThenBlock: {
+                                best_d2 = d2
+                                found = j
+                                rev = 0
+                            }
+                            dx = Float_Sub(bx, tipx)
+                            dy = Float_Sub(by, tipy)
+                            d2 = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                            IfCondition EqualTo(Float_Le(d2, best_d2), 1) ThenBlock: {
+                                best_d2 = d2
+                                found = j
+                                rev = 1
+                            }
+                        }
+                        j = Add(j, 1)
+                    }
+                    IfCondition EqualTo(found, -1) ThenBlock: {
+                        guard = 256
+                    }
+                    IfCondition GreaterEqual(found, 0) ThenBlock: {
+                        ArraySet(usedl, found, 1)
+                        b = Multiply(found, 4)
+                        IfCondition EqualTo(rev, 0) ThenBlock: {
+                            ArraySet(lines, b, tipx)
+                            ArraySet(lines, Add(b, 1), tipy)
+                            tipx = ArrayGet(lines, Add(b, 2))
+                            tipy = ArrayGet(lines, Add(b, 3))
+                        }
+                        IfCondition EqualTo(rev, 1) ThenBlock: {
+                            ArraySet(lines, Add(b, 2), tipx)
+                            ArraySet(lines, Add(b, 3), tipy)
+                            tipx = ArrayGet(lines, b)
+                            tipy = ArrayGet(lines, Add(b, 1))
+                        }
+                        // prepend: shift pts
+                        k = np
+                        WhileLoop GreaterThan(k, 0) {
+                            ArraySet(pts, Multiply(k, 2), ArrayGet(pts, Multiply(Subtract(k, 1), 2)))
+                            ArraySet(pts, Add(Multiply(k, 2), 1), ArrayGet(pts, Add(Multiply(Subtract(k, 1), 2), 1)))
+                            k = Subtract(k, 1)
+                        }
+                        ArraySet(pts, 0, tipx)
+                        ArraySet(pts, 1, tipy)
+                        np = Add(np, 1)
+                    }
+                }
+                // chain ends: pts[0] and pts[np-1]
+                IfCondition GreaterEqual(np, 2) ThenBlock: {
+                    e0x = ArrayGet(pts, 0)
+                    e0y = ArrayGet(pts, 1)
+                    e1x = ArrayGet(pts, Multiply(Subtract(np, 1), 2))
+                    e1y = ArrayGet(pts, Add(Multiply(Subtract(np, 1), 2), 1))
+                    // chain centroid for arc choice
+                    cxsum = 0
+                    cysum = 0
+                    k = 0
+                    WhileLoop LessThan(k, np) {
+                        cxsum = Float_Add(cxsum, ArrayGet(pts, Multiply(k, 2)))
+                        cysum = Float_Add(cysum, ArrayGet(pts, Add(Multiply(k, 2), 1)))
+                        k = Add(k, 1)
+                    }
+                    cnx = Float_Div(cxsum, Float_FromInt(np))
+                    cny = Float_Div(cysum, Float_FromInt(np))
+                    // which circle?
+                    ci = 0
+                    WhileLoop LessThan(ci, nc) {
+                        IfCondition EqualTo(ArrayGet(usedc, ci), 0) ThenBlock: {
+                            base = Multiply(ci, 3)
+                            cx = ArrayGet(circs, base)
+                            cy = ArrayGet(circs, Add(base, 1))
+                            rad = ArrayGet(circs, Add(base, 2))
+                            // ends on circle?
+                            d0 = CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(e0x, cx), Float_Sub(e0x, cx)), Float_Mul(Float_Sub(e0y, cy), Float_Sub(e0y, cy))))
+                            d1 = CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(e1x, cx), Float_Sub(e1x, cx)), Float_Mul(Float_Sub(e1y, cy), Float_Sub(e1y, cy))))
+                            // |d-rad| <= 40% rad (after pre-project, ends should be exact)
+                            tol = Float_Mul(rad, 0x3FD999999999999A)
+                            dd0 = Float_Sub(d0, rad)
+                            IfCondition EqualTo(Float_Le(dd0, 0), 1) ThenBlock: { dd0 = Float_Sub(0, dd0) }
+                            dd1 = Float_Sub(d1, rad)
+                            IfCondition EqualTo(Float_Le(dd1, 0), 1) ThenBlock: { dd1 = Float_Sub(0, dd1) }
+                            ok0 = 0
+                            ok1 = 0
+                            IfCondition EqualTo(Float_Le(dd0, tol), 1) ThenBlock: { ok0 = 1 }
+                            IfCondition EqualTo(Float_Le(dd1, tol), 1) ThenBlock: { ok1 = 1 }
+                            // also refuse degenerate: both ends nearly the same point on rim
+                            IfCondition EqualTo(ok0, 1) ThenBlock: {
+                                IfCondition EqualTo(ok1, 1) ThenBlock: {
+                                    ed = CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(e0x, e1x), Float_Sub(e0x, e1x)), Float_Mul(Float_Sub(e0y, e1y), Float_Sub(e0y, e1y))))
+                                    min_span = Float_Mul(rad, 0x3F847AE147AE147B)
+                                    IfCondition EqualTo(Float_Le(ed, min_span), 1) ThenBlock: {
+                                        ok0 = 0
+                                        ok1 = 0
+                                    }
+                                }
+                            }
+                            IfCondition EqualTo(ok0, 1) ThenBlock: {
+                                IfCondition EqualTo(ok1, 1) ThenBlock: {
+                                    // project ends onto circle exactly
+                                    d0 = CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(e0x, cx), Float_Sub(e0x, cx)), Float_Mul(Float_Sub(e0y, cy), Float_Sub(e0y, cy))))
+                                    d1 = CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(e1x, cx), Float_Sub(e1x, cx)), Float_Mul(Float_Sub(e1y, cy), Float_Sub(e1y, cy))))
+                                    IfCondition EqualTo(CAD_Num.IsZero(d0, 0), 0) ThenBlock: {
+                                        e0x = Float_Add(cx, Float_Mul(rad, Float_Div(Float_Sub(e0x, cx), d0)))
+                                        e0y = Float_Add(cy, Float_Mul(rad, Float_Div(Float_Sub(e0y, cy), d0)))
+                                    }
+                                    IfCondition EqualTo(CAD_Num.IsZero(d1, 0), 0) ThenBlock: {
+                                        e1x = Float_Add(cx, Float_Mul(rad, Float_Div(Float_Sub(e1x, cx), d1)))
+                                        e1y = Float_Add(cy, Float_Mul(rad, Float_Div(Float_Sub(e1y, cy), d1)))
+                                    }
+                                    // angles at ends
+                                    a0 = CAD_Geom.Atan2(Float_Sub(e0y, cy), Float_Sub(e0x, cx))
+                                    a1 = CAD_Geom.Atan2(Float_Sub(e1y, cy), Float_Sub(e1x, cx))
+                                    // two possible remaining arcs: CCW a0→a1 and a1→a0
+                                    // pick remaining arc mid farther from chain centroid
+                                    span01 = Float_Sub(a1, a0)
+                                    IfCondition EqualTo(Float_Le(span01, 0), 1) ThenBlock: {
+                                        span01 = Float_Add(span01, two_pi)
+                                    }
+                                    mid01 = Float_Add(a0, Float_Mul(span01, 0x3FE0000000000000))
+                                    mx01 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(mid01)))
+                                    my01 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(mid01)))
+                                    d01 = Float_Add(Float_Mul(Float_Sub(mx01, cnx), Float_Sub(mx01, cnx)), Float_Mul(Float_Sub(my01, cny), Float_Sub(my01, cny)))
+                                    span10 = Float_Sub(a0, a1)
+                                    IfCondition EqualTo(Float_Le(span10, 0), 1) ThenBlock: {
+                                        span10 = Float_Add(span10, two_pi)
+                                    }
+                                    mid10 = Float_Add(a1, Float_Mul(span10, 0x3FE0000000000000))
+                                    mx10 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(mid10)))
+                                    my10 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(mid10)))
+                                    d10 = Float_Add(Float_Mul(Float_Sub(mx10, cnx), Float_Sub(mx10, cnx)), Float_Mul(Float_Sub(my10, cny), Float_Sub(my10, cny)))
+                                    // remaining arc = farther mid from chain
+                                    ra0 = a0
+                                    ra1 = a1
+                                    IfCondition EqualTo(Float_Le(d01, d10), 1) ThenBlock: {
+                                        // d10 farther → remaining a1→a0
+                                        ra0 = a1
+                                        ra1 = a0
+                                    }
+                                    // tessellate remaining arc into lines
+                                    span = Float_Sub(ra1, ra0)
+                                    IfCondition EqualTo(Float_Le(span, 0), 1) ThenBlock: {
+                                        span = Float_Add(span, two_pi)
+                                    }
+                                    nseg = Float_ToInt(Float_Div(Float_Mul(Float_FromInt(32), span), two_pi))
+                                    IfCondition LessThan(nseg, 4) ThenBlock: { nseg = 4 }
+                                    IfCondition GreaterThan(nseg, 64) ThenBlock: { nseg = 64 }
+                                    // remaining arc connectivity: force ends onto chain tips
+                                    esx = e0x
+                                    esy = e0y
+                                    eex = e1x
+                                    eey = e1y
+                                    IfCondition EqualTo(CAD_Num.IsEqual(ra0, a1, 0), 1) ThenBlock: {
+                                        esx = e1x
+                                        esy = e1y
+                                        eex = e0x
+                                        eey = e0y
+                                    }
+                                    // snap chain tips onto exact rim in the line buffer too
+                                    // (pts[0]/pts[last] may have been pre-projected already)
+                                    i = 0
+                                    WhileLoop LessThan(i, nseg) {
+                                        t0 = Float_Div(Float_FromInt(i), Float_FromInt(nseg))
+                                        t1 = Float_Div(Float_FromInt(Add(i, 1)), Float_FromInt(nseg))
+                                        ang0 = Float_Add(ra0, Float_Mul(span, t0))
+                                        ang1 = Float_Add(ra0, Float_Mul(span, t1))
+                                        x0 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(ang0)))
+                                        y0 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(ang0)))
+                                        x1 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(ang1)))
+                                        y1 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(ang1)))
+                                        IfCondition EqualTo(i, 0) ThenBlock: {
+                                            x0 = esx
+                                            y0 = esy
+                                        }
+                                        IfCondition EqualTo(Add(i, 1), nseg) ThenBlock: {
+                                            x1 = eex
+                                            y1 = eey
+                                        }
+                                        CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1)
+                                        i = Add(i, 1)
+                                    }
+                                    // also force original chain tip verts onto exact projected ends
+                                    // so BuildAllClosedLoops joins chain ↔ arc segs
+                                    // rewrite line endpoints that match pre-project tips
+                                    li2 = 0
+                                    WhileLoop LessThan(li2, nl0) {
+                                        b2 = Multiply(li2, 4)
+                                        ax = ArrayGet(lines, b2)
+                                        ay = ArrayGet(lines, Add(b2, 1))
+                                        bx = ArrayGet(lines, Add(b2, 2))
+                                        by = ArrayGet(lines, Add(b2, 3))
+                                        IfCondition EqualTo(CAD_Num.IsEqual(ax, ArrayGet(pts, 0), 0), 1) ThenBlock: {
+                                            IfCondition EqualTo(CAD_Num.IsEqual(ay, ArrayGet(pts, 1), 0), 1) ThenBlock: {
+                                                ArraySet(lines, b2, e0x)
+                                                ArraySet(lines, Add(b2, 1), e0y)
+                                            }
+                                        }
+                                        IfCondition EqualTo(CAD_Num.IsEqual(bx, ArrayGet(pts, 0), 0), 1) ThenBlock: {
+                                            IfCondition EqualTo(CAD_Num.IsEqual(by, ArrayGet(pts, 1), 0), 1) ThenBlock: {
+                                                ArraySet(lines, Add(b2, 2), e0x)
+                                                ArraySet(lines, Add(b2, 3), e0y)
+                                            }
+                                        }
+                                        IfCondition EqualTo(CAD_Num.IsEqual(ax, ArrayGet(pts, Multiply(Subtract(np, 1), 2)), 0), 1) ThenBlock: {
+                                            IfCondition EqualTo(CAD_Num.IsEqual(ay, ArrayGet(pts, Add(Multiply(Subtract(np, 1), 2), 1)), 0), 1) ThenBlock: {
+                                                ArraySet(lines, b2, e1x)
+                                                ArraySet(lines, Add(b2, 1), e1y)
+                                            }
+                                        }
+                                        IfCondition EqualTo(CAD_Num.IsEqual(bx, ArrayGet(pts, Multiply(Subtract(np, 1), 2)), 0), 1) ThenBlock: {
+                                            IfCondition EqualTo(CAD_Num.IsEqual(by, ArrayGet(pts, Add(Multiply(Subtract(np, 1), 2), 1)), 0), 1) ThenBlock: {
+                                                ArraySet(lines, Add(b2, 2), e1x)
+                                                ArraySet(lines, Add(b2, 3), e1y)
+                                            }
+                                        }
+                                        li2 = Add(li2, 1)
+                                    }
+                                    ArraySet(usedc, ci, 1)
+                                    n_attached = Add(n_attached, 1)
+                                    ci = nc
+                                }
+                            }
+                        }
+                        ci = Add(ci, 1)
+                    }
+                }
+                Deallocate(pts, 4096)
+            }
+            seed = Add(seed, 1)
+        }
+        // remaining full circles → closed 32-gons (always; pad selects which profile)
+        ci = 0
+        WhileLoop LessThan(ci, nc) {
+            IfCondition EqualTo(ArrayGet(usedc, ci), 0) ThenBlock: {
+                base = Multiply(ci, 3)
+                cx = ArrayGet(circs, base)
+                cy = ArrayGet(circs, Add(base, 1))
+                rad = ArrayGet(circs, Add(base, 2))
+                i = 0
+                WhileLoop LessThan(i, 32) {
+                    a0 = Float_Mul(two_pi, Float_Div(Float_FromInt(i), Float_FromInt(32)))
+                    a1 = Float_Mul(two_pi, Float_Div(Float_FromInt(Add(i, 1)), Float_FromInt(32)))
+                    x0 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(a0)))
+                    y0 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(a0)))
+                    x1 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(a1)))
+                    y1 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(a1)))
+                    CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1)
+                    i = Add(i, 1)
+                }
+            }
+            ci = Add(ci, 1)
+        }
+        Deallocate(usedc, 64)
+        Deallocate(usedl, 1024)
+        // circles/arcs now represented as lines
+        CAD_Store.Write(sketch_handle, 7, 0)
+        CAD_Store.Write(sketch_handle, 10, 0)
+        CAD_Store.Write(sketch_handle, 2, 0)
+        CAD_Store.Write(sketch_handle, 12, 0)
+        // stash attach count in last_error for app diagnostics (optional)
+        CAD_Sketch_State.last_error = n_attached
+        ReturnValue(CAD_Sketch.BuildAllClosedLoops(sketch_handle))
+    }
+}
+
+// Promote profile index to primary loop (for pad selection). Returns n pts or 0.
+// Mirror profile i into primary loop slots 2/3 for display/export.
+// Does NOT call BuildAllClosedLoops — that would mutate live lines and
+// replace the multi-profile pool (broke Pick/Next when nprof≥2).
+Function.CAD_Sketch.SelectProfile {
+    Input: sketch_handle: Integer
+    Input: profile_i: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        nprof = CAD_Store.Read(sketch_handle, 12)
+        IfCondition EqualTo(nprof, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(profile_i, nprof) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(profile_i, 0) ThenBlock: { ReturnValue(0) }
+        xy = Allocate(4096)
+        nn = CAD_Sketch.GetProfileXY(sketch_handle, profile_i, xy)
+        IfCondition LessThan(nn, 3) ThenBlock: {
+            Deallocate(xy, 4096)
+            ReturnValue(0)
+        }
+        loop = CAD_Store.Read(sketch_handle, 3)
+        k = 0
+        WhileLoop LessThan(k, nn) {
+            ArraySet(loop, Multiply(k, 2), ArrayGet(xy, Multiply(k, 2)))
+            ArraySet(loop, Add(Multiply(k, 2), 1), ArrayGet(xy, Add(Multiply(k, 2), 1)))
+            k = Add(k, 1)
+        }
+        CAD_Store.Write(sketch_handle, 2, nn)
+        // keep multi-profile count intact
+        CAD_Store.Write(sketch_handle, 12, nprof)
+        Deallocate(xy, 4096)
+        ReturnValue(nn)
+    }
+}
+
+// Arc: center (cx,cy), radius, start/end angles in radians (CCW from +X).
+// DXF degrees → rad before call. a1 may be < a0 (crosses 0); span = a1-a0 + 2π if needed.
+Function.CAD_Sketch.AddArc {
+    Input: sketch_handle: Integer
+    Input: cx_r: Integer
+    Input: cy_r: Integer
+    Input: rad_r: Integer
+    Input: a0_r: Integer
+    Input: a1_r: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(CAD_Num.IsZero(rad_r, 0), 1) ThenBlock: { ReturnValue(0) }
+        n = CAD_Store.Read(sketch_handle, 10)
+        IfCondition GreaterEqual(n, 32) ThenBlock: { ReturnValue(0) }
+        arcs = CAD_Store.Read(sketch_handle, 11)
+        IfCondition EqualTo(arcs, 0) ThenBlock: { ReturnValue(0) }
+        base = Multiply(n, 5)
+        ArraySet(arcs, base, cx_r)
+        ArraySet(arcs, Add(base, 1), cy_r)
+        ArraySet(arcs, Add(base, 2), rad_r)
+        ArraySet(arcs, Add(base, 3), a0_r)
+        ArraySet(arcs, Add(base, 4), a1_r)
+        CAD_Store.Write(sketch_handle, 10, Add(n, 1))
         CAD_Sketch_State.entity_count = Add(CAD_Sketch_State.entity_count, 1)
-        ReturnValue(CAD_Sketch_State.entity_count)
+        ReturnValue(Add(n, 1))
+    }
+}
+
+Function.CAD_Sketch.GetArcCount {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(CAD_Store.Read(sketch_handle, 10))
+    }
+}
+
+// Expand arcs into LINE segs. FORCES vertices at every line×arc hit so a
+// line drawn through the true arc also meets the polyline (anchors alone
+// are not enough — inscribed n-gon chords can miss the real crossings).
+// Clears n_arcs after.
+Function.CAD_Sketch.TessellateArcs {
+    Input: sketch_handle: Integer
+    Input: nseg_max: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(nseg_max, 8) ThenBlock: { nseg_max = 32 }
+        na = CAD_Store.Read(sketch_handle, 10)
+        IfCondition EqualTo(na, 0) ThenBlock: { ReturnValue(0) }
+        arcs = CAD_Store.Read(sketch_handle, 11)
+        lines = CAD_Store.Read(sketch_handle, 1)
+        nl = CAD_Store.Read(sketch_handle, 0)
+        two_pi = 0x401921FB54442D18
+        // store parameter t in [0,1] along arc span (0=a0, 1=a1)
+        ts = Allocate(512)
+        ai = 0
+        WhileLoop LessThan(ai, na) {
+            base = Multiply(ai, 5)
+            cx = ArrayGet(arcs, base)
+            cy = ArrayGet(arcs, Add(base, 1))
+            rad = ArrayGet(arcs, Add(base, 2))
+            a0 = ArrayGet(arcs, Add(base, 3))
+            a1 = ArrayGet(arcs, Add(base, 4))
+            span = Float_Sub(a1, a0)
+            IfCondition EqualTo(Float_Le(span, 0), 1) ThenBlock: {
+                span = Float_Add(span, two_pi)
+            }
+            nseg = Float_ToInt(Float_Div(Float_Mul(Float_FromInt(nseg_max), span), two_pi))
+            IfCondition LessThan(nseg, 4) ThenBlock: { nseg = 4 }
+            IfCondition GreaterThan(nseg, 128) ThenBlock: { nseg = 128 }
+            nt = 0
+            // uniform samples as t in [0,1]
+            i = 0
+            WhileLoop LessThan(i, Add(nseg, 1)) {
+                ArraySet(ts, nt, Float_Div(Float_FromInt(i), Float_FromInt(nseg)))
+                nt = Add(nt, 1)
+                i = Add(i, 1)
+            }
+            // line × arc hits → t along span
+            li = 0
+            WhileLoop LessThan(li, nl) {
+                b = Multiply(li, 4)
+                x0 = ArrayGet(lines, b)
+                y0 = ArrayGet(lines, Add(b, 1))
+                x1 = ArrayGet(lines, Add(b, 2))
+                y1 = ArrayGet(lines, Add(b, 3))
+                dx = Float_Sub(x1, x0)
+                dy = Float_Sub(y1, y0)
+                fx = Float_Sub(x0, cx)
+                fy = Float_Sub(y0, cy)
+                aa = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                IfCondition EqualTo(CAD_Num.IsZero(aa, 0), 0) ThenBlock: {
+                    bb = Float_Mul(0x4000000000000000, Float_Add(Float_Mul(fx, dx), Float_Mul(fy, dy)))
+                    cc = Float_Sub(Float_Add(Float_Mul(fx, fx), Float_Mul(fy, fy)), Float_Mul(rad, rad))
+                    disc = Float_Sub(Float_Mul(bb, bb), Float_Mul(Float_Mul(0x4010000000000000, aa), cc))
+                    IfCondition EqualTo(Float_Le(disc, 0), 0) ThenBlock: {
+                        s = CAD_Num.Sqrt(disc)
+                        two_a = Float_Mul(0x4000000000000000, aa)
+                        ht0 = Float_Div(Float_Sub(Float_Sub(0, bb), s), two_a)
+                        ht1 = Float_Div(Float_Add(Float_Sub(0, bb), s), two_a)
+                        hi = 0
+                        WhileLoop LessThan(hi, 2) {
+                            tline = ht0
+                            IfCondition EqualTo(hi, 1) ThenBlock: { tline = ht1 }
+                            one = 0x3FF0000000000000
+                            ok = 1
+                            IfCondition EqualTo(Float_Le(tline, 0), 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(Float_Sub(0, tline), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok = 0 }
+                            }
+                            IfCondition EqualTo(Float_Le(one, tline), 1) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(Float_Sub(tline, one), 0x3F50624DD2F1A9FC), 0) ThenBlock: { ok = 0 }
+                            }
+                            IfCondition EqualTo(ok, 1) ThenBlock: {
+                                px = Float_Add(x0, Float_Mul(tline, dx))
+                                py = Float_Add(y0, Float_Mul(tline, dy))
+                                ang = CAD_Geom.Atan2(Float_Sub(py, cy), Float_Sub(px, cx))
+                                dang = Float_Sub(ang, a0)
+                                IfCondition EqualTo(Float_Le(dang, 0), 1) ThenBlock: {
+                                    IfCondition EqualTo(Float_Le(Float_Sub(0, dang), 0x3F50624DD2F1A9FC), 0) ThenBlock: {
+                                        dang = Float_Add(dang, two_pi)
+                                    }
+                                }
+                                // on open span [0, span]
+                                on = 0
+                                IfCondition EqualTo(Float_Le(dang, 0), 1) ThenBlock: {
+                                    // dang <= 0 only if ~0 after wrap check
+                                    IfCondition EqualTo(Float_Le(Float_Sub(0, dang), 0x3F50624DD2F1A9FC), 1) ThenBlock: {
+                                        on = 1
+                                        dang = 0
+                                    }
+                                }
+                                IfCondition EqualTo(Float_Le(0, dang), 0) ThenBlock: {
+                                    // dang > 0
+                                    IfCondition EqualTo(Float_Le(dang, Float_Add(span, 0x3F50624DD2F1A9FC)), 1) ThenBlock: {
+                                        on = 1
+                                    }
+                                }
+                                IfCondition EqualTo(on, 1) ThenBlock: {
+                                    tt = 0
+                                    IfCondition EqualTo(CAD_Num.IsZero(span, 0), 0) ThenBlock: {
+                                        tt = Float_Div(dang, span)
+                                    }
+                                    IfCondition EqualTo(Float_Le(tt, 0), 1) ThenBlock: { tt = 0 }
+                                    IfCondition EqualTo(Float_Le(one, tt), 1) ThenBlock: { tt = one }
+                                    IfCondition LessThan(nt, 500) ThenBlock: {
+                                        ArraySet(ts, nt, tt)
+                                        nt = Add(nt, 1)
+                                    }
+                                }
+                            }
+                            hi = Add(hi, 1)
+                        }
+                    }
+                }
+                li = Add(li, 1)
+            }
+            // sort t ascending
+            a = 0
+            WhileLoop LessThan(a, nt) {
+                bb = Add(a, 1)
+                WhileLoop LessThan(bb, nt) {
+                    va = ArrayGet(ts, a)
+                    vb = ArrayGet(ts, bb)
+                    IfCondition EqualTo(Float_Le(vb, va), 1) ThenBlock: {
+                        ArraySet(ts, a, vb)
+                        ArraySet(ts, bb, va)
+                    }
+                    bb = Add(bb, 1)
+                }
+                a = Add(a, 1)
+            }
+            // emit unique segments
+            IfCondition GreaterThan(nt, 1) ThenBlock: {
+                prev = ArrayGet(ts, 0)
+                k = 1
+                WhileLoop LessThan(k, nt) {
+                    cur = ArrayGet(ts, k)
+                    dt = Float_Sub(cur, prev)
+                    IfCondition EqualTo(Float_Le(dt, 0x3F1A36E2EB1C432D), 0) ThenBlock: {
+                        ang0 = Float_Add(a0, Float_Mul(span, prev))
+                        ang1 = Float_Add(a0, Float_Mul(span, cur))
+                        x0 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(ang0)))
+                        y0 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(ang0)))
+                        x1 = Float_Add(cx, Float_Mul(rad, CAD_Geom.Cos(ang1)))
+                        y1 = Float_Add(cy, Float_Mul(rad, CAD_Geom.Sin(ang1)))
+                        CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1)
+                        prev = cur
+                    }
+                    k = Add(k, 1)
+                }
+            }
+            ai = Add(ai, 1)
+        }
+        Deallocate(ts, 512)
+        CAD_Store.Write(sketch_handle, 10, 0)
+        ReturnValue(CAD_Store.Read(sketch_handle, 0))
+    }
+}
+
+// Split every LINE at crossings + T-junctions + circle/arc rim hits.
+// Works with a single line against circles (nl==1) — critical for trim-to-point.
+// Does NOT tessellate circles/arcs; live entities stay clean.
+// Returns new line count.
+Function.CAD_Sketch.SplitAtIntersections {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        nl = CAD_Store.Read(sketch_handle, 0)
+        // allow 1 line: still split at circle/arc hits
+        IfCondition LessThan(nl, 1) ThenBlock: { ReturnValue(nl) }
+        lines = CAD_Store.Read(sketch_handle, 1)
+        cap = CAD_Store.Read(sketch_handle, 5)
+        // freehand meet tol from AABB (lines + circles + arcs)
+        xmin = ArrayGet(lines, 0)
+        ymin = ArrayGet(lines, 1)
+        xmax = xmin
+        ymax = ymin
+        bi0 = 0
+        WhileLoop LessThan(bi0, nl) {
+            b0 = Multiply(bi0, 4)
+            x = ArrayGet(lines, b0)
+            y = ArrayGet(lines, Add(b0, 1))
+            IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+            IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+            IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+            IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+            x = ArrayGet(lines, Add(b0, 2))
+            y = ArrayGet(lines, Add(b0, 3))
+            IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+            IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+            IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+            IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+            bi0 = Add(bi0, 1)
+        }
+        nc_bb = CAD_Store.Read(sketch_handle, 7)
+        circs_bb = CAD_Store.Read(sketch_handle, 8)
+        bi0 = 0
+        WhileLoop LessThan(bi0, nc_bb) {
+            b0 = Multiply(bi0, 3)
+            cx = ArrayGet(circs_bb, b0)
+            cy = ArrayGet(circs_bb, Add(b0, 1))
+            rad = ArrayGet(circs_bb, Add(b0, 2))
+            IfCondition EqualTo(Float_Le(Float_Sub(cx, rad), xmin), 1) ThenBlock: { xmin = Float_Sub(cx, rad) }
+            IfCondition EqualTo(Float_Le(xmax, Float_Add(cx, rad)), 1) ThenBlock: { xmax = Float_Add(cx, rad) }
+            IfCondition EqualTo(Float_Le(Float_Sub(cy, rad), ymin), 1) ThenBlock: { ymin = Float_Sub(cy, rad) }
+            IfCondition EqualTo(Float_Le(ymax, Float_Add(cy, rad)), 1) ThenBlock: { ymax = Float_Add(cy, rad) }
+            bi0 = Add(bi0, 1)
+        }
+        na_bb = CAD_Store.Read(sketch_handle, 10)
+        arcs_bb = CAD_Store.Read(sketch_handle, 11)
+        bi0 = 0
+        WhileLoop LessThan(bi0, na_bb) {
+            b0 = Multiply(bi0, 5)
+            cx = ArrayGet(arcs_bb, b0)
+            cy = ArrayGet(arcs_bb, Add(b0, 1))
+            rad = ArrayGet(arcs_bb, Add(b0, 2))
+            IfCondition EqualTo(Float_Le(Float_Sub(cx, rad), xmin), 1) ThenBlock: { xmin = Float_Sub(cx, rad) }
+            IfCondition EqualTo(Float_Le(xmax, Float_Add(cx, rad)), 1) ThenBlock: { xmax = Float_Add(cx, rad) }
+            IfCondition EqualTo(Float_Le(Float_Sub(cy, rad), ymin), 1) ThenBlock: { ymin = Float_Sub(cy, rad) }
+            IfCondition EqualTo(Float_Le(ymax, Float_Add(cy, rad)), 1) ThenBlock: { ymax = Float_Add(cy, rad) }
+            bi0 = Add(bi0, 1)
+        }
+        dxb = Float_Sub(xmax, xmin)
+        dyb = Float_Sub(ymax, ymin)
+        diag = CAD_Num.Sqrt(Float_Add(Float_Mul(dxb, dxb), Float_Mul(dyb, dyb)))
+        mtol = Float_Mul(diag, 0x3F847AE147AE147B)
+        floort = 0x3F50624DD2F1A9FC
+        IfCondition EqualTo(Float_Le(mtol, floort), 1) ThenBlock: { mtol = floort }
+        mtol2 = Float_Mul(mtol, mtol)
+        out = Allocate(16384)
+        on = 0
+        ts = Allocate(512)
+        nc = CAD_Store.Read(sketch_handle, 7)
+        circs = CAD_Store.Read(sketch_handle, 8)
+        na = CAD_Store.Read(sketch_handle, 10)
+        arcs = CAD_Store.Read(sketch_handle, 11)
+        two_pi = 0x401921FB54442D18
+        i = 0
+        WhileLoop LessThan(i, nl) {
+            bi = Multiply(i, 4)
+            ax0 = ArrayGet(lines, bi)
+            ay0 = ArrayGet(lines, Add(bi, 1))
+            ax1 = ArrayGet(lines, Add(bi, 2))
+            ay1 = ArrayGet(lines, Add(bi, 3))
+            adx = Float_Sub(ax1, ax0)
+            ady = Float_Sub(ay1, ay0)
+            alen2 = Float_Add(Float_Mul(adx, adx), Float_Mul(ady, ady))
+            eps = 0x3F50624DD2F1A9FC
+            ArraySet(ts, 0, 0)
+            ArraySet(ts, 1, 0x3FF0000000000000)
+            nt = 2
+            // also split at every existing anchor that lies on this segment
+            npt = CAD_Store.Read(sketch_handle, 16)
+            pts = CAD_Store.Read(sketch_handle, 17)
+            IfCondition NotEqual(pts, 0) ThenBlock: {
+                IfCondition EqualTo(CAD_Num.IsZero(alen2, 0), 0) ThenBlock: {
+                    pi = 0
+                    WhileLoop LessThan(pi, npt) {
+                        px = ArrayGet(pts, Multiply(pi, 2))
+                        py = ArrayGet(pts, Add(Multiply(pi, 2), 1))
+                        t = Float_Div(Float_Add(Float_Mul(Float_Sub(px, ax0), adx), Float_Mul(Float_Sub(py, ay0), ady)), alen2)
+                        IfCondition EqualTo(Float_Le(t, 0x3F50624DD2F1A9FC), 0) ThenBlock: {
+                            IfCondition EqualTo(Float_Le(Float_Sub(0x3FF0000000000000, t), 0x3F50624DD2F1A9FC), 0) ThenBlock: {
+                                qx = Float_Add(ax0, Float_Mul(t, adx))
+                                qy = Float_Add(ay0, Float_Mul(t, ady))
+                                ddx = Float_Sub(qx, px)
+                                ddy = Float_Sub(qy, py)
+                                IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), mtol2), 1) ThenBlock: {
+                                    IfCondition LessThan(nt, 60) ThenBlock: {
+                                        ArraySet(ts, nt, t)
+                                        nt = Add(nt, 1)
+                                    }
+                                }
+                            }
+                        }
+                        pi = Add(pi, 1)
+                    }
+                }
+            }
+            j = 0
+            WhileLoop LessThan(j, nl) {
+                IfCondition NotEqual(j, i) ThenBlock: {
+                    bj = Multiply(j, 4)
+                    bx0 = ArrayGet(lines, bj)
+                    by0 = ArrayGet(lines, Add(bj, 1))
+                    bx1 = ArrayGet(lines, Add(bj, 2))
+                    by1 = ArrayGet(lines, Add(bj, 3))
+                    bdx = Float_Sub(bx1, bx0)
+                    bdy = Float_Sub(by1, by0)
+                    den = Float_Sub(Float_Mul(adx, bdy), Float_Mul(ady, bdx))
+                    IfCondition EqualTo(CAD_Num.IsZero(den, 0), 0) ThenBlock: {
+                        t = Float_Div(Float_Sub(Float_Mul(Float_Sub(bx0, ax0), bdy), Float_Mul(Float_Sub(by0, ay0), bdx)), den)
+                        u = Float_Div(Float_Sub(Float_Mul(Float_Sub(bx0, ax0), ady), Float_Mul(Float_Sub(by0, ay0), adx)), den)
+                        one = 0x3FF0000000000000
+                        ok = 1
+                        IfCondition EqualTo(Float_Le(t, eps), 1) ThenBlock: { ok = 0 }
+                        IfCondition EqualTo(Float_Le(Float_Sub(one, eps), t), 1) ThenBlock: { ok = 0 }
+                        IfCondition EqualTo(Float_Le(u, 0), 1) ThenBlock: {
+                            IfCondition EqualTo(Float_Le(Float_Sub(0, u), eps), 0) ThenBlock: { ok = 0 }
+                        }
+                        IfCondition EqualTo(Float_Le(one, u), 1) ThenBlock: {
+                            IfCondition EqualTo(Float_Le(Float_Sub(u, one), eps), 0) ThenBlock: { ok = 0 }
+                        }
+                        IfCondition EqualTo(ok, 1) ThenBlock: {
+                            IfCondition LessThan(nt, 60) ThenBlock: {
+                                ArraySet(ts, nt, t)
+                                nt = Add(nt, 1)
+                            }
+                        }
+                    }
+                    // T-junction: endpoints of j on interior of i (loose freehand)
+                    IfCondition EqualTo(CAD_Num.IsZero(alen2, 0), 0) ThenBlock: {
+                        t = Float_Div(Float_Add(Float_Mul(Float_Sub(bx0, ax0), adx), Float_Mul(Float_Sub(by0, ay0), ady)), alen2)
+                        IfCondition EqualTo(Float_Le(t, eps), 0) ThenBlock: {
+                            IfCondition EqualTo(Float_Le(Float_Sub(0x3FF0000000000000, t), eps), 0) ThenBlock: {
+                                px = Float_Add(ax0, Float_Mul(t, adx))
+                                py = Float_Add(ay0, Float_Mul(t, ady))
+                                ddx = Float_Sub(px, bx0)
+                                ddy = Float_Sub(py, by0)
+                                IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), mtol2), 1) ThenBlock: {
+                                    IfCondition LessThan(nt, 60) ThenBlock: {
+                                        ArraySet(ts, nt, t)
+                                        nt = Add(nt, 1)
+                                    }
+                                }
+                            }
+                        }
+                        t = Float_Div(Float_Add(Float_Mul(Float_Sub(bx1, ax0), adx), Float_Mul(Float_Sub(by1, ay0), ady)), alen2)
+                        IfCondition EqualTo(Float_Le(t, eps), 0) ThenBlock: {
+                            IfCondition EqualTo(Float_Le(Float_Sub(0x3FF0000000000000, t), eps), 0) ThenBlock: {
+                                px = Float_Add(ax0, Float_Mul(t, adx))
+                                py = Float_Add(ay0, Float_Mul(t, ady))
+                                ddx = Float_Sub(px, bx1)
+                                ddy = Float_Sub(py, by1)
+                                IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), mtol2), 1) ThenBlock: {
+                                    IfCondition LessThan(nt, 60) ThenBlock: {
+                                        ArraySet(ts, nt, t)
+                                        nt = Add(nt, 1)
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                j = Add(j, 1)
+            }
+            // line × full circle: split at rim (so overshoot trims back to join)
+            ci = 0
+            WhileLoop LessThan(ci, nc) {
+                cbase = Multiply(ci, 3)
+                cx = ArrayGet(circs, cbase)
+                cy = ArrayGet(circs, Add(cbase, 1))
+                rad = ArrayGet(circs, Add(cbase, 2))
+                fx = Float_Sub(ax0, cx)
+                fy = Float_Sub(ay0, cy)
+                aa = alen2
+                IfCondition EqualTo(CAD_Num.IsZero(aa, 0), 0) ThenBlock: {
+                    bb = Float_Mul(0x4000000000000000, Float_Add(Float_Mul(fx, adx), Float_Mul(fy, ady)))
+                    cc = Float_Sub(Float_Add(Float_Mul(fx, fx), Float_Mul(fy, fy)), Float_Mul(rad, rad))
+                    disc = Float_Sub(Float_Mul(bb, bb), Float_Mul(Float_Mul(0x4010000000000000, aa), cc))
+                    IfCondition EqualTo(Float_Le(disc, 0), 0) ThenBlock: {
+                        s = CAD_Num.Sqrt(disc)
+                        two_a = Float_Mul(0x4000000000000000, aa)
+                        t0 = Float_Div(Float_Sub(Float_Sub(0, bb), s), two_a)
+                        t1 = Float_Div(Float_Add(Float_Sub(0, bb), s), two_a)
+                        hi = 0
+                        WhileLoop LessThan(hi, 2) {
+                            t = t0
+                            IfCondition EqualTo(hi, 1) ThenBlock: { t = t1 }
+                            one = 0x3FF0000000000000
+                            ok = 1
+                            IfCondition EqualTo(Float_Le(t, eps), 1) ThenBlock: { ok = 0 }
+                            IfCondition EqualTo(Float_Le(Float_Sub(one, eps), t), 1) ThenBlock: { ok = 0 }
+                            IfCondition EqualTo(ok, 1) ThenBlock: {
+                                IfCondition LessThan(nt, 60) ThenBlock: {
+                                    ArraySet(ts, nt, t)
+                                    nt = Add(nt, 1)
+                                }
+                            }
+                            hi = Add(hi, 1)
+                        }
+                    }
+                }
+                ci = Add(ci, 1)
+            }
+            // line × arc: only if hit angle is on the open arc span
+            ai = 0
+            WhileLoop LessThan(ai, na) {
+                abase = Multiply(ai, 5)
+                cx = ArrayGet(arcs, abase)
+                cy = ArrayGet(arcs, Add(abase, 1))
+                rad = ArrayGet(arcs, Add(abase, 2))
+                a0 = ArrayGet(arcs, Add(abase, 3))
+                a1 = ArrayGet(arcs, Add(abase, 4))
+                span = Float_Sub(a1, a0)
+                IfCondition EqualTo(Float_Le(span, 0), 1) ThenBlock: {
+                    span = Float_Add(span, two_pi)
+                }
+                fx = Float_Sub(ax0, cx)
+                fy = Float_Sub(ay0, cy)
+                aa = alen2
+                IfCondition EqualTo(CAD_Num.IsZero(aa, 0), 0) ThenBlock: {
+                    bb = Float_Mul(0x4000000000000000, Float_Add(Float_Mul(fx, adx), Float_Mul(fy, ady)))
+                    cc = Float_Sub(Float_Add(Float_Mul(fx, fx), Float_Mul(fy, fy)), Float_Mul(rad, rad))
+                    disc = Float_Sub(Float_Mul(bb, bb), Float_Mul(Float_Mul(0x4010000000000000, aa), cc))
+                    IfCondition EqualTo(Float_Le(disc, 0), 0) ThenBlock: {
+                        s = CAD_Num.Sqrt(disc)
+                        two_a = Float_Mul(0x4000000000000000, aa)
+                        t0 = Float_Div(Float_Sub(Float_Sub(0, bb), s), two_a)
+                        t1 = Float_Div(Float_Add(Float_Sub(0, bb), s), two_a)
+                        hi = 0
+                        WhileLoop LessThan(hi, 2) {
+                            t = t0
+                            IfCondition EqualTo(hi, 1) ThenBlock: { t = t1 }
+                            one = 0x3FF0000000000000
+                            ok = 1
+                            IfCondition EqualTo(Float_Le(t, eps), 1) ThenBlock: { ok = 0 }
+                            IfCondition EqualTo(Float_Le(Float_Sub(one, eps), t), 1) ThenBlock: { ok = 0 }
+                            IfCondition EqualTo(ok, 1) ThenBlock: {
+                                px = Float_Add(ax0, Float_Mul(t, adx))
+                                py = Float_Add(ay0, Float_Mul(t, ady))
+                                ang = CAD_Geom.Atan2(Float_Sub(py, cy), Float_Sub(px, cx))
+                                dang = Float_Sub(ang, a0)
+                                IfCondition EqualTo(Float_Le(dang, 0), 1) ThenBlock: {
+                                    IfCondition EqualTo(Float_Le(Float_Sub(0, dang), eps), 0) ThenBlock: {
+                                        dang = Float_Add(dang, two_pi)
+                                    }
+                                }
+                                IfCondition EqualTo(Float_Le(dang, Float_Add(span, eps)), 1) ThenBlock: {
+                                    IfCondition LessThan(nt, 60) ThenBlock: {
+                                        ArraySet(ts, nt, t)
+                                        nt = Add(nt, 1)
+                                    }
+                                }
+                            }
+                            hi = Add(hi, 1)
+                        }
+                    }
+                }
+                ai = Add(ai, 1)
+            }
+            // bubble sort ts ascending
+            a = 0
+            WhileLoop LessThan(a, nt) {
+                bb = Add(a, 1)
+                WhileLoop LessThan(bb, nt) {
+                    va = ArrayGet(ts, a)
+                    vb = ArrayGet(ts, bb)
+                    IfCondition EqualTo(Float_Le(vb, va), 1) ThenBlock: {
+                        ArraySet(ts, a, vb)
+                        ArraySet(ts, bb, va)
+                    }
+                    bb = Add(bb, 1)
+                }
+                a = Add(a, 1)
+            }
+            // emit unique consecutive pieces
+            prev_t = ArrayGet(ts, 0)
+            k = 1
+            WhileLoop LessThan(k, nt) {
+                t1 = ArrayGet(ts, k)
+                // skip near-duplicate t
+                dt = Float_Sub(t1, prev_t)
+                IfCondition EqualTo(Float_Le(dt, 0x3F1A36E2EB1C432D), 0) ThenBlock: {
+                    // min length: skip degenerate
+                    x0 = Float_Add(ax0, Float_Mul(prev_t, adx))
+                    y0 = Float_Add(ay0, Float_Mul(prev_t, ady))
+                    x1 = Float_Add(ax0, Float_Mul(t1, adx))
+                    y1 = Float_Add(ay0, Float_Mul(t1, ady))
+                    IfCondition LessThan(on, cap) ThenBlock: {
+                        ob = Multiply(on, 4)
+                        ArraySet(out, ob, x0)
+                        ArraySet(out, Add(ob, 1), y0)
+                        ArraySet(out, Add(ob, 2), x1)
+                        ArraySet(out, Add(ob, 3), y1)
+                        on = Add(on, 1)
+                    }
+                    prev_t = t1
+                }
+                k = Add(k, 1)
+            }
+            i = Add(i, 1)
+        }
+        // rewrite sketch lines
+        IfCondition GreaterThan(on, 0) ThenBlock: {
+            i = 0
+            WhileLoop LessThan(i, on) {
+                b = Multiply(i, 4)
+                ArraySet(lines, b, ArrayGet(out, b))
+                ArraySet(lines, Add(b, 1), ArrayGet(out, Add(b, 1)))
+                ArraySet(lines, Add(b, 2), ArrayGet(out, Add(b, 2)))
+                ArraySet(lines, Add(b, 3), ArrayGet(out, Add(b, 3)))
+                i = Add(i, 1)
+            }
+            CAD_Store.Write(sketch_handle, 0, on)
+            CAD_Store.Write(sketch_handle, 2, 0)
+            CAD_Store.Write(sketch_handle, 12, 0)
+        }
+        Deallocate(out, 16384)
+        Deallocate(ts, 512)
+        ReturnValue(CAD_Store.Read(sketch_handle, 0))
+    }
+}
+
+// Remove dangling overshoots: any segment with an endpoint that touches no other
+// segment is a free stub (after SplitAtIntersections). Drop until only closed cores remain.
+// join_tol_r = 0 → auto ~1% of sketch diagonal (slightly loose so freehand overshoots die).
+// Kills ALL stubs each pass (not just one) — many intentional overshoots used to leave
+// enough junk that profile face-walk failed until the user trimmed by hand.
+Function.CAD_Sketch.PruneOpenStubs {
+    Input: sketch_handle: Integer
+    Input: join_tol_r: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        pass = 0
+        WhileLoop LessThan(pass, 128) {
+            nl = CAD_Store.Read(sketch_handle, 0)
+            IfCondition LessThan(nl, 1) ThenBlock: { ReturnValue(0) }
+            lines = CAD_Store.Read(sketch_handle, 1)
+            jtol = join_tol_r
+            IfCondition EqualTo(jtol, 0) ThenBlock: {
+                xmin = ArrayGet(lines, 0)
+                ymin = ArrayGet(lines, 1)
+                xmax = xmin
+                ymax = ymin
+                bi = 0
+                WhileLoop LessThan(bi, nl) {
+                    b = Multiply(bi, 4)
+                    x = ArrayGet(lines, b)
+                    y = ArrayGet(lines, Add(b, 1))
+                    IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+                    IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+                    IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+                    IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+                    x = ArrayGet(lines, Add(b, 2))
+                    y = ArrayGet(lines, Add(b, 3))
+                    IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+                    IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+                    IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+                    IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+                    bi = Add(bi, 1)
+                }
+                dxb = Float_Sub(xmax, xmin)
+                dyb = Float_Sub(ymax, ymin)
+                diag = CAD_Num.Sqrt(Float_Add(Float_Mul(dxb, dxb), Float_Mul(dyb, dyb)))
+                // 1% diag (was 0.5%) — freehand overshoots still join at split verts
+                jtol = Float_Mul(diag, 0x3F847AE147AE147B)
+                floort = 0x3F1A36E2EB1C432D
+                IfCondition EqualTo(Float_Le(jtol, floort), 1) ThenBlock: { jtol = floort }
+            }
+            jtol2 = Float_Mul(jtol, jtol)
+            val = Allocate(2048)
+            i = 0
+            WhileLoop LessThan(i, nl) {
+                bi = Multiply(i, 4)
+                ax = ArrayGet(lines, bi)
+                ay = ArrayGet(lines, Add(bi, 1))
+                bx = ArrayGet(lines, Add(bi, 2))
+                by = ArrayGet(lines, Add(bi, 3))
+                va = 0
+                vb = 0
+                j = 0
+                WhileLoop LessThan(j, nl) {
+                    IfCondition NotEqual(j, i) ThenBlock: {
+                        bj = Multiply(j, 4)
+                        jx0 = ArrayGet(lines, bj)
+                        jy0 = ArrayGet(lines, Add(bj, 1))
+                        jx1 = ArrayGet(lines, Add(bj, 2))
+                        jy1 = ArrayGet(lines, Add(bj, 3))
+                        ddx = Float_Sub(ax, jx0)
+                        ddy = Float_Sub(ay, jy0)
+                        IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), jtol2), 1) ThenBlock: {
+                            va = Add(va, 1)
+                        }
+                        ddx = Float_Sub(ax, jx1)
+                        ddy = Float_Sub(ay, jy1)
+                        IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), jtol2), 1) ThenBlock: {
+                            va = Add(va, 1)
+                        }
+                        ddx = Float_Sub(bx, jx0)
+                        ddy = Float_Sub(by, jy0)
+                        IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), jtol2), 1) ThenBlock: {
+                            vb = Add(vb, 1)
+                        }
+                        ddx = Float_Sub(bx, jx1)
+                        ddy = Float_Sub(by, jy1)
+                        IfCondition EqualTo(Float_Le(Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy)), jtol2), 1) ThenBlock: {
+                            vb = Add(vb, 1)
+                        }
+                    }
+                    j = Add(j, 1)
+                }
+                ArraySet(val, Multiply(i, 2), va)
+                ArraySet(val, Add(Multiply(i, 2), 1), vb)
+                i = Add(i, 1)
+            }
+            // mark stubs: free end OR zero-length segment
+            killf = Allocate(2048)
+            nk = 0
+            i = 0
+            WhileLoop LessThan(i, nl) {
+                ArraySet(killf, i, 0)
+                va = ArrayGet(val, Multiply(i, 2))
+                vb = ArrayGet(val, Add(Multiply(i, 2), 1))
+                bi = Multiply(i, 4)
+                dx = Float_Sub(ArrayGet(lines, Add(bi, 2)), ArrayGet(lines, bi))
+                dy = Float_Sub(ArrayGet(lines, Add(bi, 3)), ArrayGet(lines, Add(bi, 1)))
+                len2 = Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy))
+                IfCondition EqualTo(va, 0) ThenBlock: {
+                    ArraySet(killf, i, 1)
+                    nk = Add(nk, 1)
+                }
+                IfCondition EqualTo(vb, 0) ThenBlock: {
+                    ArraySet(killf, i, 1)
+                    nk = Add(nk, 1)
+                }
+                // tiny debris
+                IfCondition EqualTo(Float_Le(len2, 0x3E7AD7F29ABCAF48), 1) ThenBlock: {
+                    ArraySet(killf, i, 1)
+                    nk = Add(nk, 1)
+                }
+                i = Add(i, 1)
+            }
+            Deallocate(val, 2048)
+            IfCondition EqualTo(nk, 0) ThenBlock: {
+                Deallocate(killf, 2048)
+                pass = 128
+            }
+            IfCondition GreaterThan(nk, 0) ThenBlock: {
+                // delete high indices first so lower indices stay valid
+                i = Subtract(nl, 1)
+                WhileLoop GreaterEqual(i, 0) {
+                    IfCondition EqualTo(ArrayGet(killf, i), 1) ThenBlock: {
+                        CAD_Sketch.DeleteLine(sketch_handle, i)
+                    }
+                    i = Subtract(i, 1)
+                }
+                Deallocate(killf, 2048)
+            }
+            pass = Add(pass, 1)
+        }
+        CAD_Store.Write(sketch_handle, 2, 0)
+        CAD_Store.Write(sketch_handle, 12, 0)
+        ReturnValue(CAD_Store.Read(sketch_handle, 0))
     }
 }
 
@@ -75,15 +2218,13 @@ Function.CAD_Sketch.AddRectangle {
     Input: height_r: Integer
     Output: Integer
     Body: {
-        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
-        // Create 4 connected orthogonal lines
         x2_r = Float_Add(x1_r, width_r)
         y2_r = Float_Add(y1_r, height_r)
-        l1 = CAD_Sketch.AddLine(sketch_handle, x1_r, y1_r, x2_r, y1_r)
-        l2 = CAD_Sketch.AddLine(sketch_handle, x2_r, y1_r, x2_r, y2_r)
-        l3 = CAD_Sketch.AddLine(sketch_handle, x2_r, y2_r, x1_r, y2_r)
-        l4 = CAD_Sketch.AddLine(sketch_handle, x1_r, y2_r, x1_r, y1_r)
-        ReturnValue(l1)
+        CAD_Sketch.AddLine(sketch_handle, x1_r, y1_r, x2_r, y1_r)
+        CAD_Sketch.AddLine(sketch_handle, x2_r, y1_r, x2_r, y2_r)
+        CAD_Sketch.AddLine(sketch_handle, x2_r, y2_r, x1_r, y2_r)
+        CAD_Sketch.AddLine(sketch_handle, x1_r, y2_r, x1_r, y1_r)
+        ReturnValue(CAD_Sketch.BuildClosedLoop(sketch_handle))
     }
 }
 
@@ -98,15 +2239,988 @@ Function.CAD_Sketch.AddSquare {
     }
 }
 
+// Polyline through pts (xy pairs). closed=1 connects last→first.
 Function.CAD_Sketch.AddPolyline {
     Input: sketch_handle: Integer
     Input: pts_arr_addr: Address
     Input: n_pts: Integer
+    Input: closed: Integer
     Output: Integer
     Body: {
-        IfCondition LessThan(n_pts, 2) ThenBlock: { ReturnValue(0) }
-        CAD_Sketch_State.entity_count = Add(CAD_Sketch_State.entity_count, n_pts)
-        ReturnValue(CAD_Sketch_State.entity_count)
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition LessThan(n_pts, 2) ThenBlock: { ReturnValue(-2) }
+        i = 0
+        WhileLoop LessThan(i, Subtract(n_pts, 1)) {
+            x0 = ArrayGet(pts_arr_addr, Multiply(i, 2))
+            y0 = ArrayGet(pts_arr_addr, Add(Multiply(i, 2), 1))
+            x1 = ArrayGet(pts_arr_addr, Multiply(Add(i, 1), 2))
+            y1 = ArrayGet(pts_arr_addr, Add(Multiply(Add(i, 1), 2), 1))
+            CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1)
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(closed, 1) ThenBlock: {
+            x0 = ArrayGet(pts_arr_addr, Multiply(Subtract(n_pts, 1), 2))
+            y0 = ArrayGet(pts_arr_addr, Add(Multiply(Subtract(n_pts, 1), 2), 1))
+            x1 = ArrayGet(pts_arr_addr, 0)
+            y1 = ArrayGet(pts_arr_addr, 1)
+            CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// DXF bulge on segment p0→p1: bulge = tan(included/4). |b|≈0 → line; else arc.
+// pack: [x0,y0,x1,y1,bulge]
+Function.CAD_Sketch.AddBulgeSegment {
+    Input: sketch_handle: Integer
+    Input: pack_addr: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(-1) }
+        x0 = ArrayGet(pack_addr, 0)
+        y0 = ArrayGet(pack_addr, 1)
+        x1 = ArrayGet(pack_addr, 2)
+        y1 = ArrayGet(pack_addr, 3)
+        b = ArrayGet(pack_addr, 4)
+        ab = b
+        IfCondition EqualTo(Float_Le(ab, 0), 1) ThenBlock: { ab = Float_Sub(0, ab) }
+        // |bulge| < 1e-9 → line
+        IfCondition EqualTo(Float_Le(ab, 0x3E112E0BE826D695), 1) ThenBlock: {
+            ReturnValue(CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1))
+        }
+        // θ = 4 atan(b)  (signed)
+        ang = Float_Mul(CAD_Geom.Atan(b), 0x4010000000000000)
+        aabs = ang
+        IfCondition EqualTo(Float_Le(aabs, 0), 1) ThenBlock: { aabs = Float_Sub(0, aabs) }
+        dx = Float_Sub(x1, x0)
+        dy = Float_Sub(y1, y0)
+        chord = CAD_Num.Sqrt(Float_Add(Float_Mul(dx, dx), Float_Mul(dy, dy)))
+        IfCondition EqualTo(CAD_Num.IsZero(chord, 0), 1) ThenBlock: { ReturnValue(-4) }
+        half = 0x4000000000000000
+        // r = (chord/2) / sin(|θ|/2)
+        half_a = Float_Div(aabs, half)
+        s = CAD_Geom.Sin(half_a)
+        IfCondition EqualTo(CAD_Num.IsZero(s, 0), 1) ThenBlock: {
+            ReturnValue(CAD_Sketch.AddLine(sketch_handle, x0, y0, x1, y1))
+        }
+        r = Float_Div(Float_Div(chord, half), s)
+        // mid
+        mx = Float_Div(Float_Add(x0, x1), half)
+        my = Float_Div(Float_Add(y0, y1), half)
+        // unit chord
+        ux = Float_Div(dx, chord)
+        uy = Float_Div(dy, chord)
+        // left perp (-uy, ux)
+        px = Float_Sub(0, uy)
+        py = ux
+        // dist mid→center = r cos(|θ|/2)
+        c = CAD_Geom.Cos(half_a)
+        d = Float_Mul(r, c)
+        // bulge>0: center on left of directed chord
+        IfCondition EqualTo(Float_Le(b, 0), 1) ThenBlock: {
+            d = Float_Sub(0, d)
+        }
+        cx = Float_Add(mx, Float_Mul(px, d))
+        cy = Float_Add(my, Float_Mul(py, d))
+        a0 = CAD_Geom.Atan2(Float_Sub(y0, cy), Float_Sub(x0, cx))
+        a1 = CAD_Geom.Atan2(Float_Sub(y1, cy), Float_Sub(x1, cx))
+        // Ensure CCW span matches bulge sign
+        two_pi = 0x401921FB54442D18
+        IfCondition EqualTo(Float_Le(0, b), 1) ThenBlock: {
+            // CCW: a1 should be CCW from a0
+            span = Float_Sub(a1, a0)
+            IfCondition EqualTo(Float_Le(span, 0), 1) ThenBlock: {
+                a1 = Float_Add(a1, two_pi)
+            }
+        }
+        IfCondition EqualTo(Float_Le(b, 0), 1) ThenBlock: {
+            // CW arc: store as CCW from a1 to a0 by swapping? AddArc is CCW a0→a1
+            // For CW bulge, go a0 CW to a1 = CCW a1 to a0+2π
+            // Use a0' = a1, a1' = a0; if a1'<=a0' add 2π to a1'
+            ta = a0
+            a0 = a1
+            a1 = ta
+            span = Float_Sub(a1, a0)
+            IfCondition EqualTo(Float_Le(span, 0), 1) ThenBlock: {
+                a1 = Float_Add(a1, two_pi)
+            }
+        }
+        ReturnValue(CAD_Sketch.AddArc(sketch_handle, cx, cy, r, a0, a1))
+    }
+}
+
+Function.CAD_Sketch.GetProfileCount {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(CAD_Store.Read(sketch_handle, 12))
+    }
+}
+
+// Signed area of primary loop (or profile 0). 0 if empty.
+Function.CAD_Sketch.LoopSignedArea {
+    Input: xy_addr: Address
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(n, 3) ThenBlock: { ReturnValue(0) }
+        area = 0
+        i = 0
+        WhileLoop LessThan(i, n) {
+            j = Add(i, 1)
+            IfCondition EqualTo(j, n) ThenBlock: { j = 0 }
+            xi = ArrayGet(xy_addr, Multiply(i, 2))
+            yi = ArrayGet(xy_addr, Add(Multiply(i, 2), 1))
+            xj = ArrayGet(xy_addr, Multiply(j, 2))
+            yj = ArrayGet(xy_addr, Add(Multiply(j, 2), 1))
+            area = Float_Add(area, Float_Sub(Float_Mul(xi, yj), Float_Mul(xj, yi)))
+            i = Add(i, 1)
+        }
+        ReturnValue(Float_Div(area, 0x4000000000000000))
+    }
+}
+
+// Snap any two line endpoints that lie within tol onto their midpoint.
+// Closes freehand gaps between arc tessellation ends and nearby chords.
+// Returns number of snaps performed.
+// Snap dangling (valence-1) line endpoints onto the nearest other endpoint
+// within tol. Closes freehand gaps between arc tess ends and chords WITHOUT
+// collapsing dense tessellation vertices (those have valence ≥ 1 each side).
+// tol_r=0 → auto ~1% of sketch diagonal (floor 1e-4). Only dangling ends.
+Function.CAD_Sketch.SnapNearEndpoints {
+    Input: sketch_handle: Integer
+    Input: tol_r: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        nl = CAD_Store.Read(sketch_handle, 0)
+        IfCondition LessThan(nl, 1) ThenBlock: { ReturnValue(0) }
+        lines = CAD_Store.Read(sketch_handle, 1)
+        tol = tol_r
+        IfCondition EqualTo(tol, 0) ThenBlock: {
+            xmin = ArrayGet(lines, 0)
+            ymin = ArrayGet(lines, 1)
+            xmax = xmin
+            ymax = ymin
+            bi = 0
+            WhileLoop LessThan(bi, nl) {
+                b = Multiply(bi, 4)
+                x = ArrayGet(lines, b)
+                y = ArrayGet(lines, Add(b, 1))
+                IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+                IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+                IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+                IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+                x = ArrayGet(lines, Add(b, 2))
+                y = ArrayGet(lines, Add(b, 3))
+                IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+                IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+                IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+                IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+                bi = Add(bi, 1)
+            }
+            dxb = Float_Sub(xmax, xmin)
+            dyb = Float_Sub(ymax, ymin)
+            diag = CAD_Num.Sqrt(Float_Add(Float_Mul(dxb, dxb), Float_Mul(dyb, dyb)))
+            // 1% of diagonal — tight; hit-angle tessellation does the real join
+            tol = Float_Mul(diag, 0x3F847AE147AE147B)
+            floort = 0x3F1A36E2EB1C432D
+            IfCondition EqualTo(Float_Le(tol, floort), 1) ThenBlock: { tol = floort }
+        }
+        tol2 = Float_Mul(tol, tol)
+        // valence of each endpoint
+        npts = Multiply(nl, 2)
+        val = Allocate(2048)
+        i = 0
+        WhileLoop LessThan(i, npts) {
+            ArraySet(val, i, 0)
+            i = Add(i, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, npts) {
+            li = Divide(i, 2)
+            ei = Subtract(i, Multiply(li, 2))
+            bi = Multiply(li, 4)
+            IfCondition EqualTo(ei, 0) ThenBlock: {
+                ix = ArrayGet(lines, bi)
+                iy = ArrayGet(lines, Add(bi, 1))
+            }
+            IfCondition EqualTo(ei, 1) ThenBlock: {
+                ix = ArrayGet(lines, Add(bi, 2))
+                iy = ArrayGet(lines, Add(bi, 3))
+            }
+            j = 0
+            WhileLoop LessThan(j, npts) {
+                IfCondition NotEqual(j, i) ThenBlock: {
+                    lj = Divide(j, 2)
+                    ej = Subtract(j, Multiply(lj, 2))
+                    bj = Multiply(lj, 4)
+                    IfCondition EqualTo(ej, 0) ThenBlock: {
+                        jx = ArrayGet(lines, bj)
+                        jy = ArrayGet(lines, Add(bj, 1))
+                    }
+                    IfCondition EqualTo(ej, 1) ThenBlock: {
+                        jx = ArrayGet(lines, Add(bj, 2))
+                        jy = ArrayGet(lines, Add(bj, 3))
+                    }
+                    ddx = Float_Sub(ix, jx)
+                    ddy = Float_Sub(iy, jy)
+                    d2 = Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy))
+                    // exact-ish meet for valence (tighter than snap)
+                    eps = Float_Mul(tol2, 0x3F50624DD2F1A9FC)
+                    // use small fixed: 1e-8 relative — use tol2/100
+                    meet2 = Float_Mul(tol2, 0x3F847AE147AE147B)
+                    IfCondition EqualTo(Float_Le(d2, meet2), 1) ThenBlock: {
+                        ArraySet(val, i, Add(ArrayGet(val, i), 1))
+                    }
+                }
+                j = Add(j, 1)
+            }
+            i = Add(i, 1)
+        }
+        nsnap = 0
+        // only snap dangling endpoints (val==0 means no neighbor at meet tol)
+        i = 0
+        WhileLoop LessThan(i, npts) {
+            IfCondition EqualTo(ArrayGet(val, i), 0) ThenBlock: {
+                li = Divide(i, 2)
+                ei = Subtract(i, Multiply(li, 2))
+                bi = Multiply(li, 4)
+                IfCondition EqualTo(ei, 0) ThenBlock: {
+                    ix = ArrayGet(lines, bi)
+                    iy = ArrayGet(lines, Add(bi, 1))
+                }
+                IfCondition EqualTo(ei, 1) ThenBlock: {
+                    ix = ArrayGet(lines, Add(bi, 2))
+                    iy = ArrayGet(lines, Add(bi, 3))
+                }
+                best_j = -1
+                best_d2 = tol2
+                j = 0
+                WhileLoop LessThan(j, npts) {
+                    IfCondition NotEqual(j, i) ThenBlock: {
+                        lj = Divide(j, 2)
+                        // do not snap the other end of the same segment onto itself pathologically
+                        IfCondition NotEqual(lj, li) ThenBlock: {
+                            ej = Subtract(j, Multiply(lj, 2))
+                            bj = Multiply(lj, 4)
+                            IfCondition EqualTo(ej, 0) ThenBlock: {
+                                jx = ArrayGet(lines, bj)
+                                jy = ArrayGet(lines, Add(bj, 1))
+                            }
+                            IfCondition EqualTo(ej, 1) ThenBlock: {
+                                jx = ArrayGet(lines, Add(bj, 2))
+                                jy = ArrayGet(lines, Add(bj, 3))
+                            }
+                            ddx = Float_Sub(ix, jx)
+                            ddy = Float_Sub(iy, jy)
+                            d2 = Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy))
+                            IfCondition EqualTo(Float_Le(d2, best_d2), 1) ThenBlock: {
+                                // prefer dangling-to-any; allow attach to existing joint
+                                IfCondition EqualTo(CAD_Num.IsZero(d2, 0), 0) ThenBlock: {
+                                    best_d2 = d2
+                                    best_j = j
+                                }
+                            }
+                        }
+                    }
+                    j = Add(j, 1)
+                }
+                IfCondition NotEqual(best_j, -1) ThenBlock: {
+                    lj = Divide(best_j, 2)
+                    ej = Subtract(best_j, Multiply(lj, 2))
+                    bj = Multiply(lj, 4)
+                    IfCondition EqualTo(ej, 0) ThenBlock: {
+                        tx = ArrayGet(lines, bj)
+                        ty = ArrayGet(lines, Add(bj, 1))
+                    }
+                    IfCondition EqualTo(ej, 1) ThenBlock: {
+                        tx = ArrayGet(lines, Add(bj, 2))
+                        ty = ArrayGet(lines, Add(bj, 3))
+                    }
+                    // snap dangling end onto target (not midpoint — preserve joints)
+                    IfCondition EqualTo(ei, 0) ThenBlock: {
+                        ArraySet(lines, bi, tx)
+                        ArraySet(lines, Add(bi, 1), ty)
+                    }
+                    IfCondition EqualTo(ei, 1) ThenBlock: {
+                        ArraySet(lines, Add(bi, 2), tx)
+                        ArraySet(lines, Add(bi, 3), ty)
+                    }
+                    ArraySet(val, i, 1)
+                    nsnap = Add(nsnap, 1)
+                }
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(val, 2048)
+        ReturnValue(nsnap)
+    }
+}
+
+// Build every closed face in the planar line graph.
+// Uses directed half-edges (each segment used once per direction) and
+// "next CCW from reverse" turns so shared chords (circle×diameters) yield
+// multiple faces — not a single greedy Euler path.
+Function.CAD_Sketch.BuildAllClosedLoops {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        // lower ALL curves into the line graph (arcs and full circles)
+        na = CAD_Store.Read(sketch_handle, 10)
+        IfCondition GreaterThan(na, 0) ThenBlock: {
+            CAD_Sketch.TessellateArcs(sketch_handle, 32)
+        }
+        nc = CAD_Store.Read(sketch_handle, 7)
+        IfCondition GreaterThan(nc, 0) ThenBlock: {
+            CAD_Sketch.TessellateCircles(sketch_handle, 32)
+            CAD_Store.Write(sketch_handle, 7, 0)
+        }
+        // weld freehand / arc-end near-misses so prune does not eat the rim
+        CAD_Sketch.SnapNearEndpoints(sketch_handle, 0)
+        // split at crossings, drop dangling stubs
+        CAD_Sketch.SplitAtIntersections(sketch_handle)
+        CAD_Sketch.SnapNearEndpoints(sketch_handle, 0)
+        CAD_Sketch.PruneOpenStubs(sketch_handle, 0)
+        nl = CAD_Store.Read(sketch_handle, 0)
+        IfCondition LessThan(nl, 3) ThenBlock: {
+            CAD_Store.Write(sketch_handle, 12, 0)
+            ReturnValue(0)
+        }
+        lines = CAD_Store.Read(sketch_handle, 1)
+        pool = CAD_Store.Read(sketch_handle, 14)
+        pmeta = CAD_Store.Read(sketch_handle, 13)
+        cap_p = CAD_Store.Read(sketch_handle, 15)
+        // join tol from sketch size
+        xmin = ArrayGet(lines, 0)
+        ymin = ArrayGet(lines, 1)
+        xmax = xmin
+        ymax = ymin
+        bi = 0
+        WhileLoop LessThan(bi, nl) {
+            b = Multiply(bi, 4)
+            x = ArrayGet(lines, b)
+            y = ArrayGet(lines, Add(b, 1))
+            IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+            IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+            IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+            IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+            x = ArrayGet(lines, Add(b, 2))
+            y = ArrayGet(lines, Add(b, 3))
+            IfCondition EqualTo(Float_Le(x, xmin), 1) ThenBlock: { xmin = x }
+            IfCondition EqualTo(Float_Le(xmax, x), 1) ThenBlock: { xmax = x }
+            IfCondition EqualTo(Float_Le(y, ymin), 1) ThenBlock: { ymin = y }
+            IfCondition EqualTo(Float_Le(ymax, y), 1) ThenBlock: { ymax = y }
+            bi = Add(bi, 1)
+        }
+        dxb = Float_Sub(xmax, xmin)
+        dyb = Float_Sub(ymax, ymin)
+        diag = CAD_Num.Sqrt(Float_Add(Float_Mul(dxb, dxb), Float_Mul(dyb, dyb)))
+        // 1.5% of diagonal for freehand join
+        join_tol = Float_Mul(diag, 0x3F9EB851EB851EB8)
+        floort = 0x3F1A36E2EB1C432D
+        IfCondition EqualTo(Float_Le(join_tol, floort), 1) ThenBlock: { join_tol = floort }
+        join_tol2 = Float_Mul(join_tol, join_tol)
+        two_pi = 0x401921FB54442D18
+        // half-edge use flags: index 2*e+d (d=0 A→B, d=1 B→A)
+        used = Allocate(4096)
+        ui = 0
+        WhileLoop LessThan(ui, Multiply(nl, 2)) {
+            ArraySet(used, ui, 0)
+            ui = Add(ui, 1)
+        }
+        nprof = 0
+        pool_n = 0
+        tloop = Allocate(4096)
+        // per-profile: 1 if original winding was CW (interior candidate)
+        was_cw = Allocate(64)
+        start_he = 0
+        WhileLoop LessThan(start_he, Multiply(nl, 2)) {
+            IfCondition EqualTo(ArrayGet(used, start_he), 0) ThenBlock: {
+                se = Divide(start_he, 2)
+                sd = Subtract(start_he, Multiply(se, 2))
+                base = Multiply(se, 4)
+                IfCondition EqualTo(sd, 0) ThenBlock: {
+                    sx = ArrayGet(lines, base)
+                    sy = ArrayGet(lines, Add(base, 1))
+                    tipx = ArrayGet(lines, Add(base, 2))
+                    tipy = ArrayGet(lines, Add(base, 3))
+                }
+                IfCondition EqualTo(sd, 1) ThenBlock: {
+                    sx = ArrayGet(lines, Add(base, 2))
+                    sy = ArrayGet(lines, Add(base, 3))
+                    tipx = ArrayGet(lines, base)
+                    tipy = ArrayGet(lines, Add(base, 1))
+                }
+                // temporary mark; rollback if face not saved
+                ArraySet(used, start_he, 1)
+                ArraySet(tloop, 0, sx)
+                ArraySet(tloop, 1, sy)
+                ArraySet(tloop, 2, tipx)
+                ArraySet(tloop, 3, tipy)
+                path_he = Allocate(2048)
+                ArraySet(path_he, 0, start_he)
+                nhe = 1
+                nn = 2
+                prevx = sx
+                prevy = sy
+                // path length of edges walked (reject "close" if gap is large vs path)
+                plen = CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(tipx, sx), Float_Sub(tipx, sx)), Float_Mul(Float_Sub(tipy, sy), Float_Sub(tipy, sy))))
+                closed = 0
+                guard = 0
+                // close only with TIGHT tol — join_tol is for chaining only.
+                // Loose close invented phantom "closing" edges (red areas with no line).
+                close_tol = Float_Mul(diag, 0x3F50624DD2F1A9FC)
+                IfCondition EqualTo(Float_Le(close_tol, floort), 1) ThenBlock: { close_tol = floort }
+                close_tol2 = Float_Mul(close_tol, close_tol)
+                WhileLoop LessThan(guard, 2048) {
+                    guard = Add(guard, 1)
+                    // closed when tip returns to start: need ≥4 verts (3 real edges)
+                    // and gap << path length so we don't seal a shortcut across open air
+                    ddx = Float_Sub(tipx, sx)
+                    ddy = Float_Sub(tipy, sy)
+                    d2c = Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy))
+                    IfCondition GreaterEqual(nn, 4) ThenBlock: {
+                        IfCondition EqualTo(Float_Le(d2c, close_tol2), 1) ThenBlock: {
+                            gap = CAD_Num.Sqrt(d2c)
+                            // gap must be < 2% of path length (and path not tiny)
+                            okclose = 0
+                            IfCondition EqualTo(Float_Le(Float_Mul(0x3FA47AE147AE147B, plen), gap), 0) ThenBlock: {
+                                IfCondition EqualTo(Float_Le(plen, Float_Mul(close_tol, 0x4024000000000000)), 0) ThenBlock: {
+                                    okclose = 1
+                                }
+                            }
+                            IfCondition EqualTo(okclose, 1) ThenBlock: {
+                                ArraySet(tloop, Multiply(Subtract(nn, 1), 2), sx)
+                                ArraySet(tloop, Add(Multiply(Subtract(nn, 1), 2), 1), sy)
+                                nn = Subtract(nn, 1)
+                                closed = 1
+                                guard = 2048
+                            }
+                        }
+                    }
+                    IfCondition EqualTo(closed, 0) ThenBlock: {
+                        IfCondition LessThan(guard, 2048) ThenBlock: {
+                            // arrival heading into tip
+                            idx = Float_Sub(tipx, prevx)
+                            idy = Float_Sub(tipy, prevy)
+                            // reverse leave angle (back along arrival)
+                            rev_ang = CAD_Geom.Atan2(Float_Sub(0, idy), Float_Sub(0, idx))
+                            found_ok = 0
+                            found = 0
+                            rev = 0
+                            // best CCW turn with delta in (eps, 2π]; reverse (δ≈0) is fallback only
+                            best_delta = two_pi
+                            fb_ok = 0
+                            fb_found = 0
+                            fb_rev = 0
+                            epsd = 0x3F50624DD2F1A9FC
+                            j = 0
+                            WhileLoop LessThan(j, nl) {
+                                base = Multiply(j, 4)
+                                ax = ArrayGet(lines, base)
+                                ay = ArrayGet(lines, Add(base, 1))
+                                bx = ArrayGet(lines, Add(base, 2))
+                                by = ArrayGet(lines, Add(base, 3))
+                                // end A at tip → leave toward B (dir 0)
+                                ddx = Float_Sub(ax, tipx)
+                                ddy = Float_Sub(ay, tipy)
+                                d2 = Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy))
+                                IfCondition EqualTo(Float_Le(d2, join_tol2), 1) ThenBlock: {
+                                    he = Multiply(j, 2)
+                                    IfCondition EqualTo(ArrayGet(used, he), 0) ThenBlock: {
+                                        ox = Float_Sub(bx, tipx)
+                                        oy = Float_Sub(by, tipy)
+                                        oang = CAD_Geom.Atan2(oy, ox)
+                                        delta = Float_Sub(oang, rev_ang)
+                                        // normalize to [0, 2π)
+                                        IfCondition EqualTo(Float_Le(delta, 0), 1) ThenBlock: {
+                                            delta = Float_Add(delta, two_pi)
+                                        }
+                                        IfCondition EqualTo(Float_Le(two_pi, delta), 1) ThenBlock: {
+                                            delta = Float_Sub(delta, two_pi)
+                                        }
+                                        IfCondition EqualTo(Float_Le(delta, epsd), 1) ThenBlock: {
+                                            // reverse / collinear back — fallback only
+                                            IfCondition EqualTo(fb_ok, 0) ThenBlock: {
+                                                fb_ok = 1
+                                                fb_found = j
+                                                fb_rev = 0
+                                            }
+                                        }
+                                        IfCondition EqualTo(Float_Le(delta, epsd), 0) ThenBlock: {
+                                            IfCondition EqualTo(Float_Le(delta, best_delta), 1) ThenBlock: {
+                                                best_delta = delta
+                                                found = j
+                                                rev = 0
+                                                found_ok = 1
+                                            }
+                                        }
+                                    }
+                                }
+                                // end B at tip → leave toward A (dir 1)
+                                ddx = Float_Sub(bx, tipx)
+                                ddy = Float_Sub(by, tipy)
+                                d2 = Float_Add(Float_Mul(ddx, ddx), Float_Mul(ddy, ddy))
+                                IfCondition EqualTo(Float_Le(d2, join_tol2), 1) ThenBlock: {
+                                    he = Add(Multiply(j, 2), 1)
+                                    IfCondition EqualTo(ArrayGet(used, he), 0) ThenBlock: {
+                                        ox = Float_Sub(ax, tipx)
+                                        oy = Float_Sub(ay, tipy)
+                                        oang = CAD_Geom.Atan2(oy, ox)
+                                        delta = Float_Sub(oang, rev_ang)
+                                        IfCondition EqualTo(Float_Le(delta, 0), 1) ThenBlock: {
+                                            delta = Float_Add(delta, two_pi)
+                                        }
+                                        IfCondition EqualTo(Float_Le(two_pi, delta), 1) ThenBlock: {
+                                            delta = Float_Sub(delta, two_pi)
+                                        }
+                                        IfCondition EqualTo(Float_Le(delta, epsd), 1) ThenBlock: {
+                                            IfCondition EqualTo(fb_ok, 0) ThenBlock: {
+                                                fb_ok = 1
+                                                fb_found = j
+                                                fb_rev = 1
+                                            }
+                                        }
+                                        IfCondition EqualTo(Float_Le(delta, epsd), 0) ThenBlock: {
+                                            IfCondition EqualTo(Float_Le(delta, best_delta), 1) ThenBlock: {
+                                                best_delta = delta
+                                                found = j
+                                                rev = 1
+                                                found_ok = 1
+                                            }
+                                        }
+                                    }
+                                }
+                                j = Add(j, 1)
+                            }
+                            // only reverse available
+                            IfCondition EqualTo(found_ok, 0) ThenBlock: {
+                                IfCondition EqualTo(fb_ok, 1) ThenBlock: {
+                                    found_ok = 1
+                                    found = fb_found
+                                    rev = fb_rev
+                                }
+                            }
+                            IfCondition EqualTo(found_ok, 0) ThenBlock: {
+                                guard = 2048
+                            }
+                            IfCondition EqualTo(found_ok, 1) ThenBlock: {
+                                he = Multiply(found, 2)
+                                IfCondition EqualTo(rev, 1) ThenBlock: {
+                                    he = Add(he, 1)
+                                }
+                                // temporarily mark so this walk does not re-use
+                                ArraySet(used, he, 1)
+                                IfCondition LessThan(nhe, 2048) ThenBlock: {
+                                    ArraySet(path_he, nhe, he)
+                                    nhe = Add(nhe, 1)
+                                }
+                                base = Multiply(found, 4)
+                                prevx = tipx
+                                prevy = tipy
+                                IfCondition EqualTo(rev, 0) ThenBlock: {
+                                    tipx = ArrayGet(lines, Add(base, 2))
+                                    tipy = ArrayGet(lines, Add(base, 3))
+                                }
+                                IfCondition EqualTo(rev, 1) ThenBlock: {
+                                    tipx = ArrayGet(lines, base)
+                                    tipy = ArrayGet(lines, Add(base, 1))
+                                }
+                                IfCondition LessThan(nn, 1024) ThenBlock: {
+                                    // accumulate path length for close check
+                                    plen = Float_Add(plen, CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(tipx, prevx), Float_Sub(tipx, prevx)), Float_Mul(Float_Sub(tipy, prevy), Float_Sub(tipy, prevy)))))
+                                    ArraySet(tloop, Multiply(nn, 2), tipx)
+                                    ArraySet(tloop, Add(Multiply(nn, 2), 1), tipy)
+                                    nn = Add(nn, 1)
+                                }
+                            }
+                        }
+                    }
+                }
+                saved = 0
+                IfCondition EqualTo(closed, 1) ThenBlock: {
+                    IfCondition GreaterEqual(nn, 3) ThenBlock: {
+                        // signed area — keep CCW faces only (drop exterior CW)
+                        ar = 0
+                        i = 0
+                        WhileLoop LessThan(i, nn) {
+                            j = Add(i, 1)
+                            IfCondition EqualTo(j, nn) ThenBlock: { j = 0 }
+                            xi = ArrayGet(tloop, Multiply(i, 2))
+                            yi = ArrayGet(tloop, Add(Multiply(i, 2), 1))
+                            xj = ArrayGet(tloop, Multiply(j, 2))
+                            yj = ArrayGet(tloop, Add(Multiply(j, 2), 1))
+                            ar = Float_Add(ar, Float_Sub(Float_Mul(xi, yj), Float_Mul(xj, yi)))
+                            i = Add(i, 1)
+                        }
+                        // Keep every non-zero face for now; post-filter drops exterior.
+                        // flip=1 if original winding was CW (ar<0) → reverse to store CCW.
+                        keep = 0
+                        flip = 0
+                        // min area ~ 0.05% of diag^2 (reject phantom thin red strips)
+                        amin = Float_Mul(Float_Mul(diag, diag), 0x3F50624DD2F1A9FC)
+                        arn = ar
+                        IfCondition EqualTo(Float_Le(ar, 0), 1) ThenBlock: { arn = Float_Sub(0, ar) }
+                        // perimeter for sliver test
+                        peri = 0
+                        i = 0
+                        WhileLoop LessThan(i, nn) {
+                            j = Add(i, 1)
+                            IfCondition EqualTo(j, nn) ThenBlock: { j = 0 }
+                            xi = ArrayGet(tloop, Multiply(i, 2))
+                            yi = ArrayGet(tloop, Add(Multiply(i, 2), 1))
+                            xj = ArrayGet(tloop, Multiply(j, 2))
+                            yj = ArrayGet(tloop, Add(Multiply(j, 2), 1))
+                            peri = Float_Add(peri, CAD_Num.Sqrt(Float_Add(Float_Mul(Float_Sub(xj, xi), Float_Sub(xj, xi)), Float_Mul(Float_Sub(yj, yi), Float_Sub(yj, yi)))))
+                            i = Add(i, 1)
+                        }
+                        // isoperimetric: peri^2 / area huge ⇒ needle/sliver (no real face)
+                        // reject if peri^2 > 400 * |ar|  (area is 2*signed so use arn)
+                        sliver = 0
+                        IfCondition EqualTo(Float_Le(arn, amin), 1) ThenBlock: { sliver = 1 }
+                        IfCondition EqualTo(sliver, 0) ThenBlock: {
+                            IfCondition EqualTo(Float_Le(Float_Mul(0x4079000000000000, arn), Float_Mul(peri, peri)), 1) ThenBlock: {
+                                sliver = 1
+                            }
+                        }
+                        IfCondition EqualTo(sliver, 0) ThenBlock: {
+                            IfCondition EqualTo(Float_Le(ar, 0), 1) ThenBlock: {
+                                keep = 1
+                                flip = 1
+                            }
+                            IfCondition EqualTo(Float_Le(ar, 0), 0) ThenBlock: {
+                                keep = 1
+                                flip = 0
+                            }
+                        }
+                        IfCondition EqualTo(keep, 1) ThenBlock: {
+                            IfCondition LessThan(nprof, cap_p) ThenBlock: {
+                                ArraySet(pmeta, Multiply(nprof, 2), nn)
+                                ArraySet(pmeta, Add(Multiply(nprof, 2), 1), pool_n)
+                                // stash original sign in reserved: use high bit of nn? instead
+                                // write sign into a side array via pool: store flip after verts? 
+                                // Use pmeta packing: we only have n,off — encode flip in off later.
+                                k = 0
+                                WhileLoop LessThan(k, nn) {
+                                    src = k
+                                    IfCondition EqualTo(flip, 1) ThenBlock: {
+                                        src = Subtract(Subtract(nn, 1), k)
+                                    }
+                                    ArraySet(pool, Multiply(Add(pool_n, k), 2), ArrayGet(tloop, Multiply(src, 2)))
+                                    ArraySet(pool, Add(Multiply(Add(pool_n, k), 2), 1), ArrayGet(tloop, Add(Multiply(src, 2), 1)))
+                                    k = Add(k, 1)
+                                }
+                                // encode flip in pmeta as nn with sign via separate pass on area
+                                ArraySet(pmeta, Multiply(nprof, 2), nn)
+                                ArraySet(pmeta, Add(Multiply(nprof, 2), 1), pool_n)
+                                ArraySet(was_cw, nprof, flip)
+                                pool_n = Add(pool_n, nn)
+                                nprof = Add(nprof, 1)
+                                saved = 1
+                            }
+                        }
+                    }
+                }
+                // rollback temporary marks if face not saved
+                IfCondition EqualTo(saved, 0) ThenBlock: {
+                    pi = 0
+                    WhileLoop LessThan(pi, nhe) {
+                        ArraySet(used, ArrayGet(path_he, pi), 0)
+                        pi = Add(pi, 1)
+                    }
+                }
+                Deallocate(path_he, 2048)
+            }
+            start_he = Add(start_he, 1)
+        }
+        Deallocate(used, 4096)
+        Deallocate(tloop, 4096)
+        // Keep CW interiors always. Also keep ONE exterior envelope (was_cw=0)
+        // with the most verts when there are 2+ interiors — that is the outer
+        // silhouette of multi-circle/slot sketches (two full circles + tangents).
+        // Simple single-polygon: only one interior, skip exterior (same ring).
+        n_cw = 0
+        pi = 0
+        WhileLoop LessThan(pi, nprof) {
+            IfCondition EqualTo(ArrayGet(was_cw, pi), 1) ThenBlock: {
+                n_cw = Add(n_cw, 1)
+            }
+            pi = Add(pi, 1)
+        }
+        // find best exterior envelope candidate
+        env_i = -1
+        env_nn = 0
+        env_ar = 0
+        pi = 0
+        WhileLoop LessThan(pi, nprof) {
+            IfCondition EqualTo(ArrayGet(was_cw, pi), 0) ThenBlock: {
+                pn = ArrayGet(pmeta, Multiply(pi, 2))
+                po = ArrayGet(pmeta, Add(Multiply(pi, 2), 1))
+                ar = 0
+                i = 0
+                WhileLoop LessThan(i, pn) {
+                    j = Add(i, 1)
+                    IfCondition EqualTo(j, pn) ThenBlock: { j = 0 }
+                    xi = ArrayGet(pool, Multiply(Add(po, i), 2))
+                    yi = ArrayGet(pool, Add(Multiply(Add(po, i), 2), 1))
+                    xj = ArrayGet(pool, Multiply(Add(po, j), 2))
+                    yj = ArrayGet(pool, Add(Multiply(Add(po, j), 2), 1))
+                    ar = Float_Add(ar, Float_Sub(Float_Mul(xi, yj), Float_Mul(xj, yi)))
+                    i = Add(i, 1)
+                }
+                IfCondition EqualTo(Float_Le(ar, 0), 1) ThenBlock: { ar = Float_Sub(0, ar) }
+                // prefer more verts (outer slot uses many rim segs)
+                take = 0
+                IfCondition GreaterEqual(pn, 8) ThenBlock: {
+                    IfCondition EqualTo(env_i, -1) ThenBlock: { take = 1 }
+                    IfCondition GreaterThan(pn, env_nn) ThenBlock: { take = 1 }
+                    IfCondition EqualTo(pn, env_nn) ThenBlock: {
+                        IfCondition EqualTo(Float_Le(env_ar, ar), 1) ThenBlock: { take = 1 }
+                    }
+                }
+                IfCondition EqualTo(take, 1) ThenBlock: {
+                    env_i = pi
+                    env_nn = pn
+                    env_ar = ar
+                }
+            }
+            pi = Add(pi, 1)
+        }
+        // only attach envelope when multi-interior (slot / multi-body graph)
+        use_env = 0
+        IfCondition GreaterThan(n_cw, 1) ThenBlock: {
+            IfCondition GreaterEqual(env_i, 0) ThenBlock: { use_env = 1 }
+        }
+        // if NO interiors, keep exteriors (fallback)
+        IfCondition EqualTo(n_cw, 0) ThenBlock: {
+            use_env = 0
+            prefer_ext = 1
+        }
+        IfCondition GreaterThan(n_cw, 0) ThenBlock: {
+            prefer_ext = 0
+        }
+        IfCondition GreaterThan(nprof, 0) ThenBlock: {
+            new_n = 0
+            new_pool_n = 0
+            pi = 0
+            WhileLoop LessThan(pi, nprof) {
+                keep_i = 0
+                IfCondition EqualTo(prefer_ext, 1) ThenBlock: {
+                    IfCondition EqualTo(ArrayGet(was_cw, pi), 0) ThenBlock: { keep_i = 1 }
+                }
+                IfCondition EqualTo(prefer_ext, 0) ThenBlock: {
+                    IfCondition EqualTo(ArrayGet(was_cw, pi), 1) ThenBlock: { keep_i = 1 }
+                    IfCondition EqualTo(use_env, 1) ThenBlock: {
+                        IfCondition EqualTo(pi, env_i) ThenBlock: { keep_i = 1 }
+                    }
+                }
+                IfCondition EqualTo(keep_i, 1) ThenBlock: {
+                    pn = ArrayGet(pmeta, Multiply(pi, 2))
+                    po = ArrayGet(pmeta, Add(Multiply(pi, 2), 1))
+                    ArraySet(pmeta, Multiply(new_n, 2), pn)
+                    ArraySet(pmeta, Add(Multiply(new_n, 2), 1), new_pool_n)
+                    k = 0
+                    WhileLoop LessThan(k, pn) {
+                        ArraySet(pool, Multiply(Add(new_pool_n, k), 2), ArrayGet(pool, Multiply(Add(po, k), 2)))
+                        ArraySet(pool, Add(Multiply(Add(new_pool_n, k), 2), 1), ArrayGet(pool, Add(Multiply(Add(po, k), 2), 1)))
+                        k = Add(k, 1)
+                    }
+                    new_pool_n = Add(new_pool_n, pn)
+                    new_n = Add(new_n, 1)
+                }
+                pi = Add(pi, 1)
+            }
+            nprof = new_n
+        }
+        Deallocate(was_cw, 64)
+        CAD_Store.Write(sketch_handle, 12, nprof)
+        IfCondition EqualTo(nprof, 0) ThenBlock: {
+            ReturnValue(CAD_Sketch.BuildClosedLoop(sketch_handle))
+        }
+        // pick largest |area| as profile 0 (outer pad default)
+        best = 0
+        best_a = 0
+        pi = 0
+        WhileLoop LessThan(pi, nprof) {
+            pn = ArrayGet(pmeta, Multiply(pi, 2))
+            po = ArrayGet(pmeta, Add(Multiply(pi, 2), 1))
+            ar = 0
+            i = 0
+            WhileLoop LessThan(i, pn) {
+                j = Add(i, 1)
+                IfCondition EqualTo(j, pn) ThenBlock: { j = 0 }
+                xi = ArrayGet(pool, Multiply(Add(po, i), 2))
+                yi = ArrayGet(pool, Add(Multiply(Add(po, i), 2), 1))
+                xj = ArrayGet(pool, Multiply(Add(po, j), 2))
+                yj = ArrayGet(pool, Add(Multiply(Add(po, j), 2), 1))
+                ar = Float_Add(ar, Float_Sub(Float_Mul(xi, yj), Float_Mul(xj, yi)))
+                i = Add(i, 1)
+            }
+            IfCondition EqualTo(Float_Le(ar, 0), 1) ThenBlock: { ar = Float_Sub(0, ar) }
+            IfCondition EqualTo(Float_Le(best_a, ar), 1) ThenBlock: {
+                best_a = ar
+                best = pi
+            }
+            pi = Add(pi, 1)
+        }
+        IfCondition NotEqual(best, 0) ThenBlock: {
+            n0 = ArrayGet(pmeta, 0)
+            o0 = ArrayGet(pmeta, 1)
+            ArraySet(pmeta, 0, ArrayGet(pmeta, Multiply(best, 2)))
+            ArraySet(pmeta, 1, ArrayGet(pmeta, Add(Multiply(best, 2), 1)))
+            ArraySet(pmeta, Multiply(best, 2), n0)
+            ArraySet(pmeta, Add(Multiply(best, 2), 1), o0)
+        }
+        pn0 = ArrayGet(pmeta, 0)
+        po0 = ArrayGet(pmeta, 1)
+        ploop = CAD_Store.Read(sketch_handle, 3)
+        k = 0
+        WhileLoop LessThan(k, pn0) {
+            ArraySet(ploop, Multiply(k, 2), ArrayGet(pool, Multiply(Add(po0, k), 2)))
+            ArraySet(ploop, Add(Multiply(k, 2), 1), ArrayGet(pool, Add(Multiply(Add(po0, k), 2), 1)))
+            k = Add(k, 1)
+        }
+        CAD_Store.Write(sketch_handle, 2, pn0)
+        ReturnValue(nprof)
+    }
+}
+
+// Copy profile i verts into out_xy (caller buffer). Returns n or 0.
+Function.CAD_Sketch.GetProfileXY {
+    Input: sketch_handle: Integer
+    Input: profile_i: Integer
+    Input: out_xy_addr: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        np = CAD_Store.Read(sketch_handle, 12)
+        IfCondition GreaterEqual(profile_i, np) ThenBlock: { ReturnValue(0) }
+        pmeta = CAD_Store.Read(sketch_handle, 13)
+        pool = CAD_Store.Read(sketch_handle, 14)
+        nn = ArrayGet(pmeta, Multiply(profile_i, 2))
+        off = ArrayGet(pmeta, Add(Multiply(profile_i, 2), 1))
+        k = 0
+        WhileLoop LessThan(k, nn) {
+            ArraySet(out_xy_addr, Multiply(k, 2), ArrayGet(pool, Multiply(Add(off, k), 2)))
+            ArraySet(out_xy_addr, Add(Multiply(k, 2), 1), ArrayGet(pool, Add(Multiply(Add(off, k), 2), 1)))
+            k = Add(k, 1)
+        }
+        ReturnValue(nn)
+    }
+}
+
+// Build a new sketch whose only closed loop is the given XY ring (n_pts ≥ 3).
+// Used for hole/cut tools from multi-profile DXF loops.
+Function.CAD_Sketch.FromClosedXY {
+    Input: xy_addr: Address
+    Input: n_pts: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(xy_addr, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(n_pts, 3) ThenBlock: { ReturnValue(0) }
+        h = CAD_Sketch.CreateSketch(1)
+        IfCondition EqualTo(h, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, n_pts) {
+            j = Add(i, 1)
+            IfCondition EqualTo(j, n_pts) ThenBlock: { j = 0 }
+            x0 = ArrayGet(xy_addr, Multiply(i, 2))
+            y0 = ArrayGet(xy_addr, Add(Multiply(i, 2), 1))
+            x1 = ArrayGet(xy_addr, Multiply(j, 2))
+            y1 = ArrayGet(xy_addr, Add(Multiply(j, 2), 1))
+            CAD_Sketch.AddLine(h, x0, y0, x1, y1)
+            i = Add(i, 1)
+        }
+        CAD_Sketch.BuildClosedLoop(h)
+        ReturnValue(h)
+    }
+}
+
+// Append a closed XY ring as the next multi-profile on an existing sketch.
+// First call should start from CreateSketch; profile 0 is also mirrored to primary loop.
+// Returns new n_profiles or 0 on fail.
+Function.CAD_Sketch.AddProfileXY {
+    Input: sketch_handle: Integer
+    Input: xy_addr: Address
+    Input: n_pts: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(xy_addr, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(n_pts, 3) ThenBlock: { ReturnValue(0) }
+        nprof = CAD_Store.Read(sketch_handle, 12)
+        cap_p = CAD_Store.Read(sketch_handle, 15)
+        IfCondition GreaterEqual(nprof, cap_p) ThenBlock: { ReturnValue(0) }
+        pmeta = CAD_Store.Read(sketch_handle, 13)
+        pool = CAD_Store.Read(sketch_handle, 14)
+        // compute current pool_n from last profile
+        pool_n = 0
+        IfCondition GreaterThan(nprof, 0) ThenBlock: {
+            li = Subtract(nprof, 1)
+            pool_n = Add(ArrayGet(pmeta, Add(Multiply(li, 2), 1)), ArrayGet(pmeta, Multiply(li, 2)))
+        }
+        ArraySet(pmeta, Multiply(nprof, 2), n_pts)
+        ArraySet(pmeta, Add(Multiply(nprof, 2), 1), pool_n)
+        k = 0
+        WhileLoop LessThan(k, n_pts) {
+            ArraySet(pool, Multiply(Add(pool_n, k), 2), ArrayGet(xy_addr, Multiply(k, 2)))
+            ArraySet(pool, Add(Multiply(Add(pool_n, k), 2), 1), ArrayGet(xy_addr, Add(Multiply(k, 2), 1)))
+            k = Add(k, 1)
+        }
+        nprof = Add(nprof, 1)
+        CAD_Store.Write(sketch_handle, 12, nprof)
+        // first profile → primary loop + lines for ExtrudeProfile
+        IfCondition EqualTo(nprof, 1) ThenBlock: {
+            ploop = CAD_Store.Read(sketch_handle, 3)
+            k = 0
+            WhileLoop LessThan(k, n_pts) {
+                ArraySet(ploop, Multiply(k, 2), ArrayGet(xy_addr, Multiply(k, 2)))
+                ArraySet(ploop, Add(Multiply(k, 2), 1), ArrayGet(xy_addr, Add(Multiply(k, 2), 1)))
+                k = Add(k, 1)
+            }
+            CAD_Store.Write(sketch_handle, 2, n_pts)
+            // also add lines so Extrude has geometry
+            i = 0
+            WhileLoop LessThan(i, n_pts) {
+                j = Add(i, 1)
+                IfCondition EqualTo(j, n_pts) ThenBlock: { j = 0 }
+                CAD_Sketch.AddLine(sketch_handle, ArrayGet(xy_addr, Multiply(i, 2)), ArrayGet(xy_addr, Add(Multiply(i, 2), 1)), ArrayGet(xy_addr, Multiply(j, 2)), ArrayGet(xy_addr, Add(Multiply(j, 2), 1)))
+                i = Add(i, 1)
+            }
+        }
+        ReturnValue(nprof)
+    }
+}
+
+// Validate primary loop: n≥3, |area|>0. Returns 0 ok, negative error.
+Function.CAD_Sketch.ValidateProfile {
+    Input: sketch_handle: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(sketch_handle, 0) ThenBlock: {
+            CAD_Sketch_State.last_error = -1
+            ReturnValue(-1)
+        }
+        n = CAD_Store.Read(sketch_handle, 2)
+        IfCondition LessThan(n, 3) ThenBlock: {
+            n = CAD_Sketch.BuildAllClosedLoops(sketch_handle)
+            n = CAD_Store.Read(sketch_handle, 2)
+        }
+        IfCondition LessThan(n, 3) ThenBlock: {
+            CAD_Sketch_State.last_error = -2
+            ReturnValue(-2)
+        }
+        loop = CAD_Store.Read(sketch_handle, 3)
+        a = CAD_Sketch.LoopSignedArea(loop, n)
+        IfCondition EqualTo(CAD_Num.IsZero(a, 0), 1) ThenBlock: {
+            CAD_Sketch_State.last_error = -4
+            ReturnValue(-4)
+        }
+        CAD_Sketch_State.last_error = 0
+        ReturnValue(0)
     }
 }
 
@@ -116,25 +3230,15 @@ Function.CAD_Sketch.AddBSpline {
     Input: degree: Integer
     Output: Integer
     Body: {
-        IfCondition EqualTo(sketch_handle, 0) ThenBlock: { ReturnValue(0) }
-        CAD_Sketch_State.entity_count = Add(CAD_Sketch_State.entity_count, 1)
-        ReturnValue(CAD_Sketch_State.entity_count)
+        ReturnValue(0)
     }
 }
-
-// -------------------------------------------------------------------------
-// 2. Fusion 360 / Inventor Style Object & Grid Snap Engine (§7.3)
-// -------------------------------------------------------------------------
 
 Function.CAD_Sketch.SnapToGrid {
     Input: val_r: Integer
     Input: grid_step_r: Integer
     Output: Integer
     Body: {
-        IfCondition EqualTo(grid_step_r, 0) ThenBlock: {
-            grid_step_r = 0x4024000000000000 // 10.0 mm
-        }
-        CAD_Sketch_State.snaps_performed = Add(CAD_Sketch_State.snaps_performed, 1)
         ReturnValue(val_r)
     }
 }
@@ -149,195 +3253,6 @@ Function.CAD_Sketch.SnapToEndPoint {
     Body: {
         ArraySet(out_snap_pt_addr, 0, mouse_x_r)
         ArraySet(out_snap_pt_addr, 1, mouse_y_r)
-        CAD_Sketch_State.snaps_performed = Add(CAD_Sketch_State.snaps_performed, 1)
-        ReturnValue(1) // Snapped to EndPoint
-    }
-}
-
-Function.CAD_Sketch.SnapToMidPoint {
-    Input: sketch_handle: Integer
-    Input: mouse_x_r: Integer
-    Input: mouse_y_r: Integer
-    Input: tol_r: Integer
-    Input: out_snap_pt_addr: Address
-    Output: Integer
-    Body: {
-        ArraySet(out_snap_pt_addr, 0, mouse_x_r)
-        ArraySet(out_snap_pt_addr, 1, mouse_y_r)
-        CAD_Sketch_State.snaps_performed = Add(CAD_Sketch_State.snaps_performed, 1)
-        ReturnValue(2) // Snapped to MidPoint
-    }
-}
-
-Function.CAD_Sketch.SnapToArcCenter {
-    Input: sketch_handle: Integer
-    Input: mouse_x_r: Integer
-    Input: mouse_y_r: Integer
-    Input: tol_r: Integer
-    Input: out_snap_pt_addr: Address
-    Output: Integer
-    Body: {
-        ArraySet(out_snap_pt_addr, 0, mouse_x_r)
-        ArraySet(out_snap_pt_addr, 1, mouse_y_r)
-        CAD_Sketch_State.snaps_performed = Add(CAD_Sketch_State.snaps_performed, 1)
-        ReturnValue(3) // Snapped to ArcCenter
-    }
-}
-
-Function.CAD_Sketch.SnapToTangent {
-    Input: sketch_handle: Integer
-    Input: circle_id: Integer
-    Input: mouse_x_r: Integer
-    Input: mouse_y_r: Integer
-    Input: out_snap_pt_addr: Address
-    Output: Integer
-    Body: {
-        ArraySet(out_snap_pt_addr, 0, mouse_x_r)
-        ArraySet(out_snap_pt_addr, 1, mouse_y_r)
-        CAD_Sketch_State.snaps_performed = Add(CAD_Sketch_State.snaps_performed, 1)
-        ReturnValue(4) // Snapped to Tangent
-    }
-}
-
-// -------------------------------------------------------------------------
-// 3. Standard Industry CAD Constraints (Coincident, Parallel, Perpendicular, Tangent, Distance, Angle, etc.)
-// -------------------------------------------------------------------------
-
-Function.CAD_Sketch.AddCoincident {
-    Input: sketch_handle: Integer
-    Input: elem1_id: Integer
-    Input: elem2_id: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 1, elem1_id, elem2_id, 0))
-    }
-}
-
-Function.CAD_Sketch.AddParallel {
-    Input: sketch_handle: Integer
-    Input: line1_id: Integer
-    Input: line2_id: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 3, line1_id, line2_id, 0))
-    }
-}
-
-Function.CAD_Sketch.AddPerpendicular {
-    Input: sketch_handle: Integer
-    Input: line1_id: Integer
-    Input: line2_id: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 4, line1_id, line2_id, 0))
-    }
-}
-
-Function.CAD_Sketch.AddHorizontal {
-    Input: sketch_handle: Integer
-    Input: line_id: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 5, line_id, 0, 0))
-    }
-}
-
-Function.CAD_Sketch.AddVertical {
-    Input: sketch_handle: Integer
-    Input: line_id: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 6, line_id, 0, 0))
-    }
-}
-
-Function.CAD_Sketch.AddTangent {
-    Input: sketch_handle: Integer
-    Input: line_id: Integer
-    Input: circle_id: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 7, line_id, circle_id, 0))
-    }
-}
-
-Function.CAD_Sketch.AddEqual {
-    Input: sketch_handle: Integer
-    Input: elem1_id: Integer
-    Input: elem2_id: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 8, elem1_id, elem2_id, 0))
-    }
-}
-
-Function.CAD_Sketch.AddDistance {
-    Input: sketch_handle: Integer
-    Input: elem1_id: Integer
-    Input: elem2_id: Integer
-    Input: dist_r: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 12, elem1_id, elem2_id, dist_r))
-    }
-}
-
-Function.CAD_Sketch.AddRadius {
-    Input: sketch_handle: Integer
-    Input: circle_id: Integer
-    Input: radius_r: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 14, circle_id, 0, radius_r))
-    }
-}
-
-Function.CAD_Sketch.AddDiameter {
-    Input: sketch_handle: Integer
-    Input: circle_id: Integer
-    Input: dia_r: Integer
-    Output: Integer
-    Body: {
-        rad_r = Float_Div(dia_r, 0x4000000000000000) // / 2.0
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 14, circle_id, 0, rad_r))
-    }
-}
-
-Function.CAD_Sketch.AddAngle {
-    Input: sketch_handle: Integer
-    Input: line1_id: Integer
-    Input: line2_id: Integer
-    Input: angle_r: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(CAD_Sketch.AddConstraint(sketch_handle, 13, line1_id, line2_id, angle_r))
-    }
-}
-
-Function.CAD_Sketch.AddConstraint {
-    Input: sketch_handle: Integer
-    Input: constr_type: Integer
-    Input: elem1_id: Integer
-    Input: elem2_id: Integer
-    Input: param_val_r: Integer
-    Output: Integer
-    Body: {
-        IfCondition EqualTo(sketch_handle, 0) ThenBlock: {
-            ReturnValue(-1) // CAD_E_NULL
-        }
-        CAD_Sketch_State.constraint_count = Add(CAD_Sketch_State.constraint_count, 1)
-        ReturnValue(CAD_Sketch_State.constraint_count)
-    }
-}
-
-Function.CAD_Sketch.SolveConstraints {
-    Input: sketch_handle: Integer
-    Output: Integer
-    Body: {
-        IfCondition EqualTo(sketch_handle, 0) ThenBlock: {
-            ReturnValue(-1) // CAD_E_NULL
-        }
-        CAD_Sketch_State.solved_dof = Add(CAD_Sketch_State.solved_dof, 1)
-        ReturnValue(0) // CAD_OK (Converged)
+        ReturnValue(0)
     }
 }

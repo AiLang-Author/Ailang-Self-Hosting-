@@ -1,27 +1,27 @@
 # CAD Kernel — Development Guide
 
 **Status:** living process doc (pairs with `CAD_Kernel_Design_v3.md` v3.1)  
-**Last updated:** 2026-08-05
+**Last updated:** 2026-08-08
 
 ---
 
-## 1. Diagnosis (where we actually are)
+## 1. Where we are
 
-Gemini (and the v3.0 skeleton push) left a **correct module map** and a lot of
-**API theater**. Interfaces and phase names exist; most bodies do not implement
-geometry. Gallery STLs/STEPs and many “passes” were driven or backfilled by
-**Python scripts in `CAD/`** — those scripts are **deleted**. The kernel is pure
-AILang or it is lying.
+Pure-AILang kernel with real Store-backed B-Rep, walk STEP look-ats, restricted
+bool/holes, **plane–plane fillet + equal-R digon**, DXF→pad, and an interactive
+`cad_app` that can freehand multi-circle dogbones (clone projection, entity
+circles, dense poly prism). Feature tree / Sketch_0 / PG product path still
+ahead. Full status: `CAD_PROGRESS.md` §0 (latest grind).
+
+**Interactive sketch rule:** never permanently tessellate live circles/arcs for
+display or trim; project on a clone. Pad path: profile XY → `MakePolyPrism` (≤2048).
 
 | Reality | Notes |
 |--------|--------|
-| Design path | Layer graph in design doc is sound (compiler metaphor: feature tree = AST, B-rep = IR) |
-| Implementation | Mostly stubs: counters, null checks, `ReturnValue(0)` |
-| Closest to real | `CAD_Num` (tol, vectors, Orient*, Newton Sqrt) — still incomplete vs design |
-| Critical hole | `CAD_Store.Alloc` does not store entity payloads — handles without memory |
-| Dual files | `CAD_Num`/`CAD.Num`, `CAD_Store`/`CAD.Store`, `CAD_Sys`/`CAD.Sys` — pick one |
-| Persistence | **v3.1:** Postgres = system of record; `.cadx` abandoned |
-| Interchange | **STEP** primary (B-Rep); DXF sketches; STL optional not look-at |
+| Design path | Layer graph still sound (feature tree = AST, B-rep = IR) |
+| Implementation | Hot path real: Geom, Topo, Tess, IO walk, restricted Bool, Blend digon |
+| Persistence | **v3.1:** Postgres = system of record (not wired end-to-end yet) |
+| Interchange | **STEP** primary (B-Rep); sketch import TBD (DXF / other — see progress pow-wow) |
 | Competitive target | OpenCASCADE-class **kernel** (L0–L6), not FreeCAD UI glue |
 
 **Rule:** if a demo “works” without a solid gate test that can fail on wrong
@@ -203,9 +203,39 @@ export special cases.
 ./ailang.x CAD/demo_regen_all.ailang -o /tmp/regen && /tmp/regen
 ./ailang.x CAD/demo_bool_ops.ailang -o /tmp/dbo && /tmp/dbo
 ./ailang.x CAD/demo_pad_boss.ailang -o /tmp/dpad && /tmp/dpad
+# Fillets / equal-R digon (plane–plane):
+./ailang.x CAD/demo_fillet_edge.ailang -o /tmp/dfe && /tmp/dfe
+./ailang.x CAD/demo_fillet_horiz.ailang -o /tmp/dfh && /tmp/dfh
+./ailang.x CAD/demo_fillet_verticals.ailang -o /tmp/dfv && /tmp/dfv
+./ailang.x CAD/demo_fillet_edges.ailang -o /tmp/dfes && /tmp/dfes
+./ailang.x CAD/demo_fillet_wedge.ailang -o /tmp/dfw && /tmp/dfw
+./ailang.x CAD/demo_fillet_roof.ailang -o /tmp/dfr && /tmp/dfr
+# DXF profile ladder:
+./ailang.x CAD/demo_dxf_cube.ailang -o /tmp/dc && /tmp/dc
+./ailang.x CAD/demo_dxf_diamond.ailang -o /tmp/dd && /tmp/dd
+./ailang.x CAD/demo_dxf_keyhole.ailang -o /tmp/dk && /tmp/dk
+./ailang.x CAD/demo_dxf_circle.ailang -o /tmp/dci && /tmp/dci
+./ailang.x CAD/demo_dxf_escutcheon.ailang -o /tmp/de && /tmp/de   # plate + keyhole through
+# CLI loader (files or full pipe: DXF stdin → STEP stdout):
+./ailang.x CAD/cad_load.ailang -o cad_load.x
+./cad_load.x --in path/to/profile.dxf --out out.stp --height 10
+./cad_load.x --in plate.dxf --hole hole.dxf --out esc.stp --height 4
+cat profile.dxf | ./cad_load.x -H 10 > solid.stp          # pure pipe
+./cad_load.x -H 8 < keyhole.dxf > keyhole.stp             # redirect
+# Software viewport (no FreeCAD, no AOS): mesh → headless FB → BMP
+./ailang.x CAD/cad_view.ailang -o cad_view.x
+./cad_view.x --in keyhole.dxf --shot test-stl/cad_view.bmp -H 8
+./cad_view.x --in keyhole.dxf -o out.bmp -H 8 --show   # host eog window
+cat profile.dxf | ./cad_view.x --shot out.bmp -H 10
+./CAD/smoke_view.sh    # regenerate look-at BMPs under test-stl/
+# CLI contract (scripts + AIMacro surface): Docs/CAD/CAD_CLI.md
+CAD/scripts/load_profile.sh profile.dxf out.stp 10
+CAD/scripts/view_profile.sh profile.dxf out.bmp 10 0
 # FreeCAD: test-stl/cad_*.stp only
 # Note: side holes/notches open on vertical faces — look from the side, not top.
 # Pad boss = stepped solid on top of plate (not a Union of two floating boxes).
+# Digon: equal-R multi-edge cycle → cylinders + ellipses, no sphere faces.
+# Escutcheon: 70×100×4 plate, flared keyhole cut through (not a solid keyhole pad).
 ```
 
 **Plate-hole shells (Topo, not STEP recipes)**
@@ -235,17 +265,20 @@ export special cases.
 9. [x] Box Intersection; ClassifyPoint (AABB/cyl/sphere); rect notch +X
 10. [x] Pad boss stepped shell; kind-3 ClassifyPoint subtracts Z-holes
 11. [x] **General `FilletEdge` plane–plane** (vertical + horizontal + multi-edge)
-12. [ ] Top-rim (4 edges) + vertex spheres; chamfer strip
-13. [ ] Plane–cyl / plane–cone edge blend
-14. [ ] General B-Rep cut / shell hollow
-15. [ ] Sketch_0 / extrude / revolve (**after** blend spine)
-16. [ ] Viewport/Vulkan **after** tess emits real buffers
+12. [x] **Equal-R digon** (box 90°, wedge 31°, roof 15° planes); no sphere on equal-R
+13. [ ] Chamfer strip; unequal-R ball corner (globe only when radii differ)
+14. [ ] Plane–cyl / plane–cone edge blend
+15. [ ] General B-Rep cut / shell hollow
+16. [ ] Sketch_0 / extrude / revolve (**next authoring** — blend spine usable on planes)
+17. [x] Software viewport: Tess mesh → headless FB → BMP (`cad_view.x`); multi-loop holes
+18. [ ] Interactive host window / orbit (optional); full Vulkan later
 
-**Priority (2026-08):** solid modelling geometry before sketch.
+**Priority (2026-08-06):** plane solid blend ✓ → sketch-driven pad/pocket next.
+See `CAD_PROGRESS.md` §4 for implemented vs not (fillet tranche).
 
-**Fillet policy — no shape recipes.** API is `FilletEdge(solid, edge, R)`.
-Offset supports → spine → cylindrical blend face → rebuild planar faces.
-Domain: plane–plane first; then plane–cyl / cone. Unsupported → **0**.
+**Fillet policy — no shape recipes.** API is `FilletEdge` / `FilletEdges`.
+Plane–plane: cylinder strip; shared verts + equal R → **digon ellipses** (not sphere).
+Unsupported support pair → **0**.
 
 ---
 
@@ -254,6 +287,8 @@ Domain: plane–plane first; then plane–cyl / cone. Unsupported → **0**.
 | Doc | Role |
 |-----|------|
 | `Docs/CAD/CAD_PROGRESS.md` | **Living plan + turn log** (update every grind turn) |
+| `Docs/CAD/CAD_CORE_COMPETITIVE_PLAN.md` | Sketch/DXF → solid core roadmap (vs OCC/SW; no scripting-first) |
+| `Docs/CAD/CAD_CLI.md` | Frozen host tool surface (`cad_load` / `cad_view`) |
 | `Docs/CAD/CAD_Kernel_Design_v3.md` | Normative architecture & contracts |
 | `Docs/CAD/plane_coordinate_tree_spec.md` | Workplane / plane feature tree |
 | `Docs/CAD/notes/*` | Historical; not binding |

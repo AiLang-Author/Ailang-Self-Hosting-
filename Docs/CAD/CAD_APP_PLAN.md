@@ -1,29 +1,39 @@
 # CAD Working App Plan — Real-time DXF / Geometry Loops
 
-**Status:** plan + **M-B implemented** (2026-08-07)  
+**Status:** plan + **M-B..D + interactive dogbone pad green** (2026-08-08)  
 **Goal:** See and edit DXF + solids in a **hosted window** for fast test loops.  
 **Headless BMP** = bootstrap / CI / agents only, not the daily path.  
-**Pairs with:** `CAD_APP_PATH.md`, `CAD_CLI.md`, `CAD_OCC_CAPABILITY_AUDIT.md`.
+**Pairs with:** `CAD_APP_PATH.md`, `CAD_CLI.md`, `CAD_PROGRESS.md` §0, `CAD_OCC_CAPABILITY_AUDIT.md`.
 
-### M-B + M-C shipped
+### Shipped
 
 | Piece | Path |
 |-------|------|
 | Buffer render | `CAD_View.RenderSolidToFB` / `WriteFBRaw` |
 | App | `cad_app.x` / `CAD/cad_app.ailang` |
-| Host presenter | `CAD/host/cad_host_x11` (blit + keys + **LMB click**) |
-| Sketch edit | mode `m`, tools `l`/`e`/`c`, pad `r`, new `n`, export DXF `x` |
-| Headless gate | `./CAD/smoke_app.sh` (includes `--sketch-demo`) |
+| Host presenter | `CAD/host/cad_host_x11` (blit + keys + LMB + orbit/zoom/pan) |
+| Sketch edit | Line/Rect/Circ/Arc/Trim/Pick; Profiles → Pad |
+| Orbit / zoom / cube | LMB-drag orbit, scroll zoom, hold-LMB pan, **nav cube** |
+| **DXF → solid** | pad, multi-loop holes, `--hole` plate pair, `u` cut, `o` reload |
+| **Live multi-circle pad** | clone projection; keep circles as entities; prism ≤2048 verts |
+| Headless gate | `./CAD/smoke_app.sh` (keyhole, multi-loop, escutcheon, M-D) |
+
+### Interactive sketch rules (2026-08-08)
+
+1. **Live geometry stays clean:** circles/arcs are entities; display tess only.  
+2. **Projection mutates a clone** (`CA_RebuildProfiles`) — never PrepareExtrude the live sketch.  
+3. **Trim** splits at real joins (incl. line×circle); circle trim → remaining **arcs**.  
+4. **Pad** uses selected profile mask; if Profiles just ran, densest/outer is auto-selected (no warn yet).
 
 ```bash
 # CI
 ./CAD/smoke_app.sh
 
-# Window (DISPLAY required)
-cc -O2 -o CAD/host/cad_host_x11 CAD/host/cad_host_x11.c -lX11
-./ailang.x CAD/cad_app.ailang -o cad_app.x
-./cad_app.x -i test-stl/test-dxf-files/cube.dxf -H 10
-# m sketch | l line e rect c circle | LMB place | r pad | 1-3 view | [ ] H | s/b/x export
+# Window (always use launcher — real viewport)
+./CAD/scripts/run_cad_app.sh -i test-stl/test-dxf-files/diamond.dxf -H 20
+./CAD/scripts/run_cad_app.sh -i escutcheon_plate.dxf --hole keyhole_flared.dxf -H 4
+# 3D: LMB-drag orbit | scroll zoom | nav cube | r pad | u cut | o reload
+# sketch: m | l/e/c | LMB | 1-3 | [ ] H | s/b/x | q
 ```
 
 ---
@@ -173,12 +183,15 @@ document {
 
 ### Phase E — Modeling tools in-app (grow with kernel)
 
-| Step | Tool | Kernel |
-|------|------|--------|
-| E1 | Pocket / hole | `ExtrudeCut`, `CreateHole` |
-| E2 | Edge pick → fillet / chamfer | hit-test mesh edge → `FilletEdge` / `ChamferEdge` |
-| E3 | Pattern / mirror | existing Feat APIs |
-| E4 | Feature list / undo | later; not required for test loops |
+| Step | Tool | Kernel | Status |
+|------|------|--------|--------|
+| E0 | Multi-circle / dogbone pad | clone tess + `MakePolyPrism` ≤2048 | **done** |
+| E1 | Pocket / hole | `ExtrudeCut`, `CreateHole` | partial |
+| E2 | **Revolve pad/cut UI** | `RevolveProfile` / `RevolveCut` | **next** |
+| E3 | Explicit pad pick / confirm | app only | later |
+| E4 | Edge pick → fillet / chamfer | hit-test mesh → `FilletEdge` / `ChamferEdge` | later |
+| E5 | Pattern / mirror | existing Feat APIs | later |
+| E6 | Feature list / undo | later; not required for test loops | open |
 
 Kernel expands **only when the app hits a wall**.
 
