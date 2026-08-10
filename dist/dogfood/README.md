@@ -11,13 +11,35 @@ License: **SCSL v1.0** (see `LICENSE` in the package and repo root). Personal/ac
 
 Contact: smc.collins1977@gmail.com
 
+## Install (recommended)
+
+One script installs **system packages** (X11 libs, build tools, python3, git) and verifies the kit:
+
+```bash
+# from the unzipped folder
+chmod +x install.sh bin/* scripts/*.sh
+./install.sh                 # deps + check prebuilts
+./install.sh --run           # deps + launch CAD
+
+# or bootstrap straight from GitHub (full monorepo):
+curl -fsSL https://raw.githubusercontent.com/AiLang-Author/Ailang-Self-Hosting-/master/install_dogfood.sh | bash -s -- --full --run
+```
+
+| Flag | Meaning |
+|------|---------|
+| `--deps-only` | Only apt/dnf/pacman packages |
+| `--full` | Clone monorepo + rebuild `cad_app.x` + hosts |
+| `--fltk` | Also build FLTK menus shell (local or system) |
+| `--run` | Start CAD when install finishes |
+| `--no-sudo` | Skip package manager |
+| `--install-compiler` | Symlink `ailang.x` into `/usr/local/bin` (monorepo) |
+
 ## What you can try (Linux + X11 / XWayland)
 
 This kit includes a **prebuilt Linux x86_64** CAD kernel + X11 presenters so you can poke at viewport UX without building the whole monorepo first.
 
 ```bash
-# from this folder
-chmod +x bin/* scripts/*.sh
+# after ./install.sh
 export DISPLAY=:0   # or your XWayland display
 ./scripts/run_dogfood.sh
 ```
@@ -53,12 +75,13 @@ Please tell us (Telegram thread or GitHub issue) what felt **wrong, slow, or fre
 
 ## Full repo / rebuild
 
-The monorepo has the compiler (`ailang.x`), `Librarys/Cad/*`, and the FLTK shell:
-
 ```bash
+# install deps + clone + build hosts (+ optional FLTK) + run
+./install_dogfood.sh --full --fltk --run
+# or:
 git clone https://github.com/AiLang-Author/Ailang-Self-Hosting-.git
 cd Ailang-Self-Hosting-
-# optional: build FLTK under third_party (see CAD/host/BUILD_FLTK.md)
+./install_dogfood.sh --full
 ./CAD/scripts/run_cad_app.sh
 ```
 

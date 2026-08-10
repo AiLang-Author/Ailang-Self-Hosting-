@@ -28,6 +28,8 @@ rm -rf "$OUT"
 mkdir -p "$OUT/bin" "$OUT/scripts" "$OUT/samples" "$OUT/docs"
 
 cp -f dist/dogfood/README.md "$OUT/README.md"
+cp -f install_dogfood.sh "$OUT/install.sh"
+chmod +x "$OUT/install.sh"
 cp -f LICENSE "$OUT/LICENSE" 2>/dev/null || cp -f License.md "$OUT/LICENSE"
 cp -f WORKSPACE.md "$OUT/WORKSPACE.md" 2>/dev/null || true
 cp -f docs/cad/CAD_UI_PLAN.md "$OUT/docs/CAD_UI_PLAN.md" 2>/dev/null || true
