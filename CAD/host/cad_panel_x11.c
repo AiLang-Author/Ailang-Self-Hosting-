@@ -108,7 +108,7 @@ typedef struct {
 
 /* Layout: rows of buttons */
 static Btn g_btns[] = {
-    /* row 0: mode / pad */
+    /* row 0: mode / pad (Pad uses current pad_H from HUD) */
     { 10,  40, 90, 28, "Sketch/3D", "mode" },
     {110,  40, 40, 28, "Pad",  "repad" },
     {154,  40, 40, 28, "Rev",  "revolve" },
@@ -138,6 +138,8 @@ static Btn g_btns[] = {
     { 86, 132, 54, 24, "Next",     "y" },
     {146, 132, 60, 24, "Solve",    "solve" },
     {212, 132, 60, 24, "Cancel",   "cancel" },
+    {276, 132, 48, 24, "MirX",     "mirror_x" },
+    {328, 132, 48, 24, "MirY",     "mirror_y" },
     /* row 1c: constraints (click geom after; DistO/Rad/Dist lock current size) */
     { 10, 162, 48, 24, "Coin",  "cstr_coinc" },
     { 62, 162, 32, 24, "H",     "cstr_h" },
@@ -161,13 +163,18 @@ static Btn g_btns[] = {
     { 90, 258, 70, 28, "Reload",  "reload" },
     {170, 258, 70, 28, "STEP",    "step" },
     {250, 258, 70, 28, "BMP",     "bmp" },
-    /* row 4: views */
-    { 10, 298, 50, 28, "Iso",     "view0" },
-    { 70, 298, 50, 28, "Top",     "view1" },
-    {130, 298, 50, 28, "Front",   "view2" },
-    {190, 298, 50, 28, "H-",      "hdec" },
-    {250, 298, 50, 28, "H+",      "hinc" },
-    {310, 298, 50, 28, "Quit",    "quit" },
+    /* row 4: views + pad height (set before Pad; pad_H in status/HUD) */
+    { 10, 298, 44, 28, "Iso",     "view0" },
+    { 58, 298, 44, 28, "Top",     "view1" },
+    {106, 298, 48, 28, "Front",   "view2" },
+    {158, 298, 36, 28, "H5",      "height 5" },
+    {198, 298, 40, 28, "H10",     "height 10" },
+    {242, 298, 40, 28, "H20",     "height 20" },
+    {286, 298, 40, 28, "H50",     "height 50" },
+    /* row 5: fine height + quit */
+    { 10, 332, 44, 28, "H-",      "hdec" },
+    { 58, 332, 44, 28, "H+",      "hinc" },
+    {110, 332, 70, 28, "Quit",    "quit" },
 };
 static const int g_nbtn = (int)(sizeof g_btns / sizeof g_btns[0]);
 
@@ -314,7 +321,7 @@ int main(int argc, char **argv) {
 
     int screen = DefaultScreen(dpy);
     Window root = RootWindow(dpy, screen);
-    int win_w = 390, win_h = 480;
+    int win_w = 390, win_h = 520;
     Window win = XCreateSimpleWindow(dpy, root, 860, 40, win_w, win_h, 2,
                                      0x6080A0, 0x12151C);
     XStoreName(dpy, win, "AILang CAD — Tools");

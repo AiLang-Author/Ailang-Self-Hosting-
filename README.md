@@ -4,6 +4,9 @@ Welcome to the **AILang Programming Language** — a production-grade, self-host
 
 ## Overview
 
+**Repo layout:** see [`WORKSPACE.md`](WORKSPACE.md) (language + libraries first; apps as proofs). **Docs:** [`docs/README.md`](docs/README.md). **AMD GPU driver kit:** [`dev/amdgpu/`](dev/amdgpu/).
+
+
 This is the official self-hosting repository for **AILang**, featuring:
 
 - **Ultra-efficient compiler** (1.x Mb) — Self-hosted, generates highly optimized native binaries
