@@ -1,0 +1,314 @@
+// reset_gpu.ailang — GPU soft reset for wedged compute engine
+// Build: ./ailang.x dev/compiler-regression/reset_gpu.ailang reset_gpu.x
+// Run:   sg video -c "./reset_gpu.x"
+//
+// Follows the Linux kernel radeon si_gpu_soft_reset() sequence:
+//   1. Halt CP
+//   2. Halt RLC (halted, NOT reset — preserves DCE power gating state)
+//   3. MC stop: disable VGA render, fence BAR, blackout MC
+//   4. GRBM_SOFT_RESET (CP + full shader pipeline, NO RLC)
+//   5. SRBM_SOFT_RESET (HDP + GRBM)
+//   6. MC resume: unblackout, re-enable BAR, restore VGA
+//   7. Restart RLC
+//   8. Unhalt CP
+//
+// The MC MUST be blackouted before touching soft-reset registers.
+// Without this the reset deadlocks the PCIe bus → system lockup.
+//
+// Does NOT require reboot. Firmware survives soft reset.
+// After running this, re-run test_accel_gcn.x (it reloads CP firmware).
+
+LibraryImport.Arena
+LibraryImport.Drivers.AMDGPU.AMDGPUFamily
+LibraryImport.Drivers.AMDGPU.AMDGPUDiscover
+LibraryImport.Drivers.AMDGPU.AMDGPUBAR
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4
+LibraryImport.Drivers.AMDGPU.AMDGPUPM4Regs
+LibraryImport.Drivers.AMDGPU.AMDGPUDisplay
+
+SubRoutine.Main {
+    PrintMessage("=== GPU Reset Tool (MC-safe) ===\n\n")
+
+    count = GPU_Discover()
+    IfCondition EqualTo(count, 0) ThenBlock: {
+        PrintMessage("No AMD GPUs found.\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    GPU_PrintAll()
+    PrintMessage("\n")
+
+    // Map MMIO BAR on all GPUs for CRTC probing
+    GPU_BAR_Init()
+    gi = 0
+    WhileLoop LessThan(gi, count) {
+        GPU_BAR_MapMMIO(gi)
+        gi = Add(gi, 1)
+    }
+
+    // Auto-select compute GPU (zero active CRTCs = no display = safe to reset)
+    gpu = -1
+    gi = 0
+    WhileLoop LessThan(gi, count) {
+        IfCondition EqualTo(GPU_BAR_IsMMIOMapped(gi), 1) ThenBlock: {
+            crtc_count = 0
+            pipe = 0
+            WhileLoop LessThan(pipe, 6) {
+                IfCondition EqualTo(DCE6_IsCRTCActive(gi, pipe), 1) ThenBlock: {
+                    crtc_count = Add(crtc_count, 1)
+                }
+                pipe = Add(pipe, 1)
+            }
+            PrintMessage("GPU ")
+            PrintNumber(gi)
+            PrintMessage(": active CRTCs = ")
+            PrintNumber(crtc_count)
+            PrintMessage("\n")
+
+            IfCondition EqualTo(crtc_count, 0) ThenBlock: {
+                gpu = gi
+            }
+        }
+        gi = Add(gi, 1)
+    }
+
+    IfCondition LessThan(gpu, 0) ThenBlock: {
+        // Fallback: if only 1 GPU, use it (original behavior)
+        IfCondition EqualTo(count, 1) ThenBlock: {
+            gpu = 0
+            PrintMessage("Single GPU — resetting GPU 0\n")
+        }
+        IfCondition GreaterThan(count, 1) ThenBlock: {
+            PrintMessage("FAIL: no GPU with zero active CRTCs — refusing to reset display card.\n")
+            PrintMessage("      Specify which GPU to reset or disconnect its monitor.\n")
+            SystemCall(60, 1, 0, 0, 0, 0)
+        }
+    }
+
+    PrintMessage("\n--- Resetting GPU ")
+    PrintNumber(gpu)
+    PrintMessage(" (compute card) ---\n")
+
+    // Ensure MMIO is mapped for the target
+    rc = GPU_BAR_MapMMIO(gpu)
+    IfCondition EqualTo(rc, 0) ThenBlock: {
+        PrintMessage("MMIO map failed!\n")
+        SystemCall(60, 1, 0, 0, 0, 0)
+    }
+
+    // --- Read pre-reset status ---
+    PrintMessage("\n--- Pre-Reset Status ---\n")
+    grbm = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+    PrintMessage("GRBM_STATUS:  0x")
+    PrintHex(grbm)
+    PrintMessage("\n")
+
+    srbm = GPU_Rd32(gpu, SIReg.SRBM_STATUS)
+    PrintMessage("SRBM_STATUS:  0x")
+    PrintHex(srbm)
+    PrintMessage("\n")
+
+    rptr = GPU_Rd32(gpu, SIReg.CP_RB0_RPTR)
+    PrintMessage("CP_RB0_RPTR:  ")
+    PrintNumber(rptr)
+    PrintMessage("\n")
+
+    wptr = GPU_Rd32(gpu, SIReg.CP_RB0_WPTR)
+    PrintMessage("CP_RB0_WPTR:  ")
+    PrintNumber(wptr)
+    PrintMessage("\n")
+
+    // --- Step 1: Halt CP (all three micro-engines) ---
+    PrintMessage("\n--- Step 1: Halt CP ---\n")
+    halt_bits = Add(CPMEBits.CE_HALT, Add(CPMEBits.PFP_HALT, CPMEBits.ME_HALT))
+    GPU_Wr32(gpu, SIReg.CP_ME_CNTL, halt_bits)
+    flush = GPU_Rd32(gpu, SIReg.CP_ME_CNTL)
+    PrintMessage("CP halted\n")
+
+    // Brief spin ~20us to let CP drain
+    di = 0
+    WhileLoop LessThan(di, 100) {
+        flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+        di = Add(di, 1)
+    }
+
+    // --- Step 2: Halt RLC ---
+    // RLC manages DCE power gating.  We HALT it (RLC_CNTL=0), we do NOT
+    // RESET it (SOFT_RESET_RLC is never set in GRBM mask below).
+    // Halting is safe — it just stops power-gating decisions during reset.
+    PrintMessage("\n--- Step 2: Halt RLC ---\n")
+    saved_rlc = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+    PrintMessage("RLC_CNTL saved: 0x")
+    PrintHex(saved_rlc)
+    PrintMessage("\n")
+    GPU_Wr32(gpu, SIReg.RLC_CNTL, 0)
+    flush = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+    PrintMessage("RLC halted\n")
+
+    // --- Step 3: MC stop (evergreen_mc_stop equivalent) ---
+    PrintMessage("\n--- Step 3: MC Stop ---\n")
+
+    // Save and disable VGA render
+    saved_vga = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+    GPU_Wr32(gpu, SIReg.VGA_RENDER_CONTROL, 0)
+    flush = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+    PrintMessage("VGA render disabled\n")
+
+    // Fence CPU BAR access to VRAM
+    saved_bif = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+    GPU_Wr32(gpu, SIReg.BIF_FB_EN, 0)
+    flush = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+    PrintMessage("BAR access fenced (BIF_FB_EN=0)\n")
+
+    // Blackout the Memory Controller
+    saved_blackout = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+    GPU_Wr32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL, BitwiseOr(saved_blackout, 1))
+    flush = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+    PrintMessage("MC blackout asserted\n")
+
+    // Wait ~100us for MC to settle
+    di = 0
+    WhileLoop LessThan(di, 500) {
+        flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+        di = Add(di, 1)
+    }
+
+    // --- Step 4: GRBM soft reset (kernel order: GRBM first, SRBM second) ---
+    // Full shader pipeline + CP.  RLC excluded (halted, not reset).
+    PrintMessage("\n--- Step 4: GRBM Soft Reset ---\n")
+    grbm_mask = Add(GRBMResetBits.SOFT_RESET_CP,
+                Add(GRBMResetBits.SOFT_RESET_CB,
+                Add(GRBMResetBits.SOFT_RESET_DB,
+                Add(GRBMResetBits.SOFT_RESET_GDS,
+                Add(GRBMResetBits.SOFT_RESET_PA,
+                Add(GRBMResetBits.SOFT_RESET_SC,
+                Add(GRBMResetBits.SOFT_RESET_BCI,
+                Add(GRBMResetBits.SOFT_RESET_SPI,
+                Add(GRBMResetBits.SOFT_RESET_SX,
+                Add(GRBMResetBits.SOFT_RESET_TC,
+                Add(GRBMResetBits.SOFT_RESET_TA,
+                Add(GRBMResetBits.SOFT_RESET_VGT,
+                    GRBMResetBits.SOFT_RESET_IA))))))))))))
+    PrintMessage("GRBM mask: 0x")
+    PrintHex(grbm_mask)
+    PrintMessage("\n")
+
+    GPU_Wr32(gpu, SIReg.GRBM_SOFT_RESET, grbm_mask)
+    flush = GPU_Rd32(gpu, SIReg.GRBM_SOFT_RESET)
+    PrintMessage("GRBM asserted, readback: 0x")
+    PrintHex(flush)
+    PrintMessage("\n")
+
+    // Hold assert ~50us
+    di = 0
+    WhileLoop LessThan(di, 200) {
+        flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+        di = Add(di, 1)
+    }
+
+    GPU_Wr32(gpu, SIReg.GRBM_SOFT_RESET, 0)
+    flush = GPU_Rd32(gpu, SIReg.GRBM_SOFT_RESET)
+    PrintMessage("GRBM deasserted\n")
+
+    // --- Step 5: SRBM soft reset ---
+    // HDP + GRBM (kernel sets SOFT_RESET_GRBM when resetting CP).
+    // Do NOT include SOFT_RESET_MC — kills the memory controller.
+    PrintMessage("\n--- Step 5: SRBM Soft Reset ---\n")
+    srbm_mask = Add(SRBMResetBits.SOFT_RESET_HDP, SRBMResetBits.SOFT_RESET_GRBM)
+    PrintMessage("SRBM mask: 0x")
+    PrintHex(srbm_mask)
+    PrintMessage("\n")
+
+    GPU_Wr32(gpu, SIReg.SRBM_SOFT_RESET, srbm_mask)
+    flush = GPU_Rd32(gpu, SIReg.SRBM_SOFT_RESET)
+    PrintMessage("SRBM asserted, readback: 0x")
+    PrintHex(flush)
+    PrintMessage("\n")
+
+    // Hold assert ~50us
+    di = 0
+    WhileLoop LessThan(di, 200) {
+        flush = GPU_Rd32(gpu, SIReg.SRBM_STATUS)
+        di = Add(di, 1)
+    }
+
+    GPU_Wr32(gpu, SIReg.SRBM_SOFT_RESET, 0)
+    flush = GPU_Rd32(gpu, SIReg.SRBM_SOFT_RESET)
+    PrintMessage("SRBM deasserted\n")
+
+    // Post-reset settle ~50us
+    di = 0
+    WhileLoop LessThan(di, 200) {
+        flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+        di = Add(di, 1)
+    }
+
+    // --- Step 6: MC resume (evergreen_mc_resume equivalent) ---
+    PrintMessage("\n--- Step 6: MC Resume ---\n")
+
+    // Unblackout MC
+    GPU_Wr32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL, saved_blackout)
+    flush = GPU_Rd32(gpu, SIReg.MC_SHARED_BLACKOUT_CNTL)
+    PrintMessage("MC blackout removed\n")
+
+    // Re-enable CPU BAR access
+    GPU_Wr32(gpu, SIReg.BIF_FB_EN, saved_bif)
+    flush = GPU_Rd32(gpu, SIReg.BIF_FB_EN)
+    PrintMessage("BAR access restored\n")
+
+    // Restore VGA render
+    GPU_Wr32(gpu, SIReg.VGA_RENDER_CONTROL, saved_vga)
+    flush = GPU_Rd32(gpu, SIReg.VGA_RENDER_CONTROL)
+    PrintMessage("VGA render restored\n")
+
+    // Final settle ~50us
+    di = 0
+    WhileLoop LessThan(di, 200) {
+        flush = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+        di = Add(di, 1)
+    }
+
+    // --- Step 7: Restart RLC ---
+    PrintMessage("\n--- Step 7: Restart RLC ---\n")
+    GPU_Wr32(gpu, SIReg.RLC_CNTL, saved_rlc)
+    flush = GPU_Rd32(gpu, SIReg.RLC_CNTL)
+    PrintMessage("RLC restored: 0x")
+    PrintHex(flush)
+    PrintMessage("\n")
+
+    // --- Step 8: Unhalt CP ---
+    PrintMessage("\n--- Step 8: Unhalt CP ---\n")
+    GPU_Wr32(gpu, SIReg.CP_ME_CNTL, 0)
+    flush = GPU_Rd32(gpu, SIReg.CP_ME_CNTL)
+    PrintMessage("CP unhalted\n")
+
+    // --- Read post-reset status ---
+    PrintMessage("\n--- Post-Reset Status ---\n")
+    grbm = GPU_Rd32(gpu, SIReg.GRBM_STATUS)
+    PrintMessage("GRBM_STATUS:  0x")
+    PrintHex(grbm)
+    PrintMessage("\n")
+
+    srbm = GPU_Rd32(gpu, SIReg.SRBM_STATUS)
+    PrintMessage("SRBM_STATUS:  0x")
+    PrintHex(srbm)
+    PrintMessage("\n")
+
+    rptr = GPU_Rd32(gpu, SIReg.CP_RB0_RPTR)
+    PrintMessage("CP_RB0_RPTR:  ")
+    PrintNumber(rptr)
+    PrintMessage("\n")
+
+    wptr = GPU_Rd32(gpu, SIReg.CP_RB0_WPTR)
+    PrintMessage("CP_RB0_WPTR:  ")
+    PrintNumber(wptr)
+    PrintMessage("\n")
+
+    // Unmap
+    GPU_BAR_Unmap(gpu)
+    PrintMessage("\n=== GPU Reset Complete ===\n")
+    PrintMessage("You can now re-run test_accel_gcn.x\n")
+    SystemCall(60, 0, 0, 0, 0, 0)
+}
+
+RunTask(Main)

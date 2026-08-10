@@ -233,7 +233,7 @@ The `Demo Programs/` directory includes **over 150 runnable examples**:
 │   ├── riscv/                  # RISC-V (in development)
 │   └── optimizer/              # IR optimizer & analyzer
 │
-├── TestCode/                    # Testing code examples
+├── dev/compiler-regression/     # Compiler golden programs (was TestCode/)
 ├── Tests/                       # Test suite & harness
 │   └── Test262Harness.ailang   # ECMAScript Test262 compliance
 │

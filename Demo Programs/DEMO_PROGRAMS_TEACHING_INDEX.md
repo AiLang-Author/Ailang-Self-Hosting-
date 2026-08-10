@@ -28,7 +28,7 @@ Example:
 Alternative form seen in build scripts and notes (some versions support `-o`):
 
 ```bash
-./ailang.x TestCode/some_test.ailang -o /tmp/some_test.x
+./ailang.x dev/compiler-regression/some_test.ailang -o /tmp/some_test.x
 /tmp/some_test.x
 ```
 

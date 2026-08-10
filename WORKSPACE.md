@@ -37,6 +37,7 @@ Shipping any one of them is optional; keeping the path from “hello world” �
 │   └── archive/              # historical / sandbox / old prompts
 │
 ├── dev/                      # developer tooling (not end-user product)
+│   ├── compiler-regression/  # known-good programs for compiler debug (was TestCode/)
 │   └── amdgpu/               # AMD GCN / SI driver bring-up kit
 │       ├── tools/            # Python/shell probes, mmiotrace helpers
 │       ├── notes/            # session handoffs, crash postmortems
@@ -63,6 +64,7 @@ Shipping any one of them is optional; keeping the path from “hello world” �
 | App proof (e.g. CAD) | `CAD/` + its `Librarys/Cad/` + `docs/cad/` | app-local `build/`, screenshots — not repo root |
 | AOS / desktop | `OS/`, `Main.ailang`, `Librarys/Display/`, `Applications/` | `docs/aos/` |
 | Browser / JS | `Librarys/Browser/`, `docs/browser/`, `tools/*test262*` | `results/` (ignored) |
+| Compiler debug / golden programs | `dev/compiler-regression/` (was `TestCode/`) | local `/tmp` binaries only |
 | AMD GPU drivers | `Librarys/Accel/`, `Librarys/Drivers/AMDGPU/`, `dev/amdgpu/` | `dev/amdgpu/traces/` |
 
 ## What not to dump at repo root
