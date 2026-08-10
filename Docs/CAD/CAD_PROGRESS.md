@@ -3,13 +3,44 @@
 **Living document.** Update every grind turn. Pair with `CAD_DEV_GUIDE.md` (process) and `CAD_Kernel_Design_v3.md` (normative).  
 **Rule:** local commit after each meaningful turn so regressions are git-bisectable.
 
-**Last updated:** 2026-08-08 (interactive sketch profile/pad: dogbone solid green)  
+**Last updated:** 2026-08-09 (pad+hole multi-loop prism; pow-wow priority lock)  
 **Branch:** `master`  
-**Strategy:** `Docs/CAD/CAD_CORE_COMPETITIVE_PLAN.md` · Phase A: `CAD_PHASE_A_SKETCH.md` · App: `CAD_APP_PLAN.md`
+**Strategy:** `Docs/CAD/CAD_CORE_COMPETITIVE_PLAN.md` · Phase A: `CAD_PHASE_A_SKETCH.md` · App: `CAD_APP_PLAN.md`  
+**Sketcher system:** `Docs/CAD/CAD_SKETCHER_IMPL.md`  
+**Design evolution (theory → now):** `Docs/CAD/CAD_DESIGN_EVOLUTION.md`  
+**Plane / topo naming:** `Docs/CAD/CAD_PLANE_ON_FACE.md`
 
 ---
 
-## 0. Latest grind — interactive sketch → profile → pad (2026-08-08)
+## 0. Priority lock (pow-wow 2026-08-09)
+
+### Invest (kernel + thin app wire)
+
+| Priority | Work | Why |
+|---------:|------|-----|
+| **1** | **Revolve UI** in `cad_app` | Kernel done; hubs / washers / grooves |
+| **2** | **Sketch-on-face** | Origin + PlaneFeature → stop topo-naming breakage |
+| **3** | Draft / loft / sweep **expose + harden** | Kernels exist; dogfood next |
+| **∞** | Real-part edge cases | Hub plate dogfood is the suite |
+
+### Defer (temporary UI — do not sink time)
+
+| Item | Reason |
+|------|--------|
+| Length / angle dim HUD | UI we may replace; constraints/API cover intent |
+| Pattern / mirror **panel tools** | `LinearPattern` / `CircularPattern` / `Mirror` already in kernel |
+| N-gon builder UI, spline tools | Construction polish |
+| Fillet R HUD, undo polish | QoL, not capability |
+
+**Rule:** wire **verbs** (revolve, plane-on-face, draft…); avoid disposable panel chrome.
+
+---
+
+## 0b. Latest grind — sketch → profile → pad/hole (through 2026-08-09)
+
+**Outcome:** Freehand dual-circle / dogbone → outer envelope pad. Then **notched plate + through holes**, multi-select, Arc3, fillet, CS-0 constraints. Look-ats: hub/plate sessions; `padprofile.png` / `padfail.png` drove hole-loop fix.
+
+### Architecture (do not regress)
 
 **Outcome:** Freehand dual-circle / dogbone sketches project a clean outer envelope, pad to a correct dense poly prism. Live circles stay **entities** (not permanent polylines). Look-at: `dogbone.png` (red profile), `solid.png` (3D pad).
 
@@ -32,32 +63,80 @@ LIVE sketch:  lines + true CIRCLE/ARC entities + anchors (display markers)
                     │
                     │  Profiles / Pad: CA_CopySketchGeom → clone
                     ▼
-CLONE: TessellateArcs/Circles (forced intersection verts) → Split → Prune → BuildAllClosedLoops
+CLONE: TessellateArcs/Circles (forced isect verts) → Split → Snap → Prune → BuildAllClosedLoops
                     │
                     ▼
-Profile pool on LIVE (overlay only) → AddProfileXY → ExtrudeProfile → MakePolyPrism (≤2048)
+Profile pool on LIVE → user multi-select (mask) → AddProfileXY outer [+ holes]
+                    │
+                    ▼
+ExtrudeProfile → MakePolyPrism / MakePolyPrismHoles (inner loops) — NOT AABB plate rebuild
 ```
 
-**Trim:** FreeCAD-style — split at joins, delete dangling piece; circles/arcs remain curves.
+**Trim:** FreeCAD-style — split at joins; circles/arcs remain curves.  
+**Pad selection:** largest selected = outer; other selected with centroid inside = through holes. **No auto nn/area rules.**  
+**Pad solid:** notched outer kept; holes are real cap inner loops (`MakePolyPrismHoles`). Keyhole bridge / AABB plate on through-cut **removed** (was dropping notches).
 
-**Pad UX (known):** Profiles auto-selects densest/outer and marks Pad ready. No confirm dialog yet — real-app polish later.
+### Caps
 
-### Demos / gates
+| Cap | Value |
+|-----|------:|
+| Lines | 4096 |
+| Circles / arcs | 64 / 512 |
+| Profile verts / poly prism | 2048 |
+| User points / constraints | 512 / 128 |
+
+### Done this arc (constraints + construction + pad)
+
+| Piece | Status |
+|-------|--------|
+| CS-0 datum + multipass constraints + panel | **done** |
+| Fillet + Arc3 (`FilletLines`, `Arc3Pend`/`Arc3Point`) | **done** |
+| Dual join-tol face walk (tess tight + freehand free) | **done** |
+| Exact circle×line hit tess | **done** |
+| Multi-select holes; `MakePolyPrismHoles` | **done** |
+| `MakePolyPrism` FixedPool pin (no n-clobber cube) | **done** |
+| Hub/plate dogfood (manual freehand, no dim HUD) | **partial** — workable |
 
 ```bash
-./ailang.x CAD/demo_trim_circle.ailang -o /tmp/d && /tmp/d   # live circles stay entities
-./ailang.x CAD/demo_peanut_pad.ailang  -o /tmp/d && /tmp/d   # 80/512-pt prism + dual-circle pad
-./ailang.x CAD/demo_cross_close.ailang -o /tmp/d && /tmp/d
-./ailang.x CAD/cad_app.ailang -o cad_app.x
-./CAD/scripts/run_cad_app.sh   # sketch → Profiles → Pad
+./ailang.x CAD/demo_trim_circle.ailang -o /tmp/d && /tmp/d
+./ailang.x CAD/demo_peanut_pad.ailang  -o /tmp/d && /tmp/d
+./ailang.x CAD/demo_sketch_arc3.ailang -o /tmp/d && /tmp/d
+./ailang.x CAD/demo_arc_profile.ailang -o /tmp/d && /tmp/d
+./ailang.x CAD/cad_app.ailang -o cad_app.x && ./CAD/scripts/run_cad_app.sh
 ```
 
-### Next up
+### Revolve UI (2026-08-09)
 
-1. **Revolve in app** (kernel `RevolveProfile` / `RevolveCut` already Phase B done — wire UI + look-at)  
-2. Explicit pad selection / warn when using default profile  
-3. Nested dense holes (auto-hole currently simple rings ≤12 verts)  
-4. Optional: raise prism cap further (memory is cheap; store capacity is the real bound)
+| Piece | Status |
+|-------|--------|
+| Panel **Rev** → cmd `revolve` | **done** |
+| `CA_RevolveFromSketch` | **done** — selected **profile verts** → axis → RZ lathe 360° |
+| Default axis | sketch **Y-axis (X=0)**; **radius = \|X\|** (left half-plane OK) |
+| Custom axis | nearly-vertical sketch line **not** a profile AABB edge (longest wins) |
+| Kernel | `MakeLatheClosed` — **true profile** (arcs/slants kept), not AABB tube |
+| Gate | `demo_revolve` · `demo_revolve_profile` · `demo_revolve_lefthalf` |
+
+```bash
+# App: draw profile anywhere; default axis = green Y-axis (X=0)
+#   radius = distance from axis; Profiles → Rev
+# Custom: draw a vertical line (not a profile side) for axis, then Rev
+# Tube: leave a gap between profile and axis (inner radius = gap)
+```
+
+### Next up (locked)
+
+1. ~~**Sketch-on-face**~~ **done** — B-Rep pick + **face signature rebind**  
+   - `PickFaceRay` / `CreateFromFace(solid)` / `ResolveFaceBySignature`  
+   - Plane stores centroid+normal + pid; `RebindFace` after pad (loud miss)  
+   - Gate: `demo_plane_on_top` · `demo_face_rebind`  
+2. **Bare construction planes** — **done** (offset / angle / flip / datums + SkPln)  
+   - Kernel: `CreateOffset`, `CreateAngleX/Y`, `Flip`, `CreateDatumXZ/YZ`  
+   - App: XY/XZ/YZ · Off50 · Flip · Ang90 · SkPln; cmds `plane_off N`, `plane_ang N`, `sketch_pln`  
+   - Gate: `demo_planes_facing` (offset+flip → loft)  
+3. Draft / loft / sweep **verbs** in app (kernel ready; planes ready)  
+4. RevolveCut in app (optional)  
+5. Repo `plane_tree` JSON persist (optional)  
+6. ~~Pattern / dim HUD~~ **deferred**
 
 ---
 
@@ -188,12 +267,12 @@ Pure-AILang CAD/CAM **kernel** (not FreeCAD glue):
 
 | Capability | Notes |
 |------------|--------|
-| **Revolve UI in cad_app** | Kernel `RevolveProfile`/`RevolveCut` done; app tool next |
-| Explicit pad confirm / no silent default profile | Profiles auto-selects densest today |
-| Dense nested hole auto-void | Simple rings only (nn≤12); tessellated holes need Select |
-| General pocket/cut from DXF tool solid | Restricted Difference only; plate-through-poly is explicit topology |
-| Sketch constraints / DOF solve | `CAD_Solve2D` theater |
-| Sketch_0 plane recipes + Feat tree | Product model |
+| **Revolve UI in cad_app** | **done** — profile lathe / panel Rev |
+| Sketch-on-face | **done** — face pick + signature rebind / `demo_face_rebind` |
+| Draft / loft / sweep in app | Kernel done; wire after plane-on-face |
+| Pattern / mirror / dim HUD | **Deferred** (temp panel) |
+| General unrestricted Bool | Restricted Difference domain remains |
+| Full Jacobian sketcher drag | Multipass constraints only |
 | DXF units / layers / blocks | Minimal path only |
 
 ```bash
@@ -318,9 +397,10 @@ Historic design note “equal-R → sphere sector” is **superseded** for the e
 | 9 | Plane–cyl fillet cyl top + bottom rim | ✓ |
 | 10 | Washer (round) hole top inner fillet | ✓ |
 | 11 | **Interactive sketch profile/pad** (dogbone) | ✓ |
-| 12 | **Revolve in cad_app UI** | **next** |
-| 11 | Rect plate kind-3 hole rim; analytic torus | open |
-| 12 | **Working draw app** (see `CAD_APP_PATH.md`) | next product |
+| 12 | **Revolve in cad_app UI** | **done** 2026-08-09 |
+| 13 | **Sketch-on-face** (PlaneFeature + origin) | **next** |
+| 14 | Draft / loft / sweep app expose | after plane-on-face |
+| — | Pattern/mirror/dim HUD | **deferred** |
 
 DXF chosen as profile bootstrap (not STEP — STEP is solid interchange). SVG remains available for 2D image work outside the solid kernel.
 
@@ -344,9 +424,10 @@ DXF chosen as profile bootstrap (not STEP — STEP is solid interchange). SVG re
 | J3.3 | DXF CIRCLE/ARC/LWPOLYLINE | **next** |
 | J3.4 | Revolve profile (kernel) | **done** Phase B |
 | J3.5 | Interactive multi-circle pad (dogbone) | **done** 2026-08-08 |
-| J3.6 | Revolve / explicit pad UX in cad_app | **next** |
-| J3.5 | Draft / pocket-from-DXF | **next** |
-| J3.6 | Sketch_0 constraints + plane recipes | open |
+| J3.6 | Revolve UI in cad_app | **done** |
+| J3.7 | Sketch-on-face + plane recipes | **next** |
+| J3.8 | Draft / loft / sweep app | after J3.7 |
+| J3.5b | Interactive notched pad + multi-hole | **done** 2026-08-09 |
 
 ---
 

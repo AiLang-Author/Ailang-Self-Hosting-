@@ -38,14 +38,26 @@ static void paths_init(const char *dir) {
     snprintf(path_tool, sizeof path_tool, "%s/tool.txt", dir);
 }
 
-/* tool.txt: mode tool nclick dirty — mode 1 = sketch */
+/* tool.txt: mode tool nclick dirty [cstr npick] — mode 1 = sketch
+ * Also true when nclick>0 so rubber-band hover is sent during Arc3/line placement. */
 static int sketch_mode(void) {
     FILE *f = fopen(path_tool, "r");
     if (!f) return 0;
-    int mode = 0, tool = 0, nclick = 0, dirty = 0;
-    if (fscanf(f, "%d %d %d %d", &mode, &tool, &nclick, &dirty) != 4) mode = 0;
+    int mode = 0, tool = 0, nclick = 0, dirty = 0, cstr = 0, np = 0;
+    int n = fscanf(f, "%d %d %d %d %d %d", &mode, &tool, &nclick, &dirty, &cstr, &np);
     fclose(f);
+    if (n < 4) return 0;
     return mode == 1;
+}
+
+/* nclick from tool.txt — host sends hover whenever placing (nclick>0) */
+static int tool_nclick(void) {
+    FILE *f = fopen(path_tool, "r");
+    if (!f) return 0;
+    int mode = 0, tool = 0, nclick = 0, dirty = 0;
+    if (fscanf(f, "%d %d %d %d", &mode, &tool, &nclick, &dirty) < 4) nclick = 0;
+    fclose(f);
+    return nclick;
 }
 
 /* Draw left-side part list overlay from parts.txt + sel.txt */
@@ -244,6 +256,8 @@ int main(int argc, char **argv) {
                 else if (ks == XK_e || ks == XK_E) write_cmd("tool_rect");
                 else if (ks == XK_c || ks == XK_C) write_cmd("tool_circ");
                 else if (ks == XK_a || ks == XK_A) write_cmd("tool_arc");
+                else if (ks == XK_period) write_cmd("tool_point"); /* place Point */
+                else if (ks == XK_z || ks == XK_Z) write_cmd("solve"); /* run constraints */
                 else if (ks == XK_y || ks == XK_Y) write_cmd("y"); /* next profile */
                 else if (ks == XK_n || ks == XK_N) write_cmd("newdoc");
                 else if (ks == XK_x || ks == XK_X) write_cmd("dxf");
@@ -327,14 +341,17 @@ int main(int argc, char **argv) {
                         }
                     }
                 } else if (!dragging) {
-                    /* free hover for rubber-band after click-release */
-                    if (sketch_mode() && (abs(fx - last_hover_fx) >= 2 || abs(fy - last_hover_fy) >= 2)) {
-                        if (fx >= 0 && fy >= 0 && (fw <= 0 || (fx < fw && fy < fh))) {
-                            pend_hover = 1;
-                            hover_fx = fx;
-                            hover_fy = fy;
-                            last_hover_fx = fx;
-                            last_hover_fy = fy;
+                    /* free hover for rubber-band (Arc3/line need this after each click) */
+                    if (sketch_mode()) {
+                        int need = (tool_nclick() > 0) ? 1 : 2;
+                        if (abs(fx - last_hover_fx) >= need || abs(fy - last_hover_fy) >= need) {
+                            if (fx >= 0 && fy >= 0 && (fw <= 0 || (fx < fw && fy < fh))) {
+                                pend_hover = 1;
+                                hover_fx = fx;
+                                hover_fy = fy;
+                                last_hover_fx = fx;
+                                last_hover_fy = fy;
+                            }
                         }
                     }
                 }

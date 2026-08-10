@@ -1,7 +1,53 @@
 # Plane-on-face + topo naming (product strategy)
 
-**Status:** design lock for next kernel tranche (after document UI).  
-**Depends on:** orthogonal `CAD_Repo` assets, working open/save, sketcher on a plane.
+**Status:** **v1 done** — face pick + signature rebind (2026-08-09).  
+**Depends on:** sketch→profile→pad/revolve (done); origin CS-0 (done).
+
+### Implementation (no AABB faces)
+
+| Piece | Role |
+|-------|------|
+| `PickFaceRay` | ray vs planar B-Rep faces + UV in-face |
+| `CreateFromFace(face, solid)` | plane recipe: live handle + **signature** + **pid** |
+| Signature | face centroid + normal; match **in-plane** (height slide OK) |
+| `RebindFace` / `EvalFrame` | re-resolve after rebuild; **-1** if lost (no invent) |
+| App **OnTop** | click face → sketch; pad → `RebindFace` on new solid |
+
+**AABB face model removed.** `SolidBounds` = vert extents for framing only.
+
+### Bare construction planes (loft / draft setup)
+
+| Cmd / panel | Action |
+|-------------|--------|
+| **XY** / `plane_xy` | World Sketch_0 plane |
+| **XZ** / **YZ** | Datum planes |
+| **Off50** / `plane_off N` | Offset active plane along normal by N mm |
+| **Flip** / `plane_flip` | Reverse normal (face a partner plane) |
+| **Ang90** / `plane_ang N` | New plane rotated N° about local X |
+| **SkPln** / `sketch_pln` | New sketch on active plane (no solid needed) |
+| **OnTop** | Still: pick solid face → sketch |
+
+Typical loft setup: **XY** → **SkPln** (profile A) → **Off50** → **Flip** → **SkPln** (profile B) → loft verb (next).
+
+### Seeing planes (3D overlay)
+
+Construction planes are **drawn in 3D mode** (`m` / Sketch/3D toggle):
+
+- **Dashed grid** (see-through) ±40 mm UV  
+- **Border**: cyan; **active plane** yellow  
+- **Axes**: U red, V green, normal cyan; yellow origin  
+- **Current sketch** projected onto its plane in cyan  
+
+After **Off / Ang / XY / XZ / YZ / Flip** the app switches to **3D** so the new plane is visible — **orbit** with LMB drag.  
+**SkPln** returns to 2D UV for drawing; press **m** again to inspect in 3D.
+
+### UI (dogfood)
+
+1. Pad base solid (Sketch_0). Stay in **3D**.  
+2. **OnTop** → status: `click FACE for sketch`.  
+3. Orbit if needed; **short LMB click** on a planar solid face.  
+4. App enters **sketch** on that face plane.  
+5. Draw → Profiles → Pad.
 
 ---
 

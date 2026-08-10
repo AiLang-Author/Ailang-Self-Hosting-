@@ -1,6 +1,7 @@
 # Phase A — Sketch Completeness (DXF + native primitives)
 
 **Parent:** `CAD_CORE_COMPETITIVE_PLAN.md`  
+**Full sketcher roadmap (working inventory + constraints + Sketch_0):** `CAD_SKETCHER_IMPL.md`  
 **Architecture:** Sketch owns 2D UV entities only; Feat turns profiles into B-Rep; IO is interchange; View is derived.  
 **Style:** Compiler-like layers — parse → IR (sketch) → lower (tess/loop) → codegen (Topo solid). Standardized `Add*` / `Get*` / `Build*` / `Validate*` / `Export*` verbs.
 
@@ -60,9 +61,9 @@ Import* (IO/DXF only) / Load* (IO: path→solid) / Extrude* (Feat only)
 
 ---
 
-## A.2 Sketch store layout (Phase A target)
+## A.2 Sketch store layout (Phase A + CS-0)
 
-Tag **10**, stride **16** (extend from 12):
+Tag **10**, stride **24**:
 
 | Slot | Name | Content |
 |-----:|------|---------|
@@ -81,11 +82,19 @@ Tag **10**, stride **16** (extend from 12):
 | 12 | n_profiles | number of closed loops (≥1 after BuildAll) |
 | 13 | profile_meta | [n_pts, start_idx] × n_profiles (start into pool as vert index) |
 | 14 | loop_pool | all profile xy packed |
-| 15 | cap_profiles | max profiles (32) |
+| 15 | cap_profiles | max profiles (64) |
 | 16 | n_pts | anchor count |
 | 17 | pts_addr | x,y anchors (ends/crossings only — not full tess) |
 | 18 | cap_pts | max anchors |
-| 19 | reserved | |
+| 19 | plane_id | 0 = world / Sketch_0 |
+| 20 | n_constraints | constraint count |
+| 21 | constraints_addr | 8 words × constraint |
+| 22 | cap_constraints | max (128) |
+| 23 | datum_flags | bit0 = EnsureDatum done |
+| 24 | n_upts | first-class user Point count |
+| 25 | upts_addr | x,y user Points (not wiped by RebuildAnchors) |
+| 26 | cap_upts | max (512) |
+| 27 | reserved | |
 
 **Caps (2026-08-08):** primary loop ≤**4096** verts; profile pool enlarged; `MakePolyPrism` ≤**2048**.
 

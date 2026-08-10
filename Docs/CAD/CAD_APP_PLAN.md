@@ -3,7 +3,7 @@
 **Status:** plan + **M-B..D + interactive dogbone pad green** (2026-08-08)  
 **Goal:** See and edit DXF + solids in a **hosted window** for fast test loops.  
 **Headless BMP** = bootstrap / CI / agents only, not the daily path.  
-**Pairs with:** `CAD_APP_PATH.md`, `CAD_CLI.md`, `CAD_PROGRESS.md` §0, `CAD_OCC_CAPABILITY_AUDIT.md`.
+**Pairs with:** `CAD_APP_PATH.md`, `CAD_CLI.md`, `CAD_PROGRESS.md` §0, `CAD_OCC_CAPABILITY_AUDIT.md`, **`CAD_SKETCHER_IMPL.md`** (full sketcher system).
 
 ### Shipped
 

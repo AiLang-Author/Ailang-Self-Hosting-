@@ -55,23 +55,36 @@ A “FreeCAD bulge fixture” just means a DXF **exported from FreeCAD** with no
 - Rect → `CreateRectPocket`; pure circle → `CreateHole`; through poly → plate shell  
 - Demos: `demo_extrude_cut`, `_circle`, `_poly`  
 
-### B3 — Revolve pad  **[kernel done; app UI next]**
+### B1b — Notched pad + multi-hole  **[done interactive 2026-08-09]**
+- Selection-only holes (no auto nn≤12 / area veto)  
+- `MakePolyPrismHoles` — outer walls + **inner hole loops** (not keyhole / not AABB plate)  
+- `MakePolyPrism` FixedPool pin (arg clobber → cube regression fixed)  
+
+### B3 — Revolve pad  **[done interactive 2026-08-09]**
 - Sketch **X = radius**, **Y = height** → solid Z; full 360° about +Z  
-- Rect on-axis → cylinder; xmin>0 → `MakeAnnulusPrism` tube  
-- **Next grind:** wire revolve into `cad_app` (tool + look-at), same buffer path as pad  
+- Rect on-axis → cylinder; xmin>0 → tube via Difference  
+- **App:** panel **Rev** / cmd `revolve` → `CA_RevolveFromSketch`  
+  - axis = Y-axis (X=0) or nearly-vertical sketch line (not profile edge)  
+  - radius = \|X − axis\| (left half-plane OK)  
+  - Uses largest selected profile (same mask as Pad)  
+  - Freehand → **AABB rect** for kernel v1 (logs when approximated)  
+- Demo: `demo_revolve`  
+
 
 ### B4 — Revolve cut  **[kernel done]**
 - `CAD_Feat.RevolveCut(body, sketch, angle)`  
 - On-axis revolve tool + box body → hole recipe / Difference  
-- Demo: `demo_revolve_cut` 
+- Demo: `demo_revolve_cut`  
+- **App wire:** after revolve pad (optional second step)  
 
 ### B5 — Analytic prefer  **[partial]**
 - Pure-circle extrude → `MakeCylinderSolid`  
 - Mixed profiles still poly prism after tess  
 
-### B6 — Draft + midplane  **[done]**
+### B6 — Draft + midplane  **[kernel done; app not wired]**
 - `ExtrudeDraft(sketch, h, draft_rad, outward)` — rect only → `MakeRectFrustum`  
-- `ExtrudeSymmetric(sketch, h)` — pad centered on z=0
+- `ExtrudeSymmetric(sketch, h)` — pad centered on z=0  
+- **After revolve UI + sketch-on-face**
 
 ---
 
@@ -111,7 +124,11 @@ A “FreeCAD bulge fixture” just means a DXF **exported from FreeCAD** with no
 | Midplane | `ExtrudeSymmetric` |
 | Fillet / Chamfer | Blend (plane–plane / box corner) |
 | Hole | `CreateHole` |
-| Loft / Sweep | not yet |
+| Loft / Sweep | `LoftProfiles` / `SweepProfile` (kernel; app later) |
 | Shell (box open) | `Shell` thickness |
-| Linear / circular pattern | `LinearPattern` / `CircularPattern` (box compound) |
-| Mirror | `Mirror` (box compound) |
+| Linear / circular pattern | kernel done; **app UI deferred** |
+| Mirror | kernel done; **app UI deferred** |
+
+### After B3 app: sketch-on-face
+
+See `CAD_PLANE_ON_FACE.md` — PlaneFeature wedded to face + **world-origin recipe** so regen does not rebind by fragile face index.
