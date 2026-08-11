@@ -14,6 +14,7 @@
 | 07 | SUPPORT_SYSTEMS.md | Debug, Link, FPU, Optimizer, Syscall dispatch |
 | 08 | DATA_FLOW.md | End-to-end data flow through the compiler |
 | 09 | FUNCTION_CATALOG.md | Every function documented with signature, purpose, flow |
+| **10** | **HDL_BACKEND.md** | **Netlist backend (ModulesHDL): IR, LUT tables, CLI `-hdl`, Yosys** |
 
 ---
 
@@ -68,6 +69,20 @@
                           ▼
                      executable.x (ELF64)
 ```
+
+### 1.1 HDL / netlist path (fork after frontend)
+
+```
+  Same frontend AST
+        │
+        ▼  -hdl (ailang_cli)
+  Compile/ModulesHDL/*     — circuit generators (no Emit_Byte / ELF)
+        │
+        ▼
+  netlist IR → structural Verilog + JSON
+```
+
+See **[10_HDL_BACKEND.md](10_HDL_BACKEND.md)**. Does not modify x86 `Compile/Modules`.
 
 ---
 
