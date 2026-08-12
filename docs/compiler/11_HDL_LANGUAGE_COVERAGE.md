@@ -113,12 +113,21 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 
 ---
 
-## Still outside core (by design for now)
+## Tech blocks = InlineAsm (escape, not core)
 
-1. **Technology block `LibraryImport`** — vendor cells as libraries (not today)  
-2. Interleaved print events (ROM mid-stream with itoa)  
-3. ForEvery depth > 32 (use index While)  
-4. Runtime-variable Power / Rotate distance  
-5. DSP black-box policy  
+See **[12_HDL_TECHBLOCK.md](12_HDL_TECHBLOCK.md)**.
 
-**Core is “done enough” when** the matrix **Y** rows cover the table above and Yosys harness stays green on non-print suites.
+```ailang
+y = TechBlock["HARD_AND2", a, b]   // blackbox; you own the cell lib
+```
+
+Robust AILang core first; hard cells only when forced. Not a second language.
+
+## Still outside core (by design)
+
+1. Named-port TechBlock / Liberty auto-import packs (thin layer on top of TechBlock)  
+2. Interleaved print events  
+3. ForEvery depth > 32  
+4. Runtime-variable Power / Rotate  
+
+**Core is solid when** harness stays green and kill-verilog soft-IP stays pure AILang.
