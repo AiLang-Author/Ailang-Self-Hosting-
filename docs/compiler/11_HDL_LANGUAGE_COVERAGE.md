@@ -70,7 +70,7 @@ The long tail of AST ops (file/hash/socket) stays software-only; that is a featu
 | `WhileLoop` | **Y** | 1 body iter / clock |
 | `UntilCondition` | **Y** | While Not(C) |
 | `ExitLoop` / `ContinueLoop` | **P** | Noted; prefer bounded loops |
-| `ForEvery` | **N** | Next: bounded FixedPool only |
+| `ForEvery` | **Y** | Unroll FixedPool array only (depth ≤ 32) |
 | `PrintMessage` / `PrintNumber` | **Y** | ROM + multi-job itoa |
 | Try/Catch/Throw | **N** | No exception fabric v1 |
 
@@ -87,6 +87,7 @@ The long tail of AST ops (file/hash/socket) stays software-only; that is a featu
 | And/Or/Not (logic) | **Y** | `$logic_*` |
 | Increment / Decrement | **Y** | ±1 |
 | AbsoluteValue / Min / Max / Clamp | **Y** | mux structure |
+| Select(cond, t, f) | **Y** | mux ternary |
 | User Function call | **Y** | instance |
 | Strings (runtime) | **N** | Only print literals → ROM |
 | File/socket/hash/… | **—** | Host software |
@@ -105,10 +106,11 @@ The long tail of AST ops (file/hash/socket) stays software-only; that is a featu
 
 ## Growth order (product)
 
-1. Finish **B**: ForEvery over FixedPool, cleaner multi-driver under deep If  
+1. ~~ForEvery over FixedPool (unroll ≤32)~~  
 2. Interleaved print event queue (ROM + itoa mixed)  
-3. Vendor DSP/`$mul` policy; true BRAM ports if Liberty/techmap needs them  
-4. Keep rejecting growth/OS — that is the language selling point  
+3. **Technology library import** (vendor cells as LibraryImport) — not day-one  
+4. Vendor DSP/`$mul` policy; Liberty/techmap hooks  
+5. Keep rejecting growth/OS — that is the language selling point  
 
 **Keywords we can “ultimately” support well:** roughly the **structured control + pool + arith** surface (~**60–100** named constructs and builtins that matter for chips).  
 **Not** every AST leaf that exists for self-hosting the OS and browser.
