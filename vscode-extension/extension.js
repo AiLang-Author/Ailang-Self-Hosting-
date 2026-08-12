@@ -1167,6 +1167,151 @@ function activate(context) {
         });
     }));
 
+    // ─── HDL / FPGA QOL ──────────────────────────────────────────────
+    // Resolve repo root: walk up from workspace or extension until boards/catalog.json
+    function findRepoRoot() {
+        const folders = vscode.workspace.workspaceFolders || [];
+        for (const f of folders) {
+            let dir = f.uri.fsPath;
+            for (let i = 0; i < 8; i++) {
+                if (fs.existsSync(path.join(dir, 'boards', 'catalog.json'))) return dir;
+                if (fs.existsSync(path.join(dir, 'ailang_hdl.x'))) return dir;
+                const parent = path.dirname(dir);
+                if (parent === dir) break;
+                dir = parent;
+            }
+        }
+        // extension may live inside repo (vscode-extension/)
+        let dir = __dirname;
+        for (let i = 0; i < 6; i++) {
+            if (fs.existsSync(path.join(dir, 'boards', 'catalog.json'))) return dir;
+            const parent = path.dirname(dir);
+            if (parent === dir) break;
+            dir = parent;
+        }
+        return folders[0] ? folders[0].uri.fsPath : __dirname;
+    }
+
+    function hdlBin(repo) {
+        const cfg = vscode.workspace.getConfiguration('ailang.hdl');
+        const custom = cfg.get('compilerPath', '');
+        if (custom && fs.existsSync(custom)) return custom;
+        const candidates = [
+            path.join(repo, 'ailang_hdl.x'),
+            path.join(__dirname, 'ailang_hdl.x'),
+            path.join(__dirname, '..', 'ailang_hdl.x')
+        ];
+        for (const c of candidates) {
+            if (fs.existsSync(c)) return c;
+        }
+        return path.join(repo, 'ailang_hdl.x');
+    }
+
+    function readBoardCatalog(repo) {
+        const catPath = path.join(repo, 'boards', 'catalog.json');
+        if (!fs.existsSync(catPath)) return [];
+        try {
+            const cat = JSON.parse(fs.readFileSync(catPath, 'utf8'));
+            return (cat.boards || []).map(b => ({
+                label: b.name || b.path,
+                description: b.display_name || b.part || '',
+                detail: b.path ? ('boards/' + b.path.replace(/^\//, '')) : '',
+                boardPath: path.join(repo, 'boards', b.path || (b.name + '/board.json'))
+            }));
+        } catch (e) {
+            return [];
+        }
+    }
+
+    // AILang: Select HDL Board — QuickPick from boards/catalog.json
+    context.subscriptions.push(vscode.commands.registerCommand('ailang.selectBoard', async () => {
+        const repo = findRepoRoot();
+        const items = readBoardCatalog(repo);
+        if (!items.length) {
+            vscode.window.showWarningMessage(
+                'No boards/catalog.json found. Open the AILang repo root as workspace.'
+            );
+            return;
+        }
+        const sel = await vscode.window.showQuickPick(items, {
+            placeHolder: 'Select AILang HDL board profile (ailang.board/v1)'
+        });
+        if (!sel) return;
+        const cfg = vscode.workspace.getConfiguration('ailang.hdl');
+        await cfg.update('board', sel.boardPath, vscode.ConfigurationTarget.Workspace);
+        // default bind if present
+        const bindGuess = path.join(path.dirname(sel.boardPath), 'bind_blink.json');
+        if (fs.existsSync(bindGuess)) {
+            await cfg.update('bind', bindGuess, vscode.ConfigurationTarget.Workspace);
+        }
+        vscode.window.showInformationMessage('AILang HDL board: ' + sel.label);
+    }));
+
+    // AILang: Compile HDL — netlist + board profile
+    context.subscriptions.push(vscode.commands.registerCommand('ailang.compileHdl', () => {
+        const e = vscode.window.activeTextEditor;
+        if (!e || e.document.languageId !== 'ailang') {
+            vscode.window.showErrorMessage('Open an AILang file to compile for HDL.');
+            return;
+        }
+        e.document.save().then(() => {
+            const repo = findRepoRoot();
+            const comp = toWslPath(hdlBin(repo));
+            const src = toWslPath(e.document.fileName);
+            const srcDir = toWslPath(path.dirname(e.document.fileName));
+            const out = src.replace(/\.[^/.]+$/, '') + '_hdl';
+            const cfg = vscode.workspace.getConfiguration('ailang.hdl');
+            let board = cfg.get('board', '');
+            let bind = cfg.get('bind', '');
+            if (!board) {
+                const def = path.join(repo, 'boards', 'tang_nano_9k', 'board.json');
+                if (fs.existsSync(def)) board = def;
+            }
+            if (!bind) {
+                const defb = path.join(repo, 'boards', 'tang_nano_9k', 'bind_blink.json');
+                if (fs.existsSync(defb)) bind = defb;
+            }
+            let flags = '-hdl';
+            if (board) flags += ' -board "' + toWslPath(board) + '"';
+            if (bind) flags += ' -bind "' + toWslPath(bind) + '"';
+            const shellPath = isWindows ? 'wsl.exe' : '/bin/bash';
+            const t = vscode.window.createTerminal({ name: 'AILang HDL', shellPath });
+            t.show();
+            t.sendText(
+                `cd "${srcDir}" && chmod +x "${comp}" && "${comp}" ${flags} "${src}" "${out}"`
+            );
+        });
+    }));
+
+    // AILang: Build Tang Nano 9K bitstream
+    context.subscriptions.push(vscode.commands.registerCommand('ailang.buildTang9k', () => {
+        const repo = findRepoRoot();
+        const script = path.join(repo, 'dev', 'hdl_build_tang9k.sh');
+        if (!fs.existsSync(script)) {
+            vscode.window.showErrorMessage('dev/hdl_build_tang9k.sh not found — open AILang repo.');
+            return;
+        }
+        const e = vscode.window.activeTextEditor;
+        let srcArg = '';
+        if (e && e.document.languageId === 'ailang') {
+            srcArg = ' "' + toWslPath(e.document.fileName) + '"';
+        }
+        const shellPath = isWindows ? 'wsl.exe' : '/bin/bash';
+        const t = vscode.window.createTerminal({ name: 'Tang Nano 9K', shellPath });
+        t.show();
+        t.sendText(`cd "${toWslPath(repo)}" && bash dev/hdl_build_tang9k.sh${srcArg}`);
+    }));
+
+    // AILang: List boards
+    context.subscriptions.push(vscode.commands.registerCommand('ailang.listBoards', () => {
+        const repo = findRepoRoot();
+        const comp = toWslPath(hdlBin(repo));
+        const shellPath = isWindows ? 'wsl.exe' : '/bin/bash';
+        const t = vscode.window.createTerminal({ name: 'AILang Boards', shellPath });
+        t.show();
+        t.sendText(`cd "${toWslPath(repo)}" && chmod +x "${comp}" && "${comp}" -hdl --list-boards`);
+    }));
+
     // Re-apply on editor switch / document change / config change.
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(applyShorthandDecorations)

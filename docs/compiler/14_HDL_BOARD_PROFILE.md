@@ -89,11 +89,16 @@ Parse → Netlist IR
 }
 ```
 
-Extension runs:
+Extension commands (vscode-extension):
 
-```text
-ailang_hdl.x -hdl -board <board> -bind <bind> ${file} ${out}
-```
+| Command | Action |
+|---|---|
+| `AILang: Select HDL Board` | QuickPick `boards/catalog.json` → workspace `ailang.hdl.board` |
+| `AILang: Compile HDL` | `-hdl -board … -bind …` on active file |
+| `AILang: Build Tang Nano 9K` | runs `dev/hdl_build_tang9k.sh` |
+| `AILang: List Boards` | `--list-boards` |
+
+Settings: `ailang.hdl.board`, `ailang.hdl.bind`, `ailang.hdl.compilerPath`
 
 LSP can re-run a **light** `BoardProf_Verify` over AST pool names without full netlist (name match only), then full verify on build.
 
@@ -154,10 +159,11 @@ No Verilog required to add a board.
 | Done | Next |
 |---|---|
 | JSON schema + catalog + Tang Nano pack | PCF/XDC from same profile |
-| Load / list / verify / CST emit | Auto-period from `clocks.hz` into SDC |
-| CLI `-board` `-bind` `--list-boards` | VS Code QuickPick + LSP diagnostics |
-| | Invert-aware top_wrap generator |
-| | Strict policy: unbound_out=error fails compile |
+| Load / list / verify / CST emit | Invert-aware top_wrap generator |
+| CLI `-board` `-bind` `--list-boards` | LSP unbound-port diagnostics |
+| Auto-period from `clocks.hz` → SDC | Strict policy: unbound_out=error |
+| `.assigned.pins` report | Multi-resource CST (btn, uart) |
+| VS Code: Select Board / Compile HDL / Tang9k | Workspace task templates |
 
 ---
 

@@ -6,8 +6,7 @@
 #   ./dev/hdl_build_tang9k.sh path/to.ailang   # custom source
 #   FLASH=1 ./dev/hdl_build_tang9k.sh          # also openFPGALoader
 #
-# Needs: ailang_hdl.x, yosys, nextpnr-himbaechel, gowin_pack
-#        (and openFPGALoader if FLASH=1)
+# Board profile (ailang.board/v1) drives pins + period; generated .cst preferred.
 #
 set -euo pipefail
 
@@ -22,9 +21,12 @@ OUT_DIR="${HDL_TANG_OUT:-$BOARD_DIR/out}"
 BASE="$OUT_DIR/blink"
 HDL_BIN="${HDL_BIN:-$ROOT/ailang_hdl.x}"
 
-# Gowin part (Tang Nano 9K)
-DEVICE="GW1NR-LV9QN88PC6/I5"
-FAMILY="GW1N-9C"   # himbaechel/gowin_pack family id that works with this suite
+BOARD_JSON="${AILANG_BOARD:-${BOARD_JSON:-$ROOT/boards/tang_nano_9k/board.json}}"
+BIND_JSON="${AILANG_BIND:-${BIND_JSON:-$ROOT/boards/tang_nano_9k/bind_blink.json}}"
+
+# Prefer device fields from board JSON when python/jq available; fallbacks:
+DEVICE="${GOWIN_DEVICE:-GW1NR-LV9QN88PC6/I5}"
+FAMILY="${GOWIN_FAMILY:-GW1N-9C}"
 
 need() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -45,11 +47,15 @@ mkdir -p "$OUT_DIR"
 
 echo "== AILang HDL compile =="
 echo "  src=$SRC"
-# -period 37 ≈ 27 MHz (1000/27)
-# -board / -bind: ailang.board/v1 profile (verify pins + emit .cst)
-BOARD_JSON="${BOARD_JSON:-$ROOT/boards/tang_nano_9k/board.json}"
-BIND_JSON="${BIND_JSON:-$ROOT/boards/tang_nano_9k/bind_blink.json}"
-"$HDL_BIN" -hdl -period 37 \
+echo "  board=$BOARD_JSON"
+echo "  bind=$BIND_JSON"
+# Board profile supplies period from clocks.hz; omit -period unless PERIOD_NS set
+PERIOD_ARGS=()
+if [[ -n "${PERIOD_NS:-}" ]]; then
+  PERIOD_ARGS=(-period "$PERIOD_NS")
+fi
+"$HDL_BIN" -hdl \
+  "${PERIOD_ARGS[@]}" \
   -board "$BOARD_JSON" \
   -bind "$BIND_JSON" \
   "$SRC" "$BASE"
@@ -58,6 +64,13 @@ if [[ ! -f "$BASE.v" ]]; then
   echo "FAIL: no $BASE.v"
   exit 1
 fi
+
+# Prefer compiler-emitted CST from board profile; fallback to hand CST
+CST="$BASE.cst"
+if [[ ! -f "$CST" ]]; then
+  CST="$BOARD_DIR/tangnano9k.cst"
+fi
+echo "  cst=$CST"
 
 # Board top = wrapper + ailang_top
 cat "$BOARD_DIR/top_wrap.v" "$BASE.v" >"$OUT_DIR/top.v"
@@ -69,7 +82,7 @@ echo "== nextpnr-himbaechel (place & route) =="
 nextpnr-himbaechel \
   --device "$DEVICE" \
   -o "family=$FAMILY" \
-  -o "cst=$BOARD_DIR/tangnano9k.cst" \
+  -o "cst=$CST" \
   --json "$OUT_DIR/top.json" \
   --write "$OUT_DIR/top_pnr.json"
 
@@ -77,6 +90,10 @@ echo "== gowin_pack (bitstream) =="
 gowin_pack -d "$FAMILY" -o "$OUT_DIR/blink.fs" "$OUT_DIR/top_pnr.json"
 
 ls -la "$OUT_DIR/blink.fs"
+if [[ -f "$BASE.assigned.pins" ]]; then
+  echo "---- assigned pins ----"
+  cat "$BASE.assigned.pins"
+fi
 echo
 echo "Bitstream ready: $OUT_DIR/blink.fs"
 echo "Flash with:  openFPGALoader -b tangnano9k $OUT_DIR/blink.fs"
