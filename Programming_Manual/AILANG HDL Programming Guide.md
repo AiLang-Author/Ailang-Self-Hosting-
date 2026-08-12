@@ -15,8 +15,10 @@ Regular **AILang**. No Verilog dialect, no `always`, no wires in source.
 ```bash
 ./ailang.x ailang_cli.ailang ailang_hdl.x          # rebuild CLI once
 ./ailang_hdl.x -hdl mychip.ailang out/mychip
-# → out/mychip.v  +  out/mychip.nl.json
-yosys -p 'read_verilog out/mychip.v; hierarchy -top ailang_top; proc; stat; check'
+# → out/mychip.v  .nl.json  .sdc  .ys
+yosys -s out/mychip.ys
+# or:
+yosys -p 'read_verilog out/mychip.v; hierarchy -top ailang_top; proc; memory; opt; stat; check'
 ```
 
 `-hdl` and `-kmod` are mutually exclusive.
@@ -149,6 +151,18 @@ FixedPool.Stream {
 | `out_data`, `out_valid` | output (chip → host) |
 | `out_ready` | **input** (sink accepts) |
 
+**Fire condition** (one beat per clock when both sides ready):
+
+```ailang
+Stream.in_ready = 1
+IfCondition EqualTo(And(Stream.in_valid, Stream.in_ready), 1) ThenBlock: {
+    Stream.out_data = Stream.in_data
+    Stream.out_valid = 1
+} ElseBlock: {
+    Stream.out_valid = 0
+}
+```
+
 ### Variable array index
 
 ```ailang
@@ -216,5 +230,6 @@ Update this table whenever ModulesHDL gains a feature.
 | 2026-08-11 | WhileLoop → multi-cycle (one body iter per clock). |
 | 2026-08-11 | MaximumLength/ElementType parse; array ROM fabric; const index `pool[i]`. |
 | 2026-08-11 | Variable index; stream in_/out_ ports; If const-arms → 2-entry LUT. |
+| 2026-08-11 | Sidecars `.sdc` + `.ys`; skip empty modules; stream fire = valid∧ready. |
 
 *When you change the subset, append a row here and fix §3–§4.*
