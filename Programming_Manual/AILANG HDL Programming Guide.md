@@ -4,7 +4,7 @@
 **Backend design:** `docs/compiler/10_HDL_BACKEND.md`  
 **Living doc** — update when the subset or errata change.
 
-**Status:** 2026-08-11 · ModulesHDL v1 (+ While 1-iter/clock, user call instance)
+**Status:** 2026-08-11 · ModulesHDL v1 (+ arrays/ROM, While, user calls)
 
 ---
 

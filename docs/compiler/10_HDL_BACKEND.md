@@ -192,7 +192,8 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 - **Branch → LUT** (const table pattern)
 - **User Function calls** → hierarchical instance (define before use; arity match)
 - **WhileLoop** → one body iteration per clock while condition holds
-- Const index `pool[N]` when FixedPool depth > 1 (array fabric)
+- **MaximumLength / ElementType** on FixedPool members (array ROM fabric)
+- Const index `pool[N]` into arrays
 - Ignore: `PrintMessage` / `PrintNumber` (no console on chip)
 
 ### Not yet / rejected
@@ -201,9 +202,9 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 - Recursive / mutual calls; multi-output Functions
 - Unbounded while-true busy loops (legal syntax, bad design)
 - String pool inits
+- Non-const array indices
 - Full behavioral scheduling / multi-cycle FSM inference beyond 1-iter while
 - Vendor primitive black boxes (BRAM/DSP) — planned escape hatch
-- MaximumLength-driven depth (parser gap on FixedPool members)
 
 ---
 
@@ -215,9 +216,9 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 | **Done** | Empty `task_Main` noise removed; pool scalars as top `output reg` |
 | **Done** | User Function call → module instance |
 | **Done** | WhileLoop multi-cycle (1 iter/clock) |
-| **Next** | Array FixedPool as ROM (`$memrd`); MaximumLength parse; 2D matrix dogfood |
-| **Then** | ready/valid IO streams; richer FSM |
-| **Later** | Techmap to cell lib; SDC sidecar; BLIF/eBLIF; ASIC liberty path |
+| **Done** | MaximumLength/ElementType → array/ROM; const index |
+| **Next** | 2D matrix dogfood; ready/valid IO; non-const index (registered) |
+| **Then** | richer FSM; techmap / SDC / BLIF |
 
 Always: **table-shaped control first**, free-form control only when necessary.
 
