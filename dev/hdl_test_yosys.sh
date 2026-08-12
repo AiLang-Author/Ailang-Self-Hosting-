@@ -74,6 +74,7 @@ declare -a SMOKES=(
   "dev/hdl_stress_extreme.ailang:stress_extreme"
   "dev/hdl_stress_sat.ailang:stress_sat"
   "dev/hdl_stress_fsm.ailang:stress_fsm"
+  "dev/hdl_kill_verilog.ailang:kill_verilog"
 )
 
 pass=0
