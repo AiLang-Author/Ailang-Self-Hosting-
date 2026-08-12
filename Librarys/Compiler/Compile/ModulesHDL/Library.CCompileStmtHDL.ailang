@@ -367,20 +367,31 @@ Function.CompileStmtHDL_Assign {
             }
         }
 
-        // Straight-line pool updates: shadow chain so BitSet;BitSet accumulates
-        // (flush at control-flow boundaries via NL_ChainShadowFlush)
+        // Straight-line updates: shadow chain so x=f(x); x=g(x) accumulates
+        // Applies to pool SEQ and comb locals (Function temps like PopCount8)
+        use_chain = 0
         IfCondition EqualTo(is_pool, 1) ThenBlock: {
             IfCondition EqualTo(kind, NLKind.ASSIGN_SEQ) ThenBlock: {
-                out = NL_FreshWire()
-                NL_AddAssign(mod, out, rhs, NLKind.ASSIGN_COMB, 64)
-                NL_ChainShadowSet(lhs, out)
-                PrintMessage("  chain-shadow ")
-                PrintMessage(lhs)
-                PrintMessage(" = ")
-                PrintMessage(out)
-                PrintMessage("\n")
-                ReturnValue(1)
+                use_chain = 1
             }
+        }
+        IfCondition EqualTo(kind, NLKind.ASSIGN_COMB) ThenBlock: {
+            IfCondition EqualTo(is_pool, 0) ThenBlock: {
+                IfCondition NotEqual(StringCompare(lhs, "result"), 0) ThenBlock: {
+                    use_chain = 1
+                }
+            }
+        }
+        IfCondition EqualTo(use_chain, 1) ThenBlock: {
+            out = NL_FreshWire()
+            NL_AddAssign(mod, out, rhs, NLKind.ASSIGN_COMB, 64)
+            NL_ChainShadowSet(lhs, out)
+            PrintMessage("  chain-shadow ")
+            PrintMessage(lhs)
+            PrintMessage(" = ")
+            PrintMessage(out)
+            PrintMessage("\n")
+            ReturnValue(1)
         }
 
         NL_AddAssign(mod, lhs, rhs, kind, 64)
@@ -781,14 +792,98 @@ Function.CompileStmtHDL_While {
     }
 }
 
+// Branch multi-stmt / multi-target: cascade if (sel==K) begin body end
+Function.CompileStmtHDL_BranchSeq {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        mod = NL_GetCurrentModule()
+        NL_ChainShadowFlush(mod)
+        sel_node = AST_GetChild(node, 0)
+        sel_net = CompileExprHDL(sel_node)
+        IfCondition EqualTo(sel_net, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        prev_seq = NL.seq_mode
+        NL.seq_mode = 1
+
+        def_body = 0
+        cc = AST_GetChildCount(node)
+        ci = 1
+        first = 1
+        WhileLoop LessThan(ci, cc) {
+            ch = AST_GetChild(node, ci)
+            ctype = AST_GetType(ch)
+            IfCondition EqualTo(ctype, AST.CASE) ThenBlock: {
+                IfCondition LessThan(AST_GetChildCount(ch), 2) ThenBlock: {
+                    NL.seq_mode = prev_seq
+                    NL_Error("Case missing body", AST_GetLine(ch))
+                    ReturnValue(0)
+                }
+                kn = AST_GetChild(ch, 0)
+                body = AST_GetChild(ch, 1)
+                IfCondition NotEqual(AST_GetType(kn), AST.NUMBER) ThenBlock: {
+                    NL.seq_mode = prev_seq
+                    NL_Error("Branch seq needs constant Case keys", AST_GetLine(ch))
+                    ReturnValue(0)
+                }
+                k = StringToNumber(AST_GetData1(kn))
+                knet = NL_Prim_Const(mod, k, 64)
+                eq = NL_Prim_Eq(mod, sel_net, knet, 64)
+                // if (sel==k) begin body end  — independent cascade
+                NL_AddAssign(mod, "__if_begin", eq, 2, 1)
+                ok = CompileStmtHDL(body)
+                IfCondition EqualTo(ok, 0) ThenBlock: {
+                    NL.seq_mode = prev_seq
+                    ReturnValue(0)
+                }
+                NL_ChainShadowFlush(mod)
+                NL_AddAssign(mod, "__if_end", eq, 4, 1)
+                first = 0
+            }
+            IfCondition EqualTo(ctype, AST.DEFAULT) ThenBlock: {
+                def_body = AST_GetChild(ch, 0)
+            }
+            ci = Add(ci, 1)
+        }
+        // Default when no case key matched
+        IfCondition NotEqual(def_body, 0) ThenBlock: {
+            matched = NL_Prim_Const(mod, 0, 1)
+            ci = 1
+            WhileLoop LessThan(ci, cc) {
+                ch = AST_GetChild(node, ci)
+                IfCondition EqualTo(AST_GetType(ch), AST.CASE) ThenBlock: {
+                    IfCondition GreaterThan(AST_GetChildCount(ch), 0) ThenBlock: {
+                        kn = AST_GetChild(ch, 0)
+                        IfCondition EqualTo(AST_GetType(kn), AST.NUMBER) ThenBlock: {
+                            k = StringToNumber(AST_GetData1(kn))
+                            knet = NL_Prim_Const(mod, k, 64)
+                            eq = NL_Prim_Eq(mod, sel_net, knet, 64)
+                            matched = NL_Prim_LogicOr(mod, matched, eq, 1)
+                        }
+                    }
+                }
+                ci = Add(ci, 1)
+            }
+            nmatch = NL_Prim_LogicNot(mod, matched, 1)
+            NL_AddAssign(mod, "__if_begin", nmatch, 2, 1)
+            ok = CompileStmtHDL(def_body)
+            IfCondition EqualTo(ok, 0) ThenBlock: {
+                NL.seq_mode = prev_seq
+                ReturnValue(0)
+            }
+            NL_ChainShadowFlush(mod)
+            NL_AddAssign(mod, "__if_end", nmatch, 4, 1)
+        }
+
+        NL.seq_mode = prev_seq
+        PrintMessage("  Branch → seq if-cascade (multi-stmt cases)\n")
+        ReturnValue(1)
+    }
+}
+
 // =============================================================================
-// BRANCH → LUT matrix
-// Prefer: selector indexes a solution table (X conditions → Y result).
-// Pattern required for table form (v1):
-//   each Case N: { target = constant }
-//   optional Default: { target = constant }
-//   all cases write the SAME target
-// Otherwise fall back to error (no 400-deep if chain).
+// BRANCH → LUT if pure const table; else sequential if-chain (multi-stmt cases)
 // =============================================================================
 Function.CompileStmtHDL_BranchLut {
     Input: node: Address
@@ -806,6 +901,50 @@ Function.CompileStmtHDL_BranchLut {
         IfCondition LessThan(AST_GetChildCount(node), 2) ThenBlock: {
             NL_Error("Branch empty", AST_GetLine(node))
             ReturnValue(0)
+        }
+
+        // Probe: can all cases be const-table form?
+        can_lut = 1
+        probe_tgt = 0
+        cc0 = AST_GetChildCount(node)
+        ci0 = 1
+        WhileLoop LessThan(ci0, cc0) {
+            ch0 = AST_GetChild(node, ci0)
+            ctype0 = AST_GetType(ch0)
+            IfCondition EqualTo(ctype0, AST.CASE) ThenBlock: {
+                IfCondition LessThan(AST_GetChildCount(ch0), 2) ThenBlock: {
+                    can_lut = 0
+                    ExitLoop
+                }
+                IfCondition NotEqual(AST_GetType(AST_GetChild(ch0, 0)), AST.NUMBER) ThenBlock: {
+                    can_lut = 0
+                    ExitLoop
+                }
+                okx0 = CompileStmtHDL_ExtractConstAssign(AST_GetChild(ch0, 1))
+                IfCondition EqualTo(okx0, 0) ThenBlock: {
+                    can_lut = 0
+                    ExitLoop
+                }
+                IfCondition EqualTo(probe_tgt, 0) ThenBlock: {
+                    probe_tgt = NL.last_net
+                } ElseBlock: {
+                    IfCondition NotEqual(StringCompare(probe_tgt, NL.last_net), 0) ThenBlock: {
+                        can_lut = 0
+                        ExitLoop
+                    }
+                }
+            }
+            IfCondition EqualTo(ctype0, AST.DEFAULT) ThenBlock: {
+                okx0 = CompileStmtHDL_ExtractConstAssign(AST_GetChild(ch0, 0))
+                IfCondition EqualTo(okx0, 0) ThenBlock: {
+                    can_lut = 0
+                    ExitLoop
+                }
+            }
+            ci0 = Add(ci0, 1)
+        }
+        IfCondition EqualTo(can_lut, 0) ThenBlock: {
+            ReturnValue(CompileStmtHDL_BranchSeq(node))
         }
 
         sel_node = AST_GetChild(node, 0)

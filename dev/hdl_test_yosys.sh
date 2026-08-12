@@ -71,6 +71,9 @@ declare -a SMOKES=(
   "dev/hdl_stress_array.ailang:stress_array"
   "dev/hdl_stress_branch.ailang:stress_branch"
   "dev/hdl_stress_chain.ailang:stress_chain"
+  "dev/hdl_stress_extreme.ailang:stress_extreme"
+  "dev/hdl_stress_sat.ailang:stress_sat"
+  "dev/hdl_stress_fsm.ailang:stress_fsm"
 )
 
 pass=0
