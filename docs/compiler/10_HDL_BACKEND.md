@@ -194,17 +194,20 @@ Mutually exclusive with `-kmod`. Default base path: `a.nl`.
 - **WhileLoop** → one body iteration per clock
 - Arrays `MaximumLength`/`ElementType`; const + var index
 - Stream ports `in_*`/`out_*`; multi-driver seq coalesce (per if-depth)
-- **PrintMessage / PrintNumber(const)** → print ROM queue; **PrintNumber(expr)** → itoa FSM
-- Board: `.pins` + ice40 `.pcf` + Xilinx `.xdc`; `-period N` for SDC
+- **PrintMessage / PrintNumber(const)** → print ROM queue
+- **PrintNumber(expr)** × N → multi-job itoa after ROM (order preserved)
+- **Min / Max / AbsoluteValue** → mux structure
+- Arrays: `ram_style` BRAM hint when depth≥16; ElementType Byte/Word/Int32/…
+- Board: `.pins` `.pcf` `.xdc`; `-period N`; `.synth_ice40.ys` / ecp5 / xilinx
 
 ### Not yet / rejected
 
 - DynamicPool and growth
 - Recursive / mutual calls; multi-output Functions
 - Unbounded while-true busy loops (legal syntax, bad design)
-- String pool inits; multi-value itoa queue (single go latch for now)
+- Interleaved ROM↔itoa mid-stream (ROM drains fully, then jobs)
 - Full behavioral multi-cycle FSM beyond 1-iter while
-- Vendor BRAM/DSP black boxes — planned escape hatch
+- Hard DSP black-box instantiation (mul still → `$mul` / fabric)
 
 ---
 
@@ -212,11 +215,10 @@ Mutually exclusive with `-kmod`. Default base path: `a.nl`.
 
 | Phase | Goal |
 |---|---|
-| **Done** | ModulesHDL seam → NetlistPrims → Yosys `$cells` |
-| **Done** | Print ROM queue + runtime itoa; If→mux/LUT; wire predeclare |
-| **Done** | `.pins`/`.pcf`/`.xdc`; `-period N`; multi-driver coalesce by depth |
-| **Next** | multi-value print itoa queue; vendor BRAM/DSP techmap |
-| **Then** | real STA signoff packs |
+| **Done** | NetlistPrims → `$cells`; If→mux/LUT; Min/Max/Abs |
+| **Done** | Print ROM + multi-job itoa; wire predeclare; multi-driver by depth |
+| **Done** | pins/pcf/xdc; period; synth_* scripts; BRAM attrs |
+| **Next** | interleaved print events; DSP escape; real STA packs |
 
 Always: **table-shaped control first**, free-form control only when necessary.
 
