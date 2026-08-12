@@ -175,6 +175,17 @@ Emit: `always @(*) case (addr) … endcase` (Yosys → `$pmux` / ROM / LUT fabri
 yosys -s out/chip.ys
 ```
 
+### Yosys regression harness
+
+```bash
+./dev/hdl_test_yosys.sh           # all smokes; WARN if check problems > 0
+./dev/hdl_test_yosys.sh --strict # fail on any check problems
+./dev/hdl_test_yosys.sh logic    # subset by name
+AILANG_HDL_REBUILD=1 ./dev/hdl_test_yosys.sh
+```
+
+Artifacts under `dev/hdl_test_out/` (gitignored). Needs `yosys` (e.g. oss-cad-suite).
+
 Flags: `-hdl` / `--hdl`, `-period N` / `--period-ns N` (SDC/XDC clock ns, default 10).  
 Mutually exclusive with `-kmod`. Default base path: `a.nl`.
 
