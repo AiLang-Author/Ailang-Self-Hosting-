@@ -221,8 +221,9 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 | **Done** | Stream in_/out_ ports; If→2-LUT |
 | **Done** | SDC + Yosys `.ys` sidecars; skip empty modules; valid∧ready fire pattern |
 | **Done** | Pin map `.pins`; BLIF via yosys script; skid + multi-state stream FSM smoke |
-| **Next** | Auto skid library; board PCF/XDC; vendor BRAM/DSP black boxes |
-| **Then** | richer scheduling; techmap packs |
+| **Done** | Uncond multi-driver seq coalesce+warn; `dev/hdl_templates/` skid |
+| **Next** | Priority mux under if; board PCF/XDC; auto skid import |
+| **Then** | vendor BRAM/DSP; techmap packs |
 
 Always: **table-shaped control first**, free-form control only when necessary.
 

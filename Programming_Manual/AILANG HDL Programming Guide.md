@@ -4,7 +4,7 @@
 **Backend design:** `docs/compiler/10_HDL_BACKEND.md`  
 **Living doc** — update when the subset or errata change.
 
-**Status:** 2026-08-11 · ModulesHDL v1 (+ streams, var index, if→LUT)
+**Status:** 2026-08-11 · ModulesHDL v1 (skid template + multi-driver coalesce)
 
 ---
 
@@ -162,9 +162,13 @@ IfCondition EqualTo(And(Stream.in_valid, Stream.in_ready), 1) ThenBlock: {
 }
 ```
 
-**Skid (1-deep hold)** when sink may stall: keep `Skid.data` / `Skid.valid`;  
-`in_ready = !skid_valid || out_ready`; load skid on fire-in; clear on fire-out.  
-See `dev/hdl_smoke.ailang` for a full IDLE→RUN→DRAIN→DONE FSM around the skid.
+**Skid (1-deep hold)** — copy `dev/hdl_templates/stream_skid_1deep.ailang`  
+(or the Stream/Skid section of `dev/hdl_smoke.ailang`).
+
+Rules of thumb:
+- `in_ready` low when skid full and sink not ready  
+- `out_valid` / `out_data` mirror skid  
+- Load skid on `in_valid && in_ready`; clear on `out_valid && out_ready`
 
 ### Artifacts
 
@@ -212,6 +216,7 @@ IfCondition EqualTo(App.mode, 0) ThenBlock: {
 | **While** | Spin in process | **1 iteration/clock** while cond; avoid unbounded true |
 | **Syscalls / files / sockets** | OK | **Illegal** without IO binding (none yet) |
 | **Main location** | Process entry | Sequential **netlist top**, not a software main |
+| **Multi-write same reg** | Last store wins in SW too | Uncond seq multi-driver: **warn + keep last**; exclusive updates under `If`/`Branch` |
 
 Update this table whenever ModulesHDL gains a feature.
 
@@ -221,6 +226,7 @@ Update this table whenever ModulesHDL gains a feature.
 
 - Growing memory or pointer graphs with unbounded life  
 - Long if/else ladders for decode → use **`Branch` + constants**  
+- **Multiple unconditional writes to the same reg in Main** — you'll see `[HDL] warn: multi-driver seq`  
 - Calling a Function before it is defined in the source file  
 - Mixing `-hdl` with OS-facing libraries  
 
@@ -230,8 +236,10 @@ Update this table whenever ModulesHDL gains a feature.
 
 | File | Role |
 |---|---|
-| `dev/hdl_smoke.ailang` | Counter + Branch LUT + comb `Inc` |
+| `dev/hdl_smoke.ailang` | Dogfood: Inc, ROM index, if-LUT, skid stream |
+| `dev/hdl_templates/` | Copy-paste chips (skid stream) |
 | `docs/compiler/10_HDL_BACKEND.md` | Compiler architecture |
+| `claude-memory/project_ailang_hdl.md` | Agent notes / grind priorities |
 
 ---
 
@@ -246,5 +254,6 @@ Update this table whenever ModulesHDL gains a feature.
 | 2026-08-11 | Variable index; stream in_/out_ ports; If const-arms → 2-entry LUT. |
 | 2026-08-11 | Sidecars `.sdc` + `.ys`; skip empty modules; stream fire = valid∧ready. |
 | 2026-08-11 | `.pins` pin map; `.ys` writes `.blif`; skid+FSM stream smoke. |
+| 2026-08-11 | Multi-driver seq coalesce+warn; `dev/hdl_templates/stream_skid_1deep`. |
 
 *When you change the subset, append a row here and fix §3–§4.*
