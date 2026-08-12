@@ -129,6 +129,42 @@ App.count = Inc(App.count)
 
 Define `Function.Inc` **before** the call site. Becomes a module instance.
 
+### Streams (ready/valid naming)
+
+```ailang
+FixedPool.Stream {
+    "in_data": Initialize=0
+    "in_valid": Initialize=0
+    "in_ready": Initialize=1
+    "out_data": Initialize=0
+    "out_valid": Initialize=0
+    "out_ready": Initialize=0
+}
+```
+
+| Field | Direction |
+|---|---|
+| `in_data`, `in_valid` | input (host → chip) |
+| `in_ready` | **output** (we accept) |
+| `out_data`, `out_valid` | output (chip → host) |
+| `out_ready` | **input** (sink accepts) |
+
+### Variable array index
+
+```ailang
+App.limit = App.table[App.mode]
+```
+
+### If both arms are constants → 2-entry LUT
+
+```ailang
+IfCondition EqualTo(App.mode, 0) ThenBlock: {
+    App.count = 100
+} ElseBlock: {
+    App.count = 200
+}
+```
+
 ---
 
 ## 4. Errata & “software vs `-hdl`” differences
@@ -137,7 +173,8 @@ Define `Function.Inc` **before** the call site. Becomes a module instance.
 |---|---|---|
 | **DynamicPool** | Grows (with limits) | **Hard error** |
 | **MaximumLength / ElementType** | Array constraints | **Supported** (dash or `=`): `MaximumLength-N`, `ElementType-Integer\|Byte\|Address`. Cap 4096. Becomes `reg [W-1:0] name [0:N-1]` ROM-style fill from `Initialize`. |
-| **Index `pool[i]`** | Runtime index | **Const index only** today: `App.table[2]` |
+| **Index `pool[i]`** | Runtime index | **Const or variable**: `App.table[2]`, `App.table[App.mode]` (async read) |
+| **Stream ports** | sockets/files | Name convention: `in_data`/`in_valid` → inputs; `in_ready` → output; `out_data`/`out_valid` → outputs; `out_ready` → input |
 | **LinkagePool attrs** | Full attr children | Not in HDL subset |
 | **String `Initialize`** | OK | **Error** (no string heap on chip) |
 | **PrintMessage / PrintNumber** | stdout | **No-ops** (ignored) |
@@ -156,7 +193,6 @@ Update this table whenever ModulesHDL gains a feature.
 
 - Growing memory or pointer graphs with unbounded life  
 - Long if/else ladders for decode → use **`Branch` + constants**  
-- Variable (non-const) array indices  
 - Calling a Function before it is defined in the source file  
 - Mixing `-hdl` with OS-facing libraries  
 
@@ -179,5 +215,6 @@ Update this table whenever ModulesHDL gains a feature.
 | 2026-08-11 | User Function calls → module instances (define before use). |
 | 2026-08-11 | WhileLoop → multi-cycle (one body iter per clock). |
 | 2026-08-11 | MaximumLength/ElementType parse; array ROM fabric; const index `pool[i]`. |
+| 2026-08-11 | Variable index; stream in_/out_ ports; If const-arms → 2-entry LUT. |
 
 *When you change the subset, append a row here and fix §3–§4.*
