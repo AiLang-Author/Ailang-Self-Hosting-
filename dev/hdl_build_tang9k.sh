@@ -46,7 +46,13 @@ mkdir -p "$OUT_DIR"
 echo "== AILang HDL compile =="
 echo "  src=$SRC"
 # -period 37 ≈ 27 MHz (1000/27)
-"$HDL_BIN" -hdl -period 37 "$SRC" "$BASE"
+# -board / -bind: ailang.board/v1 profile (verify pins + emit .cst)
+BOARD_JSON="${BOARD_JSON:-$ROOT/boards/tang_nano_9k/board.json}"
+BIND_JSON="${BIND_JSON:-$ROOT/boards/tang_nano_9k/bind_blink.json}"
+"$HDL_BIN" -hdl -period 37 \
+  -board "$BOARD_JSON" \
+  -bind "$BIND_JSON" \
+  "$SRC" "$BASE"
 
 if [[ ! -f "$BASE.v" ]]; then
   echo "FAIL: no $BASE.v"
