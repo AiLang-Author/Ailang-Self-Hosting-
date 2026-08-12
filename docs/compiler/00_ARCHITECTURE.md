@@ -15,6 +15,7 @@
 | 08 | DATA_FLOW.md | End-to-end data flow through the compiler |
 | 09 | FUNCTION_CATALOG.md | Every function documented with signature, purpose, flow |
 | **10** | **HDL_BACKEND.md** | **Netlist backend (ModulesHDL): IR, LUT tables, CLI `-hdl`, Yosys** |
+| **11** | **HDL_LANGUAGE_COVERAGE.md** | **What AILang constructs lower to gates (matrix + ceiling)** |
 
 ---
 
