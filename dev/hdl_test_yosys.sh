@@ -80,6 +80,11 @@ declare -a SMOKES=(
   "dev/hdl_fifo_smoke.ailang:fifo"
   "dev/hdl_spi_smoke.ailang:spi"
   "dev/hdl_arbiter_smoke.ailang:arbiter"
+  "dev/hdl_debounce_smoke.ailang:debounce"
+  "dev/hdl_i2c_smoke.ailang:i2c"
+  "dev/hdl_pwm_smoke.ailang:pwm"
+  "dev/hdl_crc_stream.ailang:crc_stream"
+  "dev/hdl_uart_rx_smoke.ailang:uart_rx"
   "dev/hdl_techblock_smoke.ailang:techblock"
 )
 

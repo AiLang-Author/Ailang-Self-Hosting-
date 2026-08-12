@@ -115,6 +115,11 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 | `fifo` | depth-4 ring FIFO push/pop |
 | `spi` | bit-serial SPI-ish master FSM |
 | `arbiter` | 4-way round-robin grant |
+| `debounce` | N-cycle stable filter + edges |
+| `i2c` | bit-bang START/addr/data/ACK/STOP |
+| `pwm` | timer wrap + duty compare |
+| `crc_stream` | CRC-8 over ROM payload stream |
+| `uart_rx` | start/data/stop RX + soft TX stim |
 | `kill_verilog` | LFSR CRC UART priority + soft-IP showcase |
 | `techblock` | InlineAsm-style blackbox escape |
 
