@@ -66,6 +66,10 @@ declare -a SMOKES=(
   "dev/hdl_smoke.ailang:stream"
   "dev/hdl_logic_only.ailang:logic"
   "dev/hdl_core_syntax.ailang:core"
+  "dev/hdl_stress_nested.ailang:stress_nested"
+  "dev/hdl_stress_bits.ailang:stress_bits"
+  "dev/hdl_stress_array.ailang:stress_array"
+  "dev/hdl_stress_branch.ailang:stress_branch"
 )
 
 pass=0

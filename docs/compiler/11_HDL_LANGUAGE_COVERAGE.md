@@ -92,14 +92,24 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 
 ---
 
-## Dogfood
+## Dogfood + stress
 
 ```bash
 ./dev/hdl_test_yosys.sh
+./dev/hdl_test_yosys.sh stress
 ./dev/hdl_test_yosys.sh core logic
 ```
 
-Key sources: `dev/hdl_core_syntax.ailang`, `dev/hdl_logic_only.ailang`, `dev/hdl_foreach_smoke.ailang`, …
+| Suite | What it stresses |
+|---|---|
+| `core` / `logic` | Core syntax without host I/O noise |
+| `stress_bits` | BitSet/Clear/Test, rotate, Power, fat exprs |
+| `stress_array` | ForEvery depth 32, var index R/W |
+| `stress_nested` | Nested ForEvery, F1→F2→F3, nested If, Branch |
+| `stress_branch` | Dense Branch table, While/Until, multi-stmt If |
+
+**Semantics note:** straight-line pool updates use a **comb shadow chain** so  
+`x = BitSet(x,0); x = BitSet(x,1)` accumulates (not NBA last-wins).
 
 ---
 
