@@ -120,6 +120,11 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 | `pwm` | timer wrap + duty compare |
 | `crc_stream` | CRC-8 over ROM payload stream |
 | `uart_rx` | start/data/stop RX + soft TX stim |
+| `watchdog` | kick / timeout / sticky fault |
+| `cdc` | 2FF sync + toggle→pulse handshake |
+| `alu` | 8-op ALU + 4-reg file datapath |
+| `stack` | depth-8 push/pop with ovf/unf |
+| `barrel` | rotate/shift + nibble swap |
 | `kill_verilog` | LFSR CRC UART priority + soft-IP showcase |
 | `techblock` | InlineAsm-style blackbox escape |
 

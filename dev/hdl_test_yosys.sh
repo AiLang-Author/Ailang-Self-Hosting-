@@ -85,6 +85,11 @@ declare -a SMOKES=(
   "dev/hdl_pwm_smoke.ailang:pwm"
   "dev/hdl_crc_stream.ailang:crc_stream"
   "dev/hdl_uart_rx_smoke.ailang:uart_rx"
+  "dev/hdl_watchdog_smoke.ailang:watchdog"
+  "dev/hdl_cdc_smoke.ailang:cdc"
+  "dev/hdl_alu_smoke.ailang:alu"
+  "dev/hdl_stack_smoke.ailang:stack"
+  "dev/hdl_barrel_smoke.ailang:barrel"
   "dev/hdl_techblock_smoke.ailang:techblock"
 )
 
