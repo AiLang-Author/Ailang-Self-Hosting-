@@ -92,6 +92,7 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 | `.pins` `.pcf` `.xdc` | **Y** |
 | synth_ice40/ecp5/xilinx | **Y** |
 | `dev/hdl_test_yosys.sh` | **Y** |
+| Tang Nano 9K bitstream | **Y** | `dev/hdl_build_tang9k.sh` (Yosys+himbaechel+gowin_pack) |
 
 ---
 
