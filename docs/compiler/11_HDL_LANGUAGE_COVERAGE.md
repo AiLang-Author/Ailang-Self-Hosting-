@@ -73,8 +73,8 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 | Bitwise | BitwiseAnd/Or/Xor/Not, Xor, shifts | **Y** |
 | Rotate | RotateLeft/Right | **Y** const dist 0..63 |
 | Bits | BitTest BitSet BitClear LowBits | **Y** const bit/width |
-| Bit soft-IP | OneHot ReverseBits8 Parity8 PopCount8 Ctz8 Clz8 ByteSwap16 | **Y** |
-| Gray / sat | GrayEncode8 GrayDecode8 SaturateU8 AddSatU8 | **Y** |
+| Bit soft-IP | OneHot ReverseBits8 Parity8 PopCount8 Ctz8 Clz8 ByteSwap16 Hamming8 | **Y** |
+| Gray / sat | GrayEncode8 GrayDecode8 SaturateU8 AddSatU8 SubSatU8 AbsDiff8 SignExtend8 | **Y** |
 | Predicates | IsZero IsNonZero | **Y** |
 | Compare | EqualTo NotEqual Less* Greater* | **Y** |
 | Logic | And Or Not | **Y** `$logic_*` |
@@ -111,6 +111,10 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 | `stress_nested` | Nested ForEvery, F1→F2→F3, nested If, Branch |
 | `stress_branch` | Dense Branch table, While/Until, multi-stmt If |
 | `softip` | PopCount / Gray / sat / edge detect |
+| `delay` | 8-tap delay line + moving average |
+| `fifo` | depth-4 ring FIFO push/pop |
+| `spi` | bit-serial SPI-ish master FSM |
+| `arbiter` | 4-way round-robin grant |
 | `kill_verilog` | LFSR CRC UART priority + soft-IP showcase |
 | `techblock` | InlineAsm-style blackbox escape |
 

@@ -77,6 +77,9 @@ declare -a SMOKES=(
   "dev/hdl_kill_verilog.ailang:kill_verilog"
   "dev/hdl_softip_smoke.ailang:softip"
   "dev/hdl_delay_smoke.ailang:delay"
+  "dev/hdl_fifo_smoke.ailang:fifo"
+  "dev/hdl_spi_smoke.ailang:spi"
+  "dev/hdl_arbiter_smoke.ailang:arbiter"
   "dev/hdl_techblock_smoke.ailang:techblock"
 )
 
@@ -111,37 +114,34 @@ run_one() {
   fi
 
   echo "== $name =="
+  # Never return inside the redirected group — that skipped FAIL accounting.
   {
     echo "### compile $src"
     if ! "$HDL_BIN" -hdl -period 10 "$src" "$base" 2>&1; then
       echo "COMPILE_FAIL"
-      return 1
-    fi
-    if [[ ! -f "$base.v" ]]; then
+    elif [[ ! -f "$base.v" ]]; then
       echo "MISSING_V"
-      return 1
-    fi
-    echo "### yosys"
-    # Prefer generated .ys; fall back to inline check
-    if [[ -f "$base.ys" ]]; then
-      if ! "$YOSYS" -s "$base.ys" 2>&1; then
-        echo "YOSYS_FAIL"
-        return 1
-      fi
     else
-      if ! "$YOSYS" -q -p "read_verilog $base.v; hierarchy -check -top ailang_top; proc; opt; memory; opt; stat; check" 2>&1; then
-        echo "YOSYS_FAIL"
-        return 1
+      echo "### yosys"
+      if [[ -f "$base.ys" ]]; then
+        if ! "$YOSYS" -s "$base.ys" 2>&1; then
+          echo "YOSYS_FAIL"
+        fi
+      else
+        if ! "$YOSYS" -q -p "read_verilog $base.v; hierarchy -check -top ailang_top; proc; opt; memory; opt; stat; check" 2>&1; then
+          echo "YOSYS_FAIL"
+        fi
       fi
     fi
-  } >"$tlog" 2>&1
+  } >"$tlog" 2>&1 || true
 
   local problems
   problems=$(grep -E 'Found and reported [0-9]+ problems' "$tlog" | tail -1 | grep -oE '[0-9]+' | head -1 || true)
   problems=${problems:-0}
 
-  # Hard errors
-  if grep -qE 'COMPILE_FAIL|YOSYS_FAIL|MISSING_V|ERROR:|Compilation Failed' "$tlog"; then
+  # Hard errors (also catch bare Yosys "ERROR:" parse failures)
+  if grep -qE 'COMPILE_FAIL|YOSYS_FAIL|MISSING_V|Compilation Failed' "$tlog" \
+     || grep -qE '^ERROR:|syntax error' "$tlog"; then
     echo "FAIL  $name  (see $tlog)"
     echo "FAIL $name" >>"$LOG"
     fail=$((fail + 1))
