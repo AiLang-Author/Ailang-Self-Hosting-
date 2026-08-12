@@ -239,6 +239,7 @@ Update this table whenever ModulesHDL gains a feature.
 | `dev/hdl_smoke.ailang` | Dogfood: Inc, ROM index, if-LUT, skid stream |
 | `dev/hdl_templates/` | Copy-paste chips (skid stream) |
 | `docs/compiler/10_HDL_BACKEND.md` | Compiler architecture |
+| `claude-memory/project_ailang_hdl.md` | Agent notes / grind order |
 | `claude-memory/project_ailang_hdl.md` | Agent notes / grind priorities |
 
 ---
