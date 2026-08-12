@@ -3,7 +3,8 @@
 **Status:** Active development (ModulesHDL)  
 **CLI:** `./ailang.x -hdl <source.ailang> [base_path]`  
 **Artifacts:** `<base>.v` (structural Verilog), `<base>.nl.json` (graph dump)  
-**Consumers:** Yosys, vendor flows that accept structural Verilog / gate netlists
+**Consumers:** Yosys, vendor flows that accept structural Verilog / gate netlists  
+**User guide (errata / how to write sources):** [`Programming_Manual/AILANG HDL Programming Guide.md`](../../Programming_Manual/AILANG%20HDL%20Programming%20Guide.md)
 
 ---
 
@@ -189,12 +190,13 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 - Calls: `Add`, `Subtract`, `Multiply`, `Divide`, compares, `And`/`Or`/`Not`
 - Assignment, `ReturnValue`, simple `If`/`Fork` markers
 - **Branch → LUT** (const table pattern)
+- **User Function calls** → hierarchical instance (define before use; arity match)
 - Ignore: `PrintMessage` / `PrintNumber` (no console on chip)
 
 ### Not yet / rejected
 
 - DynamicPool and growth
-- User function **call** inline / instance ports (declare OK, call TBD)
+- Recursive / mutual calls; multi-output Functions
 - While / unbounded loops
 - String pool inits
 - Full behavioral scheduling / multi-cycle FSM inference
