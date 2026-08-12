@@ -73,7 +73,7 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 | Bitwise | BitwiseAnd/Or/Xor/Not, Xor, shifts | **Y** |
 | Rotate | RotateLeft/Right | **Y** const dist 0..63 |
 | Bits | BitTest BitSet BitClear LowBits | **Y** const bit/width |
-| Bit soft-IP | OneHot ReverseBits8 Parity8 PopCount8 | **Y** |
+| Bit soft-IP | OneHot ReverseBits8 Parity8 PopCount8 Ctz8 Clz8 ByteSwap16 | **Y** |
 | Gray / sat | GrayEncode8 GrayDecode8 SaturateU8 AddSatU8 | **Y** |
 | Predicates | IsZero IsNonZero | **Y** |
 | Compare | EqualTo NotEqual Less* Greater* | **Y** |

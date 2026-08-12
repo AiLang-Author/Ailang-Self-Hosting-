@@ -76,6 +76,7 @@ declare -a SMOKES=(
   "dev/hdl_stress_fsm.ailang:stress_fsm"
   "dev/hdl_kill_verilog.ailang:kill_verilog"
   "dev/hdl_softip_smoke.ailang:softip"
+  "dev/hdl_delay_smoke.ailang:delay"
   "dev/hdl_techblock_smoke.ailang:techblock"
 )
 
