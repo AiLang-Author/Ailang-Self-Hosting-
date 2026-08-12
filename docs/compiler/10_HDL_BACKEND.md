@@ -168,15 +168,15 @@ Emit: `always @(*) case (addr) … endcase` (Yosys → `$pmux` / ROM / LUT fabri
 # Build compiler with ModulesHDL linked (once)
 ./ailang.x ailang_cli.ailang ailang_hdl.x
 
-# Emit netlist
-./ailang_hdl.x -hdl prog.ailang out/chip
-# → out/chip.v , out/chip.nl.json
+# Emit netlist (+ board sidecars)
+./ailang_hdl.x -hdl -period 10 prog.ailang out/chip
+# → .v .nl.json .sdc .ys .pins .pcf .xdc  (+ .blif via yosys -s)
 
-# Open tool loop
-yosys -p 'read_verilog out/chip.v; hierarchy -top ailang_top; proc; stat; check'
+yosys -s out/chip.ys
 ```
 
-Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.nl`.
+Flags: `-hdl` / `--hdl`, `-period N` / `--period-ns N` (SDC/XDC clock ns, default 10).  
+Mutually exclusive with `-kmod`. Default base path: `a.nl`.
 
 ---
 
@@ -187,25 +187,24 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 - FixedPool scalars (+ top ports)
 - Function / SubRoutine / RunTask
 - Numbers, idents, pool fields
-- Calls: `Add`, `Subtract`, `Multiply`, `Divide`, compares, `And`/`Or`/`Not`
-- Assignment, `ReturnValue`, simple `If`/`Fork` markers
-- **Branch → LUT** (const table pattern)
-- **User Function calls** → hierarchical instance (define before use; arity match)
-- **WhileLoop** → one body iteration per clock while condition holds
-- **MaximumLength / ElementType** on FixedPool members (array ROM fabric)
-- Const **and variable** index `pool[i]` / `pool[reg]`
-- **Stream ports** via `in_*` / `out_*` / ready-valid naming
-- **If** both arms `target=const` → 2-entry LUT (else seq if)
-- Ignore: `PrintMessage` / `PrintNumber` (no console on chip)
+- Calls: arith/bitwise/shift/compares via **NetlistPrims** → Yosys `$cells`
+- Assignment, `ReturnValue`, `If`/`Fork`/`While`/`Branch`
+- **Branch → LUT**; **If** same-target const → LUT; same-target expr → **mux**
+- **User Function calls** → hierarchical instance
+- **WhileLoop** → one body iteration per clock
+- Arrays `MaximumLength`/`ElementType`; const + var index
+- Stream ports `in_*`/`out_*`; multi-driver seq coalesce (per if-depth)
+- **PrintMessage / PrintNumber(const)** → print ROM queue; **PrintNumber(expr)** → itoa FSM
+- Board: `.pins` + ice40 `.pcf` + Xilinx `.xdc`; `-period N` for SDC
 
 ### Not yet / rejected
 
 - DynamicPool and growth
 - Recursive / mutual calls; multi-output Functions
 - Unbounded while-true busy loops (legal syntax, bad design)
-- String pool inits
-- Full behavioral scheduling / multi-cycle FSM inference beyond 1-iter while
-- Vendor primitive black boxes (BRAM/DSP) — planned escape hatch
+- String pool inits; multi-value itoa queue (single go latch for now)
+- Full behavioral multi-cycle FSM beyond 1-iter while
+- Vendor BRAM/DSP black boxes — planned escape hatch
 
 ---
 
@@ -213,17 +212,11 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 
 | Phase | Goal |
 |---|---|
-| **Done** | ModulesHDL seam, FixedPool, body lower, Branch LUT, Yosys smoke |
-| **Done** | Empty `task_Main` noise removed; pool scalars as top `output reg` |
-| **Done** | User Function call → module instance |
-| **Done** | WhileLoop multi-cycle (1 iter/clock) |
-| **Done** | MaximumLength/ElementType → array/ROM; const + var index |
-| **Done** | Stream in_/out_ ports; If→2-LUT |
-| **Done** | SDC + Yosys `.ys` sidecars; skip empty modules; valid∧ready fire pattern |
-| **Done** | Pin map `.pins`; BLIF via yosys script; skid + multi-state stream FSM smoke |
-| **Done** | Uncond multi-driver seq coalesce+warn; `dev/hdl_templates/` skid |
-| **Next** | Priority mux under if; board PCF/XDC; auto skid import |
-| **Then** | vendor BRAM/DSP; techmap packs |
+| **Done** | ModulesHDL seam → NetlistPrims → Yosys `$cells` |
+| **Done** | Print ROM queue + runtime itoa; If→mux/LUT; wire predeclare |
+| **Done** | `.pins`/`.pcf`/`.xdc`; `-period N`; multi-driver coalesce by depth |
+| **Next** | multi-value print itoa queue; vendor BRAM/DSP techmap |
+| **Then** | real STA signoff packs |
 
 Always: **table-shaped control first**, free-form control only when necessary.
 
