@@ -50,12 +50,14 @@ FixedPool.App {
     "count": Initialize=0
     "limit": Initialize=42
     "mode":  Initialize=1
+    "table": ElementType-Integer, MaximumLength-4, Initialize=7
 }
 ```
 
-- Scalars become `output reg [63:0] App_count` (etc.) on `ailang_top`.
-- Init values become reset / `initial`.
-- Names are dotted idents in code: `App.count` (lexer may treat as one token).
+- Scalars → `output reg [63:0] App_count` on `ailang_top`.
+- Arrays → internal `reg [W-1:0] App_table [0:N-1]`, filled with `Initialize` (ROM default).
+- Const read: `App.limit = App.table[2]`
+- Dash or equals attrs: `MaximumLength-4` or `MaximumLength=4`
 
 ### Combinational Function
 
@@ -134,7 +136,8 @@ Define `Function.Inc` **before** the call site. Becomes a module instance.
 | Topic | Software | `-hdl` today |
 |---|---|---|
 | **DynamicPool** | Grows (with limits) | **Hard error** |
-| **MaximumLength / ElementType** | Used on FixedPool arrays | **Mostly ignored** by FixedPool member parser path — depth often stays **1**. Array→ROM not ready. Prefer scalar pools + `Branch` tables for now. |
+| **MaximumLength / ElementType** | Array constraints | **Supported** (dash or `=`): `MaximumLength-N`, `ElementType-Integer\|Byte\|Address`. Cap 4096. Becomes `reg [W-1:0] name [0:N-1]` ROM-style fill from `Initialize`. |
+| **Index `pool[i]`** | Runtime index | **Const index only** today: `App.table[2]` |
 | **LinkagePool attrs** | Full attr children | Not in HDL subset |
 | **String `Initialize`** | OK | **Error** (no string heap on chip) |
 | **PrintMessage / PrintNumber** | stdout | **No-ops** (ignored) |
@@ -153,7 +156,7 @@ Update this table whenever ModulesHDL gains a feature.
 
 - Growing memory or pointer graphs with unbounded life  
 - Long if/else ladders for decode → use **`Branch` + constants**  
-- Expecting `MaximumLength-N` arrays to magically become BRAM today  
+- Variable (non-const) array indices  
 - Calling a Function before it is defined in the source file  
 - Mixing `-hdl` with OS-facing libraries  
 
@@ -174,6 +177,7 @@ Update this table whenever ModulesHDL gains a feature.
 |---|---|
 | 2026-08-11 | Initial guide. FixedPool scalars, Function comb, Main seq, Branch→LUT. Errata: MaximumLength/arrays. |
 | 2026-08-11 | User Function calls → module instances (define before use). |
-| 2026-08-11 | WhileLoop → multi-cycle (one body iter per clock). Const index into pool arrays (depth>1) stub. |
+| 2026-08-11 | WhileLoop → multi-cycle (one body iter per clock). |
+| 2026-08-11 | MaximumLength/ElementType parse; array ROM fabric; const index `pool[i]`. |
 
 *When you change the subset, append a row here and fix §3–§4.*
