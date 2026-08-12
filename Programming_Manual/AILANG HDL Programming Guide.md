@@ -15,10 +15,9 @@ Regular **AILang**. No Verilog dialect, no `always`, no wires in source.
 ```bash
 ./ailang.x ailang_cli.ailang ailang_hdl.x          # rebuild CLI once
 ./ailang_hdl.x -hdl mychip.ailang out/mychip
-# → out/mychip.v  .nl.json  .sdc  .ys
+# → out/mychip.v .nl.json .sdc .ys .pins
+#    out/mychip.blif is written when you run: yosys -s out/mychip.ys
 yosys -s out/mychip.ys
-# or:
-yosys -p 'read_verilog out/mychip.v; hierarchy -top ailang_top; proc; memory; opt; stat; check'
 ```
 
 `-hdl` and `-kmod` are mutually exclusive.
@@ -163,6 +162,21 @@ IfCondition EqualTo(And(Stream.in_valid, Stream.in_ready), 1) ThenBlock: {
 }
 ```
 
+**Skid (1-deep hold)** when sink may stall: keep `Skid.data` / `Skid.valid`;  
+`in_ready = !skid_valid || out_ready`; load skid on fire-in; clear on fire-out.  
+See `dev/hdl_smoke.ailang` for a full IDLE→RUN→DRAIN→DONE FSM around the skid.
+
+### Artifacts
+
+| File | Role |
+|---|---|
+| `.v` | structural Verilog |
+| `.nl.json` | netlist graph dump |
+| `.sdc` | clock / I/O delay stubs |
+| `.ys` | Yosys script (check + `write_blif`) |
+| `.pins` | port list for board pin binding |
+| `.blif` | produced by `yosys -s *.ys` |
+
 ### Variable array index
 
 ```ailang
@@ -231,5 +245,6 @@ Update this table whenever ModulesHDL gains a feature.
 | 2026-08-11 | MaximumLength/ElementType parse; array ROM fabric; const index `pool[i]`. |
 | 2026-08-11 | Variable index; stream in_/out_ ports; If const-arms → 2-entry LUT. |
 | 2026-08-11 | Sidecars `.sdc` + `.ys`; skip empty modules; stream fire = valid∧ready. |
+| 2026-08-11 | `.pins` pin map; `.ys` writes `.blif`; skid+FSM stream smoke. |
 
 *When you change the subset, append a row here and fix §3–§4.*

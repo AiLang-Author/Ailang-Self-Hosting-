@@ -2,7 +2,7 @@
 
 **Status:** Active development (ModulesHDL)  
 **CLI:** `./ailang.x -hdl <source.ailang> [base_path]`  
-**Artifacts:** `<base>.v`, `<base>.nl.json`, `<base>.sdc`, `<base>.ys`
+**Artifacts:** `<base>.v`, `.nl.json`, `.sdc`, `.ys`, `.pins` (+ `.blif` via `yosys -s`)
 **Consumers:** Yosys, vendor flows that accept structural Verilog / gate netlists  
 **User guide (errata / how to write sources):** [`Programming_Manual/AILANG HDL Programming Guide.md`](../../Programming_Manual/AILANG%20HDL%20Programming%20Guide.md)
 
@@ -220,8 +220,9 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 | **Done** | MaximumLength/ElementType → array/ROM; const + var index |
 | **Done** | Stream in_/out_ ports; If→2-LUT |
 | **Done** | SDC + Yosys `.ys` sidecars; skip empty modules; valid∧ready fire pattern |
-| **Next** | Multi-beat streams / skid buffer; BLIF write; board pin maps |
-| **Then** | richer FSM; vendor primitives |
+| **Done** | Pin map `.pins`; BLIF via yosys script; skid + multi-state stream FSM smoke |
+| **Next** | Auto skid library; board PCF/XDC; vendor BRAM/DSP black boxes |
+| **Then** | richer scheduling; techmap packs |
 
 Always: **table-shaped control first**, free-form control only when necessary.
 
