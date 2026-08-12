@@ -73,11 +73,14 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 | Bitwise | BitwiseAnd/Or/Xor/Not, Xor, shifts | **Y** |
 | Rotate | RotateLeft/Right | **Y** const dist 0..63 |
 | Bits | BitTest BitSet BitClear LowBits | **Y** const bit/width |
+| Bit soft-IP | OneHot ReverseBits8 Parity8 PopCount8 | **Y** |
+| Gray / sat | GrayEncode8 GrayDecode8 SaturateU8 AddSatU8 | **Y** |
 | Predicates | IsZero IsNonZero | **Y** |
 | Compare | EqualTo NotEqual Less* Greater* | **Y** |
 | Logic | And Or Not | **Y** `$logic_*` |
-| Structure | AbsoluteValue Min Max Clamp Select | **Y** mux |
+| Structure | AbsoluteValue Min Max Clamp Select Mux4 | **Y** mux |
 | Calls | user Function | **Y** instance |
+| Escape | TechBlock | **Y** blackbox (InlineAsm analogue) |
 | AST binary ops | + − * / % & \| ^ << >> && \|\| | **Y** |
 | Strings / files / net | — | **N** / **—** |
 
@@ -107,6 +110,9 @@ That is the practical limit — and it is already most of what a soft-CPU-free d
 | `stress_array` | ForEvery depth 32, var index R/W |
 | `stress_nested` | Nested ForEvery, F1→F2→F3, nested If, Branch |
 | `stress_branch` | Dense Branch table, While/Until, multi-stmt If |
+| `softip` | PopCount / Gray / sat / edge detect |
+| `kill_verilog` | LFSR CRC UART priority + soft-IP showcase |
+| `techblock` | InlineAsm-style blackbox escape |
 
 **Semantics note:** straight-line pool updates use a **comb shadow chain** so  
 `x = BitSet(x,0); x = BitSet(x,1)` accumulates (not NBA last-wins).
