@@ -70,6 +70,7 @@ declare -a SMOKES=(
   "dev/hdl_stress_bits.ailang:stress_bits"
   "dev/hdl_stress_array.ailang:stress_array"
   "dev/hdl_stress_branch.ailang:stress_branch"
+  "dev/hdl_stress_chain.ailang:stress_chain"
 )
 
 pass=0
