@@ -4,7 +4,7 @@
 **Backend design:** `docs/compiler/10_HDL_BACKEND.md`  
 **Living doc** — update when the subset or errata change.
 
-**Status:** 2026-08-11 · ModulesHDL v1 (body lower + Branch LUT + user call instance)
+**Status:** 2026-08-11 · ModulesHDL v1 (+ While 1-iter/clock, user call instance)
 
 ---
 
@@ -35,6 +35,7 @@ yosys -p 'read_verilog out/mychip.v; hierarchy -top ailang_top; proc; stat; chec
 | `RunTask(Main)` | Clock domain on top (no empty task box) |
 | `Branch` table pattern | **LUT / case ROM** (preferred) |
 | Deep `IfCondition` chains | Avoid for multi-way; use `Branch` tables |
+| `WhileLoop` | **One body iteration per clock** while cond true (multi-cycle) |
 
 Slogan: **place memory, table the decisions, emit netlist.**
 
@@ -105,6 +106,27 @@ If you need free-form multi-stmt cases, that is not table-lowered yet — restru
 `EqualTo`, `NotEqual`, `LessThan`, `GreaterThan`, `LessEqual`, `GreaterEqual`,  
 `And`, `Or`, `Not`
 
+### While (multi-cycle)
+
+```ailang
+WhileLoop LessThan(App.count, 8) {
+    App.count = Inc(App.count)
+}
+```
+
+- **Not** a software spin in zero time.
+- Each `posedge clk`, if cond holds, body runs **once**.
+- Prefer conditions that eventually go false (`LessThan(reg, K)`).
+- Unbounded `WhileLoop True` will hang the machine every cycle forever — don't.
+
+### User Function call
+
+```ailang
+App.count = Inc(App.count)
+```
+
+Define `Function.Inc` **before** the call site. Becomes a module instance.
+
 ---
 
 ## 4. Errata & “software vs `-hdl`” differences
@@ -119,7 +141,7 @@ If you need free-form multi-stmt cases, that is not table-lowered yet — restru
 | **User function calls** | Normal | **Instance hierarchy** — callee must appear **before** call site in the file; arity must match `Input:` ports; result via `result` port |
 | **`Output: Integer`** | Type only | Becomes port **`result`** (fixed name) |
 | **`IfCondition`** | Full control | Seq if markers; **do not** use for dense multi-way — use **`Branch`** |
-| **While / unbounded loops** | OK | **Not supported** |
+| **While** | Spin in process | **1 iteration/clock** while cond; avoid unbounded true |
 | **Syscalls / files / sockets** | OK | **Illegal** without IO binding (none yet) |
 | **Main location** | Process entry | Sequential **netlist top**, not a software main |
 
@@ -152,5 +174,6 @@ Update this table whenever ModulesHDL gains a feature.
 |---|---|
 | 2026-08-11 | Initial guide. FixedPool scalars, Function comb, Main seq, Branch→LUT. Errata: MaximumLength/arrays. |
 | 2026-08-11 | User Function calls → module instances (define before use). |
+| 2026-08-11 | WhileLoop → multi-cycle (one body iter per clock). Const index into pool arrays (depth>1) stub. |
 
 *When you change the subset, append a row here and fix §3–§4.*

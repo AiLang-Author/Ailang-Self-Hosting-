@@ -191,16 +191,19 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 - Assignment, `ReturnValue`, simple `If`/`Fork` markers
 - **Branch → LUT** (const table pattern)
 - **User Function calls** → hierarchical instance (define before use; arity match)
+- **WhileLoop** → one body iteration per clock while condition holds
+- Const index `pool[N]` when FixedPool depth > 1 (array fabric)
 - Ignore: `PrintMessage` / `PrintNumber` (no console on chip)
 
 ### Not yet / rejected
 
 - DynamicPool and growth
 - Recursive / mutual calls; multi-output Functions
-- While / unbounded loops
+- Unbounded while-true busy loops (legal syntax, bad design)
 - String pool inits
-- Full behavioral scheduling / multi-cycle FSM inference
+- Full behavioral scheduling / multi-cycle FSM inference beyond 1-iter while
 - Vendor primitive black boxes (BRAM/DSP) — planned escape hatch
+- MaximumLength-driven depth (parser gap on FixedPool members)
 
 ---
 
@@ -210,8 +213,10 @@ Flags: `-hdl` / `--hdl`. Mutually exclusive with `-kmod`. Default base path: `a.
 |---|---|
 | **Done** | ModulesHDL seam, FixedPool, body lower, Branch LUT, Yosys smoke |
 | **Done** | Empty `task_Main` noise removed; pool scalars as top `output reg` |
-| **Next** | Array FixedPool as ROM (`$memrd`); 2D matrix dogfood; user-call inline |
-| **Then** | Bounded While → simple FSM; ready/valid IO streams |
+| **Done** | User Function call → module instance |
+| **Done** | WhileLoop multi-cycle (1 iter/clock) |
+| **Next** | Array FixedPool as ROM (`$memrd`); MaximumLength parse; 2D matrix dogfood |
+| **Then** | ready/valid IO streams; richer FSM |
 | **Later** | Techmap to cell lib; SDC sidecar; BLIF/eBLIF; ASIC liberty path |
 
 Always: **table-shaped control first**, free-form control only when necessary.
