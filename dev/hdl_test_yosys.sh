@@ -65,6 +65,7 @@ declare -a SMOKES=(
   "dev/hdl_all_smoke.ailang:all"
   "dev/hdl_smoke.ailang:stream"
   "dev/hdl_logic_only.ailang:logic"
+  "dev/hdl_core_syntax.ailang:core"
 )
 
 pass=0

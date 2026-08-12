@@ -3,35 +3,22 @@
 **Status:** living document (ModulesHDL)  
 **Companion:** [10_HDL_BACKEND.md](10_HDL_BACKEND.md)
 
-## How much can we support?
+## Practical limit (the real answer)
 
-AILang is **not** Verilog. The bet is: **structured keywords + clean AST → boring lowerings**.  
-Coverage is not “every string the lexer knows”; it is every construct that has **placeable hardware meaning**.
+AILang’s full surface is large (~250 AST kinds, host I/O, actors).  
+**HDL core is intentionally smaller** — whatever has *finite, placeable* meaning.
 
-Rough size of the full language surface (frontend today):
-
-| Layer | Count (approx) | Notes |
+| Band | Approx size | Contents |
 |---|---|---|
-| Lexer keywords | ~50–80 (shorthand VS Code set is the ergonomic 50) | Control, pools, types, loops |
-| AST node kinds | ~250+ constants | Many are types/ops/OS I/O, not “syntax forms” |
-| Builtin call names (x86 modules) | ~100+ | Arith, string, file, socket, … |
+| **Core (aim to finish)** | **~40–55 constructs** | Pools, functions, control, arith/bit, arrays, print, streams |
+| **Solid extensions** | **+10–20** | ForEvery, bit helpers, power/rotate, board sidecars |
+| **Stretch** | **+handful** | Tech-block libraries, DSP escapes, interleaved print |
+| **Never / rare black box** | rest | Dynamic growth, files, sockets, GC strings, OS |
 
-**Ultimately on HDL**, a realistic ceiling:
+**Rule:** finite state or pure logic → chip. Grow / block / heap → software.
 
-| Tier | Share of *useful chip programs* | What fits |
-|---|---|---|
-| **A — Core** | ~80% | FixedPool, Function, Main, arith/bitwise/compare, If/Branch/While/Until, print channel, streams |
-| **B — Solid** | +15% | Arrays R/W, Min/Max/Clamp/Abs, LUTs, hierarchy, multi-job I/O, board sidecars |
-| **C — Stretch** | +5% | Bounded ForEvery, soft FSMs, vendor BRAM/DSP escapes |
-| **Never (or rare black box)** | — | DynamicPool growth, sockets, files, GC strings, unbounded actors, OS syscalls |
-
-So: **dozens of keywords + a few dozen builtins**, not hundreds of OS APIs.  
-The long tail of AST ops (file/hash/socket) stays software-only; that is a feature, not a bug.
-
-### Rule of thumb
-
-> If the construct **places finite state or pure logic**, it belongs on the chip.  
-> If it **grows, blocks on the OS, or needs a heap**, it does not.
+You do **not** need “all keywords.” You need the **core band** complete and greppable.  
+That is the practical limit — and it is already most of what a soft-CPU-free datapath needs.
 
 ---
 
@@ -41,76 +28,87 @@ The long tail of AST ops (file/hash/socket) stays software-only; that is a featu
 
 | Symbol | Meaning |
 |---|---|
-| **Y** | Supported (lowers to netlist) |
-| **P** | Partial / best-effort |
-| **N** | Rejected or illegal for silicon |
-| **—** | N/A / software-only |
+| **Y** | Supported |
+| **P** | Partial |
+| **N** | Rejected / not silicon |
+| **—** | Software-only |
 
 ### Declarations
 
 | Construct | HDL | Notes |
 |---|---|---|
-| `FixedPool` | **Y** | Scalars + `MaximumLength` arrays |
-| `DynamicPool` | **N** | Cannot grow on die |
-| Other pool kinds | **N** | Temporal/Neural/… rejected |
-| `Function` | **Y** | Comb module + `result` |
-| `SubRoutine` / `Main` | **Y** | Seq region on top |
-| `RunTask` | **Y** | Clock domain anchor |
-| `Inline` / lambda / curry | **N** | Not yet |
+| `FixedPool` | **Y** | Scalars + arrays |
+| `DynamicPool` | **N** | Illegal |
+| Other pools | **N** | Rejected |
+| `Function` | **Y** | Comb + `result` |
+| `SubRoutine` / `Main` | **Y** | Seq top |
+| `RunTask` | **Y** | Clock domain |
+| Inline / lambda | **N** | |
 
 ### Statements
 
 | Construct | HDL | Notes |
 |---|---|---|
-| Assignment | **Y** | Comb or seq |
-| `pool[i] = expr` | **Y** | INDEX_ASSIGN → seq mem write |
-| `ReturnValue` | **Y** | Comb `result` |
-| `IfCondition` / `Fork` | **Y** | LUT / mux / seq if |
-| `Branch` / case table | **Y** | LUT preferred |
-| `WhileLoop` | **Y** | 1 body iter / clock |
-| `UntilCondition` | **Y** | While Not(C) |
-| `ExitLoop` / `ContinueLoop` | **P** | Noted; prefer bounded loops |
-| `ForEvery` | **Y** | Unroll FixedPool array only (depth ≤ 32) |
+| Assignment | **Y** | |
+| `pool[i] = expr` | **Y** | |
+| `ReturnValue` | **Y** | |
+| `IfCondition` / `Fork` | **Y** | LUT / mux / seq |
+| `Branch` | **Y** | LUT table |
+| `WhileLoop` | **Y** | 1 iter/clock |
+| `UntilCondition` | **Y** | inverted while |
+| `ForEvery` | **Y** | Unroll ≤32 + shadow reduce |
+| `ExitLoop` / `ContinueLoop` | **P** | noted no-ops |
 | `PrintMessage` / `PrintNumber` | **Y** | ROM + multi-job itoa |
-| Try/Catch/Throw | **N** | No exception fabric v1 |
+| `Halt` | **P** | ignored on silicon |
+| Try/Catch | **N** | |
 
-### Expressions / builtins
+### Expressions / builtins (core)
 
-| Construct | HDL | Yosys meet |
+| Family | Names | HDL |
 |---|---|---|
-| Number / Bool / Null | **Y** | const |
-| Idents / pool fields | **Y** | wires / regs |
-| `pool[i]` read | **Y** | mem read |
-| Add/Sub/Mul/Div/Modulo | **Y** | `$add`… |
-| Bitwise* / Shift* | **Y** | `$and` `$xor` `$shl`… |
-| Compares | **Y** | `$eq` `$lt`… |
-| And/Or/Not (logic) | **Y** | `$logic_*` |
-| Increment / Decrement | **Y** | ±1 |
-| AbsoluteValue / Min / Max / Clamp | **Y** | mux structure |
-| Select(cond, t, f) | **Y** | mux ternary |
-| User Function call | **Y** | instance |
-| Strings (runtime) | **N** | Only print literals → ROM |
-| File/socket/hash/… | **—** | Host software |
+| Literals | number, bool, null | **Y** |
+| Names | idents, pool fields, `pool[i]` | **Y** |
+| Arith | Add Sub Mul Div Modulo Negate Increment Decrement | **Y** |
+| Power | Power / OP_POWER | **Y** const exp 0..8 only |
+| Bitwise | BitwiseAnd/Or/Xor/Not, Xor, shifts | **Y** |
+| Rotate | RotateLeft/Right | **Y** const dist 0..63 |
+| Bits | BitTest BitSet BitClear LowBits | **Y** const bit/width |
+| Predicates | IsZero IsNonZero | **Y** |
+| Compare | EqualTo NotEqual Less* Greater* | **Y** |
+| Logic | And Or Not | **Y** `$logic_*` |
+| Structure | AbsoluteValue Min Max Clamp Select | **Y** mux |
+| Calls | user Function | **Y** instance |
+| AST binary ops | + − * / % & \| ^ << >> && \|\| | **Y** |
+| Strings / files / net | — | **N** / **—** |
 
 ### Tooling
 
 | Artifact | Status |
 |---|---|
-| `.v` `.nl.json` | **Y** |
-| `.sdc` `-period` | **Y** |
+| `.v` `.nl.json` `.sdc` `.ys` | **Y** |
 | `.pins` `.pcf` `.xdc` | **Y** |
-| `.ys` + `synth_ice40/ecp5/xilinx` | **Y** |
-| BLIF via yosys | **Y** |
+| synth_ice40/ecp5/xilinx | **Y** |
+| `dev/hdl_test_yosys.sh` | **Y** |
 
 ---
 
-## Growth order (product)
+## Dogfood
 
-1. ~~ForEvery over FixedPool (unroll ≤32)~~  
-2. Interleaved print event queue (ROM + itoa mixed)  
-3. **Technology library import** (vendor cells as LibraryImport) — not day-one  
-4. Vendor DSP/`$mul` policy; Liberty/techmap hooks  
-5. Keep rejecting growth/OS — that is the language selling point  
+```bash
+./dev/hdl_test_yosys.sh
+./dev/hdl_test_yosys.sh core logic
+```
 
-**Keywords we can “ultimately” support well:** roughly the **structured control + pool + arith** surface (~**60–100** named constructs and builtins that matter for chips).  
-**Not** every AST leaf that exists for self-hosting the OS and browser.
+Key sources: `dev/hdl_core_syntax.ailang`, `dev/hdl_logic_only.ailang`, `dev/hdl_foreach_smoke.ailang`, …
+
+---
+
+## Still outside core (by design for now)
+
+1. **Technology block `LibraryImport`** — vendor cells as libraries (not today)  
+2. Interleaved print events (ROM mid-stream with itoa)  
+3. ForEvery depth > 32 (use index While)  
+4. Runtime-variable Power / Rotate distance  
+5. DSP black-box policy  
+
+**Core is “done enough” when** the matrix **Y** rows cover the table above and Yosys harness stays green on non-print suites.
