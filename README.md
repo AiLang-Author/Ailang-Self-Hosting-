@@ -25,7 +25,7 @@ This is the official self-hosting repository for **AILang**, featuring:
 ## The AILang Advantage
 
 ### Extreme Efficiency
-- **Compiler:** 760 KB (no bloat, no runtime overhead)
+- **Compiler:** 3.x mb (no bloat, no runtime overhead) recent addition like the entire x86 instruction encoding library and HDL backend have increased the size, still small and efficient
 - **Window System:** 800 KB (full-featured desktop environment)
 - **Browser:** JS VM + HTML/CSS in development (see Docs/Browser/JS_ENGINE_MASTER.md for live scores)
 - **CoreUtils:** 57 utilities, custom-built from scratch (50-71% smaller than GNU equivalents)
