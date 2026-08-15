@@ -14,8 +14,8 @@
 --   hole_dxf      optional through-hole profile
 --   step_cache    derived solid interchange
 --   feature_tree  JSON feature list (also on cad_revision.feature_tree)
---   plane_tree    future: PlaneFeature coordinate tree JSON
---   face_map      future: persistent face/edge naming map
+--   plane_tree    Sketch_0 PlaneFeature tree (PT1 JSON + P recipe rows)
+--   face_map      persistent face names (FM1: plane pid ↔ signature)
 --   mesh_*        future: tess caches
 
 CREATE TABLE IF NOT EXISTS cad_project (
@@ -70,6 +70,19 @@ CREATE TABLE IF NOT EXISTS cad_asset (
 );
 
 CREATE INDEX IF NOT EXISTS cad_asset_role_idx ON cad_asset (role);
+
+-- Session / document command log (undo slider). Prune = DELETE extra rows.
+-- Not the feature tree — that stays on cad_revision / cad_feature.
+CREATE TABLE IF NOT EXISTS cad_hist (
+    id          BIGSERIAL PRIMARY KEY,
+    rev_id      BIGINT NOT NULL REFERENCES cad_revision(id) ON DELETE CASCADE,
+    seq         INTEGER NOT NULL,
+    kind        TEXT NOT NULL,
+    label       TEXT NOT NULL DEFAULT '',
+    UNIQUE (rev_id, seq)
+);
+
+CREATE INDEX IF NOT EXISTS cad_hist_rev_idx ON cad_hist (rev_id, seq);
 
 -- Multi-user / agent sessions (product path)
 CREATE TABLE IF NOT EXISTS cad_session (

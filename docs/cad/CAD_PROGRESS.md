@@ -3,36 +3,59 @@
 **Living document.** Update every grind turn. Pair with `CAD_DEV_GUIDE.md` (process) and `CAD_Kernel_Design_v3.md` (normative).  
 **Rule:** local commit after each meaningful turn so regressions are git-bisectable.
 
-**Last updated:** 2026-08-09 (pad+hole multi-loop prism; pow-wow priority lock)  
+**Last updated:** 2026-08-15 (real bool + junction fillet — `CAD_BREP_BOOL_FILLET.md`)  
 **Branch:** `master`  
-**Strategy:** `Docs/CAD/CAD_CORE_COMPETITIVE_PLAN.md` · Phase A: `CAD_PHASE_A_SKETCH.md` · App: `CAD_APP_PLAN.md`  
-**Sketcher system:** `Docs/CAD/CAD_SKETCHER_IMPL.md`  
-**Design evolution (theory → now):** `Docs/CAD/CAD_DESIGN_EVOLUTION.md`  
-**Plane / topo naming:** `Docs/CAD/CAD_PLANE_ON_FACE.md`
+**Strategy:** `docs/cad/CAD_CORE_COMPETITIVE_PLAN.md` · App: `CAD_APP_PLAN.md` · UI: `CAD_UI_PLAN.md`  
+**Planes / naming:** `docs/cad/CAD_PLANE_ON_FACE.md`  
+**Older grind notes below §1 are historical** — do not treat Aug 9 “next up” as current.
 
 ---
 
-## 0. Priority lock (pow-wow 2026-08-09)
+## 0. Where we are (2026-08-13)
 
-### Invest (kernel + thin app wire)
+The product path works: **sketch entities → closed profiles → pad / cut / revolve → shaded B-Rep**. No sketch-AABB solids, no faceted “stone tablet” lathe. Host is **compiled Gtk3** (`CAD/host/cad_shell_gtk`). Kernel owns geometry + `tools.json` (`Library.CAD_UI`). PG is SoR for parts.
 
-| Priority | Work | Why |
-|---------:|------|-----|
-| **1** | **Revolve UI** in `cad_app` | Kernel done; hubs / washers / grooves |
-| **2** | **Sketch-on-face** | Origin + PlaneFeature → stop topo-naming breakage |
-| **3** | Draft / loft / sweep **expose + harden** | Kernels exist; dogfood next |
-| **∞** | Real-part edge cases | Hub plate dogfood is the suite |
+### What is real (do not regress)
 
-### Defer (temporary UI — do not sink time)
-
-| Item | Reason |
+| Area | Truth |
 |------|--------|
-| Length / angle dim HUD | UI we may replace; constraints/API cover intent |
-| Pattern / mirror **panel tools** | `LinearPattern` / `CircularPattern` / `Mirror` already in kernel |
-| N-gon builder UI, spline tools | Construction polish |
-| Fillet R HUD, undo polish | QoL, not capability |
+| Sketch | Line, 2/3-pt + center rect, 2/3-pt + center circle, center/2/3-pt arc, n-gon/slot, spline CVs, point, trim, 2D fillet |
+| Profiles | Even-odd / user pick; light red available, bright red selected; Shift multi; no auto-pick |
+| Pad / cut | `MakePolyPrism` / holes from real rings; not AABB plate |
+| Revolve | User-picked sketch line = axis; signed rho; kind 6 Class A SoR (`MeshLatheAnalytic` ≥90 segs); mesh slabs sized from `n×nseg` |
+| 3D modify | Edge fillet / chamfer (prism cap / Digon); pick edges then R/D |
+| View | One camera: overlay reuses `DrawMesh` frame; AXIS label on picked revolve line |
+| Host | C++ Gtk3; rubber-band + HUD; **Quit** sends `quit` → `CA_Shutdown` |
+| Docs | `name <part>` + `save` / `load` (Postgres); File tab dialogs |
 
-**Rule:** wire **verbs** (revolve, plane-on-face, draft…); avoid disposable panel chrome.
+### Geometry policy (locked)
+
+- Sketch line/circle/arc/rect stay **entities**. Pad extrudes **rings**, not boxes.  
+- Revolve uses the **picked line** and the **profile verts**. No |X| fold, no AABB tube.  
+- Tolerances are **absolute** (`CAD_Num`), never % of sketch diagonal.  
+- FixedPools are large; pin floats across calls (ABI clobber is the real bug class).  
+- `SolidBounds` is an **extent query**, never a substitute solid.  
+- **Sketch_0 is the part root.** Child planes/sketches inherit position from that lineage (`parent_plane` + UV). No heuristic face cleanup later.  
+- **A part is the Sketch_0 tree in Postgres** (sketches + plane recipes + feature params). Solids/meshes are derived. Animation later = eval that tree.  
+- **Constraints** sit on the active sketch after draw. **Origin** (FixO, DistO) = that sketch’s `O` (Sketch_0 lineage). **Unary** H/V/Rad. **Relational** Coin / OnLine / Tang / EqR / Dist.
+
+---
+
+## 0b. Priority lock (2026-08-14)
+
+**Focus list:** `docs/cad/CAD_MODELLING_HITLIST.md` — sketcher driveability first, B-Rep second, recipes third.  
+**Real bool / junction fillet:** `docs/cad/CAD_BREP_BOOL_FILLET.md` (JOIN is still `CompoundAdd`; CUT is still recipes).
+
+| # | Work | Why now |
+|---|------|---------|
+| **D0** | **In-context sketch + honest pick** | Sketch-on-face must not blank the solid. Locked frame, outward N, Shift+cycle. |
+| **D1** | **Sketcher conveniences** | Rubber-band/HUD, undo, constraints on the face, type-in dims, UV rotate. |
+| **D2** | **Aim existing solid verbs** | Pad/cut/hole/revolve/fillet on a named face. Kernel mostly exists. |
+| **D3** | **Recipes** | Hole/pattern/mirror/pocket — native AILang, not FreeCAD Python. |
+
+**Defer:** midplane/both-dir pad, loft/sweep chrome, thread/emboss, Vulkan viewport, boolean-first UI, wrapping OCC/FreeCAD.
+
+**Rule:** verbs on real topology. No second camera. No second box.
 
 ---
 
@@ -105,38 +128,28 @@ ExtrudeProfile → MakePolyPrism / MakePolyPrismHoles (inner loops) — NOT AABB
 ./ailang.x CAD/cad_app.ailang -o cad_app.x && ./CAD/scripts/run_cad_app.sh
 ```
 
-### Revolve UI (2026-08-09)
+### Revolve (superseded 2026-08-13 — do not use |X| / AABB notes above)
 
 | Piece | Status |
 |-------|--------|
-| Panel **Rev** → cmd `revolve` | **done** |
-| `CA_RevolveFromSketch` | **done** — selected **profile verts** → axis → RZ lathe 360° |
-| Default axis | sketch **Y-axis (X=0)**; **radius = \|X\|** (left half-plane OK) |
-| Custom axis | nearly-vertical sketch line **not** a profile AABB edge (longest wins) |
-| Kernel | `MakeLatheClosed` — **true profile** (arcs/slants kept), not AABB tube |
-| Gate | `demo_revolve` · `demo_revolve_profile` · `demo_revolve_lefthalf` |
+| `revolve` → pick profile → pick **sketch line** as axis | **done** |
+| Signed rho, no \|X\| fold, no AABB tube | **done** |
+| Kind 6 Class A SoR + `MeshLatheAnalytic` (≥90 segs) | **done** |
+| Axis frame pinned (no pool clobber → upright-through-origin cone) | **done** |
+| Mesh slabs sized from `n×nseg` (359-pt B-profile was an index smash) | **done** |
+| Overlay uses **same** `DrawMesh` frame; AXIS label | **done** |
+| Gates | `demo_revolve` · `demo_revolve_profile` · `demo_revolve_caps` |
 
-```bash
-# App: draw profile anywhere; default axis = green Y-axis (X=0)
-#   radius = distance from axis; Profiles → Rev
-# Custom: draw a vertical line (not a profile side) for axis, then Rev
-# Tube: leave a gap between profile and axis (inner radius = gap)
-```
+### Next up (locked 2026-08-13)
 
-### Next up (locked)
+Kernel stubs for OnTop / offset / angle / flip **exist**. Product path is **not** done:
 
-1. ~~**Sketch-on-face**~~ **done** — B-Rep pick + **face signature rebind**  
-   - `PickFaceRay` / `CreateFromFace(solid)` / `ResolveFaceBySignature`  
-   - Plane stores centroid+normal + pid; `RebindFace` after pad (loud miss)  
-   - Gate: `demo_plane_on_top` · `demo_face_rebind`  
-2. **Bare construction planes** — **done** (offset / angle / flip / datums + SkPln)  
-   - Kernel: `CreateOffset`, `CreateAngleX/Y`, `Flip`, `CreateDatumXZ/YZ`  
-   - App: XY/XZ/YZ · Off50 · Flip · Ang90 · SkPln; cmds `plane_off N`, `plane_ang N`, `sketch_pln`  
-   - Gate: `demo_planes_facing` (offset+flip → loft)  
-3. Draft / loft / sweep **verbs** in app (kernel ready; planes ready)  
-4. RevolveCut in app (optional)  
-5. Repo `plane_tree` JSON persist (optional)  
-6. ~~Pattern / dim HUD~~ **deferred**
+1. **Face identity** — `face_map` + HUD pids + loud miss — **done**  
+2. **Sketch wed to plane** — recipe in `plane_tree`; regen parent-first — **done**  
+3. **Sketch-on-face dogfood** — pad → OnTop → click named face → draw → pad/cut; no XY fallback  
+4. **Then** project face edges, then modifiers (cut-on-face, union)
+
+Gates: `demo_plane_tree` · `demo_plane_on_top` · `demo_face_rebind` · `demo_planes_facing`.
 
 ---
 

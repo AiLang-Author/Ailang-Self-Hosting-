@@ -1,121 +1,73 @@
-# Plane-on-face + topo naming (product strategy)
+# Plane-on-face + Sketch_0 lineage
 
-**Status:** **v1 done** — face pick + signature rebind (2026-08-09).  
-**Depends on:** sketch→profile→pad/revolve (done); origin CS-0 (done).
+**Status:** identity + persist tree in (2026-08-13). Signature rebind is last-resort only.  
+**Normative:** `CAD_Kernel_Design_v3.md` §1.4.  
+**Do not** treat signature-matching as the long-term identity model.
 
-### Implementation (no AABB faces)
+---
+
+## Root rule (locked)
+
+**Sketch_0 is the part root.** It owns origin `O` / `+X` / `+Y` (usually world XY).
+
+- Every later **plane** stores `parent_plane` (slot 17) and is a **recipe** on that parent: offset, angle, flip, or “on face of a body grown from this lineage.”
+- Every later **sketch** stores `plane_id` and is **UV only**. World XYZ = `EvalFrame(plane) × (u,v,0)`.
+- Regen walks **Sketch_0 → child planes → sketches → features**. No heuristic “find a similar face and hope.”
+- Reorder or orphan Sketch_0 is unsupported. Loud fail, never silent renumber.
+
+Offset / angle already write `parent`. Face planes now do the same: `CA_SketchOnFace` parents the new plane to the **active plane** (the one that grew the solid), which chains to `CadApp.sk0_plane`.
+
+Signature rebind (`centroid+normal`) is a **last-resort loud miss** if the live face handle died — not the source of truth.
+
+---
+
+## What exists
 
 | Piece | Role |
 |-------|------|
-| `PickFaceRay` | ray vs planar B-Rep faces + UV in-face |
-| `CreateFromFace(face, solid)` | plane recipe: live handle + **signature** + **pid** |
-| Signature | face centroid + normal; match **in-plane** (height slide OK) |
-| `RebindFace` / `EvalFrame` | re-resolve after rebuild; **-1** if lost (no invent) |
-| App **OnTop** | click face → sketch; pad → `RebindFace` on new solid |
+| `CreateWorldXY` | Sketch_0 home plane (`sk0_plane`) |
+| `CreateOffset` / `CreateAngleX/Y` / `Flip` | Child recipes; parent in slot 17 |
+| `CreateFromFace` + `SetParent` | Face plane hung off Sketch_0 lineage |
+| `PickFaceRay` / OnTop | Click planar B-Rep face → new sketch |
+| `RebindFace` | Signature fallback after rebuild; **-1** if lost |
+| `MapLocal` | UV → world via evaluated frame |
 
-**AABB face model removed.** `SolidBounds` = vert extents for framing only.
-
-### Bare construction planes (loft / draft setup)
-
-| Cmd / panel | Action |
-|-------------|--------|
-| **XY** / `plane_xy` | World Sketch_0 plane |
-| **XZ** / **YZ** | Datum planes |
-| **Off50** / `plane_off N` | Offset active plane along normal by N mm |
-| **Flip** / `plane_flip` | Reverse normal (face a partner plane) |
-| **Ang90** / `plane_ang N` | New plane rotated N° about local X |
-| **SkPln** / `sketch_pln` | New sketch on active plane (no solid needed) |
-| **OnTop** | Still: pick solid face → sketch |
-
-Typical loft setup: **XY** → **SkPln** (profile A) → **Off50** → **Flip** → **SkPln** (profile B) → loft verb (next).
-
-### Seeing planes (3D overlay)
-
-Construction planes are **drawn in 3D mode** (`m` / Sketch/3D toggle):
-
-- **Dashed grid** (see-through) ±40 mm UV  
-- **Border**: cyan; **active plane** yellow  
-- **Axes**: U red, V green, normal cyan; yellow origin  
-- **Current sketch** projected onto its plane in cyan  
-
-After **Off / Ang / XY / XZ / YZ / Flip** the app switches to **3D** so the new plane is visible — **orbit** with LMB drag.  
-**SkPln** returns to 2D UV for drawing; press **m** again to inspect in 3D.
-
-### UI (dogfood)
-
-1. Pad base solid (Sketch_0). Stay in **3D**.  
-2. **OnTop** → status: `click FACE for sketch`.  
-3. Orbit if needed; **short LMB click** on a planar solid face.  
-4. App enters **sketch** on that face plane.  
-5. Draw → Profiles → Pad.
+**AABB is not a face.** `SolidBounds` is framing only.
 
 ---
 
-## Problem
+## Cmds
 
-Creating a sketch “on a face” is where FreeCAD-style **topo naming chaos** starts:
-later pads/cuts change face identities, and references break.
-
-## Strategy (wedded plane, not raw face id)
-
-When the user starts a **new sketch on a face**:
-
-1. **Create a `PlaneFeature`** (see `plane_coordinate_tree_spec.md`) **bound to that face**.
-2. Place the sketch on that plane (not “floating in world XY”).
-3. **Persist the plane as a recipe relative to world XYZ zero**, not only as “face #7”:
-   - origin (point / face centroid / …)
-   - normal / orientation (angle relative to world axes)
-   - offset distance along normal
-   - optional modifiers (tilt, flip)
-4. Store as repo asset role **`plane_tree`** (JSON) on the revision, plus a **link** from the sketch feature to that plane id in `feature_tree`.
-
-### Why this helps
-
-| Edit | Desired behavior |
-|------|------------------|
-| Tilt the cylinder / host solid | Plane **stays wed to the face** (re-eval recipe from face + stored offsets) |
-| Change face boundary shape | Plane still defined by face attachment + recipe |
-| Change height of box under the plane | Plane **follows** the face (attachment re-solved) |
-
-**Alignment drift can happen** — that is acceptable.  
-What we **refuse** is silent rebinding to the wrong face (topo chaos).
-
-If the supporting face cannot be re-identified, **loud failure** (same spirit as `CAD_Feat.ResolveNaming` → refuse inventing entities).
+| Cmd | Action |
+|-----|--------|
+| `plane_xy` | Activate Sketch_0 |
+| `plane_off N` | Offset active along normal |
+| `plane_ang N` | Rotate about local X |
+| `plane_flip` | Reverse normal |
+| `plane_pick` | Click a construction plane (or tree Plane row) to activate |
+| `plane_from` | Click a planar face → construction plane only (no sketch) |
+| `plane_org` | Click a vertex/point → move active origin there |
+| `plane_3pt` | Click three points → new plane |
+| `sketch_pln` | New sketch on active plane |
+| Sketch on Face (`plane_top`) | Click a planar face → **new** UV sketch parented to Sketch_0 (not Sketch_0 itself) |
 
 ---
 
-## Persistent naming role
+## Still to grind
 
-- **Face/edge pids** (`face_map` asset) name entities for **picking and reattachment**.
-- The **sketch does not store “face 12” alone** — it stores **plane id**, and the plane stores **attachment + world-relative recipe**.
-- After regen: resolve face via pid map → recompute plane frame → sketch UV stays on that plane.
-
-## Next feature after planes: face projection
-
-Once sketch lives on a face-plane:
-
-- **Project** edges/curves from the underlying face into the sketch plane  
-  so the user can hang dimensions / profile off the real solid (odd extrudes/revolves).
-
-That is a **sketcher** feature (project external geometry), not a pure topo feature.
+1. Dogfood: Sketch_0 pad → OnTop → named face → sketch → pad/cut; no XY fallback  
+2. Project face edges — dashed loop + gold anchors (`proj` toggle). Snap-to-edge next.  
+3. Dim values on the Constrain tab (solver already origin-relative)
 
 ---
 
-## Implementation order
-
-1. ~~Document open/save UI~~ (basic list / open / save / close)
-2. **PlaneFeature eval** + `plane_tree` asset write/read  
-3. **Sketch on plane** (not only world XY)  
-4. **Auto plane-on-face** when “new sketch on face” is invoked  
-5. **face_map** pids + `ResolveNaming`  
-6. **Project face geometry** into sketch  
-
----
-
-## Repo asset roles (already reserved)
+## Repo roles
 
 | Role | Content |
 |------|---------|
-| `plane_tree` | PlaneFeature JSON (origin, mode, angles, distances) |
-| `face_map` | Persistent face/edge ids ↔ topology hints |
-| `profile_dxf` | Sketch IR (may later key by plane id) |
+| `plane_tree` | PT1 JSON: `sk0`/`act`/`skpl` + `P` recipe rows (parent pid, mode, offset/angle bits, frame, sig) |
+| `face_map` | FM1 JSON: stable plane pid ↔ face signature (Sketch_0 lineage, not “face #7”) |
+| `profile_dxf` | Sketch IR; `skpl` in `plane_tree` rebinds UV on load |
+
+HUD (`hud.txt`): `sk0=` `pl=` `par=` `face=` `n=` — real pids, not 0/1 flags.  
+Regen after pad: `CA_RegenPlaneTree` walks registration order (parents first). FACE miss is logged, never silent XY.

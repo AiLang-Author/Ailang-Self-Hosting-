@@ -310,27 +310,27 @@ int main(int argc, char **argv) {
                                 pan_mode = 1;
                                 click_pending = 0; /* cancel deferred click */
                             }
-                            /* moved before hold timer: commit click for tool drag */
-                            if (!pan_mode && moved && click_pending && !click_sent) {
-                                char cmd[64];
-                                snprintf(cmd, sizeof cmd, "click %d %d %d", down_x, down_y, click_sh);
-                                write_cmd(cmd);
-                                click_sent = 1;
-                                click_pending = 0;
-                            }
+                            /*
+                             * Do NOT commit a click on drag. One press/release = one
+                             * sketch click; rubber-band is hover between clicks.
+                             * (Old: click on first move + click on release finished
+                             * a line with no rubber-band phase.)
+                             */
                             if (pan_mode) {
                                 pend_panx += dx;
                                 pend_pany += dy;
                                 last_x = fx;
                                 last_y = fy;
                             } else {
-                                /* rubber-band hover after first click committed */
+                                /* rubber-band hover while button down */
                                 if (abs(fx - last_hover_fx) >= 1 || abs(fy - last_hover_fy) >= 1) {
                                     pend_hover = 1;
                                     hover_fx = fx;
                                     hover_fy = fy;
                                     last_hover_fx = fx;
                                     last_hover_fy = fy;
+                                    last_x = fx;
+                                    last_y = fy;
                                 }
                             }
                         } else {
@@ -366,20 +366,22 @@ int main(int argc, char **argv) {
                             /* end pan — no click */
                             pan_mode = 0;
                         } else if (fx >= 0 && fy >= 0 && (fw <= 0 || (fx < fw && fy < fh))) {
+                            /* Exactly ONE click per press/release */
                             if (click_pending && !click_sent) {
-                                /* pure short click */
                                 char cmd[64];
-                                snprintf(cmd, sizeof cmd, "click %d %d %d", down_x, down_y, click_sh);
+                                int cx = (moved && (adx >= 3 || ady >= 3)) ? fx : down_x;
+                                int cy = (moved && (adx >= 3 || ady >= 3)) ? fy : down_y;
+                                snprintf(cmd, sizeof cmd, "click %d %d %d", cx, cy, click_sh);
                                 write_cmd(cmd);
                                 click_sent = 1;
                                 click_pending = 0;
-                            } else if (click_sent && (moved || adx >= 3 || ady >= 3)) {
-                                /* second click for drag tools (radius / end) */
-                                char cmd[64];
-                                int sh = (ev.xbutton.state & ShiftMask) ? 1 : 0;
-                                snprintf(cmd, sizeof cmd, "click %d %d %d", fx, fy, sh);
-                                write_cmd(cmd);
+                                pend_hover = 1;
+                                hover_fx = cx;
+                                hover_fy = cy;
+                                last_hover_fx = cx;
+                                last_hover_fy = cy;
                             }
+                            /* NO second click on the same press/release */
                         }
                         click_pending = 0;
                     } else {

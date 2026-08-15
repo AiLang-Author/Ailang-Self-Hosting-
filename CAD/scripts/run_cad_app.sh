@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Live CAD viewport launcher (FLTK shell preferred; X11 host+panel fallback).
-# Does NOT use headless BMP as the daily path.
+# Live CAD viewport launcher.
+# Product chrome is Gtk3 (tools.json). FLTK is dropped.
+# PostgreSQL cad_db is required (docs). See docs/cad/CAD_UI_PLAN.md v3.
 #
 # Usage:
 #   ./CAD/scripts/run_cad_app.sh
 #   ./CAD/scripts/run_cad_app.sh -i test-stl/test-dxf-files/diamond.dxf -H 15
-#   CAD_UI=x11 ./CAD/scripts/run_cad_app.sh    # force legacy X11 hosts
-#   CAD_UI=fltk ./CAD/scripts/run_cad_app.sh   # force FLTK (default if built)
+#   CAD_UI=x11  ./CAD/scripts/run_cad_app.sh   # emergency X11 blit+panel only
 #
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -15,11 +15,10 @@ cd "$ROOT"
 STATE="${CAD_APP_STATE:-/tmp/cad_app}"
 HOST_BIN="./CAD/host/cad_host_x11"
 PANEL_BIN="./CAD/host/cad_panel_x11"
-SHELL_BIN="./CAD/host/cad_shell_fltk"
-FLTK_CFG="${FLTK_CONFIG:-$ROOT/third_party/fltk/bin/fltk-config}"
+GTK_SHELL="./CAD/host/cad_shell_gtk"
 APP_BIN="./cad_app.x"
 APP_SRC="CAD/cad_app.ailang"
-UI="${CAD_UI:-auto}"
+UI="${CAD_UI:-gtk}"
 
 # --- display check (X11 or XWayland under Wayland) ---
 if [[ -z "${DISPLAY:-}" ]]; then
@@ -37,6 +36,10 @@ fi
 if [[ -z "${XAUTHORITY:-}" && -f "$HOME/.Xauthority" ]]; then
   export XAUTHORITY="$HOME/.Xauthority"
 fi
+
+export XMODIFIERS="${XMODIFIERS:-@im=none}"
+export GTK_IM_MODULE="${GTK_IM_MODULE:-}"
+export QT_IM_MODULE="${QT_IM_MODULE:-}"
 
 if ! xdpyinfo -display "$DISPLAY" >/dev/null 2>&1; then
   echo "ERROR: cannot talk to X display '$DISPLAY' (xdpyinfo failed)."
@@ -56,53 +59,71 @@ build_x11() {
   fi
 }
 
-build_fltk() {
-  if [[ ! -x "$FLTK_CFG" ]]; then
-    return 1
-  fi
-  if [[ ! -x "$SHELL_BIN" ]] || [[ "$SHELL_BIN" -ot CAD/host/cad_shell_fltk.cxx ]]; then
-    echo "run_cad_app: building cad_shell_fltk..."
-    g++ -O2 -o "$SHELL_BIN" CAD/host/cad_shell_fltk.cxx \
-      $($FLTK_CFG --cxxflags) $($FLTK_CFG --ldflags --use-images)
-  fi
-  return 0
+have_gtk() {
+  # compiled Gtk3 host (Python shell is gone)
+  [[ -x "$GTK_SHELL" ]] || [[ -f CAD/host/cad_shell_gtk.cxx ]]
 }
 
-USE_FLTK=0
+UI_KIND=""  # gtk | x11
 case "$UI" in
-  fltk)
-    if ! build_fltk; then
-      echo "ERROR: CAD_UI=fltk but FLTK not at $FLTK_CFG" >&2
-      exit 1
-    fi
-    USE_FLTK=1
-    ;;
   x11)
     build_x11
-    USE_FLTK=0
+    UI_KIND=x11
     ;;
-  auto|*)
-    if build_fltk; then
-      USE_FLTK=1
-    else
-      echo "run_cad_app: FLTK not found — falling back to X11 host+panel"
-      build_x11
-      USE_FLTK=0
+  fltk)
+    echo "ERROR: FLTK host is dropped. Use Gtk (default) or CAD_UI=x11." >&2
+    exit 1
+    ;;
+  gtk|auto|*)
+    if ! have_gtk; then
+      echo "ERROR: compiled Gtk host missing (make -C CAD/host gtk)." >&2
+      exit 1
     fi
+    UI_KIND=gtk
     ;;
 esac
 
-if [[ ! -x "$APP_BIN" ]] || [[ "$APP_BIN" -ot "$APP_SRC" ]]; then
+# --- PostgreSQL: UI catalog seed (hard dep) ---
+if ! psql -d cad_db -c 'SELECT 1' >/dev/null 2>&1; then
+  echo "ERROR: PostgreSQL cad_db not reachable (product hard dep)." >&2
+  echo "  createdb cad_db && psql -d cad_db -f CAD/sql/cad_schema.sql" >&2
+  echo "  psql -d cad_db -f CAD/sql/cad_ui_catalog.sql" >&2
+  exit 1
+fi
+echo "run_cad_app: seeding UI catalog into cad_db..."
+psql -d cad_db -v ON_ERROR_STOP=1 -f "$ROOT/CAD/sql/cad_ui_catalog.sql" >/dev/null
+
+need_rebuild=0
+if [[ ! -x "$APP_BIN" ]]; then
+  need_rebuild=1
+fi
+for src in "$APP_SRC" \
+           CAD/App/Doc.ailang CAD/App/Ipc.ailang CAD/App/Tools.ailang \
+           CAD/App/Draw.ailang CAD/App/State.ailang CAD/App/Solid.ailang \
+           CAD/App/Plane.ailang \
+           Librarys/Cad/Library.CAD_UI.ailang \
+           Librarys/Cad/Library.CAD_Repo.ailang; do
+  if [[ -f "$src" && "$APP_BIN" -ot "$src" ]]; then
+    need_rebuild=1
+  fi
+done
+if [[ "$need_rebuild" -eq 1 ]]; then
   echo "run_cad_app: building cad_app..."
   ./ailang.x "$APP_SRC" -o "$APP_BIN"
 fi
 
 mkdir -p "$STATE" test-stl
+# keep last session log for cat after a crash; rotate to .prev
+if [[ -f "$STATE/session.log" ]]; then
+  mv -f "$STATE/session.log" "$STATE/session.prev.log"
+fi
+echo "run_cad_app: session log $STATE/session.log  (previous → session.prev.log)"
 # wipe IPC state so startup never shows previous session frame/solid/status
 rm -f "$STATE"/cmd.txt "$STATE"/frame.raw "$STATE"/meta.bin \
       "$STATE"/gen.txt "$STATE"/status.txt "$STATE"/tool.txt \
       "$STATE"/parts.txt "$STATE"/sel.txt "$STATE"/hud.txt \
-      "$STATE"/path.txt "$STATE"/shot.bmp "$STATE"/viewport.png
+      "$STATE"/path.txt "$STATE"/shot.bmp "$STATE"/viewport.png \
+      "$STATE"/tools.json
 : > "$STATE/cmd.txt"
 printf '0\n' > "$STATE/gen.txt"
 printf 'SKETCH empty\n' > "$STATE/status.txt"
@@ -111,18 +132,26 @@ printf 'mode=sketch tool=line phase=0 pad_H=20 plane_pid=0 plane_n=0 grid=1 dirt
 
 HOST_PID=""
 PANEL_PID=""
-if [[ "$USE_FLTK" -eq 1 ]]; then
-  echo "run_cad_app: starting FLTK shell..."
-  "$SHELL_BIN" "$STATE" &
-  HOST_PID=$!
-else
-  echo "run_cad_app: starting viewport host..."
-  "$HOST_BIN" "$STATE" &
-  HOST_PID=$!
-  echo "run_cad_app: starting tools panel..."
-  "$PANEL_BIN" "$STATE" &
-  PANEL_PID=$!
-fi
+export CAD_APP_STATE="$STATE"
+case "$UI_KIND" in
+  gtk)
+    if [[ ! -x "$GTK_SHELL" ]] || [[ "$GTK_SHELL" -ot CAD/host/cad_shell_gtk.cxx ]]; then
+      echo "run_cad_app: building compiled Gtk shell..."
+      make -C CAD/host gtk
+    fi
+    echo "run_cad_app: starting compiled Gtk shell..."
+    "$GTK_SHELL" "$STATE" &
+    HOST_PID=$!
+    ;;
+  x11)
+    echo "run_cad_app: starting viewport host..."
+    "$HOST_BIN" "$STATE" &
+    HOST_PID=$!
+    echo "run_cad_app: starting tools panel..."
+    "$PANEL_BIN" "$STATE" &
+    PANEL_PID=$!
+    ;;
+esac
 
 cleanup() {
   echo "run_cad_app: shutting down (clear state + hosts)"
@@ -130,10 +159,17 @@ cleanup() {
         "$STATE"/gen.txt "$STATE"/status.txt "$STATE"/tool.txt \
         "$STATE"/parts.txt "$STATE"/sel.txt "$STATE"/hud.txt \
         "$STATE"/path.txt 2>/dev/null || true
-  [[ -n "$HOST_PID" ]] && kill "$HOST_PID" 2>/dev/null || true
-  [[ -n "$PANEL_PID" ]] && kill "$PANEL_PID" 2>/dev/null || true
-  wait "$HOST_PID" 2>/dev/null || true
-  [[ -n "$PANEL_PID" ]] && wait "$PANEL_PID" 2>/dev/null || true
+  # leave session.log / session.prev.log — cat after a crash instead of pasting
+  if [[ -n "$HOST_PID" ]]; then
+    kill -15 "$HOST_PID" 2>/dev/null || true
+    sleep 0.2
+    kill -9 "$HOST_PID" 2>/dev/null || true
+  fi
+  if [[ -n "$PANEL_PID" ]]; then
+    kill -15 "$PANEL_PID" 2>/dev/null || true
+    sleep 0.05
+    kill -9 "$PANEL_PID" 2>/dev/null || true
+  fi
 }
 trap cleanup EXIT INT TERM
 
@@ -142,7 +178,7 @@ if ! kill -0 "$HOST_PID" 2>/dev/null; then
   echo "ERROR: UI host exited immediately — no window."
   exit 1
 fi
-echo "run_cad_app: UI pid=$HOST_PID  fltk=$USE_FLTK"
+echo "run_cad_app: UI pid=$HOST_PID  kind=$UI_KIND"
 
 if [[ $# -eq 0 ]]; then
   set -- -H 20
@@ -150,11 +186,7 @@ fi
 
 echo "run_cad_app: starting model loop: $APP_BIN --nohost $*"
 echo "  VIEWPORT: LMB orbit | scroll zoom | sketch click | RMB cancel"
-if [[ "$USE_FLTK" -eq 1 ]]; then
-  echo "  MENUS: File · Sketch · Plane · Feature · View (grid, open DXF, shot)"
-else
-  echo "  PANEL: tools / file buttons (IPC)"
-fi
+echo "  CHROME: Gtk from CAD_UI tools.json (cmd: tools to refresh)"
 echo "  Agent:  ./CAD/scripts/cad_cmd.sh <cmd> --wait"
 echo "          ./CAD/scripts/cad_shot.sh [out.png]"
-exec "$APP_BIN" --nohost "$@"
+"$APP_BIN" --nohost "$@"
