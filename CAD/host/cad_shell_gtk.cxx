@@ -3002,6 +3002,7 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Back", "view6"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Bottom", "view7"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Grid", "grid"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vw), mk_btn("Sketch", "skvis"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Wire", "wire"), FALSE, FALSE, 0);
     {
         GtkWidget *lb = gtk_label_new(" Solid");
@@ -3100,6 +3101,7 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Zoom+", "zoom 1"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Zoom-", "zoom -1"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Grid", "grid"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Sketch", "skvis"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Wire", "wire"), FALSE, FALSE, 0);
     gtk_overlay_add_overlay(GTK_OVERLAY(ov), navbar);
 
