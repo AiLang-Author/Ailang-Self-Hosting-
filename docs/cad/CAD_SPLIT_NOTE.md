@@ -27,7 +27,7 @@ AILang imports just inline the file. No headers, no Python circular-import tax. 
 
 | File | LOC | Suggested cut |
 |------|----:|---------------|
-| Library.CAD_Topo.ailang | **12971** | Make* vs bool-support vs Rebuild/map vs FaceGet* |
+| Library.CAD_Topo.ailang | **facade** (~40) | Split 2026-08-16 into `Librarys/Cad/Topo/` (13 files, all <1500). Callers still `LibraryImport.Cad.CAD_Topo`. Revert: `Library.CAD_Topo.ailang.pre_split`. |
 | Library.CAD_Tess.ailang | **4519** | earclip vs cyl/annulus vs collect |
 | Library.CAD_SketchProfile.ailang | 2185 | tessellate vs BuildAllClosedLoops vs weld |
 | Library.CAD_Sketch.ailang | 1666 | create/add vs query vs constraints |
