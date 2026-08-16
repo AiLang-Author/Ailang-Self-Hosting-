@@ -1,8 +1,10 @@
 # CAD.Repo — PostgreSQL system of record
 
-**Status:** orthogonal v2 (document / revision / asset)  
+**Status:** orthogonal v3 (document / revision / asset + **UI catalog**)  
 **Driver:** `LibraryImport.PostgreSQL_Complete` (wire protocol v3, Unix peer + TCP)  
-**No `.cadx`.** Interchange and authority live in SQL + typed assets.
+**No `.cadx`.** Interchange and authority live in SQL + typed assets.  
+**Hard dependency:** product `cad_app` **always** connects to PG. No offline fork.  
+**UI chrome:** `cad_ui_catalog` JSONB → IPC `tools.json` (see `CAD_UI_PLAN.md` v3).
 
 ---
 
@@ -28,8 +30,8 @@ Instead:
 | `profile_dxf` | `application/dxf` | **Authoritative** 2D profile |
 | `hole_dxf` | `application/dxf` | Optional through-hole profile |
 | `step_cache` | `model/step` | Derived solid cache |
-| `plane_tree` | `application/json` | *(planned)* PlaneFeature stack |
-| `face_map` | `application/json` | *(planned)* persistent face/edge names |
+| `plane_tree` | `application/json` | Sketch_0 tree (PT1: parent/mode/recipe + frame + sig) |
+| `face_map` | `application/json` | Stable plane pid ↔ face signature |
 | `mesh_*` | binary later | Tess caches |
 
 ---
@@ -51,9 +53,9 @@ LibraryImport.Cad.CAD_Repo
 |----------|---------|
 | `ConnectLocal` / `Disconnect` | PG session |
 | `InitSchema` | Create orthogonal tables (idempotent) |
-| `SavePart(name, sketch, solid, H, hole)` | New revision + assets |
-| `LoadPart` / `LoadPartRev` | Rebuild solid from DXF assets |
-| `ListParts` / `ListRevisions` | Discovery |
+| `SavePart(name, sketch, solid, H, hole)` | New revision + assets (`save_kind`: part/assembly/group/machine) |
+| `LoadPart` / `LoadPartRev` | Import DXF; app clears the last doc then pads the profile |
+| `ListParts` / `ListRevisions` | Discovery (`name<TAB>kind`) |
 | `SetLastMessage` | Commit message on latest rev |
 | `PutAssetText` / `FetchAssetToFile` | Extensible blob path |
 | `BeginSession` / `EndSession` | Session bookkeeping |
@@ -73,14 +75,25 @@ Smoke: `./CAD/smoke_app.sh` (runs `test_repo_live` when `cad_db` is reachable).
 
 ---
 
+## UI catalog (v3)
+
+```sql
+cad_ui_catalog (role TEXT PK, catalog JSONB, updated_at)
+-- seed: CAD/sql/cad_ui_catalog.sql
+-- kernel: CAD_Repo.PublishToolsJson → /tmp/cad_app/tools.json
+```
+
+Host never invents tool cmds; it only displays `catalog.toolbars[].tools[]` and writes each tool's `cmd` to `cmd.txt`.
+
 ## Roadmap (storage stays orthogonal)
 
 1. **List / open UI** — `ListParts` + pick name in host  
 2. **Revision browser** — `ListRevisions` + load rev N  
 3. **Richer feature_tree** — pad/cut/fillet ops as JSON; `cad_feature` rows  
 4. **Checkout** — `cad_checkout` enforce single writer  
-5. **Planes** — `plane_tree` asset (`plane_coordinate_tree_spec.md`)  
-6. **Topo naming** — `face_map` asset + `CAD_Feat.ResolveNaming` (design § Feat_Pid)
+5. **Planes** — `plane_tree` asset **written** (`plane_coordinate_tree_spec.md` / PT1)  
+6. **Topo naming** — `face_map` asset **written** (pid ↔ signature); `CAD_Feat.ResolveNaming` still open  
+7. **Normalized workbench tables** (optional) that project into `cad_ui_catalog.catalog`
 
 Regeneration rule remains: **sketch / feature_tree authority → rebuild solid**; STEP is cache.
 

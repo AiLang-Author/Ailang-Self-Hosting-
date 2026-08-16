@@ -222,5 +222,6 @@ Do **not** start B10/B11 or general OCCT-style bool while B4 is red.
 | 2026-08-15 | B1 | `ClassifyFace` real |
 | 2026-08-15 | B2 | `FaceOuterXY` |
 | 2026-08-15 | B4/B6 | `GlueOnFace` + app JOIN. Plate/hole recipes kept until B5 (CUT). |
+| 2026-08-15 | B4 fix | stitchfail: last-match glued boss to a **wall** (`PointInFaceUV` ignores plane). Now require all tool verts on host plane; pick lowest plane-error pair. Demo `ninner=1 zok=1 wt=1`. |
 
 Update this table when a chunk’s demo is green (or when a chunk is blocked — say why).

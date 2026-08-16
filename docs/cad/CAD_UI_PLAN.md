@@ -1,226 +1,214 @@
-# CAD UI Plan — Internal dogfood (FLTK shell + IPC viewport)
+# CAD UI Plan v3 — IPC chrome + PG JSON catalog
 
-**Status:** charter locked (2026-08-09)  
-**Scope:** internal development only — not a product release  
-**License:** Sean Collins Software License (SCSL v1.0) — see repo root `License.md` / `LICENSE`
+**Status:** locked 2026-08-13 (v3)  
+**Replaces:** UI plan v1 (FLTK-as-product-shell), soft-optional PG notes  
+**Pairs with:** `CAD_REPO.md`, `CAD_APP_PLAN.md`, `CAD_Kernel_Design_v3.md` (engine only)  
+**UI implementers (Gemini / Fable / external):** use **`CAD_HOST_UI_BUILDER.md`** — full coding brief (IPC, pixels, tools.json, acceptance).  
+**Read time (this file):** ~8–10 min @ 250 wpm
 
 ---
 
-## 1. Architecture shape (do not break)
+## 0. One-page architecture
 
 ```text
-┌──────────────────────────────────────────────────────────────────┐
-│  FLTK presenter (window chrome only)                             │
-│  ┌── ribbon / menus ──┐  ┌── HUD (upper right) ──┐               │
-│  │ File · Sketch ▾    │  │ tool L / angle / R    │               │
-│  │ Plane ▾ · Feature ▾│  │ pad H / plane offset  │               │
-│  └────────────────────┘  └───────────────────────┘               │
-│  ┌────────────────────────────────────────────────────────────┐  │
-│  │  Viewport = blit kernel frame.raw (ARGB)                   │  │
-│  │  solids + planes + sketch overlay · orbit · pick           │  │
-│  │  grid toggle · RMB context for in-use tool                 │  │
-│  └────────────────────────────────────────────────────────────┘  │
-│  status line: mode · active plane · tool · selection             │
-└────────────────────────────▲─────────────────────────────────────┘
-                             │ IPC (/tmp/cad_app/* or socket later)
-┌────────────────────────────┴─────────────────────────────────────┐
-│  cad_app.x (AILang kernel)                                       │
-│  model · tess · planes · selection · HUD numbers as data         │
-│  never opens X11/GTK/FLTK                                        │
-└──────────────────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│  Host chrome (compiled Gtk3; AOS later)     DISPOSABLE      │
+│  • menus / toolbars from tools.json                         │
+│  • blits frame.raw                                          │
+│  • writes cmd.txt                                           │
+└────────────────────────────▲────────────────────────────────┘
+                             │ IPC only (pixel + cmd + JSON)
+┌────────────────────────────┴────────────────────────────────┐
+│  cad_app.x (AILang)   PERMANENT                             │
+│  sketch · pad · tess · shade · pick · docs                  │
+│  never links Gtk/Qt/FLTK/X11/Wayland                        │
+└────────────────────────────▲────────────────────────────────┘
+                             │ always
+┌────────────────────────────┴────────────────────────────────┐
+│  PostgreSQL (hard dependency)                               │
+│  docs/revs/assets + cad_ui_catalog (JSONB tool chrome)      │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Rules**
+| Layer | Owns | Does not own |
+|-------|------|----------------|
+| **Kernel** | Geometry, FB pixels, cmd execution, PG connect, emit `tools.json` | Button layout, docking, themes |
+| **Host** | Chrome layout, file dialogs, blit, input | Tess, BREP, shade math, inventing tool cmds |
+| **PG** | SoR + UI catalog JSON | Pixels |
 
-1. Kernel **never** owns windowing. It fills a buffer + owns model + publishes HUD fields.  
-2. Presenter is swappable: X11 host today → **FLTK shell** next → AOS later. Same IPC.  
-3. Viewport already shows planes + solids together — keep that; polish chrome around it.  
-4. Temporary button panel is disposable; do not grow more one-off buttons as the product UI.
+**Rules (do not break)**
 
----
+1. Kernel **never** links a windowing toolkit.  
+2. Host **only** blits the pixel stream and sends IPC cmds.  
+3. **PostgreSQL is required** — no offline CAD product path (one code path).  
+4. Tool **cmds** are owned by `Library.CAD_UI` (kernel writes `tools.json`). PG seed is optional sync.  
+5. AOS later = another host on the **same contract**.  
+6. Host **Quit** writes `quit`; kernel runs `CA_Shutdown`.
 
-## 2. Presenter choice
-
-| Option | Decision |
-|--------|----------|
-| **FLTK** | **Yes** — shell for menus, dialogs, ribbon strip, HUD panel |
-| X11 host (current) | Keep as blit/reference or fold into FLTK drawable |
-| GTK3 | Avoid for shell (heavy / friction); optional zenity only if needed |
-| Qt | No |
-
-FLTK draws **chrome only**. The CAD image is still `frame.raw` from the kernel (or shared mem later).
+Aligned with kernel design v3.1: no GUI in kernel; PG system of record; UI tables free with PG. Kernel design stops at mesh+CLI — **this doc owns the pixel/IPC host split.**
 
 ---
 
-## 3. Viewport (already roughly right)
+## 1. IPC contract (frozen)
 
-| Need | Plan |
-|------|------|
-| Solids + planes + sketch together | **Keep** current 3D construction view |
-| Grid toggle | Cmd `grid` / `grid 0` / `grid 1` — plane UV grid on/off (axes may stay) |
-| Orbit / zoom / nav cube | Keep; clarify click vs orbit (tool or modifier) |
-| See-through plane grid | Dashed / sparse lines (done); improve later |
+Session dir: `CAD_APP_STATE` (default `/tmp/cad_app`).
 
-**Mode policy (target)**
+| File | Direction | Role |
+|------|-----------|------|
+| `meta.bin` | K→H | `w,h,pitch` LE int32 |
+| `frame.raw` | K→H | BGRA pixels |
+| `gen.txt` | K→H | frame generation counter |
+| `cmd.txt` | H→K | one command line; kernel clears after read |
+| `tool.txt` | K→H | `mode tool nclick dirty …` |
+| `status.txt` / `hud.txt` | K→H | human / structured status |
+| **`tools.json`** | K→H | **UI catalog projection from PG** |
+| `path.txt` | H→K | import path |
+| `parts.txt` / `sel.txt` | K→H | repo list overlay |
 
-- Prefer **one 3D scene**; sketch tools draw on **active plane** (UV mapped in place).  
-- Full-screen 2D UV remains available for precision, not the only way to exist.
+### Cmd vocabulary (host writes exact `cmd` strings from JSON)
+
+Sketch: `tool_line|rect|rectc|rect3|circ|circ2|circ3|arc|arc2|arc3|polyN|spline|point|trim|pick|fillet2d` · `profiles` · `done`  
+Feature: `repad` · `revolve` · `cut` · `height N`  
+Solid: `tool_fillet3d` · `fillet R` · `tool_chamfer` · `chamfer D`  
+View: `mode` · `wire` · `grid` · `orbit` · `zoom` · `pan` · `iso` · `view0|1|2`  
+Doc: `import` · `newdoc` · `name <part>` · `save` · `load` · `files` · **`quit`**  
+Meta: `tools` → re-publish catalog from `CAD_UI`  
+
+Input: `click x y [shift]` · `hover x y`
+
+**Versioning:** `tools.json` has `"schema": 1`. Host ignores unknown fields; kernel adds fields only.
 
 ---
 
-## 4. HUD (upper right — kernel-driven)
+## 2. PostgreSQL hard dep + JSON catalog
 
-**Placement:** upper-right of viewport (kernel can paint into FB, or FLTK overlays text from IPC).
+### Why hard
 
-**Phase A (first):** kernel publishes HUD lines; presenter (or kernel FB) shows them UR.
+Dual “works without PG” paths = two products. **Refuse.**  
+If PG is down → `cad_app` exits with a clear error. Launcher may print how to `createdb cad_db`.
 
-| Context | Fields |
-|---------|--------|
-| Line / rect place | length, optional angle |
-| Circle / arc | radius, angle span |
-| Pad / cut | height / depth |
-| Plane create | offset mm, angle deg |
-| Always | active plane pid, tool name, mode |
+### Catalog storage (v3)
 
-**Phase B (later by tool type):** richer per-tool panels (line vs circle templates).  
-**Phase C (after UI up):** **Measure tool** (distance / angle pick-to-pick).
+One row of JSONB — send JSON, boom done (matches product preference):
 
-IPC sketch:
-
-```text
-# /tmp/cad_app/hud.txt  (or fields in status.txt)
-tool=line phase=2 L=42.5 ang=0
-pad_H=10
-plane_pid=2 plane_off=50
-grid=1
+```sql
+cad_ui_catalog (
+  role     TEXT PRIMARY KEY,   -- e.g. 'default'
+  catalog  JSONB NOT NULL,    -- full tools.json body
+  updated_at TIMESTAMPTZ
+)
 ```
 
-Presenter **displays** numbers; kernel **owns** them.
+Optional normalized tables (`cad_workbench` / `cad_toolbar` / `cad_tool`) can **project into** this JSON later; hosts never query SQL.
+
+### JSON shape
+
+```json
+{
+  "schema": 1,
+  "app": "cad",
+  "role": "default",
+  "defaults": { "pad_h": 20, "shade": "solid", "wire": 0 },
+  "toolbars": [
+    {
+      "id": "sketch",
+      "label": "Sketch",
+      "tools": [
+        { "id": "line", "label": "Line", "cmd": "tool_line", "group": "draw" }
+      ]
+    }
+  ]
+}
+```
+
+| Field | Meaning |
+|-------|---------|
+| `cmd` | Exact `cmd.txt` line host must write |
+| `id` | Stable key (hotkeys, telemetry) |
+| `label` | Display string (host may theme) |
+| layout / icons / dock | **Host only** |
+
+### Publish path
+
+1. Kernel `ConnectLocal` (required).  
+2. `InitSchema` + ensure `cad_ui_catalog` seed.  
+3. `SELECT catalog::text …` → write `tools.json`.  
+4. Cmd `tools` re-publishes.  
+
+Host: parse JSON once (or on gen/tools change); build chrome; never hardcode tool lists as authority.
 
 ---
 
-## 5. Shell chrome (minimal)
+## 3. Presenter choice (v3)
 
-### File
-- Open / Save with **names** (FLTK file chooser → path into existing load/save cmds)
-- New / Close / export STEP-BMP as today
+| Presenter | Role | Status |
+|-----------|------|--------|
+| **`CAD/host/cad_shell_gtk` (C++ Gtk3)** | **Product shell** — blit, rubber-band, HUD, File menubar, Guest/login chrome | **current** |
+| `cad_host_x11` + panel | Emergency blit only | `CAD_UI=x11` |
+| AOS | Future host | same IPC |
+| FLTK / Python Gtk | **Dropped** | do not build |
 
-### Ribbon-style groups (dropdowns, not a flat 40-button soup)
+Launcher: `./CAD/scripts/run_cad_app.sh` → compiled Gtk. Close window / File→Quit / Ctrl+Q → `quit`.
 
-| Group | Contents |
-|-------|----------|
-| **Sketch** | Line, Rect, Circ, Arc ▸ Arc3, Point, Trim, Pick, Fillet |
-| **Plane** | XY, XZ, YZ, Offset…, Angle…, Flip, On face (pick), SkPln |
-| **Feature** | Pad, Rev, Cut, (Loft / Draft when wired) |
-| **View** | Iso/Top/Front, Wire, Grid toggle, Fit |
-
-### Context (RMB)
-- Only for **in-use tool** + current selection  
-- Examples: Cancel, set height, flip plane, next profile  
-- No global context menu of everything
+File / Import-Export live on the top-left menubar (not a ribbon tab). The app starts as **Guest**; Log in is chrome-only until pgcrypto + capabilities land. Live grind: `CAD_UI_USABILITY.md`.
 
 ---
 
-## 6. Build order
+## 4. Viewport / shade (kernel side of glass)
 
-1. **Grid toggle** (kernel + cmd + HUD flag)  
-2. **HUD channel** + upper-right display (kernel paint or FLTK text)  
-3. **FLTK shell** skeleton: window, menubar/dropdowns, viewport blit widget, status  
-4. **File open/save** dialogs → existing IPC/file paths  
-5. **RMB context** for active tool  
-6. **Measure tool** (after shell usable)  
-7. Multi-sketch list for loft (selection model)  
-8. AOS presenter swap (same buffer API)
+- Kernel owns software raster (`CAD_View`: fill + Z + N·L; optional wire overlay).  
+- Default product view: **shaded** (`wire=0`); `wire` cmd toggles fishnet.  
+- Dense tri edges ≠ “missing mesher” — do not give host a GL path to “fix” that.  
+- Tess quality / defl = kernel; host may only send cmds that change quality later.
 
 ---
 
-## 7. Non-goals (now)
+## 5. Build order (v3)
 
-- Marketing polish, themes, docking like Fusion  
-- Full feature tree / constraint manager UI  
-- Dim-on-geometry HUD (deferred with dim system)  
-- Rewriting viewport in toolkit drawing APIs  
+| # | Item | Done when |
+|---|------|-----------|
+| 1 | This plan + `CAD_REPO` / app pointers | docs |
+| 2 | `CAD/sql/cad_ui_catalog.sql` seed | `psql -f` ok |
+| 3 | Kernel: hard PG connect, publish `tools.json`, cmd `tools` | file appears after start |
+| 4 | Gtk shell reads `tools.json`, blits, sends cmds | draw/pad loop works |
+| 5 | Launcher `CAD_UI=gtk` default when Gi present | one command run |
+| 6 | Shade default solid; wire toggle | pads look solid |
+| 7 | (Later) normalized workbench tables → catalog JSON rebuild | SQL only |
 
 ---
 
-## 8. IPC contract (freeze direction)
+## 6. Non-goals
 
-| Path / channel | Role |
-|----------------|------|
-| `frame.raw` + `meta.bin` | Viewport pixels |
-| `cmd.txt` | Tools, orbit, click, plane, pad… |
-| `status.txt` / `tool.txt` | Mode, tool, dirty |
-| `hud.txt` (new) | Live params for UR HUD |
-| Optional later | socket instead of `/tmp` files |
+- Embedding Gtk/Qt/FLTK in `cad_app.x`  
+- Offline CAD without PostgreSQL  
+- Host re-rasterizing solids  
+- Fusion-class docking product chrome  
+- Rewriting `CAD_Kernel_Design_v3.md` into this file (use agent extracts when needed)
+
+---
+
+## 7. Success criteria
+
+- Start app → PG required → `tools.json` written → Gtk toolbar matches catalog.  
+- Click Line / Rect / Profiles / Pad via toolbar only (no memorized raw cmds).  
+- Viewport is kernel pixels only.  
+- Swap host without recompiling kernel.  
+- Same contract works for agents (`cad_cmd.sh` + `cad_shot.sh`).
+
+---
+
+## 8. Kernel design v3.1 crosswalk (agent extract)
+
+| Kernel design | UI plan v3 |
+|---------------|------------|
+| No GUI / no OpenGL in kernel | Host-only windowing |
+| PG = SoR; Repo critical path | Hard dep; no `.cadx` fallback |
+| UI config free with PG | `cad_ui_catalog` JSONB → `tools.json` |
+| Tess = mesh cache, not pixels | Kernel raster still in `CAD_View` for app; design gap closed here |
+| CLI `cadk` as product surface | Interactive path = IPC host; CLI remains |
 
 ---
 
 ## 9. License
 
-This project (and CAD work) is under **Sean Collins Software License (SCSL v1.0)**  
-Copyright © Sean Collins / 2 Paws Machine and Engineering.  
-See root `License.md` and `LICENSE`. Terms stay SCSL until the author revisits licensing after the stack stabilizes.
-
----
-
-## 10. Success criteria (internal)
-
-- Open a named part, draw on two offset planes, see both grids in 3D, orbit, pad/loft without memorizing raw cmds.  
-- HUD shows length/H while placing without reading the terminal.  
-- Presenter can be swapped without touching kernel geometry code.
-
----
-
-## 11. Implementation status (dogfood)
-
-| Piece | Path | Notes |
-|-------|------|--------|
-| FLTK shell | `CAD/host/cad_shell_fltk.cxx` | Menubar + viewport blit + HUD overlay + status |
-| X11 host (ref) | `CAD/host/cad_host_x11.c` | Still builds; launcher falls back if no FLTK |
-| Tools panel | `CAD/host/cad_panel_x11.c` | Used with X11 path only |
-| Launcher | `CAD/scripts/run_cad_app.sh` | `CAD_UI=auto\|fltk\|x11` |
-| IPC drive | `CAD/scripts/cad_cmd.sh` | `--wait`, `--path` for import |
-| Screenshot | `CAD/scripts/cad_shot.sh` + `frame_to_png.py` | Reads `frame.raw` → PNG |
-| Local FLTK | `third_party/fltk/` | Build notes: `CAD/host/BUILD_FLTK.md` |
-
-### IPC files (`CAD_APP_STATE` default `/tmp/cad_app`)
-
-| File | Role |
-|------|------|
-| `frame.raw` + `meta.bin` | Viewport ARGB (w,h,pitch LE ints in meta) |
-| `gen.txt` | Frame generation counter |
-| `cmd.txt` | One command line; kernel clears after read |
-| `status.txt` | Human status line |
-| `tool.txt` | `mode tool nclick dirty cstr npick` |
-| `hud.txt` | `mode=… tool=… phase=… pad_H=… plane_pid=… plane_n=… grid=… dirty=…` |
-| `path.txt` | Path for `import` (DXF) |
-| `parts.txt` / `sel.txt` | Repo list overlay |
-| `shot.bmp` | Kernel screenshot target (`shot` / `screenshot` cmd) |
-| `viewport.png` | Agent capture via `cad_shot.sh` |
-
-### Useful commands
-
-```text
-orbit dx dy | zoom n | pan dx dy | hover x y | click x y [shift]
-mode | tool_line|rect|circ|arc|3pt|point|trim|pick|fillet
-mirror_x | mirror_y   # sketch: copy entities across X (y→-y) or Y (x→-x)
-plane_xy|xz|yz|top|off N|flip|ang N | sketch_pln
-repad | revolve | cut | height N | h N | hinc | hdec | wire | grid | grid 0 | grid 1
-# while placing a line: viewport shows live ang° + L=mm (relative if shared point)
-import          # reads path.txt
-shot|screenshot # BMP to /tmp/cad_app/shot.bmp
-newdoc | f | g | p | open | k | reload | step | bmp | dxf | quit
-```
-
-### Agent loop
-
-```bash
-./CAD/scripts/run_cad_app.sh &          # or already running
-./CAD/scripts/cad_cmd.sh plane_xy --wait
-./CAD/scripts/cad_cmd.sh tool_rect --wait
-./CAD/scripts/cad_cmd.sh "click 200 200" --wait
-./CAD/scripts/cad_cmd.sh "click 400 350" --wait
-./CAD/scripts/cad_cmd.sh repad --wait
-./CAD/scripts/cad_shot.sh /tmp/cad_view.png
-# read /tmp/cad_view.png or /tmp/cad_app/hud.txt
-```
+SCSL v1.0 — Sean Collins / 2 Paws Machine and Engineering. See root `License.md`.

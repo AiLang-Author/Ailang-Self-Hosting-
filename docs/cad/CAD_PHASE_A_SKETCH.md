@@ -94,7 +94,7 @@ Tag **10**, stride **24**:
 | 24 | n_upts | first-class user Point count |
 | 25 | upts_addr | x,y user Points (not wiped by RebuildAnchors) |
 | 26 | cap_upts | max (512) |
-| 27 | reserved | |
+| 27 | n_face_ref | frozen host-face vertex count (user points 0..n-1) |
 
 **Caps (2026-08-08):** primary loop ≤**4096** verts; profile pool enlarged; `MakePolyPrism` ≤**2048**.
 

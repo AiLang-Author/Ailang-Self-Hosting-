@@ -44,6 +44,35 @@ static void paths_init(const char *dir) {
     snprintf(path_parts, sizeof path_parts, "%s/parts.txt", dir);
 }
 
+/* Names and labels must be UTF-8. Kernel names are ASCII [A-Za-z0-9_.-]. */
+static void sanitize_doc_name(char *d, size_t dn, const char *s) {
+    size_t o = 0;
+    if (!s) s = "";
+    for (; *s && o + 1 < dn; s++) {
+        unsigned char c = (unsigned char)*s;
+        int ok = (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z')
+              || (c >= 'a' && c <= 'z') || c == '_' || c == '-' || c == '.';
+        if (ok) d[o++] = (char)c;
+    }
+    if (o == 0) {
+        snprintf(d, dn, "untitled");
+        return;
+    }
+    d[o] = 0;
+}
+
+static void label_set_safe(GtkWidget *w, const char *s) {
+    if (!w) return;
+    if (!s) s = "";
+    if (g_utf8_validate(s, -1, NULL)) {
+        gtk_label_set_text(GTK_LABEL(w), s);
+        return;
+    }
+    char *v = g_utf8_make_valid(s, -1);
+    gtk_label_set_text(GTK_LABEL(w), v ? v : " ");
+    g_free(v);
+}
+
 static void write_cmd(const char *s) {
     int tries;
     for (tries = 0; tries < 60; tries++) {
@@ -389,11 +418,19 @@ static int doc_dialog(int mode) {
     }
 
     GtkWidget *ent = gtk_entry_new();
-    gtk_entry_set_placeholder_text(GTK_ENTRY(ent), "document name");
+    gtk_entry_set_placeholder_text(GTK_ENTRY(ent), "letters numbers _ . -");
     gtk_entry_set_activates_default(GTK_ENTRY(ent), TRUE);
-    if (mode == DOC_SAVE && G.doc_name[0])
-        gtk_entry_set_text(GTK_ENTRY(ent), G.doc_name);
+    if (mode == DOC_SAVE && G.doc_name[0]) {
+        char safe[64];
+        sanitize_doc_name(safe, sizeof safe, G.doc_name);
+        gtk_entry_set_text(GTK_ENTRY(ent), safe);
+    }
     gtk_box_pack_start(GTK_BOX(box), ent, FALSE, FALSE, 4);
+    if (mode == DOC_SAVE) {
+        GtkWidget *hint = gtk_label_new("Name: A–Z a–z 0–9 _ . -   (spaces and accents are stripped)");
+        gtk_label_set_xalign(GTK_LABEL(hint), 0.0);
+        gtk_box_pack_start(GTK_BOX(box), hint, FALSE, FALSE, 0);
+    }
 
     GtkWidget *combo = NULL;
     if (mode == DOC_SAVE) {
@@ -416,7 +453,10 @@ static int doc_dialog(int mode) {
 
     int did = 0;
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
-        const char *t = gtk_entry_get_text(GTK_ENTRY(ent));
+        const char *raw = gtk_entry_get_text(GTK_ENTRY(ent));
+        char tbuf[64];
+        sanitize_doc_name(tbuf, sizeof tbuf, raw);
+        const char *t = tbuf;
         if (t && t[0]) {
             if (mode == DOC_DELETE) {
                 GtkWidget *ask = gtk_message_dialog_new(
@@ -575,10 +615,12 @@ static void prompt_name_cmd(const char *title, const char *then_cmd) {
     gtk_widget_show_all(dlg);
     gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_ACCEPT);
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
-        const char *t = gtk_entry_get_text(GTK_ENTRY(ent));
-        if (t && t[0]) {
+        const char *raw = gtk_entry_get_text(GTK_ENTRY(ent));
+        char tbuf[64];
+        sanitize_doc_name(tbuf, sizeof tbuf, raw);
+        if (tbuf[0]) {
             char cmd[96];
-            snprintf(cmd, sizeof cmd, "name %.60s", t);
+            snprintf(cmd, sizeof cmd, "name %.60s", tbuf);
             write_cmd(cmd);
             if (then_cmd && then_cmd[0]) write_cmd(then_cmd);
         }
@@ -674,10 +716,12 @@ static void prompt_cmd_name(const char *title, const char *prefix, const char *s
     gtk_widget_show_all(dlg);
     gtk_dialog_set_default_response(GTK_DIALOG(dlg), GTK_RESPONSE_ACCEPT);
     if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
-        const char *t = gtk_entry_get_text(GTK_ENTRY(ent));
-        if (t && t[0]) {
+        const char *raw = gtk_entry_get_text(GTK_ENTRY(ent));
+        char tbuf[64];
+        sanitize_doc_name(tbuf, sizeof tbuf, raw);
+        if (tbuf[0]) {
             char cmd[96];
-            snprintf(cmd, sizeof cmd, "%s %.48s", prefix, t);
+            snprintf(cmd, sizeof cmd, "%s %.48s", prefix, tbuf);
             write_cmd(cmd);
         }
     }
@@ -699,6 +743,12 @@ static void on_plane_offset(GtkButton *, gpointer) {
     write_cmd("plane_off");
     if (G.win) gtk_widget_grab_focus(G.win);
     if (G.da) gtk_widget_queue_draw(G.da);
+}
+
+static void on_opac(GtkRange *r, gpointer) {
+    char cmd[32];
+    snprintf(cmd, sizeof cmd, "opac %d", (int)(gtk_range_get_value(r) + 0.5));
+    write_cmd(cmd);
 }
 
 static void on_plane_angle(GtkButton *, gpointer) {
@@ -2017,20 +2067,22 @@ static gboolean poll_tick(gpointer) {
     }
     if (strcmp(hud, G.hud_line) != 0) {
         snprintf(G.hud_line, sizeof G.hud_line, "%s", hud);
-        if (G.hud_bar) gtk_label_set_text(GTK_LABEL(G.hud_bar), hud[0] ? hud : " ");
+        if (G.hud_bar) label_set_safe(G.hud_bar, hud[0] ? hud : " ");
         gtk_widget_queue_draw(G.da);
     }
     if (strcmp(st, G.status_line) != 0) {
         snprintf(G.status_line, sizeof G.status_line, "%s", st);
-        if (G.status) gtk_label_set_text(GTK_LABEL(G.status), st[0] ? st : "ready");
+        if (G.status) label_set_safe(G.status, st[0] ? st : "ready");
         if (!G.doc_name[0] && strncmp(st, "DOC ", 4) == 0) {
             const char *p = st + 4;
+            char raw[64];
             int i = 0;
             while (p[i] && p[i] != ' ' && p[i] != '\n' && i < 63) {
-                G.doc_name[i] = p[i];
+                raw[i] = p[i];
                 i++;
             }
-            G.doc_name[i] = 0;
+            raw[i] = 0;
+            sanitize_doc_name(G.doc_name, sizeof G.doc_name, raw);
             if (strcmp(G.doc_name, "untitled") == 0) G.doc_name[0] = 0;
         }
     }
@@ -2525,13 +2577,28 @@ static void load_tree(void) {
                 if (depth > 3) depth = 3;
                 char cmd[32], shown[96];
                 snprintf(cmd, sizeof cmd, "tree %c %d", kind, id);
-                snprintf(shown, sizeof shown, "%s%s", mark == '*' ? "● " : "", lab);
+                {
+                    char clean[80];
+                    int ci = 0, li = 0;
+                    while (lab[li] && ci < 79) {
+                        unsigned char c = (unsigned char)lab[li++];
+                        if (c >= 32 && c < 127) clean[ci++] = (char)c;
+                    }
+                    clean[ci] = 0;
+                    snprintf(shown, sizeof shown, "%s%s", mark == '*' ? "* " : "", clean);
+                }
                 GtkTreeIter it;
                 if (depth == 0 || !have[depth - 1])
                     gtk_tree_store_append(G.tstore, &it, NULL);
                 else
                     gtk_tree_store_append(G.tstore, &it, &stack[depth - 1]);
-                gtk_tree_store_set(G.tstore, &it, 0, shown, 1, cmd, -1);
+                if (g_utf8_validate(shown, -1, NULL))
+                    gtk_tree_store_set(G.tstore, &it, 0, shown, 1, cmd, -1);
+                else {
+                    char *v = g_utf8_make_valid(shown, -1);
+                    gtk_tree_store_set(G.tstore, &it, 0, v ? v : "?", 1, cmd, -1);
+                    g_free(v);
+                }
                 stack[depth] = it;
                 have[depth] = 1;
                 for (int d = depth + 1; d < 4; d++) have[d] = 0;
@@ -2612,6 +2679,7 @@ static void on_tree_row(GtkTreeView *, GtkTreePath *path, GtkTreeViewColumn *, g
 
 static void apply_css(void) {
     GtkCssProvider *p = gtk_css_provider_new();
+    /* Keep selectors Gtk3-legal. Wildcard * and :prelight flood Theme parsing errors. */
     const char *css =
         "window, box, notebook, headerbar { background:#14171e; color:#c5cbd8; }"
         "button { background:#2a3142; color:#e1ebfa; border:1px solid #1a1f2a;"
@@ -2620,31 +2688,22 @@ static void apply_css(void) {
         "notebook tab { padding:6px 12px; background:#1c202a; color:#9aa4b8; }"
         "notebook tab:checked { background:#2a3142; color:#00c4c6; }"
         "label { color:#c5cbd8; }"
-        /* File / Import / Guest / Constrain popups: light pane, dark ink */
-        "menu, .menu { background-color:#e8ecf4; background-image:none;"
-        "  color:#1a2030; border:1px solid #8a93a8; }"
-        "menu menuitem, .menu menuitem { background-color:#e8ecf4;"
-        "  background-image:none; color:#1a2030; padding:6px 14px; }"
-        "menu menuitem label, menu menuitem *, .menu menuitem label, .menu menuitem * {"
-        "  color:#1a2030; }"
-        "menu menuitem:hover, menu menuitem:prelight,"
-        "  .menu menuitem:hover, .menu menuitem:prelight {"
-        "  background-color:#00c4c6; background-image:none; color:#061014; }"
-        "menu menuitem:hover label, menu menuitem:hover *,"
-        "  menu menuitem:prelight label, menu menuitem:prelight * {"
-        "  color:#061014; }"
-        "menu menuitem:disabled, menu menuitem:disabled label,"
-        "  menu menuitem:insensitive, menu menuitem:insensitive label {"
-        "  color:#6a7388; }"
-        "menu separator, .menu separator { background-color:#b4bccb; min-height:1px; }"
-        "dialog, messagedialog { background-color:#e8ecf4; color:#1a2030; }"
-        "dialog box, messagedialog box, dialog label, messagedialog label {"
-        "  background-color:#e8ecf4; color:#1a2030; }"
+        "menubar { background-color:#0e1218; background-image:none; color:#e8eef8; }"
+        "menubar > menuitem { color:#e8eef8; }"
+        "menubar label { color:#e8eef8; }"
+        "menu { background-color:#e8ecf4; background-image:none; color:#1a2030;"
+        "  border:1px solid #8a93a8; }"
+        "menuitem { background-color:#e8ecf4; background-image:none; color:#1a2030;"
+        "  padding:6px 14px; }"
+        "menuitem label { color:#1a2030; }"
+        "menuitem:hover { background-color:#00c4c6; color:#061014; }"
+        "menuitem:hover label { color:#061014; }"
+        "menuitem:disabled { color:#6a7388; }"
+        "menuitem:disabled label { color:#6a7388; }"
+        "separator { background-color:#b4bccb; min-height:1px; }"
+        "dialog { background-color:#e8ecf4; color:#1a2030; }"
         "entry { background-color:#ffffff; color:#1a2030; border:1px solid #8a93a8;"
         "  padding:4px 8px; }"
-        "filechooser, filechooserwidget { background-color:#e8ecf4; color:#1a2030; }"
-        "filechooser treeview, filechooser list, filechooser label {"
-        "  background-color:#ffffff; color:#1a2030; }"
         "#modepill { background:#12383a; color:#00c4c6; padding:4px 10px; font-weight:bold; }"
         "#hudbar { color:#d8e4f4; font-family:monospace; font-size:11px; }"
         "#statbar { background:#10141b; color:#9aa4b8; padding:4px 8px; }"
@@ -2656,14 +2715,19 @@ static void apply_css(void) {
         "#tldock { background:#0e1218; padding:4px 8px; }"
         "#tlchip { background:#2a3142; color:#c5cbd8; padding:3px 8px; min-height:22px; font-size:11px; }"
         "#tlnow { background:#1a5c5e; color:#ffffff; padding:3px 8px; min-height:22px; font-size:11px; }"
-        "menubar { background:#0e1218; padding:0 4px; }"
+        "menubar { background-color:#0e1218; background-image:none; padding:0 4px; }"
         "menubar > menuitem { padding:4px 12px; color:#e8eef8; }"
-        "menubar > menuitem:hover, menubar > menuitem:prelight { background:#1a5c5e; }"
+        "menubar > menuitem:hover { background:#1a5c5e; }"
         "#topbar { background:#0e1218; }"
         "#sess-btn { min-height:22px; padding:2px 12px; background:#0e1218;"
         "  color:#8fdfe0; border:none; }"
         "#sess-btn:hover { background:#1a5c5e; color:#ffffff; }";
-    gtk_css_provider_load_from_data(p, css, -1, NULL);
+    GError *err = NULL;
+    gtk_css_provider_load_from_data(p, css, -1, &err);
+    if (err) {
+        fprintf(stderr, "cad_shell: css: %s\n", err->message);
+        g_error_free(err);
+    }
     gtk_style_context_add_provider_for_screen(
         gdk_screen_get_default(), GTK_STYLE_PROVIDER(p),
         GTK_STYLE_PROVIDER_PRIORITY_APPLICATION);
@@ -2939,6 +3003,19 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Bottom", "view7"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Grid", "grid"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Wire", "wire"), FALSE, FALSE, 0);
+    {
+        GtkWidget *lb = gtk_label_new(" Solid");
+        gtk_box_pack_start(GTK_BOX(vw), lb, FALSE, FALSE, 4);
+        GtkWidget *sc = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 20, 100, 5);
+        gtk_range_set_value(GTK_RANGE(sc), 85);
+        gtk_scale_set_draw_value(GTK_SCALE(sc), TRUE);
+        gtk_scale_set_value_pos(GTK_SCALE(sc), GTK_POS_RIGHT);
+        gtk_widget_set_size_request(sc, 140, -1);
+        gtk_widget_set_tooltip_text(sc,
+            "Solid fill. High = easier to read stacked bosses. Low = see through (pick is still the front face).");
+        g_signal_connect(sc, "value-changed", G_CALLBACK(on_opac), NULL);
+        gtk_box_pack_start(GTK_BOX(vw), sc, FALSE, FALSE, 0);
+    }
     add_tab(G.ribbon, "View", vw);
     g_signal_connect(G.ribbon, "switch-page", G_CALLBACK(on_ribbon_page), NULL);
 

@@ -66,7 +66,7 @@ Construct **Offset** / **Angle** planes use the same card (one field).
 | **Sketch** | Draw and constrain on the active plane. |
 | **Solid** | Pick / On Face → **Extrude** (Join/Cut/New) · Revolve · **Modify** (Fillet / Chamfer). |
 | **Construct** | Datum, pick plane / face / origin, through 3pt, offset, angle, flip, **Sketch on Plane**. |
-| **View** | ISO / Top / Front / …, grid, wireframe, 2D↔3D. |
+| **View** | ISO / Top / Front / …, grid, wireframe, **Solid** fill (20–100), 2D↔3D. |
 
 ### Construct — planes
 

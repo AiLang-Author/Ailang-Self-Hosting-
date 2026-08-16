@@ -1,9 +1,10 @@
 # CAD Working App Plan — Real-time DXF / Geometry Loops
 
-**Status:** plan + **M-B..D + interactive dogbone pad green** (2026-08-08)  
+**Status:** plan v3 (2026-08-13) — IPC host + **PG hard dep** + **tools.json**  
 **Goal:** See and edit DXF + solids in a **hosted window** for fast test loops.  
 **Headless BMP** = bootstrap / CI / agents only, not the daily path.  
-**Pairs with:** `CAD_APP_PATH.md`, `CAD_CLI.md`, `CAD_PROGRESS.md` §0, `CAD_OCC_CAPABILITY_AUDIT.md`, **`CAD_SKETCHER_IMPL.md`** (full sketcher system).
+**UI contract:** **`CAD_UI_PLAN.md` v3** (compiled Gtk3 only; FLTK dropped).  
+**Pairs with:** `CAD_APP_PATH.md`, `CAD_CLI.md`, `CAD_PROGRESS.md`, `CAD_REPO.md`, **`CAD_SKETCHER_IMPL.md`**.
 
 ### Shipped
 
@@ -76,10 +77,11 @@
 
 **Rules**
 
-1. Kernel **never** opens X11/Wayland/AOS. It fills an ARGB buffer + owns model.  
-2. Presenter is swappable: headless→BMP, host window, later AOS surface.  
+1. Kernel **never** opens X11/Wayland/AOS/Gtk/Qt. It fills an ARGB buffer + owns model.  
+2. Presenter is swappable: compiled Gtk3 (product), X11 emergency, later AOS — **same IPC**. FLTK dropped.  
 3. Live loop = edit model → rebuild solid (if needed) → remesh → redraw buffer → blit.  
-4. Coarse software raster is OK for testing; polish later.
+4. **PostgreSQL is required** for `cad_app` (docs + `tools.json` catalog). No offline product path.  
+5. Host builds chrome from **`tools.json`** only; does not invent tool cmds.
 
 ---
 

@@ -105,6 +105,6 @@ psql -d cad_db -f CAD/sql/cad_schema.sql
 ## Next
 
 1. Part list + revision browser in the host UI  
-2. **Planes** (`plane_coordinate_tree_spec.md`) as `plane_tree` assets  
-3. **Persistent topo naming** (`face_map` + `CAD_Feat.ResolveNaming`)  
+2. **Planes** — `plane_tree` asset written (PT1 recipes off Sketch_0)  
+3. **Persistent topo naming** — `face_map` written; `CAD_Feat.ResolveNaming` still open  
 4. M-E edge tools writing into feature_tree JSON

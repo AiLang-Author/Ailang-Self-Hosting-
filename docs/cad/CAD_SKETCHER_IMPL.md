@@ -177,17 +177,18 @@ Interactive pick tools with **lock current** for DistO/Rad/Dist (no HUD yet).
 S1  Sketch fillet (two lines + R)          ← DONE
 S2  3-point arc (start / through / end)    ← DONE
 --- solid product path (priority over construction UI) ---
-R1  Revolve UI in cad_app                  ← DONE (panel Rev; RZ AABB)
-R2  Sketch-on-face (PlaneFeature + origin) ← NEXT
+R1  Revolve UI in cad_app                  ← DONE (picked axis, Class A SoR)
+R2  Sketch-on-face (inherit Sketch_0)      ← NEXT (parent slot wired)
 R3  Draft / loft / sweep expose
---- deferred construction UI (kernel OK; panel not long-term) ---
-S3  N-gon builders                         ← deferred
+--- construction UI (kernel+Gtk shipped; polish later) ---
+S3  N-gon builders                         ← DONE (tool_polyN)
 S4  Linear / circular pattern UI           ← deferred
-S5  Slot + rounded rect
-S6  Spline poles
+S5  Slot + rounded rect                    ← slot = poly2
+S6  Spline poles                           ← DONE (tool_spline + done)
 S7  Mirror pattern UI                      ← deferred
 S8  Pattern of features (product tree)
 S9  Undo / dim HUD polish                  ← deferred
+S10 Constraints ribbon (origin vs relational) ← DONE (cstr_* + Solve)
 ```
 
 ### 5.3 S1 — Sketch fillet (radius)

@@ -1,6 +1,8 @@
 # CAD Kernel Design Specification
 ## AILang-Native Geometric Modeling Kernel — Core Engine
 
+> **Readers:** This is the long kernel tome (~19k words). For **UI / IPC / host chrome / tools.json / PG catalog**, use **`CAD_UI_PLAN.md` (v3)** — ~10 min read. Do not scan this file for windowing.
+
 **Project:** Clean-Sheet CAD Kernel
 **Author:** 2 Paws Machine and Engineering
 **Document version:** 3.1
@@ -124,11 +126,20 @@ rot is treated as a data-model problem rather than a mesh problem.
 
 - Every part has exactly one **root sketch** (`Sketch_0`). It defines the part
   origin and the home construction plane (typically world XY at `(0,0,0)`).
-- Sketch geometry is always **local UV** on its plane. World XYZ is obtained only
-  by evaluating `world = PlaneTransform(plane) × (u, v, 0)`.
+- Sketch geometry is always **local X/Y** on its plane (machinist Cartesian,
+  ISO 841). **Z** is the plane normal / pad direction. Do **not** label sketch
+  axes U/V/W in the product — those names collide with secondary linear axes
+  and with A/B/C rotary convention. World XYZ is obtained only by evaluating
+  `world = PlaneTransform(plane) × (x, y, 0)`.
+- Camera / table rotations are **A about X, B about Y, C about Z**. Free-orbit
+  drag is C (yaw about world Z) + B-like pitch. The host only sends `orbit` /
+  `pan` / `zoom` / `view0`–`view7` / `iso`; `CAD.View` owns the camera.
+  Sketch-on-face uses that same camera (no second view, no Gtk viewport math).
+  The orientation cube is **host chrome**: it reads `cam.txt` (yaw/pitch) and
+  sends those cmds. It is not part of the B-Rep / screenshot framebuffer.
 - All subsequent sketches and construction planes are **relative recipes** that
   ultimately hang off Sketch_0 (or bodies/features grown from it): offset,
-  angle, distance, plane-on-face-of-feature, flip normal, local Δu/Δv, etc.
+  angle, distance, plane-on-face-of-feature, flip normal, local ΔX/ΔY, etc.
 - Reordering or orphaning the root sketch **breaks the model** in every major
   CAD system. That is not a bug to paper over. Root reorder is unsupported
   (or a deliberate break-and-rebind tool), never a silent renumber.
@@ -140,7 +151,7 @@ rot is treated as a data-model problem rather than a mesh problem.
 | Construction plane / plane feature | Origin ref + construction mode + modifiers (see `plane_coordinate_tree_spec.md`) | Yes (feature tree) |
 | Evaluated frame (origin, X, Y, Z) | Cache for eval / sketch embed | No (derived) |
 | B-Rep planar face | Topology after solid ops; may back a construction plane | Derived solid |
-| Sketch | 2D entities in UV of its plane handle | Yes (under its plane) |
+| Sketch | 2D entities in local X/Y of its plane handle | Yes (under its plane) |
 
 When the user draws on a face, the system creates a **plane feature** parented to
 that face (or its supporting surface / generating feature), with a known list of
@@ -183,7 +194,7 @@ STEP/STL:  snapshot of derived geometry
 
 1. Exactly one root sketch per part; it is feature index 0 in the ordered tree.
 2. No feature is parentless except Sketch_0 (and optional world datums under the part).
-3. Sketch plane = evaluated frame from parent recipe; sketch data is UV only.
+3. Sketch plane = evaluated frame from parent recipe; sketch data is local X/Y only.
 4. Tree order + parent links in Postgres are authoritative; memory mirrors them.
 5. B-Rep, tessellation, and STEP/STL are caches with content hash + kernel version.
 6. Changing a dimension is param edit + regenerate the DAG, not edit absolute coords.
@@ -2623,6 +2634,8 @@ notified.
 | Date | Library | Change | Reason | Notified |
 |---|---|---|---|---|
 | 2026-08-05 | Product model | §1.4 Sketch_0 root, plane recipes, PG ordered tree, TNP policy | Freeze coordinate/dependency model before Feat/Sketch grind | Feat, Sketch, Repo, Geom, Topo, IO |
+| 2026-08-14 | View / Sketch | §1.4 local X/Y/Z (ISO 841), A/B/C rotary; host sends orbit/pan/zoom only | Sketch-on-face must share the 3D camera; no U/V product labels | CAD_View, App.Draw, App.Ipc, Gtk handle |
+| 2026-08-14 | View | Orientation cube is host chrome; `cam.txt` + `view0`–`view7` | Fusion/FreeCAD-style cube without Gtk owning camera math | CAD_View, App.Ipc, Gtk cube |
 | — | — | *(contracts not fully frozen)* | — | — |
 
 ---
