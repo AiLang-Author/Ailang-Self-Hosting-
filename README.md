@@ -2,6 +2,8 @@
 
 Welcome to the **AILang Programming Language** — a production-grade, self-hosted compiler with radical explicitness, extreme code efficiency, and a complete systems programming ecosystem.
 
+## This is a Working repo and as such is a bit cluttery at times. Bootstrapping a entire language ecosystem is not a clean job. Organization efforts are ongoing and regular. 
+
 ## Overview
 
 **Repo layout:** see [`WORKSPACE.md`](WORKSPACE.md) (language + libraries first; apps as proofs). **Docs:** [`docs/README.md`](docs/README.md). **AMD GPU driver kit:** [`dev/amdgpu/`](dev/amdgpu/).
