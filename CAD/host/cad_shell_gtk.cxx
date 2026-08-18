@@ -3094,17 +3094,6 @@ int main(int argc, char **argv) {
     gtk_container_add(GTK_CONTAINER(G.cube_host), G.cube);
     gtk_overlay_add_overlay(GTK_OVERLAY(ov), G.cube_host);
 
-    GtkWidget *navbar = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 4);
-    gtk_widget_set_halign(navbar, GTK_ALIGN_CENTER);
-    gtk_widget_set_valign(navbar, GTK_ALIGN_END);
-    gtk_widget_set_margin_bottom(navbar, 10);
-    gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Zoom+", "zoom 1"), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Zoom-", "zoom -1"), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Grid", "grid"), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Sketch", "skvis"), FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(navbar), mk_btn("Wire", "wire"), FALSE, FALSE, 0);
-    gtk_overlay_add_overlay(GTK_OVERLAY(ov), navbar);
-
     /* global timeline — same hist.txt as the popout / tree Back-Forward */
     G.tl_dock = gtk_box_new(GTK_ORIENTATION_VERTICAL, 2);
     gtk_widget_set_name(G.tl_dock, "tldock");
