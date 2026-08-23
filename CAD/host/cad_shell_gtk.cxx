@@ -946,6 +946,7 @@ static void dim_label_unit(const char *kind, const char *key,
     }
     else if (key[0] == 'A') { *lab = "Angle"; *unit = "deg"; }
     else if (key[0] == 'R') { *lab = "Radius"; *unit = "mm"; }
+    else if (key[0] == 'S' && key[1] == 'E') { *lab = "Pick"; *unit = ""; }
     else if (key[0] == 'W') { *lab = "Width"; *unit = "mm"; }
     else if (key[0] == 'H') { *lab = "Height"; *unit = "mm"; }
     else if (key[0] == 'O') { *lab = "Operation"; *unit = ""; }
@@ -1124,7 +1125,7 @@ static void draw_edit_hud(cairo_t *cr, GtkAllocation *al) {
     cairo_set_font_size(cr, 11);
     cairo_set_source_rgb(cr, 0.55, 0.60, 0.66);
     cairo_move_to(cr, x + pad, y + card_h - pad + 2);
-    cairo_show_text(cr, "Tab next   Enter apply   Esc close   F1 help");
+    cairo_show_text(cr, "Tab next   arrows change   Enter apply");
 }
 
 static const char *k_help_fallback =
@@ -1132,7 +1133,9 @@ static const char *k_help_fallback =
     "\n"
     "Yellow card (lower left): one field per row. The bright row with = and\n"
     "a blinking cursor is what you type. Empty looks like  Side = ??\n"
-    "  Tab = next field    Enter = apply    Esc = close\n"
+    "  Tab / Down = next field    Shift-Tab / Up = previous\n"
+    "  Left / Right = EDGE/FACE (Pick) or nudge Radius / Distance\n"
+    "  Type digits then Enter = set that number and apply    Esc = close\n"
     "\n"
     "Line: click two points → Length (mm) and Angle (deg from +X).\n"
     "Polygon (Center): click center → Sides, Side length, Diameter.\n"
@@ -1794,6 +1797,23 @@ static void hud_seed_from_card(void) {
         G.dim_sel = 0;
         return;
     }
+    /* Don't seed EDGE/FACE/JOIN into the type-in — digits set Radius. */
+    {
+        const char *q;
+        int ok = 1;
+        for (q = v; *q; q++) {
+            if (*q != '-' && *q != '.' && (*q < '0' || *q > '9')) {
+                ok = 0;
+                break;
+            }
+        }
+        if (!ok) {
+            G.dimn = 0;
+            G.dimbuf[0] = 0;
+            G.dim_sel = 0;
+            return;
+        }
+    }
     snprintf(G.dimbuf, sizeof G.dimbuf, "%s", v);
     G.dimn = (int)strlen(G.dimbuf);
     G.dim_sel = 1;
@@ -1840,27 +1860,71 @@ static void hud_commit(void) {
     gtk_widget_queue_draw(G.da);
 }
 
+static int hud_active_is_enum(void) {
+    DimCard card;
+    int i;
+    memset(&card, 0, sizeof card);
+    if (!G.dimhud[0] || !parse_dimhud(G.dimhud, &card))
+        return 0;
+    for (i = 0; i < card.n; i++) {
+        if (card.f[i].active) {
+            char k0 = card.f[i].key[0];
+            return k0 == 'S' || k0 == 'O'; /* SEL / OP */
+        }
+    }
+    return 0;
+}
+
+static void hud_flush_typein(void) {
+    if (G.dimn > 0 && !G.dim_sel && G.dimbuf[0]) {
+        char cmd[64];
+        snprintf(cmd, sizeof cmd, "dim %s", G.dimbuf);
+        write_cmd(cmd);
+    }
+}
+
+static void hud_nav(const char *cmd) {
+    hud_flush_typein();
+    G.dimn = 0;
+    G.dimbuf[0] = 0;
+    G.dim_sel = 0;
+    write_cmd(cmd);
+    G.hud_idle = 0;
+    gtk_widget_queue_draw(G.da);
+}
+
 static gboolean hud_handle_key(GdkEventKey *e) {
     if (!hud_active()) return FALSE;
     guint kv = e->keyval;
+    guint st = e->state & GDK_SHIFT_MASK;
 
     if (hud_is_enter(kv)) {
         hud_commit();
         return TRUE;
     }
-    if (kv == GDK_KEY_Tab || kv == GDK_KEY_ISO_Left_Tab) {
-        if (G.dimhud[0]) {
-            if (G.dimn > 0 && !G.dim_sel && G.dimbuf[0]) {
-                char cmd[64];
-                snprintf(cmd, sizeof cmd, "dim %s", G.dimbuf);
-                write_cmd(cmd);
-            }
-            G.dimn = 0;
-            G.dimbuf[0] = 0;
-            G.dim_sel = 0;
-            write_cmd("htab");
-            G.hud_idle = 0;
-            gtk_widget_queue_draw(G.da);
+    if (G.dimhud[0]) {
+        if (kv == GDK_KEY_ISO_Left_Tab || (kv == GDK_KEY_Tab && st)) {
+            hud_nav("hstab");
+            return TRUE;
+        }
+        if (kv == GDK_KEY_Tab) {
+            hud_nav("htab");
+            return TRUE;
+        }
+        if (kv == GDK_KEY_Down || kv == GDK_KEY_KP_Down) {
+            hud_nav("htab");
+            return TRUE;
+        }
+        if (kv == GDK_KEY_Up || kv == GDK_KEY_KP_Up) {
+            hud_nav("hstab");
+            return TRUE;
+        }
+        if (kv == GDK_KEY_Left || kv == GDK_KEY_KP_Left) {
+            hud_nav("hleft");
+            return TRUE;
+        }
+        if (kv == GDK_KEY_Right || kv == GDK_KEY_KP_Right) {
+            hud_nav("hright");
             return TRUE;
         }
     }
@@ -1879,6 +1943,9 @@ static gboolean hud_handle_key(GdkEventKey *e) {
 
     int dig = hud_digit_char(kv);
     if (dig >= 0) {
+        /* Typing a number on Pick/OP jumps to the numeric row. */
+        if (hud_active_is_enum())
+            write_cmd("htab");
         if (G.dim_sel) {
             G.dimn = 0;
             G.dimbuf[0] = 0;
@@ -3008,7 +3075,7 @@ int main(int argc, char **argv) {
         GtkWidget *lb = gtk_label_new(" Solid");
         gtk_box_pack_start(GTK_BOX(vw), lb, FALSE, FALSE, 4);
         GtkWidget *sc = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 20, 100, 5);
-        gtk_range_set_value(GTK_RANGE(sc), 85);
+        gtk_range_set_value(GTK_RANGE(sc), 100);
         gtk_scale_set_draw_value(GTK_SCALE(sc), TRUE);
         gtk_scale_set_value_pos(GTK_SCALE(sc), GTK_POS_RIGHT);
         gtk_widget_set_size_request(sc, 140, -1);
