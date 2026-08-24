@@ -737,9 +737,28 @@ FileDialog-driven save from the menu is a **system** action (`EventRouter` `"doc
 
 **Apps must not import editor libraries.** `Applications/notepad_ipc.ailang` stays a thin client. Typing works because the HTML contains `<docview>`.
 
-### 6. Persist (AILD tagged chunks)
+### 6. Persist (Postgres home, UUID blobs for pictures)
 
-**v1 file schema** (typewriter):
+Documents do **not** dump into the `files` VFS table. Names, paper, frames, captions, and UTF-8 runs live in Postgres. Binary pictures (BMP/JPG/PNG) are UUID blobs at `/data/blobs/{uuid}.blob`; a `document_assets` row stores the original filename, mime, byte length, and uuid. `pgcrypto` can wrap text columns or blob files later without changing the IR.
+
+```
+documents          id, name, paper, orientation, paper_w_pt, paper_h_pt,
+                   margins, size_pt, bold, italic, print_dpi, owner, timestamps
+document_frames    id, document_id, kind (TEXT=1 IMAGE=2 …), page_idx, z_order,
+                   box_x/y/w/h_pt  — picture-book boxes; typewriter uses one TEXT frame
+document_runs      id, frame_id, seq, text, size_pt, bold, italic, color
+document_assets    id, document_id, frame_id, name, mime, blob_uuid, byte_len, pix_w/h
+```
+
+`DocStore_EnsureTables` is called from `SysDisplay_InitDB`. `DocStore_Save` inserts a document + TEXT frame + run. `DocStore_AttachAsset` writes the blob, then an IMAGE frame + asset row pointing at `name` + `blob_uuid`. A caption is another TEXT frame with a box under the image.
+
+In-memory IR (paper + UTF-8 run + layout cache) is still the editor’s source of truth. Pagination is **not** stored.
+
+---
+
+### 6b. Optional AILD tagged export (not the save path)
+
+**v1 export schema** (typewriter), if we ever need a single-file interchange:
 
 ```
 Offset 0: magic "AILD" (4 ASCII bytes, file order A I L D)

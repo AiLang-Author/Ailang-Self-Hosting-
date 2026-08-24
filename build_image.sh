@@ -173,7 +173,8 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         "Applications/wifi_ipc.ailang:wifi_ipc.x" \
         "Applications/browser_ipc.ailang:browser.x" \
         "Applications/vscode_ipc.ailang:vscode.x" \
-        "Applications/deskbar_ipc.ailang:deskbar.x"
+        "Applications/deskbar_ipc.ailang:deskbar.x" \
+        "Applications/document_ipc.ailang:document.x"
     do
         src="${pair%%:*}"
         bin="${pair##*:}"
@@ -212,6 +213,14 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         mkdir -p "$OVERLAY/system/icons/chrome"
         cp -a icons/chrome/*.svg icons/chrome/*.tvg "$OVERLAY/system/icons/chrome/" 2>/dev/null || true
         ok "  Chrome icons synced"
+    fi
+    if [ -d "icons" ]; then
+        info "  Syncing icon packs..."
+        mkdir -p "$OVERLAY/system/icons"
+        for vif in icons/*.vif; do
+            [ -f "$vif" ] && cp "$vif" "$OVERLAY/system/icons/"
+        done
+        ok "  Icon packs synced"
     fi
 else
     info "Step 1: SKIPPED (--image-only)"
