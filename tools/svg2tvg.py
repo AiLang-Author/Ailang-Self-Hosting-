@@ -1103,9 +1103,10 @@ def convert_file(svg_path, tvg_path):
         paths, width, height = parse_svg_file(svg_path)
         if not paths:
             return False
-        # Use i32 coords + 8 fractional bits for full precision on curves.
-        # 64-bit AILang runtime has plenty of headroom; this preserves
-        # sub-unit detail (e.g. 19.5 → 4992 instead of truncated 19).
+        # FontForge SVG is already Y-down (viewBox y=0 at the top of the
+        # em square). Do not call flip_y_paths — that double-flips glyphs
+        # and they render upside-down / backwards on screen.
+        # i32 coords + 8 fractional bits keep curve precision.
         tvg_data = encode_tvg(paths, width, height, scale_bits=8, coord_range=3)
 
     with open(tvg_path, 'wb') as f:

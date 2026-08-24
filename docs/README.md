@@ -17,7 +17,7 @@ See also `WORKSPACE.md` at the repo root for the monorepo philosophy.
 | `cad/` | CAD kernel and app design (do not fight active CAD work) |
 | `aos/` | OS install, LUKS/secure boot phases, emergency notes |
 | `apps/` | Other application design (MediaCenter, etc.) |
-| `plans/` | Cross-cutting plans (clipboard, …) |
+| `plans/` | Active cross-cutting work only (landed clipboard design is `display/CLIPBOARD_SERVICE.md`) |
 | `archive/` | Historical sandboxes, old prompts, retired experiments |
 
 ## Still outside this tree (stable paths for now)

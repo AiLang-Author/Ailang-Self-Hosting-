@@ -60,6 +60,7 @@ def pack_font(input_dir, output_path):
         metrics = json.load(f)
     with open(kern_path) as f:
         kern_pairs = json.load(f)
+    kern_pairs = [k for k in kern_pairs if int(k.get("adjust_x", 0)) != 0]
 
     print(f"[pack] Font: {meta['name']}")
     print(f"[pack] Glyphs in metrics: {len(metrics)}")
@@ -73,13 +74,12 @@ def pack_font(input_dir, output_path):
         fname = m["file"].replace(".svg", ".tvg")
         tvg_path = os.path.join(tvg_dir, fname)
 
-        if not os.path.exists(tvg_path):
-            continue
+        tvg_data = b""
+        if os.path.exists(tvg_path):
+            tvg_data = open(tvg_path, "rb").read()
 
-        tvg_data = open(tvg_path, "rb").read()
-        if len(tvg_data) == 0:
-            continue
-
+        # Empty glyphs (space) have no TVG. Pack them anyway so the
+        # loader can use their advance instead of a half-em fallback.
         entries.append({
             "codepoint": cp,
             "advance": int(m["advance"]),

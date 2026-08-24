@@ -23,8 +23,9 @@ HDL_BIN="${HDL_BIN:-$ROOT/ailang_hdl.x}"
 
 BOARD_JSON="${AILANG_BOARD:-${BOARD_JSON:-$ROOT/boards/tang_nano_9k/board.json}}"
 BIND_JSON="${AILANG_BIND:-${BIND_JSON:-$ROOT/boards/tang_nano_9k/bind_blink.json}}"
+# REF=1 → known-good pure Verilog blink (proves board/cable)
+USE_REF="${REF:-0}"
 
-# Prefer device fields from board JSON when python/jq available; fallbacks:
 DEVICE="${GOWIN_DEVICE:-GW1NR-LV9QN88PC6/I5}"
 FAMILY="${GOWIN_FAMILY:-GW1N-9C}"
 
@@ -45,35 +46,38 @@ fi
 
 mkdir -p "$OUT_DIR"
 
-echo "== AILang HDL compile =="
-echo "  src=$SRC"
-echo "  board=$BOARD_JSON"
-echo "  bind=$BIND_JSON"
-# Board profile supplies period from clocks.hz; omit -period unless PERIOD_NS set
-PERIOD_ARGS=()
-if [[ -n "${PERIOD_NS:-}" ]]; then
-  PERIOD_ARGS=(-period "$PERIOD_NS")
-fi
-"$HDL_BIN" -hdl \
-  "${PERIOD_ARGS[@]}" \
-  -board "$BOARD_JSON" \
-  -bind "$BIND_JSON" \
-  "$SRC" "$BASE"
+CST="$BOARD_DIR/tangnano9k.cst"
 
-if [[ ! -f "$BASE.v" ]]; then
-  echo "FAIL: no $BASE.v"
-  exit 1
-fi
-
-# Prefer compiler-emitted CST from board profile; fallback to hand CST
-CST="$BASE.cst"
-if [[ ! -f "$CST" ]]; then
+if [[ "$USE_REF" == "1" ]]; then
+  echo "== reference Verilog blink (not AILang) =="
+  cp "$BOARD_DIR/ref_blink.v" "$OUT_DIR/top.v"
   CST="$BOARD_DIR/tangnano9k.cst"
+else
+  echo "== AILang HDL compile =="
+  echo "  src=$SRC"
+  echo "  board=$BOARD_JSON"
+  echo "  bind=$BIND_JSON"
+  PERIOD_ARGS=()
+  if [[ -n "${PERIOD_NS:-}" ]]; then
+    PERIOD_ARGS=(-period "$PERIOD_NS")
+  fi
+  "$HDL_BIN" -hdl \
+    "${PERIOD_ARGS[@]}" \
+    -board "$BOARD_JSON" \
+    -bind "$BIND_JSON" \
+    "$SRC" "$BASE"
+
+  if [[ ! -f "$BASE.v" ]]; then
+    echo "FAIL: no $BASE.v"
+    exit 1
+  fi
+  if [[ -f "$BASE.cst" ]]; then
+    CST="$BASE.cst"
+  fi
+  # wrapper + ailang_top (drop Board_tick if not in netlist)
+  cat "$BOARD_DIR/top_wrap.v" "$BASE.v" >"$OUT_DIR/top.v"
 fi
 echo "  cst=$CST"
-
-# Board top = wrapper + ailang_top
-cat "$BOARD_DIR/top_wrap.v" "$BASE.v" >"$OUT_DIR/top.v"
 
 echo "== Yosys synth_gowin =="
 yosys -q -p "read_verilog $OUT_DIR/top.v; synth_gowin -top top -json $OUT_DIR/top.json"

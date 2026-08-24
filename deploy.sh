@@ -34,6 +34,7 @@ SRC[vscode]="Applications/vscode_ipc.ailang";       BIN[vscode]="vscode.x";     
 SRC[ide]="Applications/ide_ipc.ailang";             BIN[ide]="ide.x";              DEST[ide]="/system/bin/ide.x"
 SRC[pkg]="Applications/installer_ipc.ailang";       BIN[pkg]="installer_ipc.x";    DEST[pkg]="/system/bin/installer_ipc.x"
 SRC[display]="Main.ailang"; BIN[display]="display.x"; DEST[display]="/system/bin/display.x"
+SRC[deskbar]="Applications/deskbar_ipc.ailang"; BIN[deskbar]="deskbar.x"; DEST[deskbar]="/system/bin/deskbar.x"
 SRC[videoplayer]="Applications/videoplayer.ailang"; BIN[videoplayer]="videoplayer.x"; DEST[videoplayer]="/system/bin/videoplayer.x"
 SRC[mediacenter]="MediaCenter/MediaCenter.ailang";  BIN[mediacenter]="MediaCenter.x"; DEST[mediacenter]="/system/bin/MediaCenter.x"
 

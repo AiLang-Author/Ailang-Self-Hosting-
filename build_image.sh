@@ -162,6 +162,30 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         ok "  installer_ipc.x ($(stat -c%s /tmp/installer_ipc.x) bytes)"
     fi
 
+    # Desktop IPC apps — clipboard lives in display.x; terminal/chrome must
+    # be rebuilt so they speak clipboard.set/get/paste.
+    for pair in \
+        "Applications/terminal_ipc.ailang:terminal.x" \
+        "Applications/notepad_ipc.ailang:notepad.x" \
+        "Applications/chrome_ipc.ailang:chrome.x" \
+        "Applications/calc_ipc.ailang:calc.x" \
+        "Applications/grep_ipc.ailang:grep.x" \
+        "Applications/wifi_ipc.ailang:wifi_ipc.x" \
+        "Applications/browser_ipc.ailang:browser.x" \
+        "Applications/vscode_ipc.ailang:vscode.x" \
+        "Applications/deskbar_ipc.ailang:deskbar.x"
+    do
+        src="${pair%%:*}"
+        bin="${pair##*:}"
+        if [ -f "$src" ]; then
+            info "  Compiling $bin..."
+            compile "$src" "/tmp/$bin"
+            cp "/tmp/$bin" "$OVERLAY/system/bin/$bin"
+            chmod +x "$OVERLAY/system/bin/$bin"
+            ok "  $bin ($(stat -c%s /tmp/$bin) bytes)"
+        fi
+    done
+
     # Telegram (TDLib worker + libtdjson)
     if [ -f "Telegram/tdlib_worker.c" ]; then
         info "  Building Telegram TDLib worker..."
@@ -182,6 +206,13 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         [ -f "$f" ] && cp "$f" "$OVERLAY/system/$f"
     done
     ok "  Config files synced"
+
+    if [ -d "icons/chrome" ]; then
+        info "  Syncing chrome icons..."
+        mkdir -p "$OVERLAY/system/icons/chrome"
+        cp -a icons/chrome/*.svg icons/chrome/*.tvg "$OVERLAY/system/icons/chrome/" 2>/dev/null || true
+        ok "  Chrome icons synced"
+    fi
 else
     info "Step 1: SKIPPED (--image-only)"
 fi
@@ -420,7 +451,8 @@ if [ "$RUN_QEMU" -eq 1 ]; then
         -drive if=pflash,format=raw,snapshot=on,unit=1,file="$OVMF_VARS" \
         -drive file="$DISK_IMAGE",format=raw,if=none,id=disk0,snapshot=on \
         -device virtio-blk-pci,drive=disk0 \
-        -device bochs-display,xres=1024,yres=768 \
+        -vga none \
+        -device bochs-display,edid=on,xres=1152,yres=864,xmax=1152,ymax=864 \
         -device qemu-xhci -device usb-kbd -device usb-mouse \
         -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22,hostfwd=tcp::15432-:5432 \
         -serial file:/tmp/qemu_serial.log \
