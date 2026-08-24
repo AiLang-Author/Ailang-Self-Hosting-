@@ -24,6 +24,7 @@ static char path_meta[600], path_frame[600], path_gen[600], path_cmd[600];
 static char path_status[600], path_tool[600], path_hud[600], path_path[600];
 static char path_tools[600], path_cam[600], path_cmds[600], path_tree[600];
 static char path_hist[600], path_dimhud[600], path_parts[600];
+static char path_notice[600];
 
 static void paths_init(const char *dir) {
     snprintf(g_dir, sizeof g_dir, "%s", dir);
@@ -32,6 +33,7 @@ static void paths_init(const char *dir) {
     snprintf(path_gen, sizeof path_gen, "%s/gen.txt", dir);
     snprintf(path_cmd, sizeof path_cmd, "%s/cmd.txt", dir);
     snprintf(path_status, sizeof path_status, "%s/status.txt", dir);
+    snprintf(path_notice, sizeof path_notice, "%s/notice.txt", dir);
     snprintf(path_tool, sizeof path_tool, "%s/tool.txt", dir);
     snprintf(path_hud, sizeof path_hud, "%s/hud.txt", dir);
     snprintf(path_path, sizeof path_path, "%s/path.txt", dir);
@@ -2101,9 +2103,10 @@ static gboolean poll_tick(gpointer) {
         if (load_frame() == 0) G.last_gen = g;
         gtk_widget_queue_draw(G.da);
     }
-    char hud[256], st[256], dh[128];
+    char hud[256], st[256], dh[128], nt[256];
     read_line_file(path_hud, hud, sizeof hud);
     read_line_file(path_status, st, sizeof st);
+    read_line_file(path_notice, nt, sizeof nt);
     read_line_file(path_dimhud, dh, sizeof dh);
     if (strcmp(dh, G.dimhud) != 0) {
         int opened = (!G.dimhud[0] && dh[0]);
@@ -2137,9 +2140,12 @@ static gboolean poll_tick(gpointer) {
         if (G.hud_bar) label_set_safe(G.hud_bar, hud[0] ? hud : " ");
         gtk_widget_queue_draw(G.da);
     }
-    if (strcmp(st, G.status_line) != 0) {
-        snprintf(G.status_line, sizeof G.status_line, "%s", st);
-        if (G.status) label_set_safe(G.status, st[0] ? st : "ready");
+    {
+        const char *show = nt[0] ? nt : (st[0] ? st : "ready");
+        if (strcmp(show, G.status_line) != 0) {
+            snprintf(G.status_line, sizeof G.status_line, "%s", show);
+            if (G.status) label_set_safe(G.status, show);
+        }
         if (!G.doc_name[0] && strncmp(st, "DOC ", 4) == 0) {
             const char *p = st + 4;
             char raw[64];

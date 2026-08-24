@@ -38,7 +38,7 @@
 static char g_dir[512];
 static char path_meta[600], path_frame[600], path_gen[600], path_cmd[600];
 static char path_status[600], path_parts[600], path_sel[600], path_tool[600];
-static char path_hud[600], path_path[600];
+static char path_hud[600], path_path[600], path_notice[600];
 
 static void paths_init(const char *dir) {
     snprintf(g_dir, sizeof g_dir, "%s", dir);
@@ -47,6 +47,7 @@ static void paths_init(const char *dir) {
     snprintf(path_gen, sizeof path_gen, "%s/gen.txt", dir);
     snprintf(path_cmd, sizeof path_cmd, "%s/cmd.txt", dir);
     snprintf(path_status, sizeof path_status, "%s/status.txt", dir);
+    snprintf(path_notice, sizeof path_notice, "%s/notice.txt", dir);
     snprintf(path_parts, sizeof path_parts, "%s/parts.txt", dir);
     snprintf(path_sel, sizeof path_sel, "%s/sel.txt", dir);
     snprintf(path_tool, sizeof path_tool, "%s/tool.txt", dir);
@@ -233,12 +234,19 @@ public:
                 last_gen = gen;
                 read_line_file(path_hud, hud_line, sizeof hud_line);
                 read_line_file(path_status, status_line, sizeof status_line);
+                {
+                    char nt[256];
+                    read_line_file(path_notice, nt, sizeof nt);
+                    if (nt[0]) snprintf(status_line, sizeof status_line, "%s", nt);
+                }
                 redraw();
             }
         } else {
-            char h[256], s[256];
+            char h[256], s[256], nt[256];
             read_line_file(path_hud, h, sizeof h);
             read_line_file(path_status, s, sizeof s);
+            read_line_file(path_notice, nt, sizeof nt);
+            if (nt[0]) snprintf(s, sizeof s, "%s", nt);
             if (strcmp(h, hud_line) || strcmp(s, status_line)) {
                 snprintf(hud_line, sizeof hud_line, "%s", h);
                 snprintf(status_line, sizeof status_line, "%s", s);

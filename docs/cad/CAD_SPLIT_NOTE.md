@@ -11,26 +11,33 @@ AILang imports just inline the file. No headers, no Python circular-import tax. 
 
 ## App files over 1500 (CAD/App)
 
-| File | LOC | Suggested cut |
-|------|----:|---------------|
-| Tools.ailang | 3671 | click/hover vs HUD vs rect/circ/poly edit |
-| Draw.ailang | 2592 | 2D sketch vs 3D/publish |
-| Solid.ailang | 2168 | edge-sel/blend vs pad/revolve |
-| State.ailang | 1968 | keep pools; move WriteHud/Tree/Status |
-| Ipc.ailang | 1961 | parse vs command table |
-| Plane.ailang | 1934 | pick vs plane-tree |
-| Doc.ailang | 1681 | hist vs repo save/load |
+Split 2026-08-23 via `python3 tools/cad_split_ailang.py`. Callers still
+`Import.CAD.App.Tools` etc. Revert: `CAD/App/*.ailang.pre_split`.
+
+| Facade | Parts (all <1000) |
+|--------|-------------------|
+| Tools.ailang | Snap / Cstr / Click / Hud / Edit / Poly |
+| Draw.ailang | Cam / Sketch / View3 / Hud |
+| Solid.ailang | Wire / Prof / Blend / Pad |
+| State.ailang | Pools (`CadApp`) / Hud / Tree |
+| Plane.ailang | Reg / Pick / Tree |
+| Doc.ailang | Hist / List / Repo |
+
+`CA_PollCmd` split 2026-08-23: `Branch` on first byte → `CA_IpcCmd*` helpers
+(`IpcNav` / `IpcP` / `IpcT` / `IpcS` / `IpcC` / `IpcF` / `IpcMisc` / `IpcDispatch`).
+`click` stays in dispatch (would collide with `cstr`/`clear`). `Fork` used for orbit/hover log skip.
 
 `CadApp` pool itself is ~220 lines / 161 fields — **do not prune the field list.**
+Do not insert fields in the middle of `FixedPool.CadApp`.
 
 ## Library files over 1500 (Librarys/Cad) — 2026-08-16
 
 | File | LOC | Suggested cut |
 |------|----:|---------------|
-| Library.CAD_Topo.ailang | **facade** (~40) | Split 2026-08-16 into `Librarys/Cad/Topo/` (13 files, all <1500). Callers still `LibraryImport.Cad.CAD_Topo`. Revert: `Library.CAD_Topo.ailang.pre_split`. |
-| Library.CAD_Tess.ailang | **4519** | earclip vs cyl/annulus vs collect |
-| Library.CAD_SketchProfile.ailang | 2185 | tessellate vs BuildAllClosedLoops vs weld |
-| Library.CAD_Sketch.ailang | 1666 | create/add vs query vs constraints |
+| Library.CAD_Topo.ailang | **facade** | Split 2026-08-16, then 2026-08-23: FilletVertex / FilletSeq / QueryWalk / MakeLathe. `FilletUnused` parked, not imported. Callers still `LibraryImport.Cad.CAD_Topo`. |
+| Library.CAD_Tess.ailang | **facade** | Split into `Librarys/Cad/Tess/` (7 files). |
+| Library.CAD_SketchProfile.ailang | **facade** | Loop / Tess / Snap. |
+| Library.CAD_Sketch.ailang | **facade** (~482) | Pools+CRUD here; `CAD_SketchCstr` + `CAD_SketchGeom` imported after the pools. |
 
 **Do not split Topo as a drive-by.** 13k is a dedicated session: named helpers + pinned pool fields, compile after each move. Tess next (4.5k). Issue #1 (rect+octagon → broken plate) was **not** Topo — it was pad “inside = hole” in `CAD/App/Solid.ailang` (2181) + `CAD_Feat.ExtrudeProfile`. Killed 2026-08-16: each selected ring is a planar prism; extras compound. `MakePolyPrismHoles` unused on pad.
 
