@@ -107,6 +107,13 @@ def export_font(font_path, output_dir, em_size=1024, cp_range=None):
         fname = f"{cp:04X}_{gname}.svg"
         svg_path = os.path.join(glyph_dir, fname)
 
+        # Composite glyphs (colon = two periods, quotedbl, etc.) export
+        # as an empty <g/> unless references are unlinked first.
+        try:
+            glyph.unlinkRef()
+        except Exception:
+            pass
+
         # Export SVG
         try:
             glyph.export(svg_path)

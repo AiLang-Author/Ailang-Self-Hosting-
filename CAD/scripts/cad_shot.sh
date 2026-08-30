@@ -6,6 +6,9 @@
 #   ./CAD/scripts/cad_shot.sh out.png
 #   ./CAD/scripts/cad_shot.sh --kernel out.png  # also ask kernel for shot.bmp
 #
+# Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+# Licensed under the Sean Collins Software License (SCSL v1.0).
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 STATE="${CAD_APP_STATE:-/tmp/cad_app}"

@@ -1,5 +1,8 @@
 #!/usr/bin/env bash
 # Phase A gates: LWPOLYLINE, multi-loop, ARC, export round-trip, view.
+# Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+# Licensed under the Sean Collins Software License (SCSL v1.0).
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$ROOT"

@@ -1,5 +1,7 @@
 # Build FLTK for CAD shell (no root required)
 
+> **Copyright © 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.**
+
 The FLTK presenter lives at `CAD/host/cad_shell_fltk.cxx` and expects a local install:
 
 ```text

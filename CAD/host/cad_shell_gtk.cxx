@@ -3,6 +3,9 @@
  *
  *   make -C CAD/host gtk
  *   CAD_APP_STATE=/tmp/cad_app ./CAD/host/cad_shell_gtk
+ *
+ * Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+ * Licensed under the Sean Collins Software License (SCSL v1.0).
  */
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
@@ -908,11 +911,23 @@ static void on_tree_back(GtkMenuItem *, gpointer) { write_cmd("undo"); }
 static void on_tree_fwd(GtkMenuItem *, gpointer) { write_cmd("redo"); }
 static void on_tree_timeline(GtkMenuItem *, gpointer) { show_timeline(); }
 
+static void on_tree_fdel(GtkMenuItem *, gpointer) {
+    char kind = 0;
+    int id = 0;
+    if (sscanf(G.tree_edit_cmd, "tree %c %d", &kind, &id) == 2) {
+        char cmd[40];
+        snprintf(cmd, sizeof cmd, "fdel %d", id);
+        write_cmd(cmd);
+        return;
+    }
+    write_cmd("fdel");
+}
+
 static void popup_tree_menu(GdkEventButton *e) {
     GtkWidget *m = gtk_menu_new();
-    const char *labs[] = {"Edit / Modify", "Name…", "Back", "Forward", "Timeline", NULL};
+    const char *labs[] = {"Edit / Modify", "Name…", "Delete feature", "Back", "Forward", "Timeline", NULL};
     void (*fns[])(GtkMenuItem *, gpointer) = {
-        on_tree_edit, on_tree_name, on_tree_back, on_tree_fwd, on_tree_timeline
+        on_tree_edit, on_tree_name, on_tree_fdel, on_tree_back, on_tree_fwd, on_tree_timeline
     };
     int i;
     for (i = 0; labs[i]; i++) {

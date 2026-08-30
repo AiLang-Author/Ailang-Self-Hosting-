@@ -8,6 +8,9 @@
 #   ./CAD/scripts/run_cad_app.sh -i test-stl/test-dxf-files/diamond.dxf -H 15
 #   CAD_UI=x11  ./CAD/scripts/run_cad_app.sh   # emergency X11 blit+panel only
 #
+# Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+# Licensed under the Sean Collins Software License (SCSL v1.0).
+
 set -euo pipefail
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$ROOT"

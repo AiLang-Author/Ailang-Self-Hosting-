@@ -2,6 +2,8 @@
 -- Apply: psql -d cad_db -f CAD/sql/cad_ui_catalog.sql
 -- Kernel: SELECT catalog::text → /tmp/cad_app/tools.json
 -- Hosts must not invent cmds beyond this catalog.
+-- Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+-- Licensed under the Sean Collins Software License (SCSL v1.0).
 
 CREATE TABLE IF NOT EXISTS cad_ui_catalog (
     role        TEXT PRIMARY KEY,

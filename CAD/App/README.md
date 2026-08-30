@@ -1,5 +1,7 @@
 # CAD/App — local cad_app modules
 
+> **Copyright © 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved. SCSL.**
+
 App glue for the interactive CAD runner. **Not** `Librarys/` (those are guarded kernel libs).
 
 ## Import style

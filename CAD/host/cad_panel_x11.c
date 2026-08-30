@@ -6,6 +6,9 @@
  * Viewport stays free for orbit/sketch; this window is the "toolbar".
  *
  * Build: cc -O2 -o cad_panel_x11 cad_panel_x11.c -lX11
+ *
+ * Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+ * Licensed under the Sean Collins Software License (SCSL v1.0).
  */
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>

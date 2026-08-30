@@ -1,13 +1,13 @@
 // terminal_ipc.ailang
-// IPC terminal emulator — fork/exec /bin/bash via Linux PTY, render with
-// embedded 8x16 bitmap font on ShmCanvas, forward keyboard via PTY master fd.
+// IPC terminal emulator — fork/exec a login /bin/sh (busybox ash) via
+// Linux PTY, render a monospace cell grid on ShmCanvas, forward keys.
 //
 // Architecture:
 //   - Open /dev/ptmx (PTY master), unlock, get slave path /dev/pts/N
-//   - Fork: child does setsid + open slave + TIOCSCTTY + dup2(0/1/2) + execve bash
+//   - Fork: child setsid + open slave + TIOCSCTTY + dup2(0/1/2) + execve -sh
 //   - Parent: non-blocking reads from master fd, feeds VT100 parser
-//   - Parser writes chars+attrs into 80x24 cell grid
-//   - TermFont renders grid to ShmCanvas every dirty tick
+//   - Parser writes chars+attrs into the cell grid
+//   - VFont IBM Plex Mono (TermFont 8x16 fallback) renders dirty rows
 //   - Keyboard input from IPC → translated → written to PTY master
 //
 // Build: ./ailang.x Applications/terminal_ipc.ailang terminal_ipc.x
@@ -22,6 +22,11 @@ LibraryImport.JSON
 LibraryImport.Hash
 LibraryImport.ShmCanvas
 LibraryImport.TermFont
+LibraryImport.Display.Render.DSurfaceTypes
+LibraryImport.Display.Render.DSurface
+LibraryImport.Display.Render.DDrawPixel
+LibraryImport.Display.Render.Fonts
+LibraryImport.Display.Render.SurfaceBlit
 
 // =============================================================================
 // SYSCALL CONSTANTS
@@ -67,13 +72,13 @@ FixedPool.TSig {
 // TERMINAL DIMENSIONS
 // =============================================================================
 FixedPool.TermDim {
-    "COLS":      Initialize=80
-    "ROWS":      Initialize=24
-    "CHAR_W":    Initialize=8
-    "CHAR_H":    Initialize=16
-    "CANVAS_W":  Initialize=640
-    "CANVAS_H":  Initialize=384
-    "GRID_SIZE": Initialize=1920
+    "COLS":      Initialize=80, CanChange=True
+    "ROWS":      Initialize=24, CanChange=True
+    "CHAR_W":    Initialize=8,  CanChange=True
+    "CHAR_H":    Initialize=16, CanChange=True
+    "CANVAS_W":  Initialize=960, CanChange=True
+    "CANVAS_H":  Initialize=540, CanChange=True
+    "GRID_SIZE": Initialize=1920, CanChange=True
 }
 
 // =============================================================================
@@ -94,8 +99,26 @@ FixedPool.TermState {
     "cursor_visible": Initialize=1
     "autowrap":       Initialize=1
     "app_cursor":     Initialize=0
-    "scroll_top":     Initialize=0
-    "scroll_bot":     Initialize=23
+    "scroll_top":     Initialize=0, CanChange=True
+    "scroll_bot":     Initialize=23, CanChange=True
+    "surf":           Initialize=0, CanChange=True
+    "inst":           Initialize=-1, CanChange=True
+    "face":           Initialize=-1, CanChange=True
+    "use_vf":         Initialize=0, CanChange=True
+    "mouse_1000":     Initialize=0, CanChange=True
+    "mouse_1002":     Initialize=0, CanChange=True
+    "mouse_1003":     Initialize=0, CanChange=True
+    "mouse_sgr":      Initialize=0, CanChange=True
+    "mouse_btns":     Initialize=0, CanChange=True
+    "wrap_pending":   Initialize=0, CanChange=True
+}
+
+// IPC mouse event (saved immediately — JSON locals die across calls)
+FixedPool.TermMouse {
+    "x":     Initialize=0, CanChange=True
+    "y":     Initialize=0, CanChange=True
+    "ev":    Initialize=0, CanChange=True
+    "btn":   Initialize=0, CanChange=True
 }
 
 // =============================================================================
@@ -134,12 +157,12 @@ FixedPool.TPState {
 // SGR (Select Graphic Rendition) attributes
 // =============================================================================
 FixedPool.TermSGR {
-    "fg":         Initialize=0xFFAAAAAA
-    "bg":         Initialize=0xFF000000
-    "bold":       Initialize=0
-    "reverse":    Initialize=0
-    "default_fg": Initialize=0xFFAAAAAA
-    "default_bg": Initialize=0xFF000000
+    "fg":         Initialize=0xFFE8EEF8, CanChange=True
+    "bg":         Initialize=0xFF060912, CanChange=True
+    "bold":       Initialize=0, CanChange=True
+    "reverse":    Initialize=0, CanChange=True
+    "default_fg": Initialize=0xFFE8EEF8
+    "default_bg": Initialize=0xFF060912
 }
 
 // =============================================================================
@@ -180,8 +203,8 @@ FixedPool.TermScroll {
 // =============================================================================
 FixedPool.ScrollbarConst {
     "WIDTH":       Initialize=12
-    "TRACK_COLOR": Initialize=0xFF222222
-    "THUMB_COLOR": Initialize=0xFF666666
+    "TRACK_COLOR": Initialize=0xFF0A1020
+    "THUMB_COLOR": Initialize=0xFF4A8CFF
     "MIN_THUMB":   Initialize=16
 }
 
@@ -249,6 +272,112 @@ Function.Term_FillDword {
             StoreValue(Add(ptr, Multiply(i, 4)), value, "dword")
             i = Add(i, 1)
         }
+    }
+}
+
+Function.Term_InitFont {
+    Output: Integer
+    Body: {
+        TermFont_Init()
+        TermState.use_vf = 0
+        VFont_Init()
+        VIF_Init()
+        // True monospace only. Proportional faces (Plex Sans, Alteix,
+        // DejaVu Sans) in a cell grid look sparse — every glyph sits
+        // in an M-width box. Bitmap 8x16 is the fallback, not Sans.
+        TermState.face = VFont_LoadFace("/system/fonts/IBMPlexMono-Regular.vif")
+        IfCondition LessThan(TermState.face, 0) ThenBlock: {
+            PrintMessage("[Term] VFont mono load fail — bitmap fallback\n")
+            TermDim.CHAR_W = TermFontConst.CHAR_W
+            TermDim.CHAR_H = TermFontConst.CHAR_H
+            ReturnValue(0)
+        }
+        VFont_BindFace(TermState.face)
+        TermState.inst = VFont_CreateInstance(TermState.face, 16)
+        IfCondition LessThan(TermState.inst, 0) ThenBlock: {
+            PrintMessage("[Term] VFont instance fail — bitmap fallback\n")
+            TermDim.CHAR_W = TermFontConst.CHAR_W
+            TermDim.CHAR_H = TermFontConst.CHAR_H
+            TermState.use_vf = 0
+            ReturnValue(0)
+        }
+        FontState.default_inst = TermState.inst
+        FontState.ui_face = TermState.face
+        FontState.default_face = TermState.face
+        TermDim.CHAR_H = VInst_GetLineHeight(TermState.inst)
+        IfCondition LessThan(TermDim.CHAR_H, 16) ThenBlock: {
+            TermDim.CHAR_H = 16
+        }
+        TermDim.CHAR_H = Add(TermDim.CHAR_H, 2)
+        TermDim.CHAR_W = VInst_GlyphAdvance(TermState.inst, 77)
+        IfCondition LessThan(TermDim.CHAR_W, 8) ThenBlock: {
+            TermDim.CHAR_W = 8
+        }
+        TermState.use_vf = 1
+        PrintMessage("[Term] VFont mono cell ")
+        PrintNumber(TermDim.CHAR_W)
+        PrintMessage("x")
+        PrintNumber(TermDim.CHAR_H)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+Function.Term_WrapSurf {
+    Body: {
+        IfCondition NotEqual(TermState.surf, 0) ThenBlock: {
+            Deallocate(TermState.surf, SurfaceConst.HEADER_SIZE)
+            TermState.surf = 0
+        }
+        IfCondition EqualTo(ShmCanvasState.buf, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        hdr = Allocate(SurfaceConst.HEADER_SIZE)
+        IfCondition EqualTo(hdr, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        StoreValue(Add(hdr, SurfaceFields.FORMAT), SurfaceFormat.PIXEL_32)
+        StoreValue(Add(hdr, SurfaceFields.WIDTH), TermDim.CANVAS_W)
+        StoreValue(Add(hdr, SurfaceFields.HEIGHT), TermDim.CANVAS_H)
+        StoreValue(Add(hdr, SurfaceFields.PITCH), Multiply(TermDim.CANVAS_W, 4))
+        StoreValue(Add(hdr, SurfaceFields.DATA), ShmCanvasState.buf)
+        StoreValue(Add(hdr, SurfaceFields.DATA_SIZE), Multiply(Multiply(TermDim.CANVAS_W, TermDim.CANVAS_H), 4))
+        TermState.surf = hdr
+        ReturnValue(1)
+    }
+}
+
+Function.Term_DrawCell {
+    Input: row: Integer
+    Input: col: Integer
+    Input: ch: Integer
+    Input: fg: Integer
+    Input: bg: Integer
+    Body: {
+        px = Multiply(col, TermDim.CHAR_W)
+        py = Multiply(row, TermDim.CHAR_H)
+        IfCondition And(EqualTo(TermState.use_vf, 1), NotEqual(TermState.surf, 0)) ThenBlock: {
+            Draw_Pix_FillRect(TermState.surf, px, py, TermDim.CHAR_W, TermDim.CHAR_H, bg)
+            IfCondition LessEqual(ch, 32) ThenBlock: {
+                ReturnValue(0)
+            }
+            TermState.face = TermState.face
+            gidx = VFace_FindGlyph(TermState.face, ch)
+            IfCondition LessThan(gidx, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            gs = VInst_GetGlyphSurf(TermState.inst, gidx)
+            IfCondition EqualTo(gs, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            FontState.draw_color = fg
+            Surface_BlitTinted(TermState.surf, gs, px, py, fg)
+            ReturnValue(0)
+        }
+        buf = ShmCanvasState.buf
+        stride = TermDim.CANVAS_W
+        TermFont_SetColors(fg, bg)
+        TermFont_DrawCharFgBg(buf, stride, px, py, ch)
     }
 }
 
@@ -391,6 +520,7 @@ Function.Term_GridClear {
         Term_FillDword(TermGrid.bg_arr, TermSGR.default_bg, sz)
         TermState.cursor_row = 0
         TermState.cursor_col = 0
+        TermState.wrap_pending = 0
         TermState.dirty = 1
     }
 }
@@ -512,28 +642,30 @@ Function.Term_ClearLine {
         cols = TermDim.COLS
         col  = TermState.cursor_col
 
+        efg = TermSGR.fg
+        ebg = TermSGR.bg
         IfCondition EqualTo(mode, 0) ThenBlock: {
             // Cursor to end of line
             off = Add(Multiply(row, cols), col)
             cnt = Subtract(cols, col)
             Term_FillDword(Add(TermGrid.chars,  Multiply(off, 4)), 32, cnt)
-            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), TermSGR.default_fg, cnt)
-            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), TermSGR.default_bg, cnt)
+            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), efg, cnt)
+            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), ebg, cnt)
         }
         IfCondition EqualTo(mode, 1) ThenBlock: {
             // Start of line to cursor
             off = Multiply(row, cols)
             cnt = Add(col, 1)
             Term_FillDword(Add(TermGrid.chars,  Multiply(off, 4)), 32, cnt)
-            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), TermSGR.default_fg, cnt)
-            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), TermSGR.default_bg, cnt)
+            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), efg, cnt)
+            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), ebg, cnt)
         }
         IfCondition EqualTo(mode, 2) ThenBlock: {
             // Entire line
             off = Multiply(row, cols)
             Term_FillDword(Add(TermGrid.chars,  Multiply(off, 4)), 32, cols)
-            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), TermSGR.default_fg, cols)
-            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), TermSGR.default_bg, cols)
+            Term_FillDword(Add(TermGrid.fg_arr, Multiply(off, 4)), efg, cols)
+            Term_FillDword(Add(TermGrid.bg_arr, Multiply(off, 4)), ebg, cols)
         }
         TermState.dirty = 1
     }
@@ -545,6 +677,7 @@ Function.Term_ClearLine {
 Function.Term_PutChar {
     Input: ch: Integer
     Body: {
+        Term_DoPendingWrap()
         row = TermState.cursor_row
         col = TermState.cursor_col
         fg  = TermSGR.fg
@@ -559,19 +692,27 @@ Function.Term_PutChar {
 
         Term_GridSetCell(row, col, ch, fg, bg)
 
-        // Advance cursor
+        // xterm delayed wrap: writing the last column does NOT wrap yet.
+        // Immediate wrap scrolls a TUI up one row; the next frame CUP-paints
+        // on top and you see every string twice, offset by one line.
         col = Add(col, 1)
         IfCondition GreaterEqual(col, TermDim.COLS) ThenBlock: {
-            col = 0
-            row = Add(row, 1)
-            IfCondition GreaterEqual(row, TermDim.ROWS) ThenBlock: {
-                Term_ScrollUp()
-                row = Subtract(TermDim.ROWS, 1)
-            }
+            TermState.cursor_col = Subtract(TermDim.COLS, 1)
+            TermState.wrap_pending = TermState.autowrap
+        } ElseBlock: {
+            TermState.cursor_col = col
+            TermState.wrap_pending = 0
         }
-        TermState.cursor_row = row
-        TermState.cursor_col = col
         TermState.dirty = 1
+    }
+}
+
+Function.Term_DoPendingWrap {
+    Body: {
+        IfCondition EqualTo(TermState.wrap_pending, 0) ThenBlock: { ReturnValue(0) }
+        TermState.wrap_pending = 0
+        TermState.cursor_col = 0
+        Term_LineFeed()
     }
 }
 
@@ -710,10 +851,10 @@ Function.Term_ClearDisplay {
         rows = TermDim.ROWS
 
         IfCondition EqualTo(mode, 2) ThenBlock: {
-            // Clear all
+            // Clear all (BCE: current SGR, not the palette default)
             Term_FillDword(TermGrid.chars,  32, TermDim.GRID_SIZE)
-            Term_FillDword(TermGrid.fg_arr, TermSGR.default_fg, TermDim.GRID_SIZE)
-            Term_FillDword(TermGrid.bg_arr, TermSGR.default_bg, TermDim.GRID_SIZE)
+            Term_FillDword(TermGrid.fg_arr, TermSGR.fg, TermDim.GRID_SIZE)
+            Term_FillDword(TermGrid.bg_arr, TermSGR.bg, TermDim.GRID_SIZE)
         }
         IfCondition EqualTo(mode, 0) ThenBlock: {
             // Cursor to end: clear rest of current line + all lines below
@@ -858,8 +999,9 @@ Function.Term_ScrollRegionUp {
         top = TermState.scroll_top
         bot = TermState.scroll_bot
 
-        // Save top row of scroll region to scrollback (only if region starts at 0)
-        IfCondition EqualTo(top, 0) ThenBlock: {
+        // Save top row of scroll region to scrollback (only if region starts
+        // at 0). Alt-screen TUIs must not pollute the main scrollback.
+        IfCondition And(EqualTo(top, 0), EqualTo(AltScreen.active, 0)) ThenBlock: {
             IfCondition NotEqual(TermScroll.scroll_chars, 0) ThenBlock: {
                 Term_ScrollSaveLine()
             }
@@ -920,25 +1062,33 @@ Function.Term_ScrollRegionDown {
 Function.Term_HandleCSIPrivate {
     Input: final_ch: Integer
     Body: {
-        // Parse number from param_buf starting at index 1 (skip '?')
+        // ESC[?1000;1002;1006h — several modes in one sequence.
+        // Previous parser concatenated digits and missed every mode.
         pbuf = TermParser.param_buf
         plen = TermParser.param_count
+        setv = 0
+        IfCondition EqualTo(final_ch, 104) ThenBlock: { setv = 1 }
         val = 0
-        i = 1
+        saw = 0
+        i = 0
         WhileLoop LessThan(i, plen) {
             b = GetByte(pbuf, i)
-            IfCondition And(GreaterEqual(b, 48), LessEqual(b, 57)) ThenBlock: {
-                val = Add(Multiply(val, 10), Subtract(b, 48))
+            IfCondition EqualTo(b, 59) ThenBlock: {
+                IfCondition EqualTo(saw, 1) ThenBlock: {
+                    Term_HandlePrivateMode(val, setv)
+                }
+                val = 0
+                saw = 0
+            } ElseBlock: {
+                IfCondition And(GreaterEqual(b, 48), LessEqual(b, 57)) ThenBlock: {
+                    val = Add(Multiply(val, 10), Subtract(b, 48))
+                    saw = 1
+                }
             }
             i = Add(i, 1)
         }
-
-        // h (104) = set mode, l (108) = reset mode
-        IfCondition EqualTo(final_ch, 104) ThenBlock: {
-            Term_HandlePrivateMode(val, 1)
-        }
-        IfCondition EqualTo(final_ch, 108) ThenBlock: {
-            Term_HandlePrivateMode(val, 0)
+        IfCondition EqualTo(saw, 1) ThenBlock: {
+            Term_HandlePrivateMode(val, setv)
         }
     }
 }
@@ -972,6 +1122,7 @@ Function.Term_EnterAltScreen {
 
         TermState.cursor_row = 0
         TermState.cursor_col = 0
+        TermState.wrap_pending = 0
         AltScreen.active = 1
         TermState.dirty = 1
     }
@@ -1029,8 +1180,8 @@ Function.Term_HandlePrivateMode {
             TermState.dirty = 1
         }
 
-        // ?1049 — Alternate screen buffer
-        IfCondition EqualTo(mode_num, 1049) ThenBlock: {
+        // ?47 / ?1047 / ?1049 — Alternate screen buffer
+        IfCondition Or(Or(EqualTo(mode_num, 47), EqualTo(mode_num, 1047)), EqualTo(mode_num, 1049)) ThenBlock: {
             IfCondition EqualTo(set, 1) ThenBlock: {
                 Term_EnterAltScreen()
             } ElseBlock: {
@@ -1038,7 +1189,14 @@ Function.Term_HandlePrivateMode {
             }
         }
 
-        // ?2004 — Bracketed paste mode (just track, ignore)
+        // xterm mouse: 1000 press/release, 1002 drag, 1003 any-event, 1006 SGR
+        IfCondition EqualTo(mode_num, 1000) ThenBlock: { TermState.mouse_1000 = set }
+        IfCondition EqualTo(mode_num, 1002) ThenBlock: { TermState.mouse_1002 = set }
+        IfCondition EqualTo(mode_num, 1003) ThenBlock: { TermState.mouse_1003 = set }
+        IfCondition EqualTo(mode_num, 1006) ThenBlock: { TermState.mouse_sgr = set }
+        IfCondition EqualTo(mode_num, 1015) ThenBlock: { TermState.mouse_sgr = set }
+
+        // ?2004 — Bracketed paste (track only)
     }
 }
 
@@ -1059,8 +1217,11 @@ Function.Term_HandleCSI {
             }
         }
 
-        // Parse params from param_buf
+        // Parse params from param_buf. Zero so missing p1 on ESC[H is
+        // column 1, not heap garbage (that left the cursor off-home and
+        // ESC[J failed to wipe the previous TUI).
         params = Allocate(64)
+        MemorySet(params, 0, 64)
         count = Term_ParseCSIParams(params)
 
         p0 = Dereference(params)
@@ -1072,6 +1233,7 @@ Function.Term_HandleCSI {
 
         // A — Cursor Up
         IfCondition EqualTo(final_ch, 65) ThenBlock: {
+            TermState.wrap_pending = 0
             nr = Subtract(TermState.cursor_row, dp0)
             IfCondition LessThan(nr, 0) ThenBlock: { nr = 0 }
             TermState.cursor_row = nr
@@ -1079,6 +1241,7 @@ Function.Term_HandleCSI {
 
         // B — Cursor Down
         IfCondition EqualTo(final_ch, 66) ThenBlock: {
+            TermState.wrap_pending = 0
             nr = Add(TermState.cursor_row, dp0)
             IfCondition GreaterEqual(nr, TermDim.ROWS) ThenBlock: { nr = Subtract(TermDim.ROWS, 1) }
             TermState.cursor_row = nr
@@ -1086,6 +1249,7 @@ Function.Term_HandleCSI {
 
         // C — Cursor Forward
         IfCondition EqualTo(final_ch, 67) ThenBlock: {
+            TermState.wrap_pending = 0
             nc = Add(TermState.cursor_col, dp0)
             IfCondition GreaterEqual(nc, TermDim.COLS) ThenBlock: { nc = Subtract(TermDim.COLS, 1) }
             TermState.cursor_col = nc
@@ -1093,6 +1257,7 @@ Function.Term_HandleCSI {
 
         // D — Cursor Back
         IfCondition EqualTo(final_ch, 68) ThenBlock: {
+            TermState.wrap_pending = 0
             nc = Subtract(TermState.cursor_col, dp0)
             IfCondition LessThan(nc, 0) ThenBlock: { nc = 0 }
             TermState.cursor_col = nc
@@ -1100,6 +1265,7 @@ Function.Term_HandleCSI {
 
         // H or f — Cursor Position (row;col, 1-based)
         IfCondition Or(EqualTo(final_ch, 72), EqualTo(final_ch, 102)) ThenBlock: {
+            TermState.wrap_pending = 0
             r = p0
             c = p1
             IfCondition EqualTo(r, 0) ThenBlock: { r = 1 }
@@ -1112,13 +1278,17 @@ Function.Term_HandleCSI {
             TermState.cursor_col = c
         }
 
-        // J — Erase in Display
+        // J — Erase in Display. 3 = also drop scrollback, treat as full clear.
         IfCondition EqualTo(final_ch, 74) ThenBlock: {
-            Term_ClearDisplay(p0)
+            TermState.wrap_pending = 0
+            jm = p0
+            IfCondition EqualTo(jm, 3) ThenBlock: { jm = 2 }
+            Term_ClearDisplay(jm)
         }
 
         // K — Erase in Line
         IfCondition EqualTo(final_ch, 75) ThenBlock: {
+            TermState.wrap_pending = 0
             Term_ClearLine(TermState.cursor_row, p0)
         }
 
@@ -1146,6 +1316,7 @@ Function.Term_HandleCSI {
 
         // G — Cursor Horizontal Absolute (1-based column)
         IfCondition EqualTo(final_ch, 71) ThenBlock: {
+            TermState.wrap_pending = 0
             c = dp0
             c = Subtract(c, 1)
             IfCondition LessThan(c, 0) ThenBlock: { c = 0 }
@@ -1155,6 +1326,7 @@ Function.Term_HandleCSI {
 
         // d — Vertical Line Position Absolute (1-based row)
         IfCondition EqualTo(final_ch, 100) ThenBlock: {
+            TermState.wrap_pending = 0
             r = dp0
             r = Subtract(r, 1)
             IfCondition LessThan(r, 0) ThenBlock: { r = 0 }
@@ -1211,6 +1383,7 @@ Function.Term_HandleCSI {
                 TermState.scroll_top = st
                 TermState.scroll_bot = sb
                 // CSI r also moves cursor to home
+                TermState.wrap_pending = 0
                 TermState.cursor_row = 0
                 TermState.cursor_col = 0
             }
@@ -1236,6 +1409,18 @@ Function.Term_HandleCSI {
             }
         }
 
+        // n — Device Status Report. ESC[6n → ESC[{row};{col}R (1-based)
+        IfCondition EqualTo(final_ch, 110) ThenBlock: {
+            IfCondition EqualTo(p0, 6) ThenBlock: {
+                Term_SendCursorReport()
+            }
+        }
+
+        // c — Primary DA. Grok/crossterm probe; answer as VT100 with AVO.
+        IfCondition EqualTo(final_ch, 99) ThenBlock: {
+            Term_WritePTY("\x1b[?1;2c", 7)
+        }
+
         TermState.dirty = 1
         Deallocate(params, 64)
     }
@@ -1258,16 +1443,19 @@ Function.Term_ProcessByte {
             }
             // LF (10) — line feed
             IfCondition EqualTo(ch, 10) ThenBlock: {
+                TermState.wrap_pending = 0
                 Term_LineFeed()
                 ReturnValue(0)
             }
             // CR (13) — carriage return
             IfCondition EqualTo(ch, 13) ThenBlock: {
+                TermState.wrap_pending = 0
                 TermState.cursor_col = 0
                 ReturnValue(0)
             }
             // BS (8) — backspace
             IfCondition EqualTo(ch, 8) ThenBlock: {
+                TermState.wrap_pending = 0
                 IfCondition GreaterThan(TermState.cursor_col, 0) ThenBlock: {
                     TermState.cursor_col = Subtract(TermState.cursor_col, 1)
                 }
@@ -1399,6 +1587,8 @@ Function.Term_ProcessByte {
             // Accumulate digits and ';' into param_buf
             is_digit = And(GreaterEqual(ch, 48), LessEqual(ch, 57))
             is_semi  = EqualTo(ch, 59)
+            // ':' is the ISO 8613-6 sub-param separator; treat as ';'
+            IfCondition EqualTo(ch, 58) ThenBlock: { is_semi = 1 }
             // '?' is a private mode prefix (e.g. ESC[?25l) — accumulate it
             is_qmark = EqualTo(ch, 63)
 
@@ -1449,21 +1639,13 @@ Function.Term_RenderRowFrom {
     Input: src_fg: Address
     Input: src_bg: Address
     Body: {
-        buf = ShmCanvasState.buf
-        stride = TermDim.CANVAS_W
-        py = Multiply(screen_row, TermFontConst.CHAR_H)
-
         col = 0
         WhileLoop LessThan(col, TermDim.COLS) {
             boff = Multiply(col, 4)
             ch = Dereference(Add(src_chars, boff), "dword")
             fg_c = Dereference(Add(src_fg, boff), "dword")
             bg_c = Dereference(Add(src_bg, boff), "dword")
-            TermFont_SetColors(fg_c, bg_c)
-
-            px = Multiply(col, TermFontConst.CHAR_W)
-            TermFont_DrawCharFgBg(buf, stride, px, py, ch)
-
+            Term_DrawCell(screen_row, col, ch, fg_c, bg_c)
             col = Add(col, 1)
         }
     }
@@ -1586,6 +1768,9 @@ Function.Term_RenderRow_At {
 // =============================================================================
 Function.Term_RenderGrid {
     Body: {
+        // Wipe pixels first so glyph overflow and uncleared cells cannot
+        // ghost the previous TUI frame (welcome screen leftover, etc.).
+        ShmCanvas_Clear(TermSGR.default_bg)
         Term_RenderView()
     }
 }
@@ -1597,20 +1782,11 @@ Function.Term_DrawCursor {
     Body: {
         row = TermState.cursor_row
         col = TermState.cursor_col
-        buf = ShmCanvasState.buf
-        stride = TermDim.CANVAS_W
-
         off = Multiply(Add(Multiply(row, TermDim.COLS), col), 4)
         ch = Dereference(Add(TermGrid.chars, off), "dword")
         fg_c = Dereference(Add(TermGrid.fg_arr, off), "dword")
         bg_c = Dereference(Add(TermGrid.bg_arr, off), "dword")
-
-        // Invert: swap fg and bg for cursor block
-        TermFont_SetColors(bg_c, fg_c)
-
-        px = Multiply(col, TermFontConst.CHAR_W)
-        py = Multiply(row, TermFontConst.CHAR_H)
-        TermFont_DrawCharFgBg(buf, stride, px, py, ch)
+        Term_DrawCell(row, col, ch, bg_c, fg_c)
     }
 }
 
@@ -1749,10 +1925,11 @@ Function.Term_ForkBash {
 
             // Set window size: struct winsize { rows(u16), cols(u16), xpix(u16), ypix(u16) }
             wsz = Allocate(8)
-            // rows = 24, cols = 80
             StoreValue(wsz, 0, "dword")
-            SetByte(wsz, 0, 24)
-            SetByte(wsz, 2, 80)
+            SetByte(wsz, 0, BitwiseAnd(TermDim.ROWS, 255))
+            SetByte(wsz, 1, BitwiseAnd(ShiftRight(TermDim.ROWS, 8), 255))
+            SetByte(wsz, 2, BitwiseAnd(TermDim.COLS, 255))
+            SetByte(wsz, 3, BitwiseAnd(ShiftRight(TermDim.COLS, 8), 255))
             SystemCall(TSys.SYS_IOCTL, slave_fd, TIoctl.TIOCSWINSZ, wsz)
             Deallocate(wsz, 8)
 
@@ -1766,21 +1943,28 @@ Function.Term_ForkBash {
                 SystemCall(TSys.SYS_CLOSE, slave_fd)
             }
 
-            // Build argv: ["/bin/sh", "-i", NULL]
-            argv = Allocate(24)
-            StoreValue(Add(argv, 0),  "/bin/sh")
-            StoreValue(Add(argv, 8),  "-i")
-            StoreValue(Add(argv, 16), 0)
+            // Login shell: argv[0] starts with '-' so ash reads
+            // /etc/profile and ~/.profile (prompt, aliases, HISTFILE).
+            argv = Allocate(16)
+            StoreValue(Add(argv, 0), "-sh")
+            StoreValue(Add(argv, 8), 0)
 
-            // Build envp: TERM, HOME, PATH, LANG
-            envp = Allocate(40)
-            StoreValue(Add(envp, 0),  "TERM=xterm")
-            StoreValue(Add(envp, 8),  "HOME=/root")
-            StoreValue(Add(envp, 16), "PATH=/system/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
-            StoreValue(Add(envp, 24), "LANG=en_US.UTF-8")
-            StoreValue(Add(envp, 32), 0)
+            // envp: typical login environment. PS1 lives in /etc/profile
+            // so we do not fight ash's fancy-prompt backslash codes here.
+            envp = Allocate(96)
+            StoreValue(Add(envp, 0),  "TERM=xterm-256color")
+            StoreValue(Add(envp, 8),  "COLORTERM=truecolor")
+            StoreValue(Add(envp, 16), "HOME=/root")
+            StoreValue(Add(envp, 24), "PATH=/system/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin")
+            StoreValue(Add(envp, 32), "LANG=en_US.UTF-8")
+            StoreValue(Add(envp, 40), "USER=root")
+            StoreValue(Add(envp, 48), "LOGNAME=root")
+            StoreValue(Add(envp, 56), "HOSTNAME=ailang")
+            StoreValue(Add(envp, 64), "SHELL=/bin/sh")
+            StoreValue(Add(envp, 72), "HISTFILE=/root/.ash_history")
+            StoreValue(Add(envp, 80), "HISTSIZE=1000")
+            StoreValue(Add(envp, 88), 0)
 
-            // exec
             SystemCall(TSys.SYS_EXECVE, "/bin/sh", argv, envp)
 
             // If execve returns, something went wrong
@@ -1862,6 +2046,133 @@ Function.Term_WritePTYByte {
     }
 }
 
+Function.Term_SendCursorReport {
+    Body: {
+        buf = Allocate(32)
+        tmp = Allocate(12)
+        SetByte(buf, 0, 27)
+        SetByte(buf, 1, 91)
+        n = Term_NumToStr(Add(TermState.cursor_row, 1), tmp)
+        MemoryCopy(Add(buf, 2), tmp, n)
+        off = Add(2, n)
+        SetByte(buf, off, 59)
+        off = Add(off, 1)
+        n = Term_NumToStr(Add(TermState.cursor_col, 1), tmp)
+        MemoryCopy(Add(buf, off), tmp, n)
+        off = Add(off, n)
+        SetByte(buf, off, 82)
+        off = Add(off, 1)
+        Term_WritePTY(buf, off)
+        Deallocate(tmp, 12)
+        Deallocate(buf, 32)
+    }
+}
+
+Function.Term_MouseOn {
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(TermState.mouse_1000, 0) ThenBlock: { ReturnValue(1) }
+        IfCondition GreaterThan(TermState.mouse_1002, 0) ThenBlock: { ReturnValue(1) }
+        IfCondition GreaterThan(TermState.mouse_1003, 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// SGR mouse: ESC[<pb;x;yM (press/move) or ...m (release). x/y are 1-based cells.
+Function.Term_SendMouseReport {
+    Input: pb: Integer
+    Input: mx: Integer
+    Input: my: Integer
+    Input: press: Integer
+    Body: {
+        buf = Allocate(32)
+        tmp = Allocate(12)
+        SetByte(buf, 0, 27)
+        SetByte(buf, 1, 91)
+        SetByte(buf, 2, 60)
+        n = Term_NumToStr(pb, tmp)
+        MemoryCopy(Add(buf, 3), tmp, n)
+        off = Add(3, n)
+        SetByte(buf, off, 59)
+        off = Add(off, 1)
+        n = Term_NumToStr(mx, tmp)
+        MemoryCopy(Add(buf, off), tmp, n)
+        off = Add(off, n)
+        SetByte(buf, off, 59)
+        off = Add(off, 1)
+        n = Term_NumToStr(my, tmp)
+        MemoryCopy(Add(buf, off), tmp, n)
+        off = Add(off, n)
+        IfCondition EqualTo(press, 1) ThenBlock: {
+            SetByte(buf, off, 77)
+        } ElseBlock: {
+            SetByte(buf, off, 109)
+        }
+        off = Add(off, 1)
+        Term_WritePTY(buf, off)
+        Deallocate(tmp, 12)
+        Deallocate(buf, 32)
+    }
+}
+
+Function.Term_HandleMouse {
+    Body: {
+        IfCondition EqualTo(Term_MouseOn(), 0) ThenBlock: {
+            IfCondition EqualTo(TermMouse.ev, 3) ThenBlock: {
+                IfCondition GreaterThan(TermMouse.btn, 0) ThenBlock: { Term_ScrollBack() }
+                IfCondition LessThan(TermMouse.btn, 0) ThenBlock: { Term_ScrollForward() }
+            }
+            ReturnValue(0)
+        }
+        cw = TermDim.CHAR_W
+        ch = TermDim.CHAR_H
+        IfCondition LessEqual(cw, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(ch, 0) ThenBlock: { ReturnValue(0) }
+        col = Divide(TermMouse.x, cw)
+        row = Divide(TermMouse.y, ch)
+        IfCondition LessThan(col, 0) ThenBlock: { col = 0 }
+        IfCondition LessThan(row, 0) ThenBlock: { row = 0 }
+        IfCondition GreaterEqual(col, TermDim.COLS) ThenBlock: { col = Subtract(TermDim.COLS, 1) }
+        IfCondition GreaterEqual(row, TermDim.ROWS) ThenBlock: { row = Subtract(TermDim.ROWS, 1) }
+        mx = Add(col, 1)
+        my = Add(row, 1)
+
+        // IPC button 0=left 1=right 2=middle → xterm 0=left 1=middle 2=right
+        pb = 0
+        IfCondition EqualTo(TermMouse.btn, 1) ThenBlock: { pb = 2 }
+        IfCondition EqualTo(TermMouse.btn, 2) ThenBlock: { pb = 1 }
+
+        IfCondition EqualTo(TermMouse.ev, 3) ThenBlock: {
+            IfCondition GreaterThan(TermMouse.btn, 0) ThenBlock: {
+                Term_SendMouseReport(64, mx, my, 1)
+            } ElseBlock: {
+                Term_SendMouseReport(65, mx, my, 1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(TermMouse.ev, 1) ThenBlock: {
+            TermState.mouse_btns = BitwiseOr(TermState.mouse_btns, ShiftLeft(1, BitwiseAnd(TermMouse.btn, 3)))
+            Term_SendMouseReport(pb, mx, my, 1)
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(TermMouse.ev, 2) ThenBlock: {
+            TermState.mouse_btns = BitwiseAnd(TermState.mouse_btns, Subtract(0, Add(ShiftLeft(1, BitwiseAnd(TermMouse.btn, 3)), 1)))
+            Term_SendMouseReport(pb, mx, my, 0)
+            ReturnValue(0)
+        }
+        // MOVE — 1003 any-event uses 32+3 when no button is down
+        IfCondition GreaterThan(TermState.mouse_1003, 0) ThenBlock: {
+            mp = 35
+            IfCondition GreaterThan(TermState.mouse_btns, 0) ThenBlock: { mp = Add(pb, 32) }
+            Term_SendMouseReport(mp, mx, my, 1)
+            ReturnValue(0)
+        }
+        IfCondition And(GreaterThan(TermState.mouse_1002, 0), GreaterThan(TermState.mouse_btns, 0)) ThenBlock: {
+            Term_SendMouseReport(Add(pb, 32), mx, my, 1)
+        }
+    }
+}
+
 // =============================================================================
 // DRAW SCROLLBAR — visual scrollbar on right edge of canvas
 //
@@ -1871,8 +2182,9 @@ Function.Term_WritePTYByte {
 // =============================================================================
 Function.Term_DrawScrollbar {
     Body: {
+        // Alt-screen TUIs own the whole grid — do not overlay our thumb.
+        IfCondition EqualTo(AltScreen.active, 1) ThenBlock: { ReturnValue(0) }
         lc = TermScroll.line_count
-        // No scrollbar if no history
         IfCondition EqualTo(lc, 0) ThenBlock: { ReturnValue(0) }
 
         buf = ShmCanvasState.buf
@@ -2268,52 +2580,69 @@ Function.Term_HandleKey {
 Function.Term_PollMessages {
     Input: sock: Integer
     Body: {
-        msg = Socket.RecvMsg(sock)
-        IfCondition EqualTo(msg, 0) ThenBlock: { ReturnValue(0) }
+        rounds = 0
+        WhileLoop LessThan(rounds, 32) {
+            msg = Socket.RecvMsg(sock)
+            IfCondition EqualTo(msg, 0) ThenBlock: {
+                ReturnValue(0)
+            }
 
-        pmsg = ParseJSON(msg)
-        IfCondition NotEqual(pmsg, 0) ThenBlock: {
-            mobj = JSON.AsObject(pmsg)
-            method = JSON.GetString(mobj, "method")
-            IfCondition NotEqual(method, 0) ThenBlock: {
+            pmsg = ParseJSON(msg)
+            IfCondition NotEqual(pmsg, 0) ThenBlock: {
+                mobj = JSON.AsObject(pmsg)
+                method = JSON.GetString(mobj, "method")
+                IfCondition NotEqual(method, 0) ThenBlock: {
 
-                cmp = StringCompare(method, "window.closed")
-                IfCondition EqualTo(cmp, 0) ThenBlock: {
-                    PrintMessage("[Term] Window closed\n")
-                    TermState.running = 0
-                }
+                    cmp = StringCompare(method, "window.closed")
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        PrintMessage("[Term] Window closed\n")
+                        TermState.running = 0
+                        JSON.Free(pmsg)
+                        ReturnValue(0)
+                    }
 
-                IfCondition EqualTo(Term_HandleClipMsg(mobj, method), 1) ThenBlock: {
-                    cmp = 0
-                }
+                    IfCondition EqualTo(Term_HandleClipMsg(mobj, method), 1) ThenBlock: {
+                        cmp = 0
+                    }
 
-                cmp = StringCompare(method, "input.key")
-                IfCondition EqualTo(cmp, 0) ThenBlock: {
-                    kc = JSON.GetNumber(mobj, "keycode")
-                    kch = JSON.GetNumber(mobj, "char")
-                    ksh = JSON.GetNumber(mobj, "shift")
-                    kct = JSON.GetNumber(mobj, "ctrl")
-                    Term_HandleKey(kc, kch, ksh, kct)
-                }
+                    cmp = StringCompare(method, "input.key")
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        kc = JSON.GetNumber(mobj, "keycode")
+                        kch = JSON.GetNumber(mobj, "char")
+                        ksh = JSON.GetNumber(mobj, "shift")
+                        kct = JSON.GetNumber(mobj, "ctrl")
+                        Term_HandleKey(kc, kch, ksh, kct)
+                    }
 
-                cmp = StringCompare(method, "input.action")
-                IfCondition EqualTo(cmp, 0) ThenBlock: {
-                    action = JSON.GetString(mobj, "action")
-                    IfCondition NotEqual(action, 0) ThenBlock: {
-                        PrintMessage("[Term] Action: ")
-                        PrintString(action)
-                        PrintMessage("\n")
+                    cmp = StringCompare(method, "input.mouse")
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        TermMouse.x = JSON.GetNumber(mobj, "x")
+                        TermMouse.y = JSON.GetNumber(mobj, "y")
+                        TermMouse.ev = JSON.GetNumber(mobj, "event")
+                        TermMouse.btn = JSON.GetNumber(mobj, "button")
+                        Term_HandleMouse()
+                    }
+
+                    cmp = StringCompare(method, "input.action")
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        action = JSON.GetString(mobj, "action")
+                        IfCondition NotEqual(action, 0) ThenBlock: {
+                            PrintMessage("[Term] Action: ")
+                            PrintString(action)
+                            PrintMessage("\n")
+                        }
+                    }
+
+                    cmp = StringCompare(method, "window.resized")
+                    IfCondition EqualTo(cmp, 0) ThenBlock: {
+                        rw = JSON.GetNumber(mobj, "width")
+                        rh = JSON.GetNumber(mobj, "height")
+                        Term_HandleResize(sock, rw, rh)
                     }
                 }
-
-                cmp = StringCompare(method, "window.resized")
-                IfCondition EqualTo(cmp, 0) ThenBlock: {
-                    rw = JSON.GetNumber(mobj, "width")
-                    rh = JSON.GetNumber(mobj, "height")
-                    Term_HandleResize(sock, rw, rh)
-                }
+                JSON.Free(pmsg)
             }
-            JSON.Free(pmsg)
+            rounds = Add(rounds, 1)
         }
     }
 }
@@ -2331,16 +2660,18 @@ Function.Term_HandleResize {
         IfCondition LessEqual(new_h, 0) ThenBlock: { ReturnValue(0) }
 
         // Calculate new grid dimensions from pixel size
-        new_cols = Divide(new_w, TermFontConst.CHAR_W)
-        new_rows = Divide(new_h, TermFontConst.CHAR_H)
+        usable = Subtract(new_w, ScrollbarConst.WIDTH)
+        IfCondition LessThan(usable, 80) ThenBlock: { usable = new_w }
+        new_cols = Divide(usable, TermDim.CHAR_W)
+        new_rows = Divide(new_h, TermDim.CHAR_H)
 
         // Clamp minimums
         IfCondition LessThan(new_cols, 10) ThenBlock: { new_cols = 10 }
         IfCondition LessThan(new_rows, 4)  ThenBlock: { new_rows = 4 }
 
         // Snap canvas to cell grid to prevent glyph writes past buffer edge
-        canvas_w = Multiply(new_cols, TermFontConst.CHAR_W)
-        canvas_h = Multiply(new_rows, TermFontConst.CHAR_H)
+        canvas_w = Add(Multiply(new_cols, TermDim.CHAR_W), ScrollbarConst.WIDTH)
+        canvas_h = Multiply(new_rows, TermDim.CHAR_H)
 
         // Skip if both grid AND canvas unchanged
         old_cols = TermDim.COLS
@@ -2412,10 +2743,11 @@ Function.Term_HandleResize {
             PrintMessage("[Term] ShmCanvas_Create failed after resize\n")
             ReturnValue(0)
         }
-        ShmCanvas_Attach(sock, wid, canvas_w, canvas_h)
+        ShmCanvas_AttachCaptureNative(sock, wid, canvas_w, canvas_h)
+        Term_WrapSurf()
 
         // Clear canvas to black — ensures no gap artifacts at edges
-        ShmCanvas_Clear(4278190080)
+        ShmCanvas_Clear(TermSGR.default_bg)
 
         // Send TIOCSWINSZ to PTY master so bash knows new dimensions
         Term_SetWinSize(new_rows, new_cols)
@@ -2522,11 +2854,28 @@ SubRoutine.Main {
     Arena_Init()
 
     PrintMessage("============================================\n")
-    PrintMessage("  Terminal Emulator — PTY + VT100 + ShmCanvas\n")
+    PrintMessage("  Terminal — PTY + xterm-256 + VFont\n")
     PrintMessage("============================================\n\n")
 
-    // Init font
-    TermFont_Init()
+    Term_InitFont()
+    usable = Subtract(TermDim.CANVAS_W, ScrollbarConst.WIDTH)
+    TermDim.COLS = Divide(usable, TermDim.CHAR_W)
+    TermDim.ROWS = Divide(TermDim.CANVAS_H, TermDim.CHAR_H)
+    IfCondition LessThan(TermDim.COLS, 40) ThenBlock: { TermDim.COLS = 40 }
+    IfCondition LessThan(TermDim.ROWS, 12) ThenBlock: { TermDim.ROWS = 12 }
+    TermDim.CANVAS_W = Add(Multiply(TermDim.COLS, TermDim.CHAR_W), ScrollbarConst.WIDTH)
+    TermDim.CANVAS_H = Multiply(TermDim.ROWS, TermDim.CHAR_H)
+    TermDim.GRID_SIZE = Multiply(TermDim.COLS, TermDim.ROWS)
+    TermState.scroll_bot = Subtract(TermDim.ROWS, 1)
+    PrintMessage("[Term] grid ")
+    PrintNumber(TermDim.COLS)
+    PrintMessage("x")
+    PrintNumber(TermDim.ROWS)
+    PrintMessage(" canvas ")
+    PrintNumber(TermDim.CANVAS_W)
+    PrintMessage("x")
+    PrintNumber(TermDim.CANVAS_H)
+    PrintMessage("\n")
 
     // Allocate grid buffers (all arrays: 4 bytes/cell — codepoints + BGRA colors)
     gsz = TermDim.GRID_SIZE
@@ -2564,7 +2913,7 @@ SubRoutine.Main {
     Socket.SendMsg(sock, "{\"method\":\"register\",\"service\":\"terminal\"}")
 
     // Create window
-    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Terminal\",\"w\":640,\"h\":384,\"html\":\"config/terminal.html\"}")
+    Socket.SendMsg(sock, "{\"method\":\"window.create\",\"title\":\"Terminal\",\"w\":960,\"h\":540,\"html\":\"config/terminal.html\"}")
 
     // Wait for window.created
     resp = Socket.RecvMsg(sock)
@@ -2596,11 +2945,11 @@ SubRoutine.Main {
         HaltProgram
     }
 
-    ShmCanvas_Attach(sock, wid, cw, ch)
-    PrintMessage("[Term] Canvas attached\n")
+    ShmCanvas_AttachCaptureNative(sock, wid, cw, ch)
+    Term_WrapSurf()
+    PrintMessage("[Term] Canvas attached (mouse capture)\n")
 
-    // Clear canvas to black
-    ShmCanvas_Clear(4278190080)
+    ShmCanvas_Clear(TermSGR.default_bg)
     ShmCanvas_Present(sock, wid)
 
     // Open PTY
@@ -2627,6 +2976,7 @@ SubRoutine.Main {
     }
     TermState.bash_pid = bpid
     Deallocate(slave_path, 32)
+    Term_SetWinSize(TermDim.ROWS, TermDim.COLS)
 
     // Set socket non-blocking
     Socket.SetNonBlock(sock)

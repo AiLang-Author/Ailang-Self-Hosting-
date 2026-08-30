@@ -17,6 +17,8 @@
 --   plane_tree    Sketch_0 PlaneFeature tree (PT1 JSON + P recipe rows)
 --   face_map      persistent face names (FM1: plane pid ↔ signature)
 --   mesh_*        future: tess caches
+-- Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+-- Licensed under the Sean Collins Software License (SCSL v1.0).
 
 CREATE TABLE IF NOT EXISTS cad_project (
     id          BIGSERIAL PRIMARY KEY,

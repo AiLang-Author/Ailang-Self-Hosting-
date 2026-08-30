@@ -16,12 +16,18 @@
 | 05 | 05_INPUT_SYSTEM.md | Evdev, Cursor, IPCBroker, Device Discovery (+ InputRouter archived) | ✅ |
 | 06 | 06_DESKTOP_SHELL_CONTENT.md | Deskbar, Menu, StartMenu, CascadeMenu, Theme, Content | ✅ |
 | 07 | 07_PAIN_POINTS.md | Pain points, hardening roadmap, prioritized mitigations | ✅ |
+| — | DOCUMENT_FACILITY.md | Paper IR, DocView camera, typewriter v1 | ✅ |
+| — | DOC_PHASE_FONTS_TOOLBAR.md | Format dropdowns + font catalog | ✅ |
+| — | DOC_PHASE_TABLES.md | Page tables: rubber-band, frames, themed grid | 📋 |
+| — | PLACE_HUD.md | Themed rubber-band + numeric HUD (tables, CAD, select/copy) | 📋 |
 
 ---
 
 ## Architecture Overview
 
 The AILANG Display System is a complete graphical desktop environment written in the AILANG programming language. It runs directly on the Linux framebuffer (`/dev/fb0`), bypassing X11 and Wayland entirely. The system implements its own window management, compositing, input handling, UI toolkit, and desktop shell.
+
+Containment of foreign apps (Chrome, grok CLI) and user-data paths is **not** a display-server job. See `docs/aos/SANDBOX_JAIL.md`. display.x may later show grant prompts; it must not open jail files or UUID blobs on behalf of those programs.
 
 ### System Layers
 

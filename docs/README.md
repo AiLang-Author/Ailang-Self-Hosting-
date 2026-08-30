@@ -15,7 +15,7 @@ See also `WORKSPACE.md` at the repo root for the monorepo philosophy.
 | `design/` | Design specs, compiler/display design history |
 | `browser/` | JS engine master plan, conformance, usability plans |
 | `cad/` | CAD kernel and app design (do not fight active CAD work) |
-| `aos/` | OS install, LUKS/secure boot phases, emergency notes |
+| `aos/` | OS install, LUKS/secure boot, sandbox/jail, firmware-on-disk, device UI, foreign-app porting |
 | `apps/` | Other application design (MediaCenter, etc.) |
 | `plans/` | Active cross-cutting work only (landed clipboard design is `display/CLIPBOARD_SERVICE.md`) |
 | `archive/` | Historical sandboxes, old prompts, retired experiments |

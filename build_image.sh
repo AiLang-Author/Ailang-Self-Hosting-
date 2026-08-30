@@ -26,13 +26,15 @@ AILANG="./ailang.x"
 #   Partition 1: EFI System (FAT32) — sectors 2048..409599
 #   Partition 2: Linux rootfs (ext4) — sectors 409600..end
 #   PARTUUID for P2 must match kernel baked-in cmdline
-DISK_IMAGE="$IMAGES/ailang_os.img"
+# Override while QEMU has the live image open (snapshot=on): DISK_IMAGE=.../ailang_os.img.new
+DISK_IMAGE="${DISK_IMAGE:-$IMAGES/ailang_os.img}"
 ROOTFS_IMAGE="$IMAGES/rootfs.ext2"
 KERNEL="$IMAGES/bzImage"
 EFI_START_SECTOR=2048
 EFI_END_SECTOR=409599
 ROOTFS_START_SECTOR=409600
-IMAGE_SIZE_MB=2500
+# 16G: Chrome + grok + caches. Host has ~80G free; file is sparse until written.
+IMAGE_SIZE_MB=16384
 PARTUUID="c49ed437-68e9-45a0-8988-c8fd735b40c1"
 
 # OVMF firmware for QEMU EFI boot
@@ -52,6 +54,97 @@ info()  { echo -e "${CYN}[INFO]${RST}  $*"; }
 ok()    { echo -e "${GRN}[OK]${RST}    $*"; }
 warn()  { echo -e "${YEL}[WARN]${RST}  $*"; }
 fail()  { echo -e "${RED}[FAIL]${RST}  $*"; exit 1; }
+
+# Ship the entire linux-firmware tree under overlay /lib/firmware.
+# Buildroot's kconfig only installs selected blobs; we do not want
+# "where's the firmware" on a released image. WHENCE symlinks included.
+stage_all_firmware() {
+    local ver="20240115"
+    local src="$BUILDROOT/output/build/linux-firmware-$ver"
+    local tar="$BUILDROOT/dl/linux-firmware/linux-firmware-$ver.tar.xz"
+    local dest="$OVERLAY/lib/firmware"
+    local stamp="$dest/.aos_all_firmware"
+
+    if [ -f "$stamp" ] && [ -d "$dest/i915" ] && [ -d "$dest/amdgpu" ]; then
+        ok "  linux-firmware already staged ($(du -sh "$dest" 2>/dev/null | cut -f1))"
+        return
+    fi
+    if [ ! -x "$src/copy-firmware.sh" ]; then
+        [ -f "$tar" ] || fail "linux-firmware tarball missing: $tar"
+        info "  Extracting linux-firmware $ver..."
+        mkdir -p "$BUILDROOT/output/build"
+        tar -C "$BUILDROOT/output/build" -xf "$tar"
+    fi
+    [ -x "$src/copy-firmware.sh" ] || fail "copy-firmware.sh not in $src"
+    info "  Installing ALL linux-firmware into overlay /lib/firmware..."
+    mkdir -p "$dest"
+    ( cd "$src" && ./copy-firmware.sh --ignore-duplicates "$dest" )
+    echo "$ver" > "$stamp"
+    ok "  firmware staged ($(du -sh "$dest" | cut -f1))"
+}
+
+# Grow a GPT disk file to SIZE_MB and stretch partition 2 to 100%.
+# Does not resize2fs (needs a block device). Guest runs resize2fs online.
+grow_gpt_disk() {
+    local img="$1"
+    local size_mb="$2"
+    local want=$((size_mb * 1024 * 1024))
+    local have
+    have=$(stat -c%s "$img")
+    if [ "$have" -lt "$want" ]; then
+        info "  Growing $img to ${size_mb}MB (sparse)..."
+        truncate -s "$want" "$img"
+    fi
+    python3 - "$img" <<'PY'
+import struct, sys, zlib
+path = sys.argv[1]
+SEC = 512
+with open(path, 'r+b') as f:
+    f.seek(0, 2)
+    size = f.tell()
+    if size % SEC:
+        raise SystemExit(f'image size {size} not sector-aligned')
+    last_lba = size // SEC - 1
+    f.seek(SEC)
+    hdr = bytearray(f.read(SEC))
+    if hdr[:8] != b'EFI PART':
+        raise SystemExit('no GPT header')
+    num_parts = struct.unpack_from('<I', hdr, 80)[0]
+    part_size = struct.unpack_from('<I', hdr, 84)[0]
+    part_lba = struct.unpack_from('<Q', hdr, 72)[0]
+    entry_bytes = num_parts * part_size
+    entry_secs = (entry_bytes + SEC - 1) // SEC
+    backup_lba = last_lba
+    backup_ent_lba = last_lba - entry_secs
+    last_usable = backup_ent_lba - 1
+    first_usable = struct.unpack_from('<Q', hdr, 40)[0]
+    f.seek(part_lba * SEC)
+    entries = bytearray(f.read(entry_bytes))
+    p2 = part_size
+    struct.pack_into('<Q', entries, p2 + 40, last_usable)
+    part_crc = zlib.crc32(bytes(entries)) & 0xFFFFFFFF
+    def write_hdr(buf, my, other, ent_lba):
+        struct.pack_into('<Q', buf, 24, my)
+        struct.pack_into('<Q', buf, 32, other)
+        struct.pack_into('<Q', buf, 40, first_usable)
+        struct.pack_into('<Q', buf, 48, last_usable)
+        struct.pack_into('<Q', buf, 72, ent_lba)
+        struct.pack_into('<I', buf, 88, part_crc)
+        buf[16:20] = b'\x00\x00\x00\x00'
+        crc = zlib.crc32(bytes(buf[:92])) & 0xFFFFFFFF
+        struct.pack_into('<I', buf, 16, crc)
+    phdr = bytearray(hdr)
+    write_hdr(phdr, 1, backup_lba, part_lba)
+    bhdr = bytearray(hdr)
+    write_hdr(bhdr, backup_lba, 1, backup_ent_lba)
+    f.seek(part_lba * SEC); f.write(entries)
+    f.seek(SEC); f.write(phdr)
+    f.seek(backup_ent_lba * SEC); f.write(entries)
+    f.seek(backup_lba * SEC); f.write(bhdr)
+print(f'GPT P2 last usable LBA={last_usable} disk={last_lba + 1} sectors')
+PY
+    ok "  GPT disk ${size_mb}MB, partition 2 to end"
+}
 
 # Compile an AILang source file and abort on failure
 # Usage: compile <source> <output>
@@ -174,7 +267,8 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         "Applications/browser_ipc.ailang:browser.x" \
         "Applications/vscode_ipc.ailang:vscode.x" \
         "Applications/deskbar_ipc.ailang:deskbar.x" \
-        "Applications/document_ipc.ailang:document.x"
+        "Applications/document_ipc.ailang:document.x" \
+        "Applications/picview_ipc.ailang:picview.x"
     do
         src="${pair%%:*}"
         bin="${pair##*:}"
@@ -206,6 +300,10 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         [ -f "$f" ] && cp "$f" "$OVERLAY/$f"
         [ -f "$f" ] && cp "$f" "$OVERLAY/system/$f"
     done
+    if [ -f config/profile ]; then
+        mkdir -p "$OVERLAY/etc"
+        cp config/profile "$OVERLAY/etc/profile"
+    fi
     ok "  Config files synced"
 
     if [ -d "icons/chrome" ]; then
@@ -222,6 +320,70 @@ if [ "$IMAGE_ONLY" -eq 0 ]; then
         done
         ok "  Icon packs synced"
     fi
+    if [ -d "fonts" ]; then
+        info "  Syncing fonts..."
+        mkdir -p "$OVERLAY/system/fonts"
+        for vif in fonts/*.vif; do
+            [ -f "$vif" ] && cp "$vif" "$OVERLAY/system/fonts/"
+        done
+        ok "  Fonts synced"
+    fi
+
+    GROK_BIN="${HOME}/.grok/downloads/grok-1.0.5-linux-x86_64"
+    if [ -x "$GROK_BIN" ]; then
+        info "  Installing grok CLI into grok jail..."
+        mkdir -p "$OVERLAY/system/libexec"
+        mkdir -p "$OVERLAY/data/sandboxes/grok/home/.grok"
+        mkdir -p "$OVERLAY/data/sandboxes/grok/tmp"
+        mkdir -p "$OVERLAY/data/sandboxes/chrome/home/.chrome"
+        mkdir -p "$OVERLAY/data/sandboxes/chrome/tmp"
+        cp "$GROK_BIN" "$OVERLAY/system/libexec/grok"
+        chmod +x "$OVERLAY/system/libexec/grok"
+        cp config/grok.sh "$OVERLAY/system/bin/grok"
+        chmod +x "$OVERLAY/system/bin/grok"
+        if [ -f "${HOME}/.grok/auth.json" ]; then
+            cp "${HOME}/.grok/auth.json" "$OVERLAY/data/sandboxes/grok/home/.grok/auth.json"
+            chmod 600 "$OVERLAY/data/sandboxes/grok/home/.grok/auth.json"
+        fi
+        ok "  grok CLI ($(stat -c%s "$OVERLAY/system/libexec/grok") bytes) + jail wrapper"
+    fi
+
+    # Chrome / NSS expect systemd-shaped files. We ship the files, not daemons.
+    info "  Staging Chrome NSS/sqlite + Xvfb xkb + machine-id..."
+    mkdir -p "$OVERLAY/opt/google/chrome" "$OVERLAY/usr/lib" "$OVERLAY/usr/bin" \
+             "$OVERLAY/usr/share/X11" "$OVERLAY/etc"
+    printf 'a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1\n' > "$OVERLAY/etc/machine-id"
+    SQLITE_SO="/usr/lib/x86_64-linux-gnu/libsqlite3.so.0"
+    if [ -f "$SQLITE_SO" ]; then
+        cp -a "$SQLITE_SO" "$OVERLAY/usr/lib/"
+        cp -a "$SQLITE_SO" "$OVERLAY/opt/google/chrome/"
+    fi
+    for nsslib in libsoftokn3.so libsoftokn3.chk libfreebl3.so libfreebl3.chk libfreeblpriv3.so libfreeblpriv3.chk libnssckbi.so; do
+        src=""
+        [ -f "/opt/google/chrome/$nsslib" ] && src="/opt/google/chrome/$nsslib"
+        [ -z "$src" ] && [ -f "/usr/lib/x86_64-linux-gnu/nss/$nsslib" ] && src="/usr/lib/x86_64-linux-gnu/nss/$nsslib"
+        [ -z "$src" ] && [ -f "/usr/lib/x86_64-linux-gnu/$nsslib" ] && src="/usr/lib/x86_64-linux-gnu/$nsslib"
+        [ -n "$src" ] && cp -a "$src" "$OVERLAY/opt/google/chrome/"
+    done
+    # Xvfb dies immediately without xkbcomp + xkb data (not a systemd keyboard service).
+    if [ -x /usr/bin/xkbcomp ]; then
+        cp -a /usr/bin/xkbcomp "$OVERLAY/usr/bin/xkbcomp"
+    fi
+    if [ -f /usr/lib/x86_64-linux-gnu/libxkbfile.so.1.0.2 ]; then
+        cp -a /usr/lib/x86_64-linux-gnu/libxkbfile.so.1.0.2 "$OVERLAY/usr/lib/"
+        ln -sfn libxkbfile.so.1.0.2 "$OVERLAY/usr/lib/libxkbfile.so.1"
+    fi
+    if [ -d /usr/share/X11/xkb ]; then
+        cp -a /usr/share/X11/xkb "$OVERLAY/usr/share/X11/"
+    fi
+    mkdir -p "$OVERLAY/etc/fonts" "$OVERLAY/usr/share/fonts"
+    if [ -f config/fonts.conf ]; then
+        cp config/fonts.conf "$OVERLAY/etc/fonts/fonts.conf"
+    fi
+    if [ -f /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf ]; then
+        cp /usr/share/fonts/truetype/dejavu/DejaVuSans.ttf "$OVERLAY/usr/share/fonts/DejaVuSans.ttf"
+    fi
+    ok "  Chrome runtime libs + xkbcomp + fonts + /etc/machine-id (no systemd)"
 else
     info "Step 1: SKIPPED (--image-only)"
 fi
@@ -311,6 +473,12 @@ else
 fi
 
 # =============================================================================
+# STEP 1c: ALL linux-firmware ON DISK
+# =============================================================================
+info "Step 1c: Staging all linux-firmware (no blob hunting on release)"
+stage_all_firmware
+
+# =============================================================================
 # STEP 2: BUILD ROOTFS
 # =============================================================================
 info "Step 2: Building rootfs"
@@ -324,6 +492,7 @@ rm -rf "$TARGET_DIR/etc/ld.so.conf.d"
 # Also remove stale binaries so overlay versions take precedence
 rm -f "$TARGET_DIR/sbin/ailang_init"
 rm -f "$TARGET_DIR/system/bin/display.x"
+rm -f "$TARGET_DIR/system/bin/picview.x"
 
 cd "$BUILDROOT"
 make rootfs-ext2 2>&1 | tail -3
@@ -354,8 +523,9 @@ else
 fi
 
 if [ "$NEED_NEW_IMAGE" -eq 1 ]; then
-    info "  Creating ${IMAGE_SIZE_MB}MB disk image..."
-    dd if=/dev/zero of="$DISK_IMAGE" bs=1M count=$IMAGE_SIZE_MB 2>/dev/null
+    info "  Creating ${IMAGE_SIZE_MB}MB sparse disk image..."
+    rm -f "$DISK_IMAGE"
+    truncate -s ${IMAGE_SIZE_MB}M "$DISK_IMAGE"
 
     info "  Creating GPT partition table..."
     # EFI partition: sectors 2048-409599 (200MB)
@@ -413,6 +583,10 @@ fi
 info "  Writing rootfs at sector $ROOTFS_START_SECTOR..."
 dd if="$ROOTFS_IMAGE" of="$DISK_IMAGE" bs=512 seek=$ROOTFS_START_SECTOR conv=notrunc 2>/dev/null
 ok "  Rootfs written"
+
+# Rootfs.ext2 is still ~2G (Buildroot mkfs). Grow the GPT disk + P2 to IMAGE_SIZE_MB
+# so the guest can resize2fs online. Sparse: does not eat 16G of host until filled.
+grow_gpt_disk "$DISK_IMAGE" "$IMAGE_SIZE_MB"
 
 # Verify
 info "  Verifying image..."

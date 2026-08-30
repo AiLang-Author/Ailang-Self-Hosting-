@@ -8,6 +8,9 @@
  *   CFG=third_party/fltk/bin/fltk-config
  *   g++ -O2 -o CAD/host/cad_shell_fltk CAD/host/cad_shell_fltk.cxx \
  *       $($CFG --cxxflags) $($CFG --ldflags --use-images)
+ *
+ * Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+ * Licensed under the Sean Collins Software License (SCSL v1.0).
  */
 #include <FL/Fl.H>
 #include <FL/Fl_Double_Window.H>

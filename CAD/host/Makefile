@@ -1,5 +1,8 @@
 # CAD presenters — compiled Gtk3 is the product shell. FLTK/Python dropped.
 # X11 host+panel is emergency fallback only.
+# Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+# Licensed under the Sean Collins Software License (SCSL v1.0).
+
 ROOT := ../..
 GTKH := $(ROOT)/third_party/gtk3-headers
 GLIB_INC := /usr/include/glib-2.0

@@ -7,6 +7,9 @@
 #   ./CAD/scripts/cad_cmd.sh import --path /path/to/file.dxf
 #   CAD_APP_STATE=/tmp/cad_app ./CAD/scripts/cad_cmd.sh grid 1
 #
+# Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+# Licensed under the Sean Collins Software License (SCSL v1.0).
+
 set -euo pipefail
 STATE="${CAD_APP_STATE:-/tmp/cad_app}"
 WAIT=0
