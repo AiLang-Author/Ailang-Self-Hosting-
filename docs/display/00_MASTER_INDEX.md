@@ -20,6 +20,7 @@
 | — | DOC_PHASE_FONTS_TOOLBAR.md | Format dropdowns + font catalog | ✅ |
 | — | DOC_PHASE_TABLES.md | Page tables: rubber-band, frames, themed grid | 📋 |
 | — | PLACE_HUD.md | Themed rubber-band + numeric HUD (tables, CAD, select/copy) | 📋 |
+| — | IMAGE_EDIT.md | Native raster kernel + paint.x (not a display.x facility) | 📋 |
 
 ---
 
