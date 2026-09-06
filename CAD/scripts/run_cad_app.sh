@@ -100,19 +100,17 @@ need_rebuild=0
 if [[ ! -x "$APP_BIN" ]]; then
   need_rebuild=1
 fi
-for src in "$APP_SRC" \
-           CAD/App/Doc.ailang CAD/App/Ipc.ailang CAD/App/Tools.ailang \
-           CAD/App/Draw.ailang CAD/App/State.ailang CAD/App/Solid.ailang \
-           CAD/App/Plane.ailang \
-           Librarys/Cad/Library.CAD_UI.ailang \
-           Librarys/Cad/Library.CAD_Repo.ailang; do
-  if [[ -f "$src" && "$APP_BIN" -ot "$src" ]]; then
+for src in CAD/*.ailang CAD/*/*.ailang Librarys/Cad/*.ailang Librarys/Cad/*/*.ailang; do
+  if [[ -f "$src" && ( ! -x "$APP_BIN" || "$APP_BIN" -ot "$src" ) ]]; then
     need_rebuild=1
+    break
   fi
 done
 if [[ "$need_rebuild" -eq 1 ]]; then
   echo "run_cad_app: building cad_app..."
-  ./ailang.x "$APP_SRC" -o "$APP_BIN"
+  rm -f "$APP_BIN" a.out
+  ./ailang.x "$APP_SRC"
+  cp -f a.out "$APP_BIN"
 fi
 
 mkdir -p "$STATE" test-stl
