@@ -497,10 +497,11 @@ Function.JSON.EscapeString {
 // =============================================================================
 // SERIALIZATION — uses inline temp pattern (no ConcatFree)
 //
-// Pattern used throughout v1 codebase:
+// Pattern:
 //   temp = result
 //   result = StringConcat(result, ...)
-//   Deallocate(temp, 0)
+//   Deallocate(temp, StringLength(temp)+1)
+// Arena_Free routes by size; 0 means the 24-byte slab, never "auto".
 // =============================================================================
 
 // Serialize a tagged value to JSON string
@@ -509,6 +510,7 @@ Function.JSON.Serialize {
     Output: Address
     Body: {
         IfCondition EqualTo(tagged, 0) ThenBlock: { ReturnValue(StringConcat("null", "")) }
+        IfCondition EqualTo(tagged, Arrays.NULL) ThenBlock: { ReturnValue(StringConcat("null", "")) }
 
         vtype = Dereference(tagged)
         value = Dereference(Add(tagged, 8))
@@ -525,18 +527,31 @@ Function.JSON.Serialize {
         }
 
         IfCondition EqualTo(vtype, JType.NUMBER) ThenBlock: {
-            ReturnValue(NumberToString(value))
+            // NumberToString allocates 24 bytes but returns an INTERIOR
+            // pointer to the digits. SerializeObject then Deallocate()s
+            // that pointer, which poisons the 24-byte slab. Copy into a
+            // real strlen+1 buffer so the later free hits the right slab.
+            num_str = NumberToString(value)
+            nlen = StringLength(num_str)
+            num_copy = Allocate(Add(nlen, 1))
+            ni = 0
+            WhileLoop LessThan(ni, nlen) {
+                SetByte(num_copy, ni, GetByte(num_str, ni))
+                ni = Add(ni, 1)
+            }
+            SetByte(num_copy, nlen, 0)
+            ReturnValue(num_copy)
         }
 
         IfCondition EqualTo(vtype, JType.STRING) ThenBlock: {
             escaped = JSON.EscapeString(value)
             result = StringConcat("\"", escaped)
-            // Note: escaped leaks — matches v1 pattern of not freeing
-            // intermediates. Compiler built-in allocators may not be
-            // compatible with Deallocate(ptr, 0).
             temp = result
             result = StringConcat(result, "\"")
-            Deallocate(temp, 0)
+            // Arena_Free routes by size to a slab. Size 0 is <= 24, so
+            // Deallocate(ptr, 0) always Free24s — fatal for any string
+            // longer than 23 bytes (history content, file reads, etc.).
+            Deallocate(temp, Add(StringLength(temp), 1))
             ReturnValue(result)
         }
 
@@ -570,12 +585,23 @@ Function.JSON.SerializeObject {
         result = StringConcat("{", "")
 
         i = 0
+        emitted = 0
         WhileLoop LessThan(i, count) {
             key = Array.Get(keys, i)
-            tagged = SHash.Lookup(obj, key)
+            tagged = 0
+            IfCondition NotEqual(key, 0) ThenBlock: {
+                tagged = SHash.Lookup(obj, key)
+            }
+            // Skip phantom empty keys (uninitialized hashmap buckets).
+            // Emitting {"":null} became messages[1] and the API rejected it.
+            skip = 0
+            IfCondition EqualTo(key, 0) ThenBlock: { skip = 1 }
+            IfCondition EqualTo(tagged, 0) ThenBlock: { skip = 1 }
+            IfCondition EqualTo(tagged, Arrays.NULL) ThenBlock: { skip = 1 }
 
+            IfCondition EqualTo(skip, 0) ThenBlock: {
             // Comma separator
-            IfCondition GreaterThan(i, 0) ThenBlock: {
+            IfCondition GreaterThan(emitted, 0) ThenBlock: {
                 temp = result
                 result = StringConcat(result, ",")
                 Deallocate(temp, Add(StringLength(temp), 1))
@@ -597,13 +623,14 @@ Function.JSON.SerializeObject {
             result = StringConcat(result, "\":")
             Deallocate(temp, Add(StringLength(temp), 1))
 
-            // Value — serialize then concat
             val_str = JSON.Serialize(tagged)
 
             temp = result
             result = StringConcat(result, val_str)
             Deallocate(temp, Add(StringLength(temp), 1))
             Deallocate(val_str, Add(StringLength(val_str), 1))
+            emitted = Add(emitted, 1)
+            }
 
             i = Add(i, 1)
         }
@@ -633,21 +660,24 @@ Function.JSON.SerializeArray {
         result = StringConcat("[", "")
 
         i = 0
+        emitted = 0
         WhileLoop LessThan(i, count) {
             tagged = Array.Get(arr, i)
+            IfCondition And(NotEqual(tagged, 0), NotEqual(tagged, Arrays.NULL)) ThenBlock: {
+                IfCondition GreaterThan(emitted, 0) ThenBlock: {
+                    temp = result
+                    result = StringConcat(result, ",")
+                    Deallocate(temp, Add(StringLength(temp), 1))
+                }
 
-            IfCondition GreaterThan(i, 0) ThenBlock: {
+                val_str = JSON.Serialize(tagged)
+
                 temp = result
-                result = StringConcat(result, ",")
+                result = StringConcat(result, val_str)
                 Deallocate(temp, Add(StringLength(temp), 1))
+                Deallocate(val_str, Add(StringLength(val_str), 1))
+                emitted = Add(emitted, 1)
             }
-
-            val_str = JSON.Serialize(tagged)
-
-            temp = result
-            result = StringConcat(result, val_str)
-            Deallocate(temp, Add(StringLength(temp), 1))
-            Deallocate(val_str, Add(StringLength(val_str), 1))
 
             i = Add(i, 1)
         }
@@ -841,7 +871,12 @@ Function.JSON.ParseString {
             ch = Dereference(Add(JParse.buffer, scan), "byte")
             IfCondition EqualTo(ch, 92) ThenBlock: {
                 out_len = Add(out_len, 1)
-                scan = Add(scan, 2)
+                scan = Add(scan, 1)
+                IfCondition LessThan(scan, JParse.size) ThenBlock: {
+                    scan = Add(scan, 1)
+                } ElseBlock: {
+                    BreakLoop
+                }
             } ElseBlock: {
                 IfCondition EqualTo(ch, 34) ThenBlock: {
                     BreakLoop
@@ -853,14 +888,19 @@ Function.JSON.ParseString {
         }
 
         str = Allocate(Add(out_len, 1))
+        IfCondition LessEqual(str, 0) ThenBlock: {
+            ReturnValue(JSON.Tag(JType.NULL, 0))
+        }
         dst = 0
 
-        WhileLoop LessThan(JParse.pos, scan) {
+        WhileLoop And(LessThan(JParse.pos, scan), LessThan(JParse.pos, JParse.size)) {
+            IfCondition GreaterEqual(dst, out_len) ThenBlock: { BreakLoop }
             ch = Dereference(Add(JParse.buffer, JParse.pos), "byte")
 
             IfCondition EqualTo(ch, 92) ThenBlock: {
                 JParse.pos = Add(JParse.pos, 1)
                 IfCondition LessThan(JParse.pos, JParse.size) ThenBlock: {
+                    IfCondition GreaterEqual(dst, out_len) ThenBlock: { BreakLoop }
                     esc = Dereference(Add(JParse.buffer, JParse.pos), "byte")
                     IfCondition EqualTo(esc, 34) ThenBlock: {
                         SetByte(str, dst, 34)
@@ -954,17 +994,17 @@ Function.JSON.ParsePrimitive {
         SetByte(token, length, 0)
 
         IfCondition EqualTo(StringCompare(token, "true"), 0) ThenBlock: {
-            Deallocate(token, 0)
+            Deallocate(token, Add(length, 1))
             ReturnValue(JSON.Tag(JType.BOOL, 1))
         }
 
         IfCondition EqualTo(StringCompare(token, "false"), 0) ThenBlock: {
-            Deallocate(token, 0)
+            Deallocate(token, Add(length, 1))
             ReturnValue(JSON.Tag(JType.BOOL, 0))
         }
 
         IfCondition EqualTo(StringCompare(token, "null"), 0) ThenBlock: {
-            Deallocate(token, 0)
+            Deallocate(token, Add(length, 1))
             ReturnValue(JSON.Tag(JType.NULL, 0))
         }
 
@@ -975,7 +1015,7 @@ Function.JSON.ParsePrimitive {
 
         IfCondition EqualTo(is_num, 1) ThenBlock: {
             num = StringToNumber(token)
-            Deallocate(token, 0)
+            Deallocate(token, Add(length, 1))
             ReturnValue(JSON.Tag(JType.NUMBER, num))
         }
 
