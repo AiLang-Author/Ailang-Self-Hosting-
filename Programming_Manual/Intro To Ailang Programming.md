@@ -166,6 +166,8 @@ RunTask(Main)
 
 `RunTask(Main)` at the bottom is the program entry. There is no implicit `main()`.
 
+That `RunTask` is the only executable statement allowed at file scope, and only in the main source file. Everything else at the top of a file must be a declaration: `LibraryImport`, pools, `Function`, `SubRoutine`, loop actors, macros. Assignments, `PrintMessage`, `IfCondition`, and other statements at file scope are compiled onto `_start` with no stack frame and crash. Library files must not contain `RunTask` at all — imported sources are concatenated into the consumer, so a library `RunTask` becomes every importer's startup. Put driver logic in `SubRoutine.Main`.
+
 ---
 
 ## Type System

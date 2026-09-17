@@ -20,7 +20,11 @@
 # TOP-LEVEL PROGRAM STRUCTURE
 # ==============================================
 
-<program> ::= { <declaration> | <statement> }
+<program> ::= { <declaration> } [ <run_task_entry> ]
+
+# RunTask(Name) is the program entry, allowed once at file scope in the
+# main source only. It is not a general statement slot. Library files
+# must not contain it. Other statements at file scope are illegal.
 
 <declaration> ::= <library_declaration>
                 | <pool_declaration>

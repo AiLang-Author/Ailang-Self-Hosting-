@@ -492,12 +492,14 @@ AST_DumpNode(node, indent) → void
 
 #### CSemanticCore — Semantic analysis
 ```
-Semantic_Check(ast) → Integer
-    Walk entire AST, perform checks:
-    - Undefined variable references
-    - Type mismatches in expressions
-    - Function call arity checking
-    - Pool field existence verification
+Sem_Analyze(ast) → Integer
+    Walk PROGRAM children and enforce the file-scope contract:
+    - Legal: LibraryImport, pools, Function/SubRoutine/InlineFunction,
+      loop actors, macros, comments, Debug blocks
+    - Legal in the main file only: RunTask
+    - Illegal: assignment, IfCondition, WhileLoop, PrintMessage, bare calls
+    Returns 0 on error. CLI then skips codegen.
+    Type checking / arity is not live yet (see Analyzer2).
 ```
 
 ---
@@ -528,9 +530,10 @@ Source text (string in memory)
     │   • Verify PROGRAM root type
     │   • Report statistics
     │
-    ▼ Semantic_Check(ast) [optional]
-    │   • Undefined variable detection
-    │   • Type checking
+    ▼ Sem_Analyze(ast)
+    │   • File-scope contract: only declarations, plus RunTask in main
+    │   • Returns 0 → CLI aborts before codegen
+    │   • Full type checking is not live yet
     │
     ▼ AST root (Address) → ready for compilation
 ```
