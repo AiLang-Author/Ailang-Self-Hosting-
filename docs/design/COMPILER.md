@@ -424,9 +424,9 @@ scripts therefore must `cd` to the AiLangSH root (where `Librarys/`
 sits) before calling the compiler, even if they reference source
 files under subdirectories.
 
-**Symptom when violated:** `[ERROR] Arena_Alloc not found — Ensure
-LibraryImport.Arena is included` even though the source has
-`LibraryImport.Arena` at the top.
+**Symptom when violated:** missing `LibraryImport.*` files (CWD is not the
+repo root). `StringConcat` / `NumberToString` no longer require Arena —
+they mmap if `Arena_Alloc` is not in the program.
 
 ### Deeply nested call expressions in function-call args
 
