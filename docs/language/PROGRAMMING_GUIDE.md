@@ -860,7 +860,6 @@ Both formats integrate with the display server's compositing pipeline and are ra
 | CSV | `LibraryImport.CSV` | CSV parsing |
 | RESP | `LibraryImport.RESP` | Redis protocol |
 | Math | `LibraryImport.Math` | Composed floats: Hypot, Asin, Acos, Log2. `Float_Sin` etc. need **no** import |
-| LinearAlgebra | `LibraryImport.LinearAlgebra` | Matrix and vector operations |
 | FixedPointTrig | `LibraryImport.FixedPointTrig` | Trigonometry without floating point |
 | TimeDate | `LibraryImport.TimeDate` | Date/time formatting and arithmetic |
 | TextBuffer | `LibraryImport.TextBuffer` | Gap buffer for text editing |
