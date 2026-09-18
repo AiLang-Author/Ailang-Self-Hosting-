@@ -32,6 +32,11 @@ const BUILTINS = [
     'Increment', 'Decrement', 'AbsoluteValue', 'SquareRoot', 'Floor', 'Ceil',
     'Round', 'Min', 'Max', 'Clamp', 'Sign', 'Lerp', 'Sin', 'Cos', 'Tan',
     'Exp', 'Log', 'Log2', 'Log10', 'FusedMultiplyAdd', 'Hypotenuse',
+    'Float_FromInt', 'Float_ToInt', 'Float_Add', 'Float_Sub', 'Float_Mul',
+    'Float_Div', 'Float_Sqrt', 'Float_Lt', 'Float_Gt', 'Float_Eq',
+    'Float_Le', 'Float_Ge', 'Float_Ne', 'Float_Min', 'Float_Max', 'Float_Round',
+    'Float_Sin', 'Float_Cos', 'Float_Floor', 'Float_Ceil', 'Float_Trunc',
+    'Float_FMA',
     // Comparison
     'EqualTo', 'NotEqual', 'LessThan', 'GreaterThan', 'LessEqual', 'GreaterEqual',
     // Logic

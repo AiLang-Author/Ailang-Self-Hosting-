@@ -1,383 +1,315 @@
-//Getting Started with AILANG
-//Your First AILANG Program
-//AILANG programs are simple text files with the .ailang extension. Here's the classic "Hello, World!": ailang
+# AILang — Language Introduction
 
+## What is AILang?
 
-// hello.ailang
-PrintMessage("Hello, World!")
-Save this as hello.ailang and compile it:
-bashpython3 main.py hello.ailang
-./hello_exec
-Basic Operations
-Variables and Arithmetic
-ailang// Variables don't need declaration
-a = 10
-b = 20
-sum = Add(a, b)
-PrintMessage("Sum is:")
-PrintNumber(sum)
+AILang is a compiled, statically-structured systems programming language that targets x86-64 Linux. It compiles directly to native machine code with no runtime, no garbage collector, and no virtual machine. Programs run as standalone ELF executables.
 
-// All arithmetic uses named operators
-product = Multiply(5, 6)
-difference = Subtract(100, 25)
-quotient = Divide(50, 2)
-Printing Output
-ailang// Print text
-PrintMessage("This is a message")
+AILang is designed to be:
+- **Readable by humans and AI** — explicit, unambiguous syntax with no operator overloading
+- **Systems capable** — direct syscall access, manual memory control, pointer arithmetic
+- **Safe by design** — ambiguous operators are excluded by philosophy, not accident
+- **Self-hosting** — the AILang compiler is written in AILang
 
-// Print numbers (separate function)
-value = 42
-PrintNumber(value)
+---
 
-// Concatenate strings for complex output
-name = "AILANG"
-version = NumberToString(2)
-message = StringConcat("Welcome to ", name)
-message = StringConcat(message, " v")
-message = StringConcat(message, version)
-PrintMessage(message)
-Control Flow
-If-Then-Else
-ailangscore = 85
+## How AILang Differs from C / C++ / Python
 
-IfCondition GreaterThan(score, 90) ThenBlock {
-    PrintMessage("Excellent!")
-} ElseBlock {
-    IfCondition GreaterThan(score, 70) ThenBlock {
-        PrintMessage("Good job!")
-    } ElseBlock {
-        PrintMessage("Keep trying!")
-    }
-}
-While Loops
-ailang// Count from 0 to 4
-counter = 0
-WhileLoop LessThan(counter, 5) {
-    PrintMessage("Count:")
-    PrintNumber(counter)
-    counter = Add(counter, 1)
-}
-For Each Loop
-ailang// Iterate over items (when implemented)
-ForEvery item in [1, 2, 3] {
-    PrintNumber(item)
-}
-Functions
-Defining Functions
-ailangFunction.Math.AddTwo {
-    Input: n: Integer
-    Output: Integer
-    Body: {
-        ReturnValue(Add(n, 2))
-    }
-}
+### No implicit anything
 
-// Call the function
-result = Math.AddTwo(5)
-PrintNumber(result)  // Prints: 7
-SubRoutines (No Return Value)
-ailangSubRoutine.Utils.PrintBanner {
-    PrintMessage("=" * 50)
-    PrintMessage("    AILANG Program")
-    PrintMessage("=" * 50)
-}
+C lets you write `i++`, `*p++`, `a[i++]` — expressions with implicit side effects and order-of-evaluation ambiguity. AILang requires every operation to be explicit:
 
-// Call with RunTask
-RunTask("Utils.PrintBanner")
-File Operations
-ailang// Write to file
-WriteTextFile("output.txt", "Hello, File System!")
+```ailang
+// AILang — always explicit
+i = Add(i, 1)
+// or with compound assignment (coming)
+i += 1
+```
 
-// Check if file exists
-exists = FileExists("output.txt")
-IfCondition EqualTo(exists, 1) ThenBlock {
-    PrintMessage("File created successfully")
-}
+There is no `++`, no `--`, no `,` operator, no implicit type promotion, no implicit string-to-number coercion.
 
-// Create multiple files
-i = 0
-WhileLoop LessThan(i, 3) {
-    filename = StringConcat("file_", NumberToString(i))
-    filename = StringConcat(filename, ".txt")
-    content = StringConcat("This is file ", NumberToString(i))
-    WriteTextFile(filename, content)
-    i = Add(i, 1)
-}
-Compilation and Execution
-Basic Compilation
-bash# Compile AILANG to executable
-python3 main.py myprogram.ailang
+### Named operators are first-class
 
-# Run the compiled program
-./myprogram_exec
-Debug Mode
-bash# Compile with debug info
-python3 main.py -D myprogram.ailang
+In C, `+` is an operator and `add()` is a function call. In AILang they are the same thing. `Add(a, b)` and `(a + b)` produce identical code. The function form is always available. This matters because:
 
-# This enables DebugAssert and other debug features
-Running Tests
-bash# Run the loop structure tests
-./run_loop_tests.sh
+- You can grep for `Multiply` and find every multiplication in a codebase
+- No operator overloading confusion
+- No "what does `+` mean for this type" ambiguity
 
-# Run a specific test
-python3 main.py test_basic_ops.ailang
-./test_basic_ops_exec
+### No operator precedence surprises
 
-AILANG by Example
-Learn AILANG through working examples from the test suite.
-Basic Examples
-Example 1: Simple Calculator
-ailang// calculator.ailang
-a = 10
-b = 3
+AILang infix requires explicit parentheses. There is no precedence table to memorize:
 
-// Basic arithmetic
-sum = Add(a, b)
-diff = Subtract(a, b)
-prod = Multiply(a, b)
-quot = Divide(a, b)
-rem = Modulo(a, b)
+```ailang
+// This is a syntax error in AILang:
+result = a + b * c
 
-PrintMessage("Calculator Results:")
-PrintMessage("10 + 3 =")
-PrintNumber(sum)
-PrintMessage("10 - 3 =")
-PrintNumber(diff)
-PrintMessage("10 * 3 =")
-PrintNumber(prod)
-PrintMessage("10 / 3 =")
-PrintNumber(quot)
-PrintMessage("10 % 3 =")
-PrintNumber(rem)
-Example 2: String Manipulation
-ailang// strings.ailang
-first = "Hello"
-second = "World"
+// This is correct — intent is unambiguous:
+result = (a + (b * c))
+result = ((a + b) * c)
+```
 
-// Concatenation
-greeting = StringConcat(first, ", ")
-greeting = StringConcat(greeting, second)
-greeting = StringConcat(greeting, "!")
-PrintMessage(greeting)  // "Hello, World!"
+You always know exactly what order things evaluate in.
 
-// String length
-len = StringLength(greeting)
-PrintMessage("Length:")
-PrintNumber(len)
+### `^` means Power, not XOR
 
-// String comparison
-are_equal = StringEquals("test", "test")
-PrintMessage("Strings equal (1=yes, 0=no):")
-PrintNumber(are_equal)
-Example 3: Factorial Function
-ailang// factorial.ailang
-Function.Math.Factorial {
-    Input: n: Integer
-    Output: Integer
-    Body: {
-        IfCondition LessEqual(n, 1) ThenBlock {
-            ReturnValue(1)
-        }
-        
-        result = 1
-        i = 2
-        WhileLoop LessEqual(i, n) {
-            result = Multiply(result, i)
-            i = Add(i, 1)
-        }
-        ReturnValue(result)
-    }
-}
+In C, `^` is bitwise XOR. In AILang, `^` is exponentiation — the mathematical meaning. XOR has no infix operator; use `BitwiseXor(a, b)`. This is documented in the operators reference and is intentional.
 
-// Test it
-fact5 = Math.Factorial(5)
-PrintMessage("5! =")
-PrintNumber(fact5)  // 120
-Intermediate Examples
-Example 4: File Processing
-ailang// file_processor.ailang
-// Create a log file with timestamps
+### No pointers-as-arrays confusion
 
-Function.Utils.GetTimestamp {
-    Output: Integer
-    Body: {
-        // Simplified - returns a counter
-        ReturnValue(12345)
-    }
-}
+C arrays decay to pointers, `a[i]` is `*(a + i)`, pointer arithmetic is implicit. In AILang, pointer arithmetic is explicit:
 
-SubRoutine.Logger.WriteEntry {
-    timestamp = Utils.GetTimestamp()
-    ts_str = NumberToString(timestamp)
-    
-    entry = StringConcat("[", ts_str)
-    entry = StringConcat(entry, "] ")
-    entry = StringConcat(entry, "Program started")
-    
-    WriteTextFile("app.log", entry)
-}
+```ailang
+// Access element i of an 8-byte-stride array
+offset = Multiply(i, 8)
+element = Dereference(Add(base_ptr, offset))
+```
 
-// Use the logger
-RunTask("Logger.WriteEntry")
-PrintMessage("Log entry written")
-Example 5: Nested Functions
-ailang// nested_math.ailang
+Verbose? Yes. Ambiguous? Never.
+
+### Functions vs SubRoutines
+
+AILang distinguishes functions (return a value) from subroutines (no return value). This is explicit in the definition, not inferred:
+
+```ailang
+// Function — has Output and ReturnValue
 Function.Math.Square {
-    Input: x: Integer
+    Input:  n: Integer
     Output: Integer
     Body: {
-        ReturnValue(Multiply(x, x))
+        ReturnValue(Multiply(n, n))
     }
 }
 
-Function.Math.SumOfSquares {
-    Input: a: Integer
-    Input: b: Integer
+// SubRoutine — no Output, no ReturnValue
+SubRoutine.Logger.PrintStatus {
+    PrintMessage("Status: OK")
+}
+```
+
+Calling them is also explicit:
+
+```ailang
+result = Math.Square(5)   // Function call — value captured
+RunTask(Logger.PrintStatus)  // SubRoutine call — no value
+```
+
+This makes it impossible to accidentally discard a return value or accidentally use a void function as an expression.
+
+### No header files, no forward declarations
+
+AILang uses `LibraryImport` for dependencies. The compiler resolves everything. There is no separation of declaration from definition:
+
+```ailang
+LibraryImport.Arena
+LibraryImport.Regex_Thompson
+```
+
+### Memory is explicit, not hidden
+
+There is no `new`/`delete`, no `malloc`/`free`, no garbage collector. Memory allocation and deallocation are explicit primitives:
+
+```ailang
+buf = Allocate(1024)
+// ... use buf ...
+Deallocate(buf, 1024)
+```
+
+The size passed to `Deallocate` must match `Allocate`. Passing the wrong size routes to the wrong slab and corrupts the allocator. This is intentional — it forces you to track sizes.
+
+### Global state lives in FixedPools
+
+AILang has no global variables in the C sense. Global state is declared in named `FixedPool` blocks:
+
+```ailang
+FixedPool.Config {
+    "buffer_size": Initialize=4096
+    "max_retries": Initialize=3
+}
+```
+
+Accessed as `Config.buffer_size`. This makes global state explicit, namespaced, and greppable. R15 is reserved for the pool table — never modify R15 in user code.
+
+---
+
+## Program Structure
+
+Every AILang program follows this structure:
+
+```ailang
+// 1. Library imports
+LibraryImport.Arena
+
+// 2. Global state pools
+FixedPool.AppConfig {
+    "port": Initialize=8080
+}
+
+// 3. Function and subroutine definitions
+Function.Net.ParsePort {
+    Input:  s: Address
     Output: Integer
     Body: {
-        sq_a = Math.Square(a)
-        sq_b = Math.Square(b)
-        ReturnValue(Add(sq_a, sq_b))
+        ReturnValue(StringToInt(s))
     }
 }
 
-// Calculate 3² + 4² = 25
-result = Math.SumOfSquares(3, 4)
-PrintMessage("3² + 4² =")
-PrintNumber(result)
-Example 6: Pattern Matching with ChoosePath
-ailang// menu.ailang
-choice = "2"  // Simulated user input
-
-ChoosePath(choice) {
-    CaseOption "1": PrintMessage("You chose option 1")
-    CaseOption "2": PrintMessage("You chose option 2")
-    CaseOption "3": PrintMessage("You chose option 3")
-    CaseOption "quit": HaltProgram("Goodbye!")
-    DefaultOption: PrintMessage("Invalid choice")
-}
-Advanced Examples
-Example 7: SubRoutines and State
-ailang// counter.ailang
-// Global counter managed by subroutines
-
-counter = 0
-
-SubRoutine.Counter.Increment {
-    counter = Add(counter, 1)
-    PrintMessage("Counter incremented")
+// 4. Entry point
+SubRoutine.Main {
+    port = Net.ParsePort("9000")
+    AppConfig.port = port
+    PrintNumber(AppConfig.port)
 }
 
-SubRoutine.Counter.Reset {
-    counter = 0
-    PrintMessage("Counter reset")
+// 5. Run the entry point
+RunTask(Main)
+```
+
+`RunTask(Main)` at the bottom is the program entry. There is no implicit `main()`.
+
+That `RunTask` is the only executable statement allowed at file scope, and only in the main source file. Everything else at the top of a file must be a declaration: `LibraryImport`, pools, `Function`, `SubRoutine`, loop actors, macros. Assignments, `PrintMessage`, `IfCondition`, and other statements at file scope are compiled onto `_start` with no stack frame and crash. Library files must not contain `RunTask` at all — imported sources are concatenated into the consumer, so a library `RunTask` becomes every importer's startup. Put driver logic in `SubRoutine.Main`.
+
+---
+
+## Type System
+
+AILang has two primitive types:
+
+| Type | Size | Description |
+|------|------|-------------|
+| `Integer` | 64-bit signed | All integers. -2⁶³ to 2⁶³-1 |
+| `Address` | 64-bit unsigned | Pointer / memory address |
+
+Strings are `Address` values pointing to NUL-terminated byte sequences. There is no separate string type. Booleans are `Integer` — `1` is true, `0` is false. There is no `bool`, no `true`, no `false` keyword.
+
+---
+
+## Control Flow
+
+### Conditional
+
+```ailang
+IfCondition GreaterThan(x, 0) ThenBlock: {
+    PrintMessage("positive")
+} ElseBlock: {
+    PrintMessage("non-positive")
 }
+```
 
-SubRoutine.Counter.Display {
-    PrintMessage("Current count:")
-    PrintNumber(counter)
-}
+`ElseBlock` is optional. There is no `else if` — nest another `IfCondition` inside the `ElseBlock`.
 
-// Use the counter
-RunTask("Counter.Display")
-RunTask("Counter.Increment")
-RunTask("Counter.Increment")
-RunTask("Counter.Display")
-RunTask("Counter.Reset")
-RunTask("Counter.Display")
-Example 8: Loop Patterns
-ailang// patterns.ailang
-// Different loop patterns
+### Loop
 
-// Pattern 1: Count down
-PrintMessage("Countdown:")
-i = 5
-WhileLoop GreaterThan(i, 0) {
+```ailang
+i = 0
+WhileLoop LessThan(i, 10) {
     PrintNumber(i)
-    i = Subtract(i, 1)
-}
-PrintMessage("Liftoff!")
-
-// Pattern 2: Skip even numbers
-PrintMessage("Odd numbers:")
-j = 0
-WhileLoop LessThan(j, 10) {
-    is_even = EqualTo(Modulo(j, 2), 0)
-    IfCondition Not(is_even) ThenBlock {
-        PrintNumber(j)
-    }
-    j = Add(j, 1)
-}
-
-// Pattern 3: Nested loops
-PrintMessage("Multiplication table:")
-row = 1
-WhileLoop LessEqual(row, 3) {
-    col = 1
-    WhileLoop LessEqual(col, 3) {
-        product = Multiply(row, col)
-        PrintNumber(product)
-        col = Add(col, 1)
-    }
-    row = Add(row, 1)
-}
-Example 9: Debug Features
-ailang// debug_example.ailang
-// Compile with: python3 main.py -D debug_example.ailang
-
-value = 10
-
-// Debug assertions
-DebugAssert(GreaterThan(value, 0), "Value must be positive")
-
-// Performance timing
-DebugPerf.Start("calculation")
-result = 0
-i = 0
-WhileLoop LessThan(i, 1000) {
-    result = Add(result, i)
     i = Add(i, 1)
 }
-DebugPerf.End("calculation")
+```
 
-// Trace points
-DebugTrace.Entry("MainCalc", value)
-processed = Multiply(value, 2)
-DebugTrace.Exit("MainCalc", processed)
+`BreakLoop` exits the loop. `ContinueLoop` skips to the next iteration.
 
-PrintMessage("Debug example complete")
-Working Test Files
-These tests from the test suite are confirmed working:
-Test FileDescriptiontest_basic_ops.ailangArithmetic and comparisonstest_strings_comprehensive.ailangAll string operationstest_fileio_minimal.ailangBasic file I/Otest_user_functions_basic.ailangFunction definitionstest_runtask_comprehensive.ailangSubRoutine callstest_loop_simple.ailangBasic loop structurestest_subroutine_basic.ailangSubRoutine patterns
-Tips for Success
+### Branch (switch/case)
 
-Start Simple: Begin with PrintMessage and basic arithmetic
-Use Named Operators: Remember Add() not +, Multiply() not *
-Debug Mode: Compile with -D flag to enable assertions
-Check Test Files: Look at working tests for patterns
-String Building: Use multiple StringConcat calls for complex strings
-Function Naming: Use dotted names like Math.Calculate
-
-Common Patterns
-ailang// Pattern: Building complex strings
-message = StringConcat("Part 1", " ")
-message = StringConcat(message, "Part 2")
-message = StringConcat(message, " ")
-message = StringConcat(message, NumberToString(42))
-
-// Pattern: Counter loop
-i = 0
-WhileLoop LessThan(i, limit) {
-    // Do work
-    i = Add(i, 1)
+```ailang
+Branch strategy {
+    Case 0: { PrintMessage("empty") }
+    Case 1: { PrintMessage("whole line") }
+    Case 7: { hit = Match_LiteralBM(line, line_len, pi) }
 }
+```
 
-// Pattern: State checking
-exists = FileExists("data.txt")
-IfCondition EqualTo(exists, 1) ThenBlock {
-    // File exists
-} ElseBlock {
-    // File doesn't exist
-}
+`Branch` dispatches on an integer value. Cases must be integer literals. No fallthrough — each case is a block. The compiler emits a two-instruction dispatch (CMP + JE) per case.
 
-These docs focus on what actually works based on the test files, avoiding features that are still in development. They provide a practical path for users to start writing AILANG programs today.
+---
+
+## Memory Model
+
+```
+High addresses
+┌─────────────────┐
+│     Stack       │  ← Local variables, function frames (RBP/RSP)
+├─────────────────┤
+│     Heap        │  ← Allocate() / Arena slabs
+├─────────────────┤
+│   Pool Table    │  ← R15 — FixedPool variables
+├─────────────────┤
+│  Data Section   │  ← String literals, constants
+├─────────────────┤
+│  Code Section   │  ← Compiled machine code
+└─────────────────┘
+Low addresses
+```
+
+**R15 is reserved.** The compiler uses R15 as the pool table base pointer. Never write to R15 in inline assembly or syscall wrappers.
+
+---
+
+## Compilation
+
+```bash
+# Compile to executable
+ailang program.ailang
+
+# Output: program_exec (ELF64, no extension)
+./program_exec
+```
+
+Programs produce a single ELF64 executable with no shared library dependencies beyond the Linux kernel syscall interface.
+
+---
+
+## What AILang Does Not Have
+
+These are intentional omissions, not missing features:
+
+| Missing | Why |
+|---------|-----|
+| `++` / `--` | Pre/post ambiguity, UB in expressions |
+| Implicit type coercion | Every conversion is explicit |
+| Operator overloading | `+` always means integer addition |
+| Exceptions / try-catch | Errors are return values |
+| Garbage collector | Memory ownership is explicit |
+| Header files | `LibraryImport` handles dependencies |
+| Preprocessor macros | No text substitution |
+| Undefined behavior | Every operation has defined semantics |
+| `goto` | Use `BreakLoop` / `ContinueLoop` / `ReturnValue` |
+
+---
+
+## Conventions
+
+- **Naming:** `Function.Module.Name`, `SubRoutine.Module.Name`, `FixedPool.Name`
+- **Pools:** `Pool.field` access — always namespaced
+- **Addresses:** Treated as unsigned 64-bit integers in arithmetic
+- **NUL strings:** All string `Address` values point to NUL-terminated byte arrays
+- **Error returns:** Functions return `-1` or `0` on failure by convention
+- **File extensions:** `.ailang`
+
+---
+
+## Demo Programs & Teaching Examples
+
+The `Demo Programs/programs/` directory contains 130+ progressive, numbered teaching examples — from `001_hello_world.ailang` through advanced recursion, error handling with `Result`/`Option`, classic algorithms (Tower of Hanoi, fast exponentiation), and AILang-specific control-flow idioms (`Fork` + `Branch` combinatorial decision trees).
+
+**Master index + recommended clean teaching curriculum:**
+
+`Demo Programs/DEMO_PROGRAMS_TEACHING_INDEX.md`
+
+These are the best way to learn the language by reading real, small, focused programs in order.
+
+## See Also
+
+`AILang Operators Reference`,
+`Library.Arena`,
+`Library.StringUtils`,
+`Library.Regex_Thompson`,
+`Memory Management Reference Manual`,
+`Demo Programs/DEMO_PROGRAMS_TEACHING_INDEX.md` (the full progressive curriculum)
+
+---
+
+## Copyright
+
+Copyright (c) 2025–2026 Sean Collins, 2 Paws Machine and Engineering.
+Licensed under the Sean Collins Software License (SCSL).
