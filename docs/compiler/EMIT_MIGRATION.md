@@ -203,6 +203,103 @@ Stop after each numbered step. Rebuild `-next`. Run the gates. Then the next num
 
 ---
 
+## Live call-site ledger
+
+Itemized: `docs/compiler/X86_CALLSITES.txt`
+
+**340 sites / 143 names** in compile+debug (excludes helper *definitions*, generated CoreArch, `.hand` input, HDL).
+
+| File | Sites | Notes |
+|---|---|---|
+| `FPUCompileX86String` | 86 | string/SIMD mem + BSF |
+| `FPUCompileX86AVX` | 57 → xmm-xmm Assemble, deref/PushXMM kept | SSE4.1/FMA exist but **baseline ISA is SSE2**; no CPU dispatch yet |
+| `FPUCompileX86MemOps` | 56 | mostly mem |
+| `FPUCompileX86SSE` | 55 → **Push/Pop XMM only** after first sweep | class A → `Trans_Asm` |
+| `FPUCompileX86Trans` | 35 | Sin/Cos already Assemble; leftover GPR/mem |
+| `FPUCompileX86FixedPoint` | 23 | imul/idiv/shift |
+| `CCompileDebug` | 17 | nop/int3 |
+| `CEmitDebugX86` | 11 | nopN |
+
+CoreArch keep wrappers (~145 `X86_*` in the generated dispatcher) are **not** this ledger; they are the Emit_* → keep-helper layer.
+
+---
+
+## Keep partition (then delete the cornucopia)
+
+Yes. **Partition what cannot fold into Enc, then delete every old `CEmitX86*` / `FPUEmit*` file.** Do not leave 12 half-dead libraries. The keepers are classified by *why* they are not Assemble, not by historical filename.
+
+After the generated CoreArch wrap, grep still finds **~300 `X86_*` call sites** (CoreArch keeps + FPU compile calling SSE helpers directly). Those bodies still live in the old emit files. Until they move, the files are not dead.
+
+### Four keep modules (hand)
+
+| Module | Why Enc cannot own it | What goes in |
+|---|---|---|
+| **`CEmitFixups.ailang`** | needs `Emit_AddFixup` / label ids | `Jmp/Je/…(label)`, `Call(label)`, `LeaRaxLabel`, RIP `Lea*RipOffset`, `LoadDataAddress*` |
+| **`CEmitMem.ailang`** | ParseAsm stops at `[` | `[rsp]`, `[rax]`, `[rbp+off]`, `[r15+off]`, byte deref, lock cmpxchg. **Dies** when `gen_x86enc.py` grows `[reg]` / `[reg+disp8]` |
+| **`CEmitFrame.ailang`** | composites / policy | `Prologue`, `Epilogue`, push/pop volatile, callee-saved, `AndRspAlignment` |
+| **`CEmitEncGaps.ailang`** | Enc table quirks | `RET`, `SYSCALL` (keys are `RET_`/`SYSCALL_`), `REP MOVSB` (no Enc form). **Dies** when generator emits those keys |
+
+**Runtime-reg** (`AddRegReg(dst,src)`, `MovRegReg`): not Enc’s problem. Small helper in CoreArch (or Frame) that maps reg id → `"rax"` and `Assemble("ADD " + dst + ", " + src)`. Then **no** `X86_AddRegReg` file.
+
+**SSE**: FPU compile still calls `X86_ADDSD_XMM0_XMM1` etc. Point those 39/49 functions at Assemble (same as Sin/Cos) **or** change FPU compile to `X86Enc_Assemble` / `Emit_*`. Then `FPUEmitX86SSE/AVX` die. Deref SSE waits on Mem.
+
+**CEmitCore** (bytes, labels, fixup list, data section) stays forever. Not an ISA encoder.
+
+### Delete list (after partition + grep zero)
+
+`CEmitX86Reg`, `Arith`, `Logic`, `Cmp`, `Sys`, `Helpers`, `Macros`, `String`, `Stack` (if frame absorbed), `Jump` (if fixups absorbed), `Mem` (when ParseAsm has `[reg]`), `FPUEmitX86SSE`, `AVX`, `MemOps`, `FixedPoint`.
+
+`CEmitX86Enc` stays (generated). `CEmitCoreArch` stays (generated). `.hand.ailang` is generator input only.
+
+### Order
+
+1. EncGaps: wrap RET/SYSCALL/REP as the 5 leftover opcodes (or fix `gen_x86enc.py` zero-operand `_` suffix).
+2. Runtime-reg Assemble helper; delete those `X86_*`.
+3. SSE xmm-xmm → Assemble; FPU compile keeps working.
+4. Copy remaining Jump/Mem/Frame bodies into the three keep files; retarget CoreArch imports; **grep `X86_` in old files = only definitions**; delete old files.
+5. Later: ParseAsm `[reg]` → drain Mem into Enc → delete `CEmitMem`.
+
+Identity after each step (`true`, hello, sin/cos). CAD `cmp` when a keep file moves.
+
+---
+
+## Deprecated emit files (2026-09-17)
+
+Moved off the import graph to `Librarys/Compiler/Deprecated/`:
+
+- `CodeEmit/X86/` — 11 files (`CEmitX86Reg/Arith/Logic/Cmp/Jump/Stack/Mem/Sys/String/Helpers/Macros`)
+- `Compile/FPU/X86/` — 4 `FPUEmit*` files
+- `Debug/X86/CEmitDebugX86.ailang`
+
+Live emit is now:
+
+| File | Role |
+|---|---|
+| `CEmitX86Enc.ailang` | generated assembler |
+| `CEmitCoreArch.ailang` | generated `Emit_*` (Assemble or Keep) |
+| `CEmitKeep.ailang` | ~200 remaining hand helpers (mem, fixups, frame, Enc gaps) |
+| `CEmitCore.ailang` | bytes/labels/fixup list |
+
+Compiler import count 97 → 82. `ailang-next.x` ~3.28MB → ~3.22MB (compiler itself, not user programs).
+
+Trap: `Emit_AndRspImm8(240)` must stay sign-extended imm8 (`AND rsp, -16`). Assemble(`AND rsp, 240`) zero-extends and destroys RSP — Functions SIGSEGV. Generator keeps all `AndRsp*`.
+
+---
+
+## Status (generated wrap)
+
+`tools/gen_corearch.py` reads `Library.CEmitCoreArch.hand.ailang` and writes `Library.CEmitCoreArch.ailang`.
+
+- **237** `Emit_*` → `X86Enc_Assemble` (class A)
+- **~145** keep `X86_*` (jumps/labels, mem/deref, runtime-reg, prologue, REP string, RET/SYSCALL because Enc zero-operand keys are `RET_` / `SYSCALL_` and Assemble looks up `RET` / `SYSCALL`)
+- Enc file not modified
+- Rollback of this wrap: `git checkout 81cdf0ed -- Librarys/Compiler/CodeEmit/Library.CEmitCoreArch.ailang`
+- Gated: `true.ailang` runs, hello prints, `test_float_sin.py` / `test_float_cos.py` pass
+
+Re-run: `python3 tools/gen_corearch.py` then rebuild `-next`.
+
+---
+
 ## Generating CoreArch (and ARM later)
 
 Yes: **class A (and later B) CoreArch wrappers can be generated.** Class C cannot. That is how you delete the cornucopia without a 633-file hand rewrite.
