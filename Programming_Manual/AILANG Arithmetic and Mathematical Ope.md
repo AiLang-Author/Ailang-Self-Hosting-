@@ -329,7 +329,9 @@ patterns in `Integer` slots. Compiler builtins (x86-64 SSE2 unless noted):
 | `Float_Sin`, `Float_Cos`, `Float_Tan` | Cody–Waite reduce + poly |
 | `Float_Atan2(y, x)` | quadrants; C argument order |
 | `Float_Exp`, `Float_Log`, `Float_Pow` | poly; Pow is exp(y*ln(x)); x≤0 → NaN |
-| `Float_Abs` | clear sign bit |
+| `Float_Abs` `Float_Neg` `Float_Copysign` | sign bit |
+| `Float_IsNan` `Float_IsInf` `Float_SignBit` | integer 0/1 |
+| `Float_Mod(x, y)` | remainder, sign of x; y=0 → NaN |
 | `Float_FMA(a, b, c)` | `Hw.level ≥ 2`; also fused from `Float_Add(Float_Mul(a,b), c)` |
 
 Integer `Power` is unrelated (integer exponent, non-negative).

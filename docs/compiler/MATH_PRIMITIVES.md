@@ -46,16 +46,14 @@ Missing / weak integer: negative `Power`, `Gcd`, `Popcnt`, `Clz`/`Ctz`
 | Name | Verdict |
 |------|---------|
 | `Float_Exp` `Float_Log` `Float_Pow` | **live** (poly; Pow is exp(y*ln(x)); x≤0 → NaN) |
-| `Float_Abs` | **live** (clear sign bit) |
-| `Float_Neg` `Float_Copysign` | **missing, should be core** (XORPD / copy sign) |
-| `Float_Mod` / remainder | core-ish (`fmod`); or library from trunc |
-| unary `Float_Atan` | library: `Atan2(x, 1)` — CAD_Geom.Atan already |
+| `Float_Abs` `Float_Neg` `Float_Copysign` | **live** |
+| `Float_IsNan` `Float_IsInf` `Float_SignBit` | **live** (integer 0/1) |
+| `Float_Mod` | **live** (trunc toward zero; y=0 → NaN) |
+| unary `Float_Atan` | library: `Atan2(x, 1)` |
 | `Float_Asin` `Float_Acos` | library from Atan2 |
-| `Float_Hypot` | library: `Sqrt(Add(Mul(x,x), Mul(y,y)))` — CAD_Num.Hypot2 |
+| `Float_Hypot` | library: CAD_Num.Hypot2 |
 | `Float_Log2` `Float_Log10` `Float_Exp2` | library scale of Log/Exp |
-| `Float_Cbrt` | library |
-| `Float_IsNan` `Float_IsInf` `Float_SignBit` | core predicates, cheap bit tests |
-| `Vec3_*` | **header lie** — dispatcher has Vec2 only |
+| `Vec3_*` | header lie — dispatcher has Vec2 only |
 
 ---
 
@@ -64,10 +62,10 @@ Missing / weak integer: negative `Power`, `Gcd`, `Popcnt`, `Clz`/`Ctz`
 Must be compiler (used everywhere, or one ISA insn / short poly):
 
 1. Arithmetic + cmp + sqrt + convert — **done**
-2. `Float_Abs` `Float_Neg` `Float_Copysign` — cheap, do these
+2. `Float_Abs` `Float_Neg` `Float_Copysign` `IsNan` `IsInf` `SignBit` `Mod` — **done**
 3. `Float_Sin/Cos/Tan/Atan2` — **done**
-4. **`Float_Log` + `Float_Exp` + `Float_Pow`** — Pow is `exp(y*log(x))` plus IEEE specials. Not a library.
-5. `Float_Floor/Ceil/Trunc` — done on SSE4.1; SSE2 hosts unknown (this box is level 2)
+4. `Float_Log` + `Float_Exp` + `Float_Pow` — **done**
+5. `Float_Floor/Ceil/Trunc` — SSE4.1 (`Hw.level≥1`)
 
 Not core (library `Library.Math` / CAD_Num):
 
@@ -81,5 +79,4 @@ Not core (library `Library.Math` / CAD_Num):
 
 - `SquareRoot` → **integer** ISqrt, not `Float_Sqrt`
 - `Power` → integer, exp < 0 is an infinite loop / wrong
-- Calling `Float_Exp` used to compile as a no-op; now Unknown function
-- `CAD_Num.Abs` is sign-bit (treats −0 as neg). IEEE `Float_Abs` would not.
+- `CAD_Num.IsNeg(-0)` is 1 (sign bit). `Float_Abs(-0)` is +0.
