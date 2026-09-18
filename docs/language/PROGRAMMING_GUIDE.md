@@ -46,8 +46,9 @@ Functions declare their inputs with types (`Integer`, `Address`) and an optional
 ```ailang
 SubRoutine.Main {
     PrintMessage("Hello from AILang OS\n")
-    RunTask(Main)
 }
+
+RunTask(Main)
 ```
 
 ### Control Flow
@@ -316,8 +317,9 @@ SubRoutine.Main {
 
     Socket.Close(sock)
     SystemCall(60, 0)                   // exit(0)
-    RunTask(Main)
 }
+
+RunTask(Main)
 ```
 
 ### Step 5: Send UI Updates
@@ -1039,8 +1041,9 @@ SubRoutine.Main {
 
     Socket.Close(sock)
     SystemCall(60, 0)
-    RunTask(Main)
 }
+
+RunTask(Main)
 ```
 
 **Build and deploy:**

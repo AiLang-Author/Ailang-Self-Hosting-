@@ -611,7 +611,7 @@
                                | "StringEndsWith" "(" <expression> "," <expression> ")"
                                | "StringCompare" "(" <expression> "," <expression> ")"
 
-<string_manipulation_function> ::= "StringConcat" "(" <expression> { "," <expression> } ")"
+<string_manipulation_function> ::= "StringConcat" "(" <expression> "," <expression> ")"
                                  | "StringLength" "(" <expression> ")"
                                  | "StringSubstring" "(" <expression> "," <expression> [ "," <expression> ] ")"
                                  | "StringToUpper" "(" <expression> ")"

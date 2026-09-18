@@ -196,7 +196,11 @@ This document catalogs every function in the compiler, organized by module. For 
 | CCompilePool | `CompilePool_TryCompile` | FixedPool, DynamicPool definitions |
 | CCompileLogic | `CompileLogic_TryCompile` | And, Or, Not |
 | CCompileBitwise | `CompileBitwise_TryCompile` | BitwiseAnd, BitwiseOr, BitwiseXor, BitwiseNot, LShift, RShift |
-| CCompileString | `CompileString_TryCompile` | StringCompare, StringLength, StringCopy, SetByte, GetByte |
+| CCompileString | `CompileStringCore_TryCompile` | NumberToString, StringToNumber, SetByte, GetByte |
+| FPUCompileX86String | `FPUCompileX86String_TryCompile` | StringLength, Concat, Compare, Copy, Contains, IndexOf |
+| FPUCompileX86SSE | `FPUCompileX86_TryCompile` | Float_Add/Sub/Mul/Div/Sqrt/cmp, FromInt/ToInt |
+| FPUCompileX86Trans | `Trans_TryCompile` | Float_Sin/Cos/Tan/Atan2 (Exp/Log/Pow unknown) |
+| FPUCompileX86AVX | `FPUCompileX86AVX_TryCompile` | Float_FMA, Floor/Ceil/Trunc if Hw.level |
 | CCompileMem | `CompileMem_TryCompile` | Allocate, Deallocate, StoreValue, Dereference |
 | CCompileArray | `CompileArray_TryCompile` | XCreate, XPush, XPop, XGet, XSet, XSize, XDestroy |
 | CCompileFile | `CompileFile_TryCompile` | FileOpen, FileRead, FileWrite, FileClose, FileSeek, FileGetSize, FileExists, ReadTextFile, WriteTextFile |
@@ -349,5 +353,4 @@ This document catalogs every function in the compiler, organized by module. For 
 
 *Document 09 of 10 — Function Catalog*
 
-*Total functions documented: ~250+*
-*Compiler version: May 2025*
+*Compiler: Sep 2026 (Assemble wrap + FPU). Catalog is representative, not every Enc key.*

@@ -314,6 +314,29 @@ dist_sq = (((x2 - x1) * (x2 - x1)) + ((y2 - y1) * (y2 - y1)))
 
 ---
 
+## IEEE-754 binary64 (`Float_*`)
+
+Integer `Add`/`Multiply`/`Power` are **not** floats. Floats are bit
+patterns in `Integer` slots. Compiler builtins (x86-64 SSE2 unless noted):
+
+| Live | Notes |
+|------|--------|
+| `Float_Add/Sub/Mul/Div` | SSE2 |
+| `Float_Sqrt` | `SQRTSD` (not `SQRTSS`) |
+| `Float_Min/Max`, `Float_Abs` | |
+| `Float_Eq/Ne/Lt/Gt/Le/Ge` | `UCOMISD`; `Le` is honest on negatives |
+| `Float_FromInt`, `Float_ToInt`, `Float_Round` | |
+| `Float_Sin`, `Float_Cos`, `Float_Tan` | Cody–Waite reduce + poly |
+| `Float_Atan2(y, x)` | quadrants; C argument order |
+| `Float_FMA(a, b, c)` | `Hw.level ≥ 2`; also fused from `Float_Add(Float_Mul(a,b), c)` |
+
+**Not implemented** (compile error `Unknown function`): `Float_Exp`,
+`Float_Log`, `Float_Pow`. Integer `Power` is unrelated.
+
+`CAD_Num.Sqrt` wraps `Float_Sqrt` with domain 0 / negative → 0.
+
+---
+
 ## See Also
 
 `AILang Operators Reference` — complete operator table, infix rules,

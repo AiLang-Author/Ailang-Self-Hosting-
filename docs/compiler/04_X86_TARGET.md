@@ -2,31 +2,31 @@
 
 ## Overview
 
-The X86-64 target layer encodes raw x86-64 machine code bytes. It is called exclusively through the `CEmitCoreArch` wrapper layer — compile modules never call `X86_*()` functions directly.
+The X86-64 target layer encodes machine code. Compile modules call
+`Emit_*` / `Trans_Asm("…")`. `CEmitCoreArch` wraps most `Emit_*` through
+generated Enc (`CEmitX86Enc`). Leftovers that Enc cannot name live in
+`CEmitKeep` (CQO, `SHL rax,cl`, `AND rsp,imm8` sign-extend, CLD, …).
+Do not hand-edit Enc; regenerate from `tools/gen_corearch.py`.
 
 ```
-Emit_AddRaxRbx() ──▶ X86_AddRaxRbx() ──▶ Emit_Byte(0x48); Emit_Byte(0x01); Emit_Byte(0xD8)
-     (CEmitCoreArch)      (CEmitX86Arith)      (CEmitCore)
+Emit_AddRaxRbx() ──▶ Assemble("ADD rax, rbx") ──▶ Enc bytes
+X86_AndRspImm8() ──▶ Keep hand bytes (Assemble would zero-extend)
 ```
 
 ---
 
-## 1. MODULE ORGANIZATION (12 files)
+## 1. MODULE ORGANIZATION (current)
 
-| Module | Size | Purpose |
-|--------|------|---------|
-| CEmitX86Reg | 27KB | Register moves, immediate loads |
-| CEmitX86Mem | 41KB | Memory access, addressing modes |
-| CEmitX86Stack | 13KB | Push, pop, prologue, epilogue |
-| CEmitX86Arith | 16KB | ADD, SUB, IMUL, IDIV, NEG |
-| CEmitX86Cmp | 11KB | CMP, TEST, SETcc |
-| CEmitX86Jump | 8KB | JMP, Jcc, CALL, RET |
-| CEmitX86Sys | 8KB | SYSCALL, INT, SYSENTER |
-| CEmitX86Logic | 12KB | AND, OR, XOR, NOT, SHL, SHR, SAR |
-| CEmitX86String | 7KB | REP MOVSB, REP CMPSB, SCASB |
-| CEmitX86Macros | 9KB | Pseudo-instructions expanded to real sequences |
-| CEmitX86Helpers | 4KB | Address computation helpers |
-| CEmitX86Debug | 8KB | Debug info (dwarf line programs) |
+| Module | Purpose |
+|--------|---------|
+| CEmitCoreArch | `Emit_*` wrappers → Enc Assemble |
+| CEmitX86Enc | generated opcode table (do not edit) |
+| CEmitKeep | hand bytes Enc cannot express |
+| CEmitCore / Tags | buffer, labels, relocs |
+| FPUCompileX86SSE | Float_Add/Mul/Sqrt (`SQRTSD`), compares |
+| FPUCompileX86Trans | Sin/Cos/Tan/Atan2; Exp/Log/Pow stub → unknown |
+| FPUCompileX86String | Length/Concat/Compare/Copy SSE2 |
+| FPUCompileX86AVX | FMA / Floor when `Hw.level` allows |
 
 ---
 

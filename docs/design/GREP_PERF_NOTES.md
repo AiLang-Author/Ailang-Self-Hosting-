@@ -5,6 +5,11 @@ the April 2026 perf pass, ranked by **observed** impact on real
 benchmarks. This is a field note, not a theory. Every number in it was
 measured on this box against GNU grep 3.11.
 
+**Sep 2026:** CoreUtils `grep.ailang` has HalCode engine backports (DFA
+1/0/−1, null-handle, NFA fallback per pattern). GNU-gap features `-C` /
+`-r` / `--include` remain HalCode `cc_grep_ipc` only. Rebuilding grep
+with Arena-concat did not move the hot path (BM/DFA/`MemChr`, not Concat).
+
 Two corpora used throughout:
 - **Small** — 5.5 MB source tree (223 `.ailang` files under `Librarys/`)
 - **Big**   — 536 MB concatenation of the same tree ×100

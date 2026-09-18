@@ -1,5 +1,10 @@
 # Technical Post-Mortem: `Float_Sqrt` Precision Drift Bug
 
+**Status (2026-09):** Fixed. Compiler emits `SQRTSD` (`F2 0F 51`).
+`CAD_Num.Sqrt` is a thin wrap (0 / negative → 0), not Newton-Raphson.
+`CAD/test_num.ailang` `Sqrt(2500) → 50.0` is exact. This note is the
+old `SQRTSS` failure, kept as history.
+
 ## 1. Summary of Bug
 During **Phase 3 (`CAD.Sketch`)** residual validation in [`CAD/test_sketch.ailang`](file:///mnt/c/Users/Sean/Documents/AILangSH/CAD/test_sketch.ailang), evaluating the 2D Euclidean distance between $P_1 = (0, 0)$ and $P_2 = (30, 40)$ produced a non-zero residual for a target distance of $50.0$ mm.
 

@@ -32,6 +32,10 @@ Deallocate(ptr, size)       // return `size` bytes at `ptr` to the pool
 These compile directly to `Arena_Alloc` and `Arena_Free`. You do not
 call `Arena_Alloc` / `Arena_Free` directly in normal code.
 
+`StringConcat` and `NumberToString` call `Arena_Alloc` when this library
+is imported; if it is not, they `mmap` a small buffer so tiny programs
+still compile. Real apps should `Arena_Init()`.
+
 ### Architecture
 
 The Arena uses nine fixed-size slab pools plus one general pool for

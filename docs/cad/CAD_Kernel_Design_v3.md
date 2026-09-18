@@ -276,7 +276,7 @@ compiler primitives:
 | Category | Available |
 |---|---|
 | Arithmetic | `Float_Add`, `Float_Sub`, `Float_Mul`, `Float_Div`, `Float_Min`, `Float_Max`, `Float_Sqrt` |
-| Transcendental | `Float_Sin`, `Float_Cos`, `Float_Tan`, `Float_Atan2`, `Float_Exp`, `Float_Log`, `Float_Pow` |
+| Transcendental | `Float_Sin`, `Float_Cos`, `Float_Tan`, `Float_Atan2` (live). **`Float_Exp` / `Log` / `Pow` are stubs — Unknown function.** |
 | FMA / extended | `Float_FMA`, `Float_FMS`, `Float_FNMA`, `Float_DotPD` |
 | Rounding / conversion | `Float_Floor`, `Float_Ceil`, `Float_Trunc`, `Float_Round`, `Float_FromInt`, `Float_ToInt` |
 | Comparison | `Float_Eq`, `Float_Ne`, `Float_Lt`, `Float_Gt`, `Float_Le`, `Float_Ge` |
@@ -2059,7 +2059,7 @@ because it removes a substantial speculative line item:
 
 | Earlier concern | Outcome |
 |---|---|
-| Transcendentals may be absent; `CAD.Num` grows 600–900 lines of CORDIC | **Not needed.** `Float_Sin`, `Float_Cos`, `Float_Tan`, `Float_Atan2`, `Float_Exp`, `Float_Log`, `Float_Pow` are compiler primitives |
+| Transcendentals may be absent; `CAD.Num` grows 600–900 lines of CORDIC | **Sin/Cos/Tan/Atan2 are primitives.** Exp/Log/Pow are **not** — do not call them. |
 | `Sqrt` may need software implementation | **Not needed.** `Float_Sqrt` compiles to `SQRTSD` |
 | Exact two-product needs assembly or Dekker splitting | **Not needed.** `Float_FMA` is a primitive |
 | Float params may need boxing to fit 6 registers | **Not needed.** Floats occupy ordinary integer slots; no signature exceeds 5 arguments |

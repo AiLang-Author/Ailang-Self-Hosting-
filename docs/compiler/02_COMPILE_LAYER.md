@@ -464,9 +464,10 @@ CCompileFile (22KB)    — FileOpen, FileRead, FileWrite, FileClose, FileSeek,
 CCompileLogic (6KB)    — And, Or, Not (logical)
 CCompileBitwise (8.5KB)— BitwiseAnd, BitwiseOr, BitwiseXor, BitwiseNot, LShift, RShift
 CCompileMem (23KB)     — Allocate, Deallocate, StoreValue, LoadValue, Dereference
-CCompileString (34KB)  — StringCompare, StringLength, StringCopy, StringConcat,
-                          StringSubstring, StringToNumber, SetByte, GetByte
-                          (6 files: Core + Convert + Manip + Search + main)
+CCompileString (Core) — NumberToString, StringToNumber, SetByte, GetByte;
+                          Concat/Length/Compare/Copy/Contains/IndexOf are
+                          FPU SSE2 first (Manip/Search/Convert TryCompile
+                          return 0). Substring/Trim/Replace still missing.
 CCompileArray (8KB)    — XArray.XCreate, XPush, XPop, XGet, XSet, XSize, XDestroy
 CCompileAtomic (8KB)   — AtomicAdd, AtomicSub, AtomicXchg, AtomicCmpXchg
 CCompileSystem (7.5KB) — Syscall invocation, inline assembly
@@ -484,20 +485,15 @@ CCompileScopebu (14KB) — Scope backup/restore utility
 In `Compile_FunctionCall`, modules are tried in THIS ORDER:
 
 ```
-1.  CompileArith_TryCompile      — arithmetic ops
-2.  CompileCompare_TryCompile    — comparison ops
-3.  CompileLogic_TryCompile      — logical ops (And, Or, Not)
-4.  CompileBitwise_TryCompile    — bitwise ops
-5.  CompileIO_TryCompile         — I/O ops
-6.  CompileString_TryCompile     — string ops
-7.  CompileMem_TryCompile        — memory ops
-8.  CompileArray_TryCompile      — array ops
-9.  CompileAtomic_TryCompile     — atomic ops
-10. CompileFile_TryCompile       — file I/O ops
-11. CompileSystem_TryCompile     — system ops
-    ...
-    If none match → CompileFunc_Call (user-defined function)
+CompileFile, Optimize_TryMathOp, Arith, Compare, Logic, Bitwise, IO,
+then (x86_64) FPUCompileX86String (Length/Concat/Compare/Copy/…),
+then StringCore (NumberToString, StringToNumber), Mem, Array, Pool,
+System, Func, FPU SSE / MemOps / FixedPoint / AVX (FMA, Floor),
+Atomic, user-defined call, else Unknown function.
 ```
+
+`Float_Add(Float_Mul(a,b), c)` fuses to FMA when `Hw.level ≥ 2`.
+`Float_Exp` / `Log` / `Pow` are stubs and fail as Unknown function.
 
 ---
 

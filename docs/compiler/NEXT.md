@@ -1,12 +1,14 @@
 # compiler-improvement — status and punch list
 
-Branch: `compiler-improvement`. Host toolchain is frozen. Products are aliased `*-next.x`. Never overwrite `ailang.x`, `analyzer.x`, or `cad_app.x` from this branch.
+**Merged to `master` (Sep 2026).** The freeze below is historical. Current
+`./ailang.x` is the promoted self-host (FPU Concat/Tan/Atan2/FMA, Hardware
+CPUID, Assemble wrap). Rebuild with `./ailang.x ailang_cli.ailang ailang-next.x`.
 
 This is the briefing for what landed, what was already fixed, and what is still open.
 
 ---
 
-## Host — frozen
+## Host — frozen (branch era; no longer policy)
 
 | File | Role |
 |------|------|

@@ -49,6 +49,10 @@ Function.ProcessMany {
 
 ## Expression Nesting
 
+Analyzer warning (not a compile abort): `Use(Add(1, 2))` — flatten nested
+call-args into a named local. The compiler still accepts nested calls;
+CAD `Float_Add(Float_Mul(dx, dx), …)` is fused to FMA on native hosts.
+
 ### The Problem
 
 Each nested call in an expression creates register pressure and stack usage:

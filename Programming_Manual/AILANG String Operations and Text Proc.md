@@ -8,7 +8,7 @@ AILANG provides a comprehensive set of string primitives built directly into the
 
 - Null-terminated byte sequences (`0x00` terminator)
 - UTF-8 compatible (byte-level operations; multibyte awareness is the caller's responsibility)
-- Arena-allocated: all operations that return new strings allocate via `Arena_Alloc`
+- New strings: `StringConcat` / `NumberToString` use `Arena_Alloc` when the program imported Arena, otherwise `mmap` (tiny programs). Prefer `LibraryImport.Arena` + `Arena_Init` for real work.
 - Pointer-based: strings are addresses to character data
 
 ### Core Design Principles
@@ -16,7 +16,7 @@ AILANG provides a comprehensive set of string primitives built directly into the
 - Compiler primitives: string ops are lowered directly to x86-64 machine code at compile time
 - SSE2 acceleration: search, compare, length, copy, and memory operations use 16-byte SIMD paths with scalar fallback for remainders
 - Consistent semantics: all operations follow uniform conventions for indices, return values, and edge cases (see Semantic Conventions below)
-- Arena memory model: returned strings are arena-allocated; no manual free required
+- No `free` of concat/NTS results; Arena bump or leaked mmap pages. Do not mix with `Deallocate`.
 
 ### Semantic Conventions
 
@@ -72,7 +72,8 @@ empty_len = StringLength("")         // 0
 
 ### StringConcat
 
-Concatenates two strings, returning a new arena-allocated string.
+Concatenates **exactly two** strings. Extra arguments are not accepted.
+Flatten nested concats into locals (analyzer warns on nested call-args).
 
 ```ailang
 result = StringConcat(string1, string2)
@@ -80,7 +81,8 @@ result = StringConcat(string1, string2)
 
 ```ailang
 greeting  = StringConcat("Hello", " World")     // "Hello World"
-full_name = StringConcat(first, StringConcat(" ", last))
+sp = StringConcat(" ", last)
+full_name = StringConcat(first, sp)
 ```
 
 ### StringEquals
@@ -255,7 +257,8 @@ age_str      = NumberToString(25)        // "25"
 negative_str = NumberToString(-42)       // "-42"
 zero_str     = NumberToString(0)         // "0"
 
-message = StringConcat("Error ", NumberToString(404))  // "Error 404"
+n = NumberToString(404)
+message = StringConcat("Error ", n)  // "Error 404"
 ```
 
 ### StringToNumber
