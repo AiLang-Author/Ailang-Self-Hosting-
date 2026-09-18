@@ -10,7 +10,7 @@ See also `WORKSPACE.md` at the repo root for the monorepo philosophy.
 | Path | Contents |
 |------|----------|
 | `language/` | Language warts, programming guide notes, oddities |
-| `compiler/` | Compiler architecture (frontend → emit → x86). Live FPU/ISA: `compiler/FPU_ISA_PLAN.md` |
+| `compiler/` | Architecture, `FPU_ISA_PLAN.md`, `MATH_PRIMITIVES.md` (float/int inventory) |
 | `display/` | Auckland UI / window system / input |
 | `design/` | Design specs, compiler/display design history |
 | `browser/` | JS engine master plan, conformance, usability plans |

@@ -36,9 +36,9 @@ CAD already uses Add/Sub/Mul/Div/Le heavily. **CAD_Num.Sqrt → Float_Sqrt (`SQR
 | `Float_Sin` / `Float_Cos` | polynomial + Cody-Waite | CAD_Num still has its own poly |
 | `Float_Tan` | sin/cos quotient after reduce | low |
 | `Float_Atan2` | poly + quadrants | sketch/tess — CAD_Geom.Atan2 wraps it |
-| `Float_Exp` / `Log` / `Pow` | stub | low until shading/HDR |
+| `Float_Exp` / `Log` / `Pow` | poly + ldexp | core; Pow = exp(y*ln(x)) |
 
-Tan = Sin/Cos ratio after the same reduce. Atan2 is live (quadrants + Horner). Exp/Log only when something calls them.
+Tan = Sin/Cos ratio after the same reduce. Atan2 is live. Exp/Log/Pow are live (poly; not correctly rounded).
 
 ### AVX file — implemented, Hw.level gated
 

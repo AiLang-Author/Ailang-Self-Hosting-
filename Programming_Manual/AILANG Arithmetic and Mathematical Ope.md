@@ -328,10 +328,11 @@ patterns in `Integer` slots. Compiler builtins (x86-64 SSE2 unless noted):
 | `Float_FromInt`, `Float_ToInt`, `Float_Round` | |
 | `Float_Sin`, `Float_Cos`, `Float_Tan` | Cody–Waite reduce + poly |
 | `Float_Atan2(y, x)` | quadrants; C argument order |
+| `Float_Exp`, `Float_Log`, `Float_Pow` | poly; Pow is exp(y*ln(x)); x≤0 → NaN |
+| `Float_Abs` | clear sign bit |
 | `Float_FMA(a, b, c)` | `Hw.level ≥ 2`; also fused from `Float_Add(Float_Mul(a,b), c)` |
 
-**Not implemented** (compile error `Unknown function`): `Float_Exp`,
-`Float_Log`, `Float_Pow`. Integer `Power` is unrelated.
+Integer `Power` is unrelated (integer exponent, non-negative).
 
 `CAD_Num.Sqrt` wraps `Float_Sqrt` with domain 0 / negative → 0.
 
