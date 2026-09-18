@@ -118,7 +118,12 @@ def should_keep(emit_name: str, x86: str, inputs: list[str]) -> bool:
     if emit_name.startswith("Emit_Rep"):
         return True
     # Enc zero-operand keys are "SYSCALL_" / "RET_"; Assemble("SYSCALL") looks up "SYSCALL"
-    if emit_name in ("Emit_Ret", "Emit_Syscall", "Emit_SysInstr", "Emit_Cqo"):
+    if emit_name in (
+        "Emit_Ret", "Emit_Syscall", "Emit_SysInstr", "Emit_Cqo",
+        "Emit_Cld", "Emit_Std", "Emit_Clc", "Emit_Stc", "Emit_Cmc",
+        "Emit_Nop", "Emit_Int3", "Emit_Cpuid", "Emit_Rdtsc", "Emit_Rdtscp",
+        "Emit_SignExtendRaxToRdx",
+    ):
         return True
     # Enc table is SHL_r64_cl; Assemble("SHL rax, cl") builds SHL_r64_r8
     if emit_name.endswith("RaxCl") or emit_name.endswith("Cl"):
