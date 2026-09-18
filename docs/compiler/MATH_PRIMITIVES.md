@@ -67,7 +67,7 @@ Must be compiler (used everywhere, or one ISA insn / short poly):
 4. `Float_Log` + `Float_Exp` + `Float_Pow` — **done**
 5. `Float_Floor/Ceil/Trunc` — SSE4.1 (`Hw.level≥1`)
 
-Not core (library `Library.Math` / CAD_Num):
+Not core (`LibraryImport.Math` — optional, not auto-imported):
 
 - Hypot, Asin/Acos, Atan, Log2/Log10, Cbrt, sincos pair, wrap-to-2π
 - V3Dot/Cross/Normalize, LU, Orient — already CAD_Num
