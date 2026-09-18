@@ -148,7 +148,7 @@ All graphical applications are IPC clients — separate processes that connect t
 
 The AILang standard library contains ~80 modules:
 
-**Core** — Arena (memory allocator), Arrays, Hash, StringUtils, JSON, Socket, HTTP, Regex (Thompson NFA), CSV, RESP (Redis protocol), PostgreSQL_Complete, Math, FixedPointTrig, TimeDate, TextBuffer, OAuth, MessagePort
+**Core** — Arena (memory allocator), Arrays, Hash, StringUtils, JSON, Socket, HTTP, Regex (Thompson NFA), CSV, RESP (Redis protocol), PostgreSQL_Complete, Math, FixedPointTrig, TextBuffer, OAuth, MessagePort
 
 **Display** — 60 modules covering the full display stack: SysDisplay, Auckland (layout), Framebuffer, DRenderFB, DSurface, DComposeFloat, Fonts, TermFont, SVG, VIF, HTMLParse, WinManager, WinToolbar, IPCBroker, InputRouter, DInputEvdev, Cursor, UITheme, StartMenu, Deskbar, CascadeMenu, FileDialog, Dialog, TextRegion
 

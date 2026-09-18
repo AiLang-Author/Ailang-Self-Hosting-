@@ -861,7 +861,6 @@ Both formats integrate with the display server's compositing pipeline and are ra
 | RESP | `LibraryImport.RESP` | Redis protocol |
 | Math | `LibraryImport.Math` | Composed floats: Hypot, Asin, Acos, Log2. `Float_Sin` etc. need **no** import |
 | FixedPointTrig | `LibraryImport.FixedPointTrig` | Trigonometry without floating point |
-| TimeDate | `LibraryImport.TimeDate` | Date/time formatting and arithmetic |
 | TextBuffer | `LibraryImport.TextBuffer` | Gap buffer for text editing |
 | MessagePort | `LibraryImport.MessagePort` | Inter-process message passing |
 | OAuth | `LibraryImport.OAuth` | OAuth 2.0 authentication flows |
