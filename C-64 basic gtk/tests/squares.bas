@@ -1,0 +1,4 @@
+10 FOR N = 1 TO 4
+20 PRINT N * N
+30 NEXT N
+40 END
