@@ -1,65 +1,62 @@
 # AIMacro CPython conformance scorecard
 
-Generated **2026-09-19**. Python 3.11.6. Stdlib `/home/bob/tools/oss-cad-suite/lib/python3.11`.
+Generated **2026-09-19**. Remeasured on this box with **Python 3.13.5** stdlib `/usr/lib/python3.13` (531 `.py` files after excludes). Prior Waves 1–16 scorecard used Python 3.11.6 / 585 files.
 
-## Suites
+## Suites (this box, after class-body grind + Hash order hygiene)
 
 | Suite | Stage | Total | Pass | Fail | In-scope pass | Seconds |
 |-------|-------|------:|-----:|-----:|--------------:|--------:|
-| `curated` | run vs python3 | 25 | **25** | 0 | 25/25 | 12 |
-| `lib` | transpile | 585 | **182** | 403 | 168/395 | 52 |
+| `curated` | run vs python3 | 25 | **25** | 0 | 25/25 | ~5 |
+| `lib` | transpile | 531 | **170** | 361 | 147/339 | ~23 |
 
-Was 84/585 before the SIGSEGV grind, 67/585 before the parse grind. Curated still 25/25.
+**VM baseline before class-body grind:** lib **148/531**. After grind: **170/531** (+22). Matrix **62/62/62**. SIGSEGV **0**. Fizzbuzz ELF **211054**.
 
-## The 313 “codegen fails” were a misread
+Hygiene rebuilt `aimacro.x` from this branch; curated was 24/25 until `Library.Hash` gained the Wave-10 insertion-order array (header+32) — now **25/25**.
 
-Those 313 had **no `Parse Error:` text** in the JSON tail, so they looked like codegen. Re-running with `Parse_Consume` printing `expected token N got M` showed they were **silent parse failures** (`Parse.err=1` without a message).
+## Class-body grind
 
-Of those 313:
+Target bucket from Waves 1–16 (3.11): **132** `Expected '}' after class body`.
 
-| Count | Bucket | Cause |
-|------:|--------|--------|
-| 144 | `from .mod import` / `from . import` | relative import; first token after `from` is `.` |
-| 92 | expected `)` got STRING | implicit `"a" "b"` concat, often across newlines inside `()` |
-| 21 | expected `:` got IDENT | encodings codecs / annotations |
-| 13 | expected symbol after `import` | `from x import (a, b)` parentheses |
-| 7 | SIGSEGV | real crash |
-| 3 | empty file | empty `__init__.py` |
-| rest | mixed `)`, `]`, `}` mismatches | listcomp, type params, etc. |
+| Metric (3.13 corpus) | Before | After |
+|----------------------|-------:|------:|
+| Lib transpile OK | 148 | **170** |
+| Files with class-body error | 119 | **108** (−11) |
+| `Expected '}' after class body` messages | 121 | **110** (−11) |
+| `Expected '{' to start block` | 103 | **62** |
+| `expected token 84 got 87` (`{` vs `:`) | 55 | **18** |
+| `Unexpected token in expression` | 168 | **161** |
+| `Expected ')' after parameters` | 9 | **4** |
 
-## What we fixed in this grind
+Primary wins: enum-style bare tuple RHS, chained assigns, multiline `def`/`class` headers in `py2aim`, complex param/return annotations, annotated `self.x: T = …`, `raise X from Y` skip.
 
-- `Parse_Consume` now prints expected vs got (so this bucket cannot hide again)
-- Relative `from . import x` / `from .mod import *`
-- `from x import (a, b)` parenthesized names
-- Implicit string concat `"a" "b"`
-- Lexer joins newlines inside `()` and `[]` (Python implicit line joining; not inside `{ }` blocks)
-- Skip emitting `Import.` for relative `.` modules (avoids `Import..`)
-- `AST_GetField` covers remaining node types; OOP method-body emit is null-guarded
-- Implicit `"a" "b"` BINARY_OP slots were swapped (`op` in left); encodings tables SIGSEGV
-- Decorator attach no longer `ArraySet(0, …)` when the following class/def fails to parse
+Nested `def` / `__new__` / `@_simple_enum(...)` already parsing (decorators stored, not applied).
 
-## Remaining lib fails (403)
+## What we fixed
 
-**SIGSEGV pile is gone** (`rc=-11`: 103 → 0). Former crash files now transpile (98/103) or fail as parse (`Expected '}' after class body`, 5/103).
+- Bare tuple RHS / chained assign / annotated attr assign
+- Method/func generic+union annotations skipped for parse coverage
+- `raise X from Y` skip; `Parse_EnterBlock` accepts leftover `:`
+- `py2aim` multiline suite headers
+- **Hash insertion order** (header+32 order Array) — curated dict_order
 
-| Count | Message |
+Rebuild: `./ailang.x aimacro_cli.ailang aimacro && mv -f aimacro aimacro.x`
+
+## Remaining lib fails (361 on 3.13)
+
+| Count (approx) | Message |
 |------:|---------|
-| 132 | Expected `}` after class body (enum tuple values, decorated class parse) |
-| 68 | Unexpected token in expression |
-| 27 | expected `)` got STRING |
-| 27 | expected `}` got IDENT |
-| 19 | expected `}` got STRING |
-| 19 | expected `)` got `:` |
-| 17 | Expected `{` to start block |
-| 2 | timeout (`rc=124`, `_pydecimal.py` / `smtpd.py`) |
+| 110 | Expected `}` after class body (genexp / other) |
+| ~160 | Unexpected token in expression |
+| ~27 | expected `)` got STRING |
+| rest | `{` / `}` / `:` mismatches, timeouts |
 
-Next grind: class-body `}` 132, then unexpected-token 68.
+Next: bucket remaining `}` by **construct** (genexp, implicit string concat, class-level if/try/with, …).
 
 ## How to re-run
 
 ```bash
-python3 tools/aimacro_cpython_runner.py --verbose
+python3 tools/aimacro_cpython_runner.py --verbose --timeout 8
 python3 tools/aimacro_cpython_runner.py --corpus lib --stage transpile --timeout 2 \
     --output-json results/aimacro_conformance.json
+./AIMacro/scripts/run_matrix.sh
 ```
