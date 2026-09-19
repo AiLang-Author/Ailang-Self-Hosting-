@@ -21,7 +21,7 @@ Hygiene: rebuilt `aimacro.x` from branch `aimacro/class-body-parse-fixes` (no pr
 | Files with class-body `}` error | 119 | 108 | **97** |
 | `Expected '}' after class body` msgs | 121 | 110 | **99** |
 
-Stop condition met: **lib ≥ 210** (226). Class-body bucket still 97 (not yet <60).
+Stop condition met: **lib ≥ 210** (226). Class-body bucket still 97 (not yet &lt;60).
 
 ## Constructs fixed this session (prove with `/tmp/cb_repro/*.aim` before patch)
 
