@@ -2,13 +2,13 @@
 
 Living document. Re-run audit scripts and update counts after substantive changes.
 
-**Last updated:** 2026-09-19 (CPython lib 182/585, SIGSEGV 103→0; curated 25/25, matrix 62/62/62)
+**Last updated:** 2026-09-19 (hygiene: curated 25/25 after Hash order restore; class-body lib 148→170/531; matrix 62/62/62; SIGSEGV 0)
 
 ## Build artifacts
 
 | Artifact | Path | Status |
 |----------|------|--------|
-| Transpiler CLI | `aimacro.x` | Rebuilt 2026-09-19 (~380 KB ELF; code 370 KB, data 16 KB) from `aimacro_cli.ailang` |
+| Transpiler CLI | `aimacro.x` | Rebuilt 2026-09-19 (~393 KB ELF) from `aimacro_cli.ailang` |
 | AILang runtime | `ailang.x` | Present at repo root |
 | Sources | `aimacro_cli.ailang`, `aimacro_console.ailang` | Present |
 
@@ -36,7 +36,17 @@ Living document. Re-run audit scripts and update counts after substantive change
 
 `dungeon_escape.aim` and `test_input.aim` take stdin from sibling `.stdin` files. `./AIMacro/scripts/run_matrix.sh` pipes them. No skips.
 
-CPython-lite curated: **25/25**. Mountain: CPython Lib transpile **182/585** (in-scope 168/395). SIGSEGV pile 103 → **0**. See [CONFORMANCE.md](CONFORMANCE.md).
+CPython-lite curated: **25/25** (Hash insertion order restored on this branch). Lib transpile **170/531** (py3.13; was 148 before class-body grind). SIGSEGV **0**. See [CONFORMANCE.md](CONFORMANCE.md).
+
+
+## Class-body grind (2026-09-19)
+
+- Bare tuple RHS, chained assign, annotated `self.x: T = …`
+- Method/func generic/union annotations skipped for parse coverage
+- `py2aim` multiline `def`/`class` headers; `raise X from Y` skip
+- Lib 148→170/531 (py3.13); class-body error files 119→108
+- Matrix 62/62/62; fizzbuzz ELF ~211 KB; SIGSEGV 0
+- Hygiene: `Library.Hash` order array at header+32 → curated **25/25**
 
 ## Wave 16 (this round)
 
