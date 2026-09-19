@@ -2,7 +2,7 @@
 
 Living document. Re-run audit scripts and update counts after substantive changes.
 
-**Last updated:** 2026-09-19 (hygiene: curated 25/25 after Hash order restore; class-body lib 148→170/531; matrix 62/62/62; SIGSEGV 0)
+**Last updated:** 2026-09-19 (construct grind: lib 148→226/531; class-body files 119→97; curated 25/25; matrix 62/62/62; SIGSEGV 0; fizzbuzz 211054)
 
 ## Build artifacts
 
@@ -36,7 +36,7 @@ Living document. Re-run audit scripts and update counts after substantive change
 
 `dungeon_escape.aim` and `test_input.aim` take stdin from sibling `.stdin` files. `./AIMacro/scripts/run_matrix.sh` pipes them. No skips.
 
-CPython-lite curated: **25/25** (Hash insertion order restored on this branch). Lib transpile **170/531** (py3.13; was 148 before class-body grind). SIGSEGV **0**. See [CONFORMANCE.md](CONFORMANCE.md).
+CPython-lite curated: **25/25**. Lib transpile **226/531** (py3.13; VM baseline 148, post-hygiene 170). SIGSEGV **0**. See [CONFORMANCE.md](CONFORMANCE.md).
 
 
 ## Class-body grind (2026-09-19)
@@ -44,9 +44,11 @@ CPython-lite curated: **25/25** (Hash insertion order restored on this branch). 
 - Bare tuple RHS, chained assign, annotated `self.x: T = …`
 - Method/func generic/union annotations skipped for parse coverage
 - `py2aim` multiline `def`/`class` headers; `raise X from Y` skip
-- Lib 148→170/531 (py3.13); class-body error files 119→108
-- Matrix 62/62/62; fizzbuzz ELF ~211 KB; SIGSEGV 0
 - Hygiene: `Library.Hash` order array at header+32 → curated **25/25**
+- **This session:** genexp/dictcomp/setcomp; star LHS; `b"`/`r"`/`u"` prefixes; except (A,B)/dotted; try/except/else; for multi/paren unpack
+- Lib **148→226/531**; class-body files **119→97**; msgs **121→99**
+- Matrix 62/62/62; fizzbuzz ELF **211054**; SIGSEGV 0
+- Stop: lib ≥210 met (226). Local commit `343e8dbd` on `aimacro/class-body-parse-fixes`
 
 ## Wave 16 (this round)
 
