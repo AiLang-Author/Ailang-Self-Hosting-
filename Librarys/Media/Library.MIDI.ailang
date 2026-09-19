@@ -1,0 +1,1767 @@
+// Library.MIDI.ailang
+// MIDI 1.0 message layer + Standard MIDI File (SMF Type 0/1/2) parser.
+//
+// Live path: MIDI_StreamInit / MIDI_StreamFeed (running status, SysEx, realtime).
+// File path: MIDI_SongLoadMem / MIDI_SongLoadPath → event list + arena payloads.
+//
+// Event record (32 bytes):
+//   [0]  tick     qword   absolute ticks from track start
+//   [8]  track    byte
+//   [9]  flags    byte
+//   [10] kind     byte    CHANNEL=1 META=2 SYSEX=3 SYSCOM=4 REALTIME=5
+//   [11] status   byte    full status, or meta type for META
+//   [12] d1       byte
+//   [13] d2       byte
+//   [14] ch       byte    0-15
+//   [15] pad
+//   [16] len      qword   payload bytes (0 if none); tempo us/qn packed here when ptr=0 and meta 0x51
+//   [24] ptr      qword   arena payload (text, sysex, raw meta)
+//
+// Song handle (128 bytes) — see MIDIOff.
+//
+// Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+// =============================================================================
+// CONSTANTS
+// =============================================================================
+FixedPool.MIDIKind {
+    "CHANNEL":  Initialize=1
+    "META":     Initialize=2
+    "SYSEX":    Initialize=3
+    "SYSCOM":   Initialize=4
+    "REALTIME": Initialize=5
+}
+
+FixedPool.MIDIErr {
+    "OK":        Initialize=0
+    "NOT_MIDI":  Initialize=1
+    "TRUNC":     Initialize=2
+    "BAD_VLQ":   Initialize=3
+    "BAD_TRACK": Initialize=4
+    "OOM":       Initialize=5
+    "BAD_PATH":  Initialize=6
+}
+
+FixedPool.MIDIOff {
+    "MAGIC":     Initialize=0
+    "FORMAT":    Initialize=8
+    "NTRKS":     Initialize=16
+    "DIVISION":  Initialize=24
+    "EVENTS":    Initialize=32
+    "EVCOUNT":   Initialize=40
+    "EVCAP":     Initialize=48
+    "ARENA":     Initialize=56
+    "AUSED":     Initialize=64
+    "ACAP":      Initialize=72
+    "TEMPO":     Initialize=80
+    "SRC":       Initialize=88
+    "SRCLEN":    Initialize=96
+    "FLAGS":     Initialize=104
+    "ERR":       Initialize=112
+    "SIZE":      Initialize=128
+}
+
+FixedPool.MIDIEv {
+    "TICK":    Initialize=0
+    "TRACK":   Initialize=8
+    "FLAGS":   Initialize=9
+    "KIND":    Initialize=10
+    "STATUS":  Initialize=11
+    "D1":      Initialize=12
+    "D2":      Initialize=13
+    "CH":      Initialize=14
+    "LEN":     Initialize=16
+    "PTR":     Initialize=24
+    "SIZE":    Initialize=32
+}
+
+FixedPool.MIDIFlag {
+    "OWN_SRC": Initialize=1
+}
+
+FixedPool.MIDISys {
+    "SYS_READ":  Initialize=0
+    "SYS_WRITE": Initialize=1
+    "SYS_OPEN":  Initialize=2
+    "SYS_CLOSE": Initialize=3
+    "SYS_LSEEK": Initialize=8
+    "O_RDONLY":  Initialize=0
+    "SEEK_SET":  Initialize=0
+    "SEEK_END":  Initialize=2
+}
+
+FixedPool.MIDIConst {
+    "MAGIC":       Initialize=1229214285
+    "EV_INIT_CAP": Initialize=256
+    "ARENA_INIT":  Initialize=4096
+    "DEFAULT_TEMPO": Initialize=500000
+    "SYSEX_CAP":   Initialize=4096
+}
+
+// Scratch for one in-flight parse. Sequential loads only.
+FixedPool.MIDIParse {
+    "buf":      Initialize=0, CanChange=True
+    "len":      Initialize=0, CanChange=True
+    "pos":      Initialize=0, CanChange=True
+    "song":     Initialize=0, CanChange=True
+    "running":  Initialize=0, CanChange=True
+    "status":   Initialize=0, CanChange=True
+    "tick":     Initialize=0, CanChange=True
+    "track":    Initialize=0, CanChange=True
+    "err":      Initialize=0, CanChange=True
+    "ch_prefix": Initialize=0, CanChange=True
+    "port_prefix": Initialize=0, CanChange=True
+}
+
+// Live byte stream (UART / ring ingest).
+FixedPool.MIDIStream {
+    "status":    Initialize=0, CanChange=True
+    "needed":    Initialize=0, CanChange=True
+    "have":      Initialize=0, CanChange=True
+    "d1":        Initialize=0, CanChange=True
+    "d2":        Initialize=0, CanChange=True
+    "in_sysex":  Initialize=0, CanChange=True
+    "sysex":     Initialize=0, CanChange=True
+    "sysex_len": Initialize=0, CanChange=True
+    "sysex_cap": Initialize=0, CanChange=True
+    "kind":      Initialize=0, CanChange=True
+    "last_st":   Initialize=0, CanChange=True
+    "last_d1":   Initialize=0, CanChange=True
+    "last_d2":   Initialize=0, CanChange=True
+    "last_ch":   Initialize=0, CanChange=True
+    "last_len":  Initialize=0, CanChange=True
+    "last_ptr":  Initialize=0, CanChange=True
+}
+
+// =============================================================================
+// BYTE HELPERS
+// =============================================================================
+Function.MIDI_ReadBE16 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        hi = GetByte(buf, off)
+        lo = GetByte(buf, Add(off, 1))
+        ReturnValue(Add(ShiftLeft(hi, 8), lo))
+    }
+}
+
+Function.MIDI_ReadBE24 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        s = ShiftLeft(b0, 16)
+        s = Add(s, ShiftLeft(b1, 8))
+        ReturnValue(Add(s, b2))
+    }
+}
+
+Function.MIDI_ReadBE32 {
+    Input: buf: Address
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        b0 = GetByte(buf, off)
+        b1 = GetByte(buf, Add(off, 1))
+        b2 = GetByte(buf, Add(off, 2))
+        b3 = GetByte(buf, Add(off, 3))
+        s = ShiftLeft(b0, 24)
+        s = Add(s, ShiftLeft(b1, 16))
+        s = Add(s, ShiftLeft(b2, 8))
+        ReturnValue(Add(s, b3))
+    }
+}
+
+Function.MIDI_DataBytes {
+    Input: status: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(status, 128) ThenBlock: { ReturnValue(0) }
+        hi = BitwiseAnd(status, 240)
+        IfCondition EqualTo(hi, 192) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(hi, 208) ThenBlock: { ReturnValue(1) }
+        ge = GreaterEqual(hi, 128)
+        lt = LessThan(hi, 240)
+        IfCondition And(ge, lt) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(status, 241) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(status, 242) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(status, 243) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.MIDI_IsRealtime {
+    Input: status: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(status, 248) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.MIDI_IsChannelMode {
+    Input: cc: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(cc, 120) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(cc, 127) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_CmdName {
+    Input: status: Integer
+    Output: Address
+    Body: {
+        IfCondition GreaterEqual(status, 248) ThenBlock: {
+            IfCondition EqualTo(status, 248) ThenBlock: { ReturnValue("Clock") }
+            IfCondition EqualTo(status, 249) ThenBlock: { ReturnValue("Tick") }
+            IfCondition EqualTo(status, 250) ThenBlock: { ReturnValue("Start") }
+            IfCondition EqualTo(status, 251) ThenBlock: { ReturnValue("Continue") }
+            IfCondition EqualTo(status, 252) ThenBlock: { ReturnValue("Stop") }
+            IfCondition EqualTo(status, 254) ThenBlock: { ReturnValue("Active Sensing") }
+            IfCondition EqualTo(status, 255) ThenBlock: { ReturnValue("Reset") }
+            ReturnValue("Realtime")
+        }
+        IfCondition EqualTo(status, 240) ThenBlock: { ReturnValue("SysEx") }
+        IfCondition EqualTo(status, 241) ThenBlock: { ReturnValue("MTC Quarter Frame") }
+        IfCondition EqualTo(status, 242) ThenBlock: { ReturnValue("Song Position") }
+        IfCondition EqualTo(status, 243) ThenBlock: { ReturnValue("Song Select") }
+        IfCondition EqualTo(status, 246) ThenBlock: { ReturnValue("Tune Request") }
+        IfCondition EqualTo(status, 247) ThenBlock: { ReturnValue("End of SysEx") }
+        hi = BitwiseAnd(status, 240)
+        IfCondition EqualTo(hi, 128) ThenBlock: { ReturnValue("Note Off") }
+        IfCondition EqualTo(hi, 144) ThenBlock: { ReturnValue("Note On") }
+        IfCondition EqualTo(hi, 160) ThenBlock: { ReturnValue("Poly Pressure") }
+        IfCondition EqualTo(hi, 176) ThenBlock: { ReturnValue("Control Change") }
+        IfCondition EqualTo(hi, 192) ThenBlock: { ReturnValue("Program Change") }
+        IfCondition EqualTo(hi, 208) ThenBlock: { ReturnValue("Channel Pressure") }
+        IfCondition EqualTo(hi, 224) ThenBlock: { ReturnValue("Pitch Bend") }
+        ReturnValue("Unknown")
+    }
+}
+
+Function.MIDI_MetaName {
+    Input: typ: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(typ, 0) ThenBlock: { ReturnValue("Sequence Number") }
+        IfCondition EqualTo(typ, 1) ThenBlock: { ReturnValue("Text") }
+        IfCondition EqualTo(typ, 2) ThenBlock: { ReturnValue("Copyright") }
+        IfCondition EqualTo(typ, 3) ThenBlock: { ReturnValue("Track Name") }
+        IfCondition EqualTo(typ, 4) ThenBlock: { ReturnValue("Instrument Name") }
+        IfCondition EqualTo(typ, 5) ThenBlock: { ReturnValue("Lyric") }
+        IfCondition EqualTo(typ, 6) ThenBlock: { ReturnValue("Marker") }
+        IfCondition EqualTo(typ, 7) ThenBlock: { ReturnValue("Cue Point") }
+        IfCondition EqualTo(typ, 8) ThenBlock: { ReturnValue("Program Name") }
+        IfCondition EqualTo(typ, 9) ThenBlock: { ReturnValue("Device Name") }
+        IfCondition EqualTo(typ, 32) ThenBlock: { ReturnValue("Channel Prefix") }
+        IfCondition EqualTo(typ, 33) ThenBlock: { ReturnValue("MIDI Port") }
+        IfCondition EqualTo(typ, 47) ThenBlock: { ReturnValue("End of Track") }
+        IfCondition EqualTo(typ, 81) ThenBlock: { ReturnValue("Tempo") }
+        IfCondition EqualTo(typ, 84) ThenBlock: { ReturnValue("SMPTE Offset") }
+        IfCondition EqualTo(typ, 88) ThenBlock: { ReturnValue("Time Signature") }
+        IfCondition EqualTo(typ, 89) ThenBlock: { ReturnValue("Key Signature") }
+        IfCondition EqualTo(typ, 127) ThenBlock: { ReturnValue("Sequencer Specific") }
+        ReturnValue("Meta")
+    }
+}
+
+Function.MIDI_KindName {
+    Input: kind: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(kind, 1) ThenBlock: { ReturnValue("channel") }
+        IfCondition EqualTo(kind, 2) ThenBlock: { ReturnValue("meta") }
+        IfCondition EqualTo(kind, 3) ThenBlock: { ReturnValue("sysex") }
+        IfCondition EqualTo(kind, 4) ThenBlock: { ReturnValue("syscom") }
+        IfCondition EqualTo(kind, 5) ThenBlock: { ReturnValue("realtime") }
+        ReturnValue("unknown")
+    }
+}
+
+// =============================================================================
+// VLQ
+// =============================================================================
+Function.MIDI_ReadVLQ {
+    Output: Integer
+    Body: {
+        value = 0
+        n = 0
+        WhileLoop LessThan(n, 4) {
+            IfCondition GreaterEqual(MIDIParse.pos, MIDIParse.len) ThenBlock: {
+                MIDIParse.err = MIDIErr.TRUNC
+                ReturnValue(0)
+            }
+            b = GetByte(MIDIParse.buf, MIDIParse.pos)
+            MIDIParse.pos = Add(MIDIParse.pos, 1)
+            shifted = ShiftLeft(value, 7)
+            masked = BitwiseAnd(b, 127)
+            value = BitwiseOr(shifted, masked)
+            n = Add(n, 1)
+            cont = BitwiseAnd(b, 128)
+            IfCondition EqualTo(cont, 0) ThenBlock: {
+                ReturnValue(value)
+            }
+        }
+        MIDIParse.err = MIDIErr.BAD_VLQ
+        ReturnValue(value)
+    }
+}
+
+Function.MIDI_WriteVLQ {
+    Input: dst: Address
+    Input: off: Integer
+    Input: value: Integer
+    Output: Integer
+    Body: {
+        v = value
+        IfCondition LessThan(v, 0) ThenBlock: { v = 0 }
+        IfCondition LessThan(v, 128) ThenBlock: {
+            SetByte(dst, off, v)
+            ReturnValue(1)
+        }
+        IfCondition LessThan(v, 16384) ThenBlock: {
+            b0 = Add(128, BitwiseAnd(Divide(v, 128), 127))
+            b1 = BitwiseAnd(v, 127)
+            SetByte(dst, off, b0)
+            SetByte(dst, Add(off, 1), b1)
+            ReturnValue(2)
+        }
+        IfCondition LessThan(v, 2097152) ThenBlock: {
+            b0 = Add(128, BitwiseAnd(Divide(v, 16384), 127))
+            b1 = Add(128, BitwiseAnd(Divide(v, 128), 127))
+            b2 = BitwiseAnd(v, 127)
+            SetByte(dst, off, b0)
+            SetByte(dst, Add(off, 1), b1)
+            SetByte(dst, Add(off, 2), b2)
+            ReturnValue(3)
+        }
+        b0 = Add(128, BitwiseAnd(Divide(v, 268435456), 127))
+        b1 = Add(128, BitwiseAnd(Divide(v, 2097152), 127))
+        b2 = Add(128, BitwiseAnd(Divide(v, 16384), 127))
+        b3 = Add(128, BitwiseAnd(Divide(v, 128), 127))
+        b4 = BitwiseAnd(v, 127)
+        SetByte(dst, off, b0)
+        SetByte(dst, Add(off, 1), b1)
+        SetByte(dst, Add(off, 2), b2)
+        SetByte(dst, Add(off, 3), b3)
+        SetByte(dst, Add(off, 4), b4)
+        ReturnValue(5)
+    }
+}
+
+// =============================================================================
+// SONG HANDLE
+// =============================================================================
+Function.MIDI_SongNew {
+    Output: Address
+    Body: {
+        song = Allocate(MIDIOff.SIZE)
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        MemorySet(song, 0, MIDIOff.SIZE)
+        StoreValue(Add(song, MIDIOff.MAGIC), MIDIConst.MAGIC)
+        StoreValue(Add(song, MIDIOff.TEMPO), MIDIConst.DEFAULT_TEMPO)
+        cap = MIDIConst.EV_INIT_CAP
+        evsz = Multiply(cap, MIDIEv.SIZE)
+        evs = Allocate(evsz)
+        IfCondition EqualTo(evs, 0) ThenBlock: {
+            Deallocate(song, MIDIOff.SIZE)
+            ReturnValue(0)
+        }
+        MemorySet(evs, 0, evsz)
+        StoreValue(Add(song, MIDIOff.EVENTS), evs)
+        StoreValue(Add(song, MIDIOff.EVCAP), cap)
+        acap = MIDIConst.ARENA_INIT
+        arena = Allocate(acap)
+        IfCondition EqualTo(arena, 0) ThenBlock: {
+            Deallocate(evs, evsz)
+            Deallocate(song, MIDIOff.SIZE)
+            ReturnValue(0)
+        }
+        MemorySet(arena, 0, acap)
+        StoreValue(Add(song, MIDIOff.ARENA), arena)
+        StoreValue(Add(song, MIDIOff.ACAP), acap)
+        ReturnValue(song)
+    }
+}
+
+Function.MIDI_SongOk {
+    Input: song: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        mag = Dereference(Add(song, MIDIOff.MAGIC))
+        IfCondition NotEqual(mag, MIDIConst.MAGIC) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_SongFormat {
+    Input: song: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Dereference(Add(song, MIDIOff.FORMAT)))
+    }
+}
+
+Function.MIDI_SongTracks {
+    Input: song: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(song, MIDIOff.NTRKS)))
+    }
+}
+
+Function.MIDI_SongDivision {
+    Input: song: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(song, MIDIOff.DIVISION)))
+    }
+}
+
+Function.MIDI_SongIsSMPTE {
+    Input: song: Address
+    Output: Integer
+    Body: {
+        div = MIDI_SongDivision(song)
+        bit = BitwiseAnd(div, 32768)
+        IfCondition NotEqual(bit, 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.MIDI_SongTempo {
+    Input: song: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(MIDIConst.DEFAULT_TEMPO) }
+        ReturnValue(Dereference(Add(song, MIDIOff.TEMPO)))
+    }
+}
+
+Function.MIDI_SongCount {
+    Input: song: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(song, MIDIOff.EVCOUNT)))
+    }
+}
+
+Function.MIDI_SongErr {
+    Input: song: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(MIDIErr.OOM) }
+        ReturnValue(Dereference(Add(song, MIDIOff.ERR)))
+    }
+}
+
+Function.MIDI_SongEvent {
+    Input: song: Address
+    Input: index: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Dereference(Add(song, MIDIOff.EVCOUNT))
+        IfCondition LessThan(index, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(index, cnt) ThenBlock: { ReturnValue(0) }
+        evs = Dereference(Add(song, MIDIOff.EVENTS))
+        ReturnValue(Add(evs, Multiply(index, MIDIEv.SIZE)))
+    }
+}
+
+Function.MIDI_EvTick {
+    Input: ev: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(ev))
+    }
+}
+
+Function.MIDI_EvKind {
+    Input: ev: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(GetByte(ev, MIDIEv.KIND))
+    }
+}
+
+Function.MIDI_EvStatus {
+    Input: ev: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(GetByte(ev, MIDIEv.STATUS))
+    }
+}
+
+Function.MIDI_EvD1 {
+    Input: ev: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(GetByte(ev, MIDIEv.D1))
+    }
+}
+
+Function.MIDI_EvD2 {
+    Input: ev: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(GetByte(ev, MIDIEv.D2))
+    }
+}
+
+Function.MIDI_EvCh {
+    Input: ev: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(GetByte(ev, MIDIEv.CH))
+    }
+}
+
+Function.MIDI_EvTrack {
+    Input: ev: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(GetByte(ev, MIDIEv.TRACK))
+    }
+}
+
+Function.MIDI_EvLen {
+    Input: ev: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(ev, MIDIEv.LEN)))
+    }
+}
+
+Function.MIDI_EvPtr {
+    Input: ev: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(ev, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(ev, MIDIEv.PTR)))
+    }
+}
+
+Function.MIDI_SongFree {
+    Input: song: Address
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        mag = Dereference(Add(song, MIDIOff.MAGIC))
+        IfCondition NotEqual(mag, MIDIConst.MAGIC) ThenBlock: { ReturnValue(0) }
+        evs = Dereference(Add(song, MIDIOff.EVENTS))
+        cap = Dereference(Add(song, MIDIOff.EVCAP))
+        IfCondition NotEqual(evs, 0) ThenBlock: {
+            Deallocate(evs, Multiply(cap, MIDIEv.SIZE))
+        }
+        arena = Dereference(Add(song, MIDIOff.ARENA))
+        acap = Dereference(Add(song, MIDIOff.ACAP))
+        IfCondition NotEqual(arena, 0) ThenBlock: {
+            Deallocate(arena, acap)
+        }
+        flags = Dereference(Add(song, MIDIOff.FLAGS))
+        own = BitwiseAnd(flags, MIDIFlag.OWN_SRC)
+        src = Dereference(Add(song, MIDIOff.SRC))
+        slen = Dereference(Add(song, MIDIOff.SRCLEN))
+        IfCondition And(NotEqual(own, 0), NotEqual(src, 0)) ThenBlock: {
+            Deallocate(src, slen)
+        }
+        StoreValue(Add(song, MIDIOff.MAGIC), 0)
+        Deallocate(song, MIDIOff.SIZE)
+    }
+}
+
+// =============================================================================
+// ARENA + EVENT GROW
+// =============================================================================
+Function.MIDI_ArenaAlloc {
+    Input: n: Integer
+    Output: Address
+    Body: {
+        song = MIDIParse.song
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        used = Dereference(Add(song, MIDIOff.AUSED))
+        cap = Dereference(Add(song, MIDIOff.ACAP))
+        arena = Dereference(Add(song, MIDIOff.ARENA))
+        need = Add(used, n)
+        IfCondition GreaterThan(need, cap) ThenBlock: {
+            ncap = cap
+            IfCondition LessThan(ncap, 1) ThenBlock: { ncap = MIDIConst.ARENA_INIT }
+            WhileLoop LessThan(ncap, need) {
+                ncap = Multiply(ncap, 2)
+            }
+            narena = Allocate(ncap)
+            IfCondition EqualTo(narena, 0) ThenBlock: {
+                MIDIParse.err = MIDIErr.OOM
+                ReturnValue(0)
+            }
+            IfCondition And(NotEqual(arena, 0), GreaterThan(used, 0)) ThenBlock: {
+                MemoryCopy(narena, arena, used)
+            }
+            IfCondition NotEqual(arena, 0) ThenBlock: {
+                Deallocate(arena, cap)
+            }
+            arena = narena
+            cap = ncap
+            StoreValue(Add(song, MIDIOff.ARENA), arena)
+            StoreValue(Add(song, MIDIOff.ACAP), cap)
+        }
+        p = Add(arena, used)
+        StoreValue(Add(song, MIDIOff.AUSED), Add(used, n))
+        ReturnValue(p)
+    }
+}
+
+Function.MIDI_ArenaCopy {
+    Input: src: Address
+    Input: n: Integer
+    Output: Address
+    Body: {
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(src, 0) ThenBlock: { ReturnValue(0) }
+        p = MIDI_ArenaAlloc(Add(n, 1))
+        IfCondition EqualTo(p, 0) ThenBlock: { ReturnValue(0) }
+        MemoryCopy(p, src, n)
+        SetByte(p, n, 0)
+        ReturnValue(p)
+    }
+}
+
+Function.MIDI_EvGrow {
+    Output: Integer
+    Body: {
+        song = MIDIParse.song
+        cap = Dereference(Add(song, MIDIOff.EVCAP))
+        cnt = Dereference(Add(song, MIDIOff.EVCOUNT))
+        IfCondition LessThan(cnt, cap) ThenBlock: { ReturnValue(1) }
+        ncap = Multiply(cap, 2)
+        IfCondition LessThan(ncap, MIDIConst.EV_INIT_CAP) ThenBlock: {
+            ncap = MIDIConst.EV_INIT_CAP
+        }
+        osz = Multiply(cap, MIDIEv.SIZE)
+        nsz = Multiply(ncap, MIDIEv.SIZE)
+        nev = Allocate(nsz)
+        IfCondition EqualTo(nev, 0) ThenBlock: {
+            MIDIParse.err = MIDIErr.OOM
+            ReturnValue(0)
+        }
+        MemorySet(nev, 0, nsz)
+        evs = Dereference(Add(song, MIDIOff.EVENTS))
+        IfCondition And(NotEqual(evs, 0), GreaterThan(osz, 0)) ThenBlock: {
+            MemoryCopy(nev, evs, osz)
+        }
+        IfCondition NotEqual(evs, 0) ThenBlock: {
+            Deallocate(evs, osz)
+        }
+        StoreValue(Add(song, MIDIOff.EVENTS), nev)
+        StoreValue(Add(song, MIDIOff.EVCAP), ncap)
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_EvPush {
+    Input: kind: Integer
+    Input: status: Integer
+    Input: d1: Integer
+    Input: d2: Integer
+    Input: plen: Integer
+    Input: pptr: Address
+    Output: Address
+    Body: {
+        ok = MIDI_EvGrow()
+        IfCondition EqualTo(ok, 0) ThenBlock: { ReturnValue(0) }
+        song = MIDIParse.song
+        cnt = Dereference(Add(song, MIDIOff.EVCOUNT))
+        evs = Dereference(Add(song, MIDIOff.EVENTS))
+        ev = Add(evs, Multiply(cnt, MIDIEv.SIZE))
+        MemorySet(ev, 0, MIDIEv.SIZE)
+        StoreValue(ev, MIDIParse.tick)
+        SetByte(ev, MIDIEv.TRACK, MIDIParse.track)
+        SetByte(ev, MIDIEv.KIND, kind)
+        SetByte(ev, MIDIEv.STATUS, status)
+        SetByte(ev, MIDIEv.D1, d1)
+        SetByte(ev, MIDIEv.D2, d2)
+        ch = BitwiseAnd(status, 15)
+        IfCondition EqualTo(kind, MIDIKind.CHANNEL) ThenBlock: {
+            SetByte(ev, MIDIEv.CH, ch)
+        } ElseBlock: {
+            SetByte(ev, MIDIEv.CH, MIDIParse.ch_prefix)
+        }
+        StoreValue(Add(ev, MIDIEv.LEN), plen)
+        StoreValue(Add(ev, MIDIEv.PTR), pptr)
+        StoreValue(Add(song, MIDIOff.EVCOUNT), Add(cnt, 1))
+        ReturnValue(ev)
+    }
+}
+
+// =============================================================================
+// TRACK EVENT PARSERS
+// =============================================================================
+Function.MIDI_ParseMeta {
+    Input: trk_end: Integer
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(MIDIParse.pos, trk_end) ThenBlock: {
+            MIDIParse.err = MIDIErr.TRUNC
+            ReturnValue(0)
+        }
+        typ = GetByte(MIDIParse.buf, MIDIParse.pos)
+        MIDIParse.pos = Add(MIDIParse.pos, 1)
+        ln = MIDI_ReadVLQ()
+        IfCondition NotEqual(MIDIParse.err, 0) ThenBlock: { ReturnValue(0) }
+        remain = Subtract(trk_end, MIDIParse.pos)
+        IfCondition GreaterThan(ln, remain) ThenBlock: {
+            MIDIParse.err = MIDIErr.TRUNC
+            ReturnValue(0)
+        }
+        src = Add(MIDIParse.buf, MIDIParse.pos)
+        ptr = MIDI_ArenaCopy(src, ln)
+        MIDIParse.pos = Add(MIDIParse.pos, ln)
+        ev = MIDI_EvPush(MIDIKind.META, typ, 0, 0, ln, ptr)
+        IfCondition EqualTo(typ, 32) ThenBlock: {
+            IfCondition GreaterThan(ln, 0) ThenBlock: {
+                MIDIParse.ch_prefix = GetByte(src, 0)
+            }
+        }
+        IfCondition EqualTo(typ, 33) ThenBlock: {
+            IfCondition GreaterThan(ln, 0) ThenBlock: {
+                MIDIParse.port_prefix = GetByte(src, 0)
+            }
+        }
+        IfCondition EqualTo(typ, 81) ThenBlock: {
+            IfCondition GreaterEqual(ln, 3) ThenBlock: {
+                us = MIDI_ReadBE24(src, 0)
+                song = MIDIParse.song
+                cur = Dereference(Add(song, MIDIOff.TEMPO))
+                IfCondition EqualTo(cur, MIDIConst.DEFAULT_TEMPO) ThenBlock: {
+                    StoreValue(Add(song, MIDIOff.TEMPO), us)
+                }
+                IfCondition NotEqual(ev, 0) ThenBlock: {
+                    StoreValue(Add(ev, MIDIEv.LEN), us)
+                }
+            }
+        }
+        IfCondition EqualTo(typ, 47) ThenBlock: {
+            ReturnValue(2)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_ParseSysex {
+    Input: trk_end: Integer
+    Output: Integer
+    Body: {
+        ln = MIDI_ReadVLQ()
+        IfCondition NotEqual(MIDIParse.err, 0) ThenBlock: { ReturnValue(0) }
+        remain = Subtract(trk_end, MIDIParse.pos)
+        IfCondition GreaterThan(ln, remain) ThenBlock: {
+            MIDIParse.err = MIDIErr.TRUNC
+            ReturnValue(0)
+        }
+        src = Add(MIDIParse.buf, MIDIParse.pos)
+        ptr = MIDI_ArenaCopy(src, ln)
+        MIDIParse.pos = Add(MIDIParse.pos, ln)
+        MIDI_EvPush(MIDIKind.SYSEX, MIDIParse.status, 0, 0, ln, ptr)
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_ParseChan {
+    Input: trk_end: Integer
+    Output: Integer
+    Body: {
+        st = MIDIParse.status
+        need = MIDI_DataBytes(st)
+        d1 = 0
+        d2 = 0
+        IfCondition GreaterEqual(need, 1) ThenBlock: {
+            IfCondition GreaterEqual(MIDIParse.pos, trk_end) ThenBlock: {
+                MIDIParse.err = MIDIErr.TRUNC
+                ReturnValue(0)
+            }
+            d1 = GetByte(MIDIParse.buf, MIDIParse.pos)
+            MIDIParse.pos = Add(MIDIParse.pos, 1)
+        }
+        IfCondition GreaterEqual(need, 2) ThenBlock: {
+            IfCondition GreaterEqual(MIDIParse.pos, trk_end) ThenBlock: {
+                MIDIParse.err = MIDIErr.TRUNC
+                ReturnValue(0)
+            }
+            d2 = GetByte(MIDIParse.buf, MIDIParse.pos)
+            MIDIParse.pos = Add(MIDIParse.pos, 1)
+        }
+        MIDI_EvPush(MIDIKind.CHANNEL, st, d1, d2, 0, 0)
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_ParseTrack {
+    Input: trk_end: Integer
+    Output: Integer
+    Body: {
+        MIDIParse.running = 0
+        MIDIParse.status = 0
+        MIDIParse.tick = 0
+        MIDIParse.ch_prefix = 0
+        MIDIParse.port_prefix = 0
+        WhileLoop LessThan(MIDIParse.pos, trk_end) {
+            IfCondition NotEqual(MIDIParse.err, 0) ThenBlock: { ReturnValue(0) }
+            delta = MIDI_ReadVLQ()
+            IfCondition NotEqual(MIDIParse.err, 0) ThenBlock: { ReturnValue(0) }
+            MIDIParse.tick = Add(MIDIParse.tick, delta)
+            IfCondition GreaterEqual(MIDIParse.pos, trk_end) ThenBlock: {
+                MIDIParse.err = MIDIErr.TRUNC
+                ReturnValue(0)
+            }
+            b = GetByte(MIDIParse.buf, MIDIParse.pos)
+            IfCondition GreaterEqual(b, 128) ThenBlock: {
+                MIDIParse.status = b
+                MIDIParse.pos = Add(MIDIParse.pos, 1)
+                IfCondition LessThan(b, 240) ThenBlock: {
+                    MIDIParse.running = b
+                } ElseBlock: {
+                    IfCondition LessThan(b, 248) ThenBlock: {
+                        MIDIParse.running = 0
+                    }
+                }
+            } ElseBlock: {
+                IfCondition EqualTo(MIDIParse.running, 0) ThenBlock: {
+                    MIDIParse.err = MIDIErr.BAD_TRACK
+                    ReturnValue(0)
+                }
+                MIDIParse.status = MIDIParse.running
+            }
+            st = MIDIParse.status
+            IfCondition EqualTo(st, 255) ThenBlock: {
+                r = MIDI_ParseMeta(trk_end)
+                IfCondition EqualTo(r, 2) ThenBlock: {
+                    ReturnValue(1)
+                }
+            } ElseBlock: {
+                IfCondition EqualTo(st, 240) ThenBlock: {
+                    MIDI_ParseSysex(trk_end)
+                } ElseBlock: {
+                    IfCondition EqualTo(st, 247) ThenBlock: {
+                        MIDI_ParseSysex(trk_end)
+                    } ElseBlock: {
+                        ge = GreaterEqual(st, 128)
+                        lt = LessThan(st, 240)
+                        IfCondition And(ge, lt) ThenBlock: {
+                            MIDI_ParseChan(trk_end)
+                        } ElseBlock: {
+                            IfCondition GreaterEqual(st, 248) ThenBlock: {
+                                MIDI_EvPush(MIDIKind.REALTIME, st, 0, 0, 0, 0)
+                            } ElseBlock: {
+                                MIDI_EvPush(MIDIKind.SYSCOM, st, 0, 0, 0, 0)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_MergeRange {
+    Input: src: Address
+    Input: dst: Address
+    Input: left: Integer
+    Input: mid: Integer
+    Input: right: Integer
+    Body: {
+        i = left
+        j = mid
+        k = left
+        esz = MIDIEv.SIZE
+        WhileLoop And(LessThan(i, mid), LessThan(j, right)) {
+            ia = Multiply(i, esz)
+            a = Add(src, ia)
+            ja = Multiply(j, esz)
+            b = Add(src, ja)
+            ta = Dereference(a)
+            tb = Dereference(b)
+            take_a = 0
+            IfCondition LessThan(ta, tb) ThenBlock: { take_a = 1 }
+            IfCondition EqualTo(ta, tb) ThenBlock: { take_a = 1 }
+            ka = Multiply(k, esz)
+            outp = Add(dst, ka)
+            IfCondition EqualTo(take_a, 1) ThenBlock: {
+                MemoryCopy(outp, a, esz)
+                i = Add(i, 1)
+            } ElseBlock: {
+                MemoryCopy(outp, b, esz)
+                j = Add(j, 1)
+            }
+            k = Add(k, 1)
+        }
+        WhileLoop LessThan(i, mid) {
+            ia = Multiply(i, esz)
+            a = Add(src, ia)
+            ka = Multiply(k, esz)
+            outp = Add(dst, ka)
+            MemoryCopy(outp, a, esz)
+            i = Add(i, 1)
+            k = Add(k, 1)
+        }
+        WhileLoop LessThan(j, right) {
+            ja = Multiply(j, esz)
+            b = Add(src, ja)
+            ka = Multiply(k, esz)
+            outp = Add(dst, ka)
+            MemoryCopy(outp, b, esz)
+            j = Add(j, 1)
+            k = Add(k, 1)
+        }
+    }
+}
+
+Function.MIDI_SongSort {
+    Input: song: Address
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Dereference(Add(song, MIDIOff.EVCOUNT))
+        IfCondition LessThan(cnt, 2) ThenBlock: { ReturnValue(0) }
+        evs = Dereference(Add(song, MIDIOff.EVENTS))
+        IfCondition EqualTo(evs, 0) ThenBlock: { ReturnValue(0) }
+        nsz = Multiply(cnt, MIDIEv.SIZE)
+        tmp = Allocate(nsz)
+        IfCondition EqualTo(tmp, 0) ThenBlock: { ReturnValue(0) }
+        src = evs
+        dst = tmp
+        from_evs = 1
+        width = 1
+        WhileLoop LessThan(width, cnt) {
+            nwidth = Add(width, width)
+            i = 0
+            WhileLoop LessThan(i, cnt) {
+                left = i
+                mid = Add(i, width)
+                IfCondition GreaterThan(mid, cnt) ThenBlock: { mid = cnt }
+                right = Add(i, nwidth)
+                IfCondition GreaterThan(right, cnt) ThenBlock: { right = cnt }
+                MIDI_MergeRange(src, dst, left, mid, right)
+                i = Add(i, nwidth)
+            }
+            t = src
+            src = dst
+            dst = t
+            from_evs = Subtract(1, from_evs)
+            width = nwidth
+        }
+        IfCondition EqualTo(from_evs, 0) ThenBlock: {
+            MemoryCopy(evs, tmp, nsz)
+        }
+        Deallocate(tmp, nsz)
+    }
+}
+
+// =============================================================================
+// SMF
+// =============================================================================
+Function.MIDI_SongLoadMem {
+    Input: buf: Address
+    Input: len: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessThan(len, 14) ThenBlock: { ReturnValue(0) }
+        c0 = GetByte(buf, 0)
+        c1 = GetByte(buf, 1)
+        c2 = GetByte(buf, 2)
+        c3 = GetByte(buf, 3)
+        IfCondition NotEqual(c0, 77) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c1, 84) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c2, 104) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(c3, 100) ThenBlock: { ReturnValue(0) }
+        hdr_len = MIDI_ReadBE32(buf, 4)
+        IfCondition LessThan(hdr_len, 6) ThenBlock: { ReturnValue(0) }
+        fmt = MIDI_ReadBE16(buf, 8)
+        ntrks = MIDI_ReadBE16(buf, 10)
+        div = MIDI_ReadBE16(buf, 12)
+        song = MIDI_SongNew()
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        StoreValue(Add(song, MIDIOff.FORMAT), fmt)
+        StoreValue(Add(song, MIDIOff.NTRKS), ntrks)
+        StoreValue(Add(song, MIDIOff.DIVISION), div)
+        StoreValue(Add(song, MIDIOff.SRC), buf)
+        StoreValue(Add(song, MIDIOff.SRCLEN), len)
+        MIDIParse.buf = buf
+        MIDIParse.len = len
+        MIDIParse.pos = Add(8, hdr_len)
+        MIDIParse.song = song
+        MIDIParse.err = 0
+        MIDIParse.track = 0
+        seen = 0
+        WhileLoop LessThan(MIDIParse.pos, len) {
+            IfCondition NotEqual(MIDIParse.err, 0) ThenBlock: {
+                StoreValue(Add(song, MIDIOff.ERR), MIDIParse.err)
+                ReturnValue(song)
+            }
+            remain = Subtract(len, MIDIParse.pos)
+            IfCondition LessThan(remain, 8) ThenBlock: {
+                MIDIParse.pos = len
+            } ElseBlock: {
+                k0 = GetByte(buf, MIDIParse.pos)
+                k1 = GetByte(buf, Add(MIDIParse.pos, 1))
+                k2 = GetByte(buf, Add(MIDIParse.pos, 2))
+                k3 = GetByte(buf, Add(MIDIParse.pos, 3))
+                clen = MIDI_ReadBE32(buf, Add(MIDIParse.pos, 4))
+                MIDIParse.pos = Add(MIDIParse.pos, 8)
+                endp = Add(MIDIParse.pos, clen)
+                IfCondition GreaterThan(endp, len) ThenBlock: {
+                    MIDIParse.err = MIDIErr.TRUNC
+                    StoreValue(Add(song, MIDIOff.ERR), MIDIErr.TRUNC)
+                    ReturnValue(song)
+                }
+                is_trk = 0
+                IfCondition EqualTo(k0, 77) ThenBlock: {
+                    IfCondition EqualTo(k1, 84) ThenBlock: {
+                        IfCondition EqualTo(k2, 114) ThenBlock: {
+                            IfCondition EqualTo(k3, 107) ThenBlock: {
+                                is_trk = 1
+                            }
+                        }
+                    }
+                }
+                IfCondition EqualTo(is_trk, 1) ThenBlock: {
+                    MIDIParse.track = seen
+                    MIDI_ParseTrack(endp)
+                    seen = Add(seen, 1)
+                }
+                MIDIParse.pos = endp
+            }
+        }
+        StoreValue(Add(song, MIDIOff.ERR), MIDIParse.err)
+        IfCondition GreaterThan(seen, 0) ThenBlock: {
+            StoreValue(Add(song, MIDIOff.NTRKS), seen)
+        }
+        MIDIParse.song = 0
+        MIDI_SongSort(song)
+        ReturnValue(song)
+    }
+}
+
+Function.MIDI_SongLoadPath {
+    Input: path: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(path, 0) ThenBlock: { ReturnValue(0) }
+        fd = SystemCall(MIDISys.SYS_OPEN, path, MIDISys.O_RDONLY, 0)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        sz = SystemCall(MIDISys.SYS_LSEEK, fd, 0, MIDISys.SEEK_END)
+        SystemCall(MIDISys.SYS_LSEEK, fd, 0, MIDISys.SEEK_SET)
+        IfCondition LessThan(sz, 14) ThenBlock: {
+            SystemCall(MIDISys.SYS_CLOSE, fd)
+            ReturnValue(0)
+        }
+        buf = Allocate(sz)
+        IfCondition EqualTo(buf, 0) ThenBlock: {
+            SystemCall(MIDISys.SYS_CLOSE, fd)
+            ReturnValue(0)
+        }
+        n = SystemCall(MIDISys.SYS_READ, fd, buf, sz, 0, 0, 0)
+        SystemCall(MIDISys.SYS_CLOSE, fd)
+        IfCondition LessThan(n, 14) ThenBlock: {
+            Deallocate(buf, sz)
+            ReturnValue(0)
+        }
+        song = MIDI_SongLoadMem(buf, n)
+        IfCondition EqualTo(song, 0) ThenBlock: {
+            Deallocate(buf, sz)
+            ReturnValue(0)
+        }
+        flags = Dereference(Add(song, MIDIOff.FLAGS))
+        StoreValue(Add(song, MIDIOff.FLAGS), BitwiseOr(flags, MIDIFlag.OWN_SRC))
+        StoreValue(Add(song, MIDIOff.SRC), buf)
+        StoreValue(Add(song, MIDIOff.SRCLEN), sz)
+        ReturnValue(song)
+    }
+}
+
+Function.MIDI_TickToUS {
+    Input: song: Address
+    Input: tick: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        div = Dereference(Add(song, MIDIOff.DIVISION))
+        smpte = BitwiseAnd(div, 32768)
+        IfCondition NotEqual(smpte, 0) ThenBlock: {
+            fpsb = BitwiseAnd(Divide(div, 256), 255)
+            fps = Subtract(256, fpsb)
+            tpf = BitwiseAnd(div, 255)
+            IfCondition EqualTo(fps, 0) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(tpf, 0) ThenBlock: { ReturnValue(0) }
+            tps = Multiply(fps, tpf)
+            ReturnValue(Divide(Multiply(tick, 1000000), tps))
+        }
+        IfCondition EqualTo(div, 0) ThenBlock: { ReturnValue(0) }
+        tempo = MIDIConst.DEFAULT_TEMPO
+        us = 0
+        last = 0
+        cnt = Dereference(Add(song, MIDIOff.EVCOUNT))
+        evs = Dereference(Add(song, MIDIOff.EVENTS))
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            ev = Add(evs, Multiply(i, MIDIEv.SIZE))
+            et = Dereference(ev)
+            IfCondition GreaterThan(et, tick) ThenBlock: {
+                i = cnt
+            } ElseBlock: {
+                kind = GetByte(ev, MIDIEv.KIND)
+                st = GetByte(ev, MIDIEv.STATUS)
+                IfCondition EqualTo(kind, MIDIKind.META) ThenBlock: {
+                    IfCondition EqualTo(st, 81) ThenBlock: {
+                        dt = Subtract(et, last)
+                        us = Add(us, Divide(Multiply(dt, tempo), div))
+                        last = et
+                        tempo = Dereference(Add(ev, MIDIEv.LEN))
+                    }
+                }
+                i = Add(i, 1)
+            }
+        }
+        dt2 = Subtract(tick, last)
+        us = Add(us, Divide(Multiply(dt2, tempo), div))
+        ReturnValue(us)
+    }
+}
+
+Function.MIDI_FindMeta {
+    Input: song: Address
+    Input: typ: Integer
+    Input: track: Integer
+    Output: Address
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        cnt = Dereference(Add(song, MIDIOff.EVCOUNT))
+        evs = Dereference(Add(song, MIDIOff.EVENTS))
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            ev = Add(evs, Multiply(i, MIDIEv.SIZE))
+            kind = GetByte(ev, MIDIEv.KIND)
+            st = GetByte(ev, MIDIEv.STATUS)
+            tr = GetByte(ev, MIDIEv.TRACK)
+            ok_tr = 0
+            IfCondition LessThan(track, 0) ThenBlock: { ok_tr = 1 }
+            IfCondition EqualTo(tr, track) ThenBlock: { ok_tr = 1 }
+            IfCondition EqualTo(kind, MIDIKind.META) ThenBlock: {
+                IfCondition EqualTo(st, typ) ThenBlock: {
+                    IfCondition EqualTo(ok_tr, 1) ThenBlock: {
+                        ReturnValue(ev)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// LIVE STREAM
+// =============================================================================
+Function.MIDI_StreamInit {
+    Body: {
+        MIDIStream.status = 0
+        MIDIStream.needed = 0
+        MIDIStream.have = 0
+        MIDIStream.d1 = 0
+        MIDIStream.d2 = 0
+        MIDIStream.in_sysex = 0
+        MIDIStream.sysex_len = 0
+        MIDIStream.kind = 0
+        MIDIStream.last_st = 0
+        MIDIStream.last_d1 = 0
+        MIDIStream.last_d2 = 0
+        MIDIStream.last_ch = 0
+        MIDIStream.last_len = 0
+        MIDIStream.last_ptr = 0
+        IfCondition EqualTo(MIDIStream.sysex, 0) ThenBlock: {
+            MIDIStream.sysex = Allocate(MIDIConst.SYSEX_CAP)
+            MIDIStream.sysex_cap = MIDIConst.SYSEX_CAP
+        }
+    }
+}
+
+Function.MIDI_StreamLastKind {
+    Output: Integer
+    Body: { ReturnValue(MIDIStream.kind) }
+}
+
+Function.MIDI_StreamLastStatus {
+    Output: Integer
+    Body: { ReturnValue(MIDIStream.last_st) }
+}
+
+Function.MIDI_StreamLastD1 {
+    Output: Integer
+    Body: { ReturnValue(MIDIStream.last_d1) }
+}
+
+Function.MIDI_StreamLastD2 {
+    Output: Integer
+    Body: { ReturnValue(MIDIStream.last_d2) }
+}
+
+Function.MIDI_StreamLastCh {
+    Output: Integer
+    Body: { ReturnValue(MIDIStream.last_ch) }
+}
+
+Function.MIDI_StreamLastPtr {
+    Output: Address
+    Body: { ReturnValue(MIDIStream.last_ptr) }
+}
+
+Function.MIDI_StreamLastLen {
+    Output: Integer
+    Body: { ReturnValue(MIDIStream.last_len) }
+}
+
+Function.MIDI_StreamEmit {
+    Input: kind: Integer
+    Input: st: Integer
+    Input: d1: Integer
+    Input: d2: Integer
+    Body: {
+        MIDIStream.kind = kind
+        MIDIStream.last_st = st
+        MIDIStream.last_d1 = d1
+        MIDIStream.last_d2 = d2
+        MIDIStream.last_ch = BitwiseAnd(st, 15)
+        MIDIStream.last_len = 0
+        MIDIStream.last_ptr = 0
+        IfCondition EqualTo(kind, MIDIKind.SYSEX) ThenBlock: {
+            MIDIStream.last_len = MIDIStream.sysex_len
+            MIDIStream.last_ptr = MIDIStream.sysex
+        }
+    }
+}
+
+Function.MIDI_StreamFeed {
+    Input: byte: Integer
+    Output: Integer
+    Body: {
+        b = BitwiseAnd(byte, 255)
+        IfCondition GreaterEqual(b, 248) ThenBlock: {
+            MIDI_StreamEmit(MIDIKind.REALTIME, b, 0, 0)
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(MIDIStream.in_sysex, 1) ThenBlock: {
+            IfCondition EqualTo(b, 247) ThenBlock: {
+                MIDIStream.in_sysex = 0
+                MIDI_StreamEmit(MIDIKind.SYSEX, 240, 0, 0)
+                ReturnValue(1)
+            }
+            IfCondition GreaterEqual(b, 128) ThenBlock: {
+                MIDIStream.in_sysex = 0
+            } ElseBlock: {
+                IfCondition LessThan(MIDIStream.sysex_len, MIDIStream.sysex_cap) ThenBlock: {
+                    SetByte(MIDIStream.sysex, MIDIStream.sysex_len, b)
+                    MIDIStream.sysex_len = Add(MIDIStream.sysex_len, 1)
+                }
+                ReturnValue(0)
+            }
+        }
+        IfCondition GreaterEqual(b, 128) ThenBlock: {
+            MIDIStream.status = b
+            MIDIStream.have = 0
+            MIDIStream.d1 = 0
+            MIDIStream.d2 = 0
+            IfCondition EqualTo(b, 240) ThenBlock: {
+                MIDIStream.in_sysex = 1
+                MIDIStream.sysex_len = 0
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(b, 247) ThenBlock: {
+                ReturnValue(0)
+            }
+            need = MIDI_DataBytes(b)
+            MIDIStream.needed = need
+            IfCondition EqualTo(need, 0) ThenBlock: {
+                ge = GreaterEqual(b, 128)
+                lt = LessThan(b, 240)
+                IfCondition And(ge, lt) ThenBlock: {
+                    MIDI_StreamEmit(MIDIKind.CHANNEL, b, 0, 0)
+                } ElseBlock: {
+                    MIDI_StreamEmit(MIDIKind.SYSCOM, b, 0, 0)
+                }
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(MIDIStream.status, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(MIDIStream.have, 0) ThenBlock: {
+            MIDIStream.d1 = b
+            MIDIStream.have = 1
+            IfCondition EqualTo(MIDIStream.needed, 1) ThenBlock: {
+                ge = GreaterEqual(MIDIStream.status, 128)
+                lt = LessThan(MIDIStream.status, 240)
+                IfCondition And(ge, lt) ThenBlock: {
+                    MIDI_StreamEmit(MIDIKind.CHANNEL, MIDIStream.status, MIDIStream.d1, 0)
+                } ElseBlock: {
+                    MIDI_StreamEmit(MIDIKind.SYSCOM, MIDIStream.status, MIDIStream.d1, 0)
+                }
+                MIDIStream.have = 0
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        MIDIStream.d2 = b
+        MIDI_StreamEmit(MIDIKind.CHANNEL, MIDIStream.status, MIDIStream.d1, MIDIStream.d2)
+        MIDIStream.have = 0
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
+// SONG BUILDERS
+// =============================================================================
+Function.MIDI_SongSetFormat {
+    Input: song: Address
+    Input: fmt: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        StoreValue(Add(song, MIDIOff.FORMAT), fmt)
+    }
+}
+
+Function.MIDI_SongSetDivision {
+    Input: song: Address
+    Input: div: Integer
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        StoreValue(Add(song, MIDIOff.DIVISION), div)
+    }
+}
+
+Function.MIDI_SongBind {
+    Input: song: Address
+    Input: tick: Integer
+    Input: track: Integer
+    Body: {
+        MIDIParse.song = song
+        MIDIParse.tick = tick
+        MIDIParse.track = track
+        MIDIParse.err = 0
+        MIDIParse.ch_prefix = 0
+        ntr = Dereference(Add(song, MIDIOff.NTRKS))
+        IfCondition GreaterEqual(track, ntr) ThenBlock: {
+            StoreValue(Add(song, MIDIOff.NTRKS), Add(track, 1))
+        }
+    }
+}
+
+Function.MIDI_SongAddChan {
+    Input: song: Address
+    Input: tick: Integer
+    Input: track: Integer
+    Input: status: Integer
+    Input: d1: Integer
+    Input: d2: Integer
+    Output: Address
+    Body: {
+        MIDI_SongBind(song, tick, track)
+        ev = MIDI_EvPush(MIDIKind.CHANNEL, status, d1, d2, 0, 0)
+        ReturnValue(ev)
+    }
+}
+
+Function.MIDI_SongAddMeta {
+    Input: song: Address
+    Input: tick: Integer
+    Input: track: Integer
+    Input: typ: Integer
+    Input: data: Address
+    Input: n: Integer
+    Output: Address
+    Body: {
+        MIDI_SongBind(song, tick, track)
+        MIDIParse.song = song
+        ptr = 0
+        IfCondition GreaterThan(n, 0) ThenBlock: {
+            ptr = MIDI_ArenaCopy(data, n)
+        }
+        ev = MIDI_EvPush(MIDIKind.META, typ, 0, 0, n, ptr)
+        IfCondition EqualTo(typ, 81) ThenBlock: {
+            IfCondition GreaterEqual(n, 3) ThenBlock: {
+                us = MIDI_ReadBE24(data, 0)
+                IfCondition NotEqual(ev, 0) ThenBlock: {
+                    StoreValue(Add(ev, MIDIEv.LEN), us)
+                }
+                cur = Dereference(Add(song, MIDIOff.TEMPO))
+                IfCondition EqualTo(cur, MIDIConst.DEFAULT_TEMPO) ThenBlock: {
+                    StoreValue(Add(song, MIDIOff.TEMPO), us)
+                }
+            }
+        }
+        ReturnValue(ev)
+    }
+}
+
+Function.MIDI_SongAddSysex {
+    Input: song: Address
+    Input: tick: Integer
+    Input: track: Integer
+    Input: data: Address
+    Input: n: Integer
+    Output: Address
+    Body: {
+        MIDI_SongBind(song, tick, track)
+        ptr = 0
+        IfCondition GreaterThan(n, 0) ThenBlock: {
+            ptr = MIDI_ArenaCopy(data, n)
+        }
+        ev = MIDI_EvPush(MIDIKind.SYSEX, 240, 0, 0, n, ptr)
+        ReturnValue(ev)
+    }
+}
+
+// =============================================================================
+// SMF WRITER
+// =============================================================================
+FixedPool.MIDIWrite {
+    "buf":  Initialize=0, CanChange=True
+    "pos":  Initialize=0, CanChange=True
+    "cap":  Initialize=0, CanChange=True
+    "err":  Initialize=0, CanChange=True
+    "run":  Initialize=0, CanChange=True
+    "mark": Initialize=0, CanChange=True
+}
+
+Function.MIDI_W_Need {
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        need = Add(MIDIWrite.pos, n)
+        IfCondition LessThan(need, MIDIWrite.cap) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(need, MIDIWrite.cap) ThenBlock: { ReturnValue(1) }
+        ncap = MIDIWrite.cap
+        IfCondition LessThan(ncap, 256) ThenBlock: { ncap = 256 }
+        WhileLoop LessThan(ncap, need) {
+            ncap = Multiply(ncap, 2)
+        }
+        nb = Allocate(ncap)
+        IfCondition EqualTo(nb, 0) ThenBlock: {
+            MIDIWrite.err = MIDIErr.OOM
+            ReturnValue(0)
+        }
+        IfCondition And(NotEqual(MIDIWrite.buf, 0), GreaterThan(MIDIWrite.pos, 0)) ThenBlock: {
+            MemoryCopy(nb, MIDIWrite.buf, MIDIWrite.pos)
+        }
+        IfCondition NotEqual(MIDIWrite.buf, 0) ThenBlock: {
+            Deallocate(MIDIWrite.buf, MIDIWrite.cap)
+        }
+        MIDIWrite.buf = nb
+        MIDIWrite.cap = ncap
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_W_U8 {
+    Input: v: Integer
+    Body: {
+        ok = MIDI_W_Need(1)
+        IfCondition EqualTo(ok, 0) ThenBlock: { ReturnValue(0) }
+        SetByte(MIDIWrite.buf, MIDIWrite.pos, BitwiseAnd(v, 255))
+        MIDIWrite.pos = Add(MIDIWrite.pos, 1)
+    }
+}
+
+Function.MIDI_W_BE16 {
+    Input: v: Integer
+    Body: {
+        MIDI_W_U8(Divide(v, 256))
+        MIDI_W_U8(Modulo(v, 256))
+    }
+}
+
+Function.MIDI_W_BE24 {
+    Input: v: Integer
+    Body: {
+        MIDI_W_U8(Divide(v, 65536))
+        MIDI_W_U8(Modulo(Divide(v, 256), 256))
+        MIDI_W_U8(Modulo(v, 256))
+    }
+}
+
+Function.MIDI_W_BE32 {
+    Input: v: Integer
+    Body: {
+        MIDI_W_BE16(Divide(v, 65536))
+        MIDI_W_BE16(Modulo(v, 65536))
+    }
+}
+
+Function.MIDI_W_VLQ {
+    Input: value: Integer
+    Body: {
+        ok = MIDI_W_Need(5)
+        IfCondition EqualTo(ok, 0) ThenBlock: { ReturnValue(0) }
+        n = MIDI_WriteVLQ(MIDIWrite.buf, MIDIWrite.pos, value)
+        MIDIWrite.pos = Add(MIDIWrite.pos, n)
+    }
+}
+
+Function.MIDI_W_Bytes {
+    Input: src: Address
+    Input: n: Integer
+    Body: {
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        ok = MIDI_W_Need(n)
+        IfCondition EqualTo(ok, 0) ThenBlock: { ReturnValue(0) }
+        MemoryCopy(Add(MIDIWrite.buf, MIDIWrite.pos), src, n)
+        MIDIWrite.pos = Add(MIDIWrite.pos, n)
+    }
+}
+
+Function.MIDI_W_Begin {
+    Body: {
+        IfCondition NotEqual(MIDIWrite.buf, 0) ThenBlock: {
+            Deallocate(MIDIWrite.buf, MIDIWrite.cap)
+        }
+        MIDIWrite.buf = Allocate(1024)
+        MIDIWrite.cap = 1024
+        MIDIWrite.pos = 0
+        MIDIWrite.err = 0
+        MIDIWrite.run = 0
+        MemorySet(MIDIWrite.buf, 0, 1024)
+    }
+}
+
+Function.MIDI_W_WriteOne {
+    Input: ev: Address
+    Input: last_tick: Integer
+    Output: Integer
+    Body: {
+        tk = MIDI_EvTick(ev)
+        dt = Subtract(tk, last_tick)
+        IfCondition LessThan(dt, 0) ThenBlock: { dt = 0 }
+        MIDI_W_VLQ(dt)
+        kind = MIDI_EvKind(ev)
+        st = MIDI_EvStatus(ev)
+        d1 = MIDI_EvD1(ev)
+        d2 = MIDI_EvD2(ev)
+        ln = MIDI_EvLen(ev)
+        ptr = MIDI_EvPtr(ev)
+        IfCondition EqualTo(kind, MIDIKind.CHANNEL) ThenBlock: {
+            IfCondition NotEqual(st, MIDIWrite.run) ThenBlock: {
+                MIDI_W_U8(st)
+                MIDIWrite.run = st
+            }
+            MIDI_W_U8(d1)
+            need = MIDI_DataBytes(st)
+            IfCondition GreaterEqual(need, 2) ThenBlock: {
+                MIDI_W_U8(d2)
+            }
+        } ElseBlock: {
+            MIDIWrite.run = 0
+            IfCondition EqualTo(kind, MIDIKind.META) ThenBlock: {
+                MIDI_W_U8(255)
+                MIDI_W_U8(st)
+                IfCondition EqualTo(st, 81) ThenBlock: {
+                    MIDI_W_U8(3)
+                    MIDI_W_BE24(ln)
+                } ElseBlock: {
+                    MIDI_W_VLQ(ln)
+                    IfCondition And(GreaterThan(ln, 0), NotEqual(ptr, 0)) ThenBlock: {
+                        MIDI_W_Bytes(ptr, ln)
+                    }
+                }
+            } ElseBlock: {
+                IfCondition EqualTo(kind, MIDIKind.SYSEX) ThenBlock: {
+                    MIDI_W_U8(240)
+                    MIDI_W_VLQ(ln)
+                    IfCondition And(GreaterThan(ln, 0), NotEqual(ptr, 0)) ThenBlock: {
+                        MIDI_W_Bytes(ptr, ln)
+                    }
+                } ElseBlock: {
+                    MIDI_W_U8(st)
+                    need2 = MIDI_DataBytes(st)
+                    IfCondition GreaterEqual(need2, 1) ThenBlock: { MIDI_W_U8(d1) }
+                    IfCondition GreaterEqual(need2, 2) ThenBlock: { MIDI_W_U8(d2) }
+                }
+            }
+        }
+        ReturnValue(tk)
+    }
+}
+
+Function.MIDI_W_HasEOT {
+    Input: song: Address
+    Input: track: Integer
+    Input: all: Integer
+    Output: Integer
+    Body: {
+        cnt = MIDI_SongCount(song)
+        i = 0
+        WhileLoop LessThan(i, cnt) {
+            ev = MIDI_SongEvent(song, i)
+            kind = MIDI_EvKind(ev)
+            st = MIDI_EvStatus(ev)
+            tr = MIDI_EvTrack(ev)
+            ok = 0
+            IfCondition NotEqual(all, 0) ThenBlock: { ok = 1 }
+            IfCondition EqualTo(tr, track) ThenBlock: { ok = 1 }
+            IfCondition EqualTo(ok, 1) ThenBlock: {
+                IfCondition EqualTo(kind, MIDIKind.META) ThenBlock: {
+                    IfCondition EqualTo(st, 47) ThenBlock: { ReturnValue(1) }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.MIDI_W_WriteTrack {
+    Input: song: Address
+    Input: track: Integer
+    Input: all: Integer
+    Output: Integer
+    Body: {
+        MIDI_W_U8(77)
+        MIDI_W_U8(84)
+        MIDI_W_U8(114)
+        MIDI_W_U8(107)
+        len_at = MIDIWrite.pos
+        MIDI_W_BE32(0)
+        body0 = MIDIWrite.pos
+        MIDIWrite.run = 0
+        last = 0
+        cnt = MIDI_SongCount(song)
+        IfCondition And(NotEqual(all, 0), GreaterThan(cnt, 0)) ThenBlock: {
+            used = Allocate(cnt)
+            MemorySet(used, 0, cnt)
+            left = cnt
+            WhileLoop GreaterThan(left, 0) {
+                best_i = -1
+                best_t = 0
+                i = 0
+                WhileLoop LessThan(i, cnt) {
+                    IfCondition EqualTo(GetByte(used, i), 0) ThenBlock: {
+                        ev = MIDI_SongEvent(song, i)
+                        tk = MIDI_EvTick(ev)
+                        take = 0
+                        IfCondition EqualTo(best_i, -1) ThenBlock: { take = 1 }
+                        IfCondition LessThan(tk, best_t) ThenBlock: { take = 1 }
+                        IfCondition EqualTo(take, 1) ThenBlock: {
+                            best_i = i
+                            best_t = tk
+                        }
+                    }
+                    i = Add(i, 1)
+                }
+                IfCondition LessThan(best_i, 0) ThenBlock: {
+                    left = 0
+                } ElseBlock: {
+                    SetByte(used, best_i, 1)
+                    ev = MIDI_SongEvent(song, best_i)
+                    last = MIDI_W_WriteOne(ev, last)
+                    left = Subtract(left, 1)
+                }
+            }
+            Deallocate(used, cnt)
+        } ElseBlock: {
+            i = 0
+            WhileLoop LessThan(i, cnt) {
+                ev = MIDI_SongEvent(song, i)
+                tr = MIDI_EvTrack(ev)
+                IfCondition EqualTo(tr, track) ThenBlock: {
+                    last = MIDI_W_WriteOne(ev, last)
+                }
+                i = Add(i, 1)
+            }
+        }
+        has = MIDI_W_HasEOT(song, track, all)
+        IfCondition EqualTo(has, 0) ThenBlock: {
+            MIDI_W_VLQ(0)
+            MIDI_W_U8(255)
+            MIDI_W_U8(47)
+            MIDI_W_U8(0)
+        }
+        blen = Subtract(MIDIWrite.pos, body0)
+        SetByte(MIDIWrite.buf, len_at, Divide(blen, 16777216))
+        SetByte(MIDIWrite.buf, Add(len_at, 1), Modulo(Divide(blen, 65536), 256))
+        SetByte(MIDIWrite.buf, Add(len_at, 2), Modulo(Divide(blen, 256), 256))
+        SetByte(MIDIWrite.buf, Add(len_at, 3), Modulo(blen, 256))
+        ReturnValue(1)
+    }
+}
+
+Function.MIDI_SongSaveMem {
+    Input: song: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(song, 0) ThenBlock: { ReturnValue(0) }
+        MIDI_W_Begin()
+        fmt = MIDI_SongFormat(song)
+        ntr = MIDI_SongTracks(song)
+        div = MIDI_SongDivision(song)
+        IfCondition LessThan(ntr, 1) ThenBlock: { ntr = 1 }
+        IfCondition EqualTo(fmt, 0) ThenBlock: { ntr = 1 }
+        MIDI_W_U8(77)
+        MIDI_W_U8(84)
+        MIDI_W_U8(104)
+        MIDI_W_U8(100)
+        MIDI_W_BE32(6)
+        MIDI_W_BE16(fmt)
+        MIDI_W_BE16(ntr)
+        MIDI_W_BE16(div)
+        IfCondition EqualTo(fmt, 0) ThenBlock: {
+            MIDI_W_WriteTrack(song, 0, 1)
+        } ElseBlock: {
+            t = 0
+            WhileLoop LessThan(t, ntr) {
+                MIDI_W_WriteTrack(song, t, 0)
+                t = Add(t, 1)
+            }
+        }
+        IfCondition NotEqual(MIDIWrite.err, 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(MIDIWrite.buf)
+    }
+}
+
+Function.MIDI_SongSaveLen {
+    Output: Integer
+    Body: { ReturnValue(MIDIWrite.pos) }
+}
+
+Function.MIDI_SongSavePath {
+    Input: song: Address
+    Input: path: Address
+    Output: Integer
+    Body: {
+        buf = MIDI_SongSaveMem(song)
+        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(0) }
+        n = MIDIWrite.pos
+        fd = SystemCall(MIDISys.SYS_OPEN, path, 577, 420)
+        IfCondition LessThan(fd, 0) ThenBlock: { ReturnValue(0) }
+        SystemCall(MIDISys.SYS_WRITE, fd, buf, n)
+        SystemCall(MIDISys.SYS_CLOSE, fd)
+        ReturnValue(n)
+    }
+}
