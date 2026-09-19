@@ -2,9 +2,10 @@
 
 ## Mission
 
-Deliver a **production-usable Python surface** on top of AILang: transpile the
-95th-percentile of real-world Python scripts to static binaries today, then add an
-**interpreted VM runtime** (JSVM-style) for REPL and embedding.
+Deliver a **production-usable Python surface** on top of AILang (`{ }` blocks,
+not indentation): transpile the 95th-percentile of real-world Python scripts to
+static binaries today, then add an **interpreted VM runtime** (JSVM-style) for
+REPL and embedding. See [PYTHON_GAP.md](PYTHON_GAP.md).
 
 ---
 

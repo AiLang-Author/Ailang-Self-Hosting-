@@ -16,8 +16,16 @@ echo "== transpile =="
 "$AIMACRO" "$src" "$out"
 echo "== output: $out =="
 if [[ -x "$AILANG" ]]; then
+  echo "== compile =="
+  bin="/tmp/aimacro_pipeline_$(basename "${src%.aim}")"
+  "$AILANG" "$out" "$bin"
   echo "== run =="
-  "$AILANG" "$out"
+  stdin="${src%.aim}.stdin"
+  if [[ -f "$stdin" ]]; then
+    "$bin" <"$stdin"
+  else
+    "$bin"
+  fi
 else
   echo "skip run: $AILANG not executable"
 fi

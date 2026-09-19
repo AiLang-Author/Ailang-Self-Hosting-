@@ -1,6 +1,6 @@
 # AIMacro Test Matrix
 
-**42** tests under `AIMacro_Tests/` (flat directory, all `.aim`).
+**62** tests under `AIMacro_Tests/` (flat directory, all `.aim`). Includes Wave 1–16 extras.
 
 ## How to run one test
 
@@ -9,7 +9,8 @@
 ./ailang.x AIMacro_Tests/<file>.ailang
 ```
 
-Or use `./AIMacro/scripts/run_pipeline.sh AIMacro_Tests/<file>.aim`.
+Or `./AIMacro/scripts/run_pipeline.sh AIMacro_Tests/<file>.aim`.
+Full matrix (pipes `<test>.stdin` when present): `./AIMacro/scripts/run_matrix.sh`.
 
 ## Priority tiers
 
@@ -52,7 +53,7 @@ Or use `./AIMacro/scripts/run_pipeline.sh AIMacro_Tests/<file>.aim`.
 | `test_quick_wins.aim` | Quick feature wins |
 | `practical_test.aim` | Practical script patterns |
 | `fizzbuzz.aim` | Classic algorithm |
-| `dungeon_escape.aim` | Game-style control flow |
+| `dungeon_escape.aim` | Game-style control flow (`dungeon_escape.stdin`) |
 | `complex_test.aim` | Complex expressions |
 | `complex_test_2.aim` | Complex expressions (variant) |
 
@@ -64,7 +65,7 @@ Or use `./AIMacro/scripts/run_pipeline.sh AIMacro_Tests/<file>.aim`.
 | `test_int.aim` | int builtin |
 | `test_min.aim` | min builtin |
 | `test_sorted_minimal.aim` | sorted minimal |
-| `test_input.aim` | input() |
+| `test_input.aim` | `input()` (`test_input.stdin`) |
 | `len_debug.aim` | len debugging |
 | `array_debug.aim` | Array debugging |
 | `not_debug.aim` | Boolean not |
@@ -121,7 +122,52 @@ test_quick_wins.aim
 test_sorted_minimal.aim
 test_string_methods.aim
 test_types.aim
+wave1_file_argv.aim
+wave1_in_for.aim
+wave1_none_truth.aim
+wave2_comp_with_unpack.aim
+wave2_fstring_defaults.aim
+wave3_args.aim
+wave3_math_time.aim
+wave3_os_json.aim
+wave4_float.aim
+wave5_try.aim
+wave6_json_exc.aim
+wave7_print_repr.aim
+wave8_compare.aim
+wave9_short_circuit.aim
+wave10_dict_order.aim
+wave11_lambda.aim
+wave12_ternary.aim
+wave13_kwargs.aim
+wave15_user_kwargs.aim
+wave16_print_range.aim
 ```
+
+## Wave extras (not in P0–P2)
+
+| Test | Focus |
+|------|-------|
+| `wave1_none_truth.aim` | None sentinel, truthiness, `is` |
+| `wave1_in_for.aim` | `in` / for-in |
+| `wave1_file_argv.aim` | `open` / `sys.argv` |
+| `wave2_fstring_defaults.aim` | f-strings, defaults, chained compare |
+| `wave2_comp_with_unpack.aim` | list comps, `with`, unpack |
+| `wave3_args.aim` | `*args` packed array Input |
+| `wave3_os_json.aim` | `os.path` / `listdir` / `json` |
+| `wave3_math_time.aim` | `math` / `time` / `sys.stdout` |
+| `wave4_float.aim` | true `/`, float lits, `math.sqrt/pi` |
+| `wave5_try.aim` | try/except/raise/finally, catchable open |
+| `wave6_json_exc.aim` | json dumps str, print(e), `1e-3`, float `**` |
+| `wave7_print_repr.aim` | `print(True)`/`[1, 2]`/`{"a": 1}`, `repr`, json dict dumps |
+| `wave8_compare.aim` | boxed `==`/`is`/`in`/`not`; `and`/`or` operands |
+| `wave9_short_circuit.aim` | short-circuit `and`/`or` and chained compare |
+| `wave10_dict_order.aim` | dict insertion order for print/keys/json |
+| `wave11_lambda.aim` | `lambda` hoisted def + `CallIndirect` |
+| `wave12_ternary.aim` | `x if c else y` short-circuit ternary |
+| `wave13_kwargs.aim` | `sorted(key=, reverse=)`, `open(mode=)` |
+| `wave15_user_kwargs.aim` | user `def` keyword args `f(b=2, a=1)` |
+| `wave16_print_range.aim` | `print(sep=, end=)`, `range` values, `list()` |
 
 ## Mapping tests → libraries
 

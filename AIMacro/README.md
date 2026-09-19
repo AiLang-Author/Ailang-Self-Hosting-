@@ -1,6 +1,6 @@
 # AIMacro Project
 
-AIMacro is a Python-like surface syntax (`def` / `end` blocks) that transpiles to
+AIMacro is a Python-like surface syntax (`def` / `{ }` blocks) that transpiles to
 AILang, backed by a dedicated runtime library. The long-term goal is dual execution:
 
 1. **AOT (today):** `.aim` → `.ailang` → `ailang.x` → static native binary
@@ -14,7 +14,7 @@ and automation scripts. Implementation lives in `Librarys/AIMacro/` and
 
 | Binary / source | Role |
 |-----------------|------|
-| `aimacro.x` | Compiled CLI transpiler (~297 KB) |
+| `aimacro.x` | Compiled CLI transpiler (~380 KB) |
 | `aimacro_cli.ailang` | CLI: `./aimacro.x input.aim [output.ailang]` |
 | `aimacro_console.ailang` | Interactive TUI console (lex/parse/codegen debug) |
 
@@ -27,8 +27,10 @@ There is no `aimacro.ailang` at repo root; use `aimacro_cli.ailang`.
 | [ARCHITECTURE.md](ARCHITECTURE.md) | Full pipeline, library inventory, JSVM parallel |
 | [SPECIFICATION.md](SPECIFICATION.md) | Language surface, builtins, codegen contracts |
 | [OBJECTIVES.md](OBJECTIVES.md) | Phases, milestones, acceptance criteria |
-| [TEST_MATRIX.md](TEST_MATRIX.md) | All 42 `.aim` tests by tier and status |
+| [TEST_MATRIX.md](TEST_MATRIX.md) | All `.aim` tests by tier and status |
 | [STATUS.md](STATUS.md) | Living scorecard (transpile / compile / run) |
+| [PYTHON_TESTS.md](PYTHON_TESTS.md) | CPython/test262-style harness (`py2aim`, curated runner) |
+| [AUDIT_2026-09-18.md](AUDIT_2026-09-18.md) | Post-Wave-6 reaudit + deep CPython-lite results |
 
 ## Quick commands
 

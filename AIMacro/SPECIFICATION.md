@@ -4,7 +4,7 @@ This document defines what AIMacro **is**, what the transpiler **must** emit, an
 what the runtime **must** provide. It is the contract for closing the 95th-percentile
 Python feature gap and building the VM.
 
-**Syntax rule:** Python-like grammar with **`end`** closing blocks (not indentation-only).
+**Syntax rule:** Python-like grammar with **C-style `{ }` blocks** (not indentation, not `end`).
 
 ---
 
@@ -17,11 +17,11 @@ Python feature gap and building the VM.
 | Strings | Required | `"..."` with escapes via codegen |
 | Identifiers | Required | `[a-zA-Z_][a-zA-Z0-9_]*` |
 | Keywords | Required | See `FixedPool.Token` in `AIMacroCore` |
-| Indentation | Ignored for blocks | `end` is authoritative |
+| Indentation | Ignored for blocks | `{` / `}` are authoritative |
 
 ### Keywords (parser tokens)
 
-`def`, `end`, `if`, `elif`, `else`, `while`, `for`, `in`, `return`, `pass`,
+`def`, `if`, `elif`, `else`, `while`, `for`, `in`, `return`, `pass`,
 `break`, `continue`, `try`, `except`, `finally`, `raise`, `import`, `from`,
 `class`, `True`, `False`, `None`, `and`, `or`, `not`, `is`
 
@@ -31,7 +31,7 @@ Python feature gap and building the VM.
 
 | Construct | Transpile target | Priority |
 |-----------|------------------|----------|
-| `def f(a, b): … end` | `Function.f` | P0 |
+| `def f(a, b) { … }` | `Function.f` | P0 |
 | `if` / `elif` / `else` | `IfCondition` / `ElseBlock` chains | P0 |
 | `while` | `WhileLoop` | P0 |
 | `for x in range(n)` | index loop + `AIMacro.Range` | P0 |
@@ -41,10 +41,10 @@ Python feature gap and building the VM.
 | `pass` | empty block / no-op | P0 |
 | `x = expr` | assign | P0 |
 | `x += expr` (aug assign) | read-modify-write | P0 |
-| `try` / `except` / `finally` | exception scaffolding | P1 |
+| `try` / `except` / `finally` | software exceptions (`Fork`/`Branch` + Plex) | P1 |
 | `raise` | runtime error path | P2 |
 | `import m` / `from m import x` | `LibraryImport` emission | P1 |
-| `class C: … end` | OOP codegen (`CodeGenOOP`) | P1 |
+| `class C { … }` | OOP codegen (`CodeGenOOP`) | P1 |
 | `with expr:` | desugar to try/finally | P2 |
 
 ---
@@ -53,28 +53,29 @@ Python feature gap and building the VM.
 
 | Construct | Priority | Notes |
 |-----------|----------|-------|
-| Binary ops `+ - * / % **` | P0 | `**` → `Math.Power`; `/` integer div per AIMacro |
+| Binary ops `+ - * / % **` | P0 | `**` → `Math.Power`; **`/` is true division** (`Float_Div`); `//` is integer |
 | Floor div `//` | P0 | `Math.FloorDiv` |
-| Comparisons `== != < <= > >=` | P0 | String `==` uses `StringCompare` |
-| Boolean `and or not` | P0 | `not` precedence documented in feature_probe |
+| Comparisons `== != < <= > >=` | P0 | Return boxed bool; string `==` uses `StringCompare` |
+| Boolean `and or not` | P0 | `and`/`or` return operands and short-circuit; `not` is `NotVal` |
 | Unary `-` | P0 | |
 | Function calls | P0 | |
 | Method calls `obj.m()` | P1 | String/list/dict dispatch tables in CodeGen4 |
 | Subscript `a[i]` | P0 | list + dict |
 | Slice `a[i:j]` | P1 | `ListSlice`, `StringSlice` |
-| List literal `[1, 2]` | P0 | |
-| Dict literal `{k: v}` | P1 | |
+| List literal `[1, 2]` | P0 | newlines between elements ok |
+| Tuple `(1, 2)` | P1 | Parsed as list; `print` is `[1, 2]` |
+| Dict literal `{k: v}` | P1 | newlines between pairs ok |
 | Attribute `obj.attr` | P1 | OOP |
-| Ternary | P2 | if not present, defer |
+| Ternary `x if c else y` | P1 | short-circuit; Wave 12 |
 
 ### Not in 95th-percentile scope (explicitly deferred)
 
-- `lambda`, `yield`, `async`/`await`
+- `yield`, `async`/`await`
 - Decorators `@`
 - List/dict/set comprehensions (P1 stretch — high value)
 - f-strings `f"..."` (P1 stretch)
 - `match` / `case`
-- `*args` / `**kwargs` in user defs (packed call infra exists for codegen)
+- `**kwargs` / keyword-only params (Wave 3 shipped `*args` as a packed array Input)
 
 ---
 
@@ -87,9 +88,12 @@ Python feature gap and building the VM.
 | `print(...)` | `AIMacro.Print` / `SmartPrint` |
 | `len(x)` | `SmartLen` / `Hash.Size` / `DictGen_SmartLen` |
 | `str(x)` | `AIMacro.Str` |
+| `repr(x)` | `AIMacro.Repr` |
 | `int(x)` | `AIMacro.Int` |
 | `bool(x)` | `AIMacro.Bool` |
-| `range(n)` / `range(a,b)` | `AIMacro.Range` |
+| `range(n)` / `range(a,b)` / `range(a,b,step)` | `AIMacro.Range` (negative step ok) |
+| `list()` / `list(iterable)` | `Array.Create` / `AIMacro.ListFrom` |
+| `print(..., sep=, end=)` | `Gen_PrintCall` |
 | `input(prompt)` | `AIMacro.Input` |
 
 ### P1 — 95th-percentile closure
@@ -102,7 +106,7 @@ Python feature gap and building the VM.
 | `ord chr` | `AIMacro.*` |
 | `isinstance type` | `Types.*` / `OOPGen_IsInstance` |
 | `open(path)` | `AIMacro.Open` |
-| `list dict` | constructors |
+| `list dict` | `list()` shipped Wave 16; `dict()` constructor still later |
 
 ### String methods (via `Gen_MethodCallExpr`)
 

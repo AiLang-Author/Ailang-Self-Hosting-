@@ -1,0 +1,18 @@
+print(1 if 1 else 0)
+print(1 if 0 else 2)
+print("a" if 1 else "b")
+print("a" if 0 else "b")
+x = 10
+print("big" if x > 5 else "small")
+print(1 if 1 else boom())
+print(2 if 0 else 3)
+print(1 if 1 else 0 if 1 else 2)
+n = None
+print(n if n else "d")
+f = lambda v: 1 if v else 0
+print(f(1))
+print(f(0))
+
+def boom():
+    print("BOOM")
+    return 9

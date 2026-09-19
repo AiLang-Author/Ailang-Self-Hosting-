@@ -1,0 +1,12 @@
+xs = [3, 1, 2]
+ys = sorted(xs)
+print(ys[0])
+print(ys[1])
+print(ys[2])
+zs = sorted(xs, reverse=True)
+print(zs[0])
+print(zs[2])
+ks = sorted(xs, key=lambda n: 0 - n)
+print(ks[0])
+print(ks[2])
+print(sorted([1, 2, 3], reverse=False)[0])
