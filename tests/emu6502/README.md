@@ -3,6 +3,7 @@
 ## Smoke
 
 ```
+Import.Librarys.Emulators.6502.CPU
 ./ailang.x tests/emu6502/smoke.ailang /tmp/emu6502_smoke.x
 /tmp/emu6502_smoke.x
 ```
