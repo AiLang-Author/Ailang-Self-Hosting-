@@ -53,6 +53,22 @@ JSON board loader smoke — parse `smoke.board.json`, plug `ProbeASIC` at
 /tmp/board_smoke.x
 ```
 
+CIA timer underflow + VIC `$D012` raster (65 cyc/line NTSC):
+
+```
+./ailang.x tests/emu6502/cia_vic_smoke.ailang /tmp/cia_vic_smoke.x
+/tmp/cia_vic_smoke.x
+```
+
+PLA `$01` banking, `$01` fetch, CIA2 NMI edge, timer B delay / cascade / IMR:
+
+```
+./ailang.x tests/emu6502/pla_smoke.ailang /tmp/pla_smoke.x && /tmp/pla_smoke.x
+./ailang.x tests/emu6502/mmufetch_smoke.ailang /tmp/mmufetch_smoke.x && /tmp/mmufetch_smoke.x
+./ailang.x tests/emu6502/nmi_smoke.ailang /tmp/nmi_smoke.x && /tmp/nmi_smoke.x
+./ailang.x tests/emu6502/cia_tb_smoke.ailang /tmp/cia_tb_smoke.x && /tmp/cia_tb_smoke.x
+```
+
 C64 JSON board + KERNAL stubs (`JSR $FFD2`, VIC `$D020`, 6510 `$01`):
 
 ```
