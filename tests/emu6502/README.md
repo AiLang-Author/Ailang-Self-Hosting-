@@ -67,7 +67,10 @@ PLA `$01` banking, `$01` fetch, CIA2 NMI edge, timer B delay / cascade / IMR:
 ./ailang.x tests/emu6502/mmufetch_smoke.ailang /tmp/mmufetch_smoke.x && /tmp/mmufetch_smoke.x
 ./ailang.x tests/emu6502/nmi_smoke.ailang /tmp/nmi_smoke.x && /tmp/nmi_smoke.x
 ./ailang.x tests/emu6502/cia_tb_smoke.ailang /tmp/cia_tb_smoke.x && /tmp/cia_tb_smoke.x
+./ailang.x tests/emu6502/nmi_lorenz_smoke.ailang /tmp/nmi_lorenz_smoke.x && /tmp/nmi_lorenz_smoke.x
 ```
+
+Full Lorenz 2.15 (`tests/emu6502/lorenz.ailang`): last run through `nmi` / CIA TAB / `imr` / `flipos`, then **TIMEOUT** on `oneshot` (CRA still `$09` when ICR should be `$01` in the 4-cycle `STA $DC0E` / `LDA $DC0E` window). Next name after `oneshot` is `cntdef`.
 
 C64 JSON board + KERNAL stubs (`JSR $FFD2`, VIC `$D020`, 6510 `$01`):
 

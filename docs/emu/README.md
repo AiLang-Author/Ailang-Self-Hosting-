@@ -18,9 +18,9 @@ The board file is the schematic (`docs/emu/boards/c64.board.json`). Chips are Ai
 | JSON board loader | **PASS** (`ProbeASIC` at `$DE00`) |
 | C64 pack + KERNAL stubs | **PASS** (`JSR $FFD2`, VIC `$D020`, 6510 `$01`) |
 | PLA `$01` fetch map | **PASS** (`mmufetch` / `mmu` / `cpuport`) |
-| CIA | timers A+B, 2-cycle start delay, ICR/IMR, TA→TB cascade |
-| IRQ / NMI | CIA1 → IRQ; CIA2 edge → NMI (`nmi_smoke` **PASS**) |
+| CIA | timers A+B, per-CPU-cycle phi2, start delay 3, ICR/IMR, TA→TB cascade, PB6/PB7; IRQ pin one cycle after underflow |
+| IRQ / NMI | CIA1 → IRQ; CIA2 edge → NMI; Lorenz `nmi` `$DD0D` **PASS** |
 | VIC | NTSC raster `$D011`/`$D012` (paint later) |
-| Lorenz 2.15 | 245 OK through `irq` previously; NMI wired; full rerun in flight |
+| Lorenz 2.15 | through `imr` / `flipos`; **TIMEOUT** on `oneshot` (`CRA IS NOT $08 AT ICR=$01`) |
 
 See `tests/emu6502/README.md` for how to run the smokes.
