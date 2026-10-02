@@ -132,6 +132,11 @@ def should_keep(emit_name: str, x86: str, inputs: list[str]) -> bool:
     # AND RSP, imm8 0xF0 is sign-extended -16. Assemble("AND rsp, 240") zero-extends.
     if "AndRsp" in emit_name:
         return True
+    # Hand body is X86_MovRaxRsp24 (mov rax, [rsp+24]). The name's trailing
+    # 24 is split into a single digit, so Assemble emits "MOV rax, rsp, 2",
+    # which is not an opcode. The assembler also has no [rsp+disp] syntax.
+    if emit_name == "Emit_MovRaxRsp8":
+        return True
     if any(s in emit_name for s in (
         "Jmp", "Je", "Jne", "Jz", "Jnz", "Jl", "Jle", "Jg", "Jge",
         "Jb", "Jbe", "Ja", "Jae", "Js", "Jns", "Jo", "Jno", "Call",
