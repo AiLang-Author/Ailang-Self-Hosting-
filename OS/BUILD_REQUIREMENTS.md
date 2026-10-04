@@ -27,23 +27,27 @@ and launches QEMU.
 ```bash
 qemu-system-x86_64 \
     -enable-kvm \
-    -m 2G \
+    -m 2G -smp 2 \
     -drive if=pflash,format=raw,readonly=on,unit=0,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,snapshot=on,unit=1,file=/usr/share/OVMF/OVMF_VARS_4M.fd \
     -drive file=ailang_os.img,format=raw,if=none,id=disk0,snapshot=on \
     -device virtio-blk-pci,drive=disk0 \
-    -device virtio-vga,xres=1024,yres=768 \
+    -vga none \
+    -device bochs-display,edid=on,xres=1152,yres=864,xmax=1152,ymax=864 \
     -device qemu-xhci -device usb-kbd -device usb-mouse \
     -nic user,model=virtio-net-pci,hostfwd=tcp::2222-:22,hostfwd=tcp::15432-:5432 \
+    -serial file:/tmp/qemu_serial.log \
     -display gtk
 ```
+
+This is `run_aos.sh` and the `--qemu` path in `build_image.sh`. Do not pass `virtio-vga,xres=,yres=`. On this QEMU those properties are ignored and the guest stays 640×480.
 
 **Critical flags:**
 - `-enable-kvm` — Required. KVM exposes the host CPU (with SSE2) to the guest.
   Without KVM, use `-cpu max` to enable SSE2 (AILang emits SSE2 instructions).
 - `pflash unit=0` / `unit=1` — OVMF_CODE is unit 0, OVMF_VARS is unit 1.
   Omitting units causes "drive with bus=0, unit=0 exists" errors.
-- `virtio-vga` — Framebuffer for the display server.
+- `bochs-display` — Guest framebuffer. 1152×864 is the QEMU mode, not the real panel.
 - `snapshot=on` on disk0 — Disk image is not modified by QEMU.
 
 The kernel is an EFI stub placed on the EFI System Partition as

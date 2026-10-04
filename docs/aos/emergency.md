@@ -1,5 +1,7 @@
 # EMERGENCY CONTEXT SAVE — 2026-06-10
 
+This is a dated scratch note. It was not re-checked against the display code on 2026-10-03. Do not treat the bug list as the current desktop status.
+
 ## What We Were Doing
 Windows-style text selection & clipboard for Auckland UI framework.
 

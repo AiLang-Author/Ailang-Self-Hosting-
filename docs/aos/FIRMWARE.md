@@ -2,7 +2,7 @@
 
 **Policy**: a released AOS image ships **all** `linux-firmware` blobs under `/lib/firmware`. Users must never hunt `iwlwifi-*.ucode` or `i915/kbl_dmc_*.bin`.
 
-**Status**: bake-time. `build_image.sh` `stage_all_firmware` runs `copy-firmware.sh` from linux-firmware 20240115 into the rootfs overlay. Buildroot kconfig also has every `BR2_PACKAGE_LINUX_FIRMWARE_*` set. Packed rootfs is **8G** so the tree fits; the GPT disk is 16G and `growroot` stretches ext4 on first boot.
+**Status**: bake-time. `build_image.sh` `stage_all_firmware` runs `copy-firmware.sh` from linux-firmware 20240115 into the rootfs overlay. Buildroot's `rootfs.ext2` is about 2 GB. `IMAGE_SIZE_MB=16384` makes a 16 GB sparse GPT disk and grows partition 2 to that size. The old "8G packed rootfs" line does not match the script.
 
 ## Why kconfig alone is not enough
 

@@ -102,19 +102,16 @@ rm -f $BUILDROOT/output/target/system/bin/display.x
 cd $BUILDROOT && make rootfs-ext2
 ```
 
-This produces `output/images/rootfs.ext2` (2 GB).
+This produces `output/images/rootfs.ext2` (about 2 GB).
 
 ### Step 3: Build disk image
 
-If no disk image exists (or partition layout is wrong):
-1. Create blank 2500 MB image with `dd`
-2. Create GPT table with `parted` (EFI + rootfs partitions)
-3. Patch partition 2 PARTUUID with Python script
-4. Create FAT32 EFI partition with kernel as `EFI/BOOT/BOOTX64.EFI`
+`build_image.sh` creates a 16 GB sparse GPT image (`IMAGE_SIZE_MB=16384`):
 
-Then always:
-5. Write rootfs.ext2 at sector 409600: `dd if=rootfs.ext2 of=ailang_os.img bs=512 seek=409600 conv=notrunc`
-6. Verify partition 2 starts at sector 409600
+1. Partition 1 is the EFI system partition, sectors 2048..409599.
+2. Partition 2 starts at sector 409600. PARTUUID `c49ed437-68e9-45a0-8988-c8fd735b40c1`.
+3. The kernel is written as `EFI/BOOT/BOOTX64.EFI`.
+4. `rootfs.ext2` is written at sector 409600, then partition 2 is grown to fill the 16 GB disk.
 
 ### Step 4 (optional): Flash to USB
 
@@ -140,15 +137,15 @@ not work because `CONFIG_CMDLINE_OVERRIDE=y` bakes `root=PARTUUID=...` into the
 kernel — QEMU's `-append` is ignored, and the PARTUUID won't resolve without GPT.
 
 ```bash
-# EFI boot (default, matches real hardware)
-~/buildroot/board/ailang_os/run_qemu.sh
+# EFI boot. Screen is bochs-display at 1152x864, not virtio-vga.
+./run_aos.sh
 
 # Port forwards: host:2222 -> vm:22 (SSH), host:15432 -> vm:5432 (PG)
 # SSH: ssh -p 2222 root@localhost (password: ailang)
 # PG:  psql -h localhost -p 15432 -U bob ailang_system
 ```
 
-See `OS/BUILD_REQUIREMENTS.md` for the full QEMU command line reference.
+`virtio-vga,xres=,yres=` is ignored on this QEMU and the guest stays 640×480. See `OS/BUILD_REQUIREMENTS.md`.
 
 ## Live Deployment (deploy.sh)
 

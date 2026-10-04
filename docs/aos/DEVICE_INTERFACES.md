@@ -11,7 +11,7 @@
 | Device | Kernel / node | AOS interface | Notes |
 |--------|----------------|---------------|--------|
 | Keyboard / mouse | hid/evdev `/dev/input/event*` | display.x `DInputDiscover` + `Evdev_Poll`; rescan ~60 frames | Works. USB HID, not hidraw. |
-| Framebuffer | `/dev/fb0` | SysDisplay mmap | Works. No DRM/KMS ioctl yet. |
+| Framebuffer | `/dev/fb0` | SysDisplay mmap | Opens fb0 and uses the mode the kernel left. `FB_RGB` assumes BGRA. No DRM/KMS ioctl, and the mode is not switched to 32-bit. |
 | Ethernet | NIC + `udhcpc` | Init once at boot | Works, no settings UI. |
 | Wi-Fi | nl80211 | `wifi_ipc` + `config/wifi.html`: `iw` scan, write `/etc/wpa_supplicant.conf`, `wpa_supplicant -D nl80211,wext`, `udhcpc` | **Template.** Flaky: no rfkill, persist/reconnect, tray, signal/security parse. Init auto-connect only if `wlan0` + conf exist. |
 | Theme / font sizes | — | Settings | Not devices. |

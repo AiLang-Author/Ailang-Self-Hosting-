@@ -1,6 +1,6 @@
 # AOS Sandbox Jail — Quarantine Disk, FUSE User Data, Capabilities Later
 
-**Status**: v0 in progress (quarantine homes). v1 mount-ns / v2 FUSE+caps not wired.
+**Status** (checked 2026-10-03): v0 directories exist. `Init.ailang` mkdirs `/data/sandboxes/{chrome,grok}/{home,tmp}`, mounts tmpfs on both `tmp` dirs, and chowns them. `Schema.ailang` seeds the `sandboxes` rows. v1 and v2 are not wired. `FileTree.ailang` (resolve, list, create, read, update, rename, delete) is only called from `OS/TestFileTree.ailang`.
 **Related**: `OS/FileTree.ailang`, `OS/UUIDStore.ailang`, `OS/Schema.ailang` (`packages`, `applets`, `files`, `sandboxes`), `Applications/chrome_ipc.ailang`, `Applications/terminal_ipc.ailang`, `docs/aos/phase1-rls-pgcrypto-login.md`, `docs/aos/phase2-luks-secure-boot.md`, `CONTRIBUTING.md` §1 (X11 sandbox hardening), `docs/display/00_MASTER_INDEX.md`
 
 ---
@@ -124,9 +124,9 @@ Xvfb framebuffers stay under `/tmp/chrome_fb` (ephemeral shm). That is display m
 - Catalog row in `sandboxes`. No FUSE, no unshare, no capability checks.
 - Honest label: **convention**, not confinement.
 
-### v1 — mount namespace (kernel already has the knobs)
+### v1 — mount namespace (kernel config does not have the knobs yet)
 
-Guest kernel: `CONFIG_USER_NS`, `OVERLAY_FS`, `FUSE_FS`, `9P_FS`, `SECCOMP`. Busybox **does not** ship `unshare`; v1 needs util-linux `unshare` (or raw `unshare(2)` from Ailang).
+`board/ailang_os/linux_alldrv.config` has `CONFIG_USER_NS`, `CONFIG_OVERLAY_FS`, and `CONFIG_FUSE_FS` unset. v1 needs those turned on before `unshare` can do this. Busybox does not ship `unshare`; v1 needs util-linux `unshare` or raw `unshare(2)` from Ailang.
 
 Then:
 

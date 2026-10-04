@@ -6,16 +6,16 @@ AILang OS is a custom Linux-based operating system with:
 - Custom PID 1 init (`Init.ailang` → `ailang_init`)
 - PostgreSQL-backed service registry and settings
 - Custom display server with window manager and compositor
-- 15 windowed applications (IPC over Unix sockets)
+- 17 IPC window clients in `Applications/*_ipc.ailang` (HTML window configs, Unix sockets)
 - UEFI boot via EFI stub kernel (bzImage as BOOTX64.EFI)
 
 ### Disk Image Layout
 
 ```
-ailang_os.img (2.5 GB GPT)
-├── Partition 1: EFI System (200 MB, FAT32)
+ailang_os.img (16 GB sparse GPT — build_image.sh IMAGE_SIZE_MB=16384)
+├── Partition 1: EFI System (sectors 2048..409599, FAT32)
 │   └── EFI/BOOT/BOOTX64.EFI    ← Linux bzImage with EFI stub
-└── Partition 2: rootfs (2.1 GB, ext4)
+└── Partition 2: rootfs (sector 409600..end, ext4)
     ├── /sbin/ailang_init         ← PID 1
     ├── /system/bin/              ← All AILang binaries
     ├── /config/                  ← HTML window configs
@@ -140,8 +140,8 @@ debugfs -w -R "rm /sbin/ailang_init" rootfs.ext2
 debugfs -w -R "write /path/to/new/ailang_init /sbin/ailang_init" rootfs.ext2
 debugfs -w -R "set_inode_field /sbin/ailang_init mode 0100755" rootfs.ext2
 
-# 3. Write rootfs into full disk image (partition 2 starts at sector 411648)
-dd if=rootfs.ext2 of=ailang_os.img bs=512 seek=411648 conv=notrunc
+# 3. Write rootfs into full disk image (partition 2 starts at sector 409600)
+dd if=rootfs.ext2 of=ailang_os.img bs=512 seek=409600 conv=notrunc
 
 # 4. Update kernel on EFI partition
 cat > /tmp/mtoolsrc << 'EOF'
@@ -177,20 +177,12 @@ sudo dd if=~/buildroot/output/images/ailang_os.img of=/dev/sdX bs=4M status=prog
 
 ## Testing in QEMU (UEFI Boot)
 
-Matches real hardware boot path exactly:
+The boot path matches real hardware (OVMF loads `BOOTX64.EFI`). The screen does not. `run_aos.sh` and `build_image.sh --qemu` are the commands that actually run. Both use `bochs-display` at 1152×864 because `virtio-vga,xres=,yres=` is ignored on this QEMU and stays 640×480. Real hardware keeps whatever mode `/dev/fb0` already has. The display code does not set 32-bit and does not read the red/green/blue offsets.
 
 ```bash
-cp /usr/share/OVMF/OVMF_VARS_4M.fd /tmp/ovmf_vars.fd
-
-qemu-system-x86_64 \
-  -m 2G -enable-kvm \
-  -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
-  -drive if=pflash,format=raw,file=/tmp/ovmf_vars.fd \
-  -drive file=~/buildroot/output/images/ailang_os.img,format=raw,if=none,id=disk0,snapshot=on \
-  -device virtio-blk-pci,drive=disk0 \
-  -device virtio-vga,xres=1440,yres=900 \
-  -usb -device usb-kbd -device usb-mouse \
-  -display gtk -no-reboot
+./run_aos.sh
+# or
+./build_image.sh --qemu
 ```
 
 Note: `-snapshot=on` means changes don't persist to the image file.

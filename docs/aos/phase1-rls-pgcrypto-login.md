@@ -1,6 +1,6 @@
 # Phase 1: RLS, pgcrypto, and Login Validation
 
-**Status**: Current Sprint
+**Status** (checked 2026-10-03): `Login.ailang` queries `crypt()` against `users.password_hash`. `Schema.ailang` inserts the default user with `gen_salt('bf', 12)`. No `ROW LEVEL SECURITY` statement is in `Schema.ailang`. The policies below are the plan.
 **Default Credentials**: username=`user`, password=`password`
 
 ---
