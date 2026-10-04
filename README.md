@@ -6,6 +6,8 @@ Welcome to the **AILang Programming Language** — a self-hosted compiler featur
 
 **Repo layout:** see [`WORKSPACE.md`](WORKSPACE.md). **Docs:** [`docs/README.md`](docs/README.md). **AMD GPU driver kit:** [`dev/amdgpu/`](dev/amdgpu/).
 
+The OS userspace is [Ailang-OS](https://github.com/AiLang-Author/Ailang-OS). Clone it next to this tree. `OS`, `docs/aos`, and `board/ailang_os` are symlinks into that checkout.
+
 ### Key Components
 
 - **Self-hosted compiler** (3 MB) — Includes complete x86 instruction library (10k instructions), inline assembly support, and optimized code generation
