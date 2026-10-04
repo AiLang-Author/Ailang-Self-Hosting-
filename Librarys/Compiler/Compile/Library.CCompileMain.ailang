@@ -92,6 +92,12 @@ FixedPool.Compile {
     "function_hash":     Initialize=0, CanChange=True
     "extern_hash":       Initialize=0, CanChange=True
     "inline_hash":       Initialize=0, CanChange=True
+    // -TS mark set. 0 means emit every registered function.
+    "shake":             Initialize=0, CanChange=True
+    "shake_nodes":       Initialize=0, CanChange=True
+    "shake_live":        Initialize=0, CanChange=True
+    "shake_queue":       Initialize=0, CanChange=True
+    "shake_kept":        Initialize=0, CanChange=True
 }
 
 // =============================================================================
@@ -152,6 +158,15 @@ Function.Compile_Init {
         IfCondition NotEqual(Compile.inline_hash, 0) ThenBlock: {
             SHash.Destroy(Compile.inline_hash)
         }
+        IfCondition NotEqual(Compile.shake_nodes, 0) ThenBlock: {
+            SHash.Destroy(Compile.shake_nodes)
+        }
+        IfCondition NotEqual(Compile.shake_live, 0) ThenBlock: {
+            SHash.Destroy(Compile.shake_live)
+        }
+        IfCondition NotEqual(Compile.shake_queue, 0) ThenBlock: {
+            Array.Destroy(Compile.shake_queue)
+        }
 
         // === NOW ALLOCATE FRESH ===
         Compile.ast = 0
@@ -163,6 +178,11 @@ Function.Compile_Init {
         Compile.function_hash = SHash.Create(4096)
         Compile.extern_hash = SHash.Create(256)
         Compile.inline_hash = SHash.Create(256)
+        Compile.shake = 0
+        Compile.shake_nodes = 0
+        Compile.shake_live = 0
+        Compile.shake_queue = 0
+        Compile.shake_kept = 0
         Compile.inline_return_label = 0
         Compile.current_func = 0
         Compile.current_scope = 0
@@ -237,6 +257,18 @@ Function.Compile_Free {
         IfCondition NotEqual(Compile.inline_hash, 0) ThenBlock: {
             SHash.Destroy(Compile.inline_hash)
             Compile.inline_hash = 0
+        }
+        IfCondition NotEqual(Compile.shake_nodes, 0) ThenBlock: {
+            SHash.Destroy(Compile.shake_nodes)
+            Compile.shake_nodes = 0
+        }
+        IfCondition NotEqual(Compile.shake_live, 0) ThenBlock: {
+            SHash.Destroy(Compile.shake_live)
+            Compile.shake_live = 0
+        }
+        IfCondition NotEqual(Compile.shake_queue, 0) ThenBlock: {
+            Array.Destroy(Compile.shake_queue)
+            Compile.shake_queue = 0
         }
         
         // Free variable entries (40 bytes each: [name:8, offset:8, type:8, size:8, flags:8])
@@ -363,6 +395,10 @@ Function.Compile_Program {
             ReturnValue(0)
         }
 
+        // -TS: mark functions reachable from the program, then skip the rest
+        // in pass 2. Off by default, so a compiler build emits every function.
+        Compile_Shake(ast)
+
         // Pass 1.5: Emit pool table initialization (R15)
         // Skipped in kmod mode — kernel modules have no entry point that
         // would execute these bytes. module_init dispatches directly to
@@ -372,8 +408,10 @@ Function.Compile_Program {
         // kmod context would have to initialize them inside ail_main.
         DebugPerf.Start("pools")
         IfCondition EqualTo(Compile.kmod_mode, 0) ThenBlock: {
+            Listing_Compiler("pool base")
             Compile_EmitPoolTableInit()
             Compile_EmitPoolInitializers()
+            Listing_Source()
         }
         DebugPerf.End("pools")
 
@@ -486,6 +524,237 @@ Function.Compile_DiscoverDeclarations {
 }
 
 // =============================================================================
+// -TS TREE SHAKE
+// Pass 1 has already registered every function. This marks the ones a
+// call, a RunTask, or AddressOf can reach, plus the runtime helpers the
+// emitter calls without an AST node. Pass 2 skips the rest.
+// =============================================================================
+Function.Compile_ShakeShouldEmit {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Compile.shake, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Compile.shake_live, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+        live = SHash.Lookup(Compile.shake_live, name)
+        IfCondition EqualTo(live, Collections.XNULL) ThenBlock: {
+            ReturnValue(0)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.Compile_ShakeIsDef {
+    Input: node_type: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node_type, AST.FUNCTION) ThenBlock: {
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(node_type, AST.SUBROUTINE) ThenBlock: {
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(node_type, AST.INLINE_FUNCTION) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Compile_ShakeMarkName {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        live = SHash.Lookup(Compile.shake_live, name)
+        IfCondition NotEqual(live, Collections.XNULL) ThenBlock: {
+            ReturnValue(0)
+        }
+        node = SHash.LookupAddr(Compile.shake_nodes, name)
+        IfCondition EqualTo(node, Collections.XNULL) ThenBlock: {
+            ReturnValue(0)
+        }
+        SHash.Insert(Compile.shake_live, name, 1)
+        Array.Push(Compile.shake_queue, node)
+        Compile.shake_kept = Add(Compile.shake_kept, 1)
+        ReturnValue(1)
+    }
+}
+
+Function.Compile_ShakeNoteCall {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        name = AST_GetData1(node)
+        IfCondition EqualTo(name, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        cmp = StringCompare(name, "AddressOf")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            arg_count = AST_GetChildCount(node)
+            IfCondition GreaterEqual(arg_count, 1) ThenBlock: {
+                arg0 = AST_GetChild(node, 0)
+                IfCondition NotEqual(arg0, 0) ThenBlock: {
+                    arg_type = AST_GetType(arg0)
+                    IfCondition EqualTo(arg_type, AST.IDENTIFIER) ThenBlock: {
+                        id_name = AST_GetData1(arg0)
+                        Compile_ShakeMarkName(id_name)
+                    }
+                }
+            }
+            ReturnValue(1)
+        }
+        Compile_ShakeMarkName(name)
+        ReturnValue(1)
+    }
+}
+
+Function.Compile_ShakeNoteTask {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        task_name = AST_GetData1(node)
+        IfCondition EqualTo(task_name, 0) ThenBlock: {
+            arg_count = AST_GetChildCount(node)
+            IfCondition GreaterEqual(arg_count, 1) ThenBlock: {
+                arg = AST_GetChild(node, 0)
+                IfCondition NotEqual(arg, 0) ThenBlock: {
+                    task_name = AST_GetData1(arg)
+                }
+            }
+        }
+        Compile_ShakeMarkName(task_name)
+        ReturnValue(1)
+    }
+}
+
+Function.Compile_ShakeIndex {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        node_type = AST_GetType(node)
+        is_def = Compile_ShakeIsDef(node_type)
+        IfCondition EqualTo(is_def, 1) ThenBlock: {
+            name = AST_GetData1(node)
+            IfCondition NotEqual(name, 0) ThenBlock: {
+                existing = SHash.LookupAddr(Compile.shake_nodes, name)
+                IfCondition EqualTo(existing, Collections.XNULL) ThenBlock: {
+                    SHash.InsertAddr(Compile.shake_nodes, name, node)
+                }
+            }
+        }
+        count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            child = AST_GetChild(node, i)
+            Compile_ShakeIndex(child)
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.Compile_ShakeScan {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        node_type = AST_GetType(node)
+        is_def = Compile_ShakeIsDef(node_type)
+        IfCondition EqualTo(is_def, 1) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(node_type, AST.CALL) ThenBlock: {
+            Compile_ShakeNoteCall(node)
+        }
+        IfCondition EqualTo(node_type, AST.RUN_TASK) ThenBlock: {
+            Compile_ShakeNoteTask(node)
+        }
+        count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            child = AST_GetChild(node, i)
+            Compile_ShakeScan(child)
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.Compile_ShakeWalkBody {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        count = AST_GetChildCount(node)
+        c = 0
+        WhileLoop LessThan(c, count) {
+            child = AST_GetChild(node, c)
+            Compile_ShakeScan(child)
+            c = Add(c, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.Compile_Shake {
+    Input: ast: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Compile.shake, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        Compile.shake_nodes = SHash.Create(4096)
+        Compile.shake_live = SHash.Create(4096)
+        Compile.shake_queue = Array.Create(256)
+        Compile.shake_kept = 0
+        Compile_ShakeIndex(ast)
+        Compile_ShakeScan(ast)
+        Compile_ShakeMarkName("Arena_EnsureInit")
+        Compile_ShakeMarkName("Arena_Alloc")
+        Compile_ShakeMarkName("Arena_Free")
+        Compile_ShakeMarkName("Allocate")
+        Compile_ShakeMarkName("MemoryCopy")
+        Compile_ShakeMarkName("MemCompare")
+        Compile_ShakeMarkName("ail_main")
+        Compile_ShakeMarkName("ail_exit")
+        IfCondition EqualTo(Compile.kmod_mode, 1) ThenBlock: {
+            Compile_ShakeMarkName("ail_mx3_probe")
+            Compile_ShakeMarkName("ail_mx3_remove")
+            Compile_ShakeMarkName("ail_mx3_open")
+            Compile_ShakeMarkName("ail_mx3_release")
+            Compile_ShakeMarkName("ail_mx3_write")
+            Compile_ShakeMarkName("ail_mx3_read")
+            Compile_ShakeMarkName("ail_mx3_ioctl")
+        }
+        idx = 0
+        qsize = Array.Size(Compile.shake_queue)
+        WhileLoop LessThan(idx, qsize) {
+            node = Array.Get(Compile.shake_queue, idx)
+            Compile_ShakeWalkBody(node)
+            qsize = Array.Size(Compile.shake_queue)
+            idx = Add(idx, 1)
+        }
+        total = Array.Size(Compile.functions)
+        PrintMessage("[SHAKE] kept ")
+        PrintNumber(Compile.shake_kept)
+        PrintMessage(" of ")
+        PrintNumber(total)
+        PrintMessage("\n")
+        ReturnValue(1)
+    }
+}
+
+// =============================================================================
 // PASS 2: GENERATE CODE
 // =============================================================================
 Function.Compile_GenerateCode {
@@ -533,6 +802,10 @@ Function.Compile_Node {
         
         IfCondition EqualTo(Compile.error, 1) ThenBlock: {
             ReturnValue(0)
+        }
+
+        IfCondition NotEqual(Listing.mode, 0) ThenBlock: {
+            Listing_SetLine(AST_GetLine(node))
         }
         
         node_type = AST_GetType(node)
