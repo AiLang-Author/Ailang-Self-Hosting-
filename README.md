@@ -57,7 +57,7 @@ cd AiLang_CoreUtils
 - **No operator precedence** — Eliminates hidden behavior
 - **Static typing** — Compile-time checking with inference
 - **Direct code generation** — Compiles to machine code via custom IR
-- **LLM-friendly semantics** — Designed for AI code generation workflows
+- **LLM-friendly semantics** — Designed for AI code generation workflows Human pair programming
 
 ### Performance
 - **22 built-in string methods** — Most SSE2-optimized
