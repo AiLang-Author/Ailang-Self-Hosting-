@@ -6,7 +6,7 @@ Welcome to the **AILang Programming Language** — a self-hosted compiler featur
 
 **Repo layout:** see [`WORKSPACE.md`](WORKSPACE.md). **Docs:** [`docs/README.md`](docs/README.md). **AMD GPU driver kit:** [`dev/amdgpu/`](dev/amdgpu/).
 
-The OS userspace is [Ailang-OS](https://github.com/AiLang-Author/Ailang-OS). Clone it next to this tree. `OS`, `docs/aos`, `board/ailang_os`, `Design-Language- Refrence`, `config`, `app_icons`, `app_icons_tvg`, and `boot` are symlinks into that checkout.
+The OS userspace is [Ailang-OS](https://github.com/AiLang-Author/Ailang-OS). Clone it next to this tree. `OS`, `docs/aos`, `board/ailang_os`, `Design-Language- Refrence`, `config`, `app_icons`, `app_icons_tvg`, `boot`, `build_image.sh`, `run_aos.sh`, `deploy.sh`, and `CONTRIBUTING.md` are symlinks into that checkout. `tools/screenshot.sh` and `tools/bundle_foreign.py` are too.
 
 ### Key Components
 

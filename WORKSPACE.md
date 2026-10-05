@@ -15,7 +15,9 @@ Shipping any one of them is optional; keeping the path from “hello world” �
 .
 ├── WORKSPACE.md              # this file — how to think about the tree
 ├── README.md                 # language overview, install, quick start
-├── BUILD.md, CONTRIBUTING.md, LICENSE
+├── LICENSE
+├── CONTRIBUTING.md           # OS contributor guide; symlink to Ailang-OS
+├── build_image.sh, run_aos.sh, deploy.sh   # OS scripts; symlinks to Ailang-OS
 │
 ├── ailang.x / analyzer.x     # shipped toolchain binaries (root)
 ├── Main.ailang, ailang_*.ailang, aimacro_*.ailang
