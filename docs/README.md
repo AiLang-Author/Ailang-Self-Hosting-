@@ -28,7 +28,7 @@ These learning/reference trees keep their historical names until a later rename 
 - `Library Manuals/` — per-library manpage-style docs
 - `Language Docs BNF grammar etc/` — language spec / BNF / keywords
 - `Demo Programs/` — runnable examples (training corpus)
-- `Design-Language- Refrence/` — UI mockup PNGs
+- `Design-Language- Refrence/` — symlink to Ailang-OS; desktop mockup PNGs
 
 ## Conventions
 
