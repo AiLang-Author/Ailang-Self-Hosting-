@@ -1,6 +1,6 @@
 # AILang Self-Hosting Repository
 
-Welcome to the **AILang Programming Language** — a self-hosted compiler featuring explicit syntax, code efficiency, and a complete systems programming ecosystem.
+Welcome to the **AILang Programming Language** — a self-hosted compiler featuring explicit syntax, code efficiency, and a growing systems programming ecosystem.
 
 ## Overview
 
