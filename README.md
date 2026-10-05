@@ -2,6 +2,16 @@
 
 Welcome to the **AILang Programming Language** — a self-hosted compiler featuring explicit syntax, code efficiency, and a growing systems programming ecosystem.
 
+## IN PROGRESS ADDING OPTIMIZATION TO THE COMPILER !!!!!
+
+How this will be acheieved.
+
+1:  optimize the compile methods for each primitive, and update with the new cpuid detection in the compiler and leave the defualt sse2 x86_64 sysV abi min compile promise, so the compiler can build in place based on cpuid, might sound trivial but it is not, the packaging tool will ship with the compiler and source code, and build on the machine. 
+
+2: we will as simply as possible profile all code performance and find places where we can with minimal transformation remove redundant loads, stores and do code folding without building a massive transformation system that makes following the compiler logic nearly impossible. 
+
+3: Please file bug reports and performance bottle necks if you find them, i can only test the case i can imagine. 
+
 ## Overview
 
 **Repo layout:** see [`WORKSPACE.md`](WORKSPACE.md). **Docs:** [`docs/README.md`](docs/README.md). **AMD GPU driver kit:** [`dev/amdgpu/`](dev/amdgpu/).
