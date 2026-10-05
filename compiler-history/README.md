@@ -5,6 +5,7 @@ Binaries are gitignored (`*.x`). Sources live on git tags/commits.
 
 | File | What |
 |------|------|
+| `ailang-2026-10-02.x` | Host replaced 2026-10-04 by the tree-shake compiler. Built 2026-10-02 19:36, 3,125,174 bytes, sha256 `bb2120ab0ecbdbd82584819a0f5e5aeb2bc272d6572c9421ff31ec00b9448b8d`. Pre -TS and -asm. |
 | `ailang-2026-09-18.x` | Host replaced 2026-10-02. Built 2026-09-18, 3,120,966 bytes, sha256 `6d414a9f45ba271c92831fe92a47d00e83cb09894c6ea251ce7ca6c76e29b40a`. Pre RDTSC leaf fix. |
 | `ailang-2026-08-11.x` | Frozen host used during `compiler-improvement` (pre-Assemble wrap) |
 | `analyzer-2026-08-05.x` | Analyzer from that era |
