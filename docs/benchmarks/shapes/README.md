@@ -4,6 +4,8 @@ The same shape-area program, in two languages. `shapes.ailang` and `shapes.cpp` 
 
 A separate real-world example is the arcade shooter project in `AiLang-Author/ARCADE`. On the same machine and CPU, reported CPU usage dropped from roughly 10-15% to about 1-3% in the game loop. That result is not a direct apples-to-apples comparison against a C++ port, but it is a practical example of the optimizer and loop-home strategy working in a game-like workload. The shapes benchmark below is the controlled, reproducible microbenchmark used to explain the underlying behavior.
 
+The language structure itself also reduces the optimization surface area. AILANG does not layer hidden abstractions on top of the generated code: there are no header-driven symbol bloat problems, explicit loop-home register placement for hot values, fixed-pool layouts with predictable offsets, and no implicit allocation or conversion machinery hiding the shape of the program. That means the compiler spends less effort undoing abstractions and more effort on real code generation. The arcade result is not just a compiler win; it is also a consequence of the language's structure making the optimization problem smaller.
+
 The example is Casey Muratori's timing rewrite of the Clean Code shapes chapter, "Clean Code, Horrible Performance" (28 February 2023). Square, rectangle, triangle, and circle. Area is `w*w`, `w*h`, `0.5*w*h`, or `pi*w*w`. The f64 kernels are the paired comparison. The f32 kernels in `shapes.cpp` are the virtual-call listings from that article. AILANG has no vtable, so those rows are C++ only.
 
 ## Why use AILANG
