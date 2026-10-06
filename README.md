@@ -6,7 +6,7 @@ Welcome to the **AILang Programming Language** — a self-hosted compiler featur
 
 Read here :>  (https://github.com/AiLang-Author/Ailang-Self-Hosting-/tree/master/docs/benchmarks/shapes)
 
- 
+AILANG is designed to reduce unnecessary abstraction layers. The compiler is new, but the language structure eliminates most of the reasons C++ compilers have to work so hard: no header bloat, explicit register homes, predictable memory layouts, no implicit overhead. When the program is simpler, the compiler can be simpler too. 
 
 ## Overview
 
