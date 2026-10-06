@@ -4,7 +4,7 @@ Welcome to the **AILang Programming Language** — a self-hosted compiler featur
 
 ## Compiler Optimizations implemented for compiled code  !!!!!
 
-Rear here :>  (https://github.com/AiLang-Author/Ailang-Self-Hosting-/tree/master/docs/benchmarks/shapes)
+Read here :>  (https://github.com/AiLang-Author/Ailang-Self-Hosting-/tree/master/docs/benchmarks/shapes)
 
  
 
