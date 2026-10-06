@@ -10,6 +10,7 @@ See also `WORKSPACE.md` at the repo root for the monorepo philosophy.
 | Path | Contents |
 |------|----------|
 | `language/` | Language warts, programming guide notes, oddities |
+| `benchmarks/shapes/` | C and C++ versus AILANG shape-area timing harness, line count, and binary size |
 | `compiler/` | Architecture, `FPU_ISA_PLAN.md`, `MATH_PRIMITIVES.md` (float/int inventory) |
 | `display/` | Auckland UI / window system / input |
 | `design/` | Design specs, compiler/display design history |
