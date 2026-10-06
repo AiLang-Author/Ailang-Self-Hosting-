@@ -6,9 +6,9 @@ The example is Casey Muratori's timing rewrite of the Clean Code shapes chapter,
 
 ## Why use AILANG
 
-`run.sh` does not pass `-TS`. The compiler reads both files and parsed 142 declarations, and the unshaken executable contains the benchmark and the whole Arena library, including slab sizes this program never asks for. A second build, `shapes_ts.x`, passes `-TS` and keeps 82 of those 121 functions. Tree-shaking changes the binary, not the two files a person reads.
+The AILANG program is one 1,005-line file and one 2,128-line library. A person can read both, and then they have seen every name the program can reach. `shapes.cpp` is 607 lines, and the other 12,805 lines are headers the programmer did not set out to read. Those headers are the rest of the program's state, spread across 80 files.
 
-That is the comparison to show when someone asks why the language exists. The state of the AILANG program is one 1,005-line file and one 2,128-line library. A person can read both, and then they have seen every name the program can reach. `shapes.cpp` is 607 lines, and the other 12,805 lines are headers the programmer did not set out to read. Those headers are the rest of the program's state, spread across 80 files.
+That is the comparison to show when someone asks why the language exists. The built binaries illustrate the point: `run.sh` builds an unshaken executable containing the benchmark and the whole Arena library, with no tree-shaking optimization. A second build with `-TS` (tree-shaking to remove unused code) reduces the binary from 55,174 bytes to 33,454 bytes—but the two source files remain unchanged. Tree-shaking changes the binary, not the program a person reads.
 
 The kernels are a list of named steps, so the running values stay visible. `SumFadd` keeps `acc`, `psum`, `cursor`, and `rep` in order:
 
@@ -247,7 +247,7 @@ WhileLoop LessThan(rep, reps) {
 
 `SumFadd` in the file is that loop with only the width: `rec = cursor`, `w = rec@w`, `psum = Float_Add(psum, w)`, `cursor = Add(cursor, 24)`. The allocation sits above the repetition loop. The inner loop does not allocate. `LibraryImport.Arena` stays, because `AllocateLinkage` is an Arena allocation.
 
-`@` is legal only on a name that already carries the pool mark. `cursor@w`, with `cursor` never assigned from `AllocateLinkage`, is a compile error: the variable is not a LinkagePool pointer. The fix in the hot loops is the copy above, `rec = cursor`, into a name that was stamped once. Writing `cursor = AllocateLinkage(...)` and then `cursor = base` also works, because the mark survives the second assignment. The first binary that compiled `cursor@kind` without that copy read a stale stack slot, still holding the first pointer, and `loop-int` printed 2457600: on type-3 record, counted 4,096 × 200 times.
+`@` is legal only on a name that already carries the pool mark. `cursor@w`, with `cursor` never assigned from `AllocateLinkage`, is a compile error: the variable is not a LinkagePool pointer. The fix in the hot loops is the copy above, `rec = cursor`, into a name that was stamped once. Writing `cursor = AllocateLinkage(...)` and then `cursor = base` also works, because the mark survives the second assignment. The first binary that compiled `cursor@kind` without that copy read a stale stack slot, still holding the first pointer, and `loop-int` printed 2457600: one type-3 record, counted 4,096 × 200 times.
 
 `Fill` uses the same names, one allocation per record, outside the timed kernels:
 
