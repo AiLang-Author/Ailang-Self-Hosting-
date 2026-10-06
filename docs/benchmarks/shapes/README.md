@@ -2,6 +2,8 @@
 
 The same shape-area program, in two languages. `shapes.ailang` and `shapes.cpp` in this directory are the sources. `run.sh` rebuilds both, pins one core, and checks that paired results carry the same f64 bits. `shapes-fixedpool.ailang` and `shapes-linkage.ailang` are the same kernels with the clock and the records stored differently. The case studies at the bottom time those two files against `shapes.ailang`.
 
+A separate real-world example is the arcade shooter project in `AiLang-Author/ARCADE`. On the same machine and CPU, reported CPU usage dropped from roughly 10-15% to about 1-3% in the game loop. That result is not a direct apples-to-apples comparison against a C++ port, but it is a practical example of the optimizer and loop-home strategy working in a game-like workload. The shapes benchmark below is the controlled, reproducible microbenchmark used to explain the underlying behavior.
+
 The example is Casey Muratori's timing rewrite of the Clean Code shapes chapter, "Clean Code, Horrible Performance" (28 February 2023). Square, rectangle, triangle, and circle. Area is `w*w`, `w*h`, `0.5*w*h`, or `pi*w*w`. The f64 kernels are the paired comparison. The f32 kernels in `shapes.cpp` are the virtual-call listings from that article. AILANG has no vtable, so those rows are C++ only.
 
 ## Why use AILANG
