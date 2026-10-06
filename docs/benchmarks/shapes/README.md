@@ -172,3 +172,43 @@ The curve that does move is the record stream itself. Total visits were held nea
 | 8,192 | 196,608 | 5.9 | 34.2 | 38.5 |
 
 `loop-fadd` has no per-record branch, and it stays near 5 to 6 cycles from 1.5 KB through 192 KB. That range crosses the 16 KB level-1 data cache and stays inside the 2 MB level-2 cache. `area-branch` and `corner-one` climb from about 17 and 20 cycles up to about 30 and 36 by 12 KB of records, then sit on that plateau through the published 4,096-record run. The same split showed up on a second run of the short tables. The branch kernels are the ones that get cheaper as the stream gets shorter. The published hot row is already on the plateau, not on the steep part. This is the cycle curve, not a miss counter.
+
+## Case study: allocating the clock was the wrong tool
+
+`shapes.ailang` calls `Allocate(16)` for the clock and `Allocate` of 32 MB for the scrub. `Allocate` is Arena, so the program imports `Library.Arena.ailang`, 2,128 lines. The 16-byte clock comes out of the 24-byte slab, and the first use of that slab maps a 4 MB chunk. The scrub is past every slab class, so Arena maps 32 MB directly anyway. The hot loops never call `Allocate`.
+
+`shapes-fixedpool.ailang` drops the import. The clock is two words in the pool the shape table already required:
+
+```ailang
+FixedPool.Clock {
+    "sec": Initialize=0, CanChange=True
+    "nsec": Initialize=0, CanChange=True
+}
+```
+
+`CanChange` records that those words are writable. The compiler stores the flag and does not emit different instructions for it. Without Arena the pool has 22 named slots. The clock is bytes 160..175. The records start at byte 176. The scrub is still a 32 MB wipe, done with one `mmap` of that size, because that is a buffer used once and it does not fit in the 256 KB pool.
+
+Three pinned runs, same core, hot N = 4096. Every f64 bit matched the Arena build, including corner `4724367508723648189`. Median cycles per shape:
+
+| Kernel | With Arena | Fixed pool |
+|---|---:|---:|
+| loop-int | 4.2 | 3.7 |
+| loop-fadd | 5.7 | 5.7 |
+| loop-fmul | 5.9 | 5.1 |
+| area-branch | 34.4 | 34.4 |
+| area-table | 7.7 | 7.9 |
+| corner-one | 39.1 | 39.4 |
+| corner-two | 46.5 | 44.0 |
+| corner-call | 45.2 | 44.8 |
+
+`loop-fmul` was 5.9, 6.1, 5.9 with Arena and 5.1 on every fixed-pool run. `corner-one` overlapped. The branch plateau did not move. The multiply loop's source is the same function. What changed around it is the program: the record base moved from byte 1112 to byte 176, and the code section shrank from 50,450 bytes to 16,585.
+
+| Binary | Bytes | Code | What it contains |
+|---|---:|---:|---|
+| `shapes.x` | 55,174 | 50,450 | Benchmark plus the whole Arena library |
+| `shapes_ts.x` | 33,454 | 28,953 | Same source, `-TS`, 82 of 121 functions |
+| `shapes_fixedpool.x` | 20,731 | 16,585 | No Arena. 38 declarations, 3,230 nodes |
+
+`-TS` on the fixed-pool source keeps 33 of 33 functions. The file is byte-identical to the unshaken one, sha256 `30b49c0c76e896a9830f5caa26bebb0151adc3b0c93efb1168f5258ca8b6be9e`. There is nothing left to shake out.
+
+A general allocator is the wrong tool when the size and the lifetime are already known. Two pool slots hold a clock that lives as long as the process. One direct map holds a 32 MB wipe that is used once. The slab's 4 MB chunk, and the 2,128 lines that come with it, were not part of the shape loop.
