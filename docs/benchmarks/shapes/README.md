@@ -1,6 +1,6 @@
 # C and C++ versus AILANG
 
-Same shape-area program, two languages. `shapes.ailang` and `shapes.cpp` in this directory are the sources. `run.sh` rebuilds both, pins one core, and checks that paired results carry the same f64 bits.
+Same shape-area program, two languages. `shapes.ailang` and `shapes.cpp` in this directory are the sources. `run.sh` rebuilds both, pins one core, and checks that paired results carry the same f64 bits. `shapes-fixedpool.ailang` and `shapes-linkage.ailang` are the same kernels with the clock and the records stored differently. The case studies at the bottom time those two files against `shapes.ailang`.
 
 The example is Casey Muratori's timing rewrite of the Clean Code shapes chapter, "Clean Code, Horrible Performance" (28 February 2023). Square, rectangle, triangle, and circle. Area is `w*w`, `w*h`, `0.5*w*h`, or `pi*w*w`. The f64 kernels are the paired comparison. The f32 kernels in `shapes.cpp` are the virtual-call listings from that article. AILANG has no vtable, so those rows are C++ only.
 
@@ -212,3 +212,113 @@ Three pinned runs, same core, hot N = 4096. Every f64 bit matched the Arena buil
 `-TS` on the fixed-pool source keeps 33 of 33 functions. The file is byte-identical to the unshaken one, sha256 `30b49c0c76e896a9830f5caa26bebb0151adc3b0c93efb1168f5258ca8b6be9e`. There is nothing left to shake out.
 
 A general allocator is the wrong tool when the size and the lifetime are already known. Two pool slots hold a clock that lives as long as the process. One direct map holds a 32 MB wipe that is used once. The slab's 4 MB chunk, and the 2,128 lines that come with it, were not part of the shape loop.
+
+## Case study: a LinkagePool pointer per record
+
+`shapes-linkage.ailang` is 1,053 lines. A shape is a pointer whose fields are the same three words, 8 bytes each, in the same order as the raw record:
+
+```ailang
+LinkagePool.Shape {
+    "kind": Initialize=0
+    "w": Initialize=0
+    "h": Initialize=0
+}
+```
+
+The load the compiler emits is `rec@kind`, `rec@w`, and `rec@h`. `AllocateLinkage(LinkagePool.Shape)` calls `Arena_Alloc` with the pool size, 24 bytes, and the assignment is what marks `rec` as that pool. A later assignment leaves the mark in place. `LibraryImport.Arena` stays. `Fill` allocates each record and writes the fields by name:
+
+```ailang
+rec = AllocateLinkage(LinkagePool.Shape)
+rec@kind = typ
+rec@w = Float_FromInt(wint)
+rec@h = Float_FromInt(hint)
+```
+
+Those 4,096 blocks come from the 24-byte slab, which bumps by 24. They land in one contiguous run, so `cursor = Add(cursor, 24)` still steps from one record to the next. The paired f64 bits are the check that the step landed on the same words as the raw table. The eight coefficients stay in the fixed pool. `CoeffAddr` is still `mov rax, r15; add rax, 1048`.
+
+On the compiler that first timed this file, a field load reloaded the pointer from the variable's stack slot, tested it for zero, and then loaded `[pointer + offset]`. A zero pointer yields 0. The hot loops keep the cursor in a register, and that register was invisible to the field load, so each record stores the cursor into the typed local first:
+
+```ailang
+rec = AllocateLinkage(LinkagePool.Shape)
+WhileLoop LessThan(rep, reps) {
+    cursor = base
+    WhileLoop LessThan(cursor, limit) {
+        rec = cursor
+        w = rec@w
+        psum = Float_Add(psum, w)
+        cursor = Add(cursor, 24)
+    }
+}
+```
+
+The allocation sits above the repetition loop. It marks `rec`. The inner loop does not allocate. A direct `cursor@w`, with `cursor` homed in a register and no earlier `AllocateLinkage` on that name, failed the pool-type check. The first binary that did compile `cursor@kind` read the stack slot, which still held the first pointer, and `loop-int` printed 2457600: one type-3 record, counted 4,096 × 200 times. The numbers below are the build that stores `rec = cursor` on every record.
+
+The clock is the same construct:
+
+```ailang
+LinkagePool.Clock {
+    "sec": Initialize=0
+    "nsec": Initialize=0
+}
+clock = AllocateLinkage(LinkagePool.Clock)
+```
+
+`Stamp` still reads the two words with `Dereference`. The syscall writes those bytes, and the parameter it receives is a bare integer.
+
+Three pinned runs, same core, hot N = 4096. Every f64 bit matched `shapes.x` on all 48 rows, including corner `4724367508723648189` and `area-table-x4` `4726534476088133271`. Both programs exited 62. Median cycles per shape, this session, `nanoseconds * 3.7 / 819200`:
+
+| Kernel | Raw offset | LinkagePool |
+|---|---:|---:|
+| loop-int | 4.1 | 9.3 |
+| loop-fadd | 5.8 | 8.2 |
+| loop-fmul | 6.0 | 15.3 |
+| area-if | 33.7 | 42.4 |
+| area-if-call | 34.2 | 42.1 |
+| area-fork | 33.5 | 41.2 |
+| area-fork-call | 33.9 | 42.7 |
+| area-branch | 34.6 | 43.5 |
+| area-branch-call | 34.8 | 43.3 |
+| area-table | 7.6 | 27.3 |
+| area-table-call | 11.1 | 32.3 |
+| area-table-x4 | 7.3 | 28.1 |
+| corner-one | 39.4 | 45.9 |
+| corner-two | 45.7 | 50.9 |
+| corner-call | 44.3 | 51.0 |
+| corner-table | 7.5 | 26.5 |
+
+`area-table-x4` on that linkage binary was 26.7, 28.1, and 32.5, so the median is 28.1. The branch rows sat inside half a cycle of their median. The table rows moved the most. Each field load on that compiler was a stack reload of a pointer the cursor register already held, a null test that never fired, and then the indirect load.
+
+The compiler-optimize fold lowers a field whose base is the homed cursor, or a local this loop assigned from that cursor (`rec = cursor`, or `rec = Add(cursor, imm)` with a nonnegative immediate), as one load from `r13` plus the field displacement. `w = rec@w` then stays the qword at that address, the same way `w = Dereference(Add(cursor, 8))` already did. The null test remains on every other pointer. A store through the same base writes `[r13 + disp]`. The source is unchanged: the hot loops still say `rec = cursor` and `rec@w`.
+
+Three pinned runs of that compiler, same core, hot N = 4096, paired with `shapes.x` in the same window. Every f64 bit matched on all 48 rows, including corner `4724367508723648189` and `area-table-x4` `4726534476088133271`. Both programs exited 62. Median cycles per shape, `nanoseconds * 3.7 / 819200`:
+
+| Kernel | Raw offset | LinkagePool |
+|---|---:|---:|
+| loop-int | 4.2 | 4.2 |
+| loop-fadd | 5.7 | 5.7 |
+| loop-fmul | 6.2 | 5.3 |
+| area-if | 33.5 | 35.0 |
+| area-if-call | 34.8 | 34.7 |
+| area-fork | 32.3 | 34.4 |
+| area-fork-call | 34.2 | 35.6 |
+| area-branch | 34.8 | 37.0 |
+| area-branch-call | 35.1 | 35.6 |
+| area-table | 7.5 | 9.1 |
+| area-table-call | 11.5 | 11.5 |
+| area-table-x4 | 7.3 | 8.1 |
+| corner-one | 40.4 | 40.1 |
+| corner-two | 46.1 | 47.9 |
+| corner-call | 45.2 | 45.5 |
+| corner-table | 7.3 | 8.9 |
+
+`loop-fmul` on the linkage binary was 5.2, 5.3, and 5.3. The raw multiply in this window was 6.2 at the median. `area-table` was 8.3, 9.1, and 9.8. `area-branch` was 37.0, 35.6, and 37.4. The table rows sit within about two cycles of the raw loads. The branch rows sit within about two cycles of theirs. `loop-int` matches the raw loop.
+
+| Binary | Bytes | Code | What it contains |
+|---|---:|---:|---|
+| `shapes.x` | 55,174 | 50,450 | Records in the fixed pool. Arena for the clock and the scrub. |
+| `shapes_linkage.x` | 55,174 | 51,709 | Folded field loads. One `AllocateLinkage` per record. Whole Arena library. 143 declarations. |
+| `shapes_fixedpool.x` | 20,731 | 16,585 | No Arena. Records and clock are pool slots. |
+
+`shapes_linkage.x` sha256 is `1dd71ae60d274a894e066693847844dbf7cf9966e1d30223d3ec1de346464dd4`. The file before the fold was 59,270 bytes, code 53,529, sha256 `95a0cd84920fd9f1af1158b27b4976dc0b56d7ff59734e030ce6844e7c705100`. A `-TS` linkage binary from that earlier compiler was 33,454 bytes, code 32,032, sha256 `8de996dfdc23fb816329dfd9bc8a944a2358b106f05d569144e3ac31808a6a4f`, and it was not rebuilt for the fold.
+
+The field names are the spelling a person reads. Allocating the records still brings the Arena library back, and the fixed-pool file remains the small one. The hot loop no longer pays a pointer reload for each field.
