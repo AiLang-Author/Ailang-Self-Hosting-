@@ -153,3 +153,22 @@ Above the scrub, the static C++ process kept 872 KB more than the tree-shaken AI
 Each core here has 16 KB of level-1 data cache. A pair of cores shares 64 KB of level-1 instruction cache. The tree-shaken AILANG code is 28,953 bytes, so the whole code section fits in that instruction cache. The 710 KB static C++ image does not. The inner shape loop is a few instructions in both languages and fits either way. The code that does not fit is the library around the loop: printing a row, allocating the scrub, and reading the clock. That is a size comparison against the cache, not a miss counter.
 
 `run.sh` rebuilds `shapes.x` and `shapes_cpp` here. `shapes_ts.x` is the `-TS` build of the same `shapes.ailang`. Those outputs, the static C++ binary, and the row logs are gitignored.
+
+## Where the footprint starts to matter
+
+Arena's slab chunk is `ArenaConst.CHUNK_SIZE`, 4 MB unless a program changes it. `shapes.ailang` does not. The hot loop never reads that slab. The 4,096 records are 98,304 bytes inside the 256 KB fixed-pool mapping, and the 32 MB scrub is a separate mapping taken after the hot runs.
+
+A one-core sweep lowered the slab from 4 MB to 4 KB. Each step mapped exactly the requested size. One pass left the 4 MB slab untouched. The other passes stored through every cache line of the slab before timing, so the memory was resident. At N = 4096 and 200 repetitions, `loop-fadd` stayed between 5.4 and 6.8 cycles per shape, `area-branch` between 32 and 36, and `corner-one` between 38 and 41. The 4 KB slab and the 4 MB slab are the same result inside the noise of a single run. Lowering Arena's slab does not find a performance knee for this benchmark. Four megabytes also still fits beside the record table in the 8 MB level-3 cache, and 200 repetitions hide a cold first pass.
+
+The curve that does move is the record stream itself. Total visits were held near 819,200, so a shorter table is repeated more often. Cycles per shape, one run:
+
+| Records | Bytes | loop-fadd | area-branch | corner-one |
+|---:|---:|---:|---:|---:|
+| 64 | 1,536 | 6.0 | 17.1 | 19.9 |
+| 256 | 6,144 | 5.1 | 26.1 | 28.7 |
+| 512 | 12,288 | 5.2 | 30.0 | 36.0 |
+| 768 | 18,432 | 5.4 | 30.5 | 35.9 |
+| 4,096 | 98,304 | 6.3 | 34.0 | 37.4 |
+| 8,192 | 196,608 | 5.9 | 34.2 | 38.5 |
+
+`loop-fadd` has no per-record branch, and it stays near 5 to 6 cycles from 1.5 KB through 192 KB. That range crosses the 16 KB level-1 data cache and stays inside the 2 MB level-2 cache. `area-branch` and `corner-one` climb from about 17 and 20 cycles up to about 30 and 36 by 12 KB of records, then sit on that plateau through the published 4,096-record run. The same split showed up on a second run of the short tables. The branch kernels are the ones that get cheaper as the stream gets shorter. The published hot row is already on the plateau, not on the steep part. This is the cycle curve, not a miss counter.
