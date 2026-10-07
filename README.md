@@ -1,3 +1,6 @@
+
+## Warning Compiler is unstable due to optimizations,testing in progress, please report any regressions or bugs thank you !
+
 # AILang Self-Hosting Repository
 
 Welcome to the **AILang Programming Language** — a self-hosted compiler featuring explicit syntax, code efficiency, and a growing systems programming ecosystem.
