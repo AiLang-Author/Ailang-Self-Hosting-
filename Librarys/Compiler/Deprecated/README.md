@@ -13,3 +13,5 @@ The V1.0.0 compiler retired on 2026-10-06 is `ailang-2026-10-04.x` in this direc
 The compiler replaced later the same day, when the cursor field fold was installed, is `ailang-2026-10-06-bdf49c48.x`: 3,099,699 bytes, sha256 `bdf49c483b2301112a384c7140025132f69b629a2013f022cef9c6d975a42e04`. Local only.
 
 The compiler replaced when InlineAsm functions stopped being spliced is `ailang-2026-10-06-f3aac2f4.x`: 3,103,795 bytes, sha256 `f3aac2f4f59812e29828fe734cb0c927bcb02cd6fe436a681770d2da43886615`. Local only.
+
+The compiler replaced on 2026-10-06 when the page-safe string scan was installed is `ailang-2026-10-06-db9c1987.x`: 3,103,795 bytes, sha256 `db9c198755c6171358ae2fe72d743e24478d124eba7682406814f39bb3ef8e8c`. It segfaults on an unaligned 16-byte string load at the end of an arena chunk. Local only.
