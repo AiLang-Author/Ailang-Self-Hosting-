@@ -253,8 +253,63 @@ Function.FPUCompileX86_TryCompile {
 // =============================================================================
 
 
+// xmm0 = xmm0 <op> xmm1. The caller decides whether the bits also go to rax.
+Function.FPUCompileX86_EmitBin {
+    Input: op: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(op, FloatOp.ADD) ThenBlock: { Trans_Asm("ADDSD xmm0, xmm1") }
+        IfCondition EqualTo(op, FloatOp.SUB) ThenBlock: { Trans_Asm("SUBSD xmm0, xmm1") }
+        IfCondition EqualTo(op, FloatOp.MUL) ThenBlock: { Trans_Asm("MULSD xmm0, xmm1") }
+        IfCondition EqualTo(op, FloatOp.DIV) ThenBlock: { Trans_Asm("DIVSD xmm0, xmm1") }
+        IfCondition EqualTo(op, FloatOp.MIN) ThenBlock: { Trans_Asm("MINSD xmm0, xmm1") }
+        IfCondition EqualTo(op, FloatOp.MAX) ThenBlock: { Trans_Asm("MAXSD xmm0, xmm1") }
+        ReturnValue(0)
+    }
+}
+
+// Opcode byte for xmm0 <op> m64. Matches X86_XmmScaled.
+Function.FPUCompileX86_MemOpcode {
+    Input: op: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(op, FloatOp.ADD) ThenBlock: { ReturnValue(88) }
+        IfCondition EqualTo(op, FloatOp.SUB) ThenBlock: { ReturnValue(92) }
+        IfCondition EqualTo(op, FloatOp.MUL) ThenBlock: { ReturnValue(89) }
+        IfCondition EqualTo(op, FloatOp.DIV) ThenBlock: { ReturnValue(94) }
+        IfCondition EqualTo(op, FloatOp.MIN) ThenBlock: { ReturnValue(93) }
+        IfCondition EqualTo(op, FloatOp.MAX) ThenBlock: { ReturnValue(95) }
+        ReturnValue(0)
+    }
+}
+
+// Add, multiply, min, and max read either side from memory. Subtract and
+// divide do not: the memory operand is the right-hand side of those ops.
+Function.FPUCompileX86_MemCommute {
+    Input: op: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(op, FloatOp.ADD) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(op, FloatOp.MUL) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(op, FloatOp.MIN) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(op, FloatOp.MAX) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+Function.FPUCompileX86_FinishXmm {
+    Input: saved: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(saved, 0) ThenBlock: { Trans_Asm("MOVQ rax, xmm0") }
+        OptState.xmm_out = saved
+        ReturnValue(1)
+    }
+}
+
 // Float_Add(Float_Mul(a,b), c) → VFMADD231SD when Hw.level ≥ 2.
 // SSE2 hosts keep separate MULSD+ADDSD. is_sub=1 → a*b - c.
+// The multiplicand is xmm15. xmm2–xmm7 are loop homes and stay live.
 Function.FPUCompileX86_TryFuseFMA {
     Input: arg_mul: Address
     Input: arg_c: Address
@@ -280,18 +335,204 @@ Function.FPUCompileX86_TryFuseFMA {
         X86_PushXMM0()
         Compile_Expression(b)
         Trans_Asm("MOVQ xmm0, rax")
-        Trans_Asm("MOVDQA xmm2, xmm0")
+        X86_CopyXmm15()
         X86_PopXMM0()
         Trans_Asm("MOVSD xmm1, xmm0")
         X86_PopXMM0()
         IfCondition EqualTo(is_sub, 0) ThenBlock: {
-            Trans_Asm("VFMADD231SD xmm0, xmm1, xmm2")
+            X86_FmaXmm15(0)
         }
         IfCondition EqualTo(is_sub, 1) ThenBlock: {
-            Trans_Asm("VFMSUB231SD xmm0, xmm1, xmm2")
+            X86_FmaXmm15(1)
         }
         Trans_Asm("MOVQ rax, xmm0")
         ReturnValue(1)
+    }
+}
+
+// VFMADD231SD xmmN, xmm0, xmm1 is xmmN = xmmN + xmm0*xmm1.
+// VFNMADD231SD xmmN, xmm0, xmm1 is xmmN = xmmN - xmm0*xmm1.
+Function.FPUCompileX86_EmitFmaInto {
+    Input: slot: Integer
+    Input: is_sub: Integer
+    Body: {
+        op = "VFMADD231SD xmm"
+        IfCondition EqualTo(is_sub, 1) ThenBlock: {
+            op = "VFNMADD231SD xmm"
+        }
+        IfCondition GreaterThan(slot, 7) ThenBlock: {
+            X86_FmaHigh(slot, is_sub)
+        } ElseBlock: {
+            op = StringConcat(op, NumberToString(slot))
+            op = StringConcat(op, ", xmm0, xmm1")
+            Trans_Asm(op)
+        }
+    }
+}
+
+// home = home + a*b, or home = home - a*b, with the home already in xmm.
+// Two induction-pointer loads are SSE2 mulsd from memory, then addsd or
+// subsd. One pointer load still uses FMA when Hw.level is at least 2.
+// Anything else is snapshotted through rax, so a factor that is the home
+// itself is the old value. Returns 0 before any instruction when this
+// shape cannot be done.
+Function.FPUCompileX86_FmaHome {
+    Input: slot: Integer
+    Input: arg_a: Address
+    Input: arg_b: Address
+    Input: is_sub: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(slot, 2) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(slot, 14) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(arg_a, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(arg_b, 0) ThenBlock: { ReturnValue(0) }
+        // Two pointer loads. SSE2 movsd, mulsd from memory, then addsd or
+        // subsd. Two roundings, the scalar gcc shape. No VEX copy into
+        // xmm0 and xmm1. This runs on baseline x86-64, level 0 included.
+        ma = Optimize_IpMatch(arg_a)
+        ra = LoopHome.ip_hit_reg
+        da = LoopHome.ip_hit_disp
+        mb = Optimize_IpMatch(arg_b)
+        rb = LoopHome.ip_hit_reg
+        db = LoopHome.ip_hit_disp
+        IfCondition EqualTo(ma, 1) ThenBlock: {
+            IfCondition EqualTo(mb, 1) ThenBlock: {
+                Optimize_FlushHold()
+                saved = OptState.xmm_out
+                OptState.xmm_out = 0
+                sc = Optimize_SseScratch(slot)
+                X86_MovsdPtr(sc, ra, da)
+                X86_XmmIp(89, sc, rb, db)
+                IfCondition EqualTo(is_sub, 1) ThenBlock: {
+                    X86_XmmBin(92, slot, sc)
+                } ElseBlock: {
+                    X86_XmmBin(88, slot, sc)
+                }
+                OptState.xmm_out = saved
+                ReturnValue(1)
+            }
+        }
+        IfCondition LessThan(Hw.level, 2) ThenBlock: { ReturnValue(0) }
+        Optimize_FlushHold()
+        saved = OptState.xmm_out
+        OptState.xmm_out = 0
+        ma = Optimize_IpMatch(arg_a)
+        ra = LoopHome.ip_hit_reg
+        da = LoopHome.ip_hit_disp
+        mb = Optimize_IpMatch(arg_b)
+        rb = LoopHome.ip_hit_reg
+        db = LoopHome.ip_hit_disp
+        IfCondition EqualTo(ma, 1) ThenBlock: {
+            IfCondition EqualTo(Optimize_PinLoad(0, arg_a, ra, da), 0) ThenBlock: {
+                X86_MovsdPtr(0, ra, da)
+            }
+            X86_PushXMM0()
+            got = Compile_Expression(arg_b)
+            IfCondition EqualTo(got, 0) ThenBlock: {
+                X86_PopXMM0()
+                OptState.xmm_out = saved
+                Compile.error = 1
+                ReturnValue(1)
+            }
+            Trans_Asm("MOVQ xmm0, rax")
+            Trans_Asm("MOVSD xmm1, xmm0")
+            X86_PopXMM0()
+            FPUCompileX86_EmitFmaInto(slot, is_sub)
+            OptState.xmm_out = saved
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(mb, 1) ThenBlock: {
+            got = Compile_Expression(arg_a)
+            IfCondition EqualTo(got, 0) ThenBlock: {
+                OptState.xmm_out = saved
+                Compile.error = 1
+                ReturnValue(1)
+            }
+            Trans_Asm("MOVQ xmm0, rax")
+            IfCondition EqualTo(Optimize_PinLoad(1, arg_b, rb, db), 0) ThenBlock: {
+                X86_MovsdPtr(1, rb, db)
+            }
+            FPUCompileX86_EmitFmaInto(slot, is_sub)
+            OptState.xmm_out = saved
+            ReturnValue(1)
+        }
+        got = Compile_Expression(arg_a)
+        IfCondition EqualTo(got, 0) ThenBlock: {
+            OptState.xmm_out = saved
+            Compile.error = 1
+            ReturnValue(1)
+        }
+        Emit_PushRax()
+        got = Compile_Expression(arg_b)
+        IfCondition EqualTo(got, 0) ThenBlock: {
+            Emit_PopRax()
+            OptState.xmm_out = saved
+            Compile.error = 1
+            ReturnValue(1)
+        }
+        Trans_Asm("MOVQ xmm0, rax")
+        Trans_Asm("MOVSD xmm1, xmm0")
+        Emit_PopRax()
+        Trans_Asm("MOVQ xmm0, rax")
+        FPUCompileX86_EmitFmaInto(slot, is_sub)
+        OptState.xmm_out = saved
+        ReturnValue(1)
+    }
+}
+
+// Float_Sub or Float_Div of a float home by Float_FromInt. The integer
+// child is compiled to rax, then converted straight into xmm1. Returns 0
+// when the shape does not match, 1 when xmm0 and xmm1 are ready, 2 when
+// emission started and then failed.
+Function.FPUCompileX86_DivFromInt {
+    Input: arg0: Address
+    Input: arg1: Address
+    Input: op: Integer
+    Output: Integer
+    Body: {
+        legal = 0
+        IfCondition EqualTo(op, FloatOp.SUB) ThenBlock: { legal = 1 }
+        IfCondition EqualTo(op, FloatOp.DIV) ThenBlock: { legal = 1 }
+        IfCondition EqualTo(legal, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(arg0), AST.IDENTIFIER) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_IsFltHome(AST_GetData1(arg0)), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(arg1), AST.CALL) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(StringCompare(AST_GetData1(arg1), "Float_FromInt"), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetChildCount(arg1), 1) ThenBlock: { ReturnValue(0) }
+        child = AST_GetChild(arg1, 0)
+        IfCondition EqualTo(Optimize_GprSafe(child), 0) ThenBlock: { ReturnValue(0) }
+        got = Compile_Expression(child)
+        IfCondition EqualTo(got, 0) ThenBlock: { ReturnValue(2) }
+        X86_Cvtsi2sdXmm1()
+        got0 = Optimize_LoadLeafXmm(arg0, 0)
+        IfCondition EqualTo(got0, 0) ThenBlock: { ReturnValue(2) }
+        ReturnValue(1)
+    }
+}
+
+// Slot of an identifier that is already a float home. Otherwise 0.
+Function.FPUCompileX86_HomeSlot {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(node), AST.IDENTIFIER) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_IsFltHome(AST_GetData1(node)), 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Optimize_FltSlot(AST_GetData1(node)))
+    }
+}
+
+// Slot of Float_Sqrt's argument when that argument is a float home.
+Function.FPUCompileX86_SqrtHome {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(node), AST.CALL) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(StringCompare(AST_GetData1(node), "Float_Sqrt"), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetChildCount(node), 1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(FPUCompileX86_HomeSlot(AST_GetChild(node, 0)))
     }
 }
 
@@ -309,62 +550,222 @@ Function.FPUCompileX86_FloatBinOp {
         arg0 = AST_GetChild(node, 0)
         arg1 = AST_GetChild(node, 1)
 
+        // FMA reads each argument from rax. Nested float children must
+        // still write rax while that pattern is matched.
+        saved = OptState.xmm_out
+        OptState.xmm_out = 0
         IfCondition EqualTo(op, FloatOp.ADD) ThenBlock: {
             fused = FPUCompileX86_TryFuseFMA(arg0, arg1, 0)
-            IfCondition EqualTo(fused, 1) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(fused, 1) ThenBlock: {
+                OptState.xmm_out = saved
+                ReturnValue(1)
+            }
             fused = FPUCompileX86_TryFuseFMA(arg1, arg0, 0)
-            IfCondition EqualTo(fused, 1) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(fused, 1) ThenBlock: {
+                OptState.xmm_out = saved
+                ReturnValue(1)
+            }
         }
         IfCondition EqualTo(op, FloatOp.SUB) ThenBlock: {
             fused = FPUCompileX86_TryFuseFMA(arg0, arg1, 1)
-            IfCondition EqualTo(fused, 1) ThenBlock: { ReturnValue(1) }
+            IfCondition EqualTo(fused, 1) ThenBlock: {
+                OptState.xmm_out = saved
+                ReturnValue(1)
+            }
         }
 
-        // Two leaves: xmm0 and xmm1, no push. A float home is already in xmm2.
-        both = 0
-        IfCondition EqualTo(Optimize_IsLeaf(arg0), 1) ThenBlock: {
-            IfCondition EqualTo(Optimize_IsLeaf(arg1), 1) ThenBlock: { both = 1 }
+        // home * sqrt(home) is sqrtsd into xmm0, then mulsd by the home.
+        // The copy through xmm1 is the same rounding and a longer chain.
+        IfCondition EqualTo(FPUCompileX86_MemCommute(op), 1) ThenBlock: {
+            sslot = 0
+            hslot = 0
+            sslot = FPUCompileX86_SqrtHome(arg1)
+            hslot = FPUCompileX86_HomeSlot(arg0)
+            IfCondition LessThan(sslot, 2) ThenBlock: {
+                sslot = FPUCompileX86_SqrtHome(arg0)
+                hslot = FPUCompileX86_HomeSlot(arg1)
+            }
+            IfCondition GreaterEqual(sslot, 2) ThenBlock: {
+                IfCondition GreaterEqual(hslot, 2) ThenBlock: {
+                    X86_XmmBin(81, 0, sslot)
+                    opc = FPUCompileX86_MemOpcode(op)
+                    X86_XmmBin(opc, 0, hslot)
+                    ReturnValue(FPUCompileX86_FinishXmm(saved))
+                }
+            }
         }
-        IfCondition EqualTo(both, 1) ThenBlock: {
-            got0 = Optimize_LoadLeafXmm(arg0, 0)
-            IfCondition EqualTo(got0, 0) ThenBlock: { ReturnValue(0) }
-            got1 = Optimize_LoadLeafXmm(arg1, 1)
-            IfCondition EqualTo(got1, 0) ThenBlock: { ReturnValue(0) }
-            IfCondition EqualTo(op, FloatOp.ADD) ThenBlock: { Trans_Asm("ADDSD xmm0, xmm1") }
-            IfCondition EqualTo(op, FloatOp.SUB) ThenBlock: { Trans_Asm("SUBSD xmm0, xmm1") }
-            IfCondition EqualTo(op, FloatOp.MUL) ThenBlock: { Trans_Asm("MULSD xmm0, xmm1") }
-            IfCondition EqualTo(op, FloatOp.DIV) ThenBlock: { Trans_Asm("DIVSD xmm0, xmm1") }
-            IfCondition EqualTo(op, FloatOp.MIN) ThenBlock: { Trans_Asm("MINSD xmm0, xmm1") }
-            IfCondition EqualTo(op, FloatOp.MAX) ThenBlock: { Trans_Asm("MAXSD xmm0, xmm1") }
-            Trans_Asm("MOVQ rax, xmm0")
-            ReturnValue(1)
+
+        // A leaf or an integer-only operand is loaded after the other side,
+        // so a float home or a table word is not pushed. The xmm0 hold is
+        // copied aside before anything else writes xmm0. OptState.xmm_out
+        // asks a nested float operation to leave the bits in xmm0.
+        ready = 0
+        hold0 = Optimize_IsXmmHold(arg0)
+        hold1 = Optimize_IsXmmHold(arg1)
+        leaf0 = Optimize_IsLeaf(arg0)
+        leaf1 = Optimize_IsLeaf(arg1)
+
+        // A scaled qword load stays in memory. The other operand is already
+        // in xmm0 before rcx is set, because that operand may itself use rcx.
+        mem = 0
+        IfCondition EqualTo(Optimize_QwordMemOk(arg1, arg0), 1) ThenBlock: {
+            scale = Optimize_QwordScale(arg1)
+            got = Optimize_CompileXmm(arg0)
+            IfCondition EqualTo(got, 0) ThenBlock: {
+                OptState.xmm_out = saved
+                ReturnValue(0)
+            }
+            got = Optimize_QwordMemAddr(arg1, arg0)
+            IfCondition EqualTo(got, 0) ThenBlock: {
+                OptState.xmm_out = saved
+                ReturnValue(0)
+            }
+            opc = FPUCompileX86_MemOpcode(op)
+            X86_XmmScaled(opc, 0, scale, LoopHome.sib_index)
+            Optimize_QwordRestore(arg1)
+            ready = 1
+            mem = 1
         }
-        
-        // Compile first arg -> RAX (float bits), bitwise load to XMM0
-        Compile_Expression(arg0)
-        Trans_Asm("MOVQ xmm0, rax")
-        X86_PushXMM0()
-        
-        // Compile second arg -> RAX (float bits), bitwise load
-        Compile_Expression(arg1)
-        Trans_Asm("MOVQ xmm0, rax")
-        Trans_Asm("MOVSD xmm1, xmm0")
-        
-        // Restore first arg to XMM0
-        X86_PopXMM0()
-        
-        // Emit operation
-        IfCondition EqualTo(op, FloatOp.ADD) ThenBlock: { Trans_Asm("ADDSD xmm0, xmm1") }
-        IfCondition EqualTo(op, FloatOp.SUB) ThenBlock: { Trans_Asm("SUBSD xmm0, xmm1") }
-        IfCondition EqualTo(op, FloatOp.MUL) ThenBlock: { Trans_Asm("MULSD xmm0, xmm1") }
-        IfCondition EqualTo(op, FloatOp.DIV) ThenBlock: { Trans_Asm("DIVSD xmm0, xmm1") }
-        IfCondition EqualTo(op, FloatOp.MIN) ThenBlock: { Trans_Asm("MINSD xmm0, xmm1") }
-        IfCondition EqualTo(op, FloatOp.MAX) ThenBlock: { Trans_Asm("MAXSD xmm0, xmm1") }
-        
-        // Result bits back to RAX (bitwise, no truncation)
-        Trans_Asm("MOVQ rax, xmm0")
-        
-        ReturnValue(1)
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            IfCondition EqualTo(FPUCompileX86_MemCommute(op), 1) ThenBlock: {
+                IfCondition EqualTo(Optimize_QwordMemOk(arg0, arg1), 1) ThenBlock: {
+                    scale = Optimize_QwordScale(arg0)
+                    got = Optimize_CompileXmm(arg1)
+                    IfCondition EqualTo(got, 0) ThenBlock: {
+                        OptState.xmm_out = saved
+                        ReturnValue(0)
+                    }
+                    got = Optimize_QwordMemAddr(arg0, arg1)
+                    IfCondition EqualTo(got, 0) ThenBlock: {
+                        OptState.xmm_out = saved
+                        ReturnValue(0)
+                    }
+                    opc = FPUCompileX86_MemOpcode(op)
+                    X86_XmmScaled(opc, 0, scale, LoopHome.sib_index)
+                    Optimize_QwordRestore(arg0)
+                    ready = 1
+                    mem = 1
+                }
+            }
+        }
+
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            IfCondition EqualTo(hold0, 1) ThenBlock: {
+                IfCondition EqualTo(leaf1, 0) ThenBlock: {
+                    IfCondition EqualTo(Optimize_GprSafe(arg1), 1) ThenBlock: {
+                        OptState.xmm_out = 0
+                        Compile_Expression(arg1)
+                        OptState.xmm_out = saved
+                        Trans_Asm("MOVQ xmm1, rax")
+                    } ElseBlock: {
+                        X86_PushXMM0()
+                        Optimize_CompileXmm(arg1)
+                        Trans_Asm("MOVSD xmm1, xmm0")
+                        X86_PopXMM0()
+                    }
+                    ready = 1
+                }
+            }
+        }
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            IfCondition EqualTo(hold1, 1) ThenBlock: {
+                IfCondition EqualTo(leaf0, 0) ThenBlock: {
+                    Trans_Asm("MOVSD xmm1, xmm0")
+                    Optimize_CompileXmm(arg0)
+                    ready = 1
+                }
+            }
+        }
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            IfCondition EqualTo(leaf0, 1) ThenBlock: {
+                IfCondition EqualTo(leaf1, 1) ThenBlock: {
+                    IfCondition EqualTo(hold1, 1) ThenBlock: {
+                        Trans_Asm("MOVSD xmm1, xmm0")
+                        got0 = Optimize_LoadLeafXmm(arg0, 0)
+                        IfCondition EqualTo(got0, 0) ThenBlock: {
+                            OptState.xmm_out = saved
+                            ReturnValue(0)
+                        }
+                    } ElseBlock: {
+                        got0 = Optimize_LoadLeafXmm(arg0, 0)
+                        IfCondition EqualTo(got0, 0) ThenBlock: {
+                            OptState.xmm_out = saved
+                            ReturnValue(0)
+                        }
+                        got1 = Optimize_LoadLeafXmm(arg1, 1)
+                        IfCondition EqualTo(got1, 0) ThenBlock: {
+                            OptState.xmm_out = saved
+                            ReturnValue(0)
+                        }
+                    }
+                    ready = 1
+                }
+            }
+        }
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            IfCondition EqualTo(leaf1, 1) ThenBlock: {
+                Optimize_CompileXmm(arg0)
+                got1 = Optimize_LoadLeafXmm(arg1, 1)
+                IfCondition EqualTo(got1, 0) ThenBlock: {
+                    OptState.xmm_out = saved
+                    ReturnValue(0)
+                }
+                ready = 1
+            }
+        }
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            placed = FPUCompileX86_DivFromInt(arg0, arg1, op)
+            IfCondition EqualTo(placed, 2) ThenBlock: {
+                OptState.xmm_out = saved
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(placed, 1) ThenBlock: { ready = 1 }
+        }
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            IfCondition EqualTo(leaf0, 1) ThenBlock: {
+                Optimize_CompileXmm(arg1)
+                Trans_Asm("MOVSD xmm1, xmm0")
+                got0 = Optimize_LoadLeafXmm(arg0, 0)
+                IfCondition EqualTo(got0, 0) ThenBlock: {
+                    OptState.xmm_out = saved
+                    ReturnValue(0)
+                }
+                ready = 1
+            }
+        }
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            IfCondition EqualTo(Optimize_GprSafe(arg1), 1) ThenBlock: {
+                Optimize_CompileXmm(arg0)
+                OptState.xmm_out = 0
+                Compile_Expression(arg1)
+                OptState.xmm_out = saved
+                Trans_Asm("MOVQ xmm1, rax")
+                ready = 1
+            }
+        }
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            IfCondition EqualTo(Optimize_GprSafe(arg0), 1) ThenBlock: {
+                Optimize_CompileXmm(arg1)
+                Trans_Asm("MOVSD xmm1, xmm0")
+                OptState.xmm_out = 0
+                Compile_Expression(arg0)
+                OptState.xmm_out = saved
+                Trans_Asm("MOVQ xmm0, rax")
+                ready = 1
+            }
+        }
+        IfCondition EqualTo(ready, 0) ThenBlock: {
+            Optimize_CompileXmm(arg0)
+            X86_PushXMM0()
+            Optimize_CompileXmm(arg1)
+            Trans_Asm("MOVSD xmm1, xmm0")
+            X86_PopXMM0()
+        }
+
+        IfCondition EqualTo(mem, 0) ThenBlock: {
+            FPUCompileX86_EmitBin(op)
+        }
+        ReturnValue(FPUCompileX86_FinishXmm(saved))
     }
 }
 
@@ -386,15 +787,11 @@ Function.FPUCompileX86_FloatSqrt {
         }
         
         arg = AST_GetChild(node, 0)
-        Compile_Expression(arg)
-        // double bits in RAX → XMM0 low 64
-        Trans_Asm("MOVQ xmm0, rax")
+        saved = OptState.xmm_out
+        Optimize_CompileXmm(arg)
         // SQRTSD xmm0, xmm0  (F2 0F 51 C0) — full double precision
         Trans_Asm("SQRTSD xmm0, xmm0")
-        // result bits back to RAX
-        Trans_Asm("MOVQ rax, xmm0")
-        
-        ReturnValue(1)
+        ReturnValue(FPUCompileX86_FinishXmm(saved))
     }
 }
 
@@ -408,11 +805,10 @@ Function.FPUCompileX86_FloatAbs {
             ReturnValue(0)
         }
         arg = AST_GetChild(node, 0)
-        Compile_Expression(arg)
-        Trans_Asm("MOVQ xmm0, rax")
+        saved = OptState.xmm_out
+        Optimize_CompileXmm(arg)
         Trans_ClearSignXmm0()
-        Trans_Asm("MOVQ rax, xmm0")
-        ReturnValue(1)
+        ReturnValue(FPUCompileX86_FinishXmm(saved))
     }
 }
 
@@ -426,11 +822,10 @@ Function.FPUCompileX86_FloatNeg {
             ReturnValue(0)
         }
         arg = AST_GetChild(node, 0)
-        Compile_Expression(arg)
-        Trans_Asm("MOVQ xmm0, rax")
+        saved = OptState.xmm_out
+        Optimize_CompileXmm(arg)
         Trans_NegateXmm0()
-        Trans_Asm("MOVQ rax, xmm0")
-        ReturnValue(1)
+        ReturnValue(FPUCompileX86_FinishXmm(saved))
     }
 }
 
@@ -591,10 +986,12 @@ Function.FPUCompileX86_FloatFromInt {
     Output: Integer
     Body: {
         arg = AST_GetChild(node, 0)
-        Compile_Expression(arg)       // integer in RAX
-        Trans_Asm("CVTSI2SD xmm0, rax")      // convert int64 → double in XMM0
-        Trans_Asm("MOVQ rax, xmm0")          // store float bits in RAX
-        ReturnValue(1)
+        saved = OptState.xmm_out
+        OptState.xmm_out = 0
+        Compile_Expression(arg)
+        OptState.xmm_out = saved
+        Trans_Asm("CVTSI2SD xmm0, rax")
+        ReturnValue(FPUCompileX86_FinishXmm(saved))
     }
 }
 

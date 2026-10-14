@@ -20,6 +20,7 @@ LibraryImport.Arrays
 LibraryImport.Compiler.Frontend.AST.CASTTypes
 LibraryImport.Compiler.Frontend.AST.CASTCore
 LibraryImport.Compiler.CodeEmit.CEmitCoreArch
+LibraryImport.Compiler.CodeEmit.CEmitTags
 LibraryImport.Compiler.Compile.Modules.CCompileScope
 // Needed for extern-call relocs in -kmod mode (see CompileFunc_ExternCall)
 LibraryImport.Compiler.Link.OS.Linux.ELFKernelModule
@@ -85,16 +86,16 @@ LibraryImport.Compiler.Link.OS.Linux.ELFKernelModule
 //   [pushed callee-saved registers below this]
 //   RSP ->
 //
-// CALLEE-SAVED REGISTERS (must preserve across calls):
-//   RBX, R12, R13, R14, R15, RBP
-//   Currently saving: RBX, R12, R13, R14 (R15 reserved for pool base)
+// CALLEE-SAVED REGISTERS:
+//   This prologue saves RBX and R12 only. R13, R14, and R11 are scratch.
+//   R15 is the pool base and is not saved here. RBP is the frame pointer.
 //
 // CALLER-SAVED REGISTERS (scratch, not preserved):
-//   RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11
+//   RAX, RCX, RDX, RSI, RDI, R8, R9, R10, R11, R13, R14
 //
-// NOTE: R12 is used for RSP preservation during aligned calls.
-// Since R12 is callee-saved, it survives nested function calls during
-// argument evaluation, making it robust for any call depth.
+// NOTE: R12 is the RSP save across an aligned call. The prologue preserves
+// it, so the restore survives a nested call. Do not park RSP in R11, R13,
+// or R14.
 //
 // =============================================================================
 
@@ -147,12 +148,7 @@ Function.CompileFunc_Function {
         Emit_MarkLabel(func_label)
         Listing_Anchor(func_name)
         
-        // === FUNCTION PROLOGUE ===
-        Listing_Compiler("frame")
-        Emit_PushRbp()
-        Emit_MovRegReg(Reg.RBP, Reg.RSP)
-        
-        // Count parameters and find body BEFORE allocating stack
+        // Count parameters and find body before any frame bytes.
         param_count = 0
         body_node = 0
         
@@ -178,6 +174,32 @@ Function.CompileFunc_Function {
         IfCondition NotEqual(body_node, 0) ThenBlock: {
             Optimize_InlinePrepare(node, body_node)
         }
+
+        // A single return of Add or Subtract on parameters and fit32
+        // numbers reads rdi-r9 and returns. No frame, no rbx, no r12.
+        EmitTag_MarkBoundary()
+        reg_expr = Optimize_RegLeafExpr(node, body_node)
+        IfCondition NotEqual(reg_expr, 0) ThenBlock: {
+            Listing_Compiler("reg leaf")
+            got_leaf = Optimize_EmitRegLeaf(node, reg_expr)
+            IfCondition EqualTo(got_leaf, 0) ThenBlock: {
+                Compile.error = 1
+            }
+            Emit_Ret()
+            Emit_MarkLabel(skip_label)
+            Listing_EndFunc()
+            Scope_ClearFunctionParams(func_name)
+            Scope_Restore()
+            Compile.current_func = prev_func
+            Compile.stack_size = prev_stack_size
+            Compile.current_return_label = prev_return_label
+            ReturnValue(1)
+        }
+
+        // === FUNCTION PROLOGUE ===
+        Listing_Compiler("frame")
+        Emit_PushRbp()
+        Emit_MovRegReg(Reg.RBP, Reg.RSP)
 
         // Build parameter name list for exclusion
         param_names = Array.Create(16)
@@ -382,6 +404,7 @@ Function.CompileFunc_SubRoutine {
         
         // === SUBROUTINE PROLOGUE ===
         Listing_Compiler("frame")
+        EmitTag_MarkBoundary()
         Emit_PushRbp()
         Emit_MovRbpRsp()
         
@@ -654,6 +677,22 @@ Function.CompileFunc_UserCall {
             Emit_MovRdiRax()
         } ElseBlock: {
             IfCondition GreaterThan(arg_count, 1) ThenBlock: {
+                // Names and numbers do not clobber rdi-r9. Move each one
+                // straight into its argument register. Anything else still
+                // pushes, because a call or a float home would.
+                direct = 0
+                IfCondition LessEqual(arg_count, 6) ThenBlock: {
+                    direct = CompileFunc_ArgsPlain(node)
+                }
+                IfCondition EqualTo(direct, 1) ThenBlock: {
+                    i = 0
+                    WhileLoop LessThan(i, arg_count) {
+                        dst = CompileFunc_ArgReg(i)
+                        got = CompileFunc_LoadArg(dst, AST_GetChild(node, i))
+                        IfCondition EqualTo(got, 0) ThenBlock: { ReturnValue(0) }
+                        i = Add(i, 1)
+                    }
+                } ElseBlock: {
                 // MULTI-ARG PATH: push in reverse, pop into registers
                 i = Subtract(arg_count, 1)
                 WhileLoop GreaterEqual(i, 0) {
@@ -680,6 +719,7 @@ Function.CompileFunc_UserCall {
                 }
                 IfCondition GreaterEqual(arg_count, 6) ThenBlock: {
                     Emit_PopR9()
+                }
                 }
             }
         }
@@ -1455,11 +1495,100 @@ Function.CompileFunc_InlineFunction {
     }
 }
 
+// SysV argument register for slot 0..5. -1 when the slot is on the stack.
+Function.CompileFunc_ArgReg {
+    Input: index: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(index, 0) ThenBlock: { ReturnValue(Reg.RDI) }
+        IfCondition EqualTo(index, 1) ThenBlock: { ReturnValue(Reg.RSI) }
+        IfCondition EqualTo(index, 2) ThenBlock: { ReturnValue(Reg.RDX) }
+        IfCondition EqualTo(index, 3) ThenBlock: { ReturnValue(Reg.RCX) }
+        IfCondition EqualTo(index, 4) ThenBlock: { ReturnValue(Reg.R8) }
+        IfCondition EqualTo(index, 5) ThenBlock: { ReturnValue(Reg.R9) }
+        ReturnValue(-1)
+    }
+}
+
+// 1 when every argument is a number or an integer name. A float home or a
+// held value lives in xmm, so the push path still materializes it.
+Function.CompileFunc_ArgPlain {
+    Input: arg: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(arg, 0) ThenBlock: { ReturnValue(0) }
+        kind = AST_GetType(arg)
+        IfCondition EqualTo(kind, AST.NUMBER) ThenBlock: { ReturnValue(1) }
+        IfCondition NotEqual(kind, AST.IDENTIFIER) ThenBlock: { ReturnValue(0) }
+        name = AST_GetData1(arg)
+        IfCondition EqualTo(Optimize_IsFltHome(name), 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(LoopHome.hold_on, 1) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(name, LoopHome.hold_name), 1) ThenBlock: {
+                ReturnValue(0)
+            }
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.CompileFunc_ArgsPlain {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        n = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(CompileFunc_ArgPlain(AST_GetChild(node, i)), 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Move one plain argument into dst. Homes and numbers do not use rdi-r9.
+// A stack name is loaded through rax after the earlier argument registers
+// are already set, and that load only writes rax.
+Function.CompileFunc_LoadArg {
+    Input: dst: Integer
+    Input: arg: Address
+    Output: Integer
+    Body: {
+        kind = AST_GetType(arg)
+        IfCondition EqualTo(kind, AST.NUMBER) ThenBlock: {
+            val = StringToNumber(AST_GetData1(arg))
+            Emit_MovRegImm64(dst, val)
+            ReturnValue(1)
+        }
+        name = AST_GetData1(arg)
+        IfCondition EqualTo(Optimize_IsIntHome(name), 1) ThenBlock: {
+            Emit_MovRegReg(dst, Reg.R13)
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(Optimize_IsAccHome(name), 1) ThenBlock: {
+            Emit_MovRegReg(dst, Reg.R12)
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(LoopHome.der_on, 1) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(name, LoopHome.der_name), 1) ThenBlock: {
+                Emit_MovRegReg(dst, Reg.R11)
+                ReturnValue(1)
+            }
+        }
+        got = Compile_Expression(arg)
+        IfCondition EqualTo(got, 0) ThenBlock: { ReturnValue(0) }
+        Emit_MovRegReg(dst, Reg.RAX)
+        ReturnValue(1)
+    }
+}
+
 // =============================================================================
 // LEAF FUNCTION DETECTION
-// Returns 1 if the subtree contains a CALL or DebugPerf, 0 if neither.
+// Returns 1 if the subtree contains a CALL, a Branch, or DebugPerf.
 // Leaf functions skip callee-save and sub rsp and keep locals in the red
-// zone. DebugPerf emits CPUID (clobbers RBX) and PUSH (writes [rbp-8]).
+// zone. A Branch slow path pushes, which would overwrite param 1 at
+// [rbp-8] while RSP still equals RBP. DebugPerf pushes there too.
 // =============================================================================
 Function.CompileFunc_HasCalls {
     Input: node: Address
@@ -1469,6 +1598,7 @@ Function.CompileFunc_HasCalls {
 
         node_type = AST_GetType(node)
         IfCondition EqualTo(node_type, AST.CALL) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(node_type, AST.SWITCH) ThenBlock: { ReturnValue(1) }
         IfCondition EqualTo(node_type, AST.DEBUG_PERF) ThenBlock: { ReturnValue(1) }
 
         child_count = AST_GetChildCount(node)
