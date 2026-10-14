@@ -82,6 +82,8 @@ The compiler is actively developed with ongoing improvements:
 - **Code Generation** — Continuous optimization of emitted machine code
 - **Performance Tuning** — Refinements to compilation speed and output quality
 - **x86 Instruction Support** — Complete 10k instruction library with full encoding/emit capabilities
+- **Assembly Listings** — `-asm` / `-asm-all` emit source-annotated disassembly beside the binary
+- **Tree Shaking** — `-TS` prunes unreachable functions from the final executable
 - **HDL to Verilog Synthesis** — Early-stage hardware description language compilation for hardware development
 
 ## 57 POSIX CoreUtils
@@ -139,6 +141,17 @@ Production-grade Unix utilities, 50-71% smaller than GNU equivalents:
 Compile AILang source:
 ```bash
 ailang.x your_program.ailang
+```
+
+Emit an annotated assembly listing alongside the binary:
+```bash
+ailang.x -asm your_program.ailang        # program functions only
+ailang.x -asm-all your_program.ailang    # includes library bodies
+```
+
+Tree-shake dead code (emit only functions reachable from the program):
+```bash
+ailang.x -TS your_program.ailang
 ```
 
 ### VS Code Integration
@@ -208,4 +221,4 @@ Modifications must be submitted upstream per SCSL. See module READMEs for guidel
 
 Built for performance. Built for clarity. Built entirely in itself. Built for AI.
 
-*Last updated: August 2026*
+*Last updated: October 2026*

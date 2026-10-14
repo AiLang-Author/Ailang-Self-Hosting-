@@ -11,6 +11,10 @@ See also `WORKSPACE.md` at the repo root for the monorepo philosophy.
 |------|----------|
 | `language/` | Language warts, programming guide notes, oddities |
 | `benchmarks/shapes/` | C and C++ versus AILANG shape-area timing harness, line count, and binary size |
+| `benchmarks/spectral-norm/` | Plain spectral-norm versus g++ -O3. Published answer 1.274224153 at N=5500 |
+| `benchmarks/matmul/` | 64x64 f64 matmul, 2x2 register tile, versus scalar g++ -O3 |
+| `benchmarks/nbody/` | Five-body solar system versus scalar g++ -O3. Both energies match. Pinned N=1000000 is about 0.29–0.32 s versus 0.153 s |
+| `benchmarks/fannkuch/` | Single-thread fannkuch-redux versus scalar g++ -O3. n=12 checksum 3968050, max flips 65 |
 | `compiler/` | Architecture, `FPU_ISA_PLAN.md`, `MATH_PRIMITIVES.md` (float/int inventory) |
 | `display/` | Auckland UI / window system / input |
 | `design/` | Design specs, compiler/display design history |

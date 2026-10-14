@@ -3,7 +3,7 @@
 **Project:** AILANG Media / SynthKit  
 **Author:** Sean Collins, 2 Paws Machine and Engineering  
 **Date:** 2026-09-17  
-**Status:** Skeleton + stereo SF2 loadable. Next: one slice at a time, starting with live MIDI-in.
+**Status:** Reference player and synth work. The DAW plan is `DAW/PLAN.md` (updated 2026-09-25). Do not treat the slice list below as the current queue.
 
 Copyright © 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
 

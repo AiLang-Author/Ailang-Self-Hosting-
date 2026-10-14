@@ -13,25 +13,32 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-#include "pcm_play.h"
 #include "midi_in.h"
+#include "surge_fxp.h"
 
 static char dir[512];
-static char path_keys[600], path_ctl[600], path_cmd[600], path_pcm[600], path_bank[600], path_midi[600];
-static char path_song[600], path_song_cmd[600];
+static char path_keys[600], path_ctl[600], path_cmd[600], path_pcm[600], path_midi[600];
+static char path_song[600], path_song_cmd[600], path_surge[600], path_heard[600];
+static char heard_last[256];
 
 static int k_c, k_d, k_e, k_f, k_g, k_a, k_b, k_sus;
-static int wave, cutoff = 256, res, delayms, fb, wet, vol = 200, atk = 8, dec = 80, rel = 180, oct = 2, pw = 64;
-static int detune, fenv, lforate, lfopwm, submix, drive;
-static int wave2 = 3, oscmix, o2oct = 2, suslvl = 180, lfofilt, lfoamp;
-static int modv, md0 = 1, ma0 = 200, md1, ma1, md2, ma2;
+static int wave = 0, cutoff = 256, res = 0, delayms = 0, fb = 0, wet = 0, vol = 80, atk = 4, dec = 200, rel = 200, oct = 2, pw = 128;
+static int detune = 0, fenv = 0, lforate = 0, lfopwm = 0, submix = 0, drive = 0;
+static int wave2 = 0, oscmix = 0, o2oct = 2, suslvl = 256, lfofilt = 0, lfoamp = 0;
+static int modv = 0, md0 = 0, ma0 = 0, md1 = 0, ma1 = 0, md2 = 0, ma2 = 0;
 static int applying;
 static void set_sc(GtkWidget *s, int *var, int v);
 
 static GtkWidget *lbl_status;
 static GtkWidget *win_main;
+static GtkWidget *btn_patch;
+static GtkWidget *btn_song;
+static char surge_path[700];
+static char song_path[700];
 static GtkWidget *combo_wave;
 static GtkWidget *combo_wave2;
+static GtkWidget *lbl_wave;
+static GtkWidget *lbl_wave2;
 static GtkWidget *sc[25];
 static GtkWidget *combo_md[3];
 static char presets_dir[700];
@@ -53,6 +60,70 @@ static void write_keys(void) {
     write_file(path_keys, buf);
 }
 
+static int ctl_ints[31];
+
+static void load_ctl_file(void) {
+    FILE *f = fopen(path_ctl, "r");
+    if (!f) return;
+    int n = 0;
+    while (n < 31 && fscanf(f, "%d", &ctl_ints[n]) == 1) n++;
+    fclose(f);
+    if (n < 22) return;
+    applying = 1;
+    wave = ctl_ints[0];
+    cutoff = ctl_ints[1];
+    res = ctl_ints[2];
+    delayms = ctl_ints[3];
+    fb = ctl_ints[4];
+    wet = ctl_ints[5];
+    vol = ctl_ints[6];
+    atk = ctl_ints[7];
+    dec = ctl_ints[8];
+    rel = ctl_ints[9];
+    oct = ctl_ints[10];
+    pw = ctl_ints[11];
+    detune = ctl_ints[12];
+    fenv = ctl_ints[13];
+    lforate = ctl_ints[14];
+    lfopwm = ctl_ints[15];
+    submix = ctl_ints[16];
+    drive = ctl_ints[17];
+    wave2 = ctl_ints[18];
+    oscmix = ctl_ints[19];
+    o2oct = ctl_ints[20];
+    suslvl = ctl_ints[21];
+    if (n > 22) lfofilt = ctl_ints[22];
+    if (n > 23) lfoamp = ctl_ints[23];
+    if (wave < 0) wave = 0;
+    if (wave > 7) wave = 7;
+    if (wave2 < 0) wave2 = 0;
+    if (wave2 > 7) wave2 = 7;
+    if (combo_wave) gtk_combo_box_set_active(GTK_COMBO_BOX(combo_wave), wave);
+    if (combo_wave2) gtk_combo_box_set_active(GTK_COMBO_BOX(combo_wave2), wave2);
+    set_sc(sc[0], &cutoff, cutoff);
+    set_sc(sc[1], &res, res);
+    set_sc(sc[2], &pw, pw);
+    set_sc(sc[3], &detune, detune);
+    set_sc(sc[4], &fenv, fenv);
+    set_sc(sc[5], &submix, submix);
+    set_sc(sc[6], &drive, drive);
+    set_sc(sc[7], &lforate, lforate);
+    set_sc(sc[8], &lfopwm, lfopwm);
+    set_sc(sc[9], &atk, atk);
+    set_sc(sc[10], &dec, dec);
+    set_sc(sc[11], &rel, rel);
+    set_sc(sc[12], &vol, vol);
+    set_sc(sc[13], &delayms, delayms);
+    set_sc(sc[14], &fb, fb);
+    set_sc(sc[15], &wet, wet);
+    set_sc(sc[20], &oscmix, oscmix);
+    set_sc(sc[21], &o2oct, o2oct);
+    set_sc(sc[22], &suslvl, suslvl);
+    set_sc(sc[23], &lfofilt, lfofilt);
+    set_sc(sc[24], &lfoamp, lfoamp);
+    applying = 0;
+}
+
 static void write_ctl(void) {
     char buf[384];
     snprintf(buf, sizeof buf,
@@ -66,50 +137,78 @@ static void write_ctl(void) {
 
 static void write_cmd(const char *s) { write_file(path_cmd, s); }
 
-static void write_bank(const char *p) {
-    if (!p || !p[0]) return;
-    write_file(path_bank, p);
-    wave = 8;
-    if (combo_wave) gtk_combo_box_set_active(GTK_COMBO_BOX(combo_wave), 8);
-    write_ctl();
-}
-
 static void write_song_cmd(const char *s) { write_file(path_song_cmd, s); }
 
-static void on_song_file(GtkFileChooserButton *b, gpointer) {
-    char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(b));
-    if (!fn) return;
-    write_file(path_song, fn);
-    g_free(fn);
-}
-
-static void on_song_play(GtkButton *, gpointer) { write_song_cmd("play\n"); }
-static void on_song_stop(GtkButton *, gpointer) { write_song_cmd("stop\n"); }
-
-static void on_bank_file(GtkFileChooserButton *b, gpointer) {
-    char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(b));
-    if (!fn) return;
-    write_bank(fn);
-    g_free(fn);
-}
-
-static void on_bank_combo(GtkComboBox *c, gpointer) {
-    int id = gtk_combo_box_get_active(c);
-    if (id <= 0) {
-        wave = 3;
-        if (combo_wave) gtk_combo_box_set_active(GTK_COMBO_BOX(combo_wave), 3);
-        write_ctl();
+static void slurp_line(const char *path, char *dest, size_t n) {
+    FILE *f = fopen(path, "r");
+    if (n) dest[0] = 0;
+    if (!f || n < 2) {
+        if (f) fclose(f);
         return;
     }
-    const char *p = NULL;
-    if (id == 1) p = "/home/bob/Downloads/PTQ.sf2";
-    else if (id == 2) p = "/home/bob/Downloads/Studio_Grand_Concert.sf2";
-    else if (id == 3) p = "/home/bob/Ailang-Self-Hosting-/tests/sample/sine_c4.sf2";
-    else if (id == 4) p = "/home/bob/Downloads/GeneralUser-GS.sf2";
-    else if (id == 5) p = "/home/bob/Downloads/FluidR3_GM.sf2";
-    else if (id == 6) p = "/usr/share/sounds/sf2/FluidR3_GM.sf2";
-    if (p) write_bank(p);
+    if (!fgets(dest, (int)n, f)) dest[0] = 0;
+    fclose(f);
+    size_t L = strlen(dest);
+    while (L && (dest[L - 1] == '\n' || dest[L - 1] == '\r')) dest[--L] = 0;
 }
+
+static const char *base_name(const char *path) {
+    const char *s = strrchr(path, '/');
+    if (s && s[1]) return s + 1;
+    return path;
+}
+
+static void set_btn_name(GtkWidget *btn, const char *fallback, const char *path) {
+    if (!btn) return;
+    if (!path || !path[0]) {
+        gtk_button_set_label(GTK_BUTTON(btn), fallback);
+        return;
+    }
+    char lab[200];
+    snprintf(lab, sizeof lab, "%s", base_name(path));
+    gtk_button_set_label(GTK_BUTTON(btn), lab);
+}
+
+/* GtkFileChooserButton aborts in gtkpathbar when the folder changes
+   (GTK 3.24.41). The system dialog runs out of process. */
+static int pick_path(const char *title, const char *folder, const char *cur,
+                     const char *filt_name, const char *pat1, const char *pat2,
+                     char *dest, size_t destn) {
+    GtkFileChooserNative *native = gtk_file_chooser_native_new(
+        title, GTK_WINDOW(win_main), GTK_FILE_CHOOSER_ACTION_OPEN,
+        "_Open", "_Cancel");
+    GtkFileFilter *pf = gtk_file_filter_new();
+    gtk_file_filter_set_name(pf, filt_name);
+    gtk_file_filter_add_pattern(pf, pat1);
+    if (pat2 && pat2[0]) gtk_file_filter_add_pattern(pf, pat2);
+    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(native), pf);
+    if (cur && cur[0] && g_file_test(cur, G_FILE_TEST_EXISTS))
+        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(native), cur);
+    else if (folder && folder[0])
+        gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(native), folder);
+    int ok = 0;
+    if (gtk_native_dialog_run(GTK_NATIVE_DIALOG(native)) == GTK_RESPONSE_ACCEPT) {
+        char *fn = gtk_file_chooser_get_filename(GTK_FILE_CHOOSER(native));
+        if (fn && fn[0]) {
+            snprintf(dest, destn, "%s", fn);
+            ok = 1;
+        }
+        g_free(fn);
+    }
+    g_object_unref(native);
+    return ok;
+}
+
+static void on_song_play(GtkButton *, gpointer) {
+    if (song_path[0]) {
+        char line[700];
+        snprintf(line, sizeof line, "%s\n", song_path);
+        write_file(path_song, line);
+        fprintf(stderr, "synth: song %s\n", song_path);
+    }
+    write_song_cmd("play\n");
+}
+static void on_song_stop(GtkButton *, gpointer) { write_song_cmd("stop\n"); }
 
 static int map_key(guint kv, int on) {
     int *slot = NULL;
@@ -175,16 +274,33 @@ static void on_wave2(GtkComboBox *c, gpointer) {
     if (!applying) write_ctl();
 }
 
+static const char *wave_names[] = {
+    "Sine", "Square", "Pulse", "Saw", "Tri", "Noise", "NES tri", "User"
+};
+
 static void fill_wave(GtkComboBoxText *c) {
-    gtk_combo_box_text_append_text(c, "Sine");
-    gtk_combo_box_text_append_text(c, "Square");
-    gtk_combo_box_text_append_text(c, "Pulse");
-    gtk_combo_box_text_append_text(c, "Saw");
-    gtk_combo_box_text_append_text(c, "Tri");
-    gtk_combo_box_text_append_text(c, "Noise");
-    gtk_combo_box_text_append_text(c, "NES tri");
-    gtk_combo_box_text_append_text(c, "User");
-    gtk_combo_box_text_append_text(c, "Sample");
+    for (int i = 0; i < 8; i++)
+        gtk_combo_box_text_append_text(c, wave_names[i]);
+}
+
+/* Rebuild the menu. GTK 3.24 keeps the old word painted on the closed
+   combo after set_active from a timer, so the row list is replaced. */
+static void show_wave(GtkWidget *combo, gpointer cb, GtkWidget *lab,
+                      const char *prefix, int active) {
+    if (active < 0) active = 0;
+    if (active > 7) active = 7;
+    if (combo) {
+        if (cb) g_signal_handlers_block_by_func(combo, cb, NULL);
+        gtk_combo_box_text_remove_all(GTK_COMBO_BOX_TEXT(combo));
+        fill_wave(GTK_COMBO_BOX_TEXT(combo));
+        gtk_combo_box_set_active(GTK_COMBO_BOX(combo), active);
+        if (cb) g_signal_handlers_unblock_by_func(combo, cb, NULL);
+    }
+    if (lab) {
+        char t[64];
+        snprintf(t, sizeof t, "%s: %s", prefix, wave_names[active]);
+        gtk_label_set_text(GTK_LABEL(lab), t);
+    }
 }
 
 static int json_nth_int(const char *js, const char *key, int nth, int def) {
@@ -490,13 +606,279 @@ static void apply_preset(int id) {
     write_ctl();
 }
 
+static GtkWidget *lbl_patch;
+
+static void apply_surge_file(const char *path) {
+    char line[700];
+    snprintf(line, sizeof line, "%s\n", path);
+    write_file(path_surge, line);
+    if (lbl_patch) {
+        char msg[420];
+        snprintf(msg, sizeof msg,
+                 "%s — waveform and envelopes stay until you move those knobs.",
+                 base_name(path));
+        gtk_label_set_text(GTK_LABEL(lbl_patch), msg);
+    }
+    set_btn_name(btn_patch, "Choose preset…", path);
+    fprintf(stderr, "synth: surge %s\n", path);
+}
+
+static const char *FACTORY = "/home/bob/.local/share/surge-xt/patches_factory";
+static char preset_cat[80] = "Polysynths";
+
+static int cmp_str(gconstpointer a, gconstpointer b) {
+    return g_ascii_strcasecmp(*(char *const *)a, *(char *const *)b);
+}
+
+static GPtrArray *dir_names(const char *dir, int want_fxp) {
+    GPtrArray *a = g_ptr_array_new_with_free_func(g_free);
+    GDir *d = g_dir_open(dir, 0, NULL);
+    if (!d) return a;
+    const char *n;
+    while ((n = g_dir_read_name(d))) {
+        if (n[0] == '.') continue;
+        char path[900];
+        snprintf(path, sizeof path, "%s/%s", dir, n);
+        if (want_fxp) {
+            if (!g_str_has_suffix(n, ".fxp")) continue;
+            if (!g_file_test(path, G_FILE_TEST_IS_REGULAR)) continue;
+        } else if (!g_file_test(path, G_FILE_TEST_IS_DIR)) {
+            continue;
+        }
+        g_ptr_array_add(a, g_strdup(n));
+    }
+    g_dir_close(d);
+    if (a->len > 1) g_ptr_array_sort(a, cmp_str);
+    return a;
+}
+
+static void clear_box(GtkWidget *box) {
+    GList *ch = gtk_container_get_children(GTK_CONTAINER(box));
+    for (GList *l = ch; l; l = l->next) gtk_widget_destroy(GTK_WIDGET(l->data));
+    g_list_free(ch);
+}
+
+static void add_row(GtkListBox *box, const char *label, const char *key) {
+    GtkWidget *row = gtk_list_box_row_new();
+    GtkWidget *lab = gtk_label_new(label);
+    gtk_label_set_xalign(GTK_LABEL(lab), 0);
+    gtk_widget_set_margin_start(lab, 6);
+    gtk_widget_set_margin_end(lab, 6);
+    gtk_widget_set_margin_top(lab, 2);
+    gtk_widget_set_margin_bottom(lab, 2);
+    gtk_container_add(GTK_CONTAINER(row), lab);
+    g_object_set_data_full(G_OBJECT(row), "key", g_strdup(key), g_free);
+    gtk_container_add(GTK_CONTAINER(box), row);
+    gtk_widget_show_all(row);
+}
+
+static void fill_fxps(GtkListBox *box, const char *dir) {
+    clear_box(GTK_WIDGET(box));
+    GPtrArray *names = dir_names(dir, 1);
+    for (guint i = 0; i < names->len; i++) {
+        const char *n = (const char *)names->pdata[i];
+        char path[900];
+        snprintf(path, sizeof path, "%s/%s", dir, n);
+        add_row(box, n, path);
+    }
+    g_ptr_array_free(names, TRUE);
+    GtkListBoxRow *first = gtk_list_box_get_row_at_index(box, 0);
+    if (first) gtk_list_box_select_row(box, first);
+}
+
+static void on_cat_row(GtkListBox *, GtkListBoxRow *row, gpointer files) {
+    if (!row) return;
+    const char *name = (const char *)g_object_get_data(G_OBJECT(row), "key");
+    if (!name) return;
+    snprintf(preset_cat, sizeof preset_cat, "%s", name);
+    char dir[900];
+    snprintf(dir, sizeof dir, "%s/%s", FACTORY, name);
+    fill_fxps(GTK_LIST_BOX(files), dir);
+}
+
+static void on_fxp_activate(GtkListBox *, GtkListBoxRow *, gpointer dlg) {
+    gtk_dialog_response(GTK_DIALOG(dlg), GTK_RESPONSE_ACCEPT);
+}
+
+static void on_pick_patch(GtkButton *, gpointer) {
+    GtkWidget *dlg = gtk_dialog_new_with_buttons(
+        "Surge factory presets", GTK_WINDOW(win_main),
+        GTK_DIALOG_MODAL,
+        "_Cancel", GTK_RESPONSE_CANCEL,
+        "_Open", GTK_RESPONSE_ACCEPT,
+        NULL);
+    gtk_window_set_default_size(GTK_WINDOW(dlg), 640, 480);
+    GtkWidget *content = gtk_dialog_get_content_area(GTK_DIALOG(dlg));
+    GtkWidget *panes = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_widget_set_margin_start(panes, 8);
+    gtk_widget_set_margin_end(panes, 8);
+    gtk_widget_set_margin_top(panes, 8);
+    gtk_widget_set_margin_bottom(panes, 8);
+    gtk_box_pack_start(GTK_BOX(content), panes, TRUE, TRUE, 0);
+
+    GtkWidget *cat_sc = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(cat_sc),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    gtk_widget_set_size_request(cat_sc, 160, -1);
+    GtkWidget *cats = gtk_list_box_new();
+    gtk_container_add(GTK_CONTAINER(cat_sc), cats);
+    gtk_box_pack_start(GTK_BOX(panes), cat_sc, FALSE, FALSE, 0);
+
+    GtkWidget *fxp_sc = gtk_scrolled_window_new(NULL, NULL);
+    gtk_scrolled_window_set_policy(GTK_SCROLLED_WINDOW(fxp_sc),
+                                   GTK_POLICY_NEVER, GTK_POLICY_AUTOMATIC);
+    GtkWidget *fxps = gtk_list_box_new();
+    gtk_container_add(GTK_CONTAINER(fxp_sc), fxps);
+    gtk_box_pack_start(GTK_BOX(panes), fxp_sc, TRUE, TRUE, 0);
+    g_signal_connect(fxps, "row-activated", G_CALLBACK(on_fxp_activate), dlg);
+    g_signal_connect(cats, "row-selected", G_CALLBACK(on_cat_row), fxps);
+
+    GPtrArray *cnames = dir_names(FACTORY, 0);
+    int sel = 0;
+    for (guint i = 0; i < cnames->len; i++) {
+        const char *n = (const char *)cnames->pdata[i];
+        add_row(GTK_LIST_BOX(cats), n, n);
+        if (strcmp(n, preset_cat) == 0) sel = (int)i;
+    }
+    g_ptr_array_free(cnames, TRUE);
+    gtk_widget_show_all(dlg);
+    GtkListBoxRow *crow = gtk_list_box_get_row_at_index(GTK_LIST_BOX(cats), sel);
+    if (crow) gtk_list_box_select_row(GTK_LIST_BOX(cats), crow);
+
+    if (gtk_dialog_run(GTK_DIALOG(dlg)) == GTK_RESPONSE_ACCEPT) {
+        GtkListBoxRow *row = gtk_list_box_get_selected_row(GTK_LIST_BOX(fxps));
+        const char *path = row ? (const char *)g_object_get_data(G_OBJECT(row), "key") : NULL;
+        if (path && path[0]) {
+            snprintf(surge_path, sizeof surge_path, "%s", path);
+            apply_surge_file(surge_path);
+        }
+    }
+    gtk_widget_destroy(dlg);
+}
+
+static void on_pick_song(GtkButton *, gpointer) {
+    char got[700];
+    if (!pick_path("MIDI file", "/home/bob/Downloads",
+                   song_path, "MIDI", "*.mid", "*.midi", got, sizeof got))
+        return;
+    snprintf(song_path, sizeof song_path, "%s", got);
+    char line[700];
+    snprintf(line, sizeof line, "%s\n", song_path);
+    write_file(path_song, line);
+    fprintf(stderr, "synth: song %s\n", song_path);
+    set_btn_name(btn_song, "Choose MIDI…", song_path);
+}
+
 static void on_preset(GtkComboBox *c, gpointer) {
     int id = gtk_combo_box_get_active(c);
     if (id < 0) id = 0;
     apply_preset(id);
 }
 
+static void osc_text(char *dst, size_t n, int typ, int wave) {
+    const char *kind = "Other";
+    const char *as = "saw";
+    int gap = 1;
+    if (wave == 0) as = "sine";
+    else if (wave == 1) as = "square";
+    else if (wave == 2) as = "pulse";
+    else if (wave == 5) as = "noise";
+    else as = "saw";
+    if (typ == 0) { kind = "Classic"; gap = 0; }
+    else if (typ == 1) { kind = "Sine"; gap = 0; }
+    else if (typ == 2) kind = "Wavetable";
+    else if (typ == 3) { kind = "Noise"; gap = 0; }
+    else if (typ == 4) kind = "Audio input";
+    else if (typ == 5) kind = "FM3";
+    else if (typ == 6) kind = "FM2";
+    else if (typ == 7) kind = "Window";
+    else if (typ == 8) kind = "Modern";
+    else if (typ == 10) kind = "Twist";
+    if (gap)
+        snprintf(dst, n, "%s, played as %s — that oscillator is not built yet", kind, as);
+    else
+        snprintf(dst, n, "%s %s", kind, as);
+}
+
+static void poll_heard(void) {
+    if (!path_heard[0]) return;
+    FILE *f = fopen(path_heard, "r");
+    if (!f) return;
+    char buf[256];
+    if (!fgets(buf, sizeof buf, f)) {
+        fclose(f);
+        return;
+    }
+    fclose(f);
+    if (strcmp(buf, heard_last) == 0) return;
+    int w, w2, t1, t2, mix, cut, rs, a, d, s, r, em;
+    if (sscanf(buf, "%d %d %d %d %d %d %d %d %d %d %d %d",
+               &w, &w2, &t1, &t2, &mix, &cut, &rs, &a, &d, &s, &r, &em) != 12)
+        return;
+    snprintf(heard_last, sizeof heard_last, "%s", buf);
+    applying = 1;
+    wave = w;
+    wave2 = w2;
+    oscmix = mix;
+    cutoff = cut;
+    res = rs;
+    atk = a;
+    dec = d;
+    suslvl = s;
+    rel = r;
+    fenv = 0;
+    lforate = 0;
+    lfopwm = 0;
+    lfofilt = 0;
+    lfoamp = 0;
+    submix = 0;
+    drive = 0;
+    detune = 0;
+    delayms = 0;
+    fb = 0;
+    wet = 0;
+    if (wave < 0) wave = 0;
+    if (wave > 7) wave = 7;
+    if (wave2 < 0) wave2 = 0;
+    if (wave2 > 7) wave2 = 7;
+    show_wave(combo_wave, (gpointer)on_wave, lbl_wave, "wave 1", wave);
+    show_wave(combo_wave2, (gpointer)on_wave2, lbl_wave2, "wave 2", wave2);
+    set_sc(sc[0], &cutoff, cutoff);
+    set_sc(sc[1], &res, res);
+    set_sc(sc[3], &detune, 0);
+    set_sc(sc[4], &fenv, 0);
+    set_sc(sc[5], &submix, 0);
+    set_sc(sc[6], &drive, 0);
+    set_sc(sc[7], &lforate, 0);
+    set_sc(sc[8], &lfopwm, 0);
+    set_sc(sc[9], &atk, atk);
+    set_sc(sc[10], &dec, dec);
+    set_sc(sc[11], &rel, rel);
+    set_sc(sc[13], &delayms, 0);
+    set_sc(sc[14], &fb, 0);
+    set_sc(sc[15], &wet, 0);
+    set_sc(sc[20], &oscmix, oscmix);
+    set_sc(sc[22], &suslvl, suslvl);
+    set_sc(sc[23], &lfofilt, 0);
+    set_sc(sc[24], &lfoamp, 0);
+    applying = 0;
+    if (lbl_patch) {
+        char o1[120], o2[120], msg[360];
+        osc_text(o1, sizeof o1, t1, wave);
+        osc_text(o2, sizeof o2, t2, wave2);
+        if (em)
+            snprintf(msg, sizeof msg,
+                     "Osc 1: %s. Osc 2: %s. Filter envelope is on.", o1, o2);
+        else
+            snprintf(msg, sizeof msg,
+                     "Osc 1: %s. Osc 2: %s. No filter envelope.", o1, o2);
+        gtk_label_set_text(GTK_LABEL(lbl_patch), msg);
+        fprintf(stderr, "synth ui: %s\n", msg);
+    }
+}
+
 static gboolean on_tick(gpointer) {
+    poll_heard();
     write_keys();
     char buf[128];
     synthkit_midi_poll();
@@ -513,13 +895,15 @@ int main(int argc, char **argv) {
     mkdir(dir, 0755);
     snprintf(path_keys, sizeof path_keys, "%s/keys.txt", dir);
     snprintf(path_ctl, sizeof path_ctl, "%s/ctl.txt", dir);
+    snprintf(path_surge, sizeof path_surge, "%s/surge.txt", dir);
+    snprintf(path_heard, sizeof path_heard, "%s/heard.txt", dir);
     snprintf(path_cmd, sizeof path_cmd, "%s/cmd.txt", dir);
     snprintf(path_pcm, sizeof path_pcm, "%s/pcm.bin", dir);
-    snprintf(path_bank, sizeof path_bank, "%s/bank.txt", dir);
     snprintf(path_midi, sizeof path_midi, "%s/midi.bin", dir);
     snprintf(path_song, sizeof path_song, "%s/song.txt", dir);
     snprintf(path_song_cmd, sizeof path_song_cmd, "%s/song_cmd.txt", dir);
 
+    g_setenv("GTK_USE_PORTAL", "1", TRUE);
     gtk_init(&argc, &argv);
     if (!getcwd(presets_dir, sizeof presets_dir))
         snprintf(presets_dir, sizeof presets_dir, ".");
@@ -531,7 +915,7 @@ int main(int argc, char **argv) {
     }
     GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
     win_main = win;
-    gtk_window_set_title(GTK_WINDOW(win), "SynthKit");
+    gtk_window_set_title(GTK_WINDOW(win), "Synth");
     gtk_window_set_default_size(GTK_WINDOW(win), 720, 860);
     gtk_widget_add_events(win, GDK_KEY_PRESS_MASK | GDK_KEY_RELEASE_MASK);
     g_signal_connect(win, "delete-event", G_CALLBACK(on_delete), NULL);
@@ -543,8 +927,8 @@ int main(int argc, char **argv) {
     gtk_container_add(GTK_CONTAINER(win), vbox);
 
     GtkWidget *hint = gtk_label_new(
-        "Notes: C D E F G A B     Space = sustain     [ / Z oct down     ] / X up     Esc quit\n"
-        "Two oscillators: wave 2 + mix + osc2 octave. Save/Load JSON patches. vmpk → SynthKit:in.");
+        "Standalone synth. Load a Surge XT .fxp patch, then play the keys or a MIDI keyboard.\n"
+        "C D E F G A B    Space = sustain    [ / Z oct down    ] / X up    Esc quit");
     gtk_label_set_xalign(GTK_LABEL(hint), 0);
     gtk_box_pack_start(GTK_BOX(vbox), hint, FALSE, FALSE, 0);
 
@@ -557,47 +941,42 @@ int main(int argc, char **argv) {
     }
     gtk_box_pack_start(GTK_BOX(vbox), keys, FALSE, FALSE, 0);
 
-    GtkWidget *bankrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *blab = gtk_label_new("SoundFont");
-    gtk_box_pack_start(GTK_BOX(bankrow), blab, FALSE, FALSE, 0);
-    GtkWidget *bcombo = gtk_combo_box_text_new();
-    gtk_widget_set_can_focus(bcombo, FALSE);
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bcombo), "(oscillators)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bcombo), "PTQ.sf2");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bcombo), "Studio Grand Concert");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bcombo), "sine_c4 test");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bcombo), "GeneralUser GS");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bcombo), "FluidR3 GM (Downloads)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(bcombo), "FluidR3 GM (system)");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(bcombo), 1);
-    g_signal_connect(bcombo, "changed", G_CALLBACK(on_bank_combo), NULL);
-    gtk_box_pack_start(GTK_BOX(bankrow), bcombo, TRUE, TRUE, 0);
-    GtkWidget *fc = gtk_file_chooser_button_new("Browse .sf2", GTK_FILE_CHOOSER_ACTION_OPEN);
-    gtk_widget_set_can_focus(fc, FALSE);
-    GtkFileFilter *ff = gtk_file_filter_new();
-    gtk_file_filter_set_name(ff, "SoundFont 2");
-    gtk_file_filter_add_pattern(ff, "*.sf2");
-    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(fc), ff);
-    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(fc), "/home/bob/Downloads");
-    g_signal_connect(fc, "file-set", G_CALLBACK(on_bank_file), NULL);
-    gtk_box_pack_start(GTK_BOX(bankrow), fc, TRUE, TRUE, 0);
-    gtk_box_pack_start(GTK_BOX(vbox), bankrow, FALSE, FALSE, 0);
+    slurp_line(path_surge, surge_path, sizeof surge_path);
+    slurp_line(path_song, song_path, sizeof song_path);
+    if (!song_path[0] &&
+        g_file_test("/home/bob/Downloads/Beverly Hills Cop Theme.mid", G_FILE_TEST_EXISTS))
+        snprintf(song_path, sizeof song_path,
+                 "/home/bob/Downloads/Beverly Hills Cop Theme.mid");
+
+    GtkWidget *patchrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
+    gtk_box_pack_start(GTK_BOX(patchrow), gtk_label_new("Surge patch"), FALSE, FALSE, 0);
+    btn_patch = gtk_button_new_with_label("Choose preset…");
+    gtk_widget_set_can_focus(btn_patch, FALSE);
+    gtk_widget_set_hexpand(btn_patch, TRUE);
+    set_btn_name(btn_patch, "Choose preset…", surge_path);
+    g_signal_connect(btn_patch, "clicked", G_CALLBACK(on_pick_patch), NULL);
+    gtk_box_pack_start(GTK_BOX(patchrow), btn_patch, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(vbox), patchrow, FALSE, FALSE, 0);
+    lbl_patch = gtk_label_new("Sine until you load a Surge .fxp. The patch selects the waveform.");
+    gtk_label_set_xalign(GTK_LABEL(lbl_patch), 0);
+    gtk_label_set_line_wrap(GTK_LABEL(lbl_patch), TRUE);
+    gtk_box_pack_start(GTK_BOX(vbox), lbl_patch, FALSE, FALSE, 0);
+    if (surge_path[0]) {
+        char msg[420];
+        snprintf(msg, sizeof msg,
+                 "%s — waveform and envelopes stay until you move those knobs.",
+                 base_name(surge_path));
+        gtk_label_set_text(GTK_LABEL(lbl_patch), msg);
+    }
 
     GtkWidget *songrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *slab = gtk_label_new("MIDI file");
-    gtk_box_pack_start(GTK_BOX(songrow), slab, FALSE, FALSE, 0);
-    GtkWidget *sfc = gtk_file_chooser_button_new("Browse .mid", GTK_FILE_CHOOSER_ACTION_OPEN);
-    gtk_widget_set_can_focus(sfc, FALSE);
-    GtkFileFilter *mf = gtk_file_filter_new();
-    gtk_file_filter_set_name(mf, "MIDI");
-    gtk_file_filter_add_pattern(mf, "*.mid");
-    gtk_file_filter_add_pattern(mf, "*.midi");
-    gtk_file_chooser_add_filter(GTK_FILE_CHOOSER(sfc), mf);
-    gtk_file_chooser_set_current_folder(GTK_FILE_CHOOSER(sfc), "/home/bob/Downloads");
-    if (g_file_test("/home/bob/Downloads/CV_Intro.mid", G_FILE_TEST_EXISTS))
-        gtk_file_chooser_set_filename(GTK_FILE_CHOOSER(sfc), "/home/bob/Downloads/CV_Intro.mid");
-    g_signal_connect(sfc, "file-set", G_CALLBACK(on_song_file), NULL);
-    gtk_box_pack_start(GTK_BOX(songrow), sfc, TRUE, TRUE, 0);
+    gtk_box_pack_start(GTK_BOX(songrow), gtk_label_new("MIDI file"), FALSE, FALSE, 0);
+    btn_song = gtk_button_new_with_label("Choose MIDI…");
+    gtk_widget_set_can_focus(btn_song, FALSE);
+    gtk_widget_set_hexpand(btn_song, TRUE);
+    set_btn_name(btn_song, "Choose MIDI…", song_path);
+    g_signal_connect(btn_song, "clicked", G_CALLBACK(on_pick_song), NULL);
+    gtk_box_pack_start(GTK_BOX(songrow), btn_song, TRUE, TRUE, 0);
     GtkWidget *bplay = gtk_button_new_with_label("Play");
     GtkWidget *bstop = gtk_button_new_with_label("Stop");
     gtk_widget_set_can_focus(bplay, FALSE);
@@ -617,114 +996,62 @@ int main(int argc, char **argv) {
     gtk_grid_set_column_spacing(GTK_GRID(grid), 8);
     gtk_container_add(GTK_CONTAINER(scroll), grid);
 
-    GtkWidget *plab = gtk_label_new("preset");
-    gtk_widget_set_halign(plab, GTK_ALIGN_START);
-    gtk_grid_attach(GTK_GRID(grid), plab, 0, 0, 1, 1);
-    GtkWidget *combo_p = gtk_combo_box_text_new();
-    gtk_widget_set_can_focus(combo_p, FALSE);
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_p), "Init (sine)");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_p), "Analog Lead");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_p), "Fat Bass");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_p), "PWM Pad");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_p), "Pluck");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_p), "Square Lead");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_p), "Dual Saw");
-    gtk_combo_box_text_append_text(GTK_COMBO_BOX_TEXT(combo_p), "Octave Lead");
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_p), 1);
-    g_signal_connect(combo_p, "changed", G_CALLBACK(on_preset), NULL);
-    gtk_grid_attach(GTK_GRID(grid), combo_p, 1, 0, 1, 1);
-
-    GtkWidget *wlab = gtk_label_new("wave 1");
-    gtk_widget_set_halign(wlab, GTK_ALIGN_START);
-    gtk_grid_attach(GTK_GRID(grid), wlab, 2, 0, 1, 1);
+    lbl_wave = gtk_label_new("wave 1: Sine");
+    gtk_widget_set_halign(lbl_wave, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), lbl_wave, 2, 0, 1, 1);
     combo_wave = gtk_combo_box_text_new();
     gtk_widget_set_can_focus(combo_wave, FALSE);
     fill_wave(GTK_COMBO_BOX_TEXT(combo_wave));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_wave), 3);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_wave), 0);
     g_signal_connect(combo_wave, "changed", G_CALLBACK(on_wave), NULL);
     gtk_grid_attach(GTK_GRID(grid), combo_wave, 3, 0, 1, 1);
 
-    GtkWidget *w2lab = gtk_label_new("wave 2");
-    gtk_widget_set_halign(w2lab, GTK_ALIGN_START);
-    gtk_grid_attach(GTK_GRID(grid), w2lab, 0, 1, 1, 1);
+    lbl_wave2 = gtk_label_new("wave 2: Sine");
+    gtk_widget_set_halign(lbl_wave2, GTK_ALIGN_START);
+    gtk_grid_attach(GTK_GRID(grid), lbl_wave2, 0, 1, 1, 1);
     combo_wave2 = gtk_combo_box_text_new();
     gtk_widget_set_can_focus(combo_wave2, FALSE);
     fill_wave(GTK_COMBO_BOX_TEXT(combo_wave2));
-    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_wave2), 3);
+    gtk_combo_box_set_active(GTK_COMBO_BOX(combo_wave2), 0);
     g_signal_connect(combo_wave2, "changed", G_CALLBACK(on_wave2), NULL);
     gtk_grid_attach(GTK_GRID(grid), combo_wave2, 1, 1, 1, 1);
-    sc[20] = mk_scale(grid, 2, 1, "osc mix", 0, 256, &oscmix, 0);
+    sc[20] = mk_scale(grid, 2, 1, "osc 2 level", 0, 256, &oscmix, 0);
 
-    sc[21] = mk_scale(grid, 0, 2, "osc2 octave", 0, 4, &o2oct, 2);
-    sc[22] = mk_scale(grid, 2, 2, "sustain lvl", 0, 256, &suslvl, 180);
+    sc[21] = mk_scale(grid, 0, 2, "osc 2 octave", 0, 4, &o2oct, 2);
+    sc[22] = mk_scale(grid, 2, 2, "sustain", 0, 256, &suslvl, 256);
     sc[23] = mk_scale(grid, 0, 3, "LFO to filter", 0, 256, &lfofilt, 0);
-    sc[24] = mk_scale(grid, 2, 3, "LFO to amp", 0, 256, &lfoamp, 0);
+    sc[24] = mk_scale(grid, 2, 3, "LFO to loudness", 0, 256, &lfoamp, 0);
 
-    GtkWidget *patchrow = gtk_box_new(GTK_ORIENTATION_HORIZONTAL, 8);
-    GtkWidget *bsave = gtk_button_new_with_label("Save patch");
-    GtkWidget *bload = gtk_button_new_with_label("Load patch");
-    gtk_widget_set_can_focus(bsave, FALSE);
-    gtk_widget_set_can_focus(bload, FALSE);
-    g_signal_connect(bsave, "clicked", G_CALLBACK(on_save_patch), NULL);
-    g_signal_connect(bload, "clicked", G_CALLBACK(on_load_patch), NULL);
-    gtk_box_pack_start(GTK_BOX(patchrow), bsave, FALSE, FALSE, 0);
-    gtk_box_pack_start(GTK_BOX(patchrow), bload, FALSE, FALSE, 0);
-    gtk_grid_attach(GTK_GRID(grid), patchrow, 0, 4, 4, 1);
-
-    sc[0] = mk_scale(grid, 0, 5, "cutoff", 0, 256, &cutoff, 105);
-    sc[1] = mk_scale(grid, 2, 5, "res", 0, 240, &res, 110);
-    sc[2] = mk_scale(grid, 0, 6, "pulse width", 8, 248, &pw, 64);
-    sc[3] = mk_scale(grid, 2, 6, "detune cents", 0, 80, &detune, 8);
-    sc[4] = mk_scale(grid, 0, 7, "filter env", 0, 256, &fenv, 230);
-    sc[5] = mk_scale(grid, 2, 7, "sub osc", 0, 256, &submix, 90);
-    sc[6] = mk_scale(grid, 0, 8, "drive", 0, 256, &drive, 55);
-    sc[7] = mk_scale(grid, 2, 8, "LFO rate", 0, 256, &lforate, 0);
-    sc[8] = mk_scale(grid, 0, 9, "LFO depth", 0, 256, &lfopwm, 0);
-    sc[9] = mk_scale(grid, 2, 9, "attack ms", 0, 2500, &atk, 4);
-    sc[10] = mk_scale(grid, 0, 10, "decay ms", 0, 2500, &dec, 220);
-    sc[11] = mk_scale(grid, 2, 10, "release ms", 0, 4000, &rel, 320);
-    sc[12] = mk_scale(grid, 0, 11, "volume", 0, 320, &vol, 170);
-    sc[13] = mk_scale(grid, 2, 11, "delay ms", 0, 1300, &delayms, 0);
-    sc[14] = mk_scale(grid, 0, 12, "delay fb", 0, 250, &fb, 0);
-    sc[15] = mk_scale(grid, 2, 12, "delay wet", 0, 256, &wet, 0);
-
-    sc[16] = mk_scale(grid, 0, 13, "MOD", 0, 256, &modv, 0);
-
-    const char *slotlab[3] = {"mod A dest", "mod B dest", "mod C dest"};
-    int *mds[3] = {&md0, &md1, &md2};
-    int *mas[3] = {&ma0, &ma1, &ma2};
-    int defd[3] = {1, 0, 0};
-    int defa[3] = {200, 0, 0};
-    for (int s = 0; s < 3; s++) {
-        int row = 14 + s;
-        GtkWidget *lab = gtk_label_new(slotlab[s]);
-        gtk_widget_set_halign(lab, GTK_ALIGN_START);
-        gtk_grid_attach(GTK_GRID(grid), lab, 0, row, 1, 1);
-        combo_md[s] = gtk_combo_box_text_new();
-        gtk_widget_set_can_focus(combo_md[s], FALSE);
-        fill_dest(GTK_COMBO_BOX_TEXT(combo_md[s]));
-        gtk_combo_box_set_active(GTK_COMBO_BOX(combo_md[s]), defd[s]);
-        g_signal_connect(combo_md[s], "changed", G_CALLBACK(on_md), GINT_TO_POINTER(s));
-        gtk_grid_attach(GTK_GRID(grid), combo_md[s], 1, row, 1, 1);
-        sc[17 + s] = mk_scale(grid, 2, row, "depth", -256, 256, mas[s], defa[s]);
-        *mds[s] = defd[s];
-    }
+    sc[0] = mk_scale(grid, 0, 4, "cutoff", 0, 256, &cutoff, 256);
+    sc[1] = mk_scale(grid, 2, 4, "resonance", 0, 240, &res, 0);
+    sc[2] = mk_scale(grid, 0, 5, "pulse width", 8, 248, &pw, 128);
+    sc[3] = mk_scale(grid, 2, 5, "detune cents", 0, 80, &detune, 0);
+    sc[4] = mk_scale(grid, 0, 6, "filter envelope", 0, 256, &fenv, 0);
+    sc[5] = mk_scale(grid, 2, 6, "sub oscillator", 0, 256, &submix, 0);
+    sc[6] = mk_scale(grid, 0, 7, "drive", 0, 256, &drive, 0);
+    sc[7] = mk_scale(grid, 2, 7, "LFO rate", 0, 256, &lforate, 0);
+    sc[8] = mk_scale(grid, 0, 8, "LFO depth", 0, 256, &lfopwm, 0);
+    sc[9] = mk_scale(grid, 2, 8, "attack ms", 0, 2500, &atk, 4);
+    sc[10] = mk_scale(grid, 0, 9, "decay ms", 0, 2500, &dec, 200);
+    sc[11] = mk_scale(grid, 2, 9, "release ms", 0, 4000, &rel, 200);
+    sc[12] = mk_scale(grid, 0, 10, "master", 0, 2048, &vol, 80);
+    sc[13] = mk_scale(grid, 2, 10, "delay ms", 0, 1300, &delayms, 0);
+    sc[14] = mk_scale(grid, 0, 11, "delay feedback", 0, 250, &fb, 0);
+    sc[15] = mk_scale(grid, 2, 11, "delay mix", 0, 256, &wet, 0);
 
     lbl_status = gtk_label_new("");
     gtk_widget_set_halign(lbl_status, GTK_ALIGN_START);
     gtk_box_pack_start(GTK_BOX(vbox), lbl_status, FALSE, FALSE, 0);
 
+    load_ctl_file();
     write_keys();
     write_ctl();
     write_cmd("");
-    write_bank("/home/bob/Downloads/PTQ.sf2");
-    synthkit_audio_init(path_pcm);
     synthkit_midi_init(path_midi);
     g_timeout_add(30, on_tick, NULL);
     gtk_widget_show_all(win);
     gtk_main();
     write_cmd("quit");
     synthkit_midi_shutdown();
-    synthkit_audio_shutdown();
     return 0;
 }
