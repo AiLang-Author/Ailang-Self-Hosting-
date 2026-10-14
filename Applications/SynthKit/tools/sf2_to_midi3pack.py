@@ -199,16 +199,21 @@ def zones_for_preset(sf, preset):
     return out
 
 
-def pick_zone(zones, note, vel):
+def pick_zone(zones, note, vel, nearest=False):
     hits = [z for z in zones if z["klo"] <= note <= z["khi"] and z["vlo"] <= vel <= z["vhi"]]
-    if not hits:
+    if hits:
+        def _key(z):
+            co = 0 if abs(z["coarse"]) >= 3 else z["coarse"]
+            return (abs((note - z["orig"]) + co), abs(z["coarse"]))
+        hits.sort(key=_key)
+        return hits[0]
+    if not nearest or not zones:
         return None
-    hits.sort(key=lambda z: abs(z["coarse"]))
-    return hits[0]
+    return min(zones, key=lambda z: abs((z["orig"] + z["coarse"]) - note))
 
 
 def resample(pcm, ratio):
-    """Linear resample: ratio>1 plays faster (higher pitch)."""
+    """Cubic resample: ratio>1 plays faster (higher pitch)."""
     if not pcm:
         return []
     if abs(ratio - 1.0) < 1e-6:
@@ -220,9 +225,15 @@ def resample(pcm, ratio):
         x = i * ratio
         j = int(x)
         f = x - j
-        a = pcm[j] if j <= last else pcm[last]
-        b = pcm[j + 1] if j + 1 <= last else pcm[last]
-        out[i] = int(a + (b - a) * f)
+        p0 = pcm[j - 1] if j >= 1 else pcm[0]
+        p1 = pcm[j] if j <= last else pcm[last]
+        p2 = pcm[j + 1] if j + 1 <= last else pcm[last]
+        p3 = pcm[j + 2] if j + 2 <= last else pcm[last]
+        a = -0.5 * p0 + 1.5 * p1 - 1.5 * p2 + 0.5 * p3
+        b = p0 - 2.5 * p1 + 2 * p2 - 0.5 * p3
+        c = -0.5 * p0 + 0.5 * p2
+        y = ((a * f + b) * f + c) * f + p1
+        out[i] = int(y)
     return out
 
 
@@ -262,14 +273,13 @@ def write_wav(path, samples, rate=RATE):
         w.writeframes(buf)
 
 
-def render_note(zone, note, held_ms):
-    """Bake SF2 pitch into a 48 kHz stream, then split attack/held."""
+def render_note(zone, note, held_ms, unpitched=False):
+    """Rate-convert to 48 kHz only. No musical pitch shift."""
     pcm = zone["pcm"]
     if not pcm:
         return None, None
-    dsemi = (note - zone["orig"]) + zone["coarse"]
-    ratio = (2.0 ** (dsemi / 12.0)) * (zone["rate"] / RATE)
-    if ratio <= 0:
+    ratio = (zone["rate"] / RATE) if zone["rate"] else 1.0
+    if abs(ratio - 1.0) < 1e-6:
         ratio = 1.0
     pitched = resample(pcm, ratio)
     if len(pitched) < 32:
@@ -277,26 +287,20 @@ def render_note(zone, note, held_ms):
     ls = int(zone["ls"] / ratio) if ratio else 0
     le = int(zone["le"] / ratio) if ratio else 0
     looping = zone["mode"] in (1, 3) and le > ls + 8
-    atk_n = ls if looping and 16 < ls < len(pitched) else min(int(RATE * 0.04), len(pitched) // 3)
+    atk_n = min(int(RATE * 0.04), max(16, len(pitched) // 5))
+    if looping and 32 < ls < len(pitched) // 2:
+        atk_n = min(ls, int(RATE * 0.08))
     if atk_n < 16:
         atk_n = min(16, len(pitched) // 4)
+    if atk_n >= len(pitched):
+        atk_n = max(8, len(pitched) // 4)
     attack = pitched[:atk_n]
     hn = held_frames(note, held_ms)
-    if looping and le <= len(pitched):
-        loop = pitched[ls:le]
-        if len(loop) < 8:
-            loop = pitched[atk_n : atk_n + hn] or pitched[-hn:]
-        if len(loop) < hn:
-            reps = (hn // max(1, len(loop))) + 1
-            loop = (loop * reps)[:hn]
-        else:
-            loop = loop[:hn]
-        held = crossfade_loop(loop)
-    else:
-        rest = pitched[atk_n:]
-        if len(rest) < hn:
-            rest = rest + [0] * (hn - len(rest))
-        held = crossfade_loop(rest[:hn])
+    body = pitched[atk_n:] if len(pitched) > atk_n + 8 else pitched
+    if len(body) < 8:
+        body = pitched
+    reps = (hn // max(1, len(body))) + 1
+    held = crossfade_loop((body * reps)[:hn])
     if attack:
         held[0] = attack[-1]
     return attack, held
@@ -354,7 +358,7 @@ def main():
         "name": os.path.splitext(os.path.basename(sf2_path))[0],
         "a4": 440.0,
         "source": os.path.basename(sf2_path),
-        "note": "Converted from SF2. Stretch in the source is baked into each note file.",
+        "note": "Converted from SF2. No musical pitch shift; files are the recorded pitch only.",
     }
     open(os.path.join(out_dir, "pack.json"), "w").write(json.dumps(pack, indent=2) + "\n")
     man = open(os.path.join(out_dir, "manifest.txt"), "w")
@@ -367,38 +371,47 @@ def main():
         os.makedirs(idir, exist_ok=True)
         man.write(f"I {name}\n")
         held_ms = 250 if name.startswith("piano") else 100
-        notes = range(0, 128) if kind == "hit" else range(21, 109)
-        at_pitch = name.startswith("piano") or name.startswith("bass")
-        for note in notes:
-            layers = vel_layers(zones, note) if kind != "hit" else [127]
-            for vhi in layers:
-                z = pick_zone(zones, note, vhi)
-                if z is None:
-                    continue
-                dsemi = (note - z["orig"]) + z["coarse"]
-                if at_pitch and abs(dsemi) > 0:
-                    continue
-                nn = note_name(note)
-                if kind == "hit":
-                    atk, held = render_note(z, note, 80)
+        if kind == "hit":
+            written = set()
+            for z in zones:
+                for note in range(z["klo"], z["khi"] + 1):
+                    if note in written:
+                        continue
+                    nn = note_name(note)
+                    atk, held = render_note(z, note, 80, unpitched=True)
                     clip = (atk or []) + (held or [])
                     if len(clip) < 16:
                         continue
-                    fn = f"{nn}.hit.v{vhi:03d}.wav"
+                    peak = max((abs(s) for s in clip), default=1)
+                    if peak > 16000:
+                        g = 16000.0 / peak
+                        clip = [int(s * g) for s in clip]
+                    fn = f"{nn}.hit.v127.wav"
                     write_wav(os.path.join(idir, fn), clip[: int(RATE * 0.4)])
-                    man.write(f"H {note} {vhi} {fn}\n")
+                    man.write(f"H {note} {fn}\n")
                     nfiles += 1
-                else:
-                    atk, held = render_note(z, note, held_ms)
-                    if not atk or not held:
+                    written.add(note)
+        else:
+            written = set()
+            for z in zones:
+                keys = list(range(z["klo"], z["khi"] + 1))
+                if z["orig"] not in keys:
+                    keys.append(z["orig"])
+                atk, held = render_note(z, z["orig"], held_ms, unpitched=True)
+                if not atk or not held:
+                    continue
+                for note in keys:
+                    if note < 0 or note > 127 or note in written:
                         continue
-                    fa = f"{nn}.attack.v{vhi:03d}.wav"
-                    fh = f"{nn}.held.v{vhi:03d}.wav"
+                    nn = note_name(note)
+                    fa = f"{nn}.attack.v127.wav"
+                    fh = f"{nn}.held.v127.wav"
                     write_wav(os.path.join(idir, fa), atk)
                     write_wav(os.path.join(idir, fh), held)
-                    man.write(f"A {note} {vhi} {fa}\n")
-                    man.write(f"L {note} {vhi} {fh}\n")
+                    man.write(f"A {note} {fa}\n")
+                    man.write(f"L {note} {fh}\n")
                     nfiles += 2
+                    written.add(note)
         print(f"wrote {name}", flush=True)
     man.close()
     print(f"done {nfiles} wavs -> {out_dir}")

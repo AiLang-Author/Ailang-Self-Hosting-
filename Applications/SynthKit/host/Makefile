@@ -35,11 +35,15 @@ endif
 
 .PHONY: all clean
 
-all: synth_shell_gtk
+all: synth_shell_gtk sample_player_gtk
 
-synth_shell_gtk: synth_shell_gtk.cxx pcm_play.cc pcm_play.h midi_in.cc midi_in.h
-	g++ -O2 -std=c++17 -I$(ARCADE)/host -o $@ synth_shell_gtk.cxx pcm_play.cc midi_in.cc \
+synth_shell_gtk: synth_shell_gtk.cxx surge_fxp.cc surge_fxp.h midi_in.cc midi_in.h
+	g++ -O2 -std=c++17 -o $@ synth_shell_gtk.cxx surge_fxp.cc midi_in.cc \
+		$(GTK_CFLAGS) $(GTK_LIBS) -lpthread -ldl -lm
+
+sample_player_gtk: sample_player_gtk.cxx midi_in.cc midi_in.h
+	g++ -O2 -std=c++17 -o $@ sample_player_gtk.cxx midi_in.cc \
 		$(GTK_CFLAGS) $(GTK_LIBS) -lpthread -ldl -lm
 
 clean:
-	rm -f synth_shell_gtk
+	rm -f synth_shell_gtk sample_player_gtk

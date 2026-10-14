@@ -17,8 +17,13 @@ a hint in a comment.
 A Program Change while notes are still sounding is an import error (SPEC.md
 section 6.2). It is reported, and the tool exits with status 1.
 
+Files with no Program Change cannot be named from the GM table. Pass
+--force-inst NAME (and optionally --pack PACKNAME) so the songmap IDs the
+instrument and the sample pack we supply, instead of NEED_NAME.
+
   python3 tools/midi3_songmap.py song.mid
   python3 tools/midi3_songmap.py song.mid -o song.mid.songmap
+  python3 tools/midi3_songmap.py piano.mid --force-inst piano_grand --pack UprightPianoKW
 
 Public domain (CC0 1.0).
 """
@@ -188,6 +193,19 @@ def parse_smf(path: str):
     return fmt, len(chunks), division, parts, track_names, errors
 
 
+def default_opcode16() -> str:
+    here = os.path.dirname(os.path.abspath(__file__))
+    cands = [
+        os.path.join(here, "..", "schemas", "opcode16.json"),
+        os.path.join(here, "..", "..", "..", "Librarys", "Media", "opcode16.json"),
+        os.path.join(here, "..", "..", "Librarys", "Media", "opcode16.json"),
+    ]
+    for p in cands:
+        if os.path.isfile(p):
+            return os.path.abspath(p)
+    return os.path.abspath(cands[0])
+
+
 def load_tables(path: str):
     with open(path, encoding="utf-8") as f:
         j = json.load(f)
@@ -199,16 +217,21 @@ def load_tables(path: str):
             if name not in registry:
                 print(f"warning: {table} program {prog} maps to '{name}', "
                       f"which is not in the registry", file=sys.stderr)
-    return gm, kit
+    return gm, kit, registry
 
 
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("mid", help="input .mid file")
     ap.add_argument("-o", "--output", help="write the songmap to this file")
-    ap.add_argument("--json", default=os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "schemas", "opcode16.json"),
-        help="path to opcode16.json")
+    ap.add_argument("--json", default=default_opcode16(),
+                    help="path to opcode16.json")
+    ap.add_argument("--default-inst",
+                    help="instrument name for parts that have no Program Change")
+    ap.add_argument("--force-inst",
+                    help="instrument name for every sounding part (ignores GM program)")
+    ap.add_argument("--pack",
+                    help="sample pack this song binds against (written into the songmap)")
     args = ap.parse_args()
 
     try:
@@ -216,7 +239,13 @@ def main() -> int:
     except (SMFError, OSError) as e:
         print(f"error: {args.mid}: {e}", file=sys.stderr)
         return 1
-    gm, kit = load_tables(args.json)
+    gm, kit, registry = load_tables(args.json)
+    for flag, value in (("--force-inst", args.force_inst),
+                        ("--default-inst", args.default_inst)):
+        if value and value not in registry:
+            print(f"error: {flag} {value} is not in the opcode16 registry",
+                  file=sys.stderr)
+            return 1
 
     lines = [
         "# songmap v1",
@@ -224,8 +253,15 @@ def main() -> int:
         f"(SMF type {fmt}, {ntracks} tracks, division {division})",
         "# src=FILETRACK:CHANNEL[@TICK]  (file track from 0, MIDI channel 1-16,",
         "#   @TICK only when a Program Change split the part)",
-        "",
+        "# inst= is an opcode16 name. The player binds InstID to the loaded pack;",
+        "# it does not guess piano from a missing Program Change.",
     ]
+    if args.pack:
+        lines.append(f"# pack: {args.pack}")
+        lines.append(f"pack {args.pack}")
+    if args.force_inst:
+        lines.append(f"# force-inst: {args.force_inst}")
+    lines.append("")
 
     for tid, p in enumerate(parts):
         src = f"{p.ftrack}:{p.channel + 1}"
@@ -239,14 +275,28 @@ def main() -> int:
                      f"program {prog}, bank {p.bank}")
 
         inst = None
-        if p.channel == DRUM_CHANNEL:
+        if args.force_inst:
+            inst = args.force_inst
+            if p.program is None:
+                lines.append("# No Program Change in the SMF; instrument comes from --force-inst.")
+        elif p.channel == DRUM_CHANNEL:
             hint = kit.get(p.program) if p.program is not None else None
             lines.append("# AMBIGUOUS: MIDI channel 10. Not assumed to be drums."
                          + (f" If this is a kit, the kit table suggests {hint}." if hint else ""))
         elif p.program is None:
-            lines.append("# No Program Change; no instrument can be chosen.")
+            if args.default_inst:
+                inst = args.default_inst
+                lines.append("# No Program Change; instrument comes from --default-inst.")
+            else:
+                lines.append("# No Program Change; no instrument can be chosen.")
         elif p.program in gm:
             inst = gm[p.program]
+        elif args.default_inst:
+            inst = args.default_inst
+            lines.append(
+                f"# Program {p.program} has no entry in the gm table. "
+                "Using the instrument selected with the pack."
+            )
         else:
             lines.append(f"# Program {p.program} has no entry in the gm table.")
 
