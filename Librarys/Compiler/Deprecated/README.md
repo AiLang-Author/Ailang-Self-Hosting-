@@ -15,3 +15,5 @@ The compiler replaced later the same day, when the cursor field fold was install
 The compiler replaced when InlineAsm functions stopped being spliced is `ailang-2026-10-06-f3aac2f4.x`: 3,103,795 bytes, sha256 `f3aac2f4f59812e29828fe734cb0c927bcb02cd6fe436a681770d2da43886615`. Local only.
 
 The compiler replaced on 2026-10-06 when the page-safe string scan was installed is `ailang-2026-10-06-db9c1987.x`: 3,103,795 bytes, sha256 `db9c198755c6171358ae2fe72d743e24478d124eba7682406814f39bb3ef8e8c`. It segfaults on an unaligned 16-byte string load at the end of an arena chunk. Local only.
+
+The compiler replaced on 2026-10-13 when the register-home lat25 compiler was installed is `ailang-2026-10-13-4006a9cf.x`: 3,902,637 bytes, sha256 `4006a9cf1140293e5691e93c2a7e156ef19a58ee1ca46db866872a6c2d9f57fe`. That was the page-safe live compiler. The same bytes are also `./ailang_2026-10-13-4006a9cf.x`. Local only.
