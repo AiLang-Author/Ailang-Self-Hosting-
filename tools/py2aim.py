@@ -120,6 +120,48 @@ def _advance_quote_state(s: str, state: str | None) -> str | None:
     return state
 
 
+def _bracket_delta(s: str) -> int:
+    """Net open-paren/bracket/brace change, ignoring strings/comments."""
+    delta = 0
+    in_s = None
+    esc = False
+    i = 0
+    while i < len(s):
+        c = s[i]
+        if in_s:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == in_s[0] and s.startswith(in_s, i):
+                i += len(in_s)
+                in_s = None
+                continue
+            i += 1
+            continue
+        if c == "#":
+            break
+        if s.startswith('"""', i):
+            in_s = '"""'
+            i += 3
+            continue
+        if s.startswith("'''", i):
+            in_s = "'''"
+            i += 3
+            continue
+        if c in ("'", '"'):
+            in_s = c
+            i += 1
+            continue
+        if c in "([{":
+            delta += 1
+        elif c in ")]}":
+            delta -= 1
+        i += 1
+    return delta
+
+
+
 def convert(src: str) -> str:
     """Insert `{` / `}` from indentation. Preserve comments."""
     raw_lines = src.splitlines()
@@ -131,6 +173,9 @@ def convert(src: str) -> str:
     i = 0
     n = len(raw_lines)
     qstate: str | None = None
+    # >0 while inside an unclosed ([{ on a suite header (multiline def/class)
+    header_depth = 0
+    header_indent = 0
 
     def is_blank_or_comment(s: str) -> bool:
         t = s.strip()
@@ -229,6 +274,48 @@ def convert(src: str) -> str:
                 out.append(f"{ws}}}")
             qstate = line_q
             continue
+
+        # Multiline def/class/(if) header: track brackets; closing '):' → ') {'
+        if header_depth > 0:
+            delta = _bracket_delta(code)
+            header_depth += delta
+            if header_depth <= 0 and code.rstrip().endswith(":"):
+                # signature finished: width=None):  →  width=None) {
+                body = code[:-1].rstrip()
+                extra = ""
+                if comment:
+                    extra = "  " + comment
+                out.append(f"{ws}{body} {{{extra}")
+                header_depth = 0
+                i += 1
+                j = i
+                while j < n and is_blank_or_comment(raw_lines[j]):
+                    j += 1
+                if j < n:
+                    nxt_w = _indent_width(_leading_ws(raw_lines[j]))
+                    if nxt_w > header_indent:
+                        stack.append(nxt_w)
+                    elif nxt_w == header_indent:
+                        out.append(f"{' ' * header_indent}}}")
+                else:
+                    out.append(f"{' ' * header_indent}}}")
+                qstate = line_q
+                continue
+            out.append(line)
+            qstate = line_q
+            i += 1
+            continue
+
+        # Suite header that opens brackets without ending ':' on this line
+        if first in SUITE_START and not code.endswith(":"):
+            delta = _bracket_delta(code)
+            if delta > 0:
+                out.append(line)
+                header_depth = delta
+                header_indent = width
+                qstate = line_q
+                i += 1
+                continue
 
         out.append(line)
         qstate = line_q
