@@ -122,4 +122,4 @@ The maintainer reserves the right to:
 
 The goal of this project is to keep a coherent, reviewable upstream codebase rather than allow endless incompatible variants. We value thoughtful, well-scoped changes that improve the project without creating parallel distributions.
 
-Thank you for helping keep Ailang-Self-Hosting- coherent, stable, and maintainable.
+Thank you for helping keep Ailang coherent, stable, and maintainable.
