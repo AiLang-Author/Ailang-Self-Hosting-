@@ -1,0 +1,850 @@
+// Copyright (c) 2025 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+//
+// Licensed under the Sean Collins Software License (SCSL). See the LICENSE file in the root directory of this project
+// for the full terms and conditions, including restrictions on forking, corporate use, and permissions for private/teaching purposes.
+
+// Library.COptAlloc.ailang
+// One table of names that already live in registers for the current loop.
+// Loaded by the optimizer shell. No imports of its own.
+//
+// The frame stays the permanent home of every local. This table only
+// answers "where is this name right now?"
+//
+// Record stride 32: name, class, register, frame offset.
+// Class 1 is a GPR. Class 2 is an XMM. Register numbers are the hardware
+// numbers (13 is r13, 2 is xmm2). Thirty-two rows, one Allocate of 1024
+// bytes. Worst case is four GPR homes, six named floats, seven xmm8–xmm14
+// rows, two extra integers, and eight borrowed floats.
+//
+// Stage 1: publish the homes the existing pickers already chose.
+// GprOf and FltSlot read the table. Coalesce wins before the table.
+// xmm8–xmm14 stay in their own slots.
+// Stage 2: LoadVariable and StoreVariable move rax to and from a published
+// register. A limit parked in rbx, and a derived name on a store, stay on
+// the old path so those bytes do not change.
+// Stage 3: one extra integer may use r11 when the derived sum, the
+// constant factor, and both induction pointers leave it free.
+// A second integer may use r14 when the table base, the induction
+// pointers, and the stride base leave it free, and nothing in the loop
+// writes r14 for a scaled address. Both require a loop with no real
+// call and no inline asm. The frame store stays. Entry reloads a name
+// that is live in.
+// The GprOf and FltSlot name ladders are gone. HomeLoad, HomeStore, and
+// LoadToRbx no longer retest the integer and accumulator names. The
+// derived sum, holds, and aliases stay on the old tests.
+// xmm8–xmm14 are published after the named floats and before the extra
+// integers. A borrowed float is a row while the borrow lasts, and it
+// leaves the table when the borrow ends. A named home keeps its earlier
+// row. FltSlot still checks the borrow first. HomeLoad, HomeStore, and
+// LoadToRbx read a float row from the table. LoadToRbx emits the same
+// move into rbx and does not flush a pin. Entry loads and exit spills
+// for xmm3–xmm14 come from the table. xmm2 stays the named float home.
+// Call save and load, the borrow drop, pin and SSE occupancy, and the
+// zero-arm check read those rows after publish. Each chosen extra is a
+// row as soon as it is chosen. AllocPublish keeps those rows and puts the
+// other homes in front of them. The pickers still choose the names.
+// A free extra slot is fewer than twelve of those rows.
+// Fold, inline, NonNeg, magic division, and FMA stay rules.
+
+// =============================================================================
+// TABLE
+// =============================================================================
+
+Function.Optimize_AllocReset {
+    Body: {
+        AllocTab.n = 0
+        AllocTab.hit_class = 0
+        AllocTab.hit_reg = -1
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_AllocEnsure {
+    Body: {
+        IfCondition EqualTo(AllocTab.recs, 0) ThenBlock: {
+            AllocTab.recs = Allocate(1024)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_AllocRec {
+    Input: index: Integer
+    Output: Address
+    Body: {
+        ReturnValue(Add(AllocTab.recs, Multiply(index, 32)))
+    }
+}
+
+Function.Optimize_AllocSeen {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Optimize_NameEq(Dereference(rec), name), 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Skip a null name, a full table, and a name already published.
+// The first row wins, matching the order GprOf checks homes.
+Function.Optimize_AllocAdd {
+    Input: name: Address
+    Input: cls: Integer
+    Input: reg: Integer
+    Input: off: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(AllocTab.n, 32) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_AllocSeen(name), 1) ThenBlock: { ReturnValue(0) }
+        Optimize_AllocEnsure()
+        rec = Optimize_AllocRec(AllocTab.n)
+        StoreValue(rec, name)
+        StoreValue(Add(rec, 8), cls)
+        StoreValue(Add(rec, 16), reg)
+        StoreValue(Add(rec, 24), off)
+        AllocTab.n = Add(AllocTab.n, 1)
+        ReturnValue(1)
+    }
+}
+
+// 1 when name is in the table. Class and register land in AllocTab.
+Function.Optimize_Loc {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        AllocTab.hit_class = 0
+        AllocTab.hit_reg = -1
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(AllocTab.n, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Optimize_NameEq(Dereference(rec), name), 1) ThenBlock: {
+                AllocTab.hit_class = Dereference(Add(rec, 8))
+                AllocTab.hit_reg = Dereference(Add(rec, 16))
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// A borrowed name shares the source xmm. A name that already has a home
+// keeps that row. FltSlot still prefers the borrow for the overlap.
+Function.Optimize_AllocCoal {
+    Input: name: Address
+    Input: slot: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_NameTaken(name), 1) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                IfCondition EqualTo(Optimize_NameEq(Dereference(rec), name), 1) ThenBlock: {
+                    StoreValue(Add(rec, 16), slot)
+                    ReturnValue(1)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(Optimize_AllocAdd(name, 2, slot, 0))
+    }
+}
+
+// Drop one borrowed row. A named home is not a borrow, so it stays.
+Function.Optimize_AllocDropCoal {
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_NameTaken(name), 1) ThenBlock: { ReturnValue(0) }
+        w = 0
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            drop = 0
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                IfCondition EqualTo(Optimize_NameEq(Dereference(rec), name), 1) ThenBlock: {
+                    drop = 1
+                }
+            }
+            IfCondition EqualTo(drop, 0) ThenBlock: {
+                IfCondition NotEqual(w, i) ThenBlock: {
+                    wrec = Optimize_AllocRec(w)
+                    StoreValue(wrec, Dereference(rec))
+                    StoreValue(Add(wrec, 8), Dereference(Add(rec, 8)))
+                    StoreValue(Add(wrec, 16), Dereference(Add(rec, 16)))
+                    StoreValue(Add(wrec, 24), Dereference(Add(rec, 24)))
+                }
+                w = Add(w, 1)
+            }
+            i = Add(i, 1)
+        }
+        AllocTab.n = w
+        ReturnValue(0)
+    }
+}
+
+// The loop edge clears every borrow at once. Named float homes stay.
+Function.Optimize_AllocCoalClear {
+    Body: {
+        w = 0
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            keep = 1
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                IfCondition EqualTo(Optimize_NameTaken(Dereference(rec)), 0) ThenBlock: {
+                    keep = 0
+                }
+            }
+            IfCondition EqualTo(keep, 1) ThenBlock: {
+                IfCondition NotEqual(w, i) ThenBlock: {
+                    wrec = Optimize_AllocRec(w)
+                    StoreValue(wrec, Dereference(rec))
+                    StoreValue(Add(wrec, 8), Dereference(Add(rec, 8)))
+                    StoreValue(Add(wrec, 16), Dereference(Add(rec, 16)))
+                    StoreValue(Add(wrec, 24), Dereference(Add(rec, 24)))
+                }
+                w = Add(w, 1)
+            }
+            i = Add(i, 1)
+        }
+        AllocTab.n = w
+        ReturnValue(0)
+    }
+}
+
+// Copy the homes this loop already picked. The extra floats are already
+// rows. Park them at index 20, which holds twelve, then put them back
+// after the other homes so the old order stays.
+Function.Optimize_AllocPublish {
+    Body: {
+        saved = AllocTab.n
+        i = 0
+        WhileLoop LessThan(i, saved) {
+            rec = Optimize_AllocRec(i)
+            dst = Optimize_AllocRec(Add(20, i))
+            StoreValue(dst, Dereference(rec))
+            StoreValue(Add(dst, 8), Dereference(Add(rec, 8)))
+            StoreValue(Add(dst, 16), Dereference(Add(rec, 16)))
+            StoreValue(Add(dst, 24), Dereference(Add(rec, 24)))
+            i = Add(i, 1)
+        }
+        Optimize_AllocReset()
+        Optimize_AllocAdd(LoopHome.int_name, 1, 13, LoopHome.int_off)
+        Optimize_AllocAdd(LoopHome.acc_name, 1, 12, LoopHome.acc_off)
+        IfCondition EqualTo(LoopHome.der_on, 1) ThenBlock: {
+            Optimize_AllocAdd(LoopHome.der_name, 1, 11, LoopHome.der_off)
+        }
+        IfCondition EqualTo(LoopHome.lim_on, 1) ThenBlock: {
+            IfCondition EqualTo(LoopHome.rbx_free, 1) ThenBlock: {
+                Optimize_AllocAdd(LoopHome.lim_name, 1, 3, LoopHome.lim_off)
+            }
+        }
+        Optimize_AllocAdd(LoopHome.flt_name, 2, 2, LoopHome.flt_off)
+        i = 0
+        WhileLoop LessThan(i, saved) {
+            rec = Optimize_AllocRec(Add(20, i))
+            Optimize_AllocAdd(Dereference(rec), Dereference(Add(rec, 8)), Dereference(Add(rec, 16)), Dereference(Add(rec, 24)))
+            i = Add(i, 1)
+        }
+        Optimize_AllocExtend()
+        ReturnValue(0)
+    }
+}
+
+// 1 when node contains a real call or inline asm. Those clobber r11.
+// HomeCallOk names are operators and leaf helpers that do not write r11.
+Function.Optimize_AllocBad {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        nt = AST_GetType(node)
+        IfCondition EqualTo(nt, AST.INLINEASM) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(nt, AST.CALL) ThenBlock: {
+            IfCondition EqualTo(Optimize_HomeCallOk(AST_GetData1(node)), 0) ThenBlock: {
+                ReturnValue(1)
+            }
+        }
+        count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            IfCondition EqualTo(Optimize_AllocBad(AST_GetChild(node, i)), 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_AllocHeld {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_AllocSeen(name), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_NameTaken(name), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_NameEq(name, LoopHome.tab_name), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_NameEq(name, LoopHome.lim_name), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_NameEq(name, LoopHome.rcx_name), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_NameEq(name, LoopHome.rdx_name), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_NameEq(name, LoopHome.kmul_name), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_NameEq(name, LoopHome.hold_name), 1) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(Optimize_NameEq(name, LoopHome.der_name), 1) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// 1 when compiling this tree does MOV r14 for a scaled qword whose base
+// is not the table already parked in r14. The memory emitter does that
+// for any base. WritesR14 only notices an identifier base.
+Function.Optimize_AllocMemR14 {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        nt = AST_GetType(node)
+        IfCondition EqualTo(nt, AST.CALL) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(AST_GetData1(node), "Dereference"), 1) ThenBlock: {
+                IfCondition EqualTo(AST_GetChildCount(node), 1) ThenBlock: {
+                    addr = AST_GetChild(node, 0)
+                    IfCondition NotEqual(addr, 0) ThenBlock: {
+                        IfCondition EqualTo(AST_GetType(addr), AST.CALL) ThenBlock: {
+                            IfCondition EqualTo(Optimize_NameEq(AST_GetData1(addr), "Add"), 1) ThenBlock: {
+                                IfCondition EqualTo(AST_GetChildCount(addr), 2) ThenBlock: {
+                                    base = AST_GetChild(addr, 0)
+                                    mul = AST_GetChild(addr, 1)
+                                    IfCondition NotEqual(mul, 0) ThenBlock: {
+                                        IfCondition EqualTo(AST_GetType(mul), AST.CALL) ThenBlock: {
+                                            IfCondition EqualTo(Optimize_NameEq(AST_GetData1(mul), "Multiply"), 1) ThenBlock: {
+                                                IfCondition EqualTo(AST_GetChildCount(mul), 2) ThenBlock: {
+                                                    IfCondition GreaterThan(Optimize_ScaleValue(AST_GetChild(mul, 1)), 0) ThenBlock: {
+                                                        keep = 0
+                                                        IfCondition EqualTo(LoopHome.tab_on, 1) ThenBlock: {
+                                                            IfCondition NotEqual(base, 0) ThenBlock: {
+                                                                IfCondition EqualTo(AST_GetType(base), AST.IDENTIFIER) ThenBlock: {
+                                                                    IfCondition EqualTo(Optimize_NameEq(AST_GetData1(base), LoopHome.tab_name), 1) ThenBlock: {
+                                                                        keep = 1
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                        IfCondition EqualTo(keep, 0) ThenBlock: { ReturnValue(1) }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        count = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            IfCondition EqualTo(Optimize_AllocMemR14(AST_GetChild(node, i)), 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// 1 when this extra register is not already a derived sum, a constant
+// factor, a table base, a stride base, or an induction pointer.
+// r14 also stays free of any scaled address that would overwrite it.
+Function.Optimize_AllocRegFree {
+    Input: reg: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(reg, 11) ThenBlock: {
+            IfCondition EqualTo(LoopHome.der_on, 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(LoopHome.kmul_on, 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(LoopHome.ip0_on, 1) ThenBlock: {
+                IfCondition EqualTo(LoopHome.ip0_reg, 11) ThenBlock: { ReturnValue(0) }
+            }
+            IfCondition EqualTo(LoopHome.ip1_on, 1) ThenBlock: {
+                IfCondition EqualTo(LoopHome.ip1_reg, 11) ThenBlock: { ReturnValue(0) }
+            }
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(reg, 14) ThenBlock: {
+            IfCondition EqualTo(LoopHome.tab_on, 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(LoopHome.st_on, 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(LoopHome.ip0_on, 1) ThenBlock: {
+                IfCondition EqualTo(LoopHome.ip0_reg, 14) ThenBlock: { ReturnValue(0) }
+            }
+            IfCondition EqualTo(LoopHome.ip1_on, 1) ThenBlock: {
+                IfCondition EqualTo(LoopHome.ip1_reg, 14) ThenBlock: { ReturnValue(0) }
+            }
+            IfCondition EqualTo(Optimize_WritesR14(LoopHome.cond), 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(Optimize_WritesR14(LoopHome.body), 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(Optimize_AllocMemR14(LoopHome.cond), 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(Optimize_AllocMemR14(LoopHome.body), 1) ThenBlock: { ReturnValue(0) }
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_AllocFromRax {
+    Input: reg: Integer
+    Body: {
+        IfCondition EqualTo(reg, 11) ThenBlock: { X86Enc_Assemble("MOV r11, rax") }
+        IfCondition EqualTo(reg, 14) ThenBlock: { X86Enc_Assemble("MOV r14, rax") }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_AllocToRax {
+    Input: reg: Integer
+    Body: {
+        IfCondition EqualTo(reg, 11) ThenBlock: { X86Enc_Assemble("MOV rax, r11") }
+        IfCondition EqualTo(reg, 14) ThenBlock: { X86Enc_Assemble("MOV rax, r14") }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_AllocToRbx {
+    Input: reg: Integer
+    Body: {
+        IfCondition EqualTo(reg, 11) ThenBlock: { X86Enc_Assemble("MOV rbx, r11") }
+        IfCondition EqualTo(reg, 14) ThenBlock: { X86Enc_Assemble("MOV rbx, r14") }
+        ReturnValue(0)
+    }
+}
+
+// The hottest leftover integer goes in r11, the next in r14.
+// A loop that already has an integer or accumulator home is active,
+// so loads through the table see the register.
+Function.Optimize_AllocExtend {
+    Body: {
+        IfCondition EqualTo(LoopHome.int_name, 0) ThenBlock: {
+            IfCondition EqualTo(LoopHome.acc_name, 0) ThenBlock: { ReturnValue(0) }
+        }
+        free11 = Optimize_AllocRegFree(11)
+        free14 = Optimize_AllocRegFree(14)
+        IfCondition EqualTo(free11, 0) ThenBlock: {
+            IfCondition EqualTo(free14, 0) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition EqualTo(Optimize_AllocBad(LoopHome.cond), 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_AllocBad(LoopHome.body), 1) ThenBlock: { ReturnValue(0) }
+        best_name = 0
+        best_off = 0
+        best_score = 0
+        second_name = 0
+        second_off = 0
+        second_score = 0
+        i = 0
+        WhileLoop LessThan(i, LoopHome.count) {
+            rec = Optimize_HomeRec(i)
+            name = Dereference(rec)
+            loads = Dereference(Add(rec, 8))
+            stores = Dereference(Add(rec, 16))
+            fops = Dereference(Add(rec, 24))
+            IfCondition GreaterThan(loads, 0) ThenBlock: {
+                IfCondition EqualTo(fops, 0) ThenBlock: {
+                    IfCondition EqualTo(Optimize_AllocHeld(name), 0) ThenBlock: {
+                        live = 0
+                        IfCondition GreaterThan(stores, 0) ThenBlock: { live = 1 }
+                        IfCondition EqualTo(live, 0) ThenBlock: {
+                            IfCondition EqualTo(Optimize_LiveIn(name, LoopHome.cond, LoopHome.body), 1) ThenBlock: {
+                                live = 1
+                            }
+                        }
+                        IfCondition EqualTo(live, 1) ThenBlock: {
+                            off = Scope_Resolve(name)
+                            rt = Scope.resolve_type
+                            ok = 0
+                            IfCondition EqualTo(rt, 1) ThenBlock: { ok = 1 }
+                            IfCondition EqualTo(rt, 2) ThenBlock: { ok = 1 }
+                            IfCondition GreaterEqual(off, 0) ThenBlock: { ok = 0 }
+                            IfCondition EqualTo(ok, 1) ThenBlock: {
+                                score = Add(loads, stores)
+                                IfCondition GreaterThan(score, best_score) ThenBlock: {
+                                    second_score = best_score
+                                    second_name = best_name
+                                    second_off = best_off
+                                    best_score = score
+                                    best_name = name
+                                    best_off = off
+                                }
+                                IfCondition LessEqual(score, best_score) ThenBlock: {
+                                    IfCondition GreaterThan(score, second_score) ThenBlock: {
+                                        IfCondition EqualTo(Optimize_NameEq(name, best_name), 0) ThenBlock: {
+                                            second_score = score
+                                            second_name = name
+                                            second_off = off
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(best_name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(free11, 1) ThenBlock: {
+            Optimize_AllocAdd(best_name, 1, 11, best_off)
+            IfCondition EqualTo(free14, 1) ThenBlock: {
+                IfCondition NotEqual(second_name, 0) ThenBlock: {
+                    Optimize_AllocAdd(second_name, 1, 14, second_off)
+                }
+            }
+            ReturnValue(1)
+        }
+        Optimize_AllocAdd(best_name, 1, 14, best_off)
+        ReturnValue(1)
+    }
+}
+
+// While entry for the extra integers. Homes and the derived sum load themselves.
+Function.Optimize_AllocGprIn {
+    Input: condition: Address
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 1) ThenBlock: {
+                reg = Dereference(Add(rec, 16))
+                take = 0
+                IfCondition EqualTo(reg, 11) ThenBlock: { take = 1 }
+                IfCondition EqualTo(reg, 14) ThenBlock: { take = 1 }
+                IfCondition EqualTo(take, 1) ThenBlock: {
+                    name = Dereference(rec)
+                    skip = 0
+                    IfCondition EqualTo(LoopHome.der_on, 1) ThenBlock: {
+                        IfCondition EqualTo(Optimize_NameEq(name, LoopHome.der_name), 1) ThenBlock: {
+                            skip = 1
+                        }
+                    }
+                    IfCondition EqualTo(skip, 0) ThenBlock: {
+                        IfCondition EqualTo(Optimize_LiveIn(name, condition, LoopHome.body), 1) ThenBlock: {
+                            Emit_MovRaxRbpOffset(Dereference(Add(rec, 24)))
+                            Optimize_AllocFromRax(reg)
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Entry load for xmm3–xmm14. Publish order is f2–f6, then xmm8–xmm14.
+// xmm2 is loaded by the named float home. Borrows do not exist yet.
+Function.Optimize_AllocXmmIn {
+    Input: condition: Address
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                reg = Dereference(Add(rec, 16))
+                IfCondition GreaterEqual(reg, 3) ThenBlock: {
+                    IfCondition EqualTo(Optimize_LiveIn(Dereference(rec), condition, LoopHome.body), 1) ThenBlock: {
+                        Emit_MovRaxRbpOffset(Dereference(Add(rec, 24)))
+                        X86_XmmRR(1, reg)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Exit spill for registers lo through hi. count is the row count from
+// before HomeRelease. That reset clears the count and leaves the bytes.
+Function.Optimize_AllocXmmOut {
+    Input: body: Address
+    Input: count: Integer
+    Input: lo: Integer
+    Input: hi: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, count) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                reg = Dereference(Add(rec, 16))
+                take = 0
+                IfCondition GreaterEqual(reg, lo) ThenBlock: {
+                    IfCondition LessEqual(reg, hi) ThenBlock: { take = 1 }
+                }
+                IfCondition EqualTo(take, 1) ThenBlock: {
+                    IfCondition EqualTo(Optimize_LiveOut(Dereference(rec), body), 1) ThenBlock: {
+                        X86_XmmRR(2, reg)
+                        Emit_MovRbpOffsetRax(Dereference(Add(rec, 24)))
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Hardware xmm of a permanent extra float, or 0. xmm2 is not extra.
+// A borrow has offset 0 and does not count. Empty until AllocPublish.
+Function.Optimize_ExtraReg {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Optimize_NameEq(name, Dereference(rec)), 1) ThenBlock: {
+                IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                    reg = Dereference(Add(rec, 16))
+                    IfCondition GreaterEqual(reg, 3) ThenBlock: {
+                        IfCondition LessThan(Dereference(Add(rec, 24)), 0) ThenBlock: {
+                            ReturnValue(reg)
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// 1 when xmm is a permanent extra home (xmm3–xmm14), not a borrow.
+Function.Optimize_ExtraXmm {
+    Input: xmm: Integer
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                IfCondition EqualTo(Dereference(Add(rec, 16)), xmm) ThenBlock: {
+                    IfCondition LessThan(Dereference(Add(rec, 24)), 0) ThenBlock: {
+                        ReturnValue(1)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// 1 when any permanent extra float is published. xmm2 does not count.
+Function.Optimize_ExtraAny {
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                reg = Dereference(Add(rec, 16))
+                IfCondition GreaterEqual(reg, 3) ThenBlock: {
+                    IfCondition LessThan(Dereference(Add(rec, 24)), 0) ThenBlock: {
+                        ReturnValue(1)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// 1 when another permanent extra float still fits. Twelve is xmm3–xmm14.
+// A borrow has offset 0 and does not count.
+Function.Optimize_FltRoom {
+    Output: Integer
+    Body: {
+        n = 0
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                reg = Dereference(Add(rec, 16))
+                IfCondition GreaterEqual(reg, 3) ThenBlock: {
+                    IfCondition LessThan(Dereference(Add(rec, 24)), 0) ThenBlock: {
+                        n = Add(n, 1)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition LessThan(n, 12) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// 1 when xmm2–xmm7 is a published home. xmm8–xmm14 stay out of this check.
+Function.Optimize_AllocNamed {
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                reg = Dereference(Add(rec, 16))
+                IfCondition GreaterEqual(reg, 2) ThenBlock: {
+                    IfCondition LessEqual(reg, 7) ThenBlock: {
+                        IfCondition LessThan(Dereference(Add(rec, 24)), 0) ThenBlock: {
+                            ReturnValue(1)
+                        }
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Call spill for permanent xmm3–xmm14. Same order as publish. No borrow.
+Function.Optimize_AllocXmmSave {
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                reg = Dereference(Add(rec, 16))
+                IfCondition GreaterEqual(reg, 3) ThenBlock: {
+                    IfCondition LessThan(Dereference(Add(rec, 24)), 0) ThenBlock: {
+                        X86_XmmRR(2, reg)
+                        Emit_MovRbpOffsetRax(Dereference(Add(rec, 24)))
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Call reload for permanent xmm3–xmm14. Same order as publish. No borrow.
+Function.Optimize_AllocXmmLoad {
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, AllocTab.n) {
+            rec = Optimize_AllocRec(i)
+            IfCondition EqualTo(Dereference(Add(rec, 8)), 2) ThenBlock: {
+                reg = Dereference(Add(rec, 16))
+                IfCondition GreaterEqual(reg, 3) ThenBlock: {
+                    IfCondition LessThan(Dereference(Add(rec, 24)), 0) ThenBlock: {
+                        Emit_MovRaxRbpOffset(Dereference(Add(rec, 24)))
+                        X86_XmmRR(1, reg)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Move a published register into rax. 1 when this emitted the load.
+// rbx (the loop limit) is published but not loaded here.
+Function.Optimize_LocLoad {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(LoopHome.active, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_Loc(name), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(AllocTab.hit_class, 1) ThenBlock: {
+            IfCondition EqualTo(AllocTab.hit_reg, 13) ThenBlock: {
+                IfCondition GreaterThan(PinDefer.n, 0) ThenBlock: { Optimize_PinFlush() }
+                Emit_HomeMove(1, 0)
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(AllocTab.hit_reg, 12) ThenBlock: {
+                IfCondition GreaterThan(PinDefer.n, 0) ThenBlock: { Optimize_PinFlush() }
+                Emit_HomeMove(16, 0)
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(AllocTab.hit_reg, 11) ThenBlock: {
+                IfCondition GreaterThan(PinDefer.n, 0) ThenBlock: { Optimize_PinFlush() }
+                Optimize_AllocToRax(11)
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(AllocTab.hit_reg, 14) ThenBlock: {
+                IfCondition GreaterThan(PinDefer.n, 0) ThenBlock: { Optimize_PinFlush() }
+                Optimize_AllocToRax(14)
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(AllocTab.hit_class, 2) ThenBlock: {
+            IfCondition GreaterThan(PinDefer.n, 0) ThenBlock: { Optimize_PinFlush() }
+            slot = Optimize_FltSlot(name)
+            IfCondition EqualTo(slot, 2) ThenBlock: { Emit_HomeMove(5, 0) }
+            IfCondition GreaterThan(slot, 2) ThenBlock: { X86_XmmRR(2, slot) }
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Move rax into a published register. 1 when the frame store is not needed.
+// A derived name and the rbx limit still take the frame store.
+Function.Optimize_LocStore {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(LoopHome.active, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_Loc(name), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(AllocTab.hit_class, 1) ThenBlock: {
+            IfCondition EqualTo(AllocTab.hit_reg, 13) ThenBlock: {
+                Emit_HomeMove(2, 0)
+                Optimize_PtrClearAll()
+                ReturnValue(1)
+            }
+            IfCondition EqualTo(AllocTab.hit_reg, 12) ThenBlock: {
+                Emit_HomeMove(17, 0)
+                ReturnValue(1)
+            }
+            // The extra integer keeps the frame store. The derived sum
+            // updates r11 on its own step, so a store of that name does not.
+            IfCondition EqualTo(AllocTab.hit_reg, 11) ThenBlock: {
+                IfCondition EqualTo(LoopHome.der_on, 1) ThenBlock: {
+                    IfCondition EqualTo(Optimize_NameEq(name, LoopHome.der_name), 1) ThenBlock: {
+                        ReturnValue(0)
+                    }
+                }
+                Optimize_AllocFromRax(11)
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(AllocTab.hit_reg, 14) ThenBlock: {
+                Optimize_AllocFromRax(14)
+                ReturnValue(0)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(AllocTab.hit_class, 2) ThenBlock: {
+            slot = Optimize_FltSlot(name)
+            IfCondition EqualTo(slot, 2) ThenBlock: { Emit_HomeMove(6, 0) }
+            IfCondition GreaterThan(slot, 2) ThenBlock: { X86_XmmRR(1, slot) }
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
