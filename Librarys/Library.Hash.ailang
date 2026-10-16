@@ -12,14 +12,19 @@
 //
 // Single API prefix: Hash.*
 //
-// Memory layout — Header (40 bytes):
+// Memory layout — Header (72 bytes):
 //   [magic:8][capacity:8][size:8][entries_ptr:8][order_arr:8]
+//   [bump:8][bump_end:8][chunk:8][key_free:8]
 //   order_arr is an Array of key pointers in insertion order (Python 3.7+)
+//   Key bytes live in chunk blocks owned by the table. A live key pointer
+//   stays put across resize. Delete recycles the cell onto key_free.
+//   Clear and Destroy free the chunks. Do not Deallocate a key pointer.
 //
 // Memory layout — Entry slot (32 bytes, open-addressed flat array):
 //   [hash:8][key_ptr:8][value:8][_pad:8]
 //   hash=0  -> empty slot
 //   hash=-1 -> tombstone (deleted)
+//   key_ptr points 8 bytes into a cell: [reserved:8][bytes...]
 //
 // Collision strategy: linear probing
 //   - Cache-friendly: entries are contiguous, no pointer chasing
@@ -60,25 +65,20 @@ Function.Hash.CRC32Step {
 
 // =============================================================================
 // HASH FUNCTION — hardware CRC32 per byte, guaranteed non-zero result
+// The byte loop is Crc32String (one SSE4.2 pass). CRC32Step stays a real
+// function: its asm reads edi/esi, so the compiler must not splice it.
+// The XOR keeps this function a call. The loop clobbers eax, ecx, and rdi.
 // =============================================================================
 Function.Hash.HashString {
     Input: str: Address
     Output: Integer
     Body: {
+        InlineAsm["XOR eax, eax"]
         IfCondition EqualTo(str, 0) ThenBlock: {
             ReturnValue(1)
         }
 
-        len = StringLength(str)
-        crc = 0
-        i   = 0
-
-        WhileLoop LessThan(i, len) {
-            b   = GetByte(str, i)
-            crc = Hash.CRC32Step(crc, b)
-            i   = Add(i, 1)
-        }
-
+        crc = Crc32String(str)
         IfCondition EqualTo(crc, 0) ThenBlock: {
             crc = 1
         }
@@ -103,25 +103,22 @@ Function.Hash.Create {
         }
         capacity = p
 
-        header = Allocate(40)
+        header = Allocate(72)
         StoreValue(header, HashMagic.MAGIC)
         StoreValue(Add(header, 8),  capacity)
         StoreValue(Add(header, 16), 0)
 
         // 32 bytes per slot: [hash:8][key_ptr:8][value:8][_pad:8]
-        entries = Allocate(Multiply(capacity, 32))
-        i = 0
-        WhileLoop LessThan(i, capacity) {
-            off = Multiply(i, 32)
-            StoreValue(Add(entries, off),        0)
-            StoreValue(Add(entries, Add(off, 8)),  0)
-            StoreValue(Add(entries, Add(off, 16)), 0)
-            StoreValue(Add(entries, Add(off, 24)), 0)
-            i = Add(i, 1)
-        }
+        bytes = Multiply(capacity, 32)
+        entries = Allocate(bytes)
+        MemorySet(entries, 0, bytes)
 
         StoreValue(Add(header, 24), entries)
         StoreValue(Add(header, 32), Array.Create(8))
+        StoreValue(Add(header, 40), 0)
+        StoreValue(Add(header, 48), 0)
+        StoreValue(Add(header, 56), 0)
+        StoreValue(Add(header, 64), 0)
         ReturnValue(header)
     }
 }
@@ -204,19 +201,10 @@ Function.Hash.Resize {
         old_entries = Dereference(Add(table, 24))
         new_cap     = Multiply(old_cap, 2)
 
-        new_entries = Allocate(Multiply(new_cap, 32))
+        new_bytes = Multiply(new_cap, 32)
+        new_entries = Allocate(new_bytes)
+        MemorySet(new_entries, 0, new_bytes)
         mask = Subtract(new_cap, 1)
-
-        // Zero new entries
-        i = 0
-        WhileLoop LessThan(i, new_cap) {
-            off = Multiply(i, 32)
-            StoreValue(Add(new_entries, off),        0)
-            StoreValue(Add(new_entries, Add(off, 8)),  0)
-            StoreValue(Add(new_entries, Add(off, 16)), 0)
-            StoreValue(Add(new_entries, Add(off, 24)), 0)
-            i = Add(i, 1)
-        }
 
         // Rehash live entries (skip empty and tombstones)
         i = 0
@@ -247,6 +235,137 @@ Function.Hash.Resize {
         Deallocate(old_entries, Multiply(old_cap, 32))
         StoreValue(Add(table, 8),  new_cap)
         StoreValue(Add(table, 24), new_entries)
+    }
+}
+
+// Copy key bytes into a table-owned cell. The returned pointer is the
+// string, 8 bytes after the cell's reserved-size word. Cells are recycled
+// by Hash.KeyRecycle. Chunks are freed only by Hash.FreeChunks.
+Function.Hash.KeyBytes {
+    Input: table: Address
+    Input: key:   Address
+    Input: klen:  Integer
+    Output: Address
+    Body: {
+        space = Add(klen, 1)
+        IfCondition LessThan(space, 8) ThenBlock: {
+            space = 8
+        }
+        raw = Add(space, 8)
+        rem = Modulo(raw, 8)
+        IfCondition GreaterThan(rem, 0) ThenBlock: {
+            raw = Add(raw, Subtract(8, rem))
+        }
+        reserved = raw
+
+        picked = 0
+        prev_cell = 0
+        cell = Dereference(Add(table, 64))
+        WhileLoop NotEqual(cell, 0) {
+            usable = Subtract(Dereference(cell), 8)
+            next = Dereference(Add(cell, 8))
+            IfCondition GreaterThan(usable, klen) ThenBlock: {
+                IfCondition EqualTo(prev_cell, 0) ThenBlock: {
+                    StoreValue(Add(table, 64), next)
+                }
+                IfCondition NotEqual(prev_cell, 0) ThenBlock: {
+                    StoreValue(Add(prev_cell, 8), next)
+                }
+                picked = Add(cell, 8)
+                BreakLoop
+            }
+            prev_cell = cell
+            cell = next
+        }
+
+        IfCondition EqualTo(picked, 0) ThenBlock: {
+            bump = Dereference(Add(table, 40))
+            bend = Dereference(Add(table, 48))
+            room = 0
+            IfCondition NotEqual(bump, 0) ThenBlock: {
+                room = Subtract(bend, bump)
+            }
+            IfCondition LessThan(room, reserved) ThenBlock: {
+                chunk_sz = 4096
+                need_sz = Add(reserved, 16)
+                IfCondition GreaterThan(need_sz, chunk_sz) ThenBlock: {
+                    chunk_sz = need_sz
+                }
+                chunk = Allocate(chunk_sz)
+                prev = Dereference(Add(table, 56))
+                StoreValue(chunk, prev)
+                StoreValue(Add(chunk, 8), chunk_sz)
+                StoreValue(Add(table, 56), chunk)
+                bump = Add(chunk, 16)
+                bend = Add(chunk, chunk_sz)
+                StoreValue(Add(table, 48), bend)
+            }
+            StoreValue(bump, reserved)
+            picked = Add(bump, 8)
+            StoreValue(Add(table, 40), Add(bump, reserved))
+        }
+
+        IfCondition GreaterThan(klen, 0) ThenBlock: {
+            MemoryCopy(picked, key, klen)
+        }
+        SetByte(picked, klen, 0)
+        ReturnValue(picked)
+    }
+}
+
+// Append one key pointer to the order array. Growth copies the block.
+Function.Hash.OrderPush {
+    Input: ord:   Address
+    Input: value: Address
+    Body: {
+        capacity = Dereference(Add(ord, 8))
+        size     = Dereference(Add(ord, 16))
+        data     = Dereference(Add(ord, 24))
+        IfCondition GreaterEqual(size, capacity) ThenBlock: {
+            new_capacity = Multiply(capacity, 2)
+            new_data = Allocate(Multiply(new_capacity, 8))
+            IfCondition GreaterThan(size, 0) ThenBlock: {
+                MemoryCopy(new_data, data, Multiply(size, 8))
+            }
+            Deallocate(data, Multiply(capacity, 8))
+            StoreValue(Add(ord, 8), new_capacity)
+            StoreValue(Add(ord, 24), new_data)
+            data = new_data
+        }
+        StoreValue(Add(data, Multiply(size, 8)), value)
+        StoreValue(Add(ord, 16), Add(size, 1))
+    }
+}
+
+// Push a live key cell back onto the table freelist. Overwrites the bytes.
+Function.Hash.KeyRecycle {
+    Input: table: Address
+    Input: sk:    Address
+    Body: {
+        IfCondition EqualTo(sk, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        cell = Subtract(sk, 8)
+        StoreValue(sk, Dereference(Add(table, 64)))
+        StoreValue(Add(table, 64), cell)
+    }
+}
+
+// Free every key chunk. Resets the bump and the cell freelist.
+Function.Hash.FreeChunks {
+    Input: table: Address
+    Body: {
+        chunk = Dereference(Add(table, 56))
+        WhileLoop NotEqual(chunk, 0) {
+            prev = Dereference(chunk)
+            sz = Dereference(Add(chunk, 8))
+            Deallocate(chunk, sz)
+            chunk = prev
+        }
+        StoreValue(Add(table, 40), 0)
+        StoreValue(Add(table, 48), 0)
+        StoreValue(Add(table, 56), 0)
+        StoreValue(Add(table, 64), 0)
     }
 }
 
@@ -295,20 +414,14 @@ Function.Hash.Set {
                 }
                 ioff  = Multiply(ins, 32)
                 klen  = StringLength(key)
-                kcopy = Allocate(Add(klen, 1))
-                j = 0
-                WhileLoop LessThan(j, klen) {
-                    SetByte(kcopy, j, GetByte(key, j))
-                    j = Add(j, 1)
-                }
-                SetByte(kcopy, klen, 0)
+                kcopy = Hash.KeyBytes(table, key, klen)
                 StoreValue(Add(ents, ioff),        h)
                 StoreValue(Add(ents, Add(ioff, 8)),  kcopy)
                 StoreValue(Add(ents, Add(ioff, 16)), value)
                 StoreValue(Add(table, 16), Add(size, 1))
                 ord = Dereference(Add(table, 32))
                 IfCondition EqualTo(Array.IsArray(ord), 1) ThenBlock: {
-                    Array.Push(ord, kcopy)
+                    Hash.OrderPush(ord, kcopy)
                 }
                 ReturnValue(1)
             }
@@ -407,7 +520,7 @@ Function.Hash.Delete {
         off = Multiply(slot, 32)
         sk  = Dereference(Add(ents, Add(off, 8)))
         Hash.OrderRemove(table, key)
-        Deallocate(sk, 0)
+        Hash.KeyRecycle(table, sk)
         StoreValue(Add(ents, off),        -1)
         StoreValue(Add(ents, Add(off, 8)),  0)
         StoreValue(Add(ents, Add(off, 16)), 0)
@@ -442,24 +555,8 @@ Function.Hash.Clear {
 
         cap  = Dereference(Add(table, 8))
         ents = Dereference(Add(table, 24))
-
-        i = 0
-        WhileLoop LessThan(i, cap) {
-            off = Multiply(i, 32)
-            sh  = Dereference(Add(ents, off))
-            IfCondition GreaterThan(sh, 0) ThenBlock: {
-                sk = Dereference(Add(ents, Add(off, 8)))
-                IfCondition NotEqual(sk, 0) ThenBlock: {
-                    Deallocate(sk, 0)
-                }
-            }
-            StoreValue(Add(ents, off),        0)
-            StoreValue(Add(ents, Add(off, 8)),  0)
-            StoreValue(Add(ents, Add(off, 16)), 0)
-            StoreValue(Add(ents, Add(off, 24)), 0)
-            i = Add(i, 1)
-        }
-
+        Hash.FreeChunks(table)
+        MemorySet(ents, 0, Multiply(cap, 32))
         StoreValue(Add(table, 16), 0)
         StoreValue(Add(table, 32), Array.Create(8))
     }
@@ -487,7 +584,7 @@ Function.Hash.OrderRemove {
 }
 
 // =============================================================================
-// KEYS — returns Array of key strings (pointers into table — do not free)
+// KEYS — returns Array of key strings (pointers into the table — do not free)
 // =============================================================================
 Function.Hash.Keys {
     Input: table: Address
@@ -583,22 +680,9 @@ Function.Hash.Destroy {
 
         cap  = Dereference(Add(table, 8))
         ents = Dereference(Add(table, 24))
-
-        i = 0
-        WhileLoop LessThan(i, cap) {
-            off = Multiply(i, 32)
-            sh  = Dereference(Add(ents, off))
-            IfCondition GreaterThan(sh, 0) ThenBlock: {
-                sk = Dereference(Add(ents, Add(off, 8)))
-                IfCondition NotEqual(sk, 0) ThenBlock: {
-                    Deallocate(sk, 0)
-                }
-            }
-            i = Add(i, 1)
-        }
-
+        Hash.FreeChunks(table)
         Deallocate(ents, Multiply(cap, 32))
-        Deallocate(table, 40)
+        Deallocate(table, 72)
     }
 }
 
