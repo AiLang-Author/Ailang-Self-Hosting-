@@ -93,6 +93,11 @@ Function.FPUCompileX86String_TryCompile {
         IfCondition EqualTo(cmp, 0) ThenBlock: {
             ReturnValue(FPUCompileX86_StringConcat(node))
         }
+
+        cmp = StringCompare(func_name, "Crc32String")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue(FPUCompileX86_Crc32String(node))
+        }
         
         ReturnValue(0)
     }
@@ -135,14 +140,86 @@ Function.FPU_EmitCopyBytes {
     }
 }
 
+// EAX nonzero when any byte in [rdi+base, rdi+base+64) is zero. XMM0 is zero.
+// base is 0 or 64 and rdi is 64-byte aligned, so every load stays in one page.
+Function.X86_StrlenProbe64 {
+    Input: base: Integer
+    Body: {
+        X86_MOVDQA_XMM1_RdiDisp(base)
+        X86_PMINUB_XMM1_RdiDisp(Add(base, 16))
+        X86_PMINUB_XMM1_RdiDisp(Add(base, 32))
+        X86_PMINUB_XMM1_RdiDisp(Add(base, 48))
+        Trans_Asm("PCMPEQB xmm1, xmm0")
+        Trans_Asm("PMOVMSKB eax, xmm1")
+    }
+}
+
+// OR the 16-byte strcmp stop mask (NUL or a difference) into EDX.
+// XMM0 is zero. Clobbers XMM1, XMM2, XMM3, EAX, ECX.
+Function.X86_StrcmpAccum {
+    Input: disp: Integer
+    Body: {
+        X86_MOVDQU_XMM1_RdiDisp(disp)
+        X86_MOVDQU_XMM2_RsiDisp(disp)
+        Trans_Asm("MOVDQA xmm3, xmm1")
+        Trans_Asm("PCMPEQB xmm3, xmm0")
+        Trans_Asm("PCMPEQB xmm1, xmm2")
+        Trans_Asm("PMOVMSKB eax, xmm3")
+        Trans_Asm("PMOVMSKB ecx, xmm1")
+        Trans_Asm("NOT ecx")
+        Trans_Asm("AND ecx, 65535")
+        Trans_Asm("OR eax, ecx")
+        Trans_Asm("OR edx, eax")
+    }
+}
+
+// EAX nonzero if [rdi+base, rdi+base+64) contains a zero. XMM0 is zero. XMM1 stays.
+Function.X86_StrchrNull64 {
+    Input: base: Integer
+    Body: {
+        X86_MOVDQU_XMM2_RdiDisp(base)
+        X86_MOVDQU_XMM3_RdiDisp(Add(base, 16))
+        Trans_Asm("PMINUB xmm2, xmm3")
+        X86_MOVDQU_XMM3_RdiDisp(Add(base, 32))
+        Trans_Asm("PMINUB xmm2, xmm3")
+        X86_MOVDQU_XMM3_RdiDisp(Add(base, 48))
+        Trans_Asm("PMINUB xmm2, xmm3")
+        Trans_Asm("PCMPEQB xmm2, xmm0")
+        Trans_Asm("PMOVMSKB eax, xmm2")
+    }
+}
+
+// EAX nonzero if [rdi+base, rdi+base+64) contains the broadcast byte in XMM1.
+Function.X86_StrchrMatch64 {
+    Input: base: Integer
+    Body: {
+        X86_MOVDQU_XMM2_RdiDisp(base)
+        Trans_Asm("PCMPEQB xmm2, xmm1")
+        X86_MOVDQU_XMM3_RdiDisp(Add(base, 16))
+        Trans_Asm("PCMPEQB xmm3, xmm1")
+        Trans_Asm("POR xmm2, xmm3")
+        X86_MOVDQU_XMM3_RdiDisp(Add(base, 32))
+        Trans_Asm("PCMPEQB xmm3, xmm1")
+        Trans_Asm("POR xmm2, xmm3")
+        X86_MOVDQU_XMM3_RdiDisp(Add(base, 48))
+        Trans_Asm("PCMPEQB xmm3, xmm1")
+        Trans_Asm("POR xmm2, xmm3")
+        Trans_Asm("PMOVMSKB eax, xmm2")
+    }
+}
+
 // RDI = C string. Returns length in RAX. Clobbers XMM0/XMM1, R8, EAX, ECX, RDI.
-// The wide load is aligned, so it stays inside one page. Bytes before that
-// alignment are read one at a time. An unaligned MOVDQU from the last
-// 15 bytes of an arena chunk reads the unmapped next page.
+// Bytes before 16-byte alignment are read one at a time. The wide loop is two
+// 64-byte PMINUB probes. A 64-byte-aligned group stays inside one page, so it
+// does not read the unmapped page after an arena chunk. The matching group is
+// rescanned 16 bytes at a time.
 Function.FPU_EmitSse2Strlen {
     Body: {
         head = Emit_CreateLabel()
-        aligned = Emit_CreateLabel()
+        align16 = Emit_CreateLabel()
+        wide = Emit_CreateLabel()
+        found_hi = Emit_CreateLabel()
+        found16 = Emit_CreateLabel()
         found_vec = Emit_CreateLabel()
         scalar_found = Emit_CreateLabel()
         done = Emit_CreateLabel()
@@ -150,30 +227,41 @@ Function.FPU_EmitSse2Strlen {
         Trans_Asm("PXOR xmm0, xmm0")
         Emit_MarkLabel(head)
         Trans_Asm("TEST rdi, 15")
-        Emit_Jz(aligned)
+        Emit_Jz(align16)
         X86_MovzxRaxByteDerefRdi()
         Trans_Asm("TEST rax, rax")
         Emit_Jz(scalar_found)
         Emit_IncRdi()
         Emit_Jmp(head)
-        Emit_MarkLabel(aligned)
-        // Table key MOVDQA_xmm_m128. Operand 0 is xmm1, operand 1 is rdi.
-        X86AsmParse.op0 = 1
-        X86AsmParse.op1 = 7
-        X86AsmParse.op2 = 0
-        X86AsmParse.op3 = 0
-        Listing_Open("MOVDQA_xmm_m128")
-        ok_movdqa = X86Enc_Emit("MOVDQA_xmm_m128")
-        Listing_Close()
-        IfCondition EqualTo(ok_movdqa, 0) ThenBlock: {
-            PrintMessage("[TRANS] encode failed: MOVDQA_xmm_m128\n")
-        }
+        Emit_MarkLabel(align16)
+        Trans_Asm("TEST rdi, 63")
+        Emit_Jz(wide)
+        X86_MOVDQA_XMM1_RdiDisp(0)
+        Trans_Asm("PCMPEQB xmm1, xmm0")
+        Trans_Asm("PMOVMSKB eax, xmm1")
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(found16)
+        Trans_Asm("ADD rdi, 16")
+        Emit_Jmp(align16)
+        Emit_MarkLabel(wide)
+        X86_StrlenProbe64(0)
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(found16)
+        X86_StrlenProbe64(64)
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(found_hi)
+        Trans_Asm("ADD rdi, 128")
+        Emit_Jmp(wide)
+        Emit_MarkLabel(found_hi)
+        Trans_Asm("ADD rdi, 64")
+        Emit_MarkLabel(found16)
+        X86_MOVDQA_XMM1_RdiDisp(0)
         Trans_Asm("PCMPEQB xmm1, xmm0")
         Trans_Asm("PMOVMSKB eax, xmm1")
         Trans_Asm("TEST eax, eax")
         Emit_Jne(found_vec)
         Trans_Asm("ADD rdi, 16")
-        Emit_Jmp(aligned)
+        Emit_Jmp(found16)
         Emit_MarkLabel(found_vec)
         Trans_Asm("BSF ecx, eax")
         Emit_MovRaxRdi()
@@ -207,6 +295,65 @@ Function.FPUCompileX86_StringLength {
         Emit_MovRdiRax()
         FPU_EmitSse2Strlen()
         ReturnValue(1)
+    }
+}
+
+// CRC32 of C-string bytes. SSE4.2. Null and empty return 0. Result in EAX.
+// Clobbers RAX, RCX, RDI. Hash.HashString turns a 0 result into 1.
+Function.FPUCompileX86_Crc32String {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        arg_count = AST_GetChildCount(node)
+        IfCondition NotEqual(arg_count, 1) ThenBlock: {
+            PrintMessage("[SSE2-String] Crc32String requires 1 argument\n")
+            ReturnValue(0)
+        }
+        arg0 = AST_GetChild(node, 0)
+        Compile_Expression(arg0)
+        Emit_MovRdiRax()
+        Optimize_OutKill()
+        Optimize_ZeroKill()
+        FPU_EmitCrc32String()
+        ReturnValue(1)
+    }
+}
+
+Function.FPU_EmitCrc32String {
+    Body: {
+        loop_label = Emit_CreateLabel()
+        done_label = Emit_CreateLabel()
+        // xor eax, eax
+        Emit_Byte(49)
+        Emit_Byte(192)
+        // test rdi, rdi
+        Emit_Byte(72)
+        Emit_Byte(133)
+        Emit_Byte(255)
+        Emit_Je(done_label)
+
+        Emit_MarkLabel(loop_label)
+        // movzx ecx, byte [rdi]
+        Emit_Byte(15)
+        Emit_Byte(182)
+        Emit_Byte(15)
+        // test cl, cl
+        Emit_Byte(132)
+        Emit_Byte(201)
+        Emit_Je(done_label)
+        // crc32 eax, cl
+        Emit_Byte(242)
+        Emit_Byte(15)
+        Emit_Byte(56)
+        Emit_Byte(240)
+        Emit_Byte(193)
+        // inc rdi
+        Emit_Byte(72)
+        Emit_Byte(255)
+        Emit_Byte(199)
+        Emit_Jmp(loop_label)
+
+        Emit_MarkLabel(done_label)
     }
 }
 
@@ -305,6 +452,7 @@ Function.FPUCompileX86_StringCompare {
         arg0 = AST_GetChild(node, 0)
         arg1 = AST_GetChild(node, 1)
         
+        wide_loop = Emit_CreateLabel()
         sse_loop = Emit_CreateLabel()
         found_stop = Emit_CreateLabel()
         page_tail = Emit_CreateLabel()
@@ -318,38 +466,82 @@ Function.FPUCompileX86_StringCompare {
         Emit_MovRdiRax()
         
         Emit_PopRsi()
+
+        // xmm2 and xmm3 are loop homes. The compare borrows them and puts
+        // them back before the caller continues. SUB 32 keeps the alignment.
+        Emit_Byte(72)
+        Emit_Byte(131)
+        Emit_Byte(236)
+        Emit_Byte(32)
+        Emit_Byte(243)
+        Emit_Byte(15)
+        Emit_Byte(127)
+        Emit_Byte(20)
+        Emit_Byte(36)
+        Emit_Byte(243)
+        Emit_Byte(15)
+        Emit_Byte(127)
+        Emit_Byte(92)
+        Emit_Byte(36)
+        Emit_Byte(16)
         
         Trans_Asm("PXOR xmm0, xmm0")
-        
+
+        // 128 unaligned bytes stay in-page when both offsets are <= 3968.
+        // A hit falls into the 16-byte loop without moving the pointers.
+        Emit_MarkLabel(wide_loop)
+        Trans_Asm("MOV eax, edi")
+        Trans_Asm("OR eax, esi")
+        Trans_Asm("AND eax, 4095")
+        Trans_Asm("CMP eax, 3968")
+        Emit_Ja(sse_loop)
+        Trans_Asm("XOR edx, edx")
+        X86_StrcmpAccum(0)
+        // EAX is the stop mask for displacement 0. found_stop indexes from
+        // rdi, so a later chunk must not take this branch.
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(found_stop)
+        X86_StrcmpAccum(16)
+        X86_StrcmpAccum(32)
+        X86_StrcmpAccum(48)
+        X86_StrcmpAccum(64)
+        X86_StrcmpAccum(80)
+        X86_StrcmpAccum(96)
+        X86_StrcmpAccum(112)
+        Trans_Asm("TEST edx, edx")
+        Emit_Jne(sse_loop)
+        Trans_Asm("ADD rdi, 128")
+        Trans_Asm("ADD rsi, 128")
+        Emit_Jmp(wide_loop)
+
         Emit_MarkLabel(sse_loop)
 
-        // Same page rule as strlen. OR of the two page offsets is enough:
-        // if either offset is above 4080, the OR is too.
+        // One pointer within 16 bytes of the page end takes the byte tail.
         Trans_Asm("MOV eax, edi")
         Trans_Asm("OR eax, esi")
         Trans_Asm("AND eax, 4095")
         Trans_Asm("CMP eax, 4080")
         Emit_Ja(page_tail)
-        
+
         X86_MOVDQU_XMM1_DerefRDI()
         X86_MOVDQU_XMM2_DerefRSI()
         Trans_Asm("MOVDQA xmm3, xmm1")
         Trans_Asm("PCMPEQB xmm3, xmm0")
         Trans_Asm("PCMPEQB xmm1, xmm2")
-        
+
         Trans_Asm("PMOVMSKB eax, xmm3")
         Trans_Asm("PMOVMSKB ecx, xmm1")
-        
+
         Trans_Asm("NOT ecx")
         Trans_Asm("AND ecx, 65535")
         Trans_Asm("OR eax, ecx")
-        
+
         Trans_Asm("TEST eax, eax")
         Emit_Jne(found_stop)
-        
+
         Trans_Asm("ADD rdi, 16")
         Trans_Asm("ADD rsi, 16")
-        Emit_Jmp(sse_loop)
+        Emit_Jmp(wide_loop)
         
         Emit_MarkLabel(found_stop)
         
@@ -375,6 +567,21 @@ Function.FPUCompileX86_StringCompare {
         Trans_Asm("MOV rax, rdx")
 
         Emit_MarkLabel(done_label)
+        Emit_Byte(243)
+        Emit_Byte(15)
+        Emit_Byte(111)
+        Emit_Byte(92)
+        Emit_Byte(36)
+        Emit_Byte(16)
+        Emit_Byte(243)
+        Emit_Byte(15)
+        Emit_Byte(111)
+        Emit_Byte(20)
+        Emit_Byte(36)
+        Emit_Byte(72)
+        Emit_Byte(131)
+        Emit_Byte(196)
+        Emit_Byte(32)
         
         ReturnValue(1)
     }
@@ -648,8 +855,11 @@ Function.FPUCompileX86_StringIndexOf {
         arg0 = AST_GetChild(node, 0)  // str
         arg1 = AST_GetChild(node, 1)  // char
         
+        wide_loop = Emit_CreateLabel()
         sse_loop = Emit_CreateLabel()
+        byte_tail = Emit_CreateLabel()
         found_match = Emit_CreateLabel()
+        found_byte = Emit_CreateLabel()
         calc_index = Emit_CreateLabel()
         not_found = Emit_CreateLabel()
         done_label = Emit_CreateLabel()
@@ -673,6 +883,7 @@ Function.FPUCompileX86_StringIndexOf {
         Emit_MovRdiRax()            // RDI = str
         
         Emit_PopRax()               // RAX = char to find
+        Trans_Asm("MOV r9, rax")    // byte tail compares against this
         Emit_PopRdx()               // RDX = start_pos
         
         // R8 = original str pointer (for absolute index calc)
@@ -687,36 +898,77 @@ Function.FPUCompileX86_StringIndexOf {
         
         // XMM0 = 0 (null detection)
         Trans_Asm("PXOR xmm0, xmm0")
-        
-        // === Main loop ===
+
+        // 128 unaligned bytes stay in-page when the offset is <= 3968.
+        // A match or a NUL falls into the 16-byte loop at the same pointer.
+        Emit_MarkLabel(wide_loop)
+        Trans_Asm("MOV eax, edi")
+        Trans_Asm("AND eax, 4095")
+        Trans_Asm("CMP eax, 3968")
+        Emit_Ja(sse_loop)
+        X86_StrchrNull64(0)
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(sse_loop)
+        X86_StrchrMatch64(0)
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(sse_loop)
+        X86_StrchrNull64(64)
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(sse_loop)
+        X86_StrchrMatch64(64)
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(sse_loop)
+        Trans_Asm("ADD rdi, 128")
+        Emit_Jmp(wide_loop)
+
+        // === 16-byte loop ===
         Emit_MarkLabel(sse_loop)
-        
+        Trans_Asm("MOV eax, edi")
+        Trans_Asm("AND eax, 4095")
+        Trans_Asm("CMP eax, 4080")
+        Emit_Ja(byte_tail)
+
         // XMM2 = [RDI] (16 bytes)
         X86_MOVDQU_XMM2_DerefRDI()
-        
+
         // XMM3 = XMM2 (copy for null check)
         Trans_Asm("MOVDQA xmm3, xmm2")
-        
+
         // XMM2 = (XMM2 == XMM1) - char matches
         Trans_Asm("PCMPEQB xmm2, xmm1")
-        
+
         // XMM3 = (XMM3 == 0) - null positions
         Trans_Asm("PCMPEQB xmm3, xmm0")
-        
+
         // Check for char match
         Trans_Asm("PMOVMSKB eax, xmm2")
         Trans_Asm("TEST eax, eax")
         Emit_Jne(found_match)
-        
+
         // Check for null (end of string)
         Trans_Asm("PMOVMSKB eax, xmm3")
         Trans_Asm("TEST eax, eax")
         Emit_Jne(not_found)
-        
+
         // Advance
         Trans_Asm("ADD rdi, 16")
+        Emit_Jmp(wide_loop)
+
+        // Last 15 bytes of a page, one byte at a time, so a guard page stays unread.
+        Emit_MarkLabel(byte_tail)
+        X86_MovzxRaxByteDerefRdi()
+        Trans_Asm("CMP eax, r9d")
+        Emit_Je(found_byte)
+        Trans_Asm("TEST eax, eax")
+        Emit_Jz(not_found)
+        Emit_IncRdi()
         Emit_Jmp(sse_loop)
-        
+
+        Emit_MarkLabel(found_byte)
+        Emit_MovRaxRdi()
+        Trans_Asm("SUB rax, r8")
+        Emit_Jmp(done_label)
+
         // === Found char match ===
         Emit_MarkLabel(found_match)
         
