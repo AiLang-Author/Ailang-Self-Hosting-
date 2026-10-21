@@ -19,8 +19,11 @@
 //
 // headers_str format: newline-separated header lines, one per line.
 //   "Authorization: Bearer sk-...\nContent-Type: application/json"
-// Each line becomes a `-H "<line>"` argument to curl. Lines may not
-// contain newlines themselves (obviously). Empty headers_str is fine.
+// Each line is delivered to curl as a `header = "<line>"` directive in a config
+// read from an inherited pipe (`-K /dev/fd/3`) -- NEVER as a command-line
+// argument, so API keys do not show up in /proc/<pid>/cmdline or `ps`.
+// Lines may not contain newlines themselves (CR/LF are dropped). Empty
+// headers_str is fine.
 //
 // Copyright 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
 
@@ -126,35 +129,146 @@ Function.HTTP_DupSlice {
 }
 
 // =============================================================================
-// ARGV BUILDER — assembles the curl command line
-// =============================================================================
-// Layout:
-//   ["/usr/bin/curl", "-sS", "-N",
-//    [POST: "-X", "POST", "--data-binary", "@-"],
-//    [for each header: "-H", "<header>"],
-//    "<url>", 0]
+// CURL CONFIG BUILDER — headers and URL are delivered to curl through a config
+// read from an inherited pipe (`-K /dev/fd/3`), NOT through argv. argv is
+// world-readable via /proc/<pid>/cmdline and `ps`; API keys must never be there.
 //
-// Returns argv pointer (caller frees argv but NOT the duped header strings,
-// which must outlive the child exec — they're freed by HTTP_FreeArgvAfterFork).
-Function.HTTP_BuildArgv {
+// Output format (one directive per line, values double-quoted with \ and "
+// escaped, which is curl's config-file syntax):
+//   header = "Expect:"                [POST only: suppress 100-continue]
+//   header = "<line>"                 [one per non-empty header line]
+//   url = "<url>"
+// Returns a NUL-terminated heap buffer. Caller Deallocates it with
+// HTTP_CfgCap(url, headers_str) bytes.
+// =============================================================================
+
+// Upper bound on the config buffer size for these inputs.
+Function.HTTP_CfgCap {
+    Input: url: Address
+    Input: headers_str: Address
+    Output: Integer
+    Body: {
+        hl = 0
+        IfCondition NotEqual(headers_str, 0) ThenBlock: { hl = StringLength(headers_str) }
+        ul = StringLength(url)
+        n_hdr = HTTP_CountHeaders(headers_str)
+        // Worst case every byte is escaped (x2); each directive adds <= 16 bytes
+        // of framing ("header = \"" + "\"\n"); +64 slack for the NUL and Expect line.
+        cap = Add(Multiply(Add(hl, ul), 2), Multiply(Add(n_hdr, 3), 16))
+        ReturnValue(Add(cap, 64))
+    }
+}
+
+// Append NUL-terminated string `s` verbatim at buf[pos]. Returns the new pos.
+Function.HTTP_CfgPut {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: s: Address
+    Output: Integer
+    Body: {
+        p = pos
+        i = 0
+        WhileLoop 1 {
+            ch = GetByte(s, i)
+            IfCondition EqualTo(ch, 0) ThenBlock: { BreakLoop }
+            SetByte(buf, p, ch)
+            p = Add(p, 1)
+            i = Add(i, 1)
+        }
+        ReturnValue(p)
+    }
+}
+
+// Append src[start .. start+len) at buf[pos], escaping \ and " for curl's
+// config syntax and dropping CR/LF (a header value cannot contain them, and
+// a raw newline would let a value inject extra config directives).
+// Returns the new pos.
+Function.HTTP_CfgPutEsc {
+    Input: buf: Address
+    Input: pos: Integer
+    Input: src: Address
+    Input: start: Integer
+    Input: len: Integer
+    Output: Integer
+    Body: {
+        p = pos
+        i = 0
+        WhileLoop LessThan(i, len) {
+            ch = GetByte(src, Add(start, i))
+            skip = 0
+            IfCondition Or(EqualTo(ch, 13), EqualTo(ch, 10)) ThenBlock: { skip = 1 }
+            IfCondition EqualTo(skip, 0) ThenBlock: {
+                IfCondition Or(EqualTo(ch, 92), EqualTo(ch, 34)) ThenBlock: {
+                    SetByte(buf, p, 92)
+                    p = Add(p, 1)
+                }
+                SetByte(buf, p, ch)
+                p = Add(p, 1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(p)
+    }
+}
+
+Function.HTTP_BuildConfig {
     Input: url: Address
     Input: headers_str: Address
     Input: with_post: Integer
     Output: Address
     Body: {
-        n_hdr = HTTP_CountHeaders(headers_str)
+        cap = HTTP_CfgCap(url, headers_str)
+        buf = Allocate(cap)
+        p = 0
 
-        // Slot count: curl, -sS, -N, --limit-rate 1M, --connect-timeout 10, -m 180,
-        //   [opt 6 POST], 2*n_hdr, url, NULL
-        // POST gets 2 extra slots for -H "Expect:" which suppresses the automatic
-        // Expect: 100-continue header curl injects for bodies > 1024 bytes.
-        post_slots = 0
-        IfCondition EqualTo(with_post, 1) ThenBlock: { post_slots = 6 }
-        slots = Add(Add(Add(9, post_slots), Multiply(n_hdr, 2)), 2)
-        bytes = Multiply(slots, 8)
+        IfCondition EqualTo(with_post, 1) ThenBlock: {
+            p = HTTP_CfgPut(buf, p, "header = \"Expect:\"\n")
+        }
 
-        argv = Allocate(bytes)
-        // Default to no curl path override
+        IfCondition NotEqual(headers_str, 0) ThenBlock: {
+            i = 0
+            line_start = 0
+            WhileLoop 1 {
+                ch = GetByte(headers_str, i)
+                at_end = 0
+                IfCondition EqualTo(ch, 0) ThenBlock: { at_end = 1 }
+                IfCondition Or(EqualTo(ch, 10), EqualTo(at_end, 1)) ThenBlock: {
+                    line_len = Subtract(i, line_start)
+                    IfCondition GreaterThan(line_len, 0) ThenBlock: {
+                        p = HTTP_CfgPut(buf, p, "header = \"")
+                        p = HTTP_CfgPutEsc(buf, p, headers_str, line_start, line_len)
+                        p = HTTP_CfgPut(buf, p, "\"\n")
+                    }
+                    line_start = Add(i, 1)
+                }
+                IfCondition EqualTo(at_end, 1) ThenBlock: { BreakLoop }
+                i = Add(i, 1)
+            }
+        }
+
+        p = HTTP_CfgPut(buf, p, "url = \"")
+        p = HTTP_CfgPutEsc(buf, p, url, 0, StringLength(url))
+        p = HTTP_CfgPut(buf, p, "\"\n")
+        SetByte(buf, p, 0)
+        ReturnValue(buf)
+    }
+}
+
+// =============================================================================
+// ARGV BUILDER — assembles the curl command line.
+// Contains NO secrets and NO url: those travel in the config pipe (fd 3).
+// Layout:
+//   ["/usr/bin/curl", "-sS", "-N", "--limit-rate", "1M",
+//    "--connect-timeout", "10", "-m", "180",
+//    [POST: "-X", "POST", "--data-binary", "@-"],
+//    "-K", "/dev/fd/3", NULL]
+// =============================================================================
+Function.HTTP_BuildArgv {
+    Input: with_post: Integer
+    Output: Address
+    Body: {
+        // 9 fixed + 4 POST + 2 (-K fd) + 1 NULL = 16 slots max; allocate 20.
+        argv = Allocate(160)
         IfCondition EqualTo(HConst.CURL_PATH, 0) ThenBlock: {
             HConst.CURL_PATH = "/usr/bin/curl"
         }
@@ -186,40 +300,12 @@ Function.HTTP_BuildArgv {
             idx = Add(idx, 1)
             StoreValue(Add(argv, Multiply(idx, 8)), "@-")
             idx = Add(idx, 1)
-            StoreValue(Add(argv, Multiply(idx, 8)), "-H")
-            idx = Add(idx, 1)
-            StoreValue(Add(argv, Multiply(idx, 8)), "Expect:")
-            idx = Add(idx, 1)
         }
-
-        // Walk headers_str line-by-line, allocating a duplicate per line
-        IfCondition NotEqual(headers_str, 0) ThenBlock: {
-            i = 0
-            line_start = 0
-            WhileLoop 1 {
-                ch = GetByte(headers_str, i)
-                at_end = 0
-                IfCondition EqualTo(ch, 0) ThenBlock: { at_end = 1 }
-                IfCondition Or(EqualTo(ch, 10), EqualTo(at_end, 1)) ThenBlock: {
-                    line_len = Subtract(i, line_start)
-                    IfCondition GreaterThan(line_len, 0) ThenBlock: {
-                        line = HTTP_DupSlice(headers_str, line_start, line_len)
-                        StoreValue(Add(argv, Multiply(idx, 8)), "-H")
-                        idx = Add(idx, 1)
-                        StoreValue(Add(argv, Multiply(idx, 8)), line)
-                        idx = Add(idx, 1)
-                    }
-                    line_start = Add(i, 1)
-                }
-                IfCondition EqualTo(at_end, 1) ThenBlock: { BreakLoop }
-                i = Add(i, 1)
-            }
-        }
-
-        StoreValue(Add(argv, Multiply(idx, 8)), url)
+        StoreValue(Add(argv, Multiply(idx, 8)), "-K")
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "/dev/fd/3")
         idx = Add(idx, 1)
         StoreValue(Add(argv, Multiply(idx, 8)), 0)
-
         ReturnValue(argv)
     }
 }
@@ -227,6 +313,12 @@ Function.HTTP_BuildArgv {
 // =============================================================================
 // FORK+EXEC CURL — returns stream handle, or 0 on failure.
 // If body_str non-zero, body is written to curl's stdin and stdin closed.
+//
+// fd plumbing for the child:
+//   0 = stdin pipe (request body)      1 = stdout pipe (response)
+//   2 = /dev/null                      3 = config pipe (headers + url)
+// The config is written and its write end closed BEFORE fork, so the child
+// holds the only reference and curl sees EOF as soon as it has read it.
 // =============================================================================
 Function.HTTP_SpawnCurl {
     Input: url: Address
@@ -235,11 +327,50 @@ Function.HTTP_SpawnCurl {
     Input: with_post: Integer
     Output: Address
     Body: {
+        // Build the config first so oversized input fails before any fd is open.
+        // A pipe buffers 64 KiB; the config is written before curl exists, so it
+        // must fit or the write would block forever.
+        cfg = HTTP_BuildConfig(url, headers_str, with_post)
+        cfg_len = StringLength(cfg)
+        cfg_cap = HTTP_CfgCap(url, headers_str)
+        IfCondition GreaterThan(cfg_len, 60000) ThenBlock: {
+            Deallocate(cfg, cfg_cap)
+            ReturnValue(0)
+        }
+
+        // config pipe (parent writes before fork, child reads as fd 3)
+        cfg_pf = Allocate(8)
+        cpr = SystemCall(HSys.SYS_PIPE, cfg_pf, 0, 0, 0, 0)
+        IfCondition LessThan(cpr, 0) ThenBlock: {
+            Deallocate(cfg_pf, 8)
+            Deallocate(cfg, cfg_cap)
+            ReturnValue(0)
+        }
+        cfg_read  = Dereference(cfg_pf, "dword")
+        cfg_write = Dereference(Add(cfg_pf, 4), "dword")
+        Deallocate(cfg_pf, 8)
+
+        cw = 0
+        WhileLoop LessThan(cw, cfg_len) {
+            w = SystemCall(HSys.SYS_WRITE, cfg_write, Add(cfg, cw), Subtract(cfg_len, cw), 0, 0)
+            IfCondition LessEqual(w, 0) ThenBlock: { BreakLoop }
+            cw = Add(cw, w)
+        }
+        SystemCall(HSys.SYS_CLOSE, cfg_write, 0, 0, 0, 0)
+        // Scrub the secret-bearing buffer before releasing it.
+        MemorySet(cfg, 0, cfg_cap)
+        Deallocate(cfg, cfg_cap)
+        IfCondition LessThan(cw, cfg_len) ThenBlock: {
+            SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+
         // stdin pipe (parent writes, child reads)
         in_pf = Allocate(8)
         ipr = SystemCall(HSys.SYS_PIPE, in_pf, 0, 0, 0, 0)
         IfCondition LessThan(ipr, 0) ThenBlock: {
             Deallocate(in_pf, 8)
+            SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
             ReturnValue(0)
         }
         in_read  = Dereference(in_pf, "dword")
@@ -252,6 +383,7 @@ Function.HTTP_SpawnCurl {
         IfCondition LessThan(opr, 0) ThenBlock: {
             SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
             Deallocate(out_pf, 8)
             ReturnValue(0)
         }
@@ -259,7 +391,7 @@ Function.HTTP_SpawnCurl {
         out_write = Dereference(Add(out_pf, 4), "dword")
         Deallocate(out_pf, 8)
 
-        argv = HTTP_BuildArgv(url, headers_str, with_post)
+        argv = HTTP_BuildArgv(with_post)
 
         pid = SystemCall(HSys.SYS_FORK, 0, 0, 0, 0, 0)
         IfCondition LessThan(pid, 0) ThenBlock: {
@@ -267,6 +399,8 @@ Function.HTTP_SpawnCurl {
             SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, out_read, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, out_write, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+            Deallocate(argv, 160)
             ReturnValue(0)
         }
 
@@ -283,6 +417,12 @@ Function.HTTP_SpawnCurl {
                 SystemCall(HSys.SYS_DUP2, null_fd, 2, 0, 0, 0)
                 SystemCall(HSys.SYS_CLOSE, null_fd, 0, 0, 0, 0)
             }
+            // Config pipe must land on fd 3 (argv says -K /dev/fd/3). Done last so
+            // none of the dup2/close calls above can clobber it.
+            IfCondition NotEqual(cfg_read, 3) ThenBlock: {
+                SystemCall(HSys.SYS_DUP2, cfg_read, 3, 0, 0, 0)
+                SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+            }
             SystemCall(HSys.SYS_EXECVE, HConst.CURL_PATH, argv, 0)
             SystemCall(HSys.SYS_EXIT, 1, 0, 0, 0, 0)
         }
@@ -290,6 +430,8 @@ Function.HTTP_SpawnCurl {
         // Parent
         SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
         SystemCall(HSys.SYS_CLOSE, out_write, 0, 0, 0, 0)
+        SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+        Deallocate(argv, 160)
 
         // Write body if any, then close stdin so curl sends and waits for response
         IfCondition NotEqual(body_str, 0) ThenBlock: {
