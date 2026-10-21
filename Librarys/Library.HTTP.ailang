@@ -52,15 +52,18 @@ FixedPool.HFcntl {
     "F_GETFL":       Initialize=3
     "F_SETFL":       Initialize=4
     "O_NONBLOCK":    Initialize=2048
+    "F_DUPFD":       Initialize=0
 }
 
 FixedPool.HConst {
     "MAX_HEADERS":   Initialize=32
     "READ_BUF_SZ":   Initialize=8192
+    "HANDLE_SZ":     Initialize=96
+    "STATUS_BUF_SZ": Initialize=1024
     "CURL_PATH":     Initialize=0, CanChange=True
 }
 
-// Stream handle layout (40 bytes):
+// Stream handle layout (96 bytes):
 //   [0]   stdin_fd  (dword)
 //   [4]   stdout_fd (dword)
 //   [8]   pid       (qword)
@@ -69,6 +72,14 @@ FixedPool.HConst {
 //   [28]  buf_end   (dword) — end of valid data in line_buf
 //   [32]  eof_flag  (dword) — 1 once read returned 0/err
 //   [36]  reserved  (dword)
+//   [40]  status_fd (dword) — read end of curl's -w record pipe, -1 once consumed
+//   [44]  st_loaded (dword) — 1 once the -w record has been parsed
+//   [48]  code      (qword) — HTTP status; -1 unknown, 0 no HTTP response
+//   [56]  retry_aft (qword) — Retry-After seconds (0 = none)
+//   [64]  req_id    (Address) — into status_buf
+//   [72]  errmsg    (Address) — into status_buf
+//   [80]  exitcode  (qword) — curl exit code
+//   [88]  status_buf (Address) — owned, freed by CloseStream
 FixedPool.HHandleOff {
     "STDIN_FD":      Initialize=0
     "STDOUT_FD":     Initialize=4
@@ -77,6 +88,14 @@ FixedPool.HHandleOff {
     "BUF_POS":       Initialize=24
     "BUF_END":       Initialize=28
     "EOF":           Initialize=32
+    "STATUS_FD":     Initialize=40
+    "ST_LOADED":     Initialize=44
+    "CODE":          Initialize=48
+    "RETRY_AFTER":   Initialize=56
+    "REQ_ID":        Initialize=64
+    "ERRMSG":        Initialize=72
+    "EXITCODE":      Initialize=80
+    "STATUS_BUF":    Initialize=88
 }
 
 // =============================================================================
@@ -257,17 +276,26 @@ Function.HTTP_BuildConfig {
 // =============================================================================
 // ARGV BUILDER — assembles the curl command line.
 // Contains NO secrets and NO url: those travel in the config pipe (fd 3).
+//
+// conn_s / max_s are decimal-second strings for --connect-timeout / -m.
+// -w writes a small status record to fd 4 (NOT stdout, so the response stream
+// is untouched). Fields, one per line: http_code, retry-after, request-id,
+// curl errormsg, curl exitcode. http_code is 000 when no HTTP response arrived.
+//
 // Layout:
 //   ["/usr/bin/curl", "-sS", "-N", "--limit-rate", "1M",
-//    "--connect-timeout", "10", "-m", "180",
+//    "--connect-timeout", conn_s, "-m", max_s,
+//    "-w", <status format>,
 //    [POST: "-X", "POST", "--data-binary", "@-"],
 //    "-K", "/dev/fd/3", NULL]
 // =============================================================================
 Function.HTTP_BuildArgv {
     Input: with_post: Integer
+    Input: conn_s: Address
+    Input: max_s: Address
     Output: Address
     Body: {
-        // 9 fixed + 4 POST + 2 (-K fd) + 1 NULL = 16 slots max; allocate 20.
+        // 11 fixed + 4 POST + 2 (-K fd) + 1 NULL = 18 slots max; allocate 20.
         argv = Allocate(160)
         IfCondition EqualTo(HConst.CURL_PATH, 0) ThenBlock: {
             HConst.CURL_PATH = "/usr/bin/curl"
@@ -285,11 +313,15 @@ Function.HTTP_BuildArgv {
         idx = Add(idx, 1)
         StoreValue(Add(argv, Multiply(idx, 8)), "--connect-timeout")
         idx = Add(idx, 1)
-        StoreValue(Add(argv, Multiply(idx, 8)), "10")
+        StoreValue(Add(argv, Multiply(idx, 8)), conn_s)
         idx = Add(idx, 1)
         StoreValue(Add(argv, Multiply(idx, 8)), "-m")
         idx = Add(idx, 1)
-        StoreValue(Add(argv, Multiply(idx, 8)), "180")
+        StoreValue(Add(argv, Multiply(idx, 8)), max_s)
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "-w")
+        idx = Add(idx, 1)
+        StoreValue(Add(argv, Multiply(idx, 8)), "%output{/dev/fd/4}%{http_code}\n%header{retry-after}\n%header{request-id}\n%{errormsg}\n%{exitcode}\n")
         idx = Add(idx, 1)
         IfCondition EqualTo(with_post, 1) ThenBlock: {
             StoreValue(Add(argv, Multiply(idx, 8)), "-X")
@@ -310,6 +342,22 @@ Function.HTTP_BuildArgv {
     }
 }
 
+// Milliseconds -> whole seconds as a decimal string, rounded up. A value <= 0
+// selects `default_s` (the library's historical defaults: 10s connect, 180s total).
+Function.HTTP_MsToSecStr {
+    Input: ms: Integer
+    Input: default_s: Integer
+    Output: Address
+    Body: {
+        s = default_s
+        IfCondition GreaterThan(ms, 0) ThenBlock: {
+            s = Divide(Add(ms, 999), 1000)
+        }
+        IfCondition LessThan(s, 1) ThenBlock: { s = 1 }
+        ReturnValue(NumberToString(s))
+    }
+}
+
 // =============================================================================
 // FORK+EXEC CURL — returns stream handle, or 0 on failure.
 // If body_str non-zero, body is written to curl's stdin and stdin closed.
@@ -317,14 +365,18 @@ Function.HTTP_BuildArgv {
 // fd plumbing for the child:
 //   0 = stdin pipe (request body)      1 = stdout pipe (response)
 //   2 = /dev/null                      3 = config pipe (headers + url)
+//   4 = status pipe (-w record)
 // The config is written and its write end closed BEFORE fork, so the child
 // holds the only reference and curl sees EOF as soon as it has read it.
+// conn_ms / max_ms are the caller's timeouts in milliseconds (<= 0 = default).
 // =============================================================================
 Function.HTTP_SpawnCurl {
     Input: url: Address
     Input: headers_str: Address
     Input: body_str: Address
     Input: with_post: Integer
+    Input: conn_ms: Integer
+    Input: max_ms: Integer
     Output: Address
     Body: {
         // Build the config first so oversized input fails before any fd is open.
@@ -365,12 +417,26 @@ Function.HTTP_SpawnCurl {
             ReturnValue(0)
         }
 
+        // status pipe (child writes the -w record as fd 4, parent reads)
+        st_pf = Allocate(8)
+        spr = SystemCall(HSys.SYS_PIPE, st_pf, 0, 0, 0, 0)
+        IfCondition LessThan(spr, 0) ThenBlock: {
+            Deallocate(st_pf, 8)
+            SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+            ReturnValue(0)
+        }
+        st_read  = Dereference(st_pf, "dword")
+        st_write = Dereference(Add(st_pf, 4), "dword")
+        Deallocate(st_pf, 8)
+
         // stdin pipe (parent writes, child reads)
         in_pf = Allocate(8)
         ipr = SystemCall(HSys.SYS_PIPE, in_pf, 0, 0, 0, 0)
         IfCondition LessThan(ipr, 0) ThenBlock: {
             Deallocate(in_pf, 8)
             SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_write, 0, 0, 0, 0)
             ReturnValue(0)
         }
         in_read  = Dereference(in_pf, "dword")
@@ -384,6 +450,8 @@ Function.HTTP_SpawnCurl {
             SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_write, 0, 0, 0, 0)
             Deallocate(out_pf, 8)
             ReturnValue(0)
         }
@@ -391,7 +459,9 @@ Function.HTTP_SpawnCurl {
         out_write = Dereference(Add(out_pf, 4), "dword")
         Deallocate(out_pf, 8)
 
-        argv = HTTP_BuildArgv(with_post)
+        conn_s = HTTP_MsToSecStr(conn_ms, 10)
+        max_s  = HTTP_MsToSecStr(max_ms, 180)
+        argv = HTTP_BuildArgv(with_post, conn_s, max_s)
 
         pid = SystemCall(HSys.SYS_FORK, 0, 0, 0, 0, 0)
         IfCondition LessThan(pid, 0) ThenBlock: {
@@ -400,12 +470,24 @@ Function.HTTP_SpawnCurl {
             SystemCall(HSys.SYS_CLOSE, out_read, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, out_write, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_write, 0, 0, 0, 0)
             Deallocate(argv, 160)
             ReturnValue(0)
         }
 
         IfCondition EqualTo(pid, 0) ThenBlock: {
-            // Child
+            // Child. First move the config and status fds out of the low range
+            // (>= 10) so none of the dup2/close calls below can clobber them, no
+            // matter which numbers the pipes happened to get.
+            cfg_hi = SystemCall(HSys.SYS_FCNTL, cfg_read, HFcntl.F_DUPFD, 10, 0, 0)
+            st_hi  = SystemCall(HSys.SYS_FCNTL, st_write, HFcntl.F_DUPFD, 10, 0, 0)
+            IfCondition Or(LessThan(cfg_hi, 0), LessThan(st_hi, 0)) ThenBlock: {
+                SystemCall(HSys.SYS_EXIT, 1, 0, 0, 0, 0)
+            }
+            SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_write, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_read, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
             SystemCall(HSys.SYS_CLOSE, out_read, 0, 0, 0, 0)
             SystemCall(HSys.SYS_DUP2, in_read, 0, 0, 0, 0)
@@ -417,12 +499,11 @@ Function.HTTP_SpawnCurl {
                 SystemCall(HSys.SYS_DUP2, null_fd, 2, 0, 0, 0)
                 SystemCall(HSys.SYS_CLOSE, null_fd, 0, 0, 0, 0)
             }
-            // Config pipe must land on fd 3 (argv says -K /dev/fd/3). Done last so
-            // none of the dup2/close calls above can clobber it.
-            IfCondition NotEqual(cfg_read, 3) ThenBlock: {
-                SystemCall(HSys.SYS_DUP2, cfg_read, 3, 0, 0, 0)
-                SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
-            }
+            // argv says -K /dev/fd/3 and -w ...%output{/dev/fd/4}. Done last.
+            SystemCall(HSys.SYS_DUP2, cfg_hi, 3, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, cfg_hi, 0, 0, 0, 0)
+            SystemCall(HSys.SYS_DUP2, st_hi, 4, 0, 0, 0)
+            SystemCall(HSys.SYS_CLOSE, st_hi, 0, 0, 0, 0)
             SystemCall(HSys.SYS_EXECVE, HConst.CURL_PATH, argv, 0)
             SystemCall(HSys.SYS_EXIT, 1, 0, 0, 0, 0)
         }
@@ -431,6 +512,7 @@ Function.HTTP_SpawnCurl {
         SystemCall(HSys.SYS_CLOSE, in_read, 0, 0, 0, 0)
         SystemCall(HSys.SYS_CLOSE, out_write, 0, 0, 0, 0)
         SystemCall(HSys.SYS_CLOSE, cfg_read, 0, 0, 0, 0)
+        SystemCall(HSys.SYS_CLOSE, st_write, 0, 0, 0, 0)
         Deallocate(argv, 160)
 
         // Write body if any, then close stdin so curl sends and waits for response
@@ -448,8 +530,8 @@ Function.HTTP_SpawnCurl {
         SystemCall(HSys.SYS_CLOSE, in_write, 0, 0, 0, 0)
 
         // Allocate handle
-        h = Allocate(40)
-        MemorySet(h, 0, 40)
+        h = Allocate(HConst.HANDLE_SZ)
+        MemorySet(h, 0, HConst.HANDLE_SZ)
         StoreValue(Add(h, HHandleOff.STDIN_FD), -1, "dword")
         StoreValue(Add(h, HHandleOff.STDOUT_FD), out_read, "dword")
         StoreValue(Add(h, HHandleOff.PID), pid)
@@ -458,6 +540,9 @@ Function.HTTP_SpawnCurl {
         StoreValue(Add(h, HHandleOff.BUF_POS), 0, "dword")
         StoreValue(Add(h, HHandleOff.BUF_END), 0, "dword")
         StoreValue(Add(h, HHandleOff.EOF), 0, "dword")
+        StoreValue(Add(h, HHandleOff.STATUS_FD), st_read, "dword")
+        StoreValue(Add(h, HHandleOff.ST_LOADED), 0, "dword")
+        StoreValue(Add(h, HHandleOff.CODE), -1)
 
         ReturnValue(h)
     }
@@ -473,7 +558,7 @@ Function.HTTP.GetStream {
     Input: max_to: Integer
     Output: Address
     Body: {
-        ReturnValue(HTTP_SpawnCurl(url, headers_str, 0, 0))
+        ReturnValue(HTTP_SpawnCurl(url, headers_str, 0, 0, conn_to, max_to))
     }
 }
 
@@ -488,7 +573,7 @@ Function.HTTP.PostStream {
     Input: max_to: Integer
     Output: Address
     Body: {
-        ReturnValue(HTTP_SpawnCurl(url, headers_str, body_str, 1))
+        ReturnValue(HTTP_SpawnCurl(url, headers_str, body_str, 1, conn_to, max_to))
     }
 }
 
@@ -738,6 +823,14 @@ Function.HTTP.CloseStream {
         IfCondition NotEqual(line_buf, 0) ThenBlock: {
             Deallocate(line_buf, HConst.READ_BUF_SZ)
         }
+        sfd = Dereference(Add(handle, HHandleOff.STATUS_FD), "dword")
+        IfCondition GreaterEqual(sfd, 0) ThenBlock: {
+            SystemCall(HSys.SYS_CLOSE, sfd, 0, 0, 0, 0)
+        }
+        sbuf = Dereference(Add(handle, HHandleOff.STATUS_BUF))
+        IfCondition NotEqual(sbuf, 0) ThenBlock: {
+            Deallocate(sbuf, HConst.STATUS_BUF_SZ)
+        }
         // Reap child (non-blocking) — best effort
         pid = Dereference(Add(handle, HHandleOff.PID))
         IfCondition GreaterThan(pid, 0) ThenBlock: {
@@ -745,7 +838,7 @@ Function.HTTP.CloseStream {
             SystemCall(HSys.SYS_WAIT4, pid, status, 0, 0, 0, 0)
             Deallocate(status, 8)
         }
-        Deallocate(handle, 40)
+        Deallocate(handle, HConst.HANDLE_SZ)
     }
 }
 
@@ -758,7 +851,7 @@ Function.HTTP.Get {
     Input: headers_str: Address
     Output: Address
     Body: {
-        h = HTTP_SpawnCurl(url, headers_str, 0, 0)
+        h = HTTP_SpawnCurl(url, headers_str, 0, 0, 0, 0)
         IfCondition EqualTo(h, 0) ThenBlock: { ReturnValue(0) }
         ReturnValue(HTTP_DrainAll(h))
     }
@@ -773,7 +866,7 @@ Function.HTTP.Post {
     Input: body_str: Address
     Output: Address
     Body: {
-        h = HTTP_SpawnCurl(url, headers_str, body_str, 1)
+        h = HTTP_SpawnCurl(url, headers_str, body_str, 1, 0, 0)
         IfCondition EqualTo(h, 0) ThenBlock: { ReturnValue(0) }
         ReturnValue(HTTP_DrainAll(h))
     }
@@ -812,5 +905,131 @@ Function.HTTP_DrainAll {
         SetByte(out, used, 0)
         HTTP.CloseStream(handle)
         ReturnValue(out)
+    }
+}
+
+// =============================================================================
+// PUBLIC: RESPONSE STATUS (read from curl's -w record on fd 4)
+//
+// Call these AFTER the stream has hit EOF (ReadLine/ReadLineTimeout returned -1)
+// and BEFORE HTTP.CloseStream. Strings returned point into the handle and are
+// invalid after CloseStream -- copy them if you need to keep them.
+//
+//   HTTP.GetStatus(h)     -> HTTP status code (200, 429, ...)
+//                            0  = no HTTP response (DNS/connect/TLS failure,
+//                                 see GetErrorMsg)
+//                            -1 = not known (curl still running, or no record)
+//   HTTP.GetRetryAfter(h) -> Retry-After in whole seconds, 0 if absent or if
+//                            the server sent an HTTP-date instead of seconds
+//   HTTP.GetRequestId(h)  -> `request-id` response header, or 0
+//   HTTP.GetErrorMsg(h)   -> curl's error message for a failed transfer, or 0
+//   HTTP.GetExitCode(h)   -> curl exit code (0 = transfer completed)
+// =============================================================================
+
+// Read and parse the status record once. Returns 1 if loaded, 0 if not yet
+// available (curl still running). Never blocks while curl is mid-transfer.
+Function.HTTP_LoadStatus {
+    Input: handle: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Dereference(Add(handle, HHandleOff.ST_LOADED), "dword"), 1) ThenBlock: {
+            ReturnValue(1)
+        }
+        sfd = Dereference(Add(handle, HHandleOff.STATUS_FD), "dword")
+        IfCondition LessThan(sfd, 0) ThenBlock: { ReturnValue(0) }
+
+        // poll(POLLIN, 0): readable or HUP means curl has written/closed its end.
+        pfd = Allocate(8)
+        StoreValue(pfd, sfd, "dword")
+        StoreValue(Add(pfd, 4), 1, "dword")
+        pr = SystemCall(HSys.SYS_POLL, pfd, 1, 0, 0, 0)
+        Deallocate(pfd, 8)
+        IfCondition LessEqual(pr, 0) ThenBlock: { ReturnValue(0) }
+
+        buf = Allocate(HConst.STATUS_BUF_SZ)
+        MemorySet(buf, 0, HConst.STATUS_BUF_SZ)
+        cap = Subtract(HConst.STATUS_BUF_SZ, 1)
+        used = 0
+        WhileLoop LessThan(used, cap) {
+            n = SystemCall(HSys.SYS_READ, sfd, Add(buf, used), Subtract(cap, used), 0, 0)
+            IfCondition LessEqual(n, 0) ThenBlock: { BreakLoop }
+            used = Add(used, n)
+        }
+        SystemCall(HSys.SYS_CLOSE, sfd, 0, 0, 0, 0)
+        StoreValue(Add(handle, HHandleOff.STATUS_FD), -1, "dword")
+        StoreValue(Add(handle, HHandleOff.STATUS_BUF), buf)
+        StoreValue(Add(handle, HHandleOff.ST_LOADED), 1, "dword")
+
+        // Fields are newline-terminated: code, retry-after, request-id, errormsg, exitcode.
+        i = 0
+        start = 0
+        field = 0
+        WhileLoop And(LessThan(i, used), LessThan(field, 5)) {
+            IfCondition EqualTo(GetByte(buf, i), 10) ThenBlock: {
+                SetByte(buf, i, 0)
+                p = Add(buf, start)
+                IfCondition EqualTo(field, 0) ThenBlock: { StoreValue(Add(handle, HHandleOff.CODE), StringToInt(p)) }
+                IfCondition EqualTo(field, 1) ThenBlock: { StoreValue(Add(handle, HHandleOff.RETRY_AFTER), StringToInt(p)) }
+                IfCondition EqualTo(field, 2) ThenBlock: { StoreValue(Add(handle, HHandleOff.REQ_ID), p) }
+                IfCondition EqualTo(field, 3) ThenBlock: { StoreValue(Add(handle, HHandleOff.ERRMSG), p) }
+                IfCondition EqualTo(field, 4) ThenBlock: { StoreValue(Add(handle, HHandleOff.EXITCODE), StringToInt(p)) }
+                field = Add(field, 1)
+                start = Add(i, 1)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+Function.HTTP.GetStatus {
+    Input: handle: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(HTTP_LoadStatus(handle), 0) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Dereference(Add(handle, HHandleOff.CODE)))
+    }
+}
+
+Function.HTTP.GetRetryAfter {
+    Input: handle: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(HTTP_LoadStatus(handle), 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(handle, HHandleOff.RETRY_AFTER)))
+    }
+}
+
+Function.HTTP.GetExitCode {
+    Input: handle: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(HTTP_LoadStatus(handle), 0) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Dereference(Add(handle, HHandleOff.EXITCODE)))
+    }
+}
+
+Function.HTTP.GetRequestId {
+    Input: handle: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(HTTP_LoadStatus(handle), 0) ThenBlock: { ReturnValue(0) }
+        p = Dereference(Add(handle, HHandleOff.REQ_ID))
+        IfCondition EqualTo(p, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(GetByte(p, 0), 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(p)
+    }
+}
+
+Function.HTTP.GetErrorMsg {
+    Input: handle: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(HTTP_LoadStatus(handle), 0) ThenBlock: { ReturnValue(0) }
+        p = Dereference(Add(handle, HHandleOff.ERRMSG))
+        IfCondition EqualTo(p, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(GetByte(p, 0), 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(p)
     }
 }
