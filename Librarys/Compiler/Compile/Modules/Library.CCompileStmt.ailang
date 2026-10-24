@@ -98,6 +98,8 @@ Function.CompileStmt_Assignment {
         IfCondition EqualTo(fused, 1) ThenBlock: { ReturnValue(1) }
         fused = Optimize_TryHomeAssign(target_name, value_node)
         IfCondition EqualTo(fused, 1) ThenBlock: { ReturnValue(1) }
+        fused = Optimize_TryLocArith(target_name, value_node)
+        IfCondition EqualTo(fused, 1) ThenBlock: { ReturnValue(1) }
         fused = Optimize_TryHomeMask(target_name, value_node)
         IfCondition EqualTo(fused, 1) ThenBlock: { ReturnValue(1) }
         fused = Optimize_TryFieldUpdate(target_name, value_node)
@@ -386,9 +388,23 @@ Function.CompileStmt_While {
         
         loop_start = Compile_NewLabel()
         loop_end = Compile_NewLabel()
-        
-        // Push loop context for break/continue
-        Compile_PushLoop(loop_end, loop_start)
+
+        // A pure leaf compare can be re-run at the back edge with no side
+        // effects, so the loop can be rotated: one-time entry test, then a
+        // bottom test that jumps back on true. This drops the per-iteration
+        // unconditional jmp that a top-tested loop always pays.
+        rotate_elig = 0
+        IfCondition EqualTo(AST_GetType(condition), AST.CALL) ThenBlock: {
+            IfCondition EqualTo(Optimize_IsCompareName(AST_GetData1(condition)), 1) ThenBlock: {
+                IfCondition EqualTo(AST_GetChildCount(condition), 2) ThenBlock: {
+                    IfCondition EqualTo(Optimize_IsLeaf(AST_GetChild(condition, 0)), 1) ThenBlock: {
+                        IfCondition EqualTo(Optimize_IsLeaf(AST_GetChild(condition, 1)), 1) ThenBlock: {
+                            rotate_elig = 1
+                        }
+                    }
+                }
+            }
+        }
 
         // Homes stay off when an outer home already owns r13/xmm2.
         outer = LoopHome.active
@@ -445,7 +461,26 @@ Function.CompileStmt_While {
             }
             Optimize_TripArm()
         }
-        
+
+        // Trip loops already have an optimal pointer-compare back edge, and
+        // a nested home inherits trip_on from the outer loop, so neither
+        // case rotates here.
+        rotate = 0
+        IfCondition EqualTo(rotate_elig, 1) ThenBlock: {
+            IfCondition EqualTo(outer, 0) ThenBlock: {
+                IfCondition EqualTo(LoopHome.trip_on, 0) ThenBlock: { rotate = 1 }
+            }
+        }
+        test_label = loop_start
+        IfCondition EqualTo(rotate, 1) ThenBlock: {
+            test_label = Compile_NewLabel()
+        }
+
+        // Push loop context for break/continue. Continue re-checks the
+        // condition, so it targets the test (the back edge when rotated,
+        // otherwise the same label as the top test).
+        Compile_PushLoop(loop_end, test_label)
+
         // Inner k=0 pointers stay in r8/r10 across this loop.
         Optimize_OutHoist(body)
 
@@ -454,9 +489,10 @@ Function.CompileStmt_While {
             X86_Align32()
         }
 
-        // Mark loop start
-        Emit_MarkLabel(loop_start)
-        
+        IfCondition EqualTo(rotate, 0) ThenBlock: {
+            Emit_MarkLabel(loop_start)
+        }
+
         // A leaf compare jumps on flags. Anything else still materializes 0/1.
         handled = Optimize_TryBranchCondition(condition, loop_end)
         IfCondition EqualTo(handled, 2) ThenBlock: {
@@ -474,12 +510,21 @@ Function.CompileStmt_While {
             Emit_TestRaxRax()
             Emit_Jz(loop_end)
         }
-        
+
+        // The back edge jumps straight to the body, past the one-time
+        // entry test above.
+        IfCondition EqualTo(rotate, 1) ThenBlock: {
+            Emit_MarkLabel(loop_start)
+        }
+
         // Compile body. A trip loop reloads its factors before the products.
         IfCondition EqualTo(LoopHome.trip_on, 1) ThenBlock: {
             Optimize_PinWarm()
         }
+        saved_loop_cond = OutKeep.loop_cond
+        OutKeep.loop_cond = condition
         result = CompileStmt_Block(body)
+        OutKeep.loop_cond = saved_loop_cond
         IfCondition EqualTo(result, 0) ThenBlock: {
             IfCondition EqualTo(outer, 0) ThenBlock: { Optimize_HomeRelease() }
             Compile_PopLoop()
@@ -491,14 +536,27 @@ Function.CompileStmt_While {
             Optimize_FwdFail()
         }
         Optimize_IholdFlush()
-        // A trip loop compares the stepped pointer with the end in r13.
-        IfCondition EqualTo(LoopHome.trip_on, 1) ThenBlock: {
-            X86_CmpRegReg(LoopHome.trip_reg, 13)
-            X86_JneBack(loop_start)
+        IfCondition EqualTo(rotate, 1) ThenBlock: {
+            Emit_MarkLabel(test_label)
+            back_handled = Optimize_TryBranchConditionBack(condition, loop_start)
+            IfCondition EqualTo(back_handled, 2) ThenBlock: {
+                IfCondition EqualTo(outer, 0) ThenBlock: { Optimize_HomeRelease() }
+                Compile_PopLoop()
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(back_handled, 0) ThenBlock: {
+                Emit_Jmp(loop_start)
+            }
         } ElseBlock: {
-            Emit_Jmp(loop_start)
+            // A trip loop compares the stepped pointer with the end in r13.
+            IfCondition EqualTo(LoopHome.trip_on, 1) ThenBlock: {
+                X86_CmpRegReg(LoopHome.trip_reg, 13)
+                X86_JneBack(loop_start)
+            } ElseBlock: {
+                Emit_Jmp(loop_start)
+            }
         }
-        
+
         // Mark loop end. Break lands here, then the homes spill once.
         Emit_MarkLabel(loop_end)
 
@@ -524,27 +582,34 @@ Function.CompileStmt_While {
             saved_exit = LoopHome.trip_exit
             xmm_n = AllocTab.n
             Optimize_AllocXmmOut(LoopHome.body, xmm_n, 8, 14)
+            Optimize_AllocGprOut(LoopHome.body, xmm_n)
             Optimize_HomeRelease()
             IfCondition NotEqual(saved_int, 0) ThenBlock: {
                 IfCondition EqualTo(Optimize_LiveOut(saved_int, saved_body), 1) ThenBlock: {
-                    IfCondition EqualTo(saved_trip, 1) ThenBlock: {
-                        Emit_MovRaxImm64(saved_exit)
-                        Emit_HomeMove(2, 0)
+                    IfCondition EqualTo(Optimize_NextDefDead(saved_int), 0) ThenBlock: {
+                        IfCondition EqualTo(saved_trip, 1) ThenBlock: {
+                            Emit_MovRaxImm64(saved_exit)
+                            Emit_HomeMove(2, 0)
+                        }
+                        Emit_HomeMove(1, 0)
+                        Emit_MovRbpOffsetRax(saved_int_off)
                     }
-                    Emit_HomeMove(1, 0)
-                    Emit_MovRbpOffsetRax(saved_int_off)
                 }
             }
             IfCondition NotEqual(saved_flt, 0) ThenBlock: {
                 IfCondition EqualTo(Optimize_LiveOut(saved_flt, saved_body), 1) ThenBlock: {
-                    Emit_HomeMove(5, 0)
-                    Emit_MovRbpOffsetRax(saved_flt_off)
+                    IfCondition EqualTo(Optimize_NextDefDead(saved_flt), 0) ThenBlock: {
+                        Emit_HomeMove(5, 0)
+                        Emit_MovRbpOffsetRax(saved_flt_off)
+                    }
                 }
             }
             IfCondition NotEqual(saved_acc, 0) ThenBlock: {
                 IfCondition EqualTo(Optimize_LiveOut(saved_acc, saved_body), 1) ThenBlock: {
-                    Emit_HomeMove(16, 0)
-                    Emit_MovRbpOffsetRax(saved_acc_off)
+                    IfCondition EqualTo(Optimize_NextDefDead(saved_acc), 0) ThenBlock: {
+                        Emit_HomeMove(16, 0)
+                        Emit_MovRbpOffsetRax(saved_acc_off)
+                    }
                 }
             }
             Optimize_AllocXmmOut(saved_body, xmm_n, 3, 7)
@@ -578,7 +643,8 @@ Function.CompileStmt_Block {
         count = AST_GetChildCount(node)
         i = 0
         skip_at = -1
-        
+        swap_end = -1
+
         WhileLoop LessThan(i, count) {
             IfCondition EqualTo(Compile.error, 1) ThenBlock: {
                 ExitLoop
@@ -631,9 +697,18 @@ Function.CompileStmt_Block {
                 }
             }
             handled = 0
-            IfCondition EqualTo(i, OptState.divmod_mid) ThenBlock: {
-                OptState.divmod_mid = -1
-                handled = 1
+            IfCondition GreaterEqual(swap_end, 0) ThenBlock: {
+                IfCondition GreaterThan(i, swap_end) ThenBlock: {
+                    swap_end = -1
+                } ElseBlock: {
+                    handled = 1
+                }
+            }
+            IfCondition EqualTo(handled, 0) ThenBlock: {
+                IfCondition EqualTo(i, OptState.divmod_mid) ThenBlock: {
+                    OptState.divmod_mid = -1
+                    handled = 1
+                }
             }
             IfCondition EqualTo(handled, 0) ThenBlock: {
                 IfCondition EqualTo(i, skip_at) ThenBlock: {
@@ -652,6 +727,27 @@ Function.CompileStmt_Block {
                     IfCondition EqualTo(paired, -2) ThenBlock: {
                         handled = 1
                     }
+                }
+            }
+            IfCondition EqualTo(handled, 0) ThenBlock: {
+                swapped = Optimize_TrySwapBlock(node, i, count)
+                IfCondition GreaterEqual(swapped, 0) ThenBlock: {
+                    swap_end = swapped
+                    handled = 1
+                }
+            }
+            IfCondition EqualTo(handled, 0) ThenBlock: {
+                copied = Optimize_TryCopyBlock(node, i, count)
+                IfCondition GreaterEqual(copied, 0) ThenBlock: {
+                    swap_end = copied
+                    handled = 1
+                }
+            }
+            IfCondition EqualTo(handled, 0) ThenBlock: {
+                shifted = Optimize_TryShiftBlock(node, i, count)
+                IfCondition GreaterEqual(shifted, 0) ThenBlock: {
+                    swap_end = shifted
+                    handled = 1
                 }
             }
             IfCondition EqualTo(handled, 0) ThenBlock: {
