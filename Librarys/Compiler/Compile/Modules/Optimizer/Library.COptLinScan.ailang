@@ -28,15 +28,11 @@
 //
 // want/eligible/mat are the gated-wiring state (see Optimize_ScanArm
 // and friends, below the scan algorithm itself): "want" caches the
-// AILANG_LINSCAN=1 environment check; "eligible" is 1 only for a
-// function whose CFG is a single straight-line block (no If/While/
-// Switch/Break/Continue/Return-early) - the narrowest, safest first
-// rollout slice, since such a function can never re-enter a point
-// where a name's register state is ambiguous (no merge points at
-// all); "mat" is a per-function, per-name "has this register actually
-// been populated yet" flag array, since a register's value is only
-// trustworthy once something has written it (a store, or the first
-// load of a not-yet-stored parameter).
+// AILANG_LINSCAN=1 environment check; "eligible" is 1 for a function
+// with no loop and no switch (If/Fork merge points are reconciled
+// below). "mat" is a per-function, per-name "has this register
+// actually been populated yet" flag. A scratch write of that
+// register clears the bit. The stack slot stays the source of truth.
 FixedPool.ScanState {
     "buf": Initialize=0, CanChange=True   // lazily allocated, 128 * 24 bytes
     "want": Initialize=-1, CanChange=True
@@ -323,28 +319,13 @@ Function.Optimize_ScanWantUse {
 // statement compilation begins (same point CompileFunc_Function/
 // SubRoutine already call Optimize_ScanRun from).
 //
-// NOTE on the If/Fork expansion attempt (2026-10-25): the natural next
-// slice after single-block was "allow If/Fork, no loops/switch",
-// reconciling their merge points via Optimize_ScanMatSnapshot/Restore/
-// MergeAnd below (wired into CompileStmt_If/Fork - that wiring is
-// still in place, just unreachable from here). Verified correct by
-// direct testing on stage1 (built by the unmodified reference
-// compiler): a dedicated asymmetric-branch repro and the full
-// AsymBranch/AsymBranchElse/ForkTest cases all matched the old path
-// exactly with AILANG_LINSCAN=1. But stage1 USING that logic to
-// compile the compiler's own source into stage2 produced a stage2
-// that segfaults on a trivial sanity test - a real, confirmed
-// generation-2 self-hosting bug, same class as the C8 float/leaf bug
-// found earlier the same day (CompileFunc_HasCalls), not reproducible
-// in any small test case tried. Reverted back to single-block-only
-// eligibility (BlockPool.head == 2) until that is root-caused -
-// bisect which of the compiler's own If/Fork-containing functions
-// breaks when compiled through the new merge-point path, the same way
-// the float/leaf bug was isolated: compare a trivial-input compile
-// through stage1 (works) against stage2 (built by stage1 with the
-// gate on) on the same trivial input (segfaults at "[SEMANTIC]
-// contract check", before pool emission - narrows it to something
-// used early in compilation, not deep in expression codegen).
+// If/Fork functions are eligible (no loop, no switch). Merge points
+// use Optimize_ScanMatSnapshot/Restore/MergeAnd in CompileStmt_If and
+// CompileStmt_Fork: a name stays materialized only when both arms
+// left it that way. Emitters still use rbx/r12/r13/r14 as scratch
+// (StoreValue's value register is rbx). Optimize_ScanNoteAsm and
+// Optimize_ScanClobberReg clear the materialized bit on those
+// writes. The next load reads the stack slot and reseeds.
 //
 // Independently of block shape: inline asm (ASM) can write any
 // register or memory address without going through CompileExpr_
@@ -359,7 +340,8 @@ Function.Optimize_ScanArm {
     Input: body: Address
     Body: {
         ScanState.eligible = 0
-        IfCondition EqualTo(BlockPool.head, 2) ThenBlock: {
+        Optimize_ScanWantUse()
+        IfCondition And(EqualTo(CFGState.has_loop, 0), EqualTo(CFGState.has_switch, 0)) ThenBlock: {
             rec = Optimize_TagPtr(body)
             IfCondition NotEqual(rec, 0) ThenBlock: {
                 unsafe = BitwiseOr(TagBit.ASM, BitwiseOr(TagBit.ESCAPE, TagBit.CLOBBER))
@@ -489,6 +471,118 @@ Function.Optimize_ScanNoteStore {
         IfCondition EqualTo(reg, -1) ThenBlock: { ReturnValue(0) }
         Emit_MovRegReg(reg, Reg.RAX)
         Optimize_ScanMatSet(id)
+        ReturnValue(0)
+    }
+}
+
+// A scratch write of this register killed whatever name was homed
+// there. The stack slot is unchanged. The next load reseeds.
+// want/eligible are read directly so this stays a couple of compares
+// on the gate-off path. ScanArm calls Optimize_ScanWantUse first, so
+// want is 0 or 1 before any body instruction is emitted.
+Function.Optimize_ScanClobberReg {
+    Input: reg: Integer
+    Body: {
+        IfCondition NotEqual(ScanState.want, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ScanState.eligible, 0) ThenBlock: { ReturnValue(0) }
+        i = 1
+        WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+            IfCondition EqualTo(Optimize_ScanReg(i), reg) ThenBlock: {
+                SetByte(ScanState.mat, Subtract(i, 1), 0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanStarts {
+    Input: text: Address
+    Input: pre: Address
+    Output: Integer
+    Body: {
+        n = StringLength(pre)
+        IfCondition LessThan(StringLength(text), n) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition NotEqual(GetByte(text, i), GetByte(pre, i)) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Called from X86Enc_Assemble. Only writer mnemonics whose first
+// operand is a scan home. CMP, TEST, PUSH, MUL, and DIV read the
+// register and are left alone.
+Function.Optimize_ScanNoteAsm {
+    Input: asm_str: Address
+    Body: {
+        IfCondition NotEqual(ScanState.want, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ScanState.eligible, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(asm_str, 0) ThenBlock: { ReturnValue(0) }
+        hit = -1
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "MOV rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "MOV r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "MOV r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "MOV r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "POP rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "POP r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "POP r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "POP r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "ADD rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "ADD r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "ADD r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "ADD r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SUB rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SUB r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SUB r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SUB r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "XOR rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "XOR r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "XOR r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "XOR r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "AND rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "AND r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "AND r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "AND r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "OR rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "OR r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "OR r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "OR r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "INC rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "INC r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "INC r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "INC r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "DEC rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "DEC r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "DEC r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "DEC r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "NEG rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "NEG r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "NEG r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "NEG r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "NOT rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "NOT r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "NOT r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "NOT r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "LEA rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "LEA r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "LEA r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "LEA r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SHL rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SHL r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SHL r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SHL r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SHR rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SHR r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SHR r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SHR r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SAR rbx"), 1) ThenBlock: { hit = Reg.RBX }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SAR r12"), 1) ThenBlock: { hit = Reg.R12 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SAR r13"), 1) ThenBlock: { hit = Reg.R13 }
+        IfCondition EqualTo(Optimize_ScanStarts(asm_str, "SAR r14"), 1) ThenBlock: { hit = Reg.R14 }
+        IfCondition NotEqual(hit, -1) ThenBlock: { Optimize_ScanClobberReg(hit) }
         ReturnValue(0)
     }
 }
