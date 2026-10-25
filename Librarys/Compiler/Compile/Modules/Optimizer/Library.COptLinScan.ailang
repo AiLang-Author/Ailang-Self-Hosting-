@@ -25,8 +25,23 @@
 
 // Per-name scratch for one sort+scan run. Reset each call. Sized 128
 // to match TagState's local-name cap.
+//
+// want/eligible/mat are the gated-wiring state (see Optimize_ScanArm
+// and friends, below the scan algorithm itself): "want" caches the
+// AILANG_LINSCAN=1 environment check; "eligible" is 1 only for a
+// function whose CFG is a single straight-line block (no If/While/
+// Switch/Break/Continue/Return-early) - the narrowest, safest first
+// rollout slice, since such a function can never re-enter a point
+// where a name's register state is ambiguous (no merge points at
+// all); "mat" is a per-function, per-name "has this register actually
+// been populated yet" flag array, since a register's value is only
+// trustworthy once something has written it (a store, or the first
+// load of a not-yet-stored parameter).
 FixedPool.ScanState {
     "buf": Initialize=0, CanChange=True   // lazily allocated, 128 * 24 bytes
+    "want": Initialize=-1, CanChange=True
+    "eligible": Initialize=0, CanChange=True
+    "mat": Initialize=0, CanChange=True   // lazily allocated, 128 bytes
 }
 
 // 24 bytes/entry: start_pos, end_pos, reg (Reg.* code, or -1 = spill).
@@ -235,6 +250,223 @@ Function.Optimize_ScanDump {
             }
             i = Add(i, 1)
         }
+        ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// GATED CONSUMER WIRING (first rollout slice)
+//
+// CompileExpr_LoadVariable/StoreVariable (Library.CCompileExpr.ailang)
+// call Optimize_ScanTryLoad/Optimize_ScanNoteStore/Optimize_ScanSeedLoad
+// as their very last option, after every existing mechanism has already
+// had a chance (Optimize_RaxTake, Optimize_LocLoad/Store - inactive
+// outside a loop anyway, since LoopHome.active stays 0 - Optimize_
+// HomeLoad/Store, Optimize_ReloadLoad, ...). Those hooks are no-ops
+// unless Optimize_ScanArm has both armed this function (single CFG
+// block - BlockPool.head == 2, entry+exit, nothing else - the
+// narrowest possible first slice: no If/While/Switch/Break/Continue/
+// early Return means no merge point, so a name's register state is
+// never ambiguous) and AILANG_LINSCAN=1 is set.
+//
+// Correctness design: every store still writes the RBP-relative stack
+// slot exactly as before (nothing here ever skips that) and also
+// copies RAX into the assigned register, marking it "materialized".
+// A load only reads the register once it is marked materialized -
+// otherwise it falls through to the normal stack load, which then
+// seeds the register for every later read. The stack slot and the
+// register are therefore always in sync by construction; the register
+// is purely a cache to skip redundant memory loads, never a second
+// source of truth.
+// =============================================================================
+
+Function.Optimize_ScanWantUse {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(ScanState.want, 0) ThenBlock: { ReturnValue(ScanState.want) }
+        ScanState.want = 0
+        envpath = "/proc/self/environ"
+        env_fd = SystemCall(2, envpath, 0, 0)
+        IfCondition LessThan(env_fd, 0) ThenBlock: { ReturnValue(0) }
+        env_bufsz = 131072
+        env_buf = Allocate(env_bufsz)
+        env_n = SystemCall(0, env_fd, env_buf, env_bufsz)
+        SystemCall(3, env_fd, 0, 0)
+        needle = "AILANG_LINSCAN="
+        nlen = 15
+        found = 0
+        ei = 0
+        elimit = Subtract(env_n, nlen)
+        WhileLoop LessEqual(ei, elimit) {
+            IfCondition EqualTo(found, 1) ThenBlock: { ExitLoop }
+            match = 1
+            ej = 0
+            WhileLoop LessThan(ej, nlen) {
+                bc = GetByte(env_buf, Add(ei, ej))
+                nc = GetByte(needle, ej)
+                IfCondition NotEqual(bc, nc) ThenBlock: { match = 0 }
+                ej = Add(ej, 1)
+            }
+            IfCondition EqualTo(match, 1) ThenBlock: {
+                vc = GetByte(env_buf, Add(ei, nlen))
+                IfCondition EqualTo(vc, 49) ThenBlock: { ScanState.want = 1 }
+                found = 1
+            }
+            ei = Add(ei, 1)
+        }
+        Deallocate(env_buf, env_bufsz)
+        ReturnValue(ScanState.want)
+    }
+}
+
+// Call once per function, after Optimize_ScanRun, right before
+// statement compilation begins (same point CompileFunc_Function/
+// SubRoutine already call Optimize_ScanRun from).
+//
+// Single-block (no If/While/Switch/.../FOR_EVERY) is necessary but not
+// sufficient: inline asm (ASM) can write any register or memory
+// address without going through CompileExpr_StoreVariable at all, and
+// AddressOf (ESCAPE) hands out one of this function's own locals'
+// stack addresses, which can then be written through a raw pointer
+// later with no way for Optimize_ScanInvalidate to see it coming.
+// CLOBBER covers the existing HomeBlockNode list for the same reason.
+// All three are already aggregated into body's own tag record by
+// Optimize_TagWalk (bottom-up OR of every descendant), so this is a
+// single O(1) read, not a new tree walk.
+Function.Optimize_ScanArm {
+    Input: body: Address
+    Body: {
+        ScanState.eligible = 0
+        IfCondition EqualTo(BlockPool.head, 2) ThenBlock: {
+            rec = Optimize_TagPtr(body)
+            IfCondition NotEqual(rec, 0) ThenBlock: {
+                unsafe = BitwiseOr(TagBit.ASM, BitwiseOr(TagBit.ESCAPE, TagBit.CLOBBER))
+                IfCondition EqualTo(BitwiseAnd(Dereference(rec), unsafe), 0) ThenBlock: {
+                    ScanState.eligible = 1
+                }
+            }
+        }
+        IfCondition EqualTo(ScanState.mat, 0) ThenBlock: {
+            ScanState.mat = Allocate(128)
+        }
+        i = 0
+        WhileLoop LessThan(i, 128) {
+            SetByte(ScanState.mat, i, 0)
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanActive {
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanWantUse(), 0) ThenBlock: { ReturnValue(0) }
+        ReturnValue(ScanState.eligible)
+    }
+}
+
+Function.Optimize_ScanMatGet {
+    Input: id: Integer
+    Output: Integer
+    Body: {
+        IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        ReturnValue(GetByte(ScanState.mat, Subtract(id, 1)))
+    }
+}
+
+Function.Optimize_ScanMatSet {
+    Input: id: Integer
+    Body: {
+        IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        SetByte(ScanState.mat, Subtract(id, 1), 1)
+        ReturnValue(0)
+    }
+}
+
+// Last-chance load: 1 when this emitted "mov rax, reg" instead of a
+// memory load. name must already be interned (Optimize_TagFunction
+// ran before any statement compiled) and materialized (some earlier
+// store in this same straight-line body already populated the
+// register - see Optimize_ScanNoteStore/Optimize_ScanSeedLoad).
+Function.Optimize_ScanTryLoad {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(name)
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        reg = Optimize_ScanReg(id)
+        IfCondition EqualTo(reg, -1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 0) ThenBlock: { ReturnValue(0) }
+        Emit_MovRegReg(Reg.RAX, reg)
+        ReturnValue(1)
+    }
+}
+
+// Called right after the normal stack load, win or lose: seeds the
+// register the first time this name is read (covers a parameter that
+// is read before ever being assigned - the only case a name can reach
+// a load with a register but without a prior store in a single
+// straight-line block).
+Function.Optimize_ScanSeedLoad {
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(name)
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        reg = Optimize_ScanReg(id)
+        IfCondition EqualTo(reg, -1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 1) ThenBlock: { ReturnValue(0) }
+        Emit_MovRegReg(reg, Reg.RAX)
+        Optimize_ScanMatSet(id)
+        ReturnValue(0)
+    }
+}
+
+// Called at the very top of CompileStmt_Assignment, before any of its
+// fused/specialized paths run - several of them (Optimize_TryFoldAssign,
+// TryHomeAssign, TryMaskStep, ...) write the target's stack slot
+// through their own emission and return without ever reaching
+// CompileExpr_StoreVariable, which is the only place Optimize_
+// ScanNoteStore lives. Without this, a name already materialized into
+// its register by an earlier plain assignment would go stale the
+// moment a fused path reassigns it through one of those side doors -
+// the stack slot gets the new value, the cached register keeps the
+// old one, and a later load would silently read the wrong answer.
+// Unconditionally clearing "materialized" here, before the assignment
+// is even dispatched, means: if the plain CompileExpr_StoreVariable
+// path ends up handling it, Optimize_ScanNoteStore immediately
+// re-marks it materialized with the correct value; if a fused path
+// handles it instead, the flag simply stays cleared and the next load
+// falls through to the real (now up to date) stack value and reseeds
+// the register from there - a missed caching opportunity, never a
+// correctness gap.
+Function.Optimize_ScanInvalidate {
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(name)
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        SetByte(ScanState.mat, Subtract(id, 1), 0)
+        ReturnValue(0)
+    }
+}
+
+// Called right after the normal stack store, unconditionally: the
+// stack write already happened, this only adds the register-cache
+// copy on top.
+Function.Optimize_ScanNoteStore {
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(name)
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        reg = Optimize_ScanReg(id)
+        IfCondition EqualTo(reg, -1) ThenBlock: { ReturnValue(0) }
+        Emit_MovRegReg(reg, Reg.RAX)
+        Optimize_ScanMatSet(id)
         ReturnValue(0)
     }
 }
