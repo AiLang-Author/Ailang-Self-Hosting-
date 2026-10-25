@@ -1,0 +1,240 @@
+// Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
+//
+// Licensed under the Sean Collins Software License (SCSL). See the LICENSE file in the root directory of this project
+// for the full terms and conditions, including restrictions on forking, corporate use, and permissions for private/teaching purposes.
+
+// Library.COptLinScan.ailang
+// Linear-scan register allocation (Poletto-Sarkar) over the per-name
+// intervals Library.COptLive.ailang computes. Replaces what LoopHome
+// (the picker) and AllocTab (the lookup table) do today, but as one
+// function-wide pass instead of a reset-per-loop one.
+//
+// Candidate pool for this first cut: the four SysV callee-saved GPRs
+// already in use by the existing home system - rbx, r12, r13, r14.
+// Callee-saved means every one of them is safe to hold a value across
+// a real call for the interval's entire lifetime, as long as the
+// prologue/epilogue actually save and restore it - which is the
+// structural fix for C2 (today only rbx/r12 are ever pushed; r13/r14
+// are not, despite being used as homes). crosses_call does not need
+// to gate this pool at all; it only matters for a true scratch
+// register, which this first cut does not use (r11 is a documented,
+// not-yet-taken future extension - see Optimize_ScanRun).
+//
+// No consumer yet. Loaded by the optimizer shell. No imports of its
+// own.
+
+// Per-name scratch for one sort+scan run. Reset each call. Sized 128
+// to match TagState's local-name cap.
+FixedPool.ScanState {
+    "buf": Initialize=0, CanChange=True   // lazily allocated, 128 * 24 bytes
+}
+
+// 24 bytes/entry: start_pos, end_pos, reg (Reg.* code, or -1 = spill).
+// Indexed 0..127 by (name id - 1), same convention as NameState.
+Function.Optimize_ScanEnsure {
+    Body: {
+        IfCondition NotEqual(ScanState.buf, 0) ThenBlock: { ReturnValue(0) }
+        ScanState.buf = Allocate(Multiply(128, 24))
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanPtr {
+    Input: id: Integer
+    Output: Address
+    Body: {
+        IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Add(ScanState.buf, Multiply(Subtract(id, 1), 24)))
+    }
+}
+
+Function.Optimize_ScanReg {
+    Input: id: Integer
+    Output: Integer
+    Body: {
+        p = Optimize_ScanPtr(id)
+        IfCondition EqualTo(p, 0) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Dereference(Add(p, 16)))
+    }
+}
+
+// Runs the whole algorithm for the function whose intervals
+// Library.COptLive.ailang just computed (Optimize_TagFunction ->
+// Optimize_CFGFunction -> Optimize_LiveFunction must already have run
+// on this body - same ordering CompileFunc_Function already uses).
+//
+// Classic Poletto-Sarkar sweep: process intervals in start order,
+// expire anything already ended, take a free register if one exists,
+// otherwise spill whichever of (the new interval, the active interval
+// with the furthest end) gains least from holding one.
+Function.Optimize_ScanRun {
+    Body: {
+        Optimize_ScanEnsure()
+        IfCondition EqualTo(ScanState.buf, 0) ThenBlock: { ReturnValue(0) }
+
+        n = 0
+        order = Allocate(Multiply(128, 8))   // name ids, sorted by start_pos
+        i = 1
+        WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+            IfCondition NotEqual(Optimize_LiveMaxPos(i), -1) ThenBlock: {
+                p = Optimize_ScanPtr(i)
+                StoreValue(p, Optimize_LiveMinPos(i))
+                StoreValue(Add(p, 8), Optimize_LiveMaxPos(i))
+                StoreValue(Add(p, 16), -1)
+                StoreValue(Add(order, Multiply(n, 8)), i)
+                n = Add(n, 1)
+            }
+            i = Add(i, 1)
+        }
+
+        // Insertion sort by start_pos - n is at most 128, plenty cheap.
+        k = 1
+        WhileLoop LessThan(k, n) {
+            kid = Dereference(Add(order, Multiply(k, 8)))
+            kstart = Dereference(Optimize_ScanPtr(kid))
+            j = Subtract(k, 1)
+            done = 0
+            WhileLoop And(GreaterEqual(j, 0), EqualTo(done, 0)) {
+                jid = Dereference(Add(order, Multiply(j, 8)))
+                jstart = Dereference(Optimize_ScanPtr(jid))
+                IfCondition GreaterThan(jstart, kstart) ThenBlock: {
+                    StoreValue(Add(order, Multiply(Add(j, 1), 8)), jid)
+                    j = Subtract(j, 1)
+                } ElseBlock: {
+                    done = 1
+                }
+            }
+            StoreValue(Add(order, Multiply(Add(j, 1), 8)), kid)
+            k = Add(k, 1)
+        }
+
+        // free_regs: fixed 4-slot pool, no growth needed.
+        free_regs = Allocate(32)
+        StoreValue(free_regs, Reg.RBX)
+        StoreValue(Add(free_regs, 8), Reg.R12)
+        StoreValue(Add(free_regs, 16), Reg.R13)
+        StoreValue(Add(free_regs, 24), Reg.R14)
+        free_n = 4
+
+        // active: parallel (name_id, end_pos) lists, at most 4 live at once.
+        active_id = Allocate(32)
+        active_end = Allocate(32)
+        active_n = 0
+
+        idx = 0
+        WhileLoop LessThan(idx, n) {
+            cur_id = Dereference(Add(order, Multiply(idx, 8)))
+            cur_ptr = Optimize_ScanPtr(cur_id)
+            cur_start = Dereference(cur_ptr)
+            cur_end = Dereference(Add(cur_ptr, 8))
+
+            // Expire active intervals that ended before this one starts.
+            a = 0
+            WhileLoop LessThan(a, active_n) {
+                IfCondition LessThan(Dereference(Add(active_end, Multiply(a, 8))), cur_start) ThenBlock: {
+                    ex_id = Dereference(Add(active_id, Multiply(a, 8)))
+                    ex_reg = Dereference(Add(Optimize_ScanPtr(ex_id), 16))
+                    StoreValue(Add(free_regs, Multiply(free_n, 8)), ex_reg)
+                    free_n = Add(free_n, 1)
+                    // swap-remove a from active
+                    last = Subtract(active_n, 1)
+                    StoreValue(Add(active_id, Multiply(a, 8)), Dereference(Add(active_id, Multiply(last, 8))))
+                    StoreValue(Add(active_end, Multiply(a, 8)), Dereference(Add(active_end, Multiply(last, 8))))
+                    active_n = last
+                } ElseBlock: {
+                    a = Add(a, 1)
+                }
+            }
+
+            IfCondition GreaterThan(free_n, 0) ThenBlock: {
+                free_n = Subtract(free_n, 1)
+                reg = Dereference(Add(free_regs, Multiply(free_n, 8)))
+                StoreValue(Add(cur_ptr, 16), reg)
+                StoreValue(Add(active_id, Multiply(active_n, 8)), cur_id)
+                StoreValue(Add(active_end, Multiply(active_n, 8)), cur_end)
+                active_n = Add(active_n, 1)
+            } ElseBlock: {
+                // Spill whichever of (cur, furthest active) ends later.
+                worst_a = -1
+                worst_end = -1
+                a = 0
+                WhileLoop LessThan(a, active_n) {
+                    e = Dereference(Add(active_end, Multiply(a, 8)))
+                    IfCondition GreaterThan(e, worst_end) ThenBlock: {
+                        worst_end = e
+                        worst_a = a
+                    }
+                    a = Add(a, 1)
+                }
+                IfCondition GreaterThan(worst_end, cur_end) ThenBlock: {
+                    worst_id = Dereference(Add(active_id, Multiply(worst_a, 8)))
+                    reg = Dereference(Add(Optimize_ScanPtr(worst_id), 16))
+                    StoreValue(Add(Optimize_ScanPtr(worst_id), 16), -1)
+                    StoreValue(Add(cur_ptr, 16), reg)
+                    StoreValue(Add(active_id, Multiply(worst_a, 8)), cur_id)
+                    StoreValue(Add(active_end, Multiply(worst_a, 8)), cur_end)
+                } ElseBlock: {
+                    StoreValue(Add(cur_ptr, 16), -1)
+                }
+            }
+            idx = Add(idx, 1)
+        }
+
+        Deallocate(order, Multiply(128, 8))
+        Deallocate(free_regs, 32)
+        Deallocate(active_id, 32)
+        Deallocate(active_end, 32)
+        ReturnValue(0)
+    }
+}
+
+// 1 when this register was assigned to any interval in the function
+// just scanned - the structural replacement for the hand-maintained
+// push rbx/push r12 list (C2) and for CompileFunc_HasCalls's
+// leaf/non-leaf guess (C8): a function is a true leaf iff no interval
+// anywhere in it ever crossed a call, which Optimize_LiveCrossesCall
+// already answers per-name directly.
+Function.Optimize_ScanRegUsed {
+    Input: reg: Integer
+    Output: Integer
+    Body: {
+        i = 1
+        WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+            IfCondition EqualTo(Optimize_ScanReg(i), reg) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Manual-verification helper, mirrors Optimize_CFGDump/LiveDump. Not
+// called by any production path.
+Function.Optimize_ScanDump {
+    Body: {
+        PrintMessage("[SCAN]\n")
+        i = 1
+        WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+            IfCondition NotEqual(Optimize_LiveMaxPos(i), -1) ThenBlock: {
+                PrintMessage("  name#")
+                PrintNumber(i)
+                PrintMessage(" [")
+                PrintNumber(Optimize_LiveMinPos(i))
+                PrintMessage("..")
+                PrintNumber(Optimize_LiveMaxPos(i))
+                PrintMessage("] reg=")
+                reg = Optimize_ScanReg(i)
+                IfCondition EqualTo(reg, -1) ThenBlock: {
+                    PrintMessage("SPILL")
+                } ElseBlock: {
+                    PrintNumber(reg)
+                }
+                IfCondition EqualTo(Optimize_LiveCrossesCall(i), 1) ThenBlock: {
+                    PrintMessage(" crosses-call")
+                }
+                PrintMessage("\n")
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
