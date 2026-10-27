@@ -52,7 +52,27 @@ Function.CompileStmt_Assignment {
         // Normal variable assignment
         target_name = AST_GetData1(node)
         value_node = AST_GetChild(node, 0)
-        Optimize_ScanInvalidate(target_name)
+        Optimize_ScanPtrRmClear(target_name)
+        // base+index*stride was hoisted. The register already holds it.
+        IfCondition EqualTo(Optimize_ScanPtrDef(target_name), 1) ThenBlock: {
+            Optimize_RaxDrop()
+            ReturnValue(1)
+        }
+        // In-place xmm update reads the old bits. Invalidate would spill
+        // them and clear the cache before the update could see them.
+        IfCondition EqualTo(Optimize_ScanFltUpdate(target_name, value_node), 1) ThenBlock: {
+            Optimize_RaxDrop()
+            Optimize_PtrClear(target_name)
+            Optimize_XmmDrop(target_name)
+            Optimize_CoalDrop(target_name)
+            Optimize_AliasClear(target_name)
+            ReturnValue(1)
+        }
+        // A homed name is read from its register by the right-hand side.
+        // Invalidating first would reload a stale frame slot.
+        IfCondition EqualTo(Optimize_ScanHomed(target_name), 0) ThenBlock: {
+            Optimize_ScanInvalidate(target_name)
+        }
         Optimize_RaxDrop()
         Optimize_PtrClear(target_name)
         // A new value replaces the parked compare. The park may be set again
@@ -147,6 +167,8 @@ Function.CompileStmt_Assignment {
         // Store RAX to variable
         stored = CompileExpr_StoreVariable(target_name)
         IfCondition EqualTo(stored, 0) ThenBlock: { ReturnValue(0) }
+        Optimize_ScanPtrRmNote(target_name, value_node)
+        Optimize_ScanPtrBump(target_name, value_node)
         Optimize_NotePtrCopy(target_name, value_node)
         ReturnValue(1)
     }
@@ -225,6 +247,10 @@ Function.CompileStmt_If {
         Optimize_OutKill()
         Optimize_XmmKill()
         Optimize_ZeroKill()
+        // An in-place xmm update leaves the frame slot stale. Publish
+        // every xmm before the condition so both arms start from the
+        // same bits, then again at the end of each arm.
+        Optimize_ScanSpillDirty()
         condition = AST_GetChild(node, 0)
         then_block = AST_GetChild(node, 1)
         
@@ -304,6 +330,7 @@ Function.CompileStmt_If {
         IfCondition EqualTo(result, 0) ThenBlock: {
             ReturnValue(0)
         }
+        Optimize_ScanSpillDirty()
         scan_mat_then = Optimize_ScanMatSnapshot()
 
         // Jump over else only if else exists
@@ -355,6 +382,7 @@ Function.CompileStmt_If {
             IfCondition EqualTo(result, 0) ThenBlock: {
                 ReturnValue(0)
             }
+            Optimize_ScanSpillDirty()
             Emit_MarkLabel(end_label)
             Optimize_RaxDrop()
             Optimize_RcxDrop()
@@ -513,11 +541,16 @@ Function.CompileStmt_While {
             X86_Align32()
         }
 
-        // The header is emitted once and re-executed every iteration.
-        // Homes materialized on the way into the loop must not be
-        // trusted here: the body can kill r12/rbx after this compare
-        // and then jump back to it. Stack slots stay current.
-        Optimize_ScanMatClear()
+        // The header is emitted once. Spill homes whose registers the
+        // body scratches, then reload those from the frame. A name in
+        // a register the body does not write stays in that register.
+        saved_mask = ScanState.loop_mask
+        ScanState.loop_mask = BitwiseOr(Optimize_ScanLoopMask(condition), Optimize_ScanLoopMask(body))
+        Optimize_ScanPtrPush()
+        Optimize_ScanDropRegs(ScanState.loop_mask)
+        Optimize_ScanPtrSpillOuter()
+        // Pointer inits run once. The back edge lands on the label below.
+        Optimize_ScanPtrArm(body)
 
         IfCondition EqualTo(rotate, 0) ThenBlock: {
             Emit_MarkLabel(loop_start)
@@ -527,6 +560,8 @@ Function.CompileStmt_While {
         handled = Optimize_TryBranchCondition(condition, loop_end)
         IfCondition EqualTo(handled, 2) ThenBlock: {
             IfCondition EqualTo(outer, 0) ThenBlock: { Optimize_HomeRelease() }
+            ScanState.loop_mask = saved_mask
+            Optimize_ScanPtrPop()
             Compile_PopLoop()
             ReturnValue(0)
         }
@@ -534,6 +569,8 @@ Function.CompileStmt_While {
             result = Compile_Expression(condition)
             IfCondition EqualTo(result, 0) ThenBlock: {
                 IfCondition EqualTo(outer, 0) ThenBlock: { Optimize_HomeRelease() }
+                ScanState.loop_mask = saved_mask
+            Optimize_ScanPtrPop()
                 Compile_PopLoop()
                 ReturnValue(0)
             }
@@ -559,6 +596,8 @@ Function.CompileStmt_While {
         OutKeep.loop_cond = saved_loop_cond
         IfCondition EqualTo(result, 0) ThenBlock: {
             IfCondition EqualTo(outer, 0) ThenBlock: { Optimize_HomeRelease() }
+            ScanState.loop_mask = saved_mask
+            Optimize_ScanPtrPop()
             Compile_PopLoop()
             ReturnValue(0)
         }
@@ -576,6 +615,8 @@ Function.CompileStmt_While {
             back_handled = Optimize_TryBranchConditionBack(condition, loop_start)
             IfCondition EqualTo(back_handled, 2) ThenBlock: {
                 IfCondition EqualTo(outer, 0) ThenBlock: { Optimize_HomeRelease() }
+                ScanState.loop_mask = saved_mask
+            Optimize_ScanPtrPop()
                 Compile_PopLoop()
                 ReturnValue(0)
             }
@@ -654,6 +695,8 @@ Function.CompileStmt_While {
             Optimize_AllocXmmOut(saved_body, xmm_n, 3, 7)
         }
         
+        ScanState.loop_mask = saved_mask
+        Optimize_ScanPtrPop()
         Compile_PopLoop()
         LoopHome.rdx_on = 0
         LoopHome.rdx_name = 0
@@ -928,10 +971,16 @@ Function.CompileStmt_ForEvery {
         // CompileExpr_StoreVariable, so it does not refresh a scan
         // home. The body is the re-executed region: start it cold.
         Emit_MovRbpOffsetRax(off_var)
+        // The slot just received the new element. Do not spill the
+        // old register over it. The body reloads from the frame, so
+        // its assignments store.
+        Optimize_ScanMatDrop(var_name)
         Optimize_ScanMatClear()
 
-        // Compile body
+        saved_mask = ScanState.loop_mask
+        ScanState.loop_mask = 7
         CompileStmt_Block(body)
+        ScanState.loop_mask = saved_mask
         
         // Increment index
         Emit_MovRaxRbpOffset(off_index)
@@ -1272,6 +1321,7 @@ Function.CompileStmt_Fork {
     Input: node: Address
     Output: Integer
     Body: {
+        Optimize_ScanSpillDirty()
         condition = AST_GetChild(node, 0)
         true_block = AST_GetChild(node, 1)
         
@@ -1307,6 +1357,7 @@ Function.CompileStmt_Fork {
         IfCondition EqualTo(result, 0) ThenBlock: {
             ReturnValue(0)
         }
+        Optimize_ScanSpillDirty()
         scan_mat_true = Optimize_ScanMatSnapshot()
 
         IfCondition EqualTo(has_false, 1) ThenBlock: {
@@ -1328,6 +1379,7 @@ Function.CompileStmt_Fork {
             IfCondition EqualTo(result, 0) ThenBlock: {
                 ReturnValue(0)
             }
+            Optimize_ScanSpillDirty()
             Emit_MarkLabel(end_label)
             Optimize_ScanMatMergeAnd(scan_mat_true)
         }

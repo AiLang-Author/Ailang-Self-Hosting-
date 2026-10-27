@@ -32,13 +32,50 @@
 // whose body the CFG models (If/Fork merge points are reconciled
 // below, and While/ForEvery drop "mat" at the back edge). "mat" is a
 // per-function, per-name "has this register
-// actually been populated yet" flag. A scratch write of that
-// register clears the bit. The stack slot stays the source of truth.
+// actually been populated yet" flag. A scratch write spills the
+// home and then clears the bit. The register is the value until
+// that spill. The frame is stale in between.
 FixedPool.ScanState {
     "buf": Initialize=0, CanChange=True   // lazily allocated, 128 * 24 bytes
     "want": Initialize=-1, CanChange=True
     "eligible": Initialize=0, CanChange=True
     "mat": Initialize=0, CanChange=True   // lazily allocated, 128 bytes
+    "flt": Initialize=0, CanChange=True   // 128 bytes: 1 = float-only name
+    "keep": Initialize=0, CanChange=True  // name id whose reg write is the new value
+    "loop_mask": Initialize=0, CanChange=True
+}
+
+// Two hoisted pointers for the loop being compiled. r14 then r11.
+// A nested loop pushes this record, spills the registers, and pops
+// them back when it returns. base/stride are scratch for the arm.
+FixedPool.ScanPtr {
+    "n": Initialize=0, CanChange=True
+    "snap": Initialize=0, CanChange=True
+    "name0": Initialize=0, CanChange=True
+    "name1": Initialize=0, CanChange=True
+    "reg0": Initialize=0, CanChange=True
+    "reg1": Initialize=0, CanChange=True
+    "bump0": Initialize=0, CanChange=True
+    "bump1": Initialize=0, CanChange=True
+    "iv0": Initialize=0, CanChange=True
+    "iv1": Initialize=0, CanChange=True
+    "step0": Initialize=0, CanChange=True
+    "step1": Initialize=0, CanChange=True
+    "base0": Initialize=0, CanChange=True
+    "base1": Initialize=0, CanChange=True
+    "stride0": Initialize=0, CanChange=True
+    "stride1": Initialize=0, CanChange=True
+    "hit_reg": Initialize=0, CanChange=True
+    "hit_disp": Initialize=0, CanChange=True
+    "mess": Initialize=0, CanChange=True
+    "found": Initialize=0, CanChange=True
+    "step": Initialize=0, CanChange=True
+    "calls": Initialize=0, CanChange=True
+    "sbase": Initialize=0, CanChange=True
+    "siv": Initialize=0, CanChange=True
+    "sstride": Initialize=0, CanChange=True
+    "rm": Initialize=0, CanChange=True
+    "rm_n": Initialize=0, CanChange=True
 }
 
 // 24 bytes/entry: start_pos, end_pos, reg (Reg.* code, or -1 = spill).
@@ -104,12 +141,29 @@ Function.Optimize_ScanRun {
         WhileLoop LessThan(k, n) {
             kid = Dereference(Add(order, Multiply(k, 8)))
             kstart = Dereference(Optimize_ScanPtr(kid))
+            kpri = 2
+            IfCondition NotEqual(ScanState.flt, 0) ThenBlock: {
+                kb = GetByte(ScanState.flt, Subtract(kid, 1))
+                IfCondition EqualTo(kb, 1) ThenBlock: { kpri = 0 }
+                IfCondition EqualTo(kb, 5) ThenBlock: { kpri = 1 }
+            }
             j = Subtract(k, 1)
             done = 0
             WhileLoop And(GreaterEqual(j, 0), EqualTo(done, 0)) {
                 jid = Dereference(Add(order, Multiply(j, 8)))
                 jstart = Dereference(Optimize_ScanPtr(jid))
-                IfCondition GreaterThan(jstart, kstart) ThenBlock: {
+                jpri = 2
+                IfCondition NotEqual(ScanState.flt, 0) ThenBlock: {
+                    jb = GetByte(ScanState.flt, Subtract(jid, 1))
+                    IfCondition EqualTo(jb, 1) ThenBlock: { jpri = 0 }
+                    IfCondition EqualTo(jb, 5) ThenBlock: { jpri = 1 }
+                }
+                shift = 0
+                IfCondition GreaterThan(jstart, kstart) ThenBlock: { shift = 1 }
+                IfCondition EqualTo(jstart, kstart) ThenBlock: {
+                    IfCondition GreaterThan(jpri, kpri) ThenBlock: { shift = 1 }
+                }
+                IfCondition EqualTo(shift, 1) ThenBlock: {
                     StoreValue(Add(order, Multiply(Add(j, 1), 8)), jid)
                     j = Subtract(j, 1)
                 } ElseBlock: {
@@ -120,22 +174,60 @@ Function.Optimize_ScanRun {
             k = Add(k, 1)
         }
 
-        // free_regs: fixed 4-slot pool, no growth needed.
-        free_regs = Allocate(32)
-        StoreValue(free_regs, Reg.RBX)
-        StoreValue(Add(free_regs, 8), Reg.R12)
-        StoreValue(Add(free_regs, 16), Reg.R13)
-        StoreValue(Add(free_regs, 24), Reg.R14)
-        free_n = 4
+        // GPRs: rbx is allocated last because Add/Mul use it as scratch
+        // and a loop full of those drops it. r12 and r13 stay live.
+        // r14 stays the scaled-address temporary.
+        // XMM numbers are stored as 32+xmm so they never match a GPR.
+        free_g = Allocate(32)
+        StoreValue(free_g, Reg.RBX)
+        StoreValue(Add(free_g, 8), Reg.R12)
+        StoreValue(Add(free_g, 16), Reg.R13)
+        free_n_g = 3
+        // xmm4-xmm14. xmm0/xmm1/xmm15 are the expression scratch.
+        // xmm2/xmm3 are the scratch the string and byte loops already use.
+        // The number stored is 32+xmm so it never compares equal to a GPR.
+        free_x = Allocate(128)
+        xi = 0
+        WhileLoop LessThan(xi, 11) {
+            StoreValue(Add(free_x, Multiply(xi, 8)), Add(36, xi))
+            xi = Add(xi, 1)
+        }
+        free_n_x = 11
 
-        // active: parallel (name_id, end_pos) lists, at most 4 live at once.
-        active_id = Allocate(32)
-        active_end = Allocate(32)
-        active_n = 0
+        active_id_g = Allocate(32)
+        active_end_g = Allocate(32)
+        active_n_g = 0
+        active_id_x = Allocate(128)
+        active_end_x = Allocate(128)
+        active_n_x = 0
 
         idx = 0
         WhileLoop LessThan(idx, n) {
             cur_id = Dereference(Add(order, Multiply(idx, 8)))
+            is_x = 0
+            skip = 0
+            IfCondition NotEqual(ScanState.flt, 0) ThenBlock: {
+                fb = GetByte(ScanState.flt, Subtract(cur_id, 1))
+                IfCondition EqualTo(fb, 1) ThenBlock: { is_x = 1 }
+                IfCondition EqualTo(fb, 5) ThenBlock: { is_x = 1 }
+                IfCondition EqualTo(fb, 3) ThenBlock: { skip = 1 }
+            }
+            IfCondition EqualTo(skip, 1) ThenBlock: {
+                idx = Add(idx, 1)
+                ContinueLoop
+            }
+            free_regs = free_g
+            free_n = free_n_g
+            active_id = active_id_g
+            active_end = active_end_g
+            active_n = active_n_g
+            IfCondition EqualTo(is_x, 1) ThenBlock: {
+                free_regs = free_x
+                free_n = free_n_x
+                active_id = active_id_x
+                active_end = active_end_x
+                active_n = active_n_x
+            }
             cur_ptr = Optimize_ScanPtr(cur_id)
             cur_start = Dereference(cur_ptr)
             cur_end = Dereference(Add(cur_ptr, 8))
@@ -166,36 +258,51 @@ Function.Optimize_ScanRun {
                 StoreValue(Add(active_end, Multiply(active_n, 8)), cur_end)
                 active_n = Add(active_n, 1)
             } ElseBlock: {
-                // Spill whichever of (cur, furthest active) ends later.
-                worst_a = -1
-                worst_end = -1
+                // Spill the name whose next mention is furthest away.
+                // A short temp used on the next line and an accumulator
+                // used again at the top of the loop are not ranked by
+                // which interval ends last.
+                cur_next = Optimize_LiveNext(cur_id, cur_start)
+                drop_a = -1
+                drop_next = cur_next
                 a = 0
                 WhileLoop LessThan(a, active_n) {
-                    e = Dereference(Add(active_end, Multiply(a, 8)))
-                    IfCondition GreaterThan(e, worst_end) ThenBlock: {
-                        worst_end = e
-                        worst_a = a
+                    aid = Dereference(Add(active_id, Multiply(a, 8)))
+                    an = Optimize_LiveNext(aid, cur_start)
+                    IfCondition GreaterThan(an, drop_next) ThenBlock: {
+                        drop_next = an
+                        drop_a = a
                     }
                     a = Add(a, 1)
                 }
-                IfCondition GreaterThan(worst_end, cur_end) ThenBlock: {
-                    worst_id = Dereference(Add(active_id, Multiply(worst_a, 8)))
-                    reg = Dereference(Add(Optimize_ScanPtr(worst_id), 16))
-                    StoreValue(Add(Optimize_ScanPtr(worst_id), 16), -1)
+                IfCondition GreaterEqual(drop_a, 0) ThenBlock: {
+                    drop_id = Dereference(Add(active_id, Multiply(drop_a, 8)))
+                    reg = Dereference(Add(Optimize_ScanPtr(drop_id), 16))
+                    StoreValue(Add(Optimize_ScanPtr(drop_id), 16), -1)
                     StoreValue(Add(cur_ptr, 16), reg)
-                    StoreValue(Add(active_id, Multiply(worst_a, 8)), cur_id)
-                    StoreValue(Add(active_end, Multiply(worst_a, 8)), cur_end)
+                    StoreValue(Add(active_id, Multiply(drop_a, 8)), cur_id)
+                    StoreValue(Add(active_end, Multiply(drop_a, 8)), cur_end)
                 } ElseBlock: {
                     StoreValue(Add(cur_ptr, 16), -1)
                 }
+            }
+            IfCondition EqualTo(is_x, 1) ThenBlock: {
+                free_n_x = free_n
+                active_n_x = active_n
+            } ElseBlock: {
+                free_n_g = free_n
+                active_n_g = active_n
             }
             idx = Add(idx, 1)
         }
 
         Deallocate(order, Multiply(128, 8))
-        Deallocate(free_regs, 32)
-        Deallocate(active_id, 32)
-        Deallocate(active_end, 32)
+        Deallocate(free_g, 32)
+        Deallocate(free_x, 128)
+        Deallocate(active_id_g, 32)
+        Deallocate(active_end_g, 32)
+        Deallocate(active_id_x, 128)
+        Deallocate(active_end_x, 128)
         ReturnValue(0)
     }
 }
@@ -348,9 +455,10 @@ Function.Optimize_ScanWantUse {
 // every iteration, including after the body has killed it. Allocate
 // and any >6-arg call do `mov r12, rsp`, and ordinary compares do
 // `mov rbx, rax`. CompileStmt_While / CompileStmt_ForEvery therefore
-// call Optimize_ScanMatClear at the back-edge target and again after
-// the loop. Clearing only drops cache hits; every store still wrote
-// the stack slot.
+// spill homes whose registers the body scratches, then compile the
+// header to reload those from the frame. Assignments of those names
+// still store. A name in a register the body leaves alone is updated
+// in the register only; the loop-exit spill writes it back.
 //
 // Everything else here has no CFG builder support at all - it would
 // fall into Optimize_CFGWalkStmt's "one atomic program point" catch-
@@ -428,6 +536,9 @@ Function.Optimize_ScanArm {
             SetByte(ScanState.mat, i, 0)
             i = Add(i, 1)
         }
+        ScanState.keep = 0
+        ScanState.loop_mask = 0
+        ScanPtr.rm_n = 0
         ReturnValue(0)
     }
 }
@@ -453,19 +564,898 @@ Function.Optimize_ScanMatSet {
     Input: id: Integer
     Body: {
         IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        // One value per register. A later name that reuses the register
+        // after this name's last use must not leave the old bit set.
+        reg = Optimize_ScanReg(id)
+        IfCondition NotEqual(reg, -1) ThenBlock: {
+            i = 1
+            WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+                IfCondition NotEqual(i, id) ThenBlock: {
+                    IfCondition EqualTo(Optimize_ScanReg(i), reg) ThenBlock: {
+                        SetByte(ScanState.mat, Subtract(i, 1), 0)
+                    }
+                }
+                i = Add(i, 1)
+            }
+        }
         SetByte(ScanState.mat, Subtract(id, 1), 1)
         ReturnValue(0)
     }
 }
 
-// Drop every materialized home. The next load of each name reloads
-// its stack slot and reseeds. Used at loop back-edge targets: the
-// header is emitted once, then the body can kill the home (scratch
-// mov into r12/rbx) before control jumps back to that header.
+// Bits of registers the loop body will scratch, so a header must not
+// keep reading them. 1 = rbx (address math), 2 = r12 (Allocate's
+// mov r12, rsp), 4 = r13 (string helpers). r14 is never a value home.
+Function.Optimize_ScanLoopMask {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        mask = 0
+        IfCondition EqualTo(AST_GetType(node), AST.CALL) ThenBlock: {
+            // Integer math parks the other operand in rbx. Any call can
+            // do that, so a loop that contains a call reloads rbx homes
+            // from the frame. r12 and r13 stay reserved for the calls
+            // that actually write them.
+            mask = 1
+            nm = AST_GetData1(node)
+            IfCondition NotEqual(nm, 0) ThenBlock: {
+                IfCondition EqualTo(StringCompare(nm, "Allocate"), 0) ThenBlock: { mask = BitwiseOr(mask, 2) }
+                IfCondition EqualTo(StringCompare(nm, "Deallocate"), 0) ThenBlock: { mask = BitwiseOr(mask, 2) }
+                rbx = 0
+                IfCondition EqualTo(StringCompare(nm, "Dereference"), 0) ThenBlock: { rbx = 1 }
+                IfCondition EqualTo(StringCompare(nm, "StoreValue"), 0) ThenBlock: { rbx = 1 }
+                IfCondition EqualTo(StringCompare(nm, "GetByte"), 0) ThenBlock: { rbx = 1 }
+                IfCondition EqualTo(StringCompare(nm, "SetByte"), 0) ThenBlock: { rbx = 1 }
+                IfCondition EqualTo(rbx, 1) ThenBlock: { mask = BitwiseOr(mask, 1) }
+                r13 = 0
+                IfCondition EqualTo(StringCompare(nm, "StringLength"), 0) ThenBlock: { r13 = 1 }
+                IfCondition EqualTo(StringCompare(nm, "StringCompare"), 0) ThenBlock: { r13 = 1 }
+                IfCondition EqualTo(StringCompare(nm, "NumberToString"), 0) ThenBlock: { r13 = 1 }
+                IfCondition EqualTo(r13, 1) ThenBlock: { mask = BitwiseOr(mask, 4) }
+            }
+        }
+        n = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            mask = BitwiseOr(mask, Optimize_ScanLoopMask(AST_GetChild(node, i)))
+            i = Add(i, 1)
+        }
+        ReturnValue(mask)
+    }
+}
+
+// The header reloads these registers from the frame. Write the current
+// value out once, before the label, then compile the header cold.
+// Later assignments of these names store, because ScanState.loop_mask
+// names the same registers. Names outside the mask stay in the register.
+Function.Optimize_ScanDropRegs {
+    Input: mask: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(mask, 0) ThenBlock: { ReturnValue(0) }
+        i = 1
+        WhileLoop LessThan(i, 129) {
+            reg = Optimize_ScanReg(i)
+            drop = 0
+            IfCondition EqualTo(reg, Reg.RBX) ThenBlock: {
+                IfCondition EqualTo(BitwiseAnd(mask, 1), 1) ThenBlock: { drop = 1 }
+            }
+            IfCondition EqualTo(reg, Reg.R12) ThenBlock: {
+                IfCondition EqualTo(BitwiseAnd(mask, 2), 2) ThenBlock: { drop = 1 }
+            }
+            IfCondition EqualTo(reg, Reg.R13) ThenBlock: {
+                IfCondition EqualTo(BitwiseAnd(mask, 4), 4) ThenBlock: { drop = 1 }
+            }
+            IfCondition EqualTo(drop, 1) ThenBlock: {
+                Optimize_ScanSpillId(i)
+                SetByte(ScanState.mat, Subtract(i, 1), 0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Register holding this name right now, if it can be a SIB base.
+// 0 means the caller reloads through r14.
+Function.Optimize_ScanAddrBase {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(name)
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 0) ThenBlock: { ReturnValue(0) }
+        reg = Optimize_ScanReg(id)
+        IfCondition EqualTo(reg, Reg.RBX) ThenBlock: { ReturnValue(reg) }
+        IfCondition EqualTo(reg, Reg.R12) ThenBlock: { ReturnValue(reg) }
+        IfCondition EqualTo(reg, Reg.R13) ThenBlock: { ReturnValue(reg) }
+        ReturnValue(0)
+    }
+}
+
+// 1 float, 2 integer, 0 neither. Float_FromInt and Float_ToInt are
+// handled by the walker because their argument class is the opposite
+// of their result.
+Function.Optimize_ScanUseClass {
+    Input: nm: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(nm, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Add"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Sub"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Mul"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Div"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Neg"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Abs"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Sqrt"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Min"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Max"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Eq"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Ne"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Lt"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Gt"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Le"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Ge"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Add"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "Subtract"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "Multiply"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "Divide"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "Modulo"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "Negate"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "BitwiseAnd"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "BitwiseOr"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "BitwiseXor"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "BitwiseNot"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "LeftShift"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "RightShift"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "BitAnd"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "BitOr"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "BitXor"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "BitNot"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "ShiftLeft"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "ShiftRight"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "LessThan"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "GreaterThan"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "LessEqual"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "GreaterEqual"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "EqualTo"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "NotEqual"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "And"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "Or"), 0) ThenBlock: { ReturnValue(2) }
+        IfCondition EqualTo(StringCompare(nm, "Not"), 0) ThenBlock: { ReturnValue(2) }
+        ReturnValue(0)
+    }
+}
+
+// Lookup only. TagIntern would append a name the liveness pass never saw.
+Function.Optimize_ScanFind {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(TagState.names, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, TagState.nnames) {
+            existing = Dereference(Add(TagState.names, Multiply(i, 8)))
+            IfCondition EqualTo(Optimize_NameEq(existing, name), 1) ThenBlock: { ReturnValue(Add(i, 1)) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanMarkBit {
+    Input: id: Integer
+    Input: bit: Integer
+    Body: {
+        IfCondition EqualTo(ScanState.flt, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        at = Subtract(id, 1)
+        SetByte(ScanState.flt, at, BitwiseOr(GetByte(ScanState.flt, at), bit))
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanMarkUses {
+    Input: node: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(node), AST.CALL) ThenBlock: { ReturnValue(0) }
+        nm = AST_GetData1(node)
+        cls = 0
+        IfCondition EqualTo(StringCompare(nm, "Float_FromInt"), 0) ThenBlock: { cls = 2 }
+        IfCondition EqualTo(StringCompare(nm, "Float_ToInt"), 0) ThenBlock: { cls = 1 }
+        IfCondition EqualTo(cls, 0) ThenBlock: { cls = Optimize_ScanUseClass(nm) }
+        IfCondition EqualTo(cls, 0) ThenBlock: { ReturnValue(0) }
+        nch = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, nch) {
+            ch = AST_GetChild(node, i)
+            IfCondition NotEqual(ch, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(ch), AST.IDENTIFIER) ThenBlock: {
+                    Optimize_ScanMarkBit(Optimize_ScanFind(AST_GetData1(ch)), cls)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanMarkNode {
+    Input: node: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        nt = AST_GetType(node)
+        IfCondition EqualTo(nt, AST.ASSIGNMENT) ThenBlock: {
+            IfCondition GreaterThan(AST_GetChildCount(node), 0) ThenBlock: {
+                val = AST_GetChild(node, 0)
+                IfCondition NotEqual(val, 0) ThenBlock: {
+                    IfCondition EqualTo(AST_GetType(val), AST.CALL) ThenBlock: {
+                        vn = AST_GetData1(val)
+                        bit = 0
+                        IfCondition EqualTo(StringCompare(vn, "Float_FromInt"), 0) ThenBlock: { bit = 1 }
+                        IfCondition EqualTo(StringCompare(vn, "Float_ToInt"), 0) ThenBlock: { bit = 2 }
+                        IfCondition EqualTo(bit, 0) ThenBlock: {
+                            c = Optimize_ScanUseClass(vn)
+                            IfCondition EqualTo(c, 1) ThenBlock: { bit = 1 }
+                            IfCondition EqualTo(c, 2) ThenBlock: { bit = 2 }
+                        }
+                        IfCondition NotEqual(bit, 0) ThenBlock: {
+                            Optimize_ScanMarkBit(Optimize_ScanFind(AST_GetData1(node)), bit)
+                        }
+                        // Bit 8: the value is a field of a plain pointer.
+                        // Bit 4: any other definition. Both means the
+                        // loaded field is later overwritten.
+                        IfCondition EqualTo(StringCompare(vn, "Dereference"), 0) ThenBlock: {
+                            IfCondition EqualTo(AST_GetChildCount(val), 1) ThenBlock: {
+                                adr = AST_GetChild(val, 0)
+                                plain = 0
+                                IfCondition NotEqual(adr, 0) ThenBlock: {
+                                    IfCondition EqualTo(AST_GetType(adr), AST.IDENTIFIER) ThenBlock: { plain = 1 }
+                                    IfCondition EqualTo(AST_GetType(adr), AST.CALL) ThenBlock: {
+                                        IfCondition EqualTo(StringCompare(AST_GetData1(adr), "Add"), 0) ThenBlock: {
+                                            IfCondition EqualTo(AST_GetChildCount(adr), 2) ThenBlock: {
+                                                d0 = AST_GetChild(adr, 0)
+                                                d1 = AST_GetChild(adr, 1)
+                                                IfCondition NotEqual(d1, 0) ThenBlock: {
+                                                    IfCondition EqualTo(AST_GetType(d1), AST.NUMBER) ThenBlock: {
+                                                        IfCondition NotEqual(d0, 0) ThenBlock: {
+                                                            IfCondition EqualTo(AST_GetType(d0), AST.IDENTIFIER) ThenBlock: { plain = 1 }
+                                                        }
+                                                    }
+                                                }
+                                                IfCondition NotEqual(d0, 0) ThenBlock: {
+                                                    IfCondition EqualTo(AST_GetType(d0), AST.NUMBER) ThenBlock: {
+                                                        IfCondition NotEqual(d1, 0) ThenBlock: {
+                                                            IfCondition EqualTo(AST_GetType(d1), AST.IDENTIFIER) ThenBlock: { plain = 1 }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                IfCondition EqualTo(plain, 1) ThenBlock: {
+                                    Optimize_ScanMarkBit(Optimize_ScanFind(AST_GetData1(node)), 8)
+                                } ElseBlock: {
+                                    Optimize_ScanMarkBit(Optimize_ScanFind(AST_GetData1(node)), 4)
+                                }
+                            }
+                        } ElseBlock: {
+                            Optimize_ScanMarkBit(Optimize_ScanFind(AST_GetData1(node)), 4)
+                        }
+                    } ElseBlock: {
+                        Optimize_ScanMarkBit(Optimize_ScanFind(AST_GetData1(node)), 4)
+                    }
+                }
+            }
+        }
+        IfCondition EqualTo(nt, AST.CALL) ThenBlock: { Optimize_ScanMarkUses(node) }
+        nch = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, nch) {
+            Optimize_ScanMarkNode(AST_GetChild(node, i))
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanMarkCopy {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        changed = 0
+        IfCondition EqualTo(AST_GetType(node), AST.ASSIGNMENT) ThenBlock: {
+            IfCondition GreaterThan(AST_GetChildCount(node), 0) ThenBlock: {
+                val = AST_GetChild(node, 0)
+                IfCondition NotEqual(val, 0) ThenBlock: {
+                    IfCondition EqualTo(AST_GetType(val), AST.IDENTIFIER) ThenBlock: {
+                        id = Optimize_ScanFind(AST_GetData1(node))
+                        sid = Optimize_ScanFind(AST_GetData1(val))
+                        IfCondition GreaterThan(id, 0) ThenBlock: {
+                            IfCondition GreaterThan(sid, 0) ThenBlock: {
+                                cur = GetByte(ScanState.flt, Subtract(id, 1))
+                                merged = BitwiseOr(cur, GetByte(ScanState.flt, Subtract(sid, 1)))
+                                IfCondition NotEqual(merged, cur) ThenBlock: {
+                                    SetByte(ScanState.flt, Subtract(id, 1), merged)
+                                    changed = 1
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        nch = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, nch) {
+            IfCondition EqualTo(Optimize_ScanMarkCopy(AST_GetChild(node, i)), 1) ThenBlock: { changed = 1 }
+            i = Add(i, 1)
+        }
+        ReturnValue(changed)
+    }
+}
+
+// Called once per function, before Optimize_ScanRun. A name is a float
+// candidate when every seen use is a float op and it is never an integer
+// operand. Literal 0 does not count as integer, so s00 = 0 still qualifies.
+Function.Optimize_ScanMark {
+    Input: body: Address
+    Body: {
+        IfCondition EqualTo(ScanState.flt, 0) ThenBlock: { ScanState.flt = Allocate(128) }
+        IfCondition EqualTo(ScanState.flt, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, 128) {
+            SetByte(ScanState.flt, i, 0)
+            i = Add(i, 1)
+        }
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(0) }
+        Optimize_ScanMarkNode(body)
+        pass = 0
+        WhileLoop LessThan(pass, 8) {
+            IfCondition EqualTo(Optimize_ScanMarkCopy(body), 0) ThenBlock: { pass = 8 }
+            pass = Add(pass, 1)
+        }
+        i = 0
+        WhileLoop LessThan(i, 128) {
+            b = GetByte(ScanState.flt, i)
+            keep = 0
+            // 1: computed float, allocated first. 5: also loaded from a
+            // field, allocated after the temps. 3: the value is only a
+            // field of a plain pointer, reloaded from that pointer, no
+            // register. 0: not a float.
+            IfCondition NotEqual(BitwiseAnd(b, 1), 0) ThenBlock: {
+                IfCondition EqualTo(BitwiseAnd(b, 2), 0) ThenBlock: {
+                    keep = 1
+                    IfCondition NotEqual(BitwiseAnd(b, 8), 0) ThenBlock: {
+                        IfCondition EqualTo(BitwiseAnd(b, 4), 0) ThenBlock: { keep = 3 }
+                        IfCondition NotEqual(BitwiseAnd(b, 4), 0) ThenBlock: { keep = 5 }
+                    }
+                }
+            }
+            SetByte(ScanState.flt, i, keep)
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// 1 when name id's bit is set in the live-in or live-out mask pair.
+Function.Optimize_ScanBit {
+    Input: id: Integer
+    Input: w0: Integer
+    Input: w1: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(id, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition LessEqual(id, 64) ThenBlock: {
+            IfCondition NotEqual(BitwiseAnd(w0, LeftShift(1, Subtract(id, 1))), 0) ThenBlock: { ReturnValue(1) }
+            ReturnValue(0)
+        }
+        IfCondition LessEqual(id, 128) ThenBlock: {
+            IfCondition NotEqual(BitwiseAnd(w1, LeftShift(1, Subtract(id, 65))), 0) ThenBlock: { ReturnValue(1) }
+            ReturnValue(0)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Record every identifier under this statement at pos. A nested
+// statement carries its own pos and is left for the outer walk.
+Function.Optimize_ScanTouch {
+    Input: node: Address
+    Input: pos: Integer
+    Input: mins: Address
+    Input: maxs: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        nt = AST_GetType(node)
+        IfCondition EqualTo(nt, AST.ASSIGNMENT) ThenBlock: {
+            id = Optimize_ScanFind(AST_GetData1(node))
+            IfCondition GreaterThan(id, 0) ThenBlock: {
+                at = Multiply(Subtract(id, 1), 8)
+                cur = Dereference(Add(mins, at))
+                IfCondition LessThan(pos, cur) ThenBlock: { StoreValue(Add(mins, at), pos) }
+                cur = Dereference(Add(maxs, at))
+                IfCondition GreaterThan(pos, cur) ThenBlock: { StoreValue(Add(maxs, at), pos) }
+            }
+        }
+        IfCondition EqualTo(nt, AST.IDENTIFIER) ThenBlock: {
+            id = Optimize_ScanFind(AST_GetData1(node))
+            IfCondition GreaterThan(id, 0) ThenBlock: {
+                at = Multiply(Subtract(id, 1), 8)
+                cur = Dereference(Add(mins, at))
+                IfCondition LessThan(pos, cur) ThenBlock: { StoreValue(Add(mins, at), pos) }
+                cur = Dereference(Add(maxs, at))
+                IfCondition GreaterThan(pos, cur) ThenBlock: { StoreValue(Add(maxs, at), pos) }
+            }
+            ReturnValue(0)
+        }
+        nch = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, nch) {
+            ch = AST_GetChild(node, i)
+            stop = 0
+            IfCondition NotEqual(ch, 0) ThenBlock: {
+                cpos = Optimize_TagPosOf(ch)
+                IfCondition GreaterThan(cpos, 0) ThenBlock: {
+                    IfCondition NotEqual(cpos, pos) ThenBlock: { stop = 1 }
+                }
+            }
+            IfCondition EqualTo(stop, 0) ThenBlock: {
+                Optimize_ScanTouch(ch, pos, mins, maxs)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanTouchWalk {
+    Input: node: Address
+    Input: mins: Address
+    Input: maxs: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        pos = Optimize_TagPosOf(node)
+        // A tag record left at 0 was never given a program point.
+        // CFG positions start at 1.
+        IfCondition GreaterThan(pos, 0) ThenBlock: {
+            Optimize_ScanTouch(node, pos, mins, maxs)
+        }
+        nch = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, nch) {
+            Optimize_ScanTouchWalk(AST_GetChild(node, i), mins, maxs)
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// The block liveness interval runs from the first statement of a block
+// to the last, for every name the block mentions. A temp that dies on
+// the next line therefore holds a register for the whole block, and the
+// float that actually needs it spills. Shrink each interval to the
+// statements that mention the name, then stretch it back out to a block
+// edge only when the name is live-in or live-out there.
+Function.Optimize_ScanRefine {
+    Input: body: Address
+    Body: {
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(NameState.buf, 0) ThenBlock: { ReturnValue(0) }
+        mins = Allocate(1024)
+        maxs = Allocate(1024)
+        i = 0
+        WhileLoop LessThan(i, 128) {
+            StoreValue(Add(mins, Multiply(i, 8)), 2147483647)
+            StoreValue(Add(maxs, Multiply(i, 8)), -1)
+            i = Add(i, 1)
+        }
+        Optimize_ScanTouchWalk(body, mins, maxs)
+        i = 1
+        WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+            at = Multiply(Subtract(i, 1), 8)
+            tmin = Dereference(Add(mins, at))
+            tmax = Dereference(Add(maxs, at))
+            IfCondition GreaterEqual(tmax, 0) ThenBlock: {
+                omin = Optimize_LiveMinPos(i)
+                omax = Optimize_LiveMaxPos(i)
+                IfCondition GreaterEqual(omax, 0) ThenBlock: {
+                    // Only shrink. A touch outside the old range is ignored
+                    // so a missed statement cannot extend a register past
+                    // the block the dataflow already proved.
+                    fmin = tmin
+                    fmax = tmax
+                    IfCondition LessThan(fmin, omin) ThenBlock: { fmin = omin }
+                    IfCondition GreaterThan(fmax, omax) ThenBlock: { fmax = omax }
+                    // A value used in a block where this block does not
+                    // define it has to survive the whole block. Otherwise
+                    // a later temp reuses the register and the next loop
+                    // trip reads that temp. A name this block defines is
+                    // not stretched: its next trip rewrites the register
+                    // before the use.
+                    b = 0
+                    WhileLoop LessThan(b, BlockPool.head) {
+                        df = Optimize_ScanBit(i, Optimize_LiveDef0(b), Optimize_LiveDef1(b))
+                        IfCondition EqualTo(df, 0) ThenBlock: {
+                            inn = Optimize_ScanBit(i, Optimize_LiveIn0(b), Optimize_LiveIn1(b))
+                            IfCondition EqualTo(inn, 1) ThenBlock: {
+                                ps = Optimize_CFGPosStart(b)
+                                IfCondition GreaterThan(ps, 0) ThenBlock: {
+                                    IfCondition LessThan(ps, fmin) ThenBlock: { fmin = ps }
+                                }
+                            }
+                            outg = Optimize_ScanBit(i, Optimize_LiveOut0(b), Optimize_LiveOut1(b))
+                            IfCondition EqualTo(outg, 1) ThenBlock: {
+                                pe = Optimize_CFGPosEnd(b)
+                                IfCondition GreaterThan(pe, 0) ThenBlock: {
+                                    IfCondition GreaterThan(pe, fmax) ThenBlock: { fmax = pe }
+                                }
+                            }
+                        }
+                        b = Add(b, 1)
+                    }
+                    IfCondition LessThan(fmin, omin) ThenBlock: { fmin = omin }
+                    IfCondition GreaterThan(fmax, omax) ThenBlock: { fmax = omax }
+                    IfCondition LessEqual(fmin, fmax) ThenBlock: {
+                        slot = Add(NameState.buf, Multiply(Subtract(i, 1), 16))
+                        StoreValue(slot, fmin)
+                        StoreValue(Add(slot, 8), fmax)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        Deallocate(mins, 1024)
+        Deallocate(maxs, 1024)
+        ReturnValue(0)
+    }
+}
+
+// Hardware xmm of a materialized identifier, or -1.
+Function.Optimize_ScanFltSrc {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition NotEqual(AST_GetType(node), AST.IDENTIFIER) ThenBlock: { ReturnValue(-1) }
+        id = Optimize_TagIntern(AST_GetData1(node))
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(-1) }
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 0) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Optimize_ScanXmm(Optimize_ScanReg(id)))
+    }
+}
+
+// Hardware xmm, or -1 when reg is a GPR or a spill.
+Function.Optimize_ScanXmm {
+    Input: reg: Integer
+    Output: Integer
+    Body: {
+        IfCondition LessThan(reg, 36) ThenBlock: { ReturnValue(-1) }
+        IfCondition GreaterThan(reg, 46) ThenBlock: { ReturnValue(-1) }
+        ReturnValue(Subtract(reg, 32))
+    }
+}
+
+// Write one materialized home back to its frame slot. Does not use
+// rax: a clobber spill runs while rax holds the value that is about
+// to overwrite the register. Leaves mat set. The caller clears it
+// when the register itself is about to die.
+Function.Optimize_ScanSpillId {
+    Input: id: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 0) ThenBlock: { ReturnValue(0) }
+        reg = Optimize_ScanReg(id)
+        IfCondition EqualTo(reg, -1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(TagState.names, 0) ThenBlock: { ReturnValue(0) }
+        name = Dereference(Add(TagState.names, Multiply(Subtract(id, 1), 8)))
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        off = Scope_Resolve(name)
+        IfCondition EqualTo(Scope.resolve_type, 3) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Scope.resolve_type, 0) ThenBlock: {
+            Compile.stack_offset = Add(Compile.stack_offset, 8)
+            off = Subtract(0, Compile.stack_offset)
+            Compile_RegisterLocal(name, off)
+        }
+        xmm = Optimize_ScanXmm(reg)
+        IfCondition GreaterEqual(xmm, 0) ThenBlock: {
+            X86_MovsdRbpDisp(xmm, off)
+            ReturnValue(0)
+        }
+        X86_MovRbpOffsetGpr(off, reg)
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanSpillXmm {
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        i = 1
+        WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+            IfCondition GreaterEqual(Optimize_ScanXmm(Optimize_ScanReg(i)), 0) ThenBlock: {
+                Optimize_ScanSpillId(i)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// GPRs and xmms. Used where a later load may read the frame: if arms,
+// loop exit, and a for-every body. Leaves mat set.
+Function.Optimize_ScanSpillDirty {
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        i = 1
+        WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+            Optimize_ScanSpillId(i)
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// A real call clobbers every xmm. Write the homes back and drop the
+// cache flags. GPRs stay: rbx/r12/r13 are callee-saved.
+Function.Optimize_ScanDropXmm {
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        Optimize_ScanSpillXmm()
+        i = 1
+        WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
+            IfCondition GreaterEqual(Optimize_ScanXmm(Optimize_ScanReg(i)), 0) ThenBlock: {
+                SetByte(ScanState.mat, Subtract(i, 1), 0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// The xmm holds the value. Create the frame slot the first time this
+// name is defined so a later spill has somewhere to land. Later
+// updates leave the slot stale until that spill.
+Function.Optimize_ScanFltPublish {
+    Input: id: Integer
+    Input: slot: Integer
+    Input: name: Address
+    Body: {
+        Optimize_ScanMatSet(id)
+        // Make sure a frame slot exists for the spill. Do not store on
+        // this path: the xmm is the value, and a store here would run
+        // on every trip of the loop.
+        Scope_Resolve(name)
+        IfCondition EqualTo(Scope.resolve_type, 0) ThenBlock: {
+            Compile.stack_offset = Add(Compile.stack_offset, 8)
+            off = Subtract(0, Compile.stack_offset)
+            Compile_RegisterLocal(name, off)
+        }
+        Optimize_RaxDrop()
+        ReturnValue(0)
+    }
+}
+
+// target = target ± (a*b), or any float add/sub/mul/div/sqrt into the
+// scan xmm. The stack slot is not rewritten on later updates. The
+// loop-exit spill and the if-arm spill publish it. Returns 0 before
+// any instruction when the shape does not match.
+Function.Optimize_ScanFltUpdate {
+    Input: target: Address
+    Input: value: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(target, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(value, 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(target)
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        slot = Optimize_ScanXmm(Optimize_ScanReg(id))
+        IfCondition LessThan(slot, 2) ThenBlock: { ReturnValue(0) }
+        // Another live name may still be in this xmm. Spill it before
+        // the first write. keep leaves this name's bits in place so an
+        // in-place update still sees them.
+        ScanState.keep = id
+        Optimize_ScanClobberReg(Optimize_ScanReg(id))
+        ScanState.keep = 0
+        // A fresh +0.0. The integer literal 0 has the same bits.
+        IfCondition EqualTo(AST_GetType(value), AST.NUMBER) ThenBlock: {
+            IfCondition EqualTo(StringToNumber(AST_GetData1(value)), 0) ThenBlock: {
+                X86_PxorXmm(slot)
+                Optimize_ScanFltPublish(id, slot, target)
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition NotEqual(AST_GetType(value), AST.CALL) ThenBlock: { ReturnValue(0) }
+        opname = AST_GetData1(value)
+        // ix = Dereference(bi) or Dereference(Add(bi, 8)) lands in the
+        // xmm. The pointer is computed to rax and the float is never
+        // staged through an integer store.
+        IfCondition EqualTo(StringCompare(opname, "Dereference"), 0) ThenBlock: {
+            IfCondition NotEqual(AST_GetChildCount(value), 1) ThenBlock: { ReturnValue(0) }
+            addr = AST_GetChild(value, 0)
+            disp = 0
+            base_node = addr
+            IfCondition NotEqual(addr, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(addr), AST.CALL) ThenBlock: {
+                    IfCondition EqualTo(StringCompare(AST_GetData1(addr), "Add"), 0) ThenBlock: {
+                        IfCondition EqualTo(AST_GetChildCount(addr), 2) ThenBlock: {
+                            c0 = AST_GetChild(addr, 0)
+                            c1 = AST_GetChild(addr, 1)
+                            IfCondition EqualTo(AST_GetType(c1), AST.NUMBER) ThenBlock: {
+                                disp = StringToNumber(AST_GetData1(c1))
+                                base_node = c0
+                            }
+                            IfCondition EqualTo(AST_GetType(c0), AST.NUMBER) ThenBlock: {
+                                disp = StringToNumber(AST_GetData1(c0))
+                                base_node = c1
+                            }
+                        }
+                    }
+                }
+            }
+            IfCondition NotEqual(base_node, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(base_node), AST.IDENTIFIER) ThenBlock: {
+                    preg = Optimize_ScanPtrReg(AST_GetData1(base_node))
+                    IfCondition NotEqual(preg, 0) ThenBlock: {
+                        X86_MovsdPtr(slot, preg, disp)
+                        Optimize_ScanFltPublish(id, slot, target)
+                        ReturnValue(1)
+                    }
+                }
+            }
+            got = Compile_Expression(base_node)
+            IfCondition EqualTo(got, 0) ThenBlock: {
+                Compile.error = 1
+                ReturnValue(1)
+            }
+            X86_MovsdRaxDisp(slot, disp)
+            Optimize_ScanFltPublish(id, slot, target)
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(StringCompare(opname, "Float_Sqrt"), 0) ThenBlock: {
+            IfCondition NotEqual(AST_GetChildCount(value), 1) ThenBlock: { ReturnValue(0) }
+            src = AST_GetChild(value, 0)
+            ss = Optimize_ScanFltSrc(src)
+            IfCondition GreaterEqual(ss, 0) ThenBlock: {
+                X86_XmmBin(81, slot, ss)
+            } ElseBlock: {
+                got = Compile_Expression(src)
+                IfCondition EqualTo(got, 0) ThenBlock: {
+                    Compile.error = 1
+                    ReturnValue(1)
+                }
+                X86_XmmRR(1, 0)
+                X86_XmmBin(81, slot, 0)
+            }
+            Optimize_ScanFltPublish(id, slot, target)
+            ReturnValue(1)
+        }
+        IfCondition NotEqual(AST_GetChildCount(value), 2) ThenBlock: { ReturnValue(0) }
+        is_add = 0
+        is_sub = 0
+        is_mul = 0
+        is_div = 0
+        IfCondition EqualTo(StringCompare(opname, "Float_Add"), 0) ThenBlock: { is_add = 1 }
+        IfCondition EqualTo(StringCompare(opname, "Float_Sub"), 0) ThenBlock: { is_sub = 1 }
+        IfCondition EqualTo(StringCompare(opname, "Float_Mul"), 0) ThenBlock: { is_mul = 1 }
+        IfCondition EqualTo(StringCompare(opname, "Float_Div"), 0) ThenBlock: { is_div = 1 }
+        IfCondition EqualTo(is_add, 0) ThenBlock: {
+            IfCondition EqualTo(is_sub, 0) ThenBlock: {
+                IfCondition EqualTo(is_mul, 0) ThenBlock: {
+                    IfCondition EqualTo(is_div, 0) ThenBlock: { ReturnValue(0) }
+                }
+            }
+        }
+        left = AST_GetChild(value, 0)
+        right = AST_GetChild(value, 1)
+        // In-place FMA needs the old accumulator, so the xmm must already
+        // hold it. A plain dx = ix - jx does not.
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 1) ThenBlock: {
+        IfCondition EqualTo(is_mul, 0) ThenBlock: {
+            mul = 0
+            IfCondition EqualTo(is_sub, 1) ThenBlock: {
+                IfCondition EqualTo(Optimize_IdentEq(left, target), 1) ThenBlock: {
+                    IfCondition EqualTo(Optimize_IsFloatMul(right), 1) ThenBlock: { mul = right }
+                }
+            }
+            IfCondition EqualTo(is_add, 1) ThenBlock: {
+                IfCondition EqualTo(Optimize_IdentEq(left, target), 1) ThenBlock: {
+                    IfCondition EqualTo(Optimize_IsFloatMul(right), 1) ThenBlock: { mul = right }
+                }
+                IfCondition EqualTo(Optimize_IdentEq(right, target), 1) ThenBlock: {
+                    IfCondition EqualTo(Optimize_IsFloatMul(left), 1) ThenBlock: { mul = left }
+                }
+            }
+            IfCondition NotEqual(mul, 0) ThenBlock: {
+                got = FPUCompileX86_FmaHome(slot, AST_GetChild(mul, 0), AST_GetChild(mul, 1), is_sub)
+                IfCondition EqualTo(got, 1) ThenBlock: {
+                    Optimize_ScanFltPublish(id, slot, target)
+                    ReturnValue(1)
+                }
+            }
+        }
+        }
+        // left in xmm0, right in xmm1, then the op into the home.
+        // A source that is already in an xmm is copied. Anything else
+        // is compiled to rax. The home is not stored; the loop-exit
+        // spill writes it back.
+        ls = Optimize_ScanFltSrc(left)
+        lrm = 0
+        IfCondition LessThan(ls, 0) ThenBlock: {
+            IfCondition NotEqual(left, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(left), AST.IDENTIFIER) ThenBlock: {
+                    lrm = Optimize_ScanPtrRmFind(AST_GetData1(left))
+                }
+            }
+        }
+        IfCondition GreaterEqual(ls, 0) ThenBlock: {
+            X86_XmmBin(16, 0, ls)
+        } ElseBlock: {
+            IfCondition EqualTo(lrm, 1) ThenBlock: {
+                X86_MovsdPtr(0, ScanPtr.hit_reg, ScanPtr.hit_disp)
+            } ElseBlock: {
+                got = Compile_Expression(left)
+                IfCondition EqualTo(got, 0) ThenBlock: {
+                    Compile.error = 1
+                    ReturnValue(1)
+                }
+                X86_XmmRR(1, 0)
+            }
+        }
+        rs = Optimize_ScanFltSrc(right)
+        rrm = 0
+        IfCondition LessThan(rs, 0) ThenBlock: {
+            IfCondition NotEqual(right, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(right), AST.IDENTIFIER) ThenBlock: {
+                    rrm = Optimize_ScanPtrRmFind(AST_GetData1(right))
+                }
+            }
+        }
+        IfCondition GreaterEqual(rs, 0) ThenBlock: {
+            X86_XmmRR(8, rs)
+        } ElseBlock: {
+            IfCondition EqualTo(rrm, 1) ThenBlock: {
+                X86_MovsdPtr(1, ScanPtr.hit_reg, ScanPtr.hit_disp)
+            } ElseBlock: {
+                X86_PushXMM0()
+                got = Compile_Expression(right)
+                IfCondition EqualTo(got, 0) ThenBlock: {
+                    X86_PopXMM0()
+                    Compile.error = 1
+                    ReturnValue(1)
+                }
+                X86_XmmRR(1, 1)
+                X86_PopXMM0()
+            }
+        }
+        X86_XmmBin(16, slot, 0)
+        opc = 88
+        IfCondition EqualTo(is_sub, 1) ThenBlock: { opc = 92 }
+        IfCondition EqualTo(is_mul, 1) ThenBlock: { opc = 89 }
+        IfCondition EqualTo(is_div, 1) ThenBlock: { opc = 94 }
+        X86_XmmBin(opc, slot, 1)
+        Optimize_ScanFltPublish(id, slot, target)
+        ReturnValue(1)
+    }
+}
+
+// Drop every materialized home. Write GPRs and xmms back first.
+// A homed assignment does not store, so the frame is behind the
+// register until this spill. A zero-trip loop still has the
+// pre-loop bits in the register.
 Function.Optimize_ScanMatClear {
     Body: {
         IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
         IfCondition EqualTo(ScanState.mat, 0) ThenBlock: { ReturnValue(0) }
+        Optimize_ScanSpillDirty()
         i = 0
         WhileLoop LessThan(i, 128) {
             SetByte(ScanState.mat, i, 0)
@@ -490,6 +1480,11 @@ Function.Optimize_ScanTryLoad {
         reg = Optimize_ScanReg(id)
         IfCondition EqualTo(reg, -1) ThenBlock: { ReturnValue(0) }
         IfCondition EqualTo(Optimize_ScanMatGet(id), 0) ThenBlock: { ReturnValue(0) }
+        xmm = Optimize_ScanXmm(reg)
+        IfCondition GreaterEqual(xmm, 0) ThenBlock: {
+            X86_XmmRR(2, xmm)
+            ReturnValue(1)
+        }
         Emit_MovRegReg(Reg.RAX, reg)
         ReturnValue(1)
     }
@@ -509,6 +1504,17 @@ Function.Optimize_ScanSeedLoad {
         reg = Optimize_ScanReg(id)
         IfCondition EqualTo(reg, -1) ThenBlock: { ReturnValue(0) }
         IfCondition EqualTo(Optimize_ScanMatGet(id), 1) ThenBlock: { ReturnValue(0) }
+        xmm = Optimize_ScanXmm(reg)
+        IfCondition GreaterEqual(xmm, 0) ThenBlock: {
+            X86_XmmRR(1, xmm)
+            Optimize_ScanMatSet(id)
+            ReturnValue(0)
+        }
+        // rbx is the scratch register for Add/Sub/Mul (the other operand
+        // sits there). Copying a home into rbx in the middle of that
+        // expression replaces the other operand. The statement-end store
+        // still fills rbx once the scratch is dead.
+        IfCondition EqualTo(reg, Reg.RBX) ThenBlock: { ReturnValue(0) }
         Emit_MovRegReg(reg, Reg.RAX)
         Optimize_ScanMatSet(id)
         ReturnValue(0)
@@ -540,14 +1546,67 @@ Function.Optimize_ScanInvalidate {
         id = Optimize_TagIntern(name)
         IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
         IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        Optimize_ScanSpillId(id)
         SetByte(ScanState.mat, Subtract(id, 1), 0)
         ReturnValue(0)
     }
 }
 
-// Called right after the normal stack store, unconditionally: the
-// stack write already happened, this only adds the register-cache
-// copy on top.
+// 1 when the scan register, not the frame, holds this name.
+Function.Optimize_ScanHomed {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(name)
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanReg(id), -1) ThenBlock: { ReturnValue(0) }
+        ReturnValue(1)
+    }
+}
+
+// 1 when StoreVariable should update the register and skip the frame
+// store. A register the enclosing loop scratches is reloaded from the
+// frame at the header, so that name still stores.
+Function.Optimize_ScanHold {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanHomed(name), 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(name)
+        reg = Optimize_ScanReg(id)
+        mask = ScanState.loop_mask
+        IfCondition EqualTo(reg, Reg.RBX) ThenBlock: {
+            IfCondition EqualTo(BitwiseAnd(mask, 1), 1) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition EqualTo(reg, Reg.R12) ThenBlock: {
+            IfCondition EqualTo(BitwiseAnd(mask, 2), 2) ThenBlock: { ReturnValue(0) }
+        }
+        IfCondition EqualTo(reg, Reg.R13) ThenBlock: {
+            IfCondition EqualTo(BitwiseAnd(mask, 4), 4) ThenBlock: { ReturnValue(0) }
+        }
+        ReturnValue(1)
+    }
+}
+
+// The frame was just written by a path that did not go through
+// StoreVariable. Drop the cache flag without spilling the old register
+// over that new slot.
+Function.Optimize_ScanMatDrop {
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        id = Optimize_TagIntern(name)
+        IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        SetByte(ScanState.mat, Subtract(id, 1), 0)
+        ReturnValue(0)
+    }
+}
+
+// Copy rax into the scan register. The frame store is the caller's
+// choice. keep stops this write from spilling the name it is defining.
+// Any other name still living in the register is spilled first.
 Function.Optimize_ScanNoteStore {
     Input: name: Address
     Body: {
@@ -556,17 +1615,24 @@ Function.Optimize_ScanNoteStore {
         IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
         reg = Optimize_ScanReg(id)
         IfCondition EqualTo(reg, -1) ThenBlock: { ReturnValue(0) }
-        Emit_MovRegReg(reg, Reg.RAX)
+        ScanState.keep = id
+        Optimize_ScanClobberReg(reg)
+        xmm = Optimize_ScanXmm(reg)
+        IfCondition GreaterEqual(xmm, 0) ThenBlock: {
+            X86_XmmRR(1, xmm)
+        } ElseBlock: {
+            Emit_MovRegReg(reg, Reg.RAX)
+        }
+        ScanState.keep = 0
         Optimize_ScanMatSet(id)
         ReturnValue(0)
     }
 }
 
-// A scratch write of this register killed whatever name was homed
-// there. The stack slot is unchanged. The next load reseeds.
-// want/eligible are read directly so this stays a couple of compares
-// on the gate-off path. ScanArm calls Optimize_ScanWantUse first, so
-// want is 0 or 1 before any body instruction is emitted.
+// A scratch write of this register is about to kill whatever name was
+// homed there. Spill that name first. The stack was not written at the
+// assignment. want/eligible are read directly so this stays a couple
+// of compares on the gate-off path.
 Function.Optimize_ScanClobberReg {
     Input: reg: Integer
     Body: {
@@ -575,7 +1641,10 @@ Function.Optimize_ScanClobberReg {
         i = 1
         WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
             IfCondition EqualTo(Optimize_ScanReg(i), reg) ThenBlock: {
-                SetByte(ScanState.mat, Subtract(i, 1), 0)
+                IfCondition NotEqual(i, ScanState.keep) ThenBlock: {
+                    Optimize_ScanSpillId(i)
+                    SetByte(ScanState.mat, Subtract(i, 1), 0)
+                }
             }
             i = Add(i, 1)
         }
@@ -740,6 +1809,833 @@ Function.Optimize_ScanMatFree {
     Input: snap: Address
     Body: {
         IfCondition NotEqual(snap, 0) ThenBlock: { Deallocate(snap, 128) }
+        ReturnValue(0)
+    }
+}
+
+// 1 when this call is compiled inline and does not kill r11.
+Function.Optimize_ScanPtrPure {
+    Input: nm: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(nm, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(StringCompare(nm, "Add"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Subtract"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Multiply"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Divide"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Modulo"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Negate"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Add"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Sub"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Mul"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Div"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Sqrt"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Neg"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Float_Abs"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Dereference"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "StoreValue"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "LessThan"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "GreaterThan"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "LessEqual"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "GreaterEqual"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "EqualTo"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "NotEqual"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "And"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Or"), 0) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(StringCompare(nm, "Not"), 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// Register holding this hoisted pointer, or 0.
+Function.Optimize_ScanPtrReg {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(ScanPtr.n, 0) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(name, ScanPtr.name0), 1) ThenBlock: {
+                ReturnValue(ScanPtr.reg0)
+            }
+        }
+        IfCondition GreaterThan(ScanPtr.n, 1) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(name, ScanPtr.name1), 1) ThenBlock: {
+                ReturnValue(ScanPtr.reg1)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// 1 when addr is this pointer or pointer+constant. Fills hit_reg/hit_disp.
+Function.Optimize_ScanPtrAddr {
+    Input: addr: Address
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(addr, 0) ThenBlock: { ReturnValue(0) }
+        reg = Optimize_ScanPtrReg(name)
+        IfCondition EqualTo(reg, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(AST_GetType(addr), AST.IDENTIFIER) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(AST_GetData1(addr), name), 1) ThenBlock: {
+                ScanPtr.hit_reg = reg
+                ScanPtr.hit_disp = 0
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition NotEqual(AST_GetType(addr), AST.CALL) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(StringCompare(AST_GetData1(addr), "Add"), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetChildCount(addr), 2) ThenBlock: { ReturnValue(0) }
+        c0 = AST_GetChild(addr, 0)
+        c1 = AST_GetChild(addr, 1)
+        disp_node = 0
+        base_node = 0
+        IfCondition NotEqual(c1, 0) ThenBlock: {
+            IfCondition EqualTo(AST_GetType(c1), AST.NUMBER) ThenBlock: {
+                disp_node = c1
+                base_node = c0
+            }
+        }
+        IfCondition EqualTo(disp_node, 0) ThenBlock: {
+            IfCondition NotEqual(c0, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(c0), AST.NUMBER) ThenBlock: {
+                    disp_node = c0
+                    base_node = c1
+                }
+            }
+        }
+        IfCondition EqualTo(disp_node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(base_node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(base_node), AST.IDENTIFIER) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_NameEq(AST_GetData1(base_node), name), 0) ThenBlock: { ReturnValue(0) }
+        disp = StringToNumber(AST_GetData1(disp_node))
+        IfCondition EqualTo(Optimize_Fit32(disp), 0) ThenBlock: { ReturnValue(0) }
+        ScanPtr.hit_reg = reg
+        ScanPtr.hit_disp = disp
+        ReturnValue(1)
+    }
+}
+
+// 1 when this address expression is one of the hoisted pointers.
+Function.Optimize_ScanPtrHit {
+    Input: addr: Address
+    Output: Integer
+    Body: {
+        IfCondition GreaterThan(ScanPtr.n, 0) ThenBlock: {
+            IfCondition EqualTo(Optimize_ScanPtrAddr(addr, ScanPtr.name0), 1) ThenBlock: { ReturnValue(1) }
+        }
+        IfCondition GreaterThan(ScanPtr.n, 1) ThenBlock: {
+            IfCondition EqualTo(Optimize_ScanPtrAddr(addr, ScanPtr.name1), 1) ThenBlock: { ReturnValue(1) }
+        }
+        ReturnValue(0)
+    }
+}
+
+// A spilled name defined by a field load is read back from the hoisted
+// pointer. 32 records of name, reg, disp. Cleared when that name is
+// assigned, and when the pointer register is stepped or reused.
+Function.Optimize_ScanPtrRmBuf {
+    Output: Address
+    Body: {
+        IfCondition EqualTo(ScanPtr.rm, 0) ThenBlock: {
+            ScanPtr.rm = Allocate(768)
+        }
+        ReturnValue(ScanPtr.rm)
+    }
+}
+
+Function.Optimize_ScanPtrRmFind {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ScanPtr.rm, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, ScanPtr.rm_n) {
+            rec = Add(ScanPtr.rm, Multiply(i, 24))
+            IfCondition EqualTo(Optimize_NameEq(Dereference(rec), name), 1) ThenBlock: {
+                reg = Dereference(Add(rec, 8))
+                IfCondition NotEqual(reg, 0) ThenBlock: {
+                    ScanPtr.hit_reg = reg
+                    ScanPtr.hit_disp = Dereference(Add(rec, 16))
+                    ReturnValue(1)
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanPtrRmClear {
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ScanPtr.rm, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, ScanPtr.rm_n) {
+            rec = Add(ScanPtr.rm, Multiply(i, 24))
+            IfCondition EqualTo(Optimize_NameEq(Dereference(rec), name), 1) ThenBlock: {
+                StoreValue(Add(rec, 8), 0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanPtrRmKill {
+    Input: reg: Integer
+    Body: {
+        IfCondition EqualTo(ScanPtr.rm, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, ScanPtr.rm_n) {
+            rec = Add(ScanPtr.rm, Multiply(i, 24))
+            IfCondition EqualTo(Dereference(Add(rec, 8)), reg) ThenBlock: {
+                StoreValue(Add(rec, 8), 0)
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanPtrRmSet {
+    Input: name: Address
+    Input: reg: Integer
+    Input: disp: Integer
+    Body: {
+        buf = Optimize_ScanPtrRmBuf()
+        IfCondition EqualTo(buf, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, ScanPtr.rm_n) {
+            rec = Add(buf, Multiply(i, 24))
+            IfCondition EqualTo(Optimize_NameEq(Dereference(rec), name), 1) ThenBlock: {
+                StoreValue(Add(rec, 8), reg)
+                StoreValue(Add(rec, 16), disp)
+                ReturnValue(1)
+            }
+            i = Add(i, 1)
+        }
+        IfCondition GreaterEqual(ScanPtr.rm_n, 32) ThenBlock: { ReturnValue(0) }
+        rec = Add(buf, Multiply(ScanPtr.rm_n, 24))
+        StoreValue(rec, name)
+        StoreValue(Add(rec, 8), reg)
+        StoreValue(Add(rec, 16), disp)
+        ScanPtr.rm_n = Add(ScanPtr.rm_n, 1)
+        ReturnValue(1)
+    }
+}
+
+// Remember name = Dereference(hoisted pointer [+ disp]). The stack
+// store still happens so a later kill can fall back to the frame.
+Function.Optimize_ScanPtrRmNote {
+    Input: name: Address
+    Input: value: Address
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(value, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(value), AST.CALL) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(StringCompare(AST_GetData1(value), "Dereference"), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetChildCount(value), 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanPtrHit(AST_GetChild(value, 0)), 0) ThenBlock: { ReturnValue(0) }
+        Optimize_ScanPtrRmSet(name, ScanPtr.hit_reg, ScanPtr.hit_disp)
+        ReturnValue(0)
+    }
+}
+
+// 1 when addr is name or Add(name, constant). Does not require the hoist.
+Function.Optimize_ScanPtrForm {
+    Input: addr: Address
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(addr, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(AST_GetType(addr), AST.IDENTIFIER) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(AST_GetData1(addr), name), 1) ThenBlock: { ReturnValue(1) }
+            ReturnValue(0)
+        }
+        IfCondition NotEqual(AST_GetType(addr), AST.CALL) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(StringCompare(AST_GetData1(addr), "Add"), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetChildCount(addr), 2) ThenBlock: { ReturnValue(0) }
+        c0 = AST_GetChild(addr, 0)
+        c1 = AST_GetChild(addr, 1)
+        IfCondition NotEqual(c1, 0) ThenBlock: {
+            IfCondition EqualTo(AST_GetType(c1), AST.NUMBER) ThenBlock: {
+                IfCondition NotEqual(c0, 0) ThenBlock: {
+                    IfCondition EqualTo(AST_GetType(c0), AST.IDENTIFIER) ThenBlock: {
+                        IfCondition EqualTo(Optimize_NameEq(AST_GetData1(c0), name), 1) ThenBlock: { ReturnValue(1) }
+                    }
+                }
+            }
+        }
+        IfCondition NotEqual(c0, 0) ThenBlock: {
+            IfCondition EqualTo(AST_GetType(c0), AST.NUMBER) ThenBlock: {
+                IfCondition NotEqual(c1, 0) ThenBlock: {
+                    IfCondition EqualTo(AST_GetType(c1), AST.IDENTIFIER) ThenBlock: {
+                        IfCondition EqualTo(Optimize_NameEq(AST_GetData1(c1), name), 1) ThenBlock: { ReturnValue(1) }
+                    }
+                }
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// 1 when a read of name is not a field address off the hoisted pointer.
+Function.Optimize_ScanPtrBad {
+    Input: node: Address
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        t = AST_GetType(node)
+        IfCondition EqualTo(t, AST.IDENTIFIER) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(AST_GetData1(node), name), 1) ThenBlock: { ReturnValue(1) }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(t, AST.ASSIGNMENT) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(AST_GetData1(node), name), 1) ThenBlock: {
+                ReturnValue(Optimize_ScanPtrBad(AST_GetChild(node, 0), name))
+            }
+        }
+        IfCondition EqualTo(t, AST.CALL) ThenBlock: {
+            nm = AST_GetData1(node)
+            IfCondition EqualTo(Optimize_ScanPtrPure(nm), 0) ThenBlock: { ScanPtr.calls = 1 }
+            IfCondition EqualTo(StringCompare(nm, "Dereference"), 0) ThenBlock: {
+                IfCondition GreaterThan(AST_GetChildCount(node), 0) ThenBlock: {
+                    IfCondition EqualTo(Optimize_ScanPtrForm(AST_GetChild(node, 0), name), 1) ThenBlock: {
+                        ReturnValue(0)
+                    }
+                }
+            }
+            IfCondition EqualTo(StringCompare(nm, "StoreValue"), 0) ThenBlock: {
+                IfCondition GreaterThan(AST_GetChildCount(node), 1) ThenBlock: {
+                    IfCondition EqualTo(Optimize_ScanPtrForm(AST_GetChild(node, 0), name), 1) ThenBlock: {
+                        ReturnValue(Optimize_ScanPtrBad(AST_GetChild(node, 1), name))
+                    }
+                }
+            }
+        }
+        n = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(Optimize_ScanPtrBad(AST_GetChild(node, i), name), 1) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Scratch: mess=1 when iv is assigned by something other than iv+step.
+// found=1 and step=the constant when there is one such add.
+Function.Optimize_ScanPtrSeeStep {
+    Input: node: Address
+    Input: iv: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(AST_GetType(node), AST.BLOCK) ThenBlock: {
+            n = AST_GetChildCount(node)
+            i = 0
+            WhileLoop LessThan(i, n) {
+                Optimize_ScanPtrSeeStep(AST_GetChild(node, i), iv)
+                i = Add(i, 1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(AST_GetType(node), AST.WHILE) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(AST_GetType(node), AST.FOR_EVERY) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_PlainAssign(node), 0) ThenBlock: {
+            n = AST_GetChildCount(node)
+            i = 0
+            WhileLoop LessThan(i, n) {
+                Optimize_ScanPtrSeeStep(AST_GetChild(node, i), iv)
+                i = Add(i, 1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(Optimize_NameEq(AST_GetData1(node), iv), 0) ThenBlock: { ReturnValue(0) }
+        val = AST_GetChild(node, 0)
+        got = 0
+        IfCondition NotEqual(val, 0) ThenBlock: {
+            IfCondition EqualTo(AST_GetType(val), AST.CALL) ThenBlock: {
+                IfCondition EqualTo(StringCompare(AST_GetData1(val), "Add"), 0) ThenBlock: {
+                    IfCondition EqualTo(AST_GetChildCount(val), 2) ThenBlock: {
+                        a0 = AST_GetChild(val, 0)
+                        a1 = AST_GetChild(val, 1)
+                        num = 0
+                        ident = 0
+                        IfCondition NotEqual(a1, 0) ThenBlock: {
+                            IfCondition EqualTo(AST_GetType(a1), AST.NUMBER) ThenBlock: {
+                                num = a1
+                                ident = a0
+                            }
+                        }
+                        IfCondition EqualTo(num, 0) ThenBlock: {
+                            IfCondition NotEqual(a0, 0) ThenBlock: {
+                                IfCondition EqualTo(AST_GetType(a0), AST.NUMBER) ThenBlock: {
+                                    num = a0
+                                    ident = a1
+                                }
+                            }
+                        }
+                        IfCondition NotEqual(num, 0) ThenBlock: {
+                            IfCondition NotEqual(ident, 0) ThenBlock: {
+                                IfCondition EqualTo(AST_GetType(ident), AST.IDENTIFIER) ThenBlock: {
+                                    IfCondition EqualTo(Optimize_NameEq(AST_GetData1(ident), iv), 1) ThenBlock: {
+                                        st = StringToNumber(AST_GetData1(num))
+                                        IfCondition EqualTo(ScanPtr.found, 0) ThenBlock: {
+                                            ScanPtr.found = 1
+                                            ScanPtr.step = st
+                                        }
+                                        IfCondition NotEqual(st, ScanPtr.step) ThenBlock: { ScanPtr.mess = 1 }
+                                        got = 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        IfCondition EqualTo(got, 0) ThenBlock: { ScanPtr.mess = 1 }
+        ReturnValue(0)
+    }
+}
+
+// value is Add(base, Multiply(index, stride)) in either order.
+// Fills base0/iv0/stride0 as scratch when slot is 0. Returns 1 on a match.
+Function.Optimize_ScanPtrShape {
+    Input: value: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(value, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(value), AST.CALL) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(StringCompare(AST_GetData1(value), "Add"), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetChildCount(value), 2) ThenBlock: { ReturnValue(0) }
+        a0 = AST_GetChild(value, 0)
+        a1 = AST_GetChild(value, 1)
+        mul = 0
+        base = 0
+        IfCondition NotEqual(a0, 0) ThenBlock: {
+            IfCondition EqualTo(AST_GetType(a0), AST.CALL) ThenBlock: {
+                IfCondition EqualTo(StringCompare(AST_GetData1(a0), "Multiply"), 0) ThenBlock: {
+                    mul = a0
+                    base = a1
+                }
+            }
+        }
+        IfCondition EqualTo(mul, 0) ThenBlock: {
+            IfCondition NotEqual(a1, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(a1), AST.CALL) ThenBlock: {
+                    IfCondition EqualTo(StringCompare(AST_GetData1(a1), "Multiply"), 0) ThenBlock: {
+                        mul = a1
+                        base = a0
+                    }
+                }
+            }
+        }
+        IfCondition EqualTo(mul, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(base, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(base), AST.IDENTIFIER) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetChildCount(mul), 2) ThenBlock: { ReturnValue(0) }
+        m0 = AST_GetChild(mul, 0)
+        m1 = AST_GetChild(mul, 1)
+        num = 0
+        ident = 0
+        IfCondition NotEqual(m1, 0) ThenBlock: {
+            IfCondition EqualTo(AST_GetType(m1), AST.NUMBER) ThenBlock: {
+                num = m1
+                ident = m0
+            }
+        }
+        IfCondition EqualTo(num, 0) ThenBlock: {
+            IfCondition NotEqual(m0, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(m0), AST.NUMBER) ThenBlock: {
+                    num = m0
+                    ident = m1
+                }
+            }
+        }
+        IfCondition EqualTo(num, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ident, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(ident), AST.IDENTIFIER) ThenBlock: { ReturnValue(0) }
+        stride = StringToNumber(AST_GetData1(num))
+        IfCondition LessThan(stride, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_Fit32(stride), 0) ThenBlock: { ReturnValue(0) }
+        ScanPtr.sbase = base
+        ScanPtr.siv = ident
+        ScanPtr.sstride = stride
+        ReturnValue(1)
+    }
+}
+
+Function.Optimize_ScanPtrTake {
+    Input: name: Address
+    Input: reg: Integer
+    Body: {
+        idx = ScanPtr.siv
+        base = ScanPtr.sbase
+        stride = ScanPtr.sstride
+        step = 0
+        bump = 0
+        IfCondition EqualTo(ScanPtr.found, 1) ThenBlock: {
+            step = ScanPtr.step
+            bump = Multiply(stride, step)
+        }
+        IfCondition EqualTo(ScanPtr.n, 0) ThenBlock: {
+            ScanPtr.name0 = name
+            ScanPtr.iv0 = idx
+            ScanPtr.base0 = base
+            ScanPtr.stride0 = stride
+            ScanPtr.bump0 = bump
+            ScanPtr.step0 = step
+            ScanPtr.reg0 = reg
+            ScanPtr.n = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(ScanPtr.n, 1) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(name, ScanPtr.name0), 1) ThenBlock: {
+                ScanPtr.bump0 = -1
+                ReturnValue(0)
+            }
+            ScanPtr.name1 = name
+            ScanPtr.iv1 = idx
+            ScanPtr.base1 = base
+            ScanPtr.stride1 = stride
+            ScanPtr.bump1 = bump
+            ScanPtr.step1 = step
+            ScanPtr.reg1 = reg
+            ScanPtr.n = 2
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// base + index*stride into r14 or r11. slot 1 pushes r14 around the math.
+Function.Optimize_ScanPtrEmit {
+    Input: slot: Integer
+    Body: {
+        idx = ScanPtr.iv0
+        base = ScanPtr.base0
+        stride = ScanPtr.stride0
+        reg = ScanPtr.reg0
+        IfCondition EqualTo(slot, 1) ThenBlock: {
+            idx = ScanPtr.iv1
+            base = ScanPtr.base1
+            stride = ScanPtr.stride1
+            reg = ScanPtr.reg1
+            Emit_PushR14()
+        }
+        got = Compile_Expression(idx)
+        IfCondition EqualTo(got, 0) ThenBlock: {
+            IfCondition EqualTo(slot, 1) ThenBlock: { Emit_PopR14() }
+            Compile.error = 1
+            ReturnValue(0)
+        }
+        pow = 0
+        IfCondition GreaterThan(stride, 1) ThenBlock: {
+            mask = BitwiseAnd(stride, Subtract(stride, 1))
+            IfCondition EqualTo(mask, 0) ThenBlock: { pow = 1 }
+        }
+        IfCondition EqualTo(stride, 1) ThenBlock: { pow = 1 }
+        IfCondition EqualTo(pow, 1) ThenBlock: {
+            sh = 0
+            tmp = stride
+            WhileLoop GreaterThan(tmp, 1) {
+                tmp = Divide(tmp, 2)
+                sh = Add(sh, 1)
+            }
+            IfCondition GreaterThan(sh, 0) ThenBlock: { Emit_ShlRaxImm8(sh) }
+        } ElseBlock: {
+            Emit_MovRbxImm64(stride)
+            Emit_ImulRaxRbx()
+        }
+        Emit_PushRax()
+        got = Compile_Expression(base)
+        IfCondition EqualTo(got, 0) ThenBlock: {
+            Emit_PopRax()
+            IfCondition EqualTo(slot, 1) ThenBlock: { Emit_PopR14() }
+            Compile.error = 1
+            ReturnValue(0)
+        }
+        Emit_PopRbx()
+        Emit_AddRaxRbx()
+        Emit_MovRegReg(reg, Reg.RAX)
+        IfCondition EqualTo(slot, 1) ThenBlock: { Emit_PopR14() }
+        ReturnValue(1)
+    }
+}
+
+Function.Optimize_ScanPtrConsider {
+    Input: node: Address
+    Input: body: Address
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(AST_GetType(node), AST.BLOCK) ThenBlock: {
+            n = AST_GetChildCount(node)
+            i = 0
+            WhileLoop LessThan(i, n) {
+                Optimize_ScanPtrConsider(AST_GetChild(node, i), body)
+                i = Add(i, 1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(AST_GetType(node), AST.WHILE) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(AST_GetType(node), AST.FOR_EVERY) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_PlainAssign(node), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(ScanPtr.n, 2) ThenBlock: { ReturnValue(0) }
+        name = AST_GetData1(node)
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanPtrShape(AST_GetChild(node, 0)), 0) ThenBlock: { ReturnValue(0) }
+        idx_node = ScanPtr.siv
+        base_node = ScanPtr.sbase
+        stride = ScanPtr.sstride
+        idx_name = AST_GetData1(idx_node)
+        IfCondition EqualTo(Optimize_NameEq(name, idx_name), 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_NameEq(name, AST_GetData1(base_node)), 1) ThenBlock: { ReturnValue(0) }
+        ScanPtr.found = 0
+        ScanPtr.mess = 0
+        ScanPtr.step = 0
+        Optimize_ScanPtrSeeStep(body, idx_name)
+        IfCondition EqualTo(ScanPtr.mess, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanPtrBad(body, name), 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ScanPtr.found, 1) ThenBlock: {
+            IfCondition EqualTo(Optimize_Fit32(Multiply(stride, ScanPtr.step)), 0) ThenBlock: { ReturnValue(0) }
+        }
+        reg = 14
+        IfCondition EqualTo(ScanPtr.n, 1) ThenBlock: {
+            IfCondition EqualTo(ScanPtr.calls, 1) ThenBlock: { ReturnValue(0) }
+            reg = 11
+        }
+        Optimize_ScanPtrTake(name, reg)
+        ReturnValue(0)
+    }
+}
+
+// Before the back-edge label: compute each pointer once. Later trips
+// add the stride instead of multiplying the index again.
+Function.Optimize_ScanPtrArm {
+    Input: body: Address
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(body, 0) ThenBlock: { ReturnValue(0) }
+        ScanPtr.calls = 0
+        ScanPtr.n = 0
+        Optimize_ScanPtrConsider(body, body)
+        IfCondition GreaterThan(ScanPtr.n, 0) ThenBlock: {
+            IfCondition LessThan(ScanPtr.bump0, 0) ThenBlock: {
+                IfCondition GreaterThan(ScanPtr.n, 1) ThenBlock: {
+                    ScanPtr.name0 = ScanPtr.name1
+                    ScanPtr.reg0 = ScanPtr.reg1
+                    ScanPtr.bump0 = ScanPtr.bump1
+                    ScanPtr.iv0 = ScanPtr.iv1
+                    ScanPtr.step0 = ScanPtr.step1
+                    ScanPtr.base0 = ScanPtr.base1
+                    ScanPtr.stride0 = ScanPtr.stride1
+                    ScanPtr.n = 1
+                } ElseBlock: {
+                    ScanPtr.n = 0
+                }
+            }
+        }
+        IfCondition GreaterThan(ScanPtr.n, 1) ThenBlock: {
+            IfCondition LessThan(ScanPtr.bump1, 0) ThenBlock: { ScanPtr.n = 1 }
+        }
+        IfCondition GreaterThan(ScanPtr.n, 1) ThenBlock: {
+            IfCondition EqualTo(ScanPtr.calls, 1) ThenBlock: { ScanPtr.n = 1 }
+        }
+        IfCondition GreaterThan(ScanPtr.n, 0) ThenBlock: {
+            Optimize_ScanPtrEmit(0)
+        }
+        IfCondition GreaterThan(ScanPtr.n, 1) ThenBlock: {
+            Optimize_ScanPtrEmit(1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanPtrSpill {
+    Input: slot: Integer
+    Body: {
+        name = ScanPtr.name0
+        reg = ScanPtr.reg0
+        IfCondition EqualTo(slot, 1) ThenBlock: {
+            name = ScanPtr.name1
+            reg = ScanPtr.reg1
+        }
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        // Copy the pointer. MovRaxIp loads [reg+disp], which is a field.
+        Emit_MovRegReg(Reg.RAX, reg)
+        off = Scope_Resolve(name)
+        IfCondition EqualTo(Scope.resolve_type, 0) ThenBlock: {
+            Compile.stack_offset = Add(Compile.stack_offset, 8)
+            off = Subtract(0, Compile.stack_offset)
+            Compile_RegisterLocal(name, off)
+        }
+        IfCondition EqualTo(Scope.resolve_type, 3) ThenBlock: { ReturnValue(0) }
+        Emit_MovRbpOffsetRax(off)
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanPtrReload {
+    Input: slot: Integer
+    Body: {
+        name = ScanPtr.name0
+        reg = ScanPtr.reg0
+        IfCondition EqualTo(slot, 1) ThenBlock: {
+            name = ScanPtr.name1
+            reg = ScanPtr.reg1
+        }
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        off = Scope_Resolve(name)
+        IfCondition EqualTo(Scope.resolve_type, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Scope.resolve_type, 3) ThenBlock: { ReturnValue(0) }
+        Emit_MovRaxRbpOffset(off)
+        Emit_MovRegReg(reg, Reg.RAX)
+        ReturnValue(0)
+    }
+}
+
+// Remember the enclosing loop's pointers, then clear the record so this
+// loop can reuse r14 and r11. The register save happens after DropRegs
+// (ScanPtrSpillOuter): that pass can write the same frame slot from a
+// value home, and the pointer register is the value that has to win.
+Function.Optimize_ScanPtrPush {
+    Body: {
+        IfCondition EqualTo(Optimize_ScanActive(), 0) ThenBlock: { ReturnValue(0) }
+        snap = Allocate(96)
+        IfCondition EqualTo(snap, 0) ThenBlock: { ReturnValue(0) }
+        StoreValue(snap, ScanPtr.n)
+        StoreValue(Add(snap, 8), ScanPtr.name0)
+        StoreValue(Add(snap, 16), ScanPtr.name1)
+        StoreValue(Add(snap, 24), ScanPtr.reg0)
+        StoreValue(Add(snap, 32), ScanPtr.reg1)
+        StoreValue(Add(snap, 40), ScanPtr.bump0)
+        StoreValue(Add(snap, 48), ScanPtr.bump1)
+        StoreValue(Add(snap, 56), ScanPtr.iv0)
+        StoreValue(Add(snap, 64), ScanPtr.iv1)
+        StoreValue(Add(snap, 72), ScanPtr.step0)
+        StoreValue(Add(snap, 80), ScanPtr.step1)
+        StoreValue(Add(snap, 88), ScanPtr.snap)
+        ScanPtr.snap = snap
+        ScanPtr.n = 0
+        ReturnValue(0)
+    }
+}
+
+// Save the pointers Push just snapshotted. name0/reg0 are still the
+// outer record; n is already 0 so the inner arm can reuse it.
+Function.Optimize_ScanPtrSpillOuter {
+    Body: {
+        snap = ScanPtr.snap
+        IfCondition EqualTo(snap, 0) ThenBlock: { ReturnValue(0) }
+        saved = Dereference(snap)
+        IfCondition GreaterThan(saved, 0) ThenBlock: {
+            Optimize_ScanPtrSpill(0)
+            Optimize_ScanPtrRmKill(ScanPtr.reg0)
+        }
+        IfCondition GreaterThan(saved, 1) ThenBlock: {
+            Optimize_ScanPtrSpill(1)
+            Optimize_ScanPtrRmKill(ScanPtr.reg1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanPtrPop {
+    Body: {
+        snap = ScanPtr.snap
+        IfCondition EqualTo(snap, 0) ThenBlock: { ReturnValue(0) }
+        ScanPtr.n = Dereference(snap)
+        ScanPtr.name0 = Dereference(Add(snap, 8))
+        ScanPtr.name1 = Dereference(Add(snap, 16))
+        ScanPtr.reg0 = Dereference(Add(snap, 24))
+        ScanPtr.reg1 = Dereference(Add(snap, 32))
+        ScanPtr.bump0 = Dereference(Add(snap, 40))
+        ScanPtr.bump1 = Dereference(Add(snap, 48))
+        ScanPtr.iv0 = Dereference(Add(snap, 56))
+        ScanPtr.iv1 = Dereference(Add(snap, 64))
+        ScanPtr.step0 = Dereference(Add(snap, 72))
+        ScanPtr.step1 = Dereference(Add(snap, 80))
+        ScanPtr.snap = Dereference(Add(snap, 88))
+        Deallocate(snap, 96)
+        IfCondition GreaterThan(ScanPtr.n, 0) ThenBlock: { Optimize_ScanPtrReload(0) }
+        IfCondition GreaterThan(ScanPtr.n, 1) ThenBlock: { Optimize_ScanPtrReload(1) }
+        ReturnValue(0)
+    }
+}
+
+// The pointer is already in its register. Skip the multiply. A later
+// load of the name as a value is rejected before the pointer is armed.
+Function.Optimize_ScanPtrDef {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_ScanPtrReg(name), 0) ThenBlock: { ReturnValue(0) }
+        Optimize_ScanMatDrop(name)
+        ReturnValue(1)
+    }
+}
+
+// iv = iv + step. The hoisted pointer moves by stride*step.
+Function.Optimize_ScanPtrBump {
+    Input: name: Address
+    Input: value: Address
+    Body: {
+        IfCondition EqualTo(ScanPtr.n, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(value, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(value), AST.CALL) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(StringCompare(AST_GetData1(value), "Add"), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetChildCount(value), 2) ThenBlock: { ReturnValue(0) }
+        a0 = AST_GetChild(value, 0)
+        a1 = AST_GetChild(value, 1)
+        num = 0
+        ident = 0
+        IfCondition NotEqual(a1, 0) ThenBlock: {
+            IfCondition EqualTo(AST_GetType(a1), AST.NUMBER) ThenBlock: {
+                num = a1
+                ident = a0
+            }
+        }
+        IfCondition EqualTo(num, 0) ThenBlock: {
+            IfCondition NotEqual(a0, 0) ThenBlock: {
+                IfCondition EqualTo(AST_GetType(a0), AST.NUMBER) ThenBlock: {
+                    num = a0
+                    ident = a1
+                }
+            }
+        }
+        IfCondition EqualTo(num, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ident, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(AST_GetType(ident), AST.IDENTIFIER) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_NameEq(AST_GetData1(ident), name), 0) ThenBlock: { ReturnValue(0) }
+        st = StringToNumber(AST_GetData1(num))
+        IfCondition GreaterThan(ScanPtr.n, 0) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(name, AST_GetData1(ScanPtr.iv0)), 1) ThenBlock: {
+                IfCondition EqualTo(st, ScanPtr.step0) ThenBlock: {
+                    IfCondition NotEqual(ScanPtr.bump0, 0) ThenBlock: {
+                        X86_AddIpImm(ScanPtr.reg0, ScanPtr.bump0)
+                        Optimize_ScanPtrRmKill(ScanPtr.reg0)
+                    }
+                }
+            }
+        }
+        IfCondition GreaterThan(ScanPtr.n, 1) ThenBlock: {
+            IfCondition EqualTo(Optimize_NameEq(name, AST_GetData1(ScanPtr.iv1)), 1) ThenBlock: {
+                IfCondition EqualTo(st, ScanPtr.step1) ThenBlock: {
+                    IfCondition NotEqual(ScanPtr.bump1, 0) ThenBlock: {
+                        X86_AddIpImm(ScanPtr.reg1, ScanPtr.bump1)
+                        Optimize_ScanPtrRmKill(ScanPtr.reg1)
+                    }
+                }
+            }
+        }
         ReturnValue(0)
     }
 }
