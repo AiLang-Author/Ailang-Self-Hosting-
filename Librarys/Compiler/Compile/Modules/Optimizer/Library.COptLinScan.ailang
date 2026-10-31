@@ -47,6 +47,13 @@ FixedPool.ScanState {
     "base": Initialize=0, CanChange=True
     "body": Initialize=0, CanChange=True
     "pick": Initialize=-1, CanChange=True
+    // 128 words. Bit r is set when an op in that name's live range
+    // writes r and does not restore it. The scan will not home it there.
+    // A spill emitted at the write would store whatever the register
+    // holds on the next trip through a loop, which is the scratch, not
+    // the home. PutInt's digit and Hash.FindSlot's probe both faulted
+    // that way.
+    "forbid": Initialize=0, CanChange=True
 }
 
 // Two hoisted pointers for the loop being compiled. r14 then r11.
@@ -317,15 +324,142 @@ Function.Optimize_ScanOfferReg {
     }
 }
 
+// Registers this lowering writes and does not restore. A home left
+// in one of them is spilled at the write. Inside a loop that spill
+// runs every trip, after the register has already been overwritten,
+// so the frame receives the scratch. Caller-saved bits match the
+// verifier: rcx rdx rsi rdi r8 r9 r10 r11. rax is not a home.
+Function.Optimize_ScanOpClobber {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        // rcx rdx rsi rdi r9. movzx r9d and movzx edx are the page tail.
+        IfCondition EqualTo(StringCompare(name, "StringCompare"), 0) ThenBlock: { ReturnValue(710) }
+        IfCondition EqualTo(StringCompare(name, "StringEquals"), 0) ThenBlock: { ReturnValue(710) }
+        // rcx rdi r8. The aligned loop is movdqa xmm, [rdi].
+        IfCondition EqualTo(StringCompare(name, "StringLength"), 0) ThenBlock: { ReturnValue(386) }
+        // rcx rdi. inc rdi walks the bytes.
+        IfCondition EqualTo(StringCompare(name, "Crc32String"), 0) ThenBlock: { ReturnValue(130) }
+        // pop rcx; mov rdi, rax. Neither is restored.
+        IfCondition EqualTo(StringCompare(name, "SetByte"), 0) ThenBlock: { ReturnValue(130) }
+        // mov rbx, rax for the index. Not restored on the slow path.
+        IfCondition EqualTo(StringCompare(name, "GetByte"), 0) ThenBlock: { ReturnValue(8) }
+        // Magic division is imul, which writes rdx, then a copy in rcx.
+        // rbx is pushed and popped around that sequence.
+        IfCondition EqualTo(StringCompare(name, "Divide"), 0) ThenBlock: { ReturnValue(6) }
+        IfCondition EqualTo(StringCompare(name, "Modulo"), 0) ThenBlock: { ReturnValue(6) }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanForbidOf {
+    Input: id: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(ScanState.forbid, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        ReturnValue(Dereference(Add(ScanState.forbid, Multiply(Subtract(id, 1), 8))))
+    }
+}
+
+// pos < 0 means the call was not a program point. Every live name
+// then avoids the mask. A name whose interval starts at pos is the
+// value this statement defines, so the write is its own definition.
+Function.Optimize_ScanForbidAt {
+    Input: pos: Integer
+    Input: mask: Integer
+    Body: {
+        IfCondition EqualTo(mask, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ScanState.forbid, 0) ThenBlock: { ReturnValue(0) }
+        i = 1
+        last = Add(TagState.nnames, 1)
+        WhileLoop LessThan(i, last) {
+            mn = Optimize_LiveMinPos(i)
+            mx = Optimize_LiveMaxPos(i)
+            hit = 0
+            IfCondition GreaterEqual(mn, 0) ThenBlock: {
+                IfCondition GreaterEqual(mx, mn) ThenBlock: {
+                    IfCondition LessThan(pos, 0) ThenBlock: { hit = 1 }
+                    IfCondition GreaterEqual(pos, 0) ThenBlock: {
+                        IfCondition GreaterThan(pos, mn) ThenBlock: {
+                            IfCondition LessEqual(pos, mx) ThenBlock: { hit = 1 }
+                        }
+                    }
+                }
+            }
+            IfCondition EqualTo(hit, 1) ThenBlock: {
+                slot = Add(ScanState.forbid, Multiply(Subtract(i, 1), 8))
+                StoreValue(slot, BitwiseOr(Dereference(slot), mask))
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanForbidWalk {
+    Input: node: Address
+    Input: pos: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        // Unstamped nodes keep block_id -1 and a zero pos word. Taking
+        // that zero would hide the enclosing statement's real position,
+        // so a StringCompare nested in a condition never forbids anything.
+        bid = Optimize_TagBlockOf(node)
+        IfCondition NotEqual(bid, -1) ThenBlock: {
+            here = Optimize_TagPosOf(node)
+            IfCondition GreaterThan(here, 0) ThenBlock: { pos = here }
+        }
+        nt = AST_GetType(node)
+        IfCondition EqualTo(nt, AST.CALL) ThenBlock: {
+            mask = Optimize_ScanOpClobber(AST_GetData1(node))
+            rec = Optimize_TagPtr(node)
+            IfCondition NotEqual(rec, 0) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(Dereference(rec), TagBit.CALL), 0) ThenBlock: {
+                    mask = BitwiseOr(mask, 4038)
+                }
+            }
+            Optimize_ScanForbidAt(pos, mask)
+        }
+        n = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            Optimize_ScanForbidWalk(AST_GetChild(node, i), pos)
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Optimize_ScanForbidBuild {
+    Input: body: Address
+    Body: {
+        IfCondition EqualTo(ScanState.forbid, 0) ThenBlock: {
+            ScanState.forbid = Allocate(1024)
+        }
+        IfCondition EqualTo(ScanState.forbid, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        WhileLoop LessThan(i, 128) {
+            StoreValue(Add(ScanState.forbid, Multiply(i, 8)), 0)
+            i = Add(i, 1)
+        }
+        Optimize_ScanForbidWalk(body, -1)
+        ReturnValue(0)
+    }
+}
+
 // First preferred register that is actually free. dangerous=1 tries
 // rcx and r11 for a value that contains no real call. Kind 1 refuses
-// that fallback and spills instead. ScanState.pick is the register,
-// or -1. The return value is the new free-list length.
+// that fallback and spills instead. forbid is the register mask this
+// name must not occupy. ScanState.pick is the register, or -1. The
+// return value is the new free-list length.
 Function.Optimize_ScanTake {
     Input: free_regs: Address
     Input: free_n: Integer
     Input: kind: Integer
     Input: dangerous: Integer
+    Input: forbid: Integer
     Output: Integer
     Body: {
         ScanState.pick = -1
@@ -380,10 +514,13 @@ Function.Optimize_ScanTake {
         WhileLoop LessThan(i, npref) {
             IfCondition EqualTo(ScanState.pick, -1) ThenBlock: {
                 want = Dereference(Add(pref, Multiply(i, 8)))
-                at = Optimize_ScanFindFree(free_regs, free_n, want)
-                IfCondition GreaterEqual(at, 0) ThenBlock: {
-                    ScanState.pick = want
-                    free_n = Optimize_ScanDropFree(free_regs, free_n, at)
+                blocked = BitwiseAnd(forbid, LeftShift(1, want))
+                IfCondition EqualTo(blocked, 0) ThenBlock: {
+                    at = Optimize_ScanFindFree(free_regs, free_n, want)
+                    IfCondition GreaterEqual(at, 0) ThenBlock: {
+                        ScanState.pick = want
+                        free_n = Optimize_ScanDropFree(free_regs, free_n, at)
+                    }
                 }
             }
             i = Add(i, 1)
@@ -407,14 +544,18 @@ Function.Optimize_ScanEvict {
         cur_ptr = Optimize_ScanPtr(cur_id)
         best_a = -1
         best_id = 0
+        cur_forbid = Optimize_ScanForbidOf(cur_id)
         a = 0
         WhileLoop LessThan(a, active_n) {
             aid = Dereference(Add(active_id, Multiply(a, 8)))
             IfCondition EqualTo(Optimize_ScanIsBase(aid), 0) ThenBlock: {
                 allow = 1
+                vreg = Dereference(Add(Optimize_ScanPtr(aid), 16))
                 IfCondition EqualTo(Optimize_LiveCrossesCall(cur_id), 1) ThenBlock: {
-                    vreg = Dereference(Add(Optimize_ScanPtr(aid), 16))
                     IfCondition EqualTo(Optimize_ScanCalleeReg(vreg), 0) ThenBlock: { allow = 0 }
+                }
+                IfCondition GreaterEqual(vreg, 0) ThenBlock: {
+                    IfCondition NotEqual(BitwiseAnd(cur_forbid, LeftShift(1, vreg)), 0) ThenBlock: { allow = 0 }
                 }
                 IfCondition EqualTo(allow, 1) ThenBlock: {
                 colder = 0
@@ -449,6 +590,7 @@ Function.Optimize_ScanRun {
     Body: {
         Optimize_ScanEnsure()
         IfCondition EqualTo(ScanState.buf, 0) ThenBlock: { ReturnValue(0) }
+        Optimize_ScanForbidBuild(ScanState.body)
 
         n = 0
         order = Allocate(Multiply(128, 8))   // name ids, sorted by start_pos
@@ -647,7 +789,7 @@ Function.Optimize_ScanRun {
                     StoreValue(Add(active_end, Multiply(active_n, 8)), cur_end)
                     active_n = Add(active_n, 1)
                 } ElseBlock: {
-                    free_n = Optimize_ScanTake(free_regs, free_n, gkind, 0)
+                    free_n = Optimize_ScanTake(free_regs, free_n, gkind, 0, Optimize_ScanForbidOf(cur_id))
                     IfCondition NotEqual(ScanState.pick, -1) ThenBlock: {
                         StoreValue(Add(cur_ptr, 16), ScanState.pick)
                         StoreValue(Add(active_id, Multiply(active_n, 8)), cur_id)
@@ -660,7 +802,7 @@ Function.Optimize_ScanRun {
                 IfCondition EqualTo(is_x, 0) ThenBlock: {
                     got_ev = Optimize_ScanEvict(active_id, active_end, active_n, cur_id, cur_end, cur_start)
                     IfCondition EqualTo(got_ev, 0) ThenBlock: {
-                        free_n = Optimize_ScanTake(free_regs, free_n, gkind, 1)
+                        free_n = Optimize_ScanTake(free_regs, free_n, gkind, 1, Optimize_ScanForbidOf(cur_id))
                         IfCondition NotEqual(ScanState.pick, -1) ThenBlock: {
                             StoreValue(Add(cur_ptr, 16), ScanState.pick)
                             StoreValue(Add(active_id, Multiply(active_n, 8)), cur_id)
@@ -861,6 +1003,9 @@ Function.Optimize_ScanRun {
                 IfCondition EqualTo(Optimize_LiveCrossesCall(best), 1) ThenBlock: {
                     give = 1
                     IfCondition EqualTo(owned, 1) ThenBlock: { give = 0 }
+                }
+                IfCondition NotEqual(BitwiseAnd(Optimize_ScanForbidOf(best), LeftShift(1, Reg.RBX)), 0) ThenBlock: {
+                    give = 0
                 }
                 IfCondition EqualTo(give, 1) ThenBlock: {
                     StoreValue(Add(Optimize_ScanPtr(best), 16), Reg.RBX)
@@ -1289,6 +1434,7 @@ Function.Optimize_ScanArm {
         ScanState.keep = 0
         ScanState.loop_mask = 0
         ScanPtr.rm_n = 0
+        Optimize_VerifyReset()
         ReturnValue(0)
     }
 }
@@ -1322,6 +1468,9 @@ Function.Optimize_ScanMatSet {
             WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
                 IfCondition NotEqual(i, id) ThenBlock: {
                     IfCondition EqualTo(Optimize_ScanReg(i), reg) ThenBlock: {
+                        IfCondition EqualTo(Optimize_ScanMatGet(i), 1) ThenBlock: {
+                            Optimize_VerifyEnd(i)
+                        }
                         SetByte(ScanState.mat, Subtract(i, 1), 0)
                     }
                 }
@@ -1464,6 +1613,9 @@ Function.Optimize_ScanDropRegs {
             IfCondition EqualTo(reg, Reg.R14) ThenBlock: { drop = 1 }
             IfCondition EqualTo(drop, 1) ThenBlock: {
                 Optimize_ScanSpillId(i)
+                IfCondition EqualTo(Optimize_ScanMatGet(i), 1) ThenBlock: {
+                    Optimize_VerifyEnd(i)
+                }
                 SetByte(ScanState.mat, Subtract(i, 1), 0)
             }
             i = Add(i, 1)
@@ -2746,6 +2898,9 @@ Function.Optimize_ScanDropXmm {
         i = 1
         WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
             IfCondition GreaterEqual(Optimize_ScanXmm(Optimize_ScanReg(i)), 0) ThenBlock: {
+                IfCondition EqualTo(Optimize_ScanMatGet(i), 1) ThenBlock: {
+                    Optimize_VerifyEnd(i)
+                }
                 SetByte(ScanState.mat, Subtract(i, 1), 0)
             }
             i = Add(i, 1)
@@ -3360,6 +3515,7 @@ Function.Optimize_ScanMatKeep {
                 }
                 IfCondition EqualTo(drop, 1) ThenBlock: {
                     Optimize_ScanSpillId(i)
+                    Optimize_VerifyEnd(i)
                     SetByte(ScanState.mat, Subtract(i, 1), 0)
                 }
             }
@@ -3380,6 +3536,9 @@ Function.Optimize_ScanMatClear {
         Optimize_ScanSpillDirty()
         i = 0
         WhileLoop LessThan(i, 128) {
+            IfCondition EqualTo(GetByte(ScanState.mat, i), 1) ThenBlock: {
+                Optimize_VerifyEnd(Add(i, 1))
+            }
             SetByte(ScanState.mat, i, 0)
             i = Add(i, 1)
         }
@@ -3395,6 +3554,9 @@ Function.Optimize_ScanMatForget {
         IfCondition EqualTo(ScanState.mat, 0) ThenBlock: { ReturnValue(0) }
         i = 0
         WhileLoop LessThan(i, 128) {
+            IfCondition EqualTo(GetByte(ScanState.mat, i), 1) ThenBlock: {
+                Optimize_VerifyEnd(Add(i, 1))
+            }
             SetByte(ScanState.mat, i, 0)
             i = Add(i, 1)
         }
@@ -3458,6 +3620,13 @@ Function.Optimize_ScanSeedLoad {
         // expression replaces the other operand. The statement-end store
         // still fills rbx once the scratch is dead.
         IfCondition EqualTo(reg, Reg.RBX) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterEqual(reg, 0) ThenBlock: {
+            IfCondition LessEqual(reg, 15) ThenBlock: {
+                IfCondition LessThan(Optimize_ScanXmm(reg), 0) ThenBlock: {
+                    Optimize_VerifyBegin(id, reg)
+                }
+            }
+        }
         Emit_MovRegReg(reg, Reg.RAX)
         Optimize_ScanMatSet(id)
         ReturnValue(0)
@@ -3490,6 +3659,9 @@ Function.Optimize_ScanInvalidate {
         IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
         IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
         Optimize_ScanSpillId(id)
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 1) ThenBlock: {
+            Optimize_VerifyEnd(id)
+        }
         SetByte(ScanState.mat, Subtract(id, 1), 0)
         ReturnValue(0)
     }
@@ -3552,6 +3724,9 @@ Function.Optimize_ScanMatDrop {
         id = Optimize_TagIntern(name)
         IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
         IfCondition Or(LessThan(id, 1), GreaterThan(id, 128)) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 1) ThenBlock: {
+            Optimize_VerifyEnd(id)
+        }
         SetByte(ScanState.mat, Subtract(id, 1), 0)
         ReturnValue(0)
     }
@@ -3574,6 +3749,13 @@ Function.Optimize_ScanNoteStore {
         IfCondition GreaterEqual(xmm, 0) ThenBlock: {
             X86_XmmRR(1, xmm)
         } ElseBlock: {
+            IfCondition GreaterEqual(reg, 0) ThenBlock: {
+                IfCondition LessEqual(reg, 15) ThenBlock: {
+                    IfCondition LessThan(Optimize_ScanXmm(reg), 0) ThenBlock: {
+                        Optimize_VerifyBegin(id, reg)
+                    }
+                }
+            }
             Emit_MovRegReg(reg, Reg.RAX)
         }
         ScanState.keep = 0
@@ -3613,6 +3795,9 @@ Function.Optimize_ScanForgetReg {
         i = 1
         WhileLoop LessThan(i, Add(TagState.nnames, 1)) {
             IfCondition EqualTo(Optimize_ScanReg(i), reg) ThenBlock: {
+                IfCondition EqualTo(Optimize_ScanMatGet(i), 1) ThenBlock: {
+                    Optimize_VerifyEnd(i)
+                }
                 SetByte(ScanState.mat, Subtract(i, 1), 0)
             }
             i = Add(i, 1)
@@ -3651,6 +3836,9 @@ Function.Optimize_ScanClobberReg {
                     IfCondition EqualTo(dead, 0) ThenBlock: {
                         Optimize_ScanSpillId(i)
                     }
+                    // The scratch bytes are emitted after this returns.
+                    // VerifyCover closes the window after those bytes, so the
+                    // write stays inside the live range. Ending here hides it.
                     SetByte(ScanState.mat, Subtract(i, 1), 0)
                     // rbx is the compare/GetByte shuttle. After a smash,
                     // ScanHold must not skip the frame store or a rotated
@@ -3860,7 +4048,13 @@ Function.Optimize_ScanMatRestore {
         IfCondition EqualTo(snap, 0) ThenBlock: { ReturnValue(0) }
         i = 0
         WhileLoop LessThan(i, 128) {
-            SetByte(ScanState.mat, i, GetByte(snap, i))
+            nb = GetByte(snap, i)
+            IfCondition EqualTo(GetByte(ScanState.mat, i), 1) ThenBlock: {
+                IfCondition EqualTo(nb, 0) ThenBlock: {
+                    Optimize_VerifyEnd(Add(i, 1))
+                }
+            }
+            SetByte(ScanState.mat, i, nb)
             i = Add(i, 1)
         }
         ReturnValue(0)
@@ -3875,7 +4069,14 @@ Function.Optimize_ScanMatMergeAnd {
         IfCondition EqualTo(snap, 0) ThenBlock: { ReturnValue(0) }
         i = 0
         WhileLoop LessThan(i, 128) {
-            SetByte(ScanState.mat, i, BitwiseAnd(GetByte(ScanState.mat, i), GetByte(snap, i)))
+            ob = GetByte(ScanState.mat, i)
+            nb = BitwiseAnd(ob, GetByte(snap, i))
+            IfCondition EqualTo(ob, 1) ThenBlock: {
+                IfCondition EqualTo(nb, 0) ThenBlock: {
+                    Optimize_VerifyEnd(Add(i, 1))
+                }
+            }
+            SetByte(ScanState.mat, i, nb)
             i = Add(i, 1)
         }
         ReturnValue(0)
@@ -6840,6 +7041,9 @@ Function.Optimize_ScanByteMatDrop {
     Body: {
         id = Optimize_TagIntern(name)
         IfCondition EqualTo(id, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_ScanMatGet(id), 1) ThenBlock: {
+            Optimize_VerifyEnd(id)
+        }
         SetByte(ScanState.mat, Subtract(id, 1), 0)
         ReturnValue(0)
     }
