@@ -8,6 +8,10 @@ Design: pure code-emitter, zero external dependencies.
   - Lookup dispatches on mnemonic characters (trie-style).
   - Each leaf has at most 400 entries (linear StringCompare chain).
   - Register lookup: two pure StringCompare chains (RegType, RegNum).
+  - X86Enc_Lookup, X86Enc_RegType and X86Enc_RegNum front their trie/chain
+    with a small open-addressing memo (builtins only). The compiler asks for
+    a few hundred distinct keys millions of times; a hit returns exactly
+    what the chain would, including desc_a/desc_b on a miss.
 
 Descriptor word A bit layout (64-bit):
   bits  0- 7  opcode byte 1
@@ -44,7 +48,8 @@ Descriptor word B (VEX/EVEX, stored in X86EncResult.desc_b):
 
 import sys
 import os
-sys.path.insert(0, '/tmp/opcodes')
+# Vendored Maratyszcza/Opcodes (parser + x86_64.xml) lives next to this script.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), 'opcodes'))
 from opcodes import x86_64
 from collections import defaultdict
 
@@ -352,6 +357,13 @@ def gen(out_path):
     W("// Zero external dependencies — DO NOT EDIT.")
     W("// Run tools/gen_x86enc.py to regenerate.")
     W(f"// {len(all_entries)} instruction forms, full ISA including SSE/AVX/AVX-512")
+    W("//")
+    W("// Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.")
+    W("// Licensed under the Sean Collins Software License (SCSL v1.0).")
+    W("")
+    W("")
+    W("LibraryImport.Compiler.CodeEmit.CEmitTypes")
+    W("LibraryImport.Compiler.CodeEmit.CEmitCore")
     W("")
 
     # -------------------------------------------------------------------------
@@ -406,7 +418,7 @@ def gen(out_path):
     # -------------------------------------------------------------------------
     # Register type lookup
     # -------------------------------------------------------------------------
-    W("Function.X86Enc_RegType {")
+    W("Function.X86Enc_RegTypeChain {")
     W("    Input: name: Address")
     W("    Output: Address")
     W("    Body: {")
@@ -420,7 +432,7 @@ def gen(out_path):
     # -------------------------------------------------------------------------
     # Register number lookup
     # -------------------------------------------------------------------------
-    W("Function.X86Enc_RegNum {")
+    W("Function.X86Enc_RegNumChain {")
     W("    Input: name: Address")
     W("    Output: Integer")
     W("    Body: {")
@@ -445,7 +457,7 @@ def gen(out_path):
         gen_tree(c, first_groups[c], 1, W)
 
     # Top-level dispatch on key[0]
-    W("Function.X86Enc_Lookup {")
+    W("Function.X86Enc_LookupTrie {")
     W("    Input: key: Address")
     W("    Output: Integer")
     W("    Body: {")
@@ -460,6 +472,158 @@ def gen(out_path):
     W("    }")
     W("}")
     W("")
+
+    # -------------------------------------------------------------------------
+    # Memo tables. Slot = [key copy, v1, v2, v3], 32 bytes, linear probing.
+    # A full table stops inserting and every miss goes to the chain.
+    # -------------------------------------------------------------------------
+    MEMO = """FixedPool.X86EncMemo {
+    "tab": Initialize=0, CanChange=True
+    "n": Initialize=0, CanChange=True
+    "rt": Initialize=0, CanChange=True
+    "rt_n": Initialize=0, CanChange=True
+    "rn": Initialize=0, CanChange=True
+    "rn_n": Initialize=0, CanChange=True
+    "hit": Initialize=0, CanChange=True
+}
+
+Function.X86Enc_MemoNew {
+    Input: cap: Integer
+    Output: Address
+    Body: {
+        bytes = Multiply(cap, 32)
+        tab = Allocate(bytes)
+        MemorySet(tab, 0, bytes)
+        ReturnValue(tab)
+    }
+}
+
+// Slot holding key, or the empty slot where it belongs (hit = 0), or 0
+// when the probe wraps without finding either.
+Function.X86Enc_MemoFind {
+    Input: tab: Address
+    Input: cap: Integer
+    Input: key: Address
+    Output: Address
+    Body: {
+        X86EncMemo.hit = 0
+        h = 5381
+        i = 0
+        c = GetByte(key, 0)
+        WhileLoop NotEqual(c, 0) {
+            h = BitwiseAnd(Add(Multiply(h, 33), c), 1073741823)
+            i = Add(i, 1)
+            c = GetByte(key, i)
+        }
+        idx = Modulo(h, cap)
+        probes = 0
+        WhileLoop LessThan(probes, cap) {
+            slot = Add(tab, Multiply(idx, 32))
+            stored = Dereference(slot)
+            IfCondition EqualTo(stored, 0) ThenBlock: { ReturnValue(slot) }
+            IfCondition EqualTo(StringCompare(stored, key), 0) ThenBlock: {
+                X86EncMemo.hit = 1
+                ReturnValue(slot)
+            }
+            idx = Add(idx, 1)
+            IfCondition EqualTo(idx, cap) ThenBlock: { idx = 0 }
+            probes = Add(probes, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.X86Enc_MemoKey {
+    Input: key: Address
+    Output: Address
+    Body: {
+        len = StringLength(key)
+        copy = Allocate(Add(len, 1))
+        i = 0
+        WhileLoop LessThan(i, len) {
+            SetByte(copy, i, GetByte(key, i))
+            i = Add(i, 1)
+        }
+        SetByte(copy, len, 0)
+        ReturnValue(copy)
+    }
+}
+
+Function.X86Enc_Lookup {
+    Input: key: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(X86EncMemo.tab, 0) ThenBlock: {
+            X86EncMemo.tab = X86Enc_MemoNew(4096)
+        }
+        slot = X86Enc_MemoFind(X86EncMemo.tab, 4096, key)
+        IfCondition EqualTo(X86EncMemo.hit, 1) ThenBlock: {
+            X86EncResult.desc_a = Dereference(Add(slot, 8))
+            X86EncResult.desc_b = Dereference(Add(slot, 16))
+            ReturnValue(Dereference(Add(slot, 24)))
+        }
+        found = X86Enc_LookupTrie(key)
+        IfCondition NotEqual(slot, 0) ThenBlock: {
+            IfCondition LessThan(X86EncMemo.n, 3072) ThenBlock: {
+                StoreValue(Add(slot, 8), X86EncResult.desc_a)
+                StoreValue(Add(slot, 16), X86EncResult.desc_b)
+                StoreValue(Add(slot, 24), found)
+                StoreValue(slot, X86Enc_MemoKey(key))
+                X86EncMemo.n = Add(X86EncMemo.n, 1)
+            }
+        }
+        ReturnValue(found)
+    }
+}
+
+Function.X86Enc_RegType {
+    Input: name: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(X86EncMemo.rt, 0) ThenBlock: {
+            X86EncMemo.rt = X86Enc_MemoNew(512)
+        }
+        slot = X86Enc_MemoFind(X86EncMemo.rt, 512, name)
+        IfCondition EqualTo(X86EncMemo.hit, 1) ThenBlock: {
+            ReturnValue(Dereference(Add(slot, 8)))
+        }
+        r = X86Enc_RegTypeChain(name)
+        IfCondition NotEqual(slot, 0) ThenBlock: {
+            IfCondition LessThan(X86EncMemo.rt_n, 384) ThenBlock: {
+                StoreValue(Add(slot, 8), r)
+                StoreValue(slot, X86Enc_MemoKey(name))
+                X86EncMemo.rt_n = Add(X86EncMemo.rt_n, 1)
+            }
+        }
+        ReturnValue(r)
+    }
+}
+
+Function.X86Enc_RegNum {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(X86EncMemo.rn, 0) ThenBlock: {
+            X86EncMemo.rn = X86Enc_MemoNew(512)
+        }
+        slot = X86Enc_MemoFind(X86EncMemo.rn, 512, name)
+        IfCondition EqualTo(X86EncMemo.hit, 1) ThenBlock: {
+            ReturnValue(Dereference(Add(slot, 8)))
+        }
+        r = X86Enc_RegNumChain(name)
+        IfCondition NotEqual(slot, 0) ThenBlock: {
+            IfCondition LessThan(X86EncMemo.rn_n, 384) ThenBlock: {
+                StoreValue(Add(slot, 8), r)
+                StoreValue(slot, X86Enc_MemoKey(name))
+                X86EncMemo.rn_n = Add(X86EncMemo.rn_n, 1)
+            }
+        }
+        ReturnValue(r)
+    }
+}
+"""
+    for line in MEMO.split("\n"):
+        W(line)
 
     # -------------------------------------------------------------------------
     # Asm string parser
@@ -644,11 +808,76 @@ def gen(out_path):
     # -------------------------------------------------------------------------
     # Emitter: reads X86EncResult.desc_a/desc_b, X86AsmParse.op*, emits bytes
     # -------------------------------------------------------------------------
+    W("// Widen the immediate suffix in a key in-place: imm8->imm32, imm16->imm32, imm32->imm64.")
+    W("// x86-64 has no MOV r64,imm8 etc — ParseAsm may classify small values as imm8")
+    W("// but the table only has imm32/imm64 forms. Returns 1 if widened, 0 if no imm found.")
+    W("Function.X86Enc_WideImm {")
+    W("    Input: key: Address")
+    W("    Output: Integer")
+    W("    Body: {")
+    W("        len = StringLength(key)")
+    W("        i = 0")
+    W("        found = -1")
+    W("        WhileLoop LessThan(i, Subtract(len, 4)) {")
+    W("            IfCondition EqualTo(GetByte(key, i), 95) ThenBlock: {")
+    W("                IfCondition EqualTo(GetByte(key, Add(i,1)), 105) ThenBlock: {")
+    W("                    IfCondition EqualTo(GetByte(key, Add(i,2)), 109) ThenBlock: {")
+    W("                        IfCondition EqualTo(GetByte(key, Add(i,3)), 109) ThenBlock: {")
+    W("                            found = i")
+    W("                            i = len")
+    W("                        }")
+    W("                    }")
+    W("                }")
+    W("            }")
+    W("            i = Add(i, 1)")
+    W("        }")
+    W("        IfCondition EqualTo(found, -1) ThenBlock: { ReturnValue(0) }")
+    W("        num_start = Add(found, 4)")
+    W("        c0 = GetByte(key, num_start)")
+    W("        // imm8 -> imm32: shift tail right by 1, write \"32\"")
+    W("        IfCondition EqualTo(c0, 56) ThenBlock: {")
+    W("            j = len")
+    W("            WhileLoop GreaterThan(j, num_start) {")
+    W("                SetByte(key, Add(j, 1), GetByte(key, j))")
+    W("                j = Subtract(j, 1)")
+    W("            }")
+    W("            SetByte(key, num_start, 51)")
+    W("            SetByte(key, Add(num_start, 1), 50)")
+    W("            ReturnValue(1)")
+    W("        }")
+    W("        // imm16 -> imm32")
+    W("        IfCondition EqualTo(c0, 49) ThenBlock: {")
+    W("            IfCondition EqualTo(GetByte(key, Add(num_start,1)), 54) ThenBlock: {")
+    W("                SetByte(key, num_start, 51)")
+    W("                SetByte(key, Add(num_start, 1), 50)")
+    W("                ReturnValue(1)")
+    W("            }")
+    W("        }")
+    W("        // imm32 -> imm64")
+    W("        IfCondition EqualTo(c0, 51) ThenBlock: {")
+    W("            IfCondition EqualTo(GetByte(key, Add(num_start,1)), 50) ThenBlock: {")
+    W("                SetByte(key, num_start, 54)")
+    W("                SetByte(key, Add(num_start, 1), 52)")
+    W("                ReturnValue(1)")
+    W("            }")
+    W("        }")
+    W("        ReturnValue(0)")
+    W("    }")
+    W("}")
+    W("")
     W("Function.X86Enc_Emit {")
     W("    Input: key: Address")
     W("    Output: Integer")
     W("    Body: {")
     W("        found = X86Enc_Lookup(key)")
+    W("        IfCondition EqualTo(found, 0) ThenBlock: {")
+    W("            w = X86Enc_WideImm(key)")
+    W("            IfCondition EqualTo(w, 1) ThenBlock: { found = X86Enc_Lookup(key) }")
+    W("        }")
+    W("        IfCondition EqualTo(found, 0) ThenBlock: {")
+    W("            w = X86Enc_WideImm(key)")
+    W("            IfCondition EqualTo(w, 1) ThenBlock: { found = X86Enc_Lookup(key) }")
+    W("        }")
     W("        IfCondition EqualTo(found, 0) ThenBlock: {")
     W("            PrintMessage(\"[X86Enc] Unknown instruction: \")")
     W("            PrintMessage(key)")
@@ -866,11 +1095,14 @@ def gen(out_path):
     W("    Input: asm_str: Address")
     W("    Output: Integer")
     W("    Body: {")
-    W("        IfCondition EqualTo(ScanState.want, 1) ThenBlock: {")
-    W("            IfCondition EqualTo(ScanState.eligible, 1) ThenBlock: {")
-    W("                Optimize_ScanNoteAsm(asm_str)")
-    W("            }")
-    W("        }")
+    W("        // CanHold leaves a parameter in rdi/rsi/rdx/rcx/r8/r9 and")
+    W("        // rewrites later slot loads back to that register. Publish")
+    W("        // the register before this instruction overwrites it. The")
+    W("        // scan gate used to skip the whole note, so a scan-off")
+    W("        // MOV rdi,imm kept the empty slot and the next load read")
+    W("        // the immediate. The spill inside ScanNoteAsm still runs")
+    W("        // only while the scan is on.")
+    W("        Optimize_ScanNoteAsm(asm_str)")
     W("        start = Emit_GetPosition()")
     W("        Listing_Open(asm_str)")
     W("        key = X86Enc_ParseAsm(asm_str)")
