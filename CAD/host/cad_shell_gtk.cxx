@@ -156,6 +156,11 @@ static void read_tool_state(int *mode, int *tool, int *nclick) {
     fclose(f);
 }
 
+/* Pick, trim, constraint: click selects an entity. No placement rubber-band. */
+static int tool_is_select(int tool) {
+    return tool == 4 || tool == 5 || tool == 7;
+}
+
 /* ---------- app state ---------- */
 
 struct App {
@@ -172,7 +177,7 @@ struct App {
     GtkWidget *fold_btn;
     int tree_open_all;
     GtkTreeStore *tstore;
-    char tree_cache[4096];
+    char tree_cache[8192];
     char tree_open[256];
     int tree_seen;
     GtkWidget *hist_win;
@@ -180,7 +185,7 @@ struct App {
     GtkWidget *hist_lbl;
     GtkWidget *tl_box;
     GtkWidget *tl_dock;
-    char hist_cache[1024];
+    char hist_cache[4096];
     int hist_ignore;
     char tree_edit_cmd[32];
     cairo_surface_t *frame;
@@ -783,13 +788,15 @@ static void hist_scale_changed(GtkRange *r, gpointer) {
     if (G.hist_ignore) return;
     int v = (int)gtk_range_get_value(r);
     char cmd[32];
+    /* Slider reports a scrub. The backend rebuilds and does not open a HUD. */
     snprintf(cmd, sizeof cmd, "hist %d", v);
     write_cmd(cmd);
 }
 
 static void on_tl_chip(GtkButton *, gpointer data) {
     char cmd[32];
-    snprintf(cmd, sizeof cmd, "hist %d", GPOINTER_TO_INT(data));
+    /* Chip reports a selection. The backend marks the work-tree row and opens the HUD. */
+    snprintf(cmd, sizeof cmd, "hpick %d", GPOINTER_TO_INT(data));
     write_cmd(cmd);
 }
 
@@ -802,7 +809,7 @@ static void rebuild_tl_chips(const char *raw, int hn, int hc) {
     const char *p = strchr(raw, '\n');
     int i;
     for (i = 0; i < hn; i++) {
-        char lab[32];
+        char lab[64];
         snprintf(lab, sizeof lab, "%d", i + 1);
         if (p) {
             p++;
@@ -811,7 +818,7 @@ static void rebuild_tl_chips(const char *raw, int hn, int hc) {
             const char *nl = strchr(p, '\n');
             int n = nl ? (int)(nl - s) : (int)strlen(s);
             while (n > 0 && (s[n - 1] == '\n' || s[n - 1] == '\r' || s[n - 1] == ' ')) n--;
-            if (n > 20) n = 20;
+            if (n > 60) n = 60;
             if (n > 0) {
                 memcpy(lab, s, (size_t)n);
                 lab[n] = 0;
@@ -827,7 +834,7 @@ static void rebuild_tl_chips(const char *raw, int hn, int hc) {
 }
 
 static void load_hist(void) {
-    char raw[1024];
+    char raw[4096];
     raw[0] = 0;
     FILE *f = fopen(path_hist, "r");
     if (f) {
@@ -1232,7 +1239,7 @@ static gboolean on_draw(GtkWidget *w, cairo_t *cr, gpointer) {
     int mode = 0, tool = 0, nclick = 0;
     read_tool_state(&mode, &tool, &nclick);
     int show_rb = 0;
-    if (mode == 1) {
+    if (mode == 1 && !tool_is_select(tool)) {
         if (G.have_anchor || nclick > 0 || (G.dragging && !G.pan_mode)) show_rb = 1;
     }
     if (show_rb && !G.mmb) {
@@ -1668,8 +1675,9 @@ static gboolean on_button(GtkWidget *, GdkEventButton *e, gpointer) {
         int adx = abs(fx - G.down_fx), ady = abs(fy - G.down_fy);
         G.dragging = 0;
         if (mode == 1) {
-            /* drag with no pending click = camera (kernel). click = sketch. */
-            if (G.moved && (adx >= 3 || ady >= 3) && nclick == 0 && !G.have_anchor) {
+            /* drag with no pending click = camera (kernel). click = sketch.
+               Select tools always deliver the click — a shaky press is not a pan. */
+            if (!tool_is_select(tool) && G.moved && (adx >= 3 || ady >= 3) && nclick == 0 && !G.have_anchor) {
                 gtk_widget_queue_draw(G.da);
                 return TRUE;
             }
@@ -1680,9 +1688,11 @@ static gboolean on_button(GtkWidget *, GdkEventButton *e, gpointer) {
                     char cmd[64];
                     snprintf(cmd, sizeof cmd, "click %d %d %d", cx, cy, G.click_sh);
                     write_cmd(cmd);
-                    G.have_anchor = 1;
-                    G.anchor_fx = cx;
-                    G.anchor_fy = cy;
+                    if (!tool_is_select(tool)) {
+                        G.have_anchor = 1;
+                        G.anchor_fx = cx;
+                        G.anchor_fy = cy;
+                    }
                 }
             }
         } else {
@@ -1736,8 +1746,17 @@ static gboolean on_motion(GtkWidget *, GdkEventMotion *e, gpointer) {
         int dx = fx - G.last_fx;
         int dy = fy - G.last_fy;
         if (abs(fx - G.down_fx) >= 3 || abs(fy - G.down_fy) >= 3) G.moved = 1;
-        /* rubber-band is tool hover; otherwise orbit — kernel remaps 2D vs 3D */
-        if (mode == 1 && (nclick > 0 || G.have_anchor)) {
+        /* rubber-band is tool hover; otherwise orbit — kernel remaps 2D vs 3D.
+           Constraint/pick/trim: hover so the kernel can highlight, no orbit. */
+        if (mode == 1 && tool_is_select(tool)) {
+            if (abs(fx - G.last_hover_fx) >= 2 || abs(fy - G.last_hover_fy) >= 2) {
+                G.pend_hover = 1;
+                G.hover_fx = fx;
+                G.hover_fy = fy;
+                G.last_hover_fx = fx;
+                G.last_hover_fy = fy;
+            }
+        } else if (mode == 1 && (nclick > 0 || G.have_anchor)) {
             if (dx || dy) {
                 G.pend_hover = 1;
                 G.hover_fx = fx;
@@ -1756,7 +1775,18 @@ static gboolean on_motion(GtkWidget *, GdkEventMotion *e, gpointer) {
         return TRUE;
     }
 
-    /* free move after first click — this is the 2-click rubber-band */
+    /* free move: selection highlights the entity; placement rubber-bands */
+    if (mode == 1 && tool_is_select(tool)) {
+        if (abs(fx - G.last_hover_fx) >= 2 || abs(fy - G.last_hover_fy) >= 2) {
+            G.pend_hover = 1;
+            G.hover_fx = fx;
+            G.hover_fy = fy;
+            G.last_hover_fx = fx;
+            G.last_hover_fy = fy;
+        }
+        gtk_widget_queue_draw(G.da);
+        return TRUE;
+    }
     if (mode == 1 && (nclick > 0 || G.have_anchor)) {
         if (abs(fx - G.last_hover_fx) >= 1 || abs(fy - G.last_hover_fy) >= 1) {
             G.pend_hover = 1;
@@ -2628,7 +2658,7 @@ static gboolean restore_open(GtkTreeModel *m, GtkTreePath *path, GtkTreeIter *it
 }
 
 static void load_tree(void) {
-    char raw[4096];
+    char raw[8192];
     raw[0] = 0;
     FILE *f = fopen(path_tree, "r");
     if (f) {
@@ -3192,7 +3222,7 @@ int main(int argc, char **argv) {
     G.hist_lbl = gtk_label_new("timeline");
     gtk_widget_set_name(G.hist_lbl, "hudbar");
     gtk_label_set_xalign(GTK_LABEL(G.hist_lbl), 0.0);
-    gtk_widget_set_size_request(G.hist_lbl, 140, -1);
+    gtk_widget_set_size_request(G.hist_lbl, 280, -1);
     gtk_box_pack_start(GTK_BOX(tlrow), G.hist_lbl, FALSE, FALSE, 4);
     G.hist_scale = gtk_scale_new_with_range(GTK_ORIENTATION_HORIZONTAL, 0, 1, 1);
     gtk_scale_set_digits(GTK_SCALE(G.hist_scale), 0);

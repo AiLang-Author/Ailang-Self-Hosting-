@@ -86,6 +86,33 @@ CREATE TABLE IF NOT EXISTS cad_hist (
 
 CREATE INDEX IF NOT EXISTS cad_hist_rev_idx ON cad_hist (rev_id, seq);
 
+-- One row per command. Integer columns only. Playback walks seq.
+-- kind: 0 sketch 1 pad 2 revolve 3 cut 4 fillet 5 chamfer 6 clear
+--       7 trim 8 poly 9 line 10 circle 11 rect 12 fillet2 13 constr 14 point
+-- a,b,c,d: mm integers (height, radius, width, height, angle). Sketch index in sk.
+CREATE TABLE IF NOT EXISTS cad_cmd (
+    rev_id  BIGINT NOT NULL REFERENCES cad_revision(id) ON DELETE CASCADE,
+    seq     INTEGER NOT NULL,
+    kind    INTEGER NOT NULL,
+    sk      INTEGER NOT NULL DEFAULT 0,
+    a       INTEGER NOT NULL DEFAULT 0,
+    b       INTEGER NOT NULL DEFAULT 0,
+    c       INTEGER NOT NULL DEFAULT 0,
+    d       INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (rev_id, seq)
+);
+
+-- Fillet / chamfer edge midpoints in micrometers. One row per edge.
+CREATE TABLE IF NOT EXISTS cad_cmd_edge (
+    rev_id  BIGINT NOT NULL REFERENCES cad_revision(id) ON DELETE CASCADE,
+    seq     INTEGER NOT NULL,
+    i       INTEGER NOT NULL,
+    x_um    BIGINT NOT NULL,
+    y_um    BIGINT NOT NULL,
+    z_um    BIGINT NOT NULL,
+    PRIMARY KEY (rev_id, seq, i)
+);
+
 -- Multi-user / agent sessions (product path)
 CREATE TABLE IF NOT EXISTS cad_session (
     id          BIGSERIAL PRIMARY KEY,
