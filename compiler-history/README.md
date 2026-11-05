@@ -10,6 +10,7 @@ Binaries are gitignored (`*.x`). Sources live on git tags/commits.
 | `ailang-2026-08-11.x` | Frozen host used during `compiler-improvement` (pre-Assemble wrap) |
 | `analyzer-2026-08-05.x` | Analyzer from that era |
 | `ailang-2026-06-02-backup8-4.x` | Older root `ailang-backup8-4-2026.x` copy |
+| `ailang-2026-10-04.x`, `ailang-2026-10-06-*.x`, `ailang-2026-10-13-*.x` | Moved here from `Librarys/Compiler/Deprecated/` on 2026-11-04. The suffix is the source commit. |
 
 Restore:
 

@@ -265,7 +265,7 @@ Identity after each step (`true`, hello, sin/cos). CAD `cmp` when a keep file mo
 
 ## Deprecated emit files (2026-09-17)
 
-Moved off the import graph to `Librarys/Compiler/Deprecated/`:
+Moved off the import graph to `Librarys/Compiler/Deprecated/`, which was later deleted (2026-11-04). The files are in git history:
 
 - `CodeEmit/X86/` — 11 files (`CEmitX86Reg/Arith/Logic/Cmp/Jump/Stack/Mem/Sys/String/Helpers/Macros`)
 - `Compile/FPU/X86/` — 4 `FPUEmit*` files
