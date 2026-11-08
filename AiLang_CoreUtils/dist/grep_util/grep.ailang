@@ -55,7 +55,7 @@ FixedPool.GrepConstants {
     "MAX_PATTERNS":   Initialize=256
     "MAX_FILES":      Initialize=4096
     "ARGBUF":         Initialize=16384
-    "OUT_BUF":        Initialize=65536
+    "OUT_BUF":        Initialize=262144
 }
 
 FixedPool.Patterns {
@@ -65,10 +65,10 @@ FixedPool.Patterns {
     "lc_ptrs":       Initialize=0   // lowercased copies for -i (literal path)
     "longest":       Initialize=0
     "regex":         Initialize=0   // array of Regex handles (or 0 = literal)
-    "bc_tables":     Initialize=0   // array of Boyer-Moore bad-char tables for literal patterns
+    // bc_tables removed: SearchBoyerMoore uses MemChr, not BM skip tables
     "rx_prefix":     Initialize=0   // array of Address: literal prefix extracted from regex (or 0)
     "rx_prefix_len": Initialize=0   // array of Integer: prefix length (<2 means unused)
-    "rx_prefix_bc":  Initialize=0   // array of Address: BM table for the regex prefix
+    // rx_prefix_bc removed: SearchBoyerMoore uses MemChr, not BM skip tables
     "dfa_ok":        Initialize=0   // DFA available? (1=yes). Only set for single-pattern grep
     "strategy":      Initialize=0   // array of Integer: per-pattern dispatch strategy id (see STRATEGY.*)
 
@@ -81,6 +81,15 @@ FixedPool.Patterns {
     "fast_pat":          Initialize=0   // pointer to pattern bytes
     "fast_plen":         Initialize=0   // pattern length
     "fast_first_byte":   Initialize=0   // GetByte(pat, 0)
+    "fast_rare_byte":    Initialize=0   // rarest byte in the pattern (for MemChr anchor)
+    "fast_rare_offset":  Initialize=0   // offset of that byte within the pattern
+    "fast_icase_ok":     Initialize=0   // single LITERAL_INSENSITIVE pattern
+    "fast_icase_pat":    Initialize=0   // lowercased pattern
+    "fast_icase_plen":   Initialize=0
+    "fast_icase_rare_lo":Initialize=0   // lowercase rare byte
+    "fast_icase_rare_up":Initialize=0   // uppercase rare byte (or same if non-alpha)
+    "fast_icase_rare_off":Initialize=0
+    "fast_word_ok":      Initialize=0   // single literal -w, no newline in the pattern
 }
 
 // Per-pattern dispatch strategy, computed once by CompileAllPatterns.
@@ -109,6 +118,8 @@ FixedPool.OutBuffer {
 FixedPool.Scratch {
     "rx":    Initialize=0   // NUL-terminated copy of current line
     "rx_lc": Initialize=0   // lowercased copy of same (for -i)
+    "num":   Initialize=0   // 24-byte digit buffer for OutUInt
+    "lc_tab":Initialize=0   // 256-byte to-lowercase lookup table
     "ready": Initialize=0
 }
 
@@ -145,6 +156,35 @@ Function.WriteStderr {
     }
 }
 
+// fstat(fd, statbuf) — fills 144-byte struct stat on x86_64 Linux.
+// st_mode at offset 24 (4 bytes), st_size at offset 48 (8 bytes).
+Function.SysFstat {
+    Input: fd: Integer
+    Input: statbuf: Address
+    Output: Integer
+    Body: { ReturnValue(SystemCall(5, fd, statbuf)) }
+}
+
+// mmap(addr=0, length, prot=PROT_READ=1, flags=MAP_PRIVATE=2, fd, offset=0)
+Function.SysMmap {
+    Input: length: Integer
+    Input: fd: Integer
+    Output: Address
+    Body: { ReturnValue(SystemCall(9, 0, length, 1, 2, fd, 0)) }
+}
+
+Function.SysMunmap {
+    Input: addr: Address
+    Input: length: Integer
+    Body: { SystemCall(11, addr, length) }
+}
+
+// fadvise64(fd, 0, 0, POSIX_FADV_SEQUENTIAL=2) — hint sequential read
+Function.SysFadvise {
+    Input: fd: Integer
+    Body: { SystemCall(221, fd, 0, 0, 2) }
+}
+
 // === OUTPUT BUFFERING ===
 
 Function.InitOut {
@@ -153,6 +193,20 @@ Function.InitOut {
         OutBuffer.pos = 0
         Scratch.rx    = Allocate(Add(GrepConstants.LINE_MAX, 1))
         Scratch.rx_lc = Allocate(Add(GrepConstants.LINE_MAX, 1))
+        Scratch.num   = Allocate(24)
+        // English only. 256-byte lowercase LUT: A-Z (65-90) map to
+        // a-z, every other byte stays itself. Same as GNU -i in the C
+        // locale. Bytes >= 0x80 are not folded.
+        Scratch.lc_tab = Allocate(256)
+        lci = 0
+        WhileLoop LessThan(lci, 256) {
+            IfCondition And(GreaterEqual(lci, 65), LessEqual(lci, 90)) ThenBlock: {
+                SetByte(Scratch.lc_tab, lci, Add(lci, 32))
+            } ElseBlock: {
+                SetByte(Scratch.lc_tab, lci, lci)
+            }
+            lci = Add(lci, 1)
+        }
         Scratch.ready = 1
     }
 }
@@ -205,7 +259,7 @@ Function.OutUInt {
         IfCondition EqualTo(v, 0) ThenBlock: {
             OutByte(48)
         } ElseBlock: {
-            digits = Allocate(24)
+            digits = Scratch.num
             n = 0
             val = v
             WhileLoop GreaterThan(val, 0) {
@@ -218,7 +272,6 @@ Function.OutUInt {
                 OutByte(GetByte(digits, i))
                 i = Subtract(i, 1)
             }
-            Deallocate(digits, 24)
         }
     }
 }
@@ -236,6 +289,10 @@ Function.ToLowerByte {
     }
 }
 
+// English only, same as GNU grep in the C locale. Word bytes are
+// digits, letters, and underscore. -i folds A-Z only. Bytes >= 0x80
+// are not word bytes and are not case-folded. AILANG does not read
+// the locale.
 Function.IsWordChar {
     Input: c: Integer
     Output: Integer
@@ -248,35 +305,57 @@ Function.IsWordChar {
     }
 }
 
-// Boyer-Moore bad-character skip table. 256-byte table indexed by the
-// byte value currently looked up in the text; entry holds the distance
-// to slide the pattern so that byte would land on its rightmost
-// occurrence in the pattern (or past the pattern end if absent).
-// Built once per pattern in CompileAllPatterns; reused for every line.
-Function.BuildBadCharTable {
-    Input: pat: Address
+// GNU -w: the match is at a line edge, or the neighbor is not a word byte.
+// Newline is not a word byte, so a buffer offset has the same edges as the line.
+Function.WordEdgesOk {
+    Input: data: Address
+    Input: pos: Integer
     Input: plen: Integer
-    Output: Address
+    Input: len: Integer
+    Output: Integer
     Body: {
-        table = Allocate(256)
-        i = 0
-        WhileLoop LessThan(i, 256) {
-            SetByte(table, i, plen)
-            i = Add(i, 1)
+        left_ok = 0
+        IfCondition EqualTo(pos, 0) ThenBlock: { left_ok = 1 }
+        IfCondition EqualTo(left_ok, 0) ThenBlock: {
+            IfCondition EqualTo(IsWordChar(GetByte(data, Subtract(pos, 1))), 0) ThenBlock: {
+                left_ok = 1
+            }
         }
-        // Last char of pattern intentionally NOT written — keeps skip
-        // for "last-char mismatched with itself" as plen, which is
-        // correct. Iterate [0, plen-1).
-        i = 0
-        last = Subtract(plen, 1)
-        WhileLoop LessThan(i, last) {
-            ch = GetByte(pat, i)
-            SetByte(table, ch, Subtract(last, i))
-            i = Add(i, 1)
+        IfCondition EqualTo(left_ok, 0) ThenBlock: { ReturnValue(0) }
+        end_pos = Add(pos, plen)
+        IfCondition GreaterEqual(end_pos, len) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(IsWordChar(GetByte(data, end_pos)), 0) ThenBlock: {
+            ReturnValue(1)
         }
-        ReturnValue(table)
+        ReturnValue(0)
     }
 }
+
+// Case-insensitive compare: data[pos..pos+plen) vs pat_lc (already lowered).
+// Uses lc_tab LUT. Returns 1 if equal, 0 if not.
+Function.IcaseCmpAt {
+    Input: data: Address
+    Input: pos: Integer
+    Input: pat_lc: Address
+    Input: plen: Integer
+    Output: Integer
+    Body: {
+        lut = Scratch.lc_tab
+        ci = 0
+        WhileLoop LessThan(ci, plen) {
+            IfCondition NotEqual(GetByte(lut, GetByte(data, Add(pos, ci))),
+                                 GetByte(pat_lc, ci)) ThenBlock: {
+                ReturnValue(0)
+            }
+            ci = Add(ci, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// BuildBadCharTable removed: SearchBoyerMoore uses MemChr-anchored
+// first-byte scan, not BM skip tables. The tables were allocated and
+// initialized but never consulted.
 
 // Substring search: MemChr-anchored on the pattern's FIRST byte, then
 // MemCompare to verify. Both primitives are SSE2-vectorized in the
@@ -291,39 +370,16 @@ Function.BuildBadCharTable {
 // regressed 10-40% on patterns like "Function" because 'n' triggered
 // a verify at every 'n' in the text.
 //
-// `table` argument retained for ABI compatibility — the BM bad-char
-// table isn't consulted in this implementation (the first-byte scan
-// subsumes its skip logic).
 Function.SearchBoyerMoore {
     Input: line: Address
     Input: line_len: Integer
     Input: pat: Address
     Input: plen: Integer
-    Input: table: Address
     Output: Integer
     Body: {
         IfCondition GreaterThan(plen, line_len) ThenBlock: { ReturnValue(-1) }
         IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(-1) }
-        IfCondition EqualTo(plen, 1) ThenBlock: {
-            ReturnValue(MemChr(line, GetByte(pat, 0), line_len))
-        }
-
-        first_pat = GetByte(pat, 0)
-        max_start = Subtract(line_len, plen)
-        pos = 0
-
-        WhileLoop LessEqual(pos, max_start) {
-            remaining = Subtract(line_len, pos)
-            off = MemChr(Add(line, pos), first_pat, remaining)
-            IfCondition LessThan(off, 0) ThenBlock: { ReturnValue(-1) }
-            cand = Add(pos, off)
-            IfCondition GreaterThan(cand, max_start) ThenBlock: { ReturnValue(-1) }
-            IfCondition EqualTo(MemCompare(Add(line, cand), pat, plen), 0) ThenBlock: {
-                ReturnValue(cand)
-            }
-            pos = Add(cand, 1)
-        }
-        ReturnValue(-1)
+        ReturnValue(MemMem(line, line_len, pat, plen))
     }
 }
 
@@ -375,7 +431,6 @@ Function.RegexLineSearch {
     Input: line_len: Integer
     Input: prefix: Address
     Input: prefix_len: Integer
-    Input: prefix_bc: Address
     Output: Integer
     Body: {
         IfCondition EqualTo(handle, 0) ThenBlock: { ReturnValue(0) }
@@ -389,7 +444,7 @@ Function.RegexLineSearch {
             WhileLoop LessEqual(search_from, Subtract(line_len, prefix_len)) {
                 found = SearchBoyerMoore(Add(scratch, search_from),
                                          Subtract(line_len, search_from),
-                                         prefix, prefix_len, prefix_bc)
+                                         prefix, prefix_len)
                 IfCondition LessThan(found, 0) ThenBlock: { BreakLoop }
                 cand = Add(search_from, found)
                 m = Regex_Match(handle, scratch, cand)
@@ -431,7 +486,6 @@ Function.Match_RegexPrefixBM {
         rhandle    = Dereference(Add(Patterns.regex,         Multiply(pi, 8)))
         rx_pfx     = Dereference(Add(Patterns.rx_prefix,     Multiply(pi, 8)))
         rx_pfx_len = Dereference(Add(Patterns.rx_prefix_len, Multiply(pi, 8)))
-        rx_pfx_bc  = Dereference(Add(Patterns.rx_prefix_bc,  Multiply(pi, 8)))
         IfCondition EqualTo(rhandle, 0) ThenBlock: { ReturnValue(0) }
 
         pbm_from = 0
@@ -439,7 +493,7 @@ Function.Match_RegexPrefixBM {
         WhileLoop LessEqual(pbm_from, Subtract(line_len, rx_pfx_len)) {
             hit = SearchBoyerMoore(Add(line, pbm_from),
                                    Subtract(line_len, pbm_from),
-                                   rx_pfx, rx_pfx_len, rx_pfx_bc)
+                                   rx_pfx, rx_pfx_len)
             IfCondition LessThan(hit, 0) ThenBlock: { BreakLoop }
             cand = Add(pbm_from, hit)
             // BM hit → materialize NUL-terminated scratch (Regex_Match reads via StringLength).
@@ -492,16 +546,16 @@ Function.Match_RegexInsensitive {
         rhandle    = Dereference(Add(Patterns.regex,         Multiply(pi, 8)))
         rx_pfx     = Dereference(Add(Patterns.rx_prefix,     Multiply(pi, 8)))
         rx_pfx_len = Dereference(Add(Patterns.rx_prefix_len, Multiply(pi, 8)))
-        rx_pfx_bc  = Dereference(Add(Patterns.rx_prefix_bc,  Multiply(pi, 8)))
+        lut = Scratch.lc_tab
         si = 0
         WhileLoop LessThan(si, line_len) {
-            SetByte(Scratch.rx_lc, si, ToLowerByte(GetByte(line, si)))
+            SetByte(Scratch.rx_lc, si, GetByte(lut, GetByte(line, si)))
             si = Add(si, 1)
         }
         SetByte(Scratch.rx_lc, line_len, 0)
         IfCondition EqualTo(rhandle, 0) ThenBlock: { ReturnValue(0) }
         ReturnValue(RegexLineSearch(rhandle, Scratch.rx_lc, line_len,
-                                    rx_pfx, rx_pfx_len, rx_pfx_bc))
+                                    rx_pfx, rx_pfx_len))
     }
 }
 
@@ -511,14 +565,13 @@ Function.Match_LiteralBM {
     Input: pi: Integer
     Output: Integer
     Body: {
-        pat    = Dereference(Add(Patterns.ptrs,      Multiply(pi, 8)))
-        plen   = Dereference(Add(Patterns.lens,      Multiply(pi, 8)))
-        bc_tbl = Dereference(Add(Patterns.bc_tables, Multiply(pi, 8)))
+        pat    = Dereference(Add(Patterns.ptrs, Multiply(pi, 8)))
+        plen   = Dereference(Add(Patterns.lens, Multiply(pi, 8)))
         search_from = 0
         WhileLoop LessEqual(search_from, Subtract(line_len, plen)) {
             found = SearchBoyerMoore(Add(line, search_from),
                                      Subtract(line_len, search_from),
-                                     pat, plen, bc_tbl)
+                                     pat, plen)
             IfCondition LessThan(found, 0) ThenBlock: { BreakLoop }
             ReturnValue(1)
         }
@@ -526,22 +579,17 @@ Function.Match_LiteralBM {
     }
 }
 
+// Lowercase via 256-byte LUT into Scratch.rx_lc, then SIMD search.
 Function.Match_LiteralInsensitive {
     Input: line: Address
     Input: line_len: Integer
     Input: pi: Integer
     Output: Integer
     Body: {
-        pat    = Dereference(Add(Patterns.ptrs,    Multiply(pi, 8)))
         pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
         plen   = Dereference(Add(Patterns.lens,    Multiply(pi, 8)))
-        last = Subtract(line_len, plen)
-        pos = 0
-        WhileLoop LessEqual(pos, last) {
-            IfCondition EqualTo(CompareAt(line, line_len, pos, pat, pat_lc, plen), 1) ThenBlock: {
-                ReturnValue(1)
-            }
-            pos = Add(pos, 1)
+        IfCondition GreaterEqual(MemMemFold(line, line_len, pat_lc, plen), 0) ThenBlock: {
+            ReturnValue(1)
         }
         ReturnValue(0)
     }
@@ -572,30 +620,22 @@ Function.Match_WordMatch {
         pat    = Dereference(Add(Patterns.ptrs,    Multiply(pi, 8)))
         pat_lc = Dereference(Add(Patterns.lc_ptrs, Multiply(pi, 8)))
         plen   = Dereference(Add(Patterns.lens,    Multiply(pi, 8)))
-        last = Subtract(line_len, plen)
+        IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition GreaterThan(plen, line_len) ThenBlock: { ReturnValue(0) }
         pos = 0
-        WhileLoop LessEqual(pos, last) {
-            IfCondition EqualTo(CompareAt(line, line_len, pos, pat, pat_lc, plen), 1) ThenBlock: {
-                left_ok = 0
-                IfCondition EqualTo(pos, 0) ThenBlock: { left_ok = 1 }
-                IfCondition EqualTo(left_ok, 0) ThenBlock: {
-                    IfCondition EqualTo(IsWordChar(GetByte(line, Subtract(pos, 1))), 0) ThenBlock: {
-                        left_ok = 1
-                    }
-                }
-                right_ok = 0
-                end_pos = Add(pos, plen)
-                IfCondition GreaterEqual(end_pos, line_len) ThenBlock: { right_ok = 1 }
-                IfCondition EqualTo(right_ok, 0) ThenBlock: {
-                    IfCondition EqualTo(IsWordChar(GetByte(line, end_pos)), 0) ThenBlock: {
-                        right_ok = 1
-                    }
-                }
-                IfCondition And(EqualTo(left_ok, 1), EqualTo(right_ok, 1)) ThenBlock: {
-                    ReturnValue(1)
-                }
+        WhileLoop LessEqual(pos, Subtract(line_len, plen)) {
+            remain = Subtract(line_len, pos)
+            IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+                found = MemMemFold(Add(line, pos), remain, pat_lc, plen)
+            } ElseBlock: {
+                found = MemMem(Add(line, pos), remain, pat, plen)
             }
-            pos = Add(pos, 1)
+            IfCondition LessThan(found, 0) ThenBlock: { ReturnValue(0) }
+            at = Add(pos, found)
+            IfCondition EqualTo(WordEdgesOk(line, at, plen, line_len), 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            pos = Add(at, 1)
         }
         ReturnValue(0)
     }
@@ -603,37 +643,20 @@ Function.Match_WordMatch {
 
 // Tight literal-pattern scan used by ProcessStream's inline fast
 // path. Returns 1 iff `pat[0..plen)` occurs anywhere in `line[0..line_len)`.
-// Pattern pointer, length, and first byte are passed explicitly so
-// ProcessStream's hot loop can keep them in registers across calls.
-// No function-call overhead into LineMatches/Branch/Match_LiteralBM.
+// Uses rare-byte anchored MemChr scan to minimize false positives.
 Function.FastLiteralSearch {
     Input: line: Address
     Input: line_len: Integer
     Input: pat: Address
     Input: plen: Integer
-    Input: first_pat: Integer
+    Input: rare_byte: Integer
+    Input: rare_off: Integer
     Output: Integer
     Body: {
         IfCondition GreaterThan(plen, line_len) ThenBlock: { ReturnValue(0) }
         IfCondition EqualTo(plen, 0) ThenBlock: { ReturnValue(0) }
-        IfCondition EqualTo(plen, 1) ThenBlock: {
-            IfCondition GreaterEqual(MemChr(line, first_pat, line_len), 0) ThenBlock: {
-                ReturnValue(1)
-            }
-            ReturnValue(0)
-        }
-        max_start = Subtract(line_len, plen)
-        pos = 0
-        WhileLoop LessEqual(pos, max_start) {
-            remaining = Subtract(line_len, pos)
-            off = MemChr(Add(line, pos), first_pat, remaining)
-            IfCondition LessThan(off, 0) ThenBlock: { ReturnValue(0) }
-            cand = Add(pos, off)
-            IfCondition GreaterThan(cand, max_start) ThenBlock: { ReturnValue(0) }
-            IfCondition EqualTo(MemCompare(Add(line, cand), pat, plen), 0) ThenBlock: {
-                ReturnValue(1)
-            }
-            pos = Add(cand, 1)
+        IfCondition GreaterEqual(MemMem(line, line_len, pat, plen), 0) ThenBlock: {
+            ReturnValue(1)
         }
         ReturnValue(0)
     }
@@ -682,13 +705,40 @@ Function.InitPatterns {
         Patterns.lens          = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.lc_ptrs       = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.regex         = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
-        Patterns.bc_tables     = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.rx_prefix     = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.rx_prefix_len = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
-        Patterns.rx_prefix_bc  = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.strategy      = Allocate(Multiply(GrepConstants.MAX_PATTERNS, 8))
         Patterns.count   = 0
         Patterns.longest = 0
+    }
+}
+
+// 1 when pat has no regex metacharacter, so it matches as a literal.
+Function.PatternIsLiteral {
+    Input: pat: Address
+    Input: plen: Integer
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            c = GetByte(pat, i)
+            IfCondition EqualTo(c, 46) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 42) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 43) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 63) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 94) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 36) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 91) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 93) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 40) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 41) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 124) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 92) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 123) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 125) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
     }
 }
 
@@ -713,7 +763,12 @@ Function.CompileAllPatterns {
                 } ElseBlock: {
                     pat = Dereference(Add(Patterns.ptrs, Multiply(i, 8)))
                 }
-                handle = Regex_Compile(pat, 0)
+                plen_i = Dereference(Add(Patterns.lens, Multiply(i, 8)))
+                IfCondition EqualTo(PatternIsLiteral(pat, plen_i), 1) ThenBlock: {
+                    handle = 0
+                } ElseBlock: {
+                    handle = Regex_Compile(pat, 0)
+                }
                 StoreValue(Add(Patterns.regex, Multiply(i, 8)), handle)
 
                 // Extract a literal prefix (CHAR-chain from start state).
@@ -725,27 +780,9 @@ Function.CompileAllPatterns {
                     prefix_len = Regex_GetPrefix(handle, prefix_buf, 32)
                     StoreValue(Add(Patterns.rx_prefix,     Multiply(i, 8)), prefix_buf)
                     StoreValue(Add(Patterns.rx_prefix_len, Multiply(i, 8)), prefix_len)
-                    IfCondition GreaterEqual(prefix_len, 2) ThenBlock: {
-                        tbl = BuildBadCharTable(prefix_buf, prefix_len)
-                        StoreValue(Add(Patterns.rx_prefix_bc, Multiply(i, 8)), tbl)
-                    }
                 }
                 i = Add(i, 1)
             }
-        }
-
-        // Build a Boyer-Moore bad-char table for each literal pattern.
-        // Case-sensitive only: the -i path needs a lowercased line to
-        // compare against, which CompareAt still handles byte-wise.
-        bi = 0
-        WhileLoop LessThan(bi, Patterns.count) {
-            pat  = Dereference(Add(Patterns.ptrs, Multiply(bi, 8)))
-            plen = Dereference(Add(Patterns.lens, Multiply(bi, 8)))
-            IfCondition GreaterThan(plen, 0) ThenBlock: {
-                tbl = BuildBadCharTable(pat, plen)
-                StoreValue(Add(Patterns.bc_tables, Multiply(bi, 8)), tbl)
-            }
-            bi = Add(bi, 1)
         }
 
         // Lazy DFA: only useful for single-pattern grep (the shared
@@ -820,6 +857,115 @@ Function.CompileAllPatterns {
                 Patterns.fast_plen        = Dereference(Patterns.lens)
                 Patterns.fast_first_byte  = GetByte(Patterns.fast_pat, 0)
                 Patterns.fast_literal_ok  = 1
+
+                // Rare-byte heuristic: pick the pattern byte that is
+                // least frequent in typical text/code as the MemChr
+                // anchor. Non-alphanumeric > uppercase > consonant >
+                // common letters. Falls back to last byte (GNU default).
+                fp = Patterns.fast_pat
+                fp_len = Patterns.fast_plen
+                best_i = Subtract(fp_len, 1)
+                best_score = 0
+                ri = 0
+                WhileLoop LessThan(ri, fp_len) {
+                    rb = GetByte(fp, ri)
+                    score = 0
+                    IfCondition Or(LessThan(rb, 32), GreaterThan(rb, 126)) ThenBlock: {
+                        score = 100
+                    } ElseBlock: {
+                        IfCondition Or(And(GreaterEqual(rb, 33), LessEqual(rb, 47)),
+                                       Or(And(GreaterEqual(rb, 58), LessEqual(rb, 64)),
+                                          And(GreaterEqual(rb, 91), LessEqual(rb, 96)))) ThenBlock: {
+                            score = 80
+                        } ElseBlock: {
+                            IfCondition And(GreaterEqual(rb, 65), LessEqual(rb, 90)) ThenBlock: {
+                                score = 60
+                            } ElseBlock: {
+                                IfCondition And(GreaterEqual(rb, 48), LessEqual(rb, 57)) ThenBlock: {
+                                    score = 40
+                                } ElseBlock: {
+                                    score = 10
+                                }
+                            }
+                        }
+                    }
+                    IfCondition GreaterThan(score, best_score) ThenBlock: {
+                        best_score = score
+                        best_i = ri
+                    }
+                    ri = Add(ri, 1)
+                }
+                Patterns.fast_rare_byte   = GetByte(fp, best_i)
+                Patterns.fast_rare_offset = best_i
+            }
+        }
+
+        // Case-insensitive literal fast path: single LITERAL_INSENSITIVE
+        // pattern. Used by ProcessMapped to do search-then-split with
+        // dual MemChr (lowercase + uppercase of the rare byte).
+        Patterns.fast_icase_ok = 0
+        IfCondition EqualTo(Patterns.count, 1) ThenBlock: {
+            only_strat2 = Dereference(Patterns.strategy)
+            IfCondition EqualTo(only_strat2, STRATEGY.LITERAL_INSENSITIVE) ThenBlock: {
+                icp = Dereference(Patterns.lc_ptrs)
+                icl = Dereference(Patterns.lens)
+                Patterns.fast_icase_pat  = icp
+                Patterns.fast_icase_plen = icl
+                Patterns.fast_icase_ok   = 1
+                // Pick rare byte from lowercased pattern, store both cases
+                ic_best = Subtract(icl, 1)
+                ic_bscore = 0
+                ici = 0
+                WhileLoop LessThan(ici, icl) {
+                    icb = GetByte(icp, ici)
+                    ics = 0
+                    IfCondition Or(LessThan(icb, 32), GreaterThan(icb, 126)) ThenBlock: {
+                        ics = 100
+                    } ElseBlock: {
+                        IfCondition And(GreaterEqual(icb, 97), LessEqual(icb, 122)) ThenBlock: {
+                            ics = 10
+                        } ElseBlock: {
+                            ics = 50
+                        }
+                    }
+                    IfCondition GreaterThan(ics, ic_bscore) ThenBlock: {
+                        ic_bscore = ics
+                        ic_best = ici
+                    }
+                    ici = Add(ici, 1)
+                }
+                lo = GetByte(icp, ic_best)
+                Patterns.fast_icase_rare_lo = lo
+                IfCondition And(GreaterEqual(lo, 97), LessEqual(lo, 122)) ThenBlock: {
+                    Patterns.fast_icase_rare_up = Subtract(lo, 32)
+                } ElseBlock: {
+                    Patterns.fast_icase_rare_up = lo
+                }
+                Patterns.fast_icase_rare_off = ic_best
+            }
+        }
+
+        // Single literal -w. The whole-file scan finds the bytes, then
+        // WordEdgesOk keeps only matches with a non-word neighbor.
+        // -x wins over -w in the strategy pick, so it stays off here.
+        Patterns.fast_word_ok = 0
+        IfCondition And(EqualTo(Patterns.count, 1),
+                        And(EqualTo(GrepConfig.word_match, 1),
+                            EqualTo(GrepConfig.whole_line, 0))) ThenBlock: {
+            wp = Dereference(Patterns.ptrs)
+            wl = Dereference(Patterns.lens)
+            w_nl = 0
+            wi = 0
+            WhileLoop LessThan(wi, wl) {
+                IfCondition EqualTo(GetByte(wp, wi), 10) ThenBlock: { w_nl = 1 }
+                wi = Add(wi, 1)
+            }
+            IfCondition And(GreaterThan(wl, 0), EqualTo(w_nl, 0)) ThenBlock: {
+                Patterns.fast_pat = wp
+                Patterns.fast_plen = wl
+                Patterns.fast_icase_pat = Dereference(Patterns.lc_ptrs)
+                Patterns.fast_icase_plen = wl
+                Patterns.fast_word_ok = 1
             }
         }
     }
@@ -940,7 +1086,8 @@ Function.ProcessStream {
                     raw_match = FastLiteralSearch(search_ptr, nl_offset,
                                                   Patterns.fast_pat,
                                                   Patterns.fast_plen,
-                                                  Patterns.fast_first_byte)
+                                                  Patterns.fast_rare_byte,
+                                                  Patterns.fast_rare_offset)
                     fast_used = 1
                 } ElseBlock: {
                     space_left = Subtract(GrepConstants.LINE_MAX, line_len)
@@ -1043,6 +1190,300 @@ Function.ProcessStream {
 
         Deallocate(line_buf, GrepConstants.LINE_MAX)
         Deallocate(read_buf, GrepConstants.BUFFER_SIZE)
+        ReturnValue(match_count)
+    }
+}
+
+// === MMAP PATH: search-then-split ===
+// For regular files we mmap the entire file and search the flat buffer.
+// The fast literal path scans for the pattern first (MemChr + MemCompare
+// in ~16-byte SIMD strides) and only locates line boundaries on a hit.
+// Non-matching regions — the vast majority of typical input — never
+// have their newlines scanned at all. This is the core technique that
+// makes GNU grep and ripgrep fast.
+//
+// Line numbers are counted lazily: we accumulate newlines between the
+// last-counted position and the current match only when -n is active.
+// -v that must print lines falls back to line-at-a-time. -c -v on a
+// single literal counts newlines once and subtracts the fast hit lines.
+
+// Count newlines in data[from..to) using MemChr.
+Function.CountNewlines {
+    Input: data: Address
+    Input: from: Integer
+    Input: to: Integer
+    Output: Integer
+    Body: {
+        count = 0
+        pos = from
+        WhileLoop LessThan(pos, to) {
+            off = MemChr(Add(data, pos), 10, Subtract(to, pos))
+            IfCondition LessThan(off, 0) ThenBlock: { BreakLoop }
+            count = Add(count, 1)
+            pos = Add(Add(pos, off), 1)
+        }
+        ReturnValue(count)
+    }
+}
+
+// Walk backwards from `pos` to find the start of the line (byte after
+// the preceding '\n', or 0 if at the start of the buffer).
+Function.FindLineStart {
+    Input: data: Address
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        p = Subtract(pos, 1)
+        WhileLoop GreaterEqual(p, 0) {
+            IfCondition EqualTo(GetByte(data, p), 10) ThenBlock: {
+                ReturnValue(Add(p, 1))
+            }
+            p = Subtract(p, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Search-then-split for the fast literal path on mmap'd data.
+// Returns match count.
+Function.ProcessMapped {
+    Input: data: Address
+    Input: data_len: Integer
+    Input: label: Address
+    Input: show_prefix: Integer
+    Output: Integer
+    Body: {
+        match_count = 0
+        stop_early = 0
+
+        // Binary detection: check for NUL in the data.
+        is_binary = 0
+        check_len = data_len
+        IfCondition GreaterThan(check_len, GrepConstants.BUFFER_SIZE) ThenBlock: {
+            check_len = GrepConstants.BUFFER_SIZE
+        }
+        IfCondition NotEqual(MemChr(data, 0, check_len), -1) ThenBlock: {
+            is_binary = 1
+        }
+
+        // -c -v on one literal (including a single -w): non-matching
+        // lines are total lines minus the lines the search hits.
+        // Printing -v, -q, -l/-L, a binary file, regex, or -x stays on
+        // the line walk. A pattern byte of '\n' cannot use that subtraction.
+        count_invert = 0
+        IfCondition And(EqualTo(GrepConfig.invert, 1),
+                        And(EqualTo(GrepConfig.count_only, 1),
+                            And(EqualTo(is_binary, 0),
+                                And(EqualTo(GrepConfig.quiet, 0),
+                                    And(EqualTo(GrepConfig.files_with, 0),
+                                        EqualTo(GrepConfig.files_without, 0)))))) ThenBlock: {
+            IfCondition EqualTo(Patterns.fast_word_ok, 1) ThenBlock: {
+                // CompileAllPatterns already rejected a newline in this pattern.
+                count_invert = 1
+            } ElseBlock: {
+                IfCondition Or(EqualTo(Patterns.fast_literal_ok, 1),
+                               EqualTo(Patterns.fast_icase_ok, 1)) ThenBlock: {
+                    pat_has_nl = 0
+                    IfCondition EqualTo(Patterns.fast_icase_ok, 1) ThenBlock: {
+                        nl_pat = Patterns.fast_icase_pat
+                        nl_plen = Patterns.fast_icase_plen
+                    } ElseBlock: {
+                        nl_pat = Patterns.fast_pat
+                        nl_plen = Patterns.fast_plen
+                    }
+                    nl_i = 0
+                    WhileLoop LessThan(nl_i, nl_plen) {
+                        IfCondition EqualTo(GetByte(nl_pat, nl_i), 10) ThenBlock: {
+                            pat_has_nl = 1
+                        }
+                        nl_i = Add(nl_i, 1)
+                    }
+                    IfCondition EqualTo(pat_has_nl, 0) ThenBlock: {
+                        count_invert = 1
+                    }
+                }
+            }
+        }
+
+        // -v that prints, regex, -x, and multi-pattern -w walk every line.
+        // A single literal -w (fast_word_ok) uses the scan below.
+        IfCondition Or(And(EqualTo(Patterns.fast_literal_ok, 0),
+                           And(EqualTo(Patterns.fast_icase_ok, 0),
+                               EqualTo(Patterns.fast_word_ok, 0))),
+                       And(EqualTo(GrepConfig.invert, 1),
+                           EqualTo(count_invert, 0))) ThenBlock: {
+            // Line-at-a-time scan over the mmap'd buffer (still avoids
+            // the read() syscall loop and buffer-boundary handling).
+            line_start = 0
+            line_no = 0
+            WhileLoop LessThan(line_start, data_len) {
+                IfCondition EqualTo(stop_early, 1) ThenBlock: { BreakLoop }
+                remaining = Subtract(data_len, line_start)
+                nl_off = MemChr(Add(data, line_start), 10, remaining)
+                IfCondition LessThan(nl_off, 0) ThenBlock: {
+                    line_end = data_len
+                } ElseBlock: {
+                    line_end = Add(line_start, nl_off)
+                }
+                line_len = Subtract(line_end, line_start)
+                line_no = Add(line_no, 1)
+
+                raw_match = LineMatches(Add(data, line_start), line_len)
+                IfCondition EqualTo(GrepConfig.invert, 1) ThenBlock: {
+                    IfCondition EqualTo(raw_match, 1) ThenBlock: { effective = 0 } ElseBlock: { effective = 1 }
+                } ElseBlock: {
+                    effective = raw_match
+                }
+
+                IfCondition EqualTo(effective, 1) ThenBlock: {
+                    match_count = Add(match_count, 1)
+                    IfCondition EqualTo(is_binary, 1) ThenBlock: {
+                        IfCondition And(EqualTo(GrepConfig.quiet, 0),
+                                        And(EqualTo(GrepConfig.files_with, 0),
+                                            And(EqualTo(GrepConfig.files_without, 0),
+                                                EqualTo(GrepConfig.count_only, 0)))) ThenBlock: {
+                            IfCondition NotEqual(label, 0) ThenBlock: {
+                                OutStr("Binary file ")
+                                OutStr(label)
+                                OutStr(" matches\n")
+                            }
+                        }
+                        stop_early = 1
+                    } ElseBlock: {
+                        IfCondition Or(EqualTo(GrepConfig.quiet, 1),
+                                       Or(EqualTo(GrepConfig.files_with, 1),
+                                          EqualTo(GrepConfig.files_without, 1))) ThenBlock: {
+                            stop_early = 1
+                        } ElseBlock: {
+                            IfCondition EqualTo(GrepConfig.count_only, 0) ThenBlock: {
+                                IfCondition And(EqualTo(show_prefix, 1), NotEqual(label, 0)) ThenBlock: {
+                                    OutStr(label)
+                                    OutByte(58)
+                                }
+                                IfCondition EqualTo(GrepConfig.line_numbers, 1) ThenBlock: {
+                                    OutUInt(line_no)
+                                    OutByte(58)
+                                }
+                                OutBytes(Add(data, line_start), line_len)
+                                OutByte(10)
+                            }
+                        }
+                    }
+                }
+                IfCondition LessThan(nl_off, 0) ThenBlock: {
+                    BreakLoop
+                }
+                line_start = Add(line_end, 1)
+            }
+            ReturnValue(match_count)
+        }
+
+        // === FAST LITERAL SEARCH-THEN-SPLIT ===
+        // One SSE2 scan. MemMemFold folds ASCII A-Z; MemMem is exact.
+        // -w uses the same scan, then rejects a hit whose neighbor is a word byte.
+        use_fold = 0
+        IfCondition EqualTo(Patterns.fast_icase_ok, 1) ThenBlock: { use_fold = 1 }
+        IfCondition And(EqualTo(Patterns.fast_word_ok, 1),
+                        EqualTo(GrepConfig.case_insensitive, 1)) ThenBlock: {
+            use_fold = 1
+        }
+        IfCondition EqualTo(use_fold, 1) ThenBlock: {
+            pat = Patterns.fast_icase_pat
+            plen = Patterns.fast_icase_plen
+        } ElseBlock: {
+            pat = Patterns.fast_pat
+            plen = Patterns.fast_plen
+        }
+
+        last_nl_pos = 0
+        nl_count = 0
+        scan_pos = 0
+
+        WhileLoop LessThan(scan_pos, data_len) {
+            IfCondition EqualTo(stop_early, 1) ThenBlock: { BreakLoop }
+            remaining = Subtract(data_len, scan_pos)
+            hay = Add(data, scan_pos)
+            IfCondition EqualTo(use_fold, 1) ThenBlock: {
+                off = MemMemFold(hay, remaining, pat, plen)
+            } ElseBlock: {
+                off = MemMem(hay, remaining, pat, plen)
+            }
+            IfCondition LessThan(off, 0) ThenBlock: { BreakLoop }
+            cand = Add(scan_pos, off)
+
+            // -w: a byte hit inside a longer word is not a match.
+            // Resume one byte later so a later word on this line can still hit.
+            IfCondition EqualTo(Patterns.fast_word_ok, 1) ThenBlock: {
+                IfCondition EqualTo(WordEdgesOk(data, cand, plen, data_len), 0) ThenBlock: {
+                    scan_pos = Add(cand, 1)
+                    ContinueLoop
+                }
+            }
+
+            // Pattern matched at `cand`. Find line boundaries.
+            line_start = FindLineStart(data, cand)
+            end_remaining = Subtract(data_len, cand)
+            nl_off = MemChr(Add(data, cand), 10, end_remaining)
+            IfCondition LessThan(nl_off, 0) ThenBlock: {
+                line_end = data_len
+            } ElseBlock: {
+                line_end = Add(cand, nl_off)
+            }
+            line_len = Subtract(line_end, line_start)
+            match_count = Add(match_count, 1)
+
+            IfCondition EqualTo(is_binary, 1) ThenBlock: {
+                IfCondition And(EqualTo(GrepConfig.quiet, 0),
+                                And(EqualTo(GrepConfig.files_with, 0),
+                                    And(EqualTo(GrepConfig.files_without, 0),
+                                        EqualTo(GrepConfig.count_only, 0)))) ThenBlock: {
+                    IfCondition NotEqual(label, 0) ThenBlock: {
+                        OutStr("Binary file ")
+                        OutStr(label)
+                        OutStr(" matches\n")
+                    }
+                }
+                stop_early = 1
+            } ElseBlock: {
+                IfCondition Or(EqualTo(GrepConfig.quiet, 1),
+                               Or(EqualTo(GrepConfig.files_with, 1),
+                                  EqualTo(GrepConfig.files_without, 1))) ThenBlock: {
+                    stop_early = 1
+                } ElseBlock: {
+                    IfCondition EqualTo(GrepConfig.count_only, 0) ThenBlock: {
+                        IfCondition And(EqualTo(show_prefix, 1), NotEqual(label, 0)) ThenBlock: {
+                            OutStr(label)
+                            OutByte(58)
+                        }
+                        IfCondition EqualTo(GrepConfig.line_numbers, 1) ThenBlock: {
+                            nl_count = Add(nl_count, CountNewlines(data, last_nl_pos, line_start))
+                            last_nl_pos = line_start
+                            OutUInt(Add(nl_count, 1))
+                            OutByte(58)
+                        }
+                        OutBytes(Add(data, line_start), line_len)
+                        OutByte(10)
+                    }
+                }
+            }
+
+            // Skip past this line — no need to find more matches on it.
+            IfCondition LessThan(nl_off, 0) ThenBlock: {
+                BreakLoop
+            }
+            scan_pos = Add(line_end, 1)
+        }
+
+        IfCondition EqualTo(count_invert, 1) ThenBlock: {
+            total_lines = CountNewlines(data, 0, data_len)
+            IfCondition GreaterThan(data_len, 0) ThenBlock: {
+                IfCondition NotEqual(GetByte(data, Subtract(data_len, 1)), 10) ThenBlock: {
+                    total_lines = Add(total_lines, 1)
+                }
+            }
+            ReturnValue(Subtract(total_lines, match_count))
+        }
+
         ReturnValue(match_count)
     }
 }
@@ -1266,7 +1707,29 @@ SubRoutine.Main {
                     any_error = 1
                     matches = 0
                 } ElseBlock: {
-                    matches = ProcessStream(fd, path, show_prefix)
+                    // Try mmap for regular files (S_ISREG: mode & 0xF000 == 0x8000).
+                    // Falls back to read-loop for pipes, devices, empty files, etc.
+                    statbuf = Allocate(144)
+                    fstat_ok = SysFstat(fd, statbuf)
+                    st_mode = Dereference(Add(statbuf, 24))
+                    st_size = Dereference(Add(statbuf, 48))
+                    Deallocate(statbuf, 144)
+
+                    mmap_used = 0
+                    IfCondition And(EqualTo(fstat_ok, 0),
+                                    And(EqualTo(BitwiseAnd(st_mode, 61440), 32768),
+                                        GreaterThan(st_size, 0))) ThenBlock: {
+                        SysFadvise(fd)
+                        mapped = SysMmap(st_size, fd)
+                        IfCondition NotEqual(mapped, -1) ThenBlock: {
+                            matches = ProcessMapped(mapped, st_size, path, show_prefix)
+                            SysMunmap(mapped, st_size)
+                            mmap_used = 1
+                        }
+                    }
+                    IfCondition EqualTo(mmap_used, 0) ThenBlock: {
+                        matches = ProcessStream(fd, path, show_prefix)
+                    }
                     SysClose(fd)
                 }
             }
