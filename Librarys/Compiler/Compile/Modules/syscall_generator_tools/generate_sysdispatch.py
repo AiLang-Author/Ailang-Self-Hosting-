@@ -21,6 +21,7 @@ Licensed under the Sean Collins Software License (SCSL).
 """
 
 import argparse
+import sys
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -95,8 +96,23 @@ HAIKU_MAP: Dict[str, HaikuMapping] = {
     "nanosleep": HaikuMapping("_kern_snooze_etc", 196, "custom", "Very different signature"),
 }
 
-# Syscalls that don't return
-NORETURN = {"exit", "exit_group"}
+# Numbers in HAIKU_MAP above are fallbacks; the target's libroot is the truth.
+try:
+    from haiku_syscall_numbers import HAIKU_SYSCALL_NUMBERS
+    for _m in HAIKU_MAP.values():
+        if _m.haiku_name in HAIKU_SYSCALL_NUMBERS:
+            _m.haiku_num = HAIKU_SYSCALL_NUMBERS[_m.haiku_name]
+        else:
+            print(f"Warning: {_m.haiku_name} not in haiku_syscall_numbers.py", file=sys.stderr)
+except ImportError:
+    print("Warning: haiku_syscall_numbers.py not found; using built-in Haiku numbers",
+          file=sys.stderr)
+
+HAIKU_EXTRA_NUMS = {"_kern_create_area": 202}
+try:
+    HAIKU_EXTRA_NUMS["_kern_create_area"] = HAIKU_SYSCALL_NUMBERS["_kern_create_area"]
+except NameError:
+    pass
 
 # Pointer arguments (for type annotation)
 POINTER_ARGS = {
@@ -144,6 +160,7 @@ def generate_header() -> str:
 
 LibraryImport.Compiler.CodeEmit.CEmitTypes
 LibraryImport.Compiler.CodeEmit.CEmitCoreArch
+LibraryImport.Compiler.Compile.Modules.CHaikuEmit
 
 '''
 
@@ -175,51 +192,16 @@ def generate_haiku_table() -> str:
             lines.append(f'    "{const}": Initialize={mapping.haiku_num}')
             seen.add(const)
     
+    # Inline anonymous-map sequence used before the shim can run (R15 setup).
+    lines.append(f'    "CREATE_AREA": Initialize={HAIKU_EXTRA_NUMS["_kern_create_area"]}')
     lines.append("}")
     return "\n".join(lines) + "\n"
-
-def generate_arg_shuffle(transform: str, num_args: int) -> List[str]:
-    """Generate argument shuffle code for Haiku using generic Emit_MovRegReg"""
-    lines = []
-    
-    if transform == "insert_pos":
-        # read/write: insert -1 for position after fd
-        # Current: RDI=fd, RSI=buf, RDX=len
-        # Need:    RDI=fd, RSI=-1,  RDX=buf, R10=len
-        if num_args >= 3:
-            lines.append("            // Shuffle: insert -1 for position")
-            lines.append("            Emit_MovRegReg(Reg.R10, Reg.RDX)  // len -> R10")
-            lines.append("            Emit_MovRegReg(Reg.RDX, Reg.RSI)  // buf -> RDX")
-            lines.append("            Emit_MovRsiImm64(-1)              // pos = -1")
-    
-    elif transform == "insert_dirfd":
-        # open: insert -1 for dirfd at start
-        # Current: RDI=path, RSI=flags, RDX=mode
-        # Need:    RDI=-1,   RSI=path,  RDX=flags, R10=mode
-        if num_args >= 3:
-            lines.append("            // Shuffle: insert -1 for dirfd")
-            lines.append("            Emit_MovRegReg(Reg.R10, Reg.RDX)  // mode -> R10")
-            lines.append("            Emit_MovRegReg(Reg.RDX, Reg.RSI)  // flags -> RDX")
-            lines.append("            Emit_MovRegReg(Reg.RSI, Reg.RDI)  // path -> RSI")
-            lines.append("            Emit_MovRdiImm64(-1)              // dirfd = -1")
-        elif num_args == 2:
-            lines.append("            // Shuffle: insert -1 for dirfd")
-            lines.append("            Emit_MovRegReg(Reg.RDX, Reg.RSI)  // arg2 -> RDX")
-            lines.append("            Emit_MovRegReg(Reg.RSI, Reg.RDI)  // arg1 -> RSI")
-            lines.append("            Emit_MovRdiImm64(-1)              // dirfd = -1")
-        elif num_args == 1:
-            lines.append("            // Shuffle: insert -1 for dirfd")
-            lines.append("            Emit_MovRegReg(Reg.RSI, Reg.RDI)  // arg1 -> RSI")
-            lines.append("            Emit_MovRdiImm64(-1)              // dirfd = -1")
-    
-    return lines
 
 def generate_syscall_function(sc) -> str:
     """Generate a Sys_* function for a Linux syscall"""
     
     func_name = syscall_to_func_name(sc.name)
     const_name = syscall_to_const_name(sc.name)
-    noreturn = sc.name in NORETURN
     
     # NOTE: No Input declarations - these are emit-time functions
     # Caller sets up registers (RDI, RSI, RDX, R10, R8, R9) before calling
@@ -233,9 +215,6 @@ def generate_syscall_function(sc) -> str:
     else:
         arg_comment = "none"
     
-    # Check if Haiku mapping exists
-    haiku_map = HAIKU_MAP.get(sc.name)
-    
     lines = [f'''
 // =============================================================================
 // {func_name} - {sc.description}
@@ -248,36 +227,12 @@ Function.{func_name} {{
         IfCondition EqualTo(Emit.os, OS.LINUX) ThenBlock: {{
             Emit_MovRaxImm64(LinuxSys.{const_name})
             Emit_SysInstr()
-        }}''']
-    
-    # Haiku block
-    if haiku_map:
-        lines.append(f'''        // --- HAIKU ---
-        IfCondition EqualTo(Emit.os, OS.HAIKU) ThenBlock: {{''')
-        
-        if haiku_map.notes:
-            lines.append(f'            // {haiku_map.notes}')
-        
-        # Add shuffle code if needed
-        shuffle = generate_arg_shuffle(haiku_map.arg_transform, sc.num_args)
-        if shuffle:
-            lines.extend(shuffle)
-        
-        if haiku_map.arg_transform == "custom":
-            lines.append(f'            // TODO: Custom mapping needed for {sc.name}')
-            lines.append(f'            Emit_MovRaxImm64(HaikuSys.{const_name})')
-        else:
-            lines.append(f'            Emit_MovRaxImm64(HaikuSys.{const_name})')
-        
-        lines.append('            Emit_SysInstr()')
-        lines.append('        }')
-    else:
-        # No Haiku mapping - emit Linux-only warning or stub
-        lines.append(f'''        // --- HAIKU: No direct mapping ---
+        }}
+        // --- HAIKU: runtime shim translates (Librarys/Haiku/Library.HaikuRT) ---
         IfCondition EqualTo(Emit.os, OS.HAIKU) ThenBlock: {{
-            // TODO: {sc.name} has no Haiku equivalent
-            Emit_MovRaxImm64(-1)  // Return error
-        }}''')
+            Emit_MovRaxImm64(LinuxSys.{const_name})
+            Haiku_EmitShimCall()
+        }}''']
     
     lines.append('    }')
     lines.append('}')
