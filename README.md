@@ -1,224 +1,49 @@
+# AILang
 
-## Warning Compiler is unstable due to optimizations,testing in progress, please report any regressions or bugs thank you !
+**A self-hosting systems language designed for consistency, readable code, and AI-assisted development.**
 
-# AILang Self-Hosting Repository
+AILang is built around a deliberate trade-off: a constrained syntax with a rich set of primitives. Rather than accumulating many special cases, language constructs follow consistent shapes—from primitive arguments to functions and subroutines. The result is code intended to be easy to scan, search with tools like `grep`, generate with AI, and understand in human–AI pair programming.
 
-Welcome to the **AILang Programming Language** — a self-hosted compiler featuring explicit syntax, code efficiency, and a growing systems programming ecosystem.
+The language is not only a proposal: its compiler is written in AILang and compiles AILang programs to native code. The project is working toward **version 1.0.0, targeted for December 31, 2026**.
 
-## Compiler Optimizations implemented for compiled code  !!!!!
+## Why AILang
 
-Read here :>  (https://github.com/AiLang-Author/Ailang-Self-Hosting-/tree/master/docs/benchmarks/shapes)
+- **Consistency over syntax variety.** Primitives, arguments, functions, and subroutines follow coherent conventions, reducing the number of forms a reader or code-generation tool needs to learn.
+- **A constrained language with substantial primitives.** Keep the surface syntax deliberate while providing reusable capabilities for practical systems code.
+- **Designed to be read and searched.** Clear, regular code is easier to skim, inspect, and navigate with ordinary tools—including `grep`.
+- **Built for human and AI collaboration.** Predictable structure supports code generation and review without giving up human readability.
+- **Systems programming with a self-hosting compiler.** AILang is statically typed and compiles to native code; the compiler itself is implemented in AILang.
 
-AILANG is designed to reduce unnecessary abstraction layers. The compiler is new, but the language structure eliminates most of the reasons C++ compilers have to work so hard: no header bloat, explicit register homes, predictable memory layouts, no implicit overhead. When the program is simpler, the compiler can be simpler too. 
+## Performance
 
-## Overview
+AILang's compiler and generated code are being optimized continuously. Project benchmarks show performance competitive with GCC `-O3` on a number of measured workloads, with results varying by program and workload. See the [benchmark results](docs/benchmarks/shapes) for the measurements and test details.
 
-**Repo layout:** see [`WORKSPACE.md`](WORKSPACE.md). **Docs:** [`docs/README.md`](docs/README.md). **AMD GPU driver kit:** [`dev/amdgpu/`](dev/amdgpu/).
+Performance claims should be read in the context of those specific benchmarks—not as a guarantee that every AILang program matches GCC. The goal is to keep improving generated code while retaining the language's emphasis on explicit, readable structure.
 
-The OS userspace is [Ailang-OS](https://github.com/AiLang-Author/Ailang-OS). Clone it next to this tree. `OS`, `docs/aos`, `board/ailang_os`, `Design-Language- Refrence`, `config`, `app_icons`, `app_icons_tvg`, `boot`, `build_image.sh`, `run_aos.sh`, `deploy.sh`, and `CONTRIBUTING.md` are symlinks into that checkout. `tools/screenshot.sh` and `tools/bundle_foreign.py` are too.
+## What it can express
 
-### Key Components
+AILang is intended to span a broad range of programs: from a small “Hello, world!” to substantial systems software. The repository includes a self-hosted compiler, reusable libraries, command-line utilities, and larger projects such as a custom CAD kernel and an OS runtime layer running on the Linux kernel. These projects are at different stages of development; see their own documentation for current status.
 
-- **Self-hosted compiler** (3 MB) — Includes complete x86 instruction library (10k instructions), inline assembly support, and optimized code generation
-- **57 POSIX CoreUtils** — Unix utility implementations with custom regex engine
-- **Windowing system & desktop environment** (800 KB) — Full-featured display server with window manager, compositor, and UI framework; runs on the Linux kernel (in development)
-- **CAD system** — Native 3D design and modeling tools (in active development)
-- **Web browser** — JavaScript JVM (~69% test262 compliance), HTML/CSS in development
-- **Vulkan API library** — Vulkan 1.1 support for graphics and compute workloads (in development)
-- **GPU computing** — Native GCN driver with support for legacy cards (GCN 1.0+, in development)
-- **Motion control library** — CNC machine programming and trajectory planning (in development)
-- **Hardware driver ecosystem** — Memryx MX3 accelerator, generic device drivers (in development)
-- **Multi-architecture IR backend** — x86_64 production-ready; ARM, RISC-V in development
+## Try AILang
 
-## Quick Start
-
-### Installation
+Compile a source file with the compiler:
 
 ```bash
-sudo ./install_compiler.sh [install-dir]
+./ailang.x path/to/program.ailang
 ```
 
-Default install directory: `/usr/local/bin`. Uses symlinks for zero-rebuild installation overhead.
+For installation, options, and compiler commands, see [`install_compiler.sh`](install_compiler.sh) and the [compiler documentation](docs/README.md).
 
-To uninstall:
-```bash
-sudo rm /usr/local/bin/ailang.x /usr/local/bin/analyzer.x
-```
+Start learning with the [programming manuals](Programming_Manual/) and browse the [demo programs](Demo%20Programs/). The [workspace guide](WORKSPACE.md) describes the repository layout.
 
-### Install AILang CoreUtils
+## Project status
 
-```bash
-cd AiLang_CoreUtils
-./install_ailang_utils.sh
-./bench_all_utils.sh  # Compare against GNU
-```
+AILang is under active development. The compiler, language, libraries, and example systems are evolving; expect incomplete features and occasional regressions. The project is progressing toward its **December 31, 2026** version 1.0.0 target. Check the relevant project documentation and tests for the current state of individual components.
 
-## Learning AILang
+## License
 
-- **26 Programming Manuals** — Step-by-step guides in `Programming_Manual/`
-- **150+ Demo Programs** — Runnable examples in `Demo Programs/`
-- **Getting Started:** Read `Programming_Manual/01_Introduction_to_Ailang.md`
-
-## Language Features
-
-### Design
-- **Verb-first syntax** — Natural language-inspired, every operation is explicit
-- **No operator precedence** — Eliminates hidden behavior
-- **Static typing** — Compile-time checking with inference
-- **Direct code generation** — Compiles to machine code via custom IR
-- **LLM-friendly semantics** — Designed for AI code generation workflows Human pair programming
-
-### Performance
-- **22 built-in string methods** — Most SSE2-optimized
-- **SSE2 function library** — Vectorized operations
-- **Direct syscalls** — Minimal abstraction
-- **Smart optimizer** — Lean, efficient code generation
-- **Inline assembly** — Direct assembly integration in AILang code
-
-## Compiler Development
-
-The compiler is actively developed with ongoing improvements:
-
-- **Code Generation** — Continuous optimization of emitted machine code
-- **Performance Tuning** — Refinements to compilation speed and output quality
-- **x86 Instruction Support** — Complete 10k instruction library with full encoding/emit capabilities
-- **Assembly Listings** — `-asm` / `-asm-all` emit source-annotated disassembly beside the binary
-- **Tree Shaking** — `-TS` prunes unreachable functions from the final executable
-- **HDL to Verilog Synthesis** — Early-stage hardware description language compilation for hardware development
-
-## 57 POSIX CoreUtils
-
-Production-grade Unix utilities, 50-71% smaller than GNU equivalents:
-
-**Text Processing:** grep, sed, awk, cut, sort, uniq, head, tail, wc, tr, fold, paste, nl
-**File Operations:** cat, cp, mv, rm, mkdir, find, ls, file, touch, ln
-**System Info:** pwd, whoami, id, uname, env, printenv, date, uptime, df
-**Data Processing:** diff, patch, cmp, od, xxd, base64, md5sum, sha256sum, tee, yes, seq
-**Output:** echo, printf, less, more, col, expand, unexpand
-**Advanced:** tar, gzip, gunzip, zip, unzip, basename, dirname, which, true, false, sleep
-
-## Repository Structure
-
-```
-.
-├── ailang.x                      # Self-hosted compiler
-├── analyzer.x                    # Static analyzer
-├── Main.ailang                   # Display server & windowing system
-├── ailang_cli.ailang             # CLI
-├── ailang_console.ailang         # REPL
-├── ailang_lsp.ailang             # Language server
-├── Librarys/                     # Standard library
-│   ├── Arena/                    # Memory allocator
-│   ├── Arrays/                   # Array utilities
-│   ├── Strings/                  # 22 string methods
-│   ├── Display/                  # Windowing & UI
-│   ├── GPU/                      # GPU computing
-│   ├── Vulkan/                   # Vulkan 1.1 graphics API
-│   ├── Motion/                   # CNC control
-│   ├── Hardware/                 # Device drivers
-│   ├── CAD/                      # CAD system
-│   └── KeyMap/, TextBuffer/
-├── AiLang_CoreUtils/             # 57 POSIX utilities
-├── Programming_Manual/           # 26 guides
-├── Demo Programs/                # 150+ examples
-├── Browser/                      # Web browser
-├── GPU/                          # GPU driver
-├── Motion/                       # Motion control
-├── Hardware/                     # Hardware integration
-├── CAD/                          # CAD system
-├── IR-Backend/                   # Multi-arch IR
-├── Tests/                        # Test suite
-├── vscode-extension/             # VS Code plugin
-├── Docs/                         # Documentation
-├── Media/, fonts/, icons/        # Assets
-├── License.md                    # SCSL v1.0
-├── TEST_ODDITIES.md              # Known issues
-└── smoke_ailang_utils.sh         # Smoke tests
-```
-
-## Building & Compilation
-
-Compile AILang source:
-```bash
-ailang.x your_program.ailang
-```
-
-Emit an annotated assembly listing alongside the binary:
-```bash
-ailang.x -asm your_program.ailang        # program functions only
-ailang.x -asm-all your_program.ailang    # includes library bodies
-```
-
-Tree-shake dead code (emit only functions reachable from the program):
-```bash
-ailang.x -TS your_program.ailang
-```
-
-### VS Code Integration
-- `Ctrl+Shift+B` — Compile
-- `F5` — Compile and run
-- `Ctrl+Shift+A` — Static analysis
-
-## Testing
-
-```bash
-./smoke_ailang_utils.sh          # Run smoke tests
-ailang.x Test262Harness.ailang   # ECMAScript compliance
-```
-
-See `TEST_ODDITIES.md` for known issues.
-
-## Documentation
-
-- **Programming Manual (26 guides)** — `Programming_Manual/`
-- **Demo Programs (150+)** — `Demo Programs/`
-- **CoreUtils Docs** — `AiLang_CoreUtils/README.md`
-- **Language Spec** — `Language Docs BNF grammar etc/`
-- **Library Reference** — `Library Manuals/`
-
-## Licensing
-
-### Main Project
-**Sean Collins Software License (SCSL v1.0)**
-- Free for personal/academic use (non-commercial)
-- Commercial use requires paid license: `smc.collins1977@gmail.com`
-- Forking/redistribution prohibited
-- No warranty
-
-See `License.md` for full terms.
-
-### VS Code Extension
-**MIT License** (separate from compiler)
-
-## Development Status
-
-This is an active development repository. Most components are under active debugging and feature completeness evaluation:
-
-- **Compiler:** 3 MB, includes complete x86 instruction library and inline assembly support
-- **Windowing System:** 800 KB, full OS layer on Linux kernel (in development)
-- **CAD System:** 3D design and modeling tools (in active development)
-- **Browser:** JavaScript JVM and HTML/CSS parser (in development)
-- **Vulkan API:** Vulkan 1.1 library (in development)
-- **GPU Computing:** GCN driver support (in development)
-- **Motion Control:** CNC programming library (in development)
-- **CoreUtils:** 57 utilities (in development)
-- **Libraries:** In `Librarys/`, auto-discovered at runtime
-
-### Contributing
-Modifications must be submitted upstream per SCSL. See module READMEs for guidelines.
-
-## Support & Contact
-
-- **License inquiries:** `smc.collins1977@gmail.com`
-- **Learning:** Start with `Programming_Manual/01_Introduction_to_Ailang.md`
-- **Examples:** Browse `Demo Programs/`
-- **CoreUtils:** See `AiLang_CoreUtils/README.md`
-- **Issues:** See `Plans/` directory
+The main project is distributed under the [Sean Collins Software License (SCSL v1.0)](License.md). Review the license before using or redistributing the project. The VS Code extension has a separate MIT license.
 
 ---
 
-**AILang** — A self-hosted systems programming language built from the ground up for AI-assisted development, with an actively expanding ecosystem including a complete desktop environment, CAD system, and comprehensive graphics APIs. All components are under active development and debugging.
-
-Built for performance. Built for clarity. Built entirely in itself. Built for AI.
-
-*Last updated: October 2026*
+**AILang: consistent syntax, capable primitives, native systems code.**
