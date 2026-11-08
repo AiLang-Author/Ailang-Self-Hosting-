@@ -2,7 +2,8 @@
 // X86-64 SSE2 memory operation compilation
 // Location: Librarys/Compiler/Compile/FPU/X86/Library.FPUCompileX86MemOps.ailang
 //
-// Compiles MemorySet, MemoryCopy, MemCompare, MemChr with SSE2 acceleration
+// Compiles MemorySet, MemoryCopy, MemCompare, MemChr, MemMem,
+// MemMemFold with SSE2 acceleration
 // Falls back to scalar for <16 byte remainder
 //
 // Copyright (c) 2025-2026 Sean Collins, 2 Paws Machine and Engineering. All rights reserved.
@@ -51,6 +52,16 @@ Function.FPUCompileX86MemOps_TryCompile {
         cmp = StringCompare(func_name, "MemChr")
         IfCondition EqualTo(cmp, 0) ThenBlock: {
             ReturnValue(FPUCompileX86_MemChr(node))
+        }
+
+        cmp = StringCompare(func_name, "MemMem")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue(FPUCompileX86_MemScan(node, 0))
+        }
+
+        cmp = StringCompare(func_name, "MemMemFold")
+        IfCondition EqualTo(cmp, 0) ThenBlock: {
+            ReturnValue(FPUCompileX86_MemScan(node, 1))
         }
         
         ReturnValue(0)
@@ -504,6 +515,626 @@ Function.FPUCompileX86_MemChr {
         // === DONE ===
         Emit_MarkLabel(done_label)
         
+        ReturnValue(1)
+    }
+}
+
+// ASCII A-Z to a-z. AL in, AL out.
+Function.FPUEmit_FoldAL {
+    Body: {
+        skip = Emit_CreateLabel()
+        Trans_Asm("CMP al, 65")
+        Emit_Jb(skip)
+        Trans_Asm("CMP al, 90")
+        Emit_Ja(skip)
+        Trans_Asm("OR al, 32")
+        Emit_MarkLabel(skip)
+        ReturnValue(0)
+    }
+}
+
+// xmm1 raw bytes. xmm5 is '@', xmm6 is '[', xmm7 is 0x20.
+// Folded bytes land in xmm4. Clobbers xmm3.
+Function.FPUEmit_FoldXmm1 {
+    Body: {
+        Trans_Asm("MOVDQA xmm4, xmm1")
+        Trans_Asm("MOVDQA xmm3, xmm5")
+        Trans_Asm("PCMPGTB xmm4, xmm3")
+        Trans_Asm("MOVDQA xmm3, xmm6")
+        Trans_Asm("PCMPGTB xmm3, xmm1")
+        Trans_Asm("PAND xmm4, xmm3")
+        Trans_Asm("PAND xmm4, xmm7")
+        Trans_Asm("POR xmm4, xmm1")
+        ReturnValue(0)
+    }
+}
+
+// which 0 broadcasts EAX into xmm0. Any other value broadcasts into xmm2.
+Function.FPUEmit_BroadcastNeedle {
+    Input: which: Integer
+    Body: {
+        IfCondition EqualTo(which, 0) ThenBlock: {
+            X86_BroadcastAL_XMM0()
+        } ElseBlock: {
+            Trans_Asm("MOVD xmm2, eax")
+            Trans_Asm("PUNPCKLBW xmm2, xmm2")
+            Trans_Asm("PSHUFLW xmm2, xmm2, 0")
+            Trans_Asm("PSHUFD xmm2, xmm2, 0")
+        }
+        ReturnValue(0)
+    }
+}
+
+// MemMem(hay, haylen, needle, needlen) -> first offset, or -1.
+// MemMemFold is the same search with ASCII A-Z folded to a-z.
+// An empty needle returns 0. A candidate is checked in this loop, so
+// the caller is not re-entered on a false first byte.
+Function.FPUCompileX86_MemScan {
+    Input: node: Address
+    Input: fold: Integer
+    Output: Integer
+    Body: {
+        arg_count = AST_GetChildCount(node)
+        IfCondition NotEqual(arg_count, 4) ThenBlock: {
+            PrintMessage("[FPU] MemMem requires 4 arguments\n")
+            ReturnValue(0)
+        }
+
+        arg0 = AST_GetChild(node, 0)
+        arg1 = AST_GetChild(node, 1)
+        arg2 = AST_GetChild(node, 2)
+        arg3 = AST_GetChild(node, 3)
+
+        ret0 = Emit_CreateLabel()
+        not_found = Emit_CreateLabel()
+        done_label = Emit_CreateLabel()
+        one_byte = Emit_CreateLabel()
+        one_loop = Emit_CreateLabel()
+        one_scalar = Emit_CreateLabel()
+        one_sloop = Emit_CreateLabel()
+        one_hit = Emit_CreateLabel()
+        one_at = Emit_CreateLabel()
+        pref = Emit_CreateLabel()
+        pref_step = Emit_CreateLabel()
+        sse = Emit_CreateLabel()
+        vec_loop = Emit_CreateLabel()
+        fast = Emit_CreateLabel()
+        step15 = Emit_CreateLabel()
+        vec_advance = Emit_CreateLabel()
+        vec_hit = Emit_CreateLabel()
+        verify = Emit_CreateLabel()
+        vec_found = Emit_CreateLabel()
+        vfail = Emit_CreateLabel()
+        scalar = Emit_CreateLabel()
+        sloop = Emit_CreateLabel()
+        scalar_ok = Emit_CreateLabel()
+        snext = Emit_CreateLabel()
+        cap_ok = Emit_CreateLabel()
+        plant = Emit_CreateLabel()
+        plant_small = Emit_CreateLabel()
+        plant_store = Emit_CreateLabel()
+        hp = Emit_CreateLabel()
+        hp_one = Emit_CreateLabel()
+        hp_fast = Emit_CreateLabel()
+        hp_hit = Emit_CreateLabel()
+        hp_shift = Emit_CreateLabel()
+        hp_verify = Emit_CreateLabel()
+        hp_found = Emit_CreateLabel()
+        hp_vfail = Emit_CreateLabel()
+        hp_miss = Emit_CreateLabel()
+        hp_leave = Emit_CreateLabel()
+
+        Compile_Expression(arg3)
+        Emit_PushRax()
+        Compile_Expression(arg2)
+        Emit_PushRax()
+        Compile_Expression(arg1)
+        Emit_PushRax()
+        Compile_Expression(arg0)
+        Emit_PushRax()
+
+        Emit_PopRdi()
+        Emit_PopRcx()
+        Emit_PopRsi()
+        Emit_PopRdx()
+
+        Trans_Asm("TEST rdx, rdx")
+        Emit_Jle(ret0)
+        Trans_Asm("CMP rcx, rdx")
+        Emit_Jb(not_found)
+
+        Trans_Asm("MOV r8, rdi")
+        Trans_Asm("MOV r10, rdx")
+        Trans_Asm("MOV r9, rsi")
+        Trans_Asm("CMP r10, 1")
+        Emit_Je(one_byte)
+
+        // Needlen >= 2. Park haylen and needlen-1. xmm2 stays the
+        // anchor distance for both searches. Fold never writes xmm2.
+        Trans_Asm("MOVQ xmm4, rcx")
+        Trans_Asm("MOV rax, r10")
+        Trans_Asm("DEC rax")
+        Trans_Asm("MOVQ xmm2, rax")
+        // Horspool's skip lost the 16MB miss and does not fire for a
+        // short word. The live search is the one-load pair filter.
+        Emit_Jmp(sse)
+
+        // Anchor is the last needle byte. rdx becomes its Horspool
+        // shift: needlen if the byte is new, else the distance back
+        // to its rightmost earlier copy. Shift 1 is the usual case
+        // for a word ("error" has 'r' again), and a scalar skip of 1
+        // loses to a streaming scan. Horspool runs only when that
+        // shift is at least 4 and the needle is at least 8 bytes.
+        Trans_Asm("MOV rsi, r9")
+        Trans_Asm("ADD rsi, r10")
+        Trans_Asm("DEC rsi")
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("MOV r11, rax")
+        FPUEmit_BroadcastNeedle(0)
+
+        Trans_Asm("MOV rdx, r10")
+        Trans_Asm("MOV rsi, r9")
+        Trans_Asm("MOV rcx, r10")
+        Trans_Asm("DEC rcx")
+        Emit_MarkLabel(pref)
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("CMP rax, r11")
+        Emit_Jne(pref_step)
+        Trans_Asm("MOV rdx, rcx")
+        Emit_MarkLabel(pref_step)
+        Trans_Asm("INC rsi")
+        Trans_Asm("DEC rcx")
+        Emit_Jne(pref)
+
+        Trans_Asm("CMP r10, 8")
+        Emit_Jb(sse)
+        Trans_Asm("CMP rdx, 4")
+        Emit_Jb(sse)
+
+        // Classic Horspool. 256-byte shift table under rsp. The last
+        // needle byte is not planted, so its shift stays at the
+        // default and the search cannot store a 0. rsp is not a scan
+        // home. One ADD rsp matches this SUB on both exits.
+        Trans_Asm("SUB rsp, 256")
+        Trans_Asm("MOV eax, 255")
+        Trans_Asm("MOVQ xmm3, rax")
+        Trans_Asm("MOVQ xmm5, r11")
+        Trans_Asm("MOV rax, r10")
+        Trans_Asm("MOVQ rdx, xmm3")
+        Trans_Asm("CMP rax, rdx")
+        Emit_Jb(cap_ok)
+        Trans_Asm("MOV rax, rdx")
+        Emit_MarkLabel(cap_ok)
+        Trans_Asm("MOV rdi, rsp")
+        Trans_Asm("MOV ecx, 256")
+        X86_RepStosb()
+
+        Trans_Asm("MOV rsi, r9")
+        Trans_Asm("MOV rcx, r10")
+        Trans_Asm("DEC rcx")
+        Emit_MarkLabel(plant)
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("MOV r11, rsp")
+        Trans_Asm("ADD r11, rax")
+        Trans_Asm("MOVQ rdx, xmm3")
+        Trans_Asm("CMP rcx, rdx")
+        Emit_Jb(plant_small)
+        Emit_Jmp(plant_store)
+        Emit_MarkLabel(plant_small)
+        Trans_Asm("MOV rdx, rcx")
+        Emit_MarkLabel(plant_store)
+        X86_MovByteDerefR11_DL()
+        Trans_Asm("INC rsi")
+        Trans_Asm("DEC rcx")
+        Emit_Jne(plant)
+
+        Trans_Asm("MOVQ rdx, xmm5")
+        Trans_Asm("MOV rdi, r8")
+        Trans_Asm("ADD rdi, r10")
+        Trans_Asm("DEC rdi")
+        Trans_Asm("MOVQ rcx, xmm4")
+        Trans_Asm("ADD rcx, r8")
+
+        Emit_MarkLabel(hp)
+        Trans_Asm("CMP rdi, rcx")
+        Emit_Jae(hp_miss)
+        IfCondition EqualTo(fold, 0) ThenBlock: {
+            Trans_Asm("MOV rax, rcx")
+            Trans_Asm("SUB rax, rdi")
+            Trans_Asm("CMP rax, 2048")
+            Emit_Jae(hp_fast)
+        }
+        Emit_MarkLabel(hp_one)
+        X86_MovzxEAX_ByteDerefRDI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("CMP eax, edx")
+        Emit_Jne(hp_shift)
+        Emit_MarkLabel(hp_hit)
+        Trans_Asm("MOV rsi, rdi")
+        Trans_Asm("MOVQ rax, xmm2")
+        Trans_Asm("SUB rsi, rax")
+        Trans_Asm("MOVQ xmm4, rdi")
+        Trans_Asm("MOVQ xmm1, r10")
+        Trans_Asm("MOV rdi, r9")
+
+        Emit_MarkLabel(hp_verify)
+        Trans_Asm("TEST r10, r10")
+        Emit_Je(hp_found)
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("MOV r11, rax")
+        X86_MovzxEAX_ByteDerefRDI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("CMP r11, rax")
+        Emit_Jne(hp_vfail)
+        Trans_Asm("INC rsi")
+        Trans_Asm("INC rdi")
+        Trans_Asm("DEC r10")
+        Emit_Jmp(hp_verify)
+
+        Emit_MarkLabel(hp_found)
+        Trans_Asm("MOVQ r10, xmm1")
+        Trans_Asm("MOV rax, rsi")
+        Trans_Asm("SUB rax, r10")
+        Trans_Asm("SUB rax, r8")
+        Emit_Jmp(hp_leave)
+
+        Emit_MarkLabel(hp_vfail)
+        Trans_Asm("MOVQ rdi, xmm4")
+        Trans_Asm("MOVQ r10, xmm1")
+        Trans_Asm("MOVQ rdx, xmm5")
+        X86_MovzxEAX_ByteDerefRDI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+
+        Emit_MarkLabel(hp_shift)
+        X86_MovzxEaxByteRspPlusRax()
+        Trans_Asm("ADD rdi, rax")
+        Emit_Jmp(hp)
+
+        IfCondition EqualTo(fold, 0) ThenBlock: {
+            Emit_MarkLabel(hp_fast)
+            step = 0
+            WhileLoop LessThan(step, 8) {
+                X86_MovzxEAX_ByteDerefRDI()
+                Trans_Asm("CMP eax, edx")
+                Emit_Je(hp_hit)
+                X86_MovzxEaxByteRspPlusRax()
+                Trans_Asm("ADD rdi, rax")
+                step = Add(step, 1)
+            }
+            Emit_Jmp(hp)
+        }
+
+        Emit_MarkLabel(hp_miss)
+        Emit_MovRaxNeg1()
+        Emit_MarkLabel(hp_leave)
+        Trans_Asm("ADD rsp, 256")
+        Emit_Jmp(done_label)
+
+        // One load per window. PSRLDQ checks needle[0],needle[1] at
+        // bytes 0..14. Bit 15 is the zero shifted in, so it is masked
+        // off; the next window starts 15 bytes later and covers it.
+        // Four windows (60 bytes) run before the branch. A hit drops
+        // into the single-window loop, which returns here after one step.
+        Emit_MarkLabel(sse)
+        Emit_MarkLabel(vec_loop)
+        Trans_Asm("MOVQ rcx, xmm4")
+        Trans_Asm("MOV rdi, r8")
+        Trans_Asm("MOV rsi, r9")
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        FPUEmit_BroadcastNeedle(0)
+        Trans_Asm("INC rsi")
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        FPUEmit_BroadcastNeedle(2)
+
+        IfCondition EqualTo(fold, 1) ThenBlock: {
+            Trans_Asm("MOV eax, 64")
+            Trans_Asm("MOVD xmm5, eax")
+            Trans_Asm("PUNPCKLBW xmm5, xmm5")
+            Trans_Asm("PSHUFLW xmm5, xmm5, 0")
+            Trans_Asm("PSHUFD xmm5, xmm5, 0")
+            Trans_Asm("MOV eax, 91")
+            Trans_Asm("MOVD xmm6, eax")
+            Trans_Asm("PUNPCKLBW xmm6, xmm6")
+            Trans_Asm("PSHUFLW xmm6, xmm6, 0")
+            Trans_Asm("PSHUFD xmm6, xmm6, 0")
+            Trans_Asm("MOV eax, 32")
+            Trans_Asm("MOVD xmm7, eax")
+            Trans_Asm("PUNPCKLBW xmm7, xmm7")
+            Trans_Asm("PSHUFLW xmm7, xmm7, 0")
+            Trans_Asm("PSHUFD xmm7, xmm7, 0")
+        }
+
+        Emit_MarkLabel(fast)
+        Trans_Asm("CMP rcx, r10")
+        Emit_Jb(not_found)
+        Trans_Asm("CMP rcx, 61")
+        Emit_Jb(step15)
+        IfCondition EqualTo(fold, 0) ThenBlock: {
+            X86_MOVDQU_XMM1_DerefRDI()
+            X86_MOVDQU_XMM3_RdiDisp(15)
+            X86_MOVDQU_XMM4_RdiDisp(30)
+            X86_MOVDQU_XMM5_RdiDisp(45)
+            Trans_Asm("MOVDQA xmm6, xmm1")
+            X86_Psrldq1_Xmm6()
+            Trans_Asm("PCMPEQB xmm1, xmm0")
+            Trans_Asm("PCMPEQB xmm6, xmm2")
+            Trans_Asm("PAND xmm1, xmm6")
+            Trans_Asm("MOVDQA xmm6, xmm3")
+            X86_Psrldq1_Xmm6()
+            Trans_Asm("PCMPEQB xmm3, xmm0")
+            Trans_Asm("PCMPEQB xmm6, xmm2")
+            Trans_Asm("PAND xmm3, xmm6")
+            Trans_Asm("POR xmm1, xmm3")
+            Trans_Asm("MOVDQA xmm6, xmm4")
+            X86_Psrldq1_Xmm6()
+            Trans_Asm("PCMPEQB xmm4, xmm0")
+            Trans_Asm("PCMPEQB xmm6, xmm2")
+            Trans_Asm("PAND xmm4, xmm6")
+            Trans_Asm("POR xmm1, xmm4")
+            Trans_Asm("MOVDQA xmm6, xmm5")
+            X86_Psrldq1_Xmm6()
+            Trans_Asm("PCMPEQB xmm5, xmm0")
+            Trans_Asm("PCMPEQB xmm6, xmm2")
+            Trans_Asm("PAND xmm5, xmm6")
+            Trans_Asm("POR xmm1, xmm5")
+            Trans_Asm("PMOVMSKB eax, xmm1")
+            Trans_Asm("AND eax, 32767")
+            Trans_Asm("TEST eax, eax")
+        } ElseBlock: {
+            Trans_Asm("XOR rax, rax")
+            Trans_Asm("MOV rdx, rax")
+            X86_MOVDQU_XMM1_DerefRDI()
+            FPUEmit_FoldXmm1()
+            Trans_Asm("MOVDQA xmm3, xmm4")
+            X86_Psrldq1_Xmm3()
+            Trans_Asm("PCMPEQB xmm4, xmm0")
+            Trans_Asm("PCMPEQB xmm3, xmm2")
+            Trans_Asm("PAND xmm4, xmm3")
+            Trans_Asm("PMOVMSKB eax, xmm4")
+            Trans_Asm("AND eax, 32767")
+            Trans_Asm("OR rdx, rax")
+            X86_MOVDQU_XMM1_RdiDisp(15)
+            FPUEmit_FoldXmm1()
+            Trans_Asm("MOVDQA xmm3, xmm4")
+            X86_Psrldq1_Xmm3()
+            Trans_Asm("PCMPEQB xmm4, xmm0")
+            Trans_Asm("PCMPEQB xmm3, xmm2")
+            Trans_Asm("PAND xmm4, xmm3")
+            Trans_Asm("PMOVMSKB eax, xmm4")
+            Trans_Asm("AND eax, 32767")
+            Trans_Asm("OR rdx, rax")
+            X86_MOVDQU_XMM1_RdiDisp(30)
+            FPUEmit_FoldXmm1()
+            Trans_Asm("MOVDQA xmm3, xmm4")
+            X86_Psrldq1_Xmm3()
+            Trans_Asm("PCMPEQB xmm4, xmm0")
+            Trans_Asm("PCMPEQB xmm3, xmm2")
+            Trans_Asm("PAND xmm4, xmm3")
+            Trans_Asm("PMOVMSKB eax, xmm4")
+            Trans_Asm("AND eax, 32767")
+            Trans_Asm("OR rdx, rax")
+            X86_MOVDQU_XMM1_RdiDisp(45)
+            FPUEmit_FoldXmm1()
+            Trans_Asm("MOVDQA xmm3, xmm4")
+            X86_Psrldq1_Xmm3()
+            Trans_Asm("PCMPEQB xmm4, xmm0")
+            Trans_Asm("PCMPEQB xmm3, xmm2")
+            Trans_Asm("PAND xmm4, xmm3")
+            Trans_Asm("PMOVMSKB eax, xmm4")
+            Trans_Asm("AND eax, 32767")
+            Trans_Asm("OR rdx, rax")
+            Trans_Asm("TEST rdx, rdx")
+        }
+        Emit_Jne(step15)
+        Trans_Asm("ADD rdi, 60")
+        Trans_Asm("SUB rcx, 60")
+        Emit_Jmp(fast)
+
+        Emit_MarkLabel(step15)
+        Trans_Asm("CMP rcx, r10")
+        Emit_Jb(not_found)
+        Trans_Asm("CMP rcx, 16")
+        Emit_Jb(scalar)
+        X86_MOVDQU_XMM1_DerefRDI()
+        IfCondition EqualTo(fold, 1) ThenBlock: {
+            FPUEmit_FoldXmm1()
+            Trans_Asm("MOVDQA xmm3, xmm4")
+            X86_Psrldq1_Xmm3()
+            Trans_Asm("PCMPEQB xmm4, xmm0")
+            Trans_Asm("PCMPEQB xmm3, xmm2")
+            Trans_Asm("PAND xmm4, xmm3")
+            Trans_Asm("PMOVMSKB eax, xmm4")
+        } ElseBlock: {
+            Trans_Asm("MOVDQA xmm6, xmm1")
+            X86_Psrldq1_Xmm6()
+            Trans_Asm("PCMPEQB xmm1, xmm0")
+            Trans_Asm("PCMPEQB xmm6, xmm2")
+            Trans_Asm("PAND xmm1, xmm6")
+            Trans_Asm("PMOVMSKB eax, xmm1")
+        }
+        Trans_Asm("AND eax, 32767")
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(vec_hit)
+
+        Emit_MarkLabel(vec_advance)
+        Trans_Asm("ADD rdi, 15")
+        Trans_Asm("SUB rcx, 15")
+        Emit_Jmp(fast)
+
+        Emit_MarkLabel(vec_hit)
+        Trans_Asm("BSF edx, eax")
+        Trans_Asm("MOV r11, rcx")
+        Trans_Asm("SUB r11, rdx")
+        Trans_Asm("CMP r11, r10")
+        Emit_Jb(vec_advance)
+        Trans_Asm("MOV r11, rdx")
+        Trans_Asm("SHL r11, 32")
+        Trans_Asm("OR rax, r11")
+        Trans_Asm("MOVQ xmm4, rax")
+        Trans_Asm("MOVQ xmm1, r10")
+        Trans_Asm("MOV rsi, rdi")
+        Trans_Asm("ADD rsi, rdx")
+        Trans_Asm("MOV rdi, r9")
+
+        Emit_MarkLabel(verify)
+        Trans_Asm("TEST r10, r10")
+        Emit_Je(vec_found)
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("MOV r11b, al")
+        X86_MovzxEAX_ByteDerefRDI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("CMP r11b, al")
+        Emit_Jne(vfail)
+        Trans_Asm("INC rsi")
+        Trans_Asm("INC rdi")
+        Trans_Asm("DEC r10")
+        Emit_Jmp(verify)
+
+        Emit_MarkLabel(vec_found)
+        Trans_Asm("MOVQ r10, xmm1")
+        Trans_Asm("MOV rax, rsi")
+        Trans_Asm("SUB rax, r10")
+        Trans_Asm("SUB rax, r8")
+        Emit_Jmp(done_label)
+
+        Emit_MarkLabel(vfail)
+        Trans_Asm("MOVQ rax, xmm1")
+        Trans_Asm("SUB rax, r10")
+        Trans_Asm("MOV rdi, rsi")
+        Trans_Asm("SUB rdi, rax")
+        Trans_Asm("MOVQ rax, xmm4")
+        Trans_Asm("MOV rdx, rax")
+        Trans_Asm("SHR rdx, 32")
+        Trans_Asm("SUB rdi, rdx")
+        Trans_Asm("MOVQ r10, xmm1")
+        Trans_Asm("BTR eax, edx")
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(vec_hit)
+        Emit_Jmp(vec_advance)
+
+        Emit_MarkLabel(scalar)
+        Trans_Asm("CMP rcx, r10")
+        Emit_Jb(not_found)
+        Trans_Asm("MOVQ xmm1, r10")
+        Trans_Asm("MOV rsi, rdi")
+        Trans_Asm("MOV rdi, r9")
+
+        Emit_MarkLabel(sloop)
+        Trans_Asm("TEST r10, r10")
+        Emit_Je(scalar_ok)
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("MOV r11b, al")
+        X86_MovzxEAX_ByteDerefRDI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("CMP r11b, al")
+        Emit_Jne(snext)
+        Trans_Asm("INC rsi")
+        Trans_Asm("INC rdi")
+        Trans_Asm("DEC r10")
+        Emit_Jmp(sloop)
+
+        Emit_MarkLabel(scalar_ok)
+        Trans_Asm("MOVQ r10, xmm1")
+        Trans_Asm("MOV rax, rsi")
+        Trans_Asm("SUB rax, r10")
+        Trans_Asm("SUB rax, r8")
+        Emit_Jmp(done_label)
+
+        Emit_MarkLabel(snext)
+        Trans_Asm("MOVQ rax, xmm1")
+        Trans_Asm("SUB rax, r10")
+        Trans_Asm("MOV rdi, rsi")
+        Trans_Asm("SUB rdi, rax")
+        Trans_Asm("MOVQ r10, xmm1")
+        Trans_Asm("INC rdi")
+        Trans_Asm("DEC rcx")
+        Emit_Jmp(scalar)
+
+        Emit_MarkLabel(one_byte)
+        Trans_Asm("MOV rsi, r9")
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("MOV r11d, eax")
+        FPUEmit_BroadcastNeedle(0)
+        IfCondition EqualTo(fold, 1) ThenBlock: {
+            Trans_Asm("MOV eax, 64")
+            Trans_Asm("MOVD xmm5, eax")
+            Trans_Asm("PUNPCKLBW xmm5, xmm5")
+            Trans_Asm("PSHUFLW xmm5, xmm5, 0")
+            Trans_Asm("PSHUFD xmm5, xmm5, 0")
+            Trans_Asm("MOV eax, 91")
+            Trans_Asm("MOVD xmm6, eax")
+            Trans_Asm("PUNPCKLBW xmm6, xmm6")
+            Trans_Asm("PSHUFLW xmm6, xmm6, 0")
+            Trans_Asm("PSHUFD xmm6, xmm6, 0")
+            Trans_Asm("MOV eax, 32")
+            Trans_Asm("MOVD xmm7, eax")
+            Trans_Asm("PUNPCKLBW xmm7, xmm7")
+            Trans_Asm("PSHUFLW xmm7, xmm7, 0")
+            Trans_Asm("PSHUFD xmm7, xmm7, 0")
+        }
+
+        Emit_MarkLabel(one_loop)
+        Trans_Asm("CMP rcx, 16")
+        Emit_Jb(one_scalar)
+        X86_MOVDQU_XMM1_DerefRDI()
+        IfCondition EqualTo(fold, 1) ThenBlock: {
+            FPUEmit_FoldXmm1()
+            Trans_Asm("PCMPEQB xmm4, xmm0")
+            Trans_Asm("PMOVMSKB eax, xmm4")
+        } ElseBlock: {
+            Trans_Asm("PCMPEQB xmm1, xmm0")
+            Trans_Asm("PMOVMSKB eax, xmm1")
+        }
+        Trans_Asm("TEST eax, eax")
+        Emit_Jne(one_hit)
+        Trans_Asm("ADD rdi, 16")
+        Trans_Asm("SUB rcx, 16")
+        Emit_Jmp(one_loop)
+
+        Emit_MarkLabel(one_hit)
+        Trans_Asm("BSF edx, eax")
+        Trans_Asm("MOV rax, rdi")
+        Trans_Asm("SUB rax, r8")
+        Trans_Asm("ADD rax, rdx")
+        Emit_Jmp(done_label)
+
+        Emit_MarkLabel(one_scalar)
+        Trans_Asm("TEST rcx, rcx")
+        Emit_Je(not_found)
+
+        Emit_MarkLabel(one_sloop)
+        Trans_Asm("MOV rsi, rdi")
+        X86_MovzxEAX_ByteDerefRSI()
+        IfCondition EqualTo(fold, 1) ThenBlock: { FPUEmit_FoldAL() }
+        Trans_Asm("CMP eax, r11d")
+        Emit_Je(one_at)
+        Trans_Asm("INC rdi")
+        Trans_Asm("DEC rcx")
+        Emit_Jne(one_sloop)
+        Emit_Jmp(not_found)
+
+        Emit_MarkLabel(one_at)
+        Trans_Asm("MOV rax, rdi")
+        Trans_Asm("SUB rax, r8")
+        Emit_Jmp(done_label)
+
+        Emit_MarkLabel(ret0)
+        Trans_Asm("XOR rax, rax")
+        Emit_Jmp(done_label)
+
+        Emit_MarkLabel(not_found)
+        Emit_MovRaxNeg1()
+
+        Emit_MarkLabel(done_label)
         ReturnValue(1)
     }
 }
