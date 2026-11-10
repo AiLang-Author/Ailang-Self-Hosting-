@@ -90,6 +90,30 @@ FixedPool.Patterns {
     "fast_icase_rare_up":Initialize=0   // uppercase rare byte (or same if non-alpha)
     "fast_icase_rare_off":Initialize=0
     "fast_word_ok":      Initialize=0   // single literal -w, no newline in the pattern
+
+    // Single-regex mmap scan. The line walker calls the Thompson
+    // interpreter on every line; these modes MemMem a required literal
+    // across the whole mapping and only then decide the line.
+    //   1 anchor   ^literal or ^literal$
+    //   2 dotstar  literal .* literal
+    //   3 alt      literal|literal|...
+    //   4 prefix   any other regex with a literal prefix of 2+ bytes
+    //              (the line is still checked with the regex engine)
+    //   5 class    literal + one simple [abc] class + literal
+    "fast_rx_ok":      Initialize=0
+    "fast_rx_mode":    Initialize=0
+    "fast_rx_fold":    Initialize=0   // 1 = MemMemFold (pattern was lowercased for -i)
+    "fast_rx_end":     Initialize=0   // mode 1: trailing $ so the whole line must equal the literal
+    "fast_rx_drive":   Initialize=0   // mode 2: 0 = scan the left literal, 1 = scan the longer right one
+    "fast_rx_a":       Initialize=0
+    "fast_rx_a_len":   Initialize=0
+    "fast_rx_b":       Initialize=0
+    "fast_rx_b_len":   Initialize=0
+    "fast_rx_class":   Initialize=0   // mode 5: bytes accepted by the one class
+    "fast_rx_class_n": Initialize=0
+    "fast_rx_alts":    Initialize=0   // mode 3: array of needle addresses
+    "fast_rx_alt_lens":Initialize=0
+    "fast_rx_alt_n":   Initialize=0
 }
 
 // Per-pattern dispatch strategy, computed once by CompileAllPatterns.
@@ -742,6 +766,285 @@ Function.PatternIsLiteral {
     }
 }
 
+// 1 when c is a regex metacharacter. Newline is rejected by callers
+// separately so a needle never spans a line.
+Function.IsRegexMeta {
+    Input: c: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(c, 46) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 42) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 43) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 63) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 94) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 36) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 91) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 93) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 40) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 41) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 124) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 92) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 123) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(c, 125) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
+// 1 when pat[start..start+n) is free of metacharacters and newlines.
+Function.SpanIsLiteral {
+    Input: pat: Address
+    Input: start: Integer
+    Input: n: Integer
+    Output: Integer
+    Body: {
+        i = 0
+        WhileLoop LessThan(i, n) {
+            c = GetByte(pat, Add(start, i))
+            IfCondition EqualTo(IsRegexMeta(c), 1) ThenBlock: { ReturnValue(0) }
+            IfCondition EqualTo(c, 10) ThenBlock: { ReturnValue(0) }
+            i = Add(i, 1)
+        }
+        ReturnValue(1)
+    }
+}
+
+// Classify one regex so ProcessMapped can scan the mapping for a
+// required literal instead of running the engine on every line.
+// -v stays on the line walk: a hit scan does not produce the non-matching lines.
+Function.ClassifyRegexFast {
+    Output: Integer
+    Body: {
+        Patterns.fast_rx_ok = 0
+        Patterns.fast_rx_mode = 0
+        Patterns.fast_rx_end = 0
+        Patterns.fast_rx_drive = 0
+        Patterns.fast_rx_alt_n = 0
+        Patterns.fast_rx_class_n = 0
+        IfCondition NotEqual(Patterns.count, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(GrepConfig.invert, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(GrepConfig.whole_line, 1) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(GrepConfig.word_match, 1) ThenBlock: { ReturnValue(0) }
+
+        strat = Dereference(Patterns.strategy)
+        is_rx = 0
+        IfCondition EqualTo(strat, STRATEGY.REGEX_PREFIX_BM) ThenBlock: { is_rx = 1 }
+        IfCondition EqualTo(strat, STRATEGY.REGEX_DFA) ThenBlock: { is_rx = 1 }
+        IfCondition EqualTo(strat, STRATEGY.REGEX_NFA) ThenBlock: { is_rx = 1 }
+        IfCondition EqualTo(strat, STRATEGY.REGEX_INSENSITIVE) ThenBlock: { is_rx = 1 }
+        IfCondition EqualTo(is_rx, 0) ThenBlock: { ReturnValue(0) }
+
+        // -i compiles and matches the lowercased pattern. Fold the file bytes.
+        IfCondition EqualTo(GrepConfig.case_insensitive, 1) ThenBlock: {
+            pat = Dereference(Patterns.lc_ptrs)
+            Patterns.fast_rx_fold = 1
+        } ElseBlock: {
+            pat = Dereference(Patterns.ptrs)
+            Patterns.fast_rx_fold = 0
+        }
+        plen = Dereference(Patterns.lens)
+        IfCondition LessEqual(plen, 0) ThenBlock: { ReturnValue(0) }
+
+        // ^literal or ^literal$
+        IfCondition And(GreaterEqual(plen, 2), EqualTo(GetByte(pat, 0), 94)) ThenBlock: {
+            lit_len = Subtract(plen, 1)
+            end_anchor = 0
+            IfCondition EqualTo(GetByte(pat, Subtract(plen, 1)), 36) ThenBlock: {
+                end_anchor = 1
+                lit_len = Subtract(plen, 2)
+            }
+            IfCondition And(GreaterEqual(lit_len, 1), EqualTo(SpanIsLiteral(pat, 1, lit_len), 1)) ThenBlock: {
+                Patterns.fast_rx_mode = 1
+                Patterns.fast_rx_end = end_anchor
+                Patterns.fast_rx_a = Add(pat, 1)
+                Patterns.fast_rx_a_len = lit_len
+                Patterns.fast_rx_ok = 1
+                ReturnValue(1)
+            }
+        }
+
+        // literal .* literal. The leftmost copy of the left literal is enough:
+        // a later copy ends later, so a right literal after it is also after
+        // the leftmost one. `.` does not cross the newline we stop at.
+        star_at = -1
+        bad = 0
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            c = GetByte(pat, i)
+            is_dotstar = 0
+            IfCondition And(EqualTo(c, 46), LessThan(Add(i, 1), plen)) ThenBlock: {
+                IfCondition EqualTo(GetByte(pat, Add(i, 1)), 42) ThenBlock: {
+                    is_dotstar = 1
+                }
+            }
+            IfCondition EqualTo(is_dotstar, 1) ThenBlock: {
+                IfCondition NotEqual(star_at, -1) ThenBlock: { bad = 1 }
+                star_at = i
+                i = Add(i, 2)
+            } ElseBlock: {
+                IfCondition EqualTo(IsRegexMeta(c), 1) ThenBlock: { bad = 1 }
+                IfCondition EqualTo(c, 10) ThenBlock: { bad = 1 }
+                i = Add(i, 1)
+            }
+        }
+        IfCondition And(EqualTo(bad, 0), GreaterThan(star_at, 0)) ThenBlock: {
+            right_from = Add(star_at, 2)
+            right_len = Subtract(plen, right_from)
+            IfCondition GreaterThan(right_len, 0) ThenBlock: {
+                Patterns.fast_rx_mode = 2
+                Patterns.fast_rx_a = pat
+                Patterns.fast_rx_a_len = star_at
+                Patterns.fast_rx_b = Add(pat, right_from)
+                Patterns.fast_rx_b_len = right_len
+                // Scan the longer literal. Equal lengths stay on the left,
+                // where one check decides the whole line.
+                IfCondition GreaterThan(right_len, star_at) ThenBlock: {
+                    Patterns.fast_rx_drive = 1
+                }
+                Patterns.fast_rx_ok = 1
+                ReturnValue(1)
+            }
+        }
+
+        // literal(|literal)+ with no other metacharacters.
+        has_bar = 0
+        pure = 1
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            c = GetByte(pat, i)
+            IfCondition EqualTo(c, 124) ThenBlock: {
+                has_bar = 1
+            } ElseBlock: {
+                IfCondition EqualTo(IsRegexMeta(c), 1) ThenBlock: { pure = 0 }
+                IfCondition EqualTo(c, 10) ThenBlock: { pure = 0 }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition And(EqualTo(has_bar, 1), EqualTo(pure, 1)) ThenBlock: {
+            IfCondition EqualTo(Patterns.fast_rx_alts, 0) ThenBlock: {
+                Patterns.fast_rx_alts = Allocate(64)
+                Patterns.fast_rx_alt_lens = Allocate(64)
+            }
+            nalt = 0
+            piece = 0
+            i = 0
+            WhileLoop LessEqual(i, plen) {
+                split_here = 0
+                IfCondition EqualTo(i, plen) ThenBlock: {
+                    split_here = 1
+                } ElseBlock: {
+                    IfCondition EqualTo(GetByte(pat, i), 124) ThenBlock: {
+                        split_here = 1
+                    }
+                }
+                IfCondition EqualTo(split_here, 1) ThenBlock: {
+                    piece_len = Subtract(i, piece)
+                    IfCondition LessThan(piece_len, 1) ThenBlock: { pure = 0 }
+                    IfCondition GreaterEqual(nalt, 8) ThenBlock: { pure = 0 }
+                    IfCondition EqualTo(pure, 1) ThenBlock: {
+                        StoreValue(Add(Patterns.fast_rx_alts, Multiply(nalt, 8)), Add(pat, piece))
+                        StoreValue(Add(Patterns.fast_rx_alt_lens, Multiply(nalt, 8)), piece_len)
+                        nalt = Add(nalt, 1)
+                    }
+                    piece = Add(i, 1)
+                }
+                i = Add(i, 1)
+            }
+            IfCondition And(EqualTo(pure, 1), GreaterEqual(nalt, 2)) ThenBlock: {
+                Patterns.fast_rx_mode = 3
+                Patterns.fast_rx_alt_n = nalt
+                Patterns.fast_rx_ok = 1
+                ReturnValue(1)
+            }
+        }
+
+        // literal + one [abc] class + literal. No ranges, no negation.
+        // The class check is a few byte compares, so ker[nm]el does not
+        // enter the Thompson interpreter.
+        lb = -1
+        i = 0
+        WhileLoop LessThan(i, plen) {
+            IfCondition EqualTo(GetByte(pat, i), 91) ThenBlock: {
+                IfCondition EqualTo(lb, -1) ThenBlock: {
+                    lb = i
+                } ElseBlock: {
+                    lb = -2
+                }
+            }
+            i = Add(i, 1)
+        }
+        IfCondition GreaterEqual(lb, 2) ThenBlock: {
+            IfCondition EqualTo(SpanIsLiteral(pat, 0, lb), 1) ThenBlock: {
+                rb = -1
+                j = Add(lb, 1)
+                WhileLoop LessThan(j, plen) {
+                    IfCondition EqualTo(GetByte(pat, j), 93) ThenBlock: {
+                        rb = j
+                        BreakLoop
+                    }
+                    j = Add(j, 1)
+                }
+                IfCondition GreaterThan(rb, lb) ThenBlock: {
+                    body_from = Add(lb, 1)
+                    body_len = Subtract(rb, body_from)
+                    body_ok = 1
+                    IfCondition Or(LessThan(body_len, 1), GreaterThan(body_len, 32)) ThenBlock: {
+                        body_ok = 0
+                    }
+                    IfCondition And(EqualTo(body_ok, 1), EqualTo(GetByte(pat, body_from), 94)) ThenBlock: {
+                        body_ok = 0
+                    }
+                    bi = 0
+                    WhileLoop And(EqualTo(body_ok, 1), LessThan(bi, body_len)) {
+                        bc = GetByte(pat, Add(body_from, bi))
+                        IfCondition EqualTo(bc, 45) ThenBlock: { body_ok = 0 }
+                        IfCondition EqualTo(bc, 92) ThenBlock: { body_ok = 0 }
+                        IfCondition EqualTo(bc, 91) ThenBlock: { body_ok = 0 }
+                        bi = Add(bi, 1)
+                    }
+                    right_from = Add(rb, 1)
+                    right_len = Subtract(plen, right_from)
+                    IfCondition And(EqualTo(body_ok, 1), GreaterThan(right_len, 0)) ThenBlock: {
+                        IfCondition EqualTo(SpanIsLiteral(pat, right_from, right_len), 0) ThenBlock: {
+                            body_ok = 0
+                        }
+                    }
+                    IfCondition And(EqualTo(body_ok, 1), LessThan(right_len, 0)) ThenBlock: {
+                        body_ok = 0
+                    }
+                    IfCondition EqualTo(body_ok, 1) ThenBlock: {
+                        IfCondition EqualTo(Patterns.fast_rx_class, 0) ThenBlock: {
+                            Patterns.fast_rx_class = Allocate(32)
+                        }
+                        MemoryCopy(Patterns.fast_rx_class, Add(pat, body_from), body_len)
+                        Patterns.fast_rx_class_n = body_len
+                        Patterns.fast_rx_mode = 5
+                        Patterns.fast_rx_a = pat
+                        Patterns.fast_rx_a_len = lb
+                        Patterns.fast_rx_b = Add(pat, right_from)
+                        Patterns.fast_rx_b_len = right_len
+                        Patterns.fast_rx_ok = 1
+                        ReturnValue(1)
+                    }
+                }
+            }
+        }
+
+        // Prefix filter. Lines that contain it still go through LineMatches.
+        pfx_len = Dereference(Patterns.rx_prefix_len)
+        pfx = Dereference(Patterns.rx_prefix)
+        IfCondition And(GreaterEqual(pfx_len, 2), NotEqual(pfx, 0)) ThenBlock: {
+            IfCondition EqualTo(SpanIsLiteral(pfx, 0, pfx_len), 1) ThenBlock: {
+                Patterns.fast_rx_mode = 4
+                Patterns.fast_rx_a = pfx
+                Patterns.fast_rx_a_len = pfx_len
+                Patterns.fast_rx_ok = 1
+                ReturnValue(1)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
 // Called after GrepConfig.fixed / case_insensitive are final. Builds
 // the regex handle for each stored pattern unless -F is in effect.
 // Patterns that fail to compile are downgraded to literal (handle = 0).
@@ -968,6 +1271,8 @@ Function.CompileAllPatterns {
                 Patterns.fast_word_ok = 1
             }
         }
+
+        ClassifyRegexFast()
     }
 }
 
@@ -1244,6 +1549,228 @@ Function.FindLineStart {
     }
 }
 
+// MemMem or MemMemFold. fold=1 compares ASCII A-Z as a-z on both sides.
+Function.FindNeedle {
+    Input: hay: Address
+    Input: hay_len: Integer
+    Input: needle: Address
+    Input: needle_len: Integer
+    Input: fold: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(fold, 1) ThenBlock: {
+            ReturnValue(MemMemFold(hay, hay_len, needle, needle_len))
+        }
+        ReturnValue(MemMem(hay, hay_len, needle, needle_len))
+    }
+}
+
+// Whole-mapping scan for one regex that has a required literal.
+// Returns the match count. Caller already rejected -v.
+Function.ProcessMappedRegex {
+    Input: data: Address
+    Input: data_len: Integer
+    Input: label: Address
+    Input: show_prefix: Integer
+    Output: Integer
+    Body: {
+        match_count = 0
+        stop_early = 0
+        is_binary = 0
+        check_len = data_len
+        IfCondition GreaterThan(check_len, GrepConstants.BUFFER_SIZE) ThenBlock: {
+            check_len = GrepConstants.BUFFER_SIZE
+        }
+        IfCondition NotEqual(MemChr(data, 0, check_len), -1) ThenBlock: {
+            is_binary = 1
+        }
+
+        mode = Patterns.fast_rx_mode
+        fold = Patterns.fast_rx_fold
+        last_nl_pos = 0
+        nl_count = 0
+        scan_pos = 0
+
+        WhileLoop LessThan(scan_pos, data_len) {
+            IfCondition EqualTo(stop_early, 1) ThenBlock: { BreakLoop }
+            remaining = Subtract(data_len, scan_pos)
+            hay = Add(data, scan_pos)
+            matched = 0
+            cand = scan_pos
+            advance = data_len
+
+            IfCondition EqualTo(mode, 3) ThenBlock: {
+                best = -1
+                ai = 0
+                WhileLoop LessThan(ai, Patterns.fast_rx_alt_n) {
+                    ap = Dereference(Add(Patterns.fast_rx_alts, Multiply(ai, 8)))
+                    al = Dereference(Add(Patterns.fast_rx_alt_lens, Multiply(ai, 8)))
+                    off = FindNeedle(hay, remaining, ap, al, fold)
+                    IfCondition GreaterEqual(off, 0) ThenBlock: {
+                        IfCondition Or(LessThan(best, 0), LessThan(off, best)) ThenBlock: {
+                            best = off
+                        }
+                    }
+                    ai = Add(ai, 1)
+                }
+                IfCondition LessThan(best, 0) ThenBlock: { BreakLoop }
+                cand = Add(scan_pos, best)
+                matched = 1
+            } ElseBlock: {
+                off = FindNeedle(hay, remaining, Patterns.fast_rx_a, Patterns.fast_rx_a_len, fold)
+                // Mode 2 with the right literal longer scans needle b instead.
+                IfCondition And(EqualTo(mode, 2), EqualTo(Patterns.fast_rx_drive, 1)) ThenBlock: {
+                    off = FindNeedle(hay, remaining, Patterns.fast_rx_b, Patterns.fast_rx_b_len, fold)
+                }
+                IfCondition LessThan(off, 0) ThenBlock: { BreakLoop }
+                cand = Add(scan_pos, off)
+            }
+
+            line_start = FindLineStart(data, cand)
+            end_remaining = Subtract(data_len, cand)
+            nl_off = MemChr(Add(data, cand), 10, end_remaining)
+            IfCondition LessThan(nl_off, 0) ThenBlock: {
+                line_end = data_len
+                advance = data_len
+            } ElseBlock: {
+                line_end = Add(cand, nl_off)
+                advance = Add(line_end, 1)
+            }
+            line_len = Subtract(line_end, line_start)
+
+            IfCondition EqualTo(mode, 1) ThenBlock: {
+                matched = 0
+                IfCondition EqualTo(cand, line_start) ThenBlock: {
+                    matched = 1
+                    IfCondition EqualTo(Patterns.fast_rx_end, 1) ThenBlock: {
+                        IfCondition NotEqual(line_len, Patterns.fast_rx_a_len) ThenBlock: {
+                            matched = 0
+                        }
+                    }
+                }
+            }
+
+            IfCondition EqualTo(mode, 2) ThenBlock: {
+                matched = 0
+                IfCondition EqualTo(Patterns.fast_rx_drive, 1) ThenBlock: {
+                    // Right literal at cand. Left literal must end at or before it.
+                    region = Subtract(cand, line_start)
+                    IfCondition GreaterEqual(region, Patterns.fast_rx_a_len) ThenBlock: {
+                        left_off = FindNeedle(Add(data, line_start), region,
+                                              Patterns.fast_rx_a, Patterns.fast_rx_a_len, fold)
+                        IfCondition GreaterEqual(left_off, 0) ThenBlock: { matched = 1 }
+                    }
+                    // A later copy of the right literal on this line can still match.
+                    IfCondition EqualTo(matched, 0) ThenBlock: {
+                        advance = Add(cand, 1)
+                    }
+                } ElseBlock: {
+                    suf_from = Add(cand, Patterns.fast_rx_a_len)
+                    IfCondition LessThan(suf_from, line_end) ThenBlock: {
+                        suf_off = FindNeedle(Add(data, suf_from), Subtract(line_end, suf_from),
+                                             Patterns.fast_rx_b, Patterns.fast_rx_b_len, fold)
+                        IfCondition GreaterEqual(suf_off, 0) ThenBlock: { matched = 1 }
+                    }
+                }
+            }
+
+            IfCondition EqualTo(mode, 4) ThenBlock: {
+                matched = LineMatches(Add(data, line_start), line_len)
+            }
+
+            IfCondition EqualTo(mode, 5) ThenBlock: {
+                matched = 0
+                at = Add(cand, Patterns.fast_rx_a_len)
+                IfCondition LessThan(at, line_end) ThenBlock: {
+                    nb = GetByte(data, at)
+                    IfCondition EqualTo(fold, 1) ThenBlock: {
+                        nb = ToLowerByte(nb)
+                    }
+                    hitc = 0
+                    ci = 0
+                    WhileLoop LessThan(ci, Patterns.fast_rx_class_n) {
+                        IfCondition EqualTo(nb, GetByte(Patterns.fast_rx_class, ci)) ThenBlock: {
+                            hitc = 1
+                        }
+                        ci = Add(ci, 1)
+                    }
+                    IfCondition EqualTo(hitc, 1) ThenBlock: {
+                        suf_from = Add(at, 1)
+                        suf_len = Patterns.fast_rx_b_len
+                        IfCondition EqualTo(suf_len, 0) ThenBlock: {
+                            matched = 1
+                        } ElseBlock: {
+                            IfCondition LessEqual(Add(suf_from, suf_len), line_end) ThenBlock: {
+                                IfCondition EqualTo(fold, 1) ThenBlock: {
+                                    same = 1
+                                    si = 0
+                                    WhileLoop LessThan(si, suf_len) {
+                                        IfCondition NotEqual(ToLowerByte(GetByte(data, Add(suf_from, si))),
+                                                             GetByte(Patterns.fast_rx_b, si)) ThenBlock: {
+                                            same = 0
+                                        }
+                                        si = Add(si, 1)
+                                    }
+                                    IfCondition EqualTo(same, 1) ThenBlock: { matched = 1 }
+                                } ElseBlock: {
+                                    IfCondition EqualTo(MemCompare(Add(data, suf_from), Patterns.fast_rx_b, suf_len), 0) ThenBlock: {
+                                        matched = 1
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                IfCondition EqualTo(matched, 0) ThenBlock: {
+                    advance = Add(cand, 1)
+                }
+            }
+
+            IfCondition EqualTo(matched, 1) ThenBlock: {
+                match_count = Add(match_count, 1)
+                IfCondition EqualTo(is_binary, 1) ThenBlock: {
+                    IfCondition And(EqualTo(GrepConfig.quiet, 0),
+                                    And(EqualTo(GrepConfig.files_with, 0),
+                                        And(EqualTo(GrepConfig.files_without, 0),
+                                            EqualTo(GrepConfig.count_only, 0)))) ThenBlock: {
+                        IfCondition NotEqual(label, 0) ThenBlock: {
+                            OutStr("Binary file ")
+                            OutStr(label)
+                            OutStr(" matches\n")
+                        }
+                    }
+                    stop_early = 1
+                } ElseBlock: {
+                    IfCondition Or(EqualTo(GrepConfig.quiet, 1),
+                                   Or(EqualTo(GrepConfig.files_with, 1),
+                                      EqualTo(GrepConfig.files_without, 1))) ThenBlock: {
+                        stop_early = 1
+                    } ElseBlock: {
+                        IfCondition EqualTo(GrepConfig.count_only, 0) ThenBlock: {
+                            IfCondition And(EqualTo(show_prefix, 1), NotEqual(label, 0)) ThenBlock: {
+                                OutStr(label)
+                                OutByte(58)
+                            }
+                            IfCondition EqualTo(GrepConfig.line_numbers, 1) ThenBlock: {
+                                nl_count = Add(nl_count, CountNewlines(data, last_nl_pos, line_start))
+                                last_nl_pos = line_start
+                                OutUInt(Add(nl_count, 1))
+                                OutByte(58)
+                            }
+                            OutBytes(Add(data, line_start), line_len)
+                            OutByte(10)
+                        }
+                    }
+                }
+            }
+
+            scan_pos = advance
+        }
+
+        ReturnValue(match_count)
+    }
+}
+
 // Search-then-split for the fast literal path on mmap'd data.
 // Returns match count.
 Function.ProcessMapped {
@@ -1305,7 +1832,14 @@ Function.ProcessMapped {
             }
         }
 
-        // -v that prints, regex, -x, and multi-pattern -w walk every line.
+        // A single regex with a required literal scans the mapping once.
+        // -v stays on the line walk below.
+        IfCondition EqualTo(Patterns.fast_rx_ok, 1) ThenBlock: {
+            ReturnValue(ProcessMappedRegex(data, data_len, label, show_prefix))
+        }
+
+        // -v that prints, regex without a usable literal, -x, and
+        // multi-pattern -w walk every line.
         // A single literal -w (fast_word_ok) uses the scan below.
         IfCondition Or(And(EqualTo(Patterns.fast_literal_ok, 0),
                            And(EqualTo(Patterns.fast_icase_ok, 0),
