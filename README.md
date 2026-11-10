@@ -22,29 +22,31 @@ Performance claims should be read in the context of those specific benchmarks—
 
 AILang grep beats GNU grep 3.11 in 13 out of 14 tests. Here's the scorecard:
 
-Test	AILang	GNU grep 3.11	Winner
-'kernel'	208ms	311ms	AILang 1.49x
--F 'kernel'	212ms	310ms	AILang 1.46x
--i 'kernel'	251ms	358ms	AILang 1.42x
--c 'kernel'	168ms	190ms	AILang 1.13x
--n 'kernel'	315ms	428ms	AILang 1.35x
--v 'kernel'	352ms	472ms	AILang 1.34x
--w 'kernel'	222ms	615ms	AILang 2.77x
--ic 'kernel'	195ms	234ms	AILang 1.20x
--wc 'kernel'	179ms	415ms	AILang 2.31x
--Fc 'kernel'	169ms	193ms	AILang 1.14x
-'UNIQUE_MARKER_XYZ'	49ms	79ms	AILang 1.61x
--c 'UNIQUE_MARKER'	47ms	78ms	AILang 1.65x
--F 'error_handler'	272ms	288ms	AILang 1.05x
--Fc 'error_handler'	223ms	163ms	GNU 1.36x
-Highlights:
+| Test | AILang | GNU grep 3.11 | Winner |
+|---|---:|---:|---|
+| `'kernel'` | 208 ms | 311 ms | AILang — 1.49× |
+| `-F 'kernel'` | 212 ms | 310 ms | AILang — 1.46× |
+| `-i 'kernel'` | 251 ms | 358 ms | AILang — 1.42× |
+| `-c 'kernel'` | 168 ms | 190 ms | AILang — 1.13× |
+| `-n 'kernel'` | 315 ms | 428 ms | AILang — 1.35× |
+| `-v 'kernel'` | 352 ms | 472 ms | AILang — 1.34× |
+| `-w 'kernel'` | 222 ms | 615 ms | AILang — 2.77× |
+| `-ic 'kernel'` | 195 ms | 234 ms | AILang — 1.20× |
+| `-wc 'kernel'` | 179 ms | 415 ms | AILang — 2.31× |
+| `-Fc 'kernel'` | 169 ms | 193 ms | AILang — 1.14× |
+| `'UNIQUE_MARKER_XYZ'` | 49 ms | 79 ms | AILang — 1.61× |
+| `-c 'UNIQUE_MARKER'` | 47 ms | 78 ms | AILang — 1.65× |
+| `-F 'error_handler'` | 272 ms | 288 ms | AILang — 1.05× |
+| `-Fc 'error_handler'` | 223 ms | 163 ms | GNU — 1.36× |
 
-Word match (-w) is 2.77x faster than GNU grep
-Rare pattern search is 1.65x faster — MemMem's scan-and-skip is very efficient
-Case-insensitive is 1.42x faster — MemMemFold pays off
-The only loss is long fixed-pattern count (-Fc error_handler), where GNU's Boyer-Moore-Horspool skip table gives it an edge on 13-character patterns
-AILang binary is 118KB vs GNU's 1.7MB — 14x smaller
-100% correctness — every test matches GNU grep output exactly
+**Highlights:**
+
+- Word match (`-w`) is 2.77× faster than GNU grep.
+- Rare-pattern search is 1.65× faster — MemMem's scan-and-skip is very efficient.
+- Case-insensitive search is 1.42× faster — MemMemFold pays off.
+- The only loss is long fixed-pattern count (`-Fc error_handler`), where GNU's Boyer–Moore–Horspool skip table gives it an edge on 13-character patterns.
+- The AILang binary is 118 KB vs. GNU's 1.7 MB — 14× smaller.
+- 100% correctness — every test matches GNU grep output exactly.
 
 ## What it can express
 
