@@ -101,24 +101,32 @@ Function.SysWrite {
 
 ## 3. Static analyzer
 
-Binary: **`./ailang_analyzer.x`** (same dir as the compiler).
+Binary: **`./analyzer.x`**. A newer build can be written to another path.
+`./analyzer.x` is the installed one.
 
 ```
-./ailang_analyzer.x <filename.ailang> [function_filter]
+./analyzer.x <file.ailang> [--json] [--brief] [function]
+./analyzer.x --help
 ```
 
-Four passes:
+Exit 0 is clean, 1 is warnings, 2 is errors. `--json` adds one JSON array
+after the text report. `--brief` keeps the memory scoreboard and the
+warnings. A function name lists its callers.
 
-| Pass   | Tag   | Catches                                                 |
-|--------|-------|---------------------------------------------------------|
-| Memory | [MEM] | leaks, unused vars, missing returns                      |
-| CFG    | [CFG] | unreachable code, infinite loops, null deref            |
-| Data   | [DFA] | uninit vars, double dealloc, call graph                 |
-| Pool   | [PTF] | address safety, field validation, type conflicts        |
+Four passes: `[MEM]` ownership, `[CFG]` control flow, `[DFA]` use after
+free, `[PTF]` pools. Memory tracking follows one name inside one function.
+An `If` counts only when both arms agree. A call in the same file can
+hand off a fresh block or take a parameter. A call into another file
+leaves the block with the caller. `--help` lists `MEM-LEAK`, `MEM-DROP`,
+`MEM-DISCARD`, `MEM-BOTH`, `MEM-UAF`, `MEM-DOUBLE`, `MEM-LOOP`,
+`MEM-REPEAT`, `MEM-PATH`, `MEM-SIZE`, `MEM-KIND`, `MEM-ARENA`, and
+`MEM-FREE`.
 
-Summary is printed at the bottom (`N errors, M warnings, P hints`). Run
-it before and after any fix; a warning that disappears is a good sign,
-and a new one is a regression.
+The probe and the count check:
+
+```
+dev/compiler-regression/check_analyzer_mem.sh /tmp/analyzer-mem.x
+```
 
 ---
 

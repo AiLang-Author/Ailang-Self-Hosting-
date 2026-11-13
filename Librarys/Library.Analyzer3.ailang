@@ -20,6 +20,7 @@ LibraryImport.Compiler.Frontend.AST.CASTCore
 LibraryImport.Compiler.Frontend.AST.CASTTypes
 LibraryImport.Compiler.Import.CFileMap
 LibraryImport.Compiler.Import.CImportResolver
+LibraryImport.Analyzer
 
 // =============================================================================
 // ANALYZER3 STATE
@@ -56,13 +57,31 @@ FixedPool.Analyzer3 {
     // Double dealloc tracking
     "deallocated_vars": Initialize=0, CanChange=True
     "dealloc_warned_vars": Initialize=0, CanChange=True
+    "maybe_freed_vars": Initialize=0, CanChange=True     // Freed on some paths only
+    "alias_names": Initialize=0, CanChange=True          // Name copied from another pointer
+    "alias_roots": Initialize=0, CanChange=True
+    "ptr_names": Initialize=0, CanChange=True            // Names that hold a block
     
     "loop_alloc_vars": Initialize=0, CanChange=True      // Vars that received allocations in current loop body
     "loop_alloc_lines": Initialize=0, CanChange=True     // Line numbers of those allocations
     "loop_alloc_funcs": Initialize=0, CanChange=True     // Which allocating function was called
     "loop_dealloc_vars": Initialize=0, CanChange=True    // Vars deallocated in current loop body
+    "loop_dealloc_lines": Initialize=0, CanChange=True
+    "loop_alloc_seq": Initialize=0, CanChange=True       // Walk order of each loop alloc
+    "loop_dealloc_seq": Initialize=0, CanChange=True
+    "loop_alloc_leave": Initialize=0, CanChange=True    // 1 when this alloc returns or halts
+    "leave_names": Initialize=0, CanChange=True         // Names returned by the current loop block
+    "halt_depth": Initialize=0, CanChange=True          // Nested blocks that halt before the next trip
+    "loop_seq": Initialize=0, CanChange=True
+    "pending_names": Initialize=0, CanChange=True        // Freed then allocated again, still open
+    "pending_lines": Initialize=0, CanChange=True
+    "pending_funcs": Initialize=0, CanChange=True
+    "loop_alloc_mark": Initialize=0, CanChange=True      // Stack of outer alloc-list sizes
+    "loop_dealloc_mark": Initialize=0, CanChange=True    // Stack of outer dealloc-list sizes
     "in_loop_body": Initialize=0, CanChange=True         // Nesting depth inside loops (>0 = in loop)
     "alloc_in_loop_warnings": Initialize=0, CanChange=True
+    "repeat_warnings": Initialize=0, CanChange=True
+    "last_valid_line": Initialize=0, CanChange=True
 
     // Import usage tracking (unused-LibraryImport detection)
     "imported_modules": Initialize=0, CanChange=True     // XArray of Address (dotted paths from AST)
@@ -83,10 +102,20 @@ FixedPool.Analyzer3 {
     "dead_assign_warnings": Initialize=0, CanChange=True
     "double_dealloc_warnings": Initialize=0, CanChange=True
     "concat_leak_warnings": Initialize=0, CanChange=True
+    "uaf_warnings": Initialize=0, CanChange=True
     "recursive_cycles": Initialize=0, CanChange=True
+
+    // Concat / long-running loop state. Init writes these.
+    "concat_results": Initialize=0, CanChange=True
+    "concat_in_loop": Initialize=0, CanChange=True
+    "concat_lines": Initialize=0, CanChange=True
+    "in_main_loop": Initialize=0, CanChange=True
+    "in_while_loop": Initialize=0, CanChange=True
+    "loop_concat_count": Initialize=0, CanChange=True
 
     // Config
     "check_shadow": Initialize=0, CanChange=True
+    "check_uaf": Initialize=1, CanChange=True
     "check_uninit": Initialize=1, CanChange=True
     "check_loop_mod": Initialize=1, CanChange=True
     "check_dead_assign": Initialize=1, CanChange=True
@@ -126,9 +155,26 @@ Function.Analyzer3.Init {
         Analyzer3.loop_alloc_lines = Array.Create(32)
         Analyzer3.loop_alloc_funcs = Array.Create(32)
         Analyzer3.loop_dealloc_vars = Array.Create(32)
+        Analyzer3.loop_dealloc_lines = Array.Create(32)
         Analyzer3.dealloc_warned_vars = Array.Create(32)
+        Analyzer3.maybe_freed_vars = Array.Create(32)
+        Analyzer3.alias_names = Array.Create(16)
+        Analyzer3.alias_roots = Array.Create(16)
+        Analyzer3.ptr_names = Array.Create(16)
+        Analyzer3.loop_alloc_seq = Array.Create(32)
+        Analyzer3.loop_dealloc_seq = Array.Create(32)
+        Analyzer3.loop_alloc_leave = Array.Create(32)
+        Analyzer3.leave_names = Array.Create(8)
+        Analyzer3.halt_depth = 0
+        Analyzer3.pending_names = Array.Create(8)
+        Analyzer3.pending_lines = Array.Create(8)
+        Analyzer3.pending_funcs = Array.Create(8)
+        Analyzer3.loop_seq = 0
+        Analyzer3.loop_alloc_mark = Array.Create(16)
+        Analyzer3.loop_dealloc_mark = Array.Create(16)
         Analyzer3.in_loop_body = 0
         Analyzer3.alloc_in_loop_warnings = 0
+        Analyzer3.repeat_warnings = 0
 
 
         // Pools
@@ -169,6 +215,7 @@ Function.Analyzer3.Init {
         Analyzer3.dead_assign_warnings = 0
         Analyzer3.double_dealloc_warnings = 0
         Analyzer3.concat_leak_warnings = 0
+        Analyzer3.uaf_warnings = 0
         Analyzer3.recursive_cycles = 0
         Analyzer3.last_valid_line = 0
     }
@@ -357,6 +404,58 @@ Function.Analyzer3.MarkRead {
     Input: line: Integer
     Body: {
         IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+
+        // A name freed earlier in this function, and not written since.
+        // A copy of that name is the same block.
+        IfCondition EqualTo(Analyzer3.check_uaf, 1) ThenBlock: {
+            root = Analyzer3.RootOf(name)
+            freed = Analyzer3.ListHas(Analyzer3.deallocated_vars, name)
+            IfCondition EqualTo(freed, 0) ThenBlock: {
+                freed = Analyzer3.ListHas(Analyzer3.deallocated_vars, root)
+            }
+            IfCondition EqualTo(freed, 1) ThenBlock: {
+                already = Analyzer3.ListHas(Analyzer3.dealloc_warned_vars, name)
+                IfCondition EqualTo(already, 0) ThenBlock: {
+                    location = FileMap_Format(line)
+                    msg = StringConcat("MEM-UAF ", location)
+                    msg = StringConcat(msg, ": '")
+                    msg = StringConcat(msg, name)
+                    msg = StringConcat(msg, "' may be used after free")
+                    IfCondition NotEqual(Analyzer3.current_func, 0) ThenBlock: {
+                        msg = StringConcat(msg, " in '")
+                        msg = StringConcat(msg, Analyzer3.current_func)
+                        msg = StringConcat(msg, "'")
+                    }
+                    Analyzer3.AddWarning(msg)
+                    Analyzer3.uaf_warnings = Add(Analyzer3.uaf_warnings, 1)
+                    Array.Push(Analyzer3.dealloc_warned_vars, name)
+                }
+            }
+            IfCondition EqualTo(freed, 0) ThenBlock: {
+                maybe = Analyzer3.ListHas(Analyzer3.maybe_freed_vars, name)
+                IfCondition EqualTo(maybe, 0) ThenBlock: {
+                    maybe = Analyzer3.ListHas(Analyzer3.maybe_freed_vars, root)
+                }
+                IfCondition EqualTo(maybe, 1) ThenBlock: {
+                    already = Analyzer3.ListHas(Analyzer3.dealloc_warned_vars, name)
+                    IfCondition EqualTo(already, 0) ThenBlock: {
+                        location = FileMap_Format(line)
+                        msg = StringConcat("MEM-UAF ", location)
+                        msg = StringConcat(msg, ": '")
+                        msg = StringConcat(msg, name)
+                        msg = StringConcat(msg, "' may be used after a free on another path")
+                        IfCondition NotEqual(Analyzer3.current_func, 0) ThenBlock: {
+                            msg = StringConcat(msg, " in '")
+                            msg = StringConcat(msg, Analyzer3.current_func)
+                            msg = StringConcat(msg, "'")
+                        }
+                        Analyzer3.AddWarning(msg)
+                        Analyzer3.uaf_warnings = Add(Analyzer3.uaf_warnings, 1)
+                        Array.Push(Analyzer3.dealloc_warned_vars, name)
+                    }
+                }
+            }
+        }
         
         // Check if written
         was_written = 0
@@ -426,6 +525,17 @@ Function.Analyzer3.ClearDataFlow {
         Array.Clear(Analyzer3.read_vars)
         Array.Clear(Analyzer3.deallocated_vars)
         Array.Clear(Analyzer3.dealloc_warned_vars)
+        Array.Clear(Analyzer3.maybe_freed_vars)
+        Array.Clear(Analyzer3.alias_names)
+        Array.Clear(Analyzer3.alias_roots)
+        Array.Clear(Analyzer3.ptr_names)
+        Array.Clear(Analyzer3.pending_names)
+        Array.Clear(Analyzer3.pending_lines)
+        Array.Clear(Analyzer3.pending_funcs)
+        Array.Clear(Analyzer3.leave_names)
+        Array.Clear(Analyzer3.loop_alloc_leave)
+        Analyzer3.halt_depth = 0
+        Analyzer3.loop_seq = 0
         Array.Clear(Analyzer3.last_assign_var)
         Array.Clear(Analyzer3.last_assign_line)
         Array.Clear(Analyzer3.var_was_read)
@@ -662,33 +772,287 @@ Function.Analyzer3.RecordDealloc {
     Input: line: Integer
     Body: {
         IfCondition EqualTo(var_name, 0) ThenBlock: { ReturnValue(0) }
+        root = Analyzer3.RootOf(var_name)
         
-        // Check if already deallocated
+        // Check if already deallocated on every path.
         IfCondition EqualTo(Analyzer3.check_double_dealloc, 1) ThenBlock: {
-            count = Array.Size(Analyzer3.deallocated_vars)
-            i = 0
-            WhileLoop LessThan(i, count) {
-                existing = Array.Get(Analyzer3.deallocated_vars, i)
-                IfCondition EqualTo(Analyzer3.StrEqual(existing, var_name), 1) ThenBlock: {
-                    location = FileMap_Format(line)
-                    msg = location
-                    msg = StringConcat(msg, ": Potential double deallocation of '")
-                    msg = StringConcat(msg, var_name)
+            already = Analyzer3.ListHas(Analyzer3.deallocated_vars, var_name)
+            IfCondition EqualTo(already, 0) ThenBlock: {
+                already = Analyzer3.ListHas(Analyzer3.deallocated_vars, root)
+            }
+            IfCondition EqualTo(already, 1) ThenBlock: {
+                location = FileMap_Format(line)
+                msg = StringConcat("MEM-DOUBLE ", location)
+                msg = StringConcat(msg, ": '")
+                msg = StringConcat(msg, var_name)
+                msg = StringConcat(msg, "' freed again")
+                IfCondition NotEqual(Analyzer3.current_func, 0) ThenBlock: {
+                    msg = StringConcat(msg, " in '")
+                    msg = StringConcat(msg, Analyzer3.current_func)
                     msg = StringConcat(msg, "'")
-                    IfCondition NotEqual(Analyzer3.current_func, 0) ThenBlock: {
-                        msg = StringConcat(msg, " in '")
-                        msg = StringConcat(msg, Analyzer3.current_func)
-                        msg = StringConcat(msg, "'")
-                    }
-                    Analyzer3.AddWarning(msg)
-                    Analyzer3.double_dealloc_warnings = Add(Analyzer3.double_dealloc_warnings, 1)
-                    ReturnValue(0)
                 }
-                i = Add(i, 1)
+                Analyzer3.AddWarning(msg)
+                Analyzer3.double_dealloc_warnings = Add(Analyzer3.double_dealloc_warnings, 1)
+                ReturnValue(0)
+            }
+            // A free that only happened on one branch, then a later free.
+            maybe = Analyzer3.ListHas(Analyzer3.maybe_freed_vars, var_name)
+            IfCondition EqualTo(maybe, 0) ThenBlock: {
+                maybe = Analyzer3.ListHas(Analyzer3.maybe_freed_vars, root)
+            }
+            IfCondition EqualTo(maybe, 1) ThenBlock: {
+                location = FileMap_Format(line)
+                msg = StringConcat("MEM-DOUBLE ", location)
+                msg = StringConcat(msg, ": '")
+                msg = StringConcat(msg, var_name)
+                msg = StringConcat(msg, "' freed again after a one-sided free")
+                IfCondition NotEqual(Analyzer3.current_func, 0) ThenBlock: {
+                    msg = StringConcat(msg, " in '")
+                    msg = StringConcat(msg, Analyzer3.current_func)
+                    msg = StringConcat(msg, "'")
+                }
+                Analyzer3.AddWarning(msg)
+                Analyzer3.double_dealloc_warnings = Add(Analyzer3.double_dealloc_warnings, 1)
+                Analyzer3.RemoveMaybe(var_name)
+                Analyzer3.RemoveMaybe(root)
+                Analyzer3.MarkFreedGroup(var_name, root)
+                Analyzer3.ClearPending(root)
+                ReturnValue(0)
             }
         }
         
-        Array.Push(Analyzer3.deallocated_vars, var_name)
+        Analyzer3.MarkFreedGroup(var_name, root)
+        Analyzer3.ClearPending(root)
+    }
+}
+
+Function.Analyzer3.IndexOf {
+    Input: list: Address
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(list, 0) ThenBlock: { ReturnValue(Subtract(0, 1)) }
+        count = Array.Size(list)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = Array.Get(list, i)
+            same = Analyzer3.StrEqual(existing, name)
+            IfCondition EqualTo(same, 1) ThenBlock: { ReturnValue(i) }
+            i = Add(i, 1)
+        }
+        ReturnValue(Subtract(0, 1))
+    }
+}
+
+Function.Analyzer3.RootOf {
+    Input: name: Address
+    Output: Address
+    Body: {
+        current = name
+        steps = 0
+        WhileLoop LessThan(steps, 8) {
+            idx = Analyzer3.IndexOf(Analyzer3.alias_names, current)
+            IfCondition LessThan(idx, 0) ThenBlock: { ReturnValue(current) }
+            current = Array.Get(Analyzer3.alias_roots, idx)
+            steps = Add(steps, 1)
+        }
+        ReturnValue(current)
+    }
+}
+
+Function.Analyzer3.ClearAlias {
+    Input: name: Address
+    Body: {
+        idx = Analyzer3.IndexOf(Analyzer3.alias_names, name)
+        IfCondition LessThan(idx, 0) ThenBlock: { ReturnValue(0) }
+        last = Array.Size(Analyzer3.alias_names)
+        last = Subtract(last, 1)
+        IfCondition NotEqual(idx, last) ThenBlock: {
+            Array.Swap(Analyzer3.alias_names, idx, last)
+            Array.Swap(Analyzer3.alias_roots, idx, last)
+        }
+        Array.Pop(Analyzer3.alias_names)
+        Array.Pop(Analyzer3.alias_roots)
+    }
+}
+
+Function.Analyzer3.BindAlias {
+    Input: name: Address
+    Input: root: Address
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(root, 0) ThenBlock: { ReturnValue(0) }
+        same = Analyzer3.StrEqual(name, root)
+        IfCondition EqualTo(same, 1) ThenBlock: {
+            Analyzer3.ClearAlias(name)
+            ReturnValue(0)
+        }
+        idx = Analyzer3.IndexOf(Analyzer3.alias_names, name)
+        IfCondition GreaterEqual(idx, 0) ThenBlock: {
+            Array.Set(Analyzer3.alias_roots, idx, root)
+            ReturnValue(0)
+        }
+        Array.Push(Analyzer3.alias_names, name)
+        Array.Push(Analyzer3.alias_roots, root)
+    }
+}
+
+Function.Analyzer3.NotePtr {
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        seen = Analyzer3.ListHas(Analyzer3.ptr_names, name)
+        IfCondition EqualTo(seen, 0) ThenBlock: {
+            Array.Push(Analyzer3.ptr_names, name)
+        }
+    }
+}
+
+Function.Analyzer3.PushFresh {
+    Input: list: Address
+    Input: name: Address
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        seen = Analyzer3.ListHas(list, name)
+        IfCondition EqualTo(seen, 0) ThenBlock: {
+            Array.Push(list, name)
+        }
+    }
+}
+
+Function.Analyzer3.MarkFreedGroup {
+    Input: var_name: Address
+    Input: root: Address
+    Body: {
+        Analyzer3.PushFresh(Analyzer3.deallocated_vars, var_name)
+        Analyzer3.PushFresh(Analyzer3.deallocated_vars, root)
+        count = Array.Size(Analyzer3.alias_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            aname = Array.Get(Analyzer3.alias_names, i)
+            aroot = Analyzer3.RootOf(aname)
+            same = Analyzer3.StrEqual(aroot, root)
+            IfCondition EqualTo(same, 1) ThenBlock: {
+                Analyzer3.PushFresh(Analyzer3.deallocated_vars, aname)
+            }
+            i = Add(i, 1)
+        }
+    }
+}
+
+Function.Analyzer3.NoteAlias {
+    Input: target: Address
+    Input: value: Address
+    Body: {
+        IfCondition EqualTo(value, 0) ThenBlock: { ReturnValue(0) }
+        value_type = AST_GetType(value)
+        IfCondition EqualTo(value_type, AST.CALL) ThenBlock: {
+            fname = AST_GetData1(value)
+            is_alloc = Analyzer3.IsAllocatingFunc(fname)
+            returns_new = Analyzer.ReturnsAlloc(fname)
+            IfCondition EqualTo(is_alloc, 1) ThenBlock: {
+                Analyzer3.ClearAlias(target)
+                Analyzer3.NotePtr(target)
+                ReturnValue(0)
+            }
+            IfCondition EqualTo(returns_new, 1) ThenBlock: {
+                Analyzer3.ClearAlias(target)
+                Analyzer3.NotePtr(target)
+                ReturnValue(0)
+            }
+        }
+        IfCondition EqualTo(value_type, AST.IDENTIFIER) ThenBlock: {
+            rhs = AST_GetData1(value)
+            root = Analyzer3.RootOf(rhs)
+            tracked = Analyzer3.ListHas(Analyzer3.ptr_names, root)
+            IfCondition EqualTo(tracked, 0) ThenBlock: {
+                tracked = Analyzer3.ListHas(Analyzer3.alias_names, rhs)
+            }
+            IfCondition EqualTo(tracked, 1) ThenBlock: {
+                Analyzer3.BindAlias(target, root)
+                ReturnValue(0)
+            }
+        }
+        Analyzer3.ClearAlias(target)
+    }
+}
+
+Function.Analyzer3.ClearPending {
+    Input: name: Address
+    Body: {
+        idx = Analyzer3.IndexOf(Analyzer3.pending_names, name)
+        IfCondition LessThan(idx, 0) ThenBlock: { ReturnValue(0) }
+        last = Array.Size(Analyzer3.pending_names)
+        last = Subtract(last, 1)
+        IfCondition NotEqual(idx, last) ThenBlock: {
+            Array.Swap(Analyzer3.pending_names, idx, last)
+            Array.Swap(Analyzer3.pending_lines, idx, last)
+            Array.Swap(Analyzer3.pending_funcs, idx, last)
+        }
+        Array.Pop(Analyzer3.pending_names)
+        Array.Pop(Analyzer3.pending_lines)
+        Array.Pop(Analyzer3.pending_funcs)
+    }
+}
+
+Function.Analyzer3.NoteReallocTail {
+    Input: name: Address
+    Input: line: Integer
+    Input: func_name: Address
+    Body: {
+        seen = Analyzer3.ListHas(Analyzer3.pending_names, name)
+        IfCondition EqualTo(seen, 1) ThenBlock: { ReturnValue(0) }
+        Array.Push(Analyzer3.pending_names, name)
+        Array.Push(Analyzer3.pending_lines, line)
+        Array.Push(Analyzer3.pending_funcs, func_name)
+    }
+}
+
+Function.Analyzer3.DropExitingFrees {
+    Input: names: Address
+    Input: other: Address
+    Input: arm_exits: Integer
+    Body: {
+        IfCondition EqualTo(arm_exits, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(names, 0) ThenBlock: { ReturnValue(0) }
+        i = 0
+        count = Array.Size(names)
+        WhileLoop LessThan(i, count) {
+            name = Array.Get(names, i)
+            keep = 0
+            IfCondition NotEqual(other, 0) ThenBlock: {
+                keep = Analyzer3.ListHas(other, name)
+            }
+            IfCondition EqualTo(keep, 0) ThenBlock: {
+                last = Subtract(count, 1)
+                IfCondition NotEqual(i, last) ThenBlock: {
+                    Array.Swap(names, i, last)
+                }
+                Array.Pop(names)
+                count = Array.Size(names)
+            }
+            IfCondition EqualTo(keep, 1) ThenBlock: {
+                i = Add(i, 1)
+            }
+        }
+    }
+}
+
+Function.Analyzer3.RestoreMaybe {
+    Input: names: Address
+    Body: {
+        IfCondition EqualTo(names, 0) ThenBlock: { ReturnValue(0) }
+        count = Array.Size(names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            name = Array.Get(names, i)
+            seen = Analyzer3.ListHas(Analyzer3.maybe_freed_vars, name)
+            IfCondition EqualTo(seen, 0) ThenBlock: {
+                Array.Push(Analyzer3.maybe_freed_vars, name)
+            }
+            i = Add(i, 1)
+        }
+        Array.Destroy(names)
     }
 }
 
@@ -696,21 +1060,36 @@ Function.Analyzer3.RemoveDealloc {
     Input: var_name: Address
     Body: {
         IfCondition EqualTo(var_name, 0) ThenBlock: { ReturnValue(0) }
-        
-        count = Array.Size(Analyzer3.deallocated_vars)
+        Analyzer3.RemoveFrom(Analyzer3.deallocated_vars, var_name)
+        Analyzer3.RemoveMaybe(var_name)
+    }
+}
+
+Function.Analyzer3.RemoveFrom {
+    Input: list: Address
+    Input: var_name: Address
+    Body: {
+        IfCondition EqualTo(list, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(var_name, 0) ThenBlock: { ReturnValue(0) }
+        count = Array.Size(list)
         i = 0
         WhileLoop LessThan(i, count) {
-            existing = Array.Get(Analyzer3.deallocated_vars, i)
+            existing = Array.Get(list, i)
             IfCondition EqualTo(Analyzer3.StrEqual(existing, var_name), 1) ThenBlock: {
-                // Found it. Swap with last and pop to remove.
                 last_idx = Subtract(count, 1)
-                Array.Swap(Analyzer3.deallocated_vars, i, last_idx)
-                Array.Pop(Analyzer3.deallocated_vars)
-                // Stop (assuming unique entries)
+                Array.Swap(list, i, last_idx)
+                Array.Pop(list)
                 ReturnValue(0)
             }
             i = Add(i, 1)
         }
+    }
+}
+
+Function.Analyzer3.RemoveMaybe {
+    Input: var_name: Address
+    Body: {
+        Analyzer3.RemoveFrom(Analyzer3.maybe_freed_vars, var_name)
     }
 }
 
@@ -810,7 +1189,7 @@ Function.Analyzer3.WalkNode {
             }
             
             Analyzer3.WalkChildren(node)
-            
+            Analyzer3.FlushPending()
             
             Analyzer3.PopScope()
             Analyzer3.current_func = 0
@@ -824,7 +1203,7 @@ Function.Analyzer3.WalkNode {
             Analyzer3.PushScope()
             
             Analyzer3.WalkChildren(node)
-          
+            Analyzer3.FlushPending()
             
             Analyzer3.PopScope()
             Analyzer3.current_func = 0
@@ -833,21 +1212,28 @@ Function.Analyzer3.WalkNode {
         
         // === BLOCK/BODY - new scope ===
         IfCondition EqualTo(node_type, AST.BLOCK) ThenBlock: {
+            leave_flag = Analyzer3.PushLeave(node)
             Analyzer3.PushScope()
             Analyzer3.WalkChildren(node)
             Analyzer3.PopScope()
+            Analyzer3.PopLeave(leave_flag)
             ReturnValue(0)
         }
         
         IfCondition EqualTo(node_type, AST.BODY) ThenBlock: {
+            leave_flag = Analyzer3.PushLeave(node)
             Analyzer3.PushScope()
             Analyzer3.WalkChildren(node)
             Analyzer3.PopScope()
+            Analyzer3.PopLeave(leave_flag)
             ReturnValue(0)
         }
         
-        // === IF CONDITION (Branching Analysis) ===
-        IfCondition EqualTo(node_type, AST.IF) ThenBlock: {
+        // === IF and FORK (Branching Analysis) ===
+        is_branch = 0
+        IfCondition EqualTo(node_type, AST.IF) ThenBlock: { is_branch = 1 }
+        IfCondition EqualTo(node_type, AST.FORK) ThenBlock: { is_branch = 1 }
+        IfCondition EqualTo(is_branch, 1) ThenBlock: {
             child_count = AST_GetChildCount(node)
             
             // 1. Analyze Condition
@@ -856,8 +1242,12 @@ Function.Analyzer3.WalkNode {
                 Analyzer3.WalkNode(cond)
             }
             
-            // Snapshot state before branches
+            // Snapshot state before branches. Maybes added in one arm
+            // must not be visible while the other arm is walked.
             start_dealloc_count = Array.Size(Analyzer3.deallocated_vars)
+            maybe_start = Array.Size(Analyzer3.maybe_freed_vars)
+            then_block = 0
+            else_block = 0
             
             // 2. Analyze Then Block
             IfCondition GreaterThan(child_count, 1) ThenBlock: {
@@ -865,76 +1255,65 @@ Function.Analyzer3.WalkNode {
                 Analyzer3.WalkNode(then_block)
             }
             
-            // Snapshot Then state and isolate for Else
-            end_then_count = Array.Size(Analyzer3.deallocated_vars)
-            temp_storage = Array.Create(16)
-            
-            // Pop Then-deallocs to temp storage so Else doesn't see them
-            count_to_move = Subtract(end_then_count, start_dealloc_count)
-            i = 0
-            WhileLoop LessThan(i, count_to_move) {
-                item = Array.Pop(Analyzer3.deallocated_vars)
-                Array.Push(temp_storage, item)
-                i = Add(i, 1)
-            }
-            
-            // 3. Analyze Else Block (if exists)
+            // Names freed only in Then. Pop them so Else does not see them.
+            then_names = Analyzer3.TakeSince(Analyzer3.deallocated_vars, start_dealloc_count)
+            then_maybe = Analyzer3.TakeSince(Analyzer3.maybe_freed_vars, maybe_start)
+            has_else = 0
             IfCondition GreaterThan(child_count, 2) ThenBlock: {
+                has_else = 1
                 else_block = AST_GetChild(node, 2)
                 Analyzer3.WalkNode(else_block)
             }
-            
-            // 4. Merge States (Union)
-            // Restore Then-deallocs so subsequent code sees deallocs from both paths
-            count_temp = Array.Size(temp_storage)
-            i = 0
-            WhileLoop LessThan(i, count_temp) {
-                item = Array.Pop(temp_storage)
-                Array.Push(Analyzer3.deallocated_vars, item)
-                i = Add(i, 1)
+            else_names = Analyzer3.TakeSince(Analyzer3.deallocated_vars, start_dealloc_count)
+            else_maybe = Analyzer3.TakeSince(Analyzer3.maybe_freed_vars, maybe_start)
+            then_exits = Analyzer.ArmExits(then_block)
+            else_exits = Analyzer.ArmExits(else_block)
+            // A free on a path that returns does not reach the code after the If,
+            // unless every arm frees that name.
+            Analyzer3.DropExitingFrees(then_names, else_names, then_exits)
+            Analyzer3.DropExitingFrees(else_names, then_names, else_exits)
+            // Intersection is definite. One side only is maybe-freed.
+            Analyzer3.JoinFrees(then_names, else_names, has_else)
+            IfCondition EqualTo(then_exits, 0) ThenBlock: {
+                Analyzer3.RestoreMaybe(then_maybe)
             }
-            Array.Destroy(temp_storage)
+            IfCondition EqualTo(then_exits, 1) ThenBlock: {
+                Array.Destroy(then_maybe)
+            }
+            IfCondition EqualTo(has_else, 1) ThenBlock: {
+                IfCondition EqualTo(else_exits, 0) ThenBlock: {
+                    Analyzer3.RestoreMaybe(else_maybe)
+                }
+                IfCondition EqualTo(else_exits, 1) ThenBlock: {
+                    Array.Destroy(else_maybe)
+                }
+            }
+            IfCondition EqualTo(has_else, 0) ThenBlock: {
+                Array.Destroy(else_maybe)
+            }
+            Array.Destroy(then_names)
+            Array.Destroy(else_names)
             
             ReturnValue(0)
         }
         
         // === WHILE LOOP ===
         IfCondition EqualTo(node_type, AST.WHILE) ThenBlock: {
-            Analyzer3.in_loop_body = Add(Analyzer3.in_loop_body, 1)
-            
-            // Save outer loop's alloc tracking (for nested loops)
-            saved_alloc_count = Array.Size(Analyzer3.loop_alloc_vars)
-            saved_dealloc_count = Array.Size(Analyzer3.loop_dealloc_vars)
-            
-            // Clear for this loop body
-            Array.Clear(Analyzer3.loop_alloc_vars)
-            Array.Clear(Analyzer3.loop_alloc_lines)
-            Array.Clear(Analyzer3.loop_alloc_funcs)
-            Array.Clear(Analyzer3.loop_dealloc_vars)
-            
+            Analyzer3.BeginLoopAlloc()
             loop_var = 0
             Analyzer3.EnterLoop(loop_var)
             Analyzer3.WalkChildren(node)
-            
-            // Check alloc balance before exiting loop context
-            Analyzer3.CheckLoopAllocBalance()
-            
             Analyzer3.ExitLoop()
-            Analyzer3.in_loop_body = Subtract(Analyzer3.in_loop_body, 1)
-            
-            // Restore outer tracking (clear inner, outer state was consumed)
-            Array.Clear(Analyzer3.loop_alloc_vars)
-            Array.Clear(Analyzer3.loop_alloc_lines)
-            Array.Clear(Analyzer3.loop_alloc_funcs)
-            Array.Clear(Analyzer3.loop_dealloc_vars)
-            
+            Analyzer3.EndLoopAlloc()
             ReturnValue(0)
         }
         
         // === LOOP MAIN (long-running server pattern) ===
         IfCondition EqualTo(node_type, AST.LOOP_MAIN) ThenBlock: {
             Analyzer3.in_main_loop = 1
+            Analyzer3.BeginLoopAlloc()
             Analyzer3.WalkChildren(node)
+            Analyzer3.EndLoopAlloc()
             Analyzer3.in_main_loop = 0
             ReturnValue(0)
         }
@@ -942,19 +1321,18 @@ Function.Analyzer3.WalkNode {
         // === FOR LOOP ===
         IfCondition EqualTo(node_type, AST.FOR_EVERY) ThenBlock: {
             loop_var = AST_GetData1(node)
+            Analyzer3.BeginLoopAlloc()
             Analyzer3.EnterLoop(loop_var)
-            Analyzer3.MarkWritten(loop_var)  // Loop var is implicitly assigned
+            Analyzer3.MarkWritten(loop_var)
             Analyzer3.WalkChildren(node)
             Analyzer3.ExitLoop()
+            Analyzer3.EndLoopAlloc()
             ReturnValue(0)
         }
         
         // === ASSIGNMENT ===
         IfCondition EqualTo(node_type, AST.ASSIGNMENT) ThenBlock: {
             target = AST_GetData1(node)
-            
-            // NEW: Variable is being reassigned, so it is no longer "deallocated"
-            Analyzer3.RemoveDealloc(target)
             
             // Check for loop variable modification
             IfCondition EqualTo(Analyzer3.check_loop_mod, 1) ThenBlock: {
@@ -992,19 +1370,35 @@ Function.Analyzer3.WalkNode {
                             // Track allocations inside loop bodies
                             IfCondition GreaterThan(Analyzer3.in_loop_body, 0) ThenBlock: {
                                 IfCondition EqualTo(Analyzer3.IsAllocatingFunc(func_name), 1) ThenBlock: {
+                                    alloc_seq = Analyzer3.loop_seq
+                                    Analyzer3.loop_seq = Add(alloc_seq, 1)
                                     Array.Push(Analyzer3.loop_alloc_vars, target)
                                     Array.Push(Analyzer3.loop_alloc_lines, node_line)
                                     Array.Push(Analyzer3.loop_alloc_funcs, func_name)
+                                    Array.Push(Analyzer3.loop_alloc_seq, alloc_seq)
+                                    hands = Analyzer3.HandsBack(target)
+                                    IfCondition GreaterThan(Analyzer3.halt_depth, 0) ThenBlock: {
+                                        hands = 1
+                                    }
+                                    Array.Push(Analyzer3.loop_alloc_leave, hands)
                                 }
                             }
                         }
                     }
                 }
                 
-                // Walk RHS first (read before write)
+                // Walk RHS first. A read of a freed name is use-after-free.
+                // The write below then clears the freed mark.
                 Analyzer3.WalkNode(rhs)
             }
 
+            Analyzer3.RemoveDealloc(target)
+            alias_value = 0
+            alias_count = AST_GetChildCount(node)
+            IfCondition GreaterThan(alias_count, 0) ThenBlock: {
+                alias_value = AST_GetChild(node, 0)
+            }
+            Analyzer3.NoteAlias(target, alias_value)
 
             // Mark written and add to scope
             Analyzer3.MarkWritten(target)
@@ -1035,7 +1429,13 @@ Function.Analyzer3.WalkNode {
             Analyzer3.RecordCall(Analyzer3.current_func, func_name)
             Analyzer3.MarkModuleUsed(func_name, node_line)
             
-            IfCondition EqualTo(StringCompare(func_name, "Deallocate"), 0) ThenBlock: {
+            // Read the arguments before recording the free, so the pointer
+            // passed to the free is not itself a use-after-free.
+            Analyzer3.WalkChildren(node)
+
+            is_free = Analyzer3.IsFreeingFunc(func_name)
+            IfCondition EqualTo(is_free, 1) ThenBlock: {
+                child_count = AST_GetChildCount(node)
                 IfCondition GreaterThan(child_count, 0) ThenBlock: {
                     dealloc_arg = AST_GetChild(node, 0)
                     IfCondition NotEqual(dealloc_arg, 0) ThenBlock: {
@@ -1045,14 +1445,43 @@ Function.Analyzer3.WalkNode {
                             
                             // Track deallocation inside loop bodies
                             IfCondition GreaterThan(Analyzer3.in_loop_body, 0) ThenBlock: {
-                                Array.Push(Analyzer3.loop_dealloc_vars, dealloc_name)
+                                loop_name = Analyzer3.RootOf(dealloc_name)
+                                free_seq = Analyzer3.loop_seq
+                                Analyzer3.loop_seq = Add(free_seq, 1)
+                                Array.Push(Analyzer3.loop_dealloc_vars, loop_name)
+                                Array.Push(Analyzer3.loop_dealloc_lines, node_line)
+                                Array.Push(Analyzer3.loop_dealloc_seq, free_seq)
                             }
                         }
                     }
                 }
             }
-            
-            Analyzer3.WalkChildren(node)
+
+            // A callee that frees one of its parameters takes that argument.
+            child_count = AST_GetChildCount(node)
+            ai = 0
+            WhileLoop LessThan(ai, child_count) {
+                arg = AST_GetChild(node, ai)
+                IfCondition NotEqual(arg, 0) ThenBlock: {
+                    arg_type = AST_GetType(arg)
+                    IfCondition EqualTo(arg_type, AST.IDENTIFIER) ThenBlock: {
+                        aname = AST_GetData1(arg)
+                        takes = Analyzer.FreesParam(func_name, ai)
+                        IfCondition EqualTo(takes, 1) ThenBlock: {
+                            Analyzer3.RecordDealloc(aname, node_line)
+                            IfCondition GreaterThan(Analyzer3.in_loop_body, 0) ThenBlock: {
+                                loop_name = Analyzer3.RootOf(aname)
+                                free_seq = Analyzer3.loop_seq
+                                Analyzer3.loop_seq = Add(free_seq, 1)
+                                Array.Push(Analyzer3.loop_dealloc_vars, loop_name)
+                                Array.Push(Analyzer3.loop_dealloc_lines, node_line)
+                                Array.Push(Analyzer3.loop_dealloc_seq, free_seq)
+                            }
+                        }
+                    }
+                }
+                ai = Add(ai, 1)
+            }
             ReturnValue(0)
         }
         
@@ -1205,6 +1634,44 @@ Function.Analyzer3.IsArenaManaged {
     }
 }
 
+Function.Analyzer3.ListHas {
+    Input: list: Address
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(list, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        count = Array.Size(list)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            existing = Array.Get(list, i)
+            same = Analyzer3.StrEqual(existing, name)
+            IfCondition EqualTo(same, 1) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Analyzer3.IsFreeingFunc {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(name, 0) ThenBlock: { ReturnValue(0) }
+        cmp = StringCompare(name, "Deallocate")
+        IfCondition EqualTo(cmp, 0) ThenBlock: { ReturnValue(1) }
+        cmp = StringCompare(name, "Arena_Free")
+        IfCondition EqualTo(cmp, 0) ThenBlock: { ReturnValue(1) }
+        cmp = StringCompare(name, "ArrayDestroy")
+        IfCondition EqualTo(cmp, 0) ThenBlock: { ReturnValue(1) }
+        cmp = StringCompare(name, "Array.Destroy")
+        IfCondition EqualTo(cmp, 0) ThenBlock: { ReturnValue(1) }
+        cmp = StringCompare(name, "FreeLinkage")
+        IfCondition EqualTo(cmp, 0) ThenBlock: { ReturnValue(1) }
+        ReturnValue(0)
+    }
+}
+
 Function.Analyzer3.IsAllocatingFunc {
     Input: name: Address
     Output: Integer
@@ -1225,59 +1692,316 @@ Function.Analyzer3.IsAllocatingFunc {
 }
 
 
+Function.Analyzer3.PopTo {
+    Input: list: Address
+    Input: start: Integer
+    Body: {
+        IfCondition EqualTo(list, 0) ThenBlock: { ReturnValue(0) }
+        sz = Array.Size(list)
+        WhileLoop GreaterThan(sz, start) {
+            Array.Pop(list)
+            sz = Array.Size(list)
+        }
+    }
+}
+
+// flag bits: 1 = pushed a returned name, 2 = this block halts.
+Function.Analyzer3.PushLeave {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        handed = 0
+        halts = 0
+        IfCondition GreaterThan(Analyzer3.in_loop_body, 0) ThenBlock: {
+            handed = Analyzer.ReturnedIdent(node)
+            halts = Analyzer.ArmHalts(node)
+        }
+        flag = 0
+        IfCondition NotEqual(handed, 0) ThenBlock: {
+            Array.Push(Analyzer3.leave_names, handed)
+            flag = 1
+        }
+        IfCondition EqualTo(halts, 1) ThenBlock: {
+            Analyzer3.halt_depth = Add(Analyzer3.halt_depth, 1)
+            flag = Add(flag, 2)
+        }
+        ReturnValue(flag)
+    }
+}
+
+Function.Analyzer3.PopLeave {
+    Input: flag: Integer
+    Body: {
+        halt_part = 0
+        IfCondition GreaterEqual(flag, 2) ThenBlock: { halt_part = 1 }
+        name_part = flag
+        IfCondition EqualTo(halt_part, 1) ThenBlock: {
+            name_part = Subtract(flag, 2)
+            IfCondition GreaterThan(Analyzer3.halt_depth, 0) ThenBlock: {
+                Analyzer3.halt_depth = Subtract(Analyzer3.halt_depth, 1)
+            }
+        }
+        IfCondition EqualTo(name_part, 1) ThenBlock: {
+            Array.Pop(Analyzer3.leave_names)
+        }
+    }
+}
+
+Function.Analyzer3.HandsBack {
+    Input: name: Address
+    Output: Integer
+    Body: {
+        count = Array.Size(Analyzer3.leave_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            item = Array.Get(Analyzer3.leave_names, i)
+            same = Analyzer3.StrEqual(item, name)
+            IfCondition EqualTo(same, 1) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Analyzer3.BeginLoopAlloc {
+    Body: {
+        mark_a = Array.Size(Analyzer3.loop_alloc_vars)
+        Array.Push(Analyzer3.loop_alloc_mark, mark_a)
+        mark_d = Array.Size(Analyzer3.loop_dealloc_vars)
+        Array.Push(Analyzer3.loop_dealloc_mark, mark_d)
+        Analyzer3.in_loop_body = Add(Analyzer3.in_loop_body, 1)
+    }
+}
+
+Function.Analyzer3.EndLoopAlloc {
+    Body: {
+        start = Array.Pop(Analyzer3.loop_alloc_mark)
+        dstart = Array.Pop(Analyzer3.loop_dealloc_mark)
+        Analyzer3.CheckLoopAllocBalance(start, dstart)
+        Analyzer3.CheckLoopFreeOutside(start, dstart)
+        Analyzer3.PopTo(Analyzer3.loop_alloc_vars, start)
+        Analyzer3.PopTo(Analyzer3.loop_alloc_lines, start)
+        Analyzer3.PopTo(Analyzer3.loop_alloc_funcs, start)
+        Analyzer3.PopTo(Analyzer3.loop_dealloc_vars, dstart)
+        Analyzer3.PopTo(Analyzer3.loop_dealloc_lines, dstart)
+        Analyzer3.PopTo(Analyzer3.loop_alloc_seq, start)
+        Analyzer3.PopTo(Analyzer3.loop_dealloc_seq, dstart)
+        Analyzer3.PopTo(Analyzer3.loop_alloc_leave, start)
+        IfCondition GreaterThan(Analyzer3.in_loop_body, 0) ThenBlock: {
+            Analyzer3.in_loop_body = Subtract(Analyzer3.in_loop_body, 1)
+        }
+    }
+}
+
+Function.Analyzer3.TakeSince {
+    Input: list: Address
+    Input: start: Integer
+    Output: Address
+    Body: {
+        out = Array.Create(8)
+        IfCondition EqualTo(list, 0) ThenBlock: { ReturnValue(out) }
+        count = Array.Size(list)
+        i = start
+        WhileLoop LessThan(i, count) {
+            item = Array.Get(list, i)
+            Array.Push(out, item)
+            i = Add(i, 1)
+        }
+        Analyzer3.PopTo(list, start)
+        ReturnValue(out)
+    }
+}
+
+Function.Analyzer3.JoinFrees {
+    Input: then_names: Address
+    Input: else_names: Address
+    Input: has_else: Integer
+    Body: {
+        tcount = Array.Size(then_names)
+        ti = 0
+        WhileLoop LessThan(ti, tcount) {
+            name = Array.Get(then_names, ti)
+            in_else = 0
+            IfCondition EqualTo(has_else, 1) ThenBlock: {
+                in_else = Analyzer3.ListHas(else_names, name)
+            }
+            IfCondition EqualTo(in_else, 1) ThenBlock: {
+                already = Analyzer3.ListHas(Analyzer3.deallocated_vars, name)
+                IfCondition EqualTo(already, 0) ThenBlock: {
+                    Array.Push(Analyzer3.deallocated_vars, name)
+                }
+            }
+            IfCondition EqualTo(in_else, 0) ThenBlock: {
+                already_m = Analyzer3.ListHas(Analyzer3.maybe_freed_vars, name)
+                IfCondition EqualTo(already_m, 0) ThenBlock: {
+                    Array.Push(Analyzer3.maybe_freed_vars, name)
+                }
+            }
+            ti = Add(ti, 1)
+        }
+        IfCondition EqualTo(has_else, 1) ThenBlock: {
+            ecount = Array.Size(else_names)
+            ei = 0
+            WhileLoop LessThan(ei, ecount) {
+                ename = Array.Get(else_names, ei)
+                in_then = Analyzer3.ListHas(then_names, ename)
+                IfCondition EqualTo(in_then, 0) ThenBlock: {
+                    already_m = Analyzer3.ListHas(Analyzer3.maybe_freed_vars, ename)
+                    IfCondition EqualTo(already_m, 0) ThenBlock: {
+                        Array.Push(Analyzer3.maybe_freed_vars, ename)
+                    }
+                }
+                ei = Add(ei, 1)
+            }
+        }
+    }
+}
+
+Function.Analyzer3.InSlice {
+    Input: list: Address
+    Input: name: Address
+    Input: start: Integer
+    Input: end: Integer
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(list, 0) ThenBlock: { ReturnValue(0) }
+        i = start
+        WhileLoop LessThan(i, end) {
+            existing = Array.Get(list, i)
+            same = Analyzer3.StrEqual(existing, name)
+            IfCondition EqualTo(same, 1) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.Analyzer3.CheckLoopFreeOutside {
+    Input: start: Integer
+    Input: dstart: Integer
+    Body: {
+        alloc_end = Array.Size(Analyzer3.loop_alloc_vars)
+        dcount = Array.Size(Analyzer3.loop_dealloc_vars)
+        di = dstart
+        WhileLoop LessThan(di, dcount) {
+            name = Array.Get(Analyzer3.loop_dealloc_vars, di)
+            inside = Analyzer3.InSlice(Analyzer3.loop_alloc_vars, name, start, alloc_end)
+            IfCondition EqualTo(inside, 0) ThenBlock: {
+                earlier = Analyzer3.InSlice(Analyzer3.loop_dealloc_vars, name, dstart, di)
+                IfCondition EqualTo(earlier, 0) ThenBlock: {
+                    line = Array.Get(Analyzer3.loop_dealloc_lines, di)
+                    location = FileMap_Format(line)
+                    msg = StringConcat("MEM-REPEAT ", location)
+                    msg = StringConcat(msg, ": '")
+                    IfCondition NotEqual(name, 0) ThenBlock: {
+                        msg = StringConcat(msg, name)
+                    }
+                    msg = StringConcat(msg, "' freed inside a loop but allocated outside it")
+                    IfCondition NotEqual(Analyzer3.current_func, 0) ThenBlock: {
+                        msg = StringConcat(msg, " in '")
+                        msg = StringConcat(msg, Analyzer3.current_func)
+                        msg = StringConcat(msg, "'")
+                    }
+                    Analyzer3.AddWarning(msg)
+                    Analyzer3.repeat_warnings = Add(Analyzer3.repeat_warnings, 1)
+                }
+            }
+            di = Add(di, 1)
+        }
+    }
+}
+
+Function.Analyzer3.EmitLoopWarn {
+    Input: var_name: Address
+    Input: line: Integer
+    Input: alloc_func: Address
+    Body: {
+        location = FileMap_Format(line)
+        msg = StringConcat("MEM-LOOP ", location)
+        msg = StringConcat(msg, ": '")
+        IfCondition NotEqual(var_name, 0) ThenBlock: {
+            msg = StringConcat(msg, var_name)
+        }
+        msg = StringConcat(msg, "' allocated by ")
+        IfCondition NotEqual(alloc_func, 0) ThenBlock: {
+            msg = StringConcat(msg, alloc_func)
+        }
+        is_arena = Analyzer3.IsArenaManaged(alloc_func)
+        IfCondition EqualTo(is_arena, 1) ThenBlock: {
+            msg = StringConcat(msg, " inside a loop; the arena grows each iteration")
+        }
+        IfCondition EqualTo(is_arena, 0) ThenBlock: {
+            msg = StringConcat(msg, " inside a loop and not freed before the next iteration")
+        }
+        IfCondition NotEqual(Analyzer3.current_func, 0) ThenBlock: {
+            msg = StringConcat(msg, " in '")
+            msg = StringConcat(msg, Analyzer3.current_func)
+            msg = StringConcat(msg, "'")
+        }
+        Analyzer3.AddWarning(msg)
+        Analyzer3.alloc_in_loop_warnings = Add(Analyzer3.alloc_in_loop_warnings, 1)
+    }
+}
+
+Function.Analyzer3.FlushPending {
+    Body: {
+        count = Array.Size(Analyzer3.pending_names)
+        i = 0
+        WhileLoop LessThan(i, count) {
+            name = Array.Get(Analyzer3.pending_names, i)
+            line = Array.Get(Analyzer3.pending_lines, i)
+            func_name = Array.Get(Analyzer3.pending_funcs, i)
+            Analyzer3.EmitLoopWarn(name, line, func_name)
+            i = Add(i, 1)
+        }
+        Array.Clear(Analyzer3.pending_names)
+        Array.Clear(Analyzer3.pending_lines)
+        Array.Clear(Analyzer3.pending_funcs)
+    }
+}
+
 Function.Analyzer3.CheckLoopAllocBalance {
+    Input: start: Integer
+    Input: dstart: Integer
     Body: {
         count = Array.Size(Analyzer3.loop_alloc_vars)
-        i = 0
+        i = start
         WhileLoop LessThan(i, count) {
             var_name = Array.Get(Analyzer3.loop_alloc_vars, i)
             
-            was_freed = 0
+            later_free = 0
+            earlier_free = 0
+            alloc_seq = Array.Get(Analyzer3.loop_alloc_seq, i)
             dcount = Array.Size(Analyzer3.loop_dealloc_vars)
-            di = 0
+            di = dstart
             WhileLoop LessThan(di, dcount) {
                 dvar = Array.Get(Analyzer3.loop_dealloc_vars, di)
                 IfCondition EqualTo(Analyzer3.StrEqual(dvar, var_name), 1) ThenBlock: {
-                    was_freed = 1
+                    dseq = Array.Get(Analyzer3.loop_dealloc_seq, di)
+                    IfCondition GreaterThan(dseq, alloc_seq) ThenBlock: {
+                        later_free = 1
+                    }
+                    IfCondition LessEqual(dseq, alloc_seq) ThenBlock: {
+                        earlier_free = 1
+                    }
                 }
                 di = Add(di, 1)
             }
             
-            IfCondition EqualTo(was_freed, 0) ThenBlock: {
-                line = Array.Get(Analyzer3.loop_alloc_lines, i)
-                alloc_func = Array.Get(Analyzer3.loop_alloc_funcs, i)
-                
-                location = FileMap_Format(line)
-                msg = location
-                
-                is_arena = Analyzer3.IsArenaManaged(alloc_func)
-                IfCondition EqualTo(is_arena, 1) ThenBlock: {
-                    msg = StringConcat(msg, ": Arena alloc in loop '")
-                } ElseBlock: {
-                    msg = StringConcat(msg, ": Allocation in loop '")
+            hands = Array.Get(Analyzer3.loop_alloc_leave, i)
+            IfCondition EqualTo(hands, 0) ThenBlock: {
+                IfCondition EqualTo(later_free, 0) ThenBlock: {
+                    line = Array.Get(Analyzer3.loop_alloc_lines, i)
+                    alloc_func = Array.Get(Analyzer3.loop_alloc_funcs, i)
+                    // Free then allocate is the realloc shape. The free after
+                    // the loop, if there is one, releases the last block.
+                    IfCondition EqualTo(earlier_free, 1) ThenBlock: {
+                        Analyzer3.NoteReallocTail(var_name, line, alloc_func)
+                    }
+                    IfCondition EqualTo(earlier_free, 0) ThenBlock: {
+                        Analyzer3.EmitLoopWarn(var_name, line, alloc_func)
+                    }
                 }
-                
-                IfCondition NotEqual(var_name, 0) ThenBlock: {
-                    msg = StringConcat(msg, var_name)
-                }
-                msg = StringConcat(msg, "' via ")
-                IfCondition NotEqual(alloc_func, 0) ThenBlock: {
-                    msg = StringConcat(msg, alloc_func)
-                }
-                
-                IfCondition EqualTo(is_arena, 1) ThenBlock: {
-                    msg = StringConcat(msg, ") grows arena each iteration — safe for batch, concern for long-running")
-                } ElseBlock: {
-                    msg = StringConcat(msg, ") not freed before next iteration — memory leak")
-                }
-                
-                IfCondition NotEqual(Analyzer3.current_func, 0) ThenBlock: {
-                    msg = StringConcat(msg, " in '")
-                    msg = StringConcat(msg, Analyzer3.current_func)
-                    msg = StringConcat(msg, "'")
-                }
-                Analyzer3.AddWarning(msg)
-                Analyzer3.alloc_in_loop_warnings = Add(Analyzer3.alloc_in_loop_warnings, 1)
             }
             
             i = Add(i, 1)
@@ -1372,9 +2096,65 @@ Function.Analyzer3.Cleanup {
             Array.Destroy(Analyzer3.loop_dealloc_vars)
             Analyzer3.loop_dealloc_vars = 0
         }
+        IfCondition NotEqual(Analyzer3.loop_dealloc_lines, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.loop_dealloc_lines)
+            Analyzer3.loop_dealloc_lines = 0
+        }
         IfCondition NotEqual(Analyzer3.dealloc_warned_vars, 0) ThenBlock: {
             Array.Destroy(Analyzer3.dealloc_warned_vars)
             Analyzer3.dealloc_warned_vars = 0
+        }
+        IfCondition NotEqual(Analyzer3.maybe_freed_vars, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.maybe_freed_vars)
+            Analyzer3.maybe_freed_vars = 0
+        }
+        IfCondition NotEqual(Analyzer3.alias_names, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.alias_names)
+            Analyzer3.alias_names = 0
+        }
+        IfCondition NotEqual(Analyzer3.alias_roots, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.alias_roots)
+            Analyzer3.alias_roots = 0
+        }
+        IfCondition NotEqual(Analyzer3.ptr_names, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.ptr_names)
+            Analyzer3.ptr_names = 0
+        }
+        IfCondition NotEqual(Analyzer3.loop_alloc_seq, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.loop_alloc_seq)
+            Analyzer3.loop_alloc_seq = 0
+        }
+        IfCondition NotEqual(Analyzer3.loop_dealloc_seq, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.loop_dealloc_seq)
+            Analyzer3.loop_dealloc_seq = 0
+        }
+        IfCondition NotEqual(Analyzer3.loop_alloc_leave, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.loop_alloc_leave)
+            Analyzer3.loop_alloc_leave = 0
+        }
+        IfCondition NotEqual(Analyzer3.leave_names, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.leave_names)
+            Analyzer3.leave_names = 0
+        }
+        IfCondition NotEqual(Analyzer3.pending_names, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.pending_names)
+            Analyzer3.pending_names = 0
+        }
+        IfCondition NotEqual(Analyzer3.pending_lines, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.pending_lines)
+            Analyzer3.pending_lines = 0
+        }
+        IfCondition NotEqual(Analyzer3.pending_funcs, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.pending_funcs)
+            Analyzer3.pending_funcs = 0
+        }
+        IfCondition NotEqual(Analyzer3.loop_alloc_mark, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.loop_alloc_mark)
+            Analyzer3.loop_alloc_mark = 0
+        }
+        IfCondition NotEqual(Analyzer3.loop_dealloc_mark, 0) ThenBlock: {
+            Array.Destroy(Analyzer3.loop_dealloc_mark)
+            Analyzer3.loop_dealloc_mark = 0
         }
 
         Analyzer3.warning_count = 0
