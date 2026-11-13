@@ -161,6 +161,13 @@ static int tool_is_select(int tool) {
     return tool == 4 || tool == 5 || tool == 7;
 }
 
+/* Ctrl, Shift, or Alt held: add or remove this profile. A plain click replaces. */
+static int click_multi_mask(guint state) {
+    if (state & (GDK_SHIFT_MASK | GDK_CONTROL_MASK | GDK_MOD1_MASK))
+        return 1;
+    return 0;
+}
+
 /* ---------- app state ---------- */
 
 struct App {
@@ -1664,8 +1671,10 @@ static gboolean on_button(GtkWidget *, GdkEventButton *e, gpointer) {
         G.pan_mode = 0;
         G.down_fx = G.last_fx = fx;
         G.down_fy = G.last_fy = fy;
-        G.click_sh = (e->state & GDK_SHIFT_MASK) ? 1 : 0;
+        G.click_sh = click_multi_mask(e->state);
         clock_gettime(CLOCK_MONOTONIC, &G.down_ts);
+        /* Press time lives in the camera. This only reports the button. */
+        write_cmd("down 1");
         gtk_widget_queue_draw(G.da);
         return TRUE;
     }
@@ -1674,6 +1683,7 @@ static gboolean on_button(GtkWidget *, GdkEventButton *e, gpointer) {
         read_tool_state(&mode, &tool, &nclick);
         int adx = abs(fx - G.down_fx), ady = abs(fy - G.down_fy);
         G.dragging = 0;
+        write_cmd("down 0");
         if (mode == 1) {
             /* drag with no pending click = camera (kernel). click = sketch.
                Select tools always deliver the click — a shaky press is not a pan. */
@@ -1686,7 +1696,9 @@ static gboolean on_button(GtkWidget *, GdkEventButton *e, gpointer) {
                 int cy = (G.moved && (adx >= 3 || ady >= 3)) ? fy : G.down_fy;
                 if (cx >= 0 && cy >= 0 && cx < G.fw && cy < G.fh) {
                     char cmd[64];
-                    snprintf(cmd, sizeof cmd, "click %d %d %d", cx, cy, G.click_sh);
+                    int sh = click_multi_mask(e->state);
+                    if (G.click_sh) sh = 1;
+                    snprintf(cmd, sizeof cmd, "click %d %d %d", cx, cy, sh);
                     write_cmd(cmd);
                     if (!tool_is_select(tool)) {
                         G.have_anchor = 1;
@@ -1700,7 +1712,9 @@ static gboolean on_button(GtkWidget *, GdkEventButton *e, gpointer) {
                 if (G.fw > 0 && G.fh > 0 && G.down_fx >= 0 && G.down_fy >= 0 &&
                     G.down_fx < G.fw && G.down_fy < G.fh) {
                     char cmd[64];
-                    snprintf(cmd, sizeof cmd, "click %d %d", G.down_fx, G.down_fy);
+                    int sh = click_multi_mask(e->state);
+                    if (G.click_sh) sh = 1;
+                    snprintf(cmd, sizeof cmd, "click %d %d %d", G.down_fx, G.down_fy, sh);
                     write_cmd(cmd);
                 }
             }
@@ -3131,7 +3145,7 @@ int main(int argc, char **argv) {
         gtk_scale_set_value_pos(GTK_SCALE(sc), GTK_POS_RIGHT);
         gtk_widget_set_size_request(sc, 140, -1);
         gtk_widget_set_tooltip_text(sc,
-            "Solid fill. High = easier to read stacked bosses. Low = see through (pick is still the front face).");
+            "Solid fill. 100 hides the sketch grid. Lower lets that grid show through the body.");
         g_signal_connect(sc, "value-changed", G_CALLBACK(on_opac), NULL);
         gtk_box_pack_start(GTK_BOX(vw), sc, FALSE, FALSE, 0);
     }
