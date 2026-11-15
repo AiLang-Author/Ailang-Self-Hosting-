@@ -93,12 +93,13 @@ echo "==> Correctness check"
 bad=0
 for c in "${CASES[@]}"; do
   label="${c%%|*}"; args="${c#*|}"
-  a=$(eval "\"$AILANG_GREP\" $args \"$DATA\"" | sha256sum | cut -c1-16) || true
-  g=$(eval "\"$GNU_GREP\" $args \"$DATA\"" | sha256sum | cut -c1-16) || true
-  if [[ "$a" != "$g" ]]; then echo "   MISMATCH: $label"; bad=1; fi
+  a=$(eval "\"$AILANG_GREP\" $args \"$DATA\"" | sha256sum | cut -c1-16); arc=${PIPESTATUS[0]}
+  g=$(eval "\"$GNU_GREP\" $args \"$DATA\"" | sha256sum | cut -c1-16); grc=${PIPESTATUS[0]}
+  if [[ "$arc" -ne "$grc" ]]; then echo "   EXIT CODE MISMATCH: $label (ailang=$arc gnu=$grc)"; bad=1
+  elif [[ "$a" != "$g" ]]; then echo "   OUTPUT MISMATCH: $label"; bad=1; fi
 done
-[[ $bad -eq 0 ]] || die "output mismatch; refusing to time"
-echo "   all ${#CASES[@]} cases byte-identical"
+[[ $bad -eq 0 ]] || die "correctness check failed; refusing to time"
+echo "   all ${#CASES[@]} cases: exit codes match, output byte-identical"
 
 echo "==> Timing (warmup=$WARMUP runs=$RUNS)"
 cat "$DATA" > /dev/null
