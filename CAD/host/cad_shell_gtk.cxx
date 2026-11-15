@@ -1176,7 +1176,7 @@ static const char *k_help_fallback =
     "The solid stays on screen in Sketch. On Face looks at that plane.\n"
     "Project (Sketch tab / pie) shows dashed face edges + gold anchors.\n"
     "Construct: Pick Plane / From Face / Origin / Through 3pt, then Offset\n"
-    "or Angle, then Sketch on Plane. Tree Plane rows activate the plane.\n"
+    "or Angle. Sketch on Plane, then click that plane or its tree row.\n"
     "Solid tab: On Face or Profiles → Pad.\n"
     "Work tree names sketches; timeline at the bottom is undo/redo.\n"
     "\n"

@@ -115,13 +115,18 @@ done
 
 CPU="$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | xargs)"
 GNU_VER="$("$GNU_GREP" --version | head -1)"
+GNU_BIN="$(readlink -f "$GNU_GREP")"
+GNU_TOTAL="$(stat -c%s "$GNU_BIN")"
+for lib in $(ldd "$GNU_BIN" 2>/dev/null | awk '/=>/{print $3} /^\t\//{print $1}'); do
+  GNU_TOTAL=$((GNU_TOTAL + $(stat -L -c%s "$lib")))
+done
 python3 -I - "$WORKDIR/json" "$RESULTS" "$CPU" "$(uname -r)" "$GNU_VER" \
   "$DATA_SIZE" "$LINES_N" "$DATA_SHA" "$RUNS" "$WARMUP" \
-  "$(stat -c%s "$AILANG_GREP")" "$(stat -c%s "$(readlink -f "$GNU_GREP")")" \
+  "$(stat -c%s "$AILANG_GREP")" "$(stat -c%s "$GNU_BIN")" "$GNU_TOTAL" \
   "${CASES[@]}" <<'PY'
 import json, os, sys
 (jdir, out, cpu, kern, gver, size, lines, sha, runs, warm,
- asz, gsz), cases = sys.argv[1:13], sys.argv[13:]
+ asz, gsz, gtot), cases = sys.argv[1:14], sys.argv[14:]
 rows, wins = [], 0
 for i, c in enumerate(cases):
     label, args = c.split('|', 1)
@@ -142,7 +147,8 @@ md = [
     f'- Reference: {gver}, `LC_ALL=C`',
     f'- Data: {int(size)/1e6:.0f} MB, {lines} lines, sha256 {sha}… (seed 42, warm page cache)',
     f'- hyperfine: {warm} warmup + {runs} runs per command, output drained through a pipe',
-    f'- Binary size: AILang {int(asz)/1024:.0f} KB, GNU {int(gsz)/1024:.0f} KB',
+    f'- Size: AILang {int(asz)/1024:.0f} KB static; GNU {int(gsz)/1024:.0f} KB binary, '
+    f'{int(gtot)/1024:.0f} KB with shared libraries it loads',
     '- All cases produce byte-identical output.',
     '',
     '| Case | Args | AILang median ms | GNU median ms | Faster |',
