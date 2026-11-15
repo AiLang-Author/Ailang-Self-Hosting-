@@ -5,11 +5,24 @@ LibraryImport.Arena
 
 FixedPool.TailConfig {
     "line_count": Initialize=10
+    "use_bytes": Initialize=0
+    "byte_count": Initialize=0
+    "follow": Initialize=0
+    "sleep_sec": Initialize=1
+    "sleep_nsec": Initialize=0
+    "file_count": Initialize=0
+}
+
+FixedPool.TailState {
+    "seekable": Initialize=0
+    "end_pos": Initialize=0
+    "errors": Initialize=0
 }
 
 FixedPool.TailConstants {
     "BUFFER_SIZE": Initialize=65536
     "MAX_LINES": Initialize=1000
+    "MAX_FILE": Initialize=16777216
 }
 
 Function.SysOpen {
@@ -48,25 +61,30 @@ Function.WriteStderr {
 }
 
 // Simple tail: read entire file, find last N lines, output
-// Core tail operation given an open fd. Shared by TailFile and TailStdin
-// so the read/scan/emit path lives in exactly one place.
-Function.TailFromFd {
+// Slurp a non-seekable input (a pipe) and keep the last N lines.
+Function.TailSlurp {
     Input: fd: Integer
     Body: {
-        // Read entire input into buffer (1MB cap). For stdin this drains
-        // to EOF; for files it reads up to the cap then stops.
-        file_buf = Allocate(1048576)
+        // Read the input into one buffer. The read size is clamped so a
+        // short read cannot run past MAX_FILE.
+        file_buf = Allocate(TailConstants.MAX_FILE)
         total = 0
 
         WhileLoop 1 {
-            bytes = SysRead(fd, Add(file_buf, total), TailConstants.BUFFER_SIZE)
+            space = Subtract(TailConstants.MAX_FILE, total)
+            IfCondition LessEqual(space, 0) ThenBlock: {
+                BreakLoop
+            }
+            chunk = TailConstants.BUFFER_SIZE
+            IfCondition GreaterThan(chunk, space) ThenBlock: {
+                chunk = space
+            }
+            dest = Add(file_buf, total)
+            bytes = SysRead(fd, dest, chunk)
             IfCondition LessEqual(bytes, 0) ThenBlock: {
                 BreakLoop
             }
             total = Add(total, bytes)
-            IfCondition GreaterEqual(total, 1000000) ThenBlock: {
-                BreakLoop
-            }
         }
 
         lines_needed = TailConfig.line_count
@@ -93,7 +111,245 @@ Function.TailFromFd {
             SysWrite(1, Add(file_buf, start_pos), out_len)
         }
 
-        Deallocate(file_buf, 1048576)
+        Deallocate(file_buf, TailConstants.MAX_FILE)
+    }
+}
+
+// Seekable files: read one block from the end. Fall back to a full read
+// when that block does not hold enough newlines.
+Function.NanoSleep {
+    Body: {
+        req = Allocate(16)
+        i = 0
+        sec = TailConfig.sleep_sec
+        nsec = TailConfig.sleep_nsec
+        WhileLoop LessThan(i, 8) {
+            SetByte(req, i, BitwiseAnd(sec, 255))
+            sec = Divide(sec, 256)
+            SetByte(req, Add(i, 8), BitwiseAnd(nsec, 255))
+            nsec = Divide(nsec, 256)
+            i = Add(i, 1)
+        }
+        SystemCall(35, req, 0)
+        Deallocate(req, 16)
+    }
+}
+
+Function.WriteLastBytes {
+    Input: buf: Address
+    Input: total: Integer
+    Body: {
+        start = 0
+        IfCondition GreaterThan(total, TailConfig.byte_count) ThenBlock: {
+            start = Subtract(total, TailConfig.byte_count)
+        }
+        out_len = Subtract(total, start)
+        IfCondition GreaterThan(out_len, 0) ThenBlock: {
+            SysWrite(1, Add(buf, start), out_len)
+        }
+    }
+}
+
+// 1 when stdout is a closed pipe or a closed descriptor.
+// poll reports POLLERR (8), POLLHUP (16), or POLLNVAL (32).
+Function.StdoutClosed {
+    Output: Integer
+    Body: {
+        pfd = Allocate(8)
+        SetByte(pfd, 0, 1)
+        SetByte(pfd, 1, 0)
+        SetByte(pfd, 2, 0)
+        SetByte(pfd, 3, 0)
+        SetByte(pfd, 4, 0)
+        SetByte(pfd, 5, 0)
+        SetByte(pfd, 6, 0)
+        SetByte(pfd, 7, 0)
+        rc = SystemCall(7, pfd, 1, 0)
+        IfCondition GreaterThan(rc, 0) ThenBlock: {
+            re = GetByte(pfd, 6)
+            closed = BitwiseAnd(re, 56)
+            Deallocate(pfd, 8)
+            IfCondition NotEqual(closed, 0) ThenBlock: {
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        Deallocate(pfd, 8)
+        ReturnValue(0)
+    }
+}
+
+Function.FollowFd {
+    Input: fd: Integer
+    Body: {
+        dead = StdoutClosed()
+        IfCondition EqualTo(dead, 1) ThenBlock: {
+            TailState.errors = 1
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(TailState.seekable, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        WhileLoop 1 {
+            dead = StdoutClosed()
+            IfCondition EqualTo(dead, 1) ThenBlock: {
+                TailState.errors = 1
+                BreakLoop
+            }
+            NanoSleep()
+            new_size = SystemCall(8, fd, 0, 2)
+            IfCondition LessThan(new_size, 0) ThenBlock: {
+                BreakLoop
+            }
+            IfCondition GreaterThan(new_size, TailState.end_pos) ThenBlock: {
+                SystemCall(8, fd, TailState.end_pos, 0)
+                left = Subtract(new_size, TailState.end_pos)
+                chunk = Allocate(65536)
+                WhileLoop GreaterThan(left, 0) {
+                    want = 65536
+                    IfCondition GreaterThan(want, left) ThenBlock: {
+                        want = left
+                    }
+                    got = SysRead(fd, chunk, want)
+                    IfCondition LessEqual(got, 0) ThenBlock: {
+                        BreakLoop
+                    }
+                    SysWrite(1, chunk, got)
+                    left = Subtract(left, got)
+                }
+                Deallocate(chunk, 65536)
+                TailState.end_pos = new_size
+            }
+            IfCondition LessThan(new_size, TailState.end_pos) ThenBlock: {
+                TailState.end_pos = new_size
+            }
+        }
+    }
+}
+
+Function.TailFromFd {
+    Input: fd: Integer
+    Body: {
+        TailState.seekable = 0
+        IfCondition EqualTo(TailConfig.use_bytes, 1) ThenBlock: {
+            size = SystemCall(8, fd, 0, 2)
+            IfCondition LessThan(size, 0) ThenBlock: {
+                file_buf = Allocate(TailConstants.MAX_FILE)
+                total = 0
+                WhileLoop 1 {
+                    space = Subtract(TailConstants.MAX_FILE, total)
+                    IfCondition LessEqual(space, 0) ThenBlock: {
+                        BreakLoop
+                    }
+                    chunk = TailConstants.BUFFER_SIZE
+                    IfCondition GreaterThan(chunk, space) ThenBlock: {
+                        chunk = space
+                    }
+                    bytes = SysRead(fd, Add(file_buf, total), chunk)
+                    IfCondition LessEqual(bytes, 0) ThenBlock: {
+                        BreakLoop
+                    }
+                    total = Add(total, bytes)
+                }
+                IfCondition GreaterThan(TailConfig.byte_count, 0) ThenBlock: {
+                    WriteLastBytes(file_buf, total)
+                }
+                Deallocate(file_buf, TailConstants.MAX_FILE)
+                ReturnValue(0)
+            }
+            TailState.seekable = 1
+            TailState.end_pos = size
+            IfCondition EqualTo(TailConfig.byte_count, 0) ThenBlock: {
+                ReturnValue(0)
+            }
+            start = 0
+            IfCondition GreaterThan(size, TailConfig.byte_count) ThenBlock: {
+                start = Subtract(size, TailConfig.byte_count)
+            }
+            SystemCall(8, fd, start, 0)
+            left = Subtract(size, start)
+            chunk = Allocate(65536)
+            WhileLoop GreaterThan(left, 0) {
+                want = 65536
+                IfCondition GreaterThan(want, left) ThenBlock: {
+                    want = left
+                }
+                got = SysRead(fd, chunk, want)
+                IfCondition LessEqual(got, 0) ThenBlock: {
+                    left = 0
+                } ElseBlock: {
+                    SysWrite(1, chunk, got)
+                    left = Subtract(left, got)
+                }
+            }
+            Deallocate(chunk, 65536)
+            ReturnValue(0)
+        }
+
+        size = SystemCall(8, fd, 0, 2)
+        IfCondition LessThan(size, 0) ThenBlock: {
+            TailSlurp(fd)
+            ReturnValue(0)
+        }
+        TailState.seekable = 1
+        TailState.end_pos = size
+        IfCondition EqualTo(TailConfig.line_count, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(size, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        chunk = 65536
+        IfCondition GreaterThan(chunk, size) ThenBlock: {
+            chunk = size
+        }
+        buf = Allocate(chunk)
+        offset = Subtract(size, chunk)
+        SystemCall(8, fd, offset, 0)
+        got = SystemCall(0, fd, buf, chunk)
+        IfCondition LessEqual(got, 0) ThenBlock: {
+            Deallocate(buf, chunk)
+            ReturnValue(0)
+        }
+
+        lines_needed = TailConfig.line_count
+        scan_from = Subtract(got, 1)
+        IfCondition EqualTo(GetByte(buf, scan_from), 10) ThenBlock: {
+            scan_from = Subtract(scan_from, 1)
+        }
+
+        lines = 0
+        i = scan_from
+        WhileLoop GreaterEqual(i, 0) {
+            ch = GetByte(buf, i)
+            IfCondition EqualTo(ch, 10) ThenBlock: {
+                lines = Add(lines, 1)
+                IfCondition GreaterEqual(lines, lines_needed) ThenBlock: {
+                    BreakLoop
+                }
+            }
+            i = Subtract(i, 1)
+        }
+
+        // i stays on the newline that closes the kept lines. i < 0 means
+        // this block did not contain enough lines.
+        IfCondition LessThan(i, 0) ThenBlock: {
+            IfCondition GreaterThan(offset, 0) ThenBlock: {
+                Deallocate(buf, chunk)
+                SystemCall(8, fd, 0, 0)
+                TailSlurp(fd)
+                ReturnValue(0)
+            }
+            SysWrite(1, buf, got)
+        } ElseBlock: {
+            start_i = Add(i, 1)
+            out_len = Subtract(got, start_i)
+            IfCondition GreaterThan(out_len, 0) ThenBlock: {
+                SysWrite(1, Add(buf, start_i), out_len)
+            }
+        }
+        Deallocate(buf, chunk)
     }
 }
 
@@ -115,6 +371,41 @@ Function.TailFile {
 
         TailFromFd(fd)
         SystemCall(3, fd)
+    }
+}
+
+Function.ParseSleep {
+    Input: str: Address
+    Body: {
+        i = 0
+        sec = 0
+        WhileLoop 1 {
+            ch = GetByte(str, i)
+            digit = And(GreaterEqual(ch, 48), LessEqual(ch, 57))
+            IfCondition EqualTo(digit, 0) ThenBlock: {
+                BreakLoop
+            }
+            sec = Add(Multiply(sec, 10), Subtract(ch, 48))
+            i = Add(i, 1)
+        }
+        nsec = 0
+        IfCondition EqualTo(GetByte(str, i), 46) ThenBlock: {
+            i = Add(i, 1)
+            scale = 100000000
+            WhileLoop GreaterThan(scale, 0) {
+                ch = GetByte(str, i)
+                digit = And(GreaterEqual(ch, 48), LessEqual(ch, 57))
+                IfCondition EqualTo(digit, 0) ThenBlock: {
+                    scale = 0
+                } ElseBlock: {
+                    nsec = Add(nsec, Multiply(Subtract(ch, 48), scale))
+                    scale = Divide(scale, 10)
+                    i = Add(i, 1)
+                }
+            }
+        }
+        TailConfig.sleep_sec = sec
+        TailConfig.sleep_nsec = nsec
     }
 }
 
@@ -172,80 +463,209 @@ SubRoutine.Main {
     }
     pos = Add(pos, 1)
     
-    filename = 0
+    names = Allocate(256)
+    TailConfig.file_count = 0
     
     WhileLoop LessThan(pos, 4096) {
         ch = GetByte(args_buffer, pos)
         IfCondition EqualTo(ch, 0) ThenBlock: {
             BreakLoop
         }
-        
-        // Check for -n flag or -N shorthand
-        first = GetByte(args_buffer, pos)
-        IfCondition EqualTo(first, 45) ThenBlock: {
-            second = GetByte(args_buffer, Add(pos, 1))
 
-            // GNU shorthand: -N (e.g. `tail -3`) — second byte is a digit.
-            // Parse the rest of this arg as the line count.
+        first = GetByte(args_buffer, pos)
+        second = GetByte(args_buffer, Add(pos, 1))
+        is_opt = And(EqualTo(first, 45), NotEqual(second, 0))
+        IfCondition EqualTo(is_opt, 1) ThenBlock: {
+            opt = Add(args_buffer, pos)
+            follow_long = StringEquals(opt, "--follow")
+            follow_name = StringEquals(opt, "--follow=name")
+            follow_desc = StringEquals(opt, "--follow=descriptor")
+            follow_short = StringEquals(opt, "-F")
+            IfCondition EqualTo(follow_long, 1) ThenBlock: {
+                TailConfig.follow = 1
+            }
+            IfCondition EqualTo(follow_name, 1) ThenBlock: {
+                TailConfig.follow = 1
+            }
+            IfCondition EqualTo(follow_desc, 1) ThenBlock: {
+                TailConfig.follow = 1
+            }
+            IfCondition EqualTo(follow_short, 1) ThenBlock: {
+                TailConfig.follow = 1
+            }
+            IfCondition EqualTo(second, 45) ThenBlock: {
+                WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+                    pos = Add(pos, 1)
+                }
+                pos = Add(pos, 1)
+                ContinueLoop
+            }
+
             IfCondition And(GreaterEqual(second, 48), LessEqual(second, 57)) ThenBlock: {
                 TailConfig.line_count = StringToInt(Add(args_buffer, Add(pos, 1)))
-                // Skip past this whole arg
-                WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
-                    pos = Add(pos, 1)
+                TailConfig.use_bytes = 0
+            } ElseBlock: {
+                i = Add(pos, 1)
+                WhileLoop NotEqual(GetByte(args_buffer, i), 0) {
+                    och = GetByte(args_buffer, i)
+                    IfCondition EqualTo(och, 102) ThenBlock: {
+                        TailConfig.follow = 1
+                    }
+                    IfCondition EqualTo(och, 70) ThenBlock: {
+                        TailConfig.follow = 1
+                    }
+                    IfCondition EqualTo(och, 110) ThenBlock: {
+                        rest = Add(args_buffer, Add(i, 1))
+                        IfCondition EqualTo(GetByte(rest, 0), 0) ThenBlock: {
+                            WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+                                pos = Add(pos, 1)
+                            }
+                            pos = Add(pos, 1)
+                            TailConfig.line_count = StringToInt(Add(args_buffer, pos))
+                            TailConfig.use_bytes = 0
+                        } ElseBlock: {
+                            TailConfig.line_count = StringToInt(rest)
+                            TailConfig.use_bytes = 0
+                        }
+                    }
+                    IfCondition EqualTo(och, 99) ThenBlock: {
+                        rest = Add(args_buffer, Add(i, 1))
+                        IfCondition EqualTo(GetByte(rest, 0), 0) ThenBlock: {
+                            WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+                                pos = Add(pos, 1)
+                            }
+                            pos = Add(pos, 1)
+                            TailConfig.byte_count = StringToInt(Add(args_buffer, pos))
+                            TailConfig.use_bytes = 1
+                        } ElseBlock: {
+                            TailConfig.byte_count = StringToInt(rest)
+                            TailConfig.use_bytes = 1
+                        }
+                    }
+                    IfCondition EqualTo(och, 115) ThenBlock: {
+                        rest = Add(args_buffer, Add(i, 1))
+                        IfCondition EqualTo(GetByte(rest, 0), 0) ThenBlock: {
+                            WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
+                                pos = Add(pos, 1)
+                            }
+                            pos = Add(pos, 1)
+                            ParseSleep(Add(args_buffer, pos))
+                        } ElseBlock: {
+                            ParseSleep(rest)
+                        }
+                    }
+                    i = Add(i, 1)
                 }
-                pos = Add(pos, 1)
-                ContinueLoop
             }
-
-            IfCondition EqualTo(second, 110) ThenBlock: {
-                // Skip "-n"
-                WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
-                    pos = Add(pos, 1)
-                }
+            WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
                 pos = Add(pos, 1)
-
-                // Next arg is the number
-                TailConfig.line_count = StringToInt(Add(args_buffer, pos))
-                WhileLoop NotEqual(GetByte(args_buffer, pos), 0) {
-                    pos = Add(pos, 1)
-                }
-                pos = Add(pos, 1)
-                ContinueLoop
             }
+            pos = Add(pos, 1)
+            ContinueLoop
         }
-        
-        // It's a filename
+
         arg_start = pos
         arg_len = 0
-        
         WhileLoop And(LessThan(pos, 4096), NotEqual(GetByte(args_buffer, pos), 0)) {
             arg_len = Add(arg_len, 1)
             pos = Add(pos, 1)
         }
-        
         filename = Allocate(Add(arg_len, 1))
         i = 0
         WhileLoop LessThan(i, arg_len) {
-            ch = GetByte(args_buffer, Add(arg_start, i))
-            SetByte(filename, i, ch)
+            SetByte(filename, i, GetByte(args_buffer, Add(arg_start, i)))
             i = Add(i, 1)
         }
         SetByte(filename, arg_len, 0)
-        
+        IfCondition LessThan(TailConfig.file_count, 32) ThenBlock: {
+            StoreValue(Add(names, Multiply(TailConfig.file_count, 8)), filename)
+            TailConfig.file_count = Add(TailConfig.file_count, 1)
+        }
         pos = Add(pos, 1)
     }
-    
+
     Deallocate(args_buffer, 4096)
-    
-    IfCondition NotEqual(filename, 0) ThenBlock: {
-        TailFile(filename)
-        Deallocate(filename, 0)
-    } ElseBlock: {
-        // No file argument — read stdin (matches GNU tail behavior).
-        TailStdin()
+
+    IfCondition EqualTo(TailConfig.follow, 1) ThenBlock: {
+        st = Allocate(144)
+        sout = SystemCall(5, 1, st)
+        Deallocate(st, 144)
+        IfCondition LessThan(sout, 0) ThenBlock: {
+            SysWrite(2, "tail: standard output: Bad file descriptor\n", 43)
+            SystemCall(60, 1)
+        }
     }
 
-    SystemCall(60, 0)
+    IfCondition EqualTo(TailConfig.file_count, 0) ThenBlock: {
+        TailStdin()
+        IfCondition EqualTo(TailConfig.follow, 1) ThenBlock: {
+            FollowFd(0)
+        }
+        SystemCall(60, 0)
+    }
+
+    opened = 0
+    follow_fd = -1
+    fi = 0
+    WhileLoop LessThan(fi, TailConfig.file_count) {
+        filename = Dereference(Add(names, Multiply(fi, 8)))
+        is_stdin = And(EqualTo(GetByte(filename, 0), 45), EqualTo(GetByte(filename, 1), 0))
+        IfCondition GreaterThan(TailConfig.file_count, 1) ThenBlock: {
+            IfCondition EqualTo(is_stdin, 0) ThenBlock: {
+                probe = SysOpen(filename)
+                IfCondition LessThan(probe, 0) ThenBlock: {
+                    SysWrite(2, "tail: cannot open '", 19)
+                    nlen = StringLength(filename)
+                    SysWrite(2, filename, nlen)
+                    SysWrite(2, "' for reading: No such file or directory\n", 41)
+                    TailState.errors = 1
+                    fi = Add(fi, 1)
+                    ContinueLoop
+                }
+                SystemCall(3, probe)
+            }
+            SysWrite(1, "==> ", 4)
+            IfCondition EqualTo(is_stdin, 1) ThenBlock: {
+                SysWrite(1, "standard input", 14)
+            } ElseBlock: {
+                nlen = StringLength(filename)
+                SysWrite(1, filename, nlen)
+            }
+            SysWrite(1, " <==\n", 5)
+        }
+        IfCondition EqualTo(is_stdin, 1) ThenBlock: {
+            TailFromFd(0)
+            opened = Add(opened, 1)
+            follow_fd = 0
+        } ElseBlock: {
+            fd = SysOpen(filename)
+            IfCondition LessThan(fd, 0) ThenBlock: {
+                SysWrite(2, "tail: cannot open '", 19)
+                nlen = StringLength(filename)
+                SysWrite(2, filename, nlen)
+                SysWrite(2, "' for reading: No such file or directory\n", 41)
+                TailState.errors = 1
+            } ElseBlock: {
+                TailFromFd(fd)
+                opened = Add(opened, 1)
+                follow_fd = fd
+            }
+        }
+        fi = Add(fi, 1)
+    }
+
+    IfCondition EqualTo(opened, 0) ThenBlock: {
+        SysWrite(2, "tail: no files remaining\n", 25)
+        SystemCall(60, 1)
+    }
+
+    IfCondition EqualTo(TailConfig.follow, 1) ThenBlock: {
+        IfCondition GreaterEqual(follow_fd, 0) ThenBlock: {
+            FollowFd(follow_fd)
+        }
+    }
+
+    SystemCall(60, TailState.errors)
 }
 
 RunTask(Main)

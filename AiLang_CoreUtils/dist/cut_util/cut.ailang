@@ -17,6 +17,7 @@ FixedPool.CutConfig {
 
 FixedPool.CutConstants {
     "BUFFER_SIZE":        Initialize=65536
+    "LINE_CAP":           Initialize=1048576
     "OUTPUT_BUFFER_SIZE": Initialize=65536
     "MAX_FIELD":          Initialize=4096
     "MAX_FILES":          Initialize=1000
@@ -106,13 +107,22 @@ Function.BufferBytes {
     Input: data: Address
     Input: len: Integer
     Body: {
-        space = Subtract(CutConstants.OUTPUT_BUFFER_SIZE, OutputBuffer.position)
-        IfCondition LessThan(space, len) ThenBlock: {
-            FlushOutputBuffer()
-        }
-        IfCondition GreaterThan(len, 0) ThenBlock: {
-            MemoryCopy(Add(OutputBuffer.buffer, OutputBuffer.position), data, len)
-            OutputBuffer.position = Add(OutputBuffer.position, len)
+        left = len
+        src = data
+        WhileLoop GreaterThan(left, 0) {
+            space = Subtract(CutConstants.OUTPUT_BUFFER_SIZE, OutputBuffer.position)
+            IfCondition LessEqual(space, 0) ThenBlock: {
+                FlushOutputBuffer()
+                space = CutConstants.OUTPUT_BUFFER_SIZE
+            }
+            chunk = left
+            IfCondition GreaterThan(chunk, space) ThenBlock: {
+                chunk = space
+            }
+            MemoryCopy(Add(OutputBuffer.buffer, OutputBuffer.position), src, chunk)
+            OutputBuffer.position = Add(OutputBuffer.position, chunk)
+            src = Add(src, chunk)
+            left = Subtract(left, chunk)
         }
     }
 }
@@ -187,6 +197,14 @@ Function.ParseUInt {
 // Bitmap-style mask using the CutMask pool. We store 1-bit per field in a
 // separate Allocate'd buffer so we can address up to MAX_FIELD fields.
 FixedPool.FieldBits { "bits": Initialize=0 }
+
+// Closed runs of selected character positions for -c/-b.
+// ends[i] == -1 means "through the end of the line" (an N- range).
+FixedPool.CharRuns {
+    "starts": Initialize=0
+    "ends":   Initialize=0
+    "count":  Initialize=0
+}
 
 Function.InitFieldMask {
     Body: {
@@ -283,85 +301,221 @@ Function.ParseFieldList {
 
 // === CORE LOGIC ===
 
-// Emit a line of fields according to the mask.
-// `line` points at the line body, `len` is its length (no trailing newline).
+// Turn the selection mask into inclusive 1-based runs so -c copies
+// spans with MemoryCopy instead of testing every byte.
+Function.BuildCharRuns {
+    Body: {
+        bytes = Multiply(CutConstants.MAX_FIELD, 8)
+        CharRuns.starts = Allocate(bytes)
+        CharRuns.ends = Allocate(bytes)
+        CharRuns.count = 0
+
+        cap = CutMask.highest
+        IfCondition GreaterThan(CutMask.to_end, 0) ThenBlock: {
+            before = Subtract(CutMask.to_end_from, 1)
+            IfCondition LessThan(before, cap) ThenBlock: {
+                cap = before
+            }
+            IfCondition LessThan(cap, 0) ThenBlock: {
+                cap = 0
+            }
+        }
+
+        i = 1
+        WhileLoop LessEqual(i, cap) {
+            sel = FieldSelected(i)
+            IfCondition EqualTo(sel, 1) ThenBlock: {
+                start = i
+                i = Add(i, 1)
+                extending = 1
+                WhileLoop And(LessEqual(i, cap), EqualTo(extending, 1)) {
+                    sel = FieldSelected(i)
+                    IfCondition EqualTo(sel, 1) ThenBlock: {
+                        i = Add(i, 1)
+                    } ElseBlock: {
+                        extending = 0
+                    }
+                }
+                idx = CharRuns.count
+                StoreValue(Add(CharRuns.starts, Multiply(idx, 8)), start)
+                end = Subtract(i, 1)
+                StoreValue(Add(CharRuns.ends, Multiply(idx, 8)), end)
+                CharRuns.count = Add(idx, 1)
+            } ElseBlock: {
+                i = Add(i, 1)
+            }
+        }
+
+        IfCondition GreaterThan(CutMask.to_end, 0) ThenBlock: {
+            idx = CharRuns.count
+            StoreValue(Add(CharRuns.starts, Multiply(idx, 8)), CutMask.to_end_from)
+            StoreValue(Add(CharRuns.ends, Multiply(idx, 8)), -1)
+            CharRuns.count = Add(idx, 1)
+        }
+    }
+}
+
+Function.DispatchLine {
+    Input: line: Address
+    Input: line_len: Integer
+    Body: {
+        IfCondition EqualTo(CutConfig.mode, 0) ThenBlock: {
+            EmitFields(line, line_len, CutConfig.delimiter)
+        } ElseBlock: {
+            EmitChars(line, line_len)
+        }
+    }
+}
+
+// Emit a line of fields. MemChr jumps to the next delimiter; the bytes
+// between delimiters are copied and not examined one by one.
 Function.EmitFields {
     Input: line: Address
     Input: line_len: Integer
     Input: delim: Integer
     Body: {
-        // First, detect whether the line has a delimiter at all. POSIX says
-        // a line without the delim is passed through unchanged unless -s is
-        // set, in which case it's dropped.
-        has_delim = 0
-        scan = 0
-        WhileLoop LessThan(scan, line_len) {
-            IfCondition EqualTo(GetByte(line, scan), delim) ThenBlock: {
-                has_delim = 1
-                BreakLoop
-            }
-            scan = Add(scan, 1)
+        dpos = -1
+        IfCondition GreaterThan(line_len, 0) ThenBlock: {
+            dpos = MemChr(line, delim, line_len)
         }
 
-        IfCondition EqualTo(has_delim, 0) ThenBlock: {
+        // A line with no delimiter is passed through unchanged, unless -s.
+        IfCondition LessThan(dpos, 0) ThenBlock: {
             IfCondition EqualTo(CutConfig.suppress, 0) ThenBlock: {
                 BufferBytes(line, line_len)
                 BufferByte(10)
             }
         } ElseBlock: {
-            // Line has the delimiter — emit selected fields, joined by delim.
             field_idx = 1
             field_start = 0
-            pos = 0
             emitted = 0
 
-            WhileLoop LessEqual(pos, line_len) {
-                IfCondition Or(EqualTo(pos, line_len), EqualTo(GetByte(line, pos), delim)) ThenBlock: {
-                    IfCondition EqualTo(FieldSelected(field_idx), 1) ThenBlock: {
-                        IfCondition GreaterThan(emitted, 0) ThenBlock: {
-                            BufferByte(delim)
-                        }
-                        seg_len = Subtract(pos, field_start)
-                        IfCondition GreaterThan(seg_len, 0) ThenBlock: {
-                            BufferBytes(Add(line, field_start), seg_len)
-                        }
-                        emitted = Add(emitted, 1)
-                    }
-                    IfCondition LessThan(pos, line_len) ThenBlock: {
-                        field_idx = Add(field_idx, 1)
-                        field_start = Add(pos, 1)
+            WhileLoop LessEqual(field_start, line_len) {
+                // N- selects the rest of the line, delimiters included.
+                open_here = 0
+                IfCondition GreaterThan(CutMask.to_end, 0) ThenBlock: {
+                    IfCondition GreaterEqual(field_idx, CutMask.to_end_from) ThenBlock: {
+                        open_here = 1
                     }
                 }
-                pos = Add(pos, 1)
+                IfCondition EqualTo(open_here, 1) ThenBlock: {
+                    IfCondition GreaterThan(emitted, 0) ThenBlock: {
+                        BufferByte(delim)
+                    }
+                    suf = Subtract(line_len, field_start)
+                    IfCondition GreaterThan(suf, 0) ThenBlock: {
+                        BufferBytes(Add(line, field_start), suf)
+                    }
+                    BreakLoop
+                }
+
+                past = 0
+                IfCondition EqualTo(CutMask.to_end, 0) ThenBlock: {
+                    IfCondition GreaterThan(field_idx, CutMask.highest) ThenBlock: {
+                        past = 1
+                    }
+                }
+                IfCondition EqualTo(past, 1) ThenBlock: {
+                    BreakLoop
+                }
+
+                rel = -1
+                remain = Subtract(line_len, field_start)
+                IfCondition GreaterThan(remain, 0) ThenBlock: {
+                    rel = MemChr(Add(line, field_start), delim, remain)
+                }
+                IfCondition LessThan(rel, 0) ThenBlock: {
+                    end = line_len
+                } ElseBlock: {
+                    end = Add(field_start, rel)
+                }
+
+                IfCondition EqualTo(FieldSelected(field_idx), 1) ThenBlock: {
+                    IfCondition GreaterThan(emitted, 0) ThenBlock: {
+                        BufferByte(delim)
+                    }
+                    seg_len = Subtract(end, field_start)
+                    IfCondition GreaterThan(seg_len, 0) ThenBlock: {
+                        BufferBytes(Add(line, field_start), seg_len)
+                    }
+                    emitted = Add(emitted, 1)
+                }
+
+                IfCondition LessThan(rel, 0) ThenBlock: {
+                    BreakLoop
+                }
+                field_idx = Add(field_idx, 1)
+                field_start = Add(end, 1)
             }
             BufferByte(10)
         }
     }
 }
 
-// Emit characters/bytes according to the mask (-c / -b mode).
+// Emit characters/bytes from the prebuilt runs (-c / -b).
 Function.EmitChars {
     Input: line: Address
     Input: line_len: Integer
     Body: {
-        pos = 0
-        WhileLoop LessThan(pos, line_len) {
-            n = Add(pos, 1)
-            IfCondition EqualTo(FieldSelected(n), 1) ThenBlock: {
-                BufferByte(GetByte(line, pos))
+        r = 0
+        WhileLoop LessThan(r, CharRuns.count) {
+            start = Dereference(Add(CharRuns.starts, Multiply(r, 8)))
+            end = Dereference(Add(CharRuns.ends, Multiply(r, 8)))
+            off = Subtract(start, 1)
+            IfCondition GreaterEqual(off, line_len) ThenBlock: {
+                BreakLoop
             }
-            pos = Add(pos, 1)
+            IfCondition LessThan(end, 0) ThenBlock: {
+                suf = Subtract(line_len, off)
+                BufferBytes(Add(line, off), suf)
+                BreakLoop
+            }
+            IfCondition GreaterThan(end, line_len) ThenBlock: {
+                end = line_len
+            }
+            seg = Subtract(end, off)
+            IfCondition GreaterThan(seg, 0) ThenBlock: {
+                BufferBytes(Add(line, off), seg)
+            }
+            r = Add(r, 1)
         }
         BufferByte(10)
     }
 }
 
-// Stream a file descriptor, split into lines, dispatch per mode.
+// Append up to `space` bytes of a partial line. Lines are capped at
+// BUFFER_SIZE, matching the previous per-byte copy.
+Function.TakePartial {
+    Input: dst: Address
+    Input: dst_len: Integer
+    Input: src: Address
+    Input: src_len: Integer
+    Output: Integer
+    Body: {
+        space = Subtract(CutConstants.LINE_CAP, dst_len)
+        take = src_len
+        IfCondition GreaterThan(take, space) ThenBlock: {
+            take = space
+        }
+        IfCondition GreaterThan(take, 0) ThenBlock: {
+            MemoryCopy(Add(dst, dst_len), src, take)
+            dst_len = Add(dst_len, take)
+        }
+        ReturnValue(dst_len)
+    }
+}
+
+// Stream a file descriptor. Whole lines inside the read are dispatched
+// in place. Only a line that crosses a read is copied into line_buf.
 Function.ProcessFd {
     Input: fd: Integer
     Body: {
+        IfCondition And(EqualTo(CutConfig.mode, 1), EqualTo(CharRuns.starts, 0)) ThenBlock: {
+            BuildCharRuns()
+        }
+
         buffer = Allocate(CutConstants.BUFFER_SIZE)
-        line_buf = Allocate(CutConstants.BUFFER_SIZE)
+        line_buf = Allocate(CutConstants.LINE_CAP)
         line_len = 0
 
         WhileLoop 1 {
@@ -370,34 +524,30 @@ Function.ProcessFd {
 
             i = 0
             WhileLoop LessThan(i, n) {
-                ch = GetByte(buffer, i)
-                IfCondition EqualTo(ch, 10) ThenBlock: {
-                    IfCondition EqualTo(CutConfig.mode, 0) ThenBlock: {
-                        EmitFields(line_buf, line_len, CutConfig.delimiter)
-                    } ElseBlock: {
-                        EmitChars(line_buf, line_len)
-                    }
-                    line_len = 0
+                remain = Subtract(n, i)
+                search = Add(buffer, i)
+                nl = MemChr(search, 10, remain)
+                IfCondition LessThan(nl, 0) ThenBlock: {
+                    line_len = TakePartial(line_buf, line_len, search, remain)
+                    i = n
                 } ElseBlock: {
-                    IfCondition LessThan(line_len, CutConstants.BUFFER_SIZE) ThenBlock: {
-                        SetByte(line_buf, line_len, ch)
-                        line_len = Add(line_len, 1)
+                    IfCondition EqualTo(line_len, 0) ThenBlock: {
+                        DispatchLine(search, nl)
+                    } ElseBlock: {
+                        line_len = TakePartial(line_buf, line_len, search, nl)
+                        DispatchLine(line_buf, line_len)
+                        line_len = 0
                     }
+                    i = Add(i, Add(nl, 1))
                 }
-                i = Add(i, 1)
             }
         }
 
-        // Trailing partial line (no final newline)
         IfCondition GreaterThan(line_len, 0) ThenBlock: {
-            IfCondition EqualTo(CutConfig.mode, 0) ThenBlock: {
-                EmitFields(line_buf, line_len, CutConfig.delimiter)
-            } ElseBlock: {
-                EmitChars(line_buf, line_len)
-            }
+            DispatchLine(line_buf, line_len)
         }
 
-        Deallocate(line_buf, CutConstants.BUFFER_SIZE)
+        Deallocate(line_buf, CutConstants.LINE_CAP)
         Deallocate(buffer, CutConstants.BUFFER_SIZE)
     }
 }
@@ -571,6 +721,11 @@ SubRoutine.Main {
     }
 
     FlushOutputBuffer()
+    IfCondition NotEqual(CharRuns.starts, 0) ThenBlock: {
+        run_bytes = Multiply(CutConstants.MAX_FIELD, 8)
+        Deallocate(CharRuns.starts, run_bytes)
+        Deallocate(CharRuns.ends, run_bytes)
+    }
     Deallocate(OutputBuffer.buffer, CutConstants.OUTPUT_BUFFER_SIZE)
     Deallocate(FieldBits.bits, CutConstants.MAX_FIELD)
     Deallocate(files, Multiply(CutConstants.MAX_FILES, 8))
