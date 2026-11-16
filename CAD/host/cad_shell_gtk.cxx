@@ -1117,7 +1117,16 @@ static void draw_edit_hud(cairo_t *cr, GtkAllocation *al) {
 
         char rhs[48];
         const char *shown = card.f[i].val;
-        if (act && (G.dimn > 0 || G.dim_sel)) shown = G.dimbuf;
+        int letters = 0;
+        {
+            const char *q;
+            for (q = card.f[i].val; *q; q++) {
+                if ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z'))
+                    letters = 1;
+            }
+        }
+        /* NEW/CUT/JOIN stay words. A leftover height must not cover them. */
+        if (act && !letters && (G.dimn > 0 || G.dim_sel)) shown = G.dimbuf;
         int empty = (!shown[0] || strcmp(shown, "_") == 0);
         if (act) {
             if (empty)
@@ -1923,6 +1932,22 @@ static void hud_commit(void) {
     gtk_widget_queue_draw(G.da);
 }
 
+static int hud_only_enum(void) {
+    DimCard card;
+    int i, active_enum = 0;
+    memset(&card, 0, sizeof card);
+    if (!G.dimhud[0] || !parse_dimhud(G.dimhud, &card))
+        return 0;
+    if (card.n != 1) return 0;
+    for (i = 0; i < card.n; i++) {
+        if (card.f[i].active) {
+            char k0 = card.f[i].key[0];
+            if (k0 == 'S' || k0 == 'O') active_enum = 1;
+        }
+    }
+    return active_enum;
+}
+
 static int hud_active_is_enum(void) {
     DimCard card;
     int i;
@@ -2006,6 +2031,11 @@ static gboolean hud_handle_key(GdkEventKey *e) {
 
     int dig = hud_digit_char(kv);
     if (dig >= 0) {
+        /* Loft's only row is NEW/CUT. A digit must not turn it into a height. */
+        if (hud_only_enum()) {
+            gtk_widget_queue_draw(G.da);
+            return TRUE;
+        }
         /* Typing a number on Pick/OP jumps to the numeric row. */
         if (hud_active_is_enum())
             write_cmd("htab");
@@ -2170,10 +2200,10 @@ static gboolean poll_tick(gpointer) {
     read_line_file(path_notice, nt, sizeof nt);
     read_line_file(path_dimhud, dh, sizeof dh);
     if (strcmp(dh, G.dimhud) != 0) {
-        int opened = (!G.dimhud[0] && dh[0]);
         snprintf(G.dimhud, sizeof G.dimhud, "%s", dh);
         G.hud_idle = 0;
-        if (opened || (dh[0] && G.dimn == 0 && !G.dim_sel && G.dim_kind == 0))
+        /* A new card drops the previous type-in, so Height=20 cannot sit on Operation. */
+        if (dh[0] && G.dim_kind == 0)
             hud_seed_from_card();
         if (!dh[0] && G.dim_kind == 0)
             hud_clear_typein();
