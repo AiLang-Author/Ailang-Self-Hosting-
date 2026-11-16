@@ -79,6 +79,22 @@ echo "$ret_out" | grep -q "fib7=13" || fail "Fib ThenBlock ReturnValue fell thro
 echo "$ret_out" | grep -q "clamp=0" || fail "ClampNeg ThenBlock ReturnValue fell through"
 ok "ret_in_then.ailang: ReturnValue in ThenBlock returns"
 
+echo "== RDMEM / WRMEM memory primitives =="
+MEM_SRC="$ROOT/tests/contract/memprim_rdwr.ailang"
+"$NEXT_AILANG" "$MEM_SRC" "$TMP/memprim_next.x"
+set +e
+mem_out="$("$TMP/memprim_next.x")"
+mem_rc=$?
+"$NEXT_AILANG" "$ROOT/tests/contract/bad_memprim.ailang" "$TMP/bad_memprim.x"
+rc_badmem=$?
+set -e
+[[ "$mem_rc" -eq 0 ]] || fail "memprim_rdwr.ailang next run rc=$mem_rc"
+echo "$mem_out" | grep -q "FAIL" && fail "memprim_rdwr.ailang: $(echo "$mem_out" | grep FAIL | head -1)"
+echo "$mem_out" | grep -q "^done$" || fail "memprim_rdwr.ailang did not finish"
+ok "memprim_rdwr.ailang: all widths, sign extension, IO forms"
+[[ "$rc_badmem" -ne 0 ]] || fail "next compiled bad_memprim.ailang"
+ok "next rejected bad_memprim.ailang"
+
 echo "== D. negative tests against next only =="
 set +e
 "$NEXT_AILANG" "$ROOT/tests/contract/bad_assign.ailang" "$TMP/bad_assign.x"
