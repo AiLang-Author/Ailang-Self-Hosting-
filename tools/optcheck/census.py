@@ -8,7 +8,7 @@ both sides. Reads <opt binary>.optlog if present (-optlog).
 
 For each compiled function it counts, in the source body:
   sys  SystemCall(...)
-  st   StoreValue(...), SetByte(...), Pool.field = ..., ptr@field = ...
+  st   WRMEM_<w>(...), Pool.field = ..., ptr@field = ...
 and in the emitted machine code:
   sys  syscall instructions
   st   instructions that write memory not addressed from rbp or rsp

@@ -1,48 +1,45 @@
 #!/usr/bin/env python3
 """Rewrite GetByte / SetByte / Dereference / StoreValue into RDMEM_ / WRMEM_.
 
-    python3 -I tools/memprim_migrate.py [--write] [--split-add] [--qword] PATH...
+    python3 -I tools/memprim_migrate.py [--write] [--split-add] PATH...
 
 PATH is a file or a directory (searched for *.ailang). Without --write it
 only reports what it would change.
 
-Mapping (each one lowers back to the same tree in the parser, so a
-migrated program compiles to the same bytes):
+Mapping:
 
     GetByte(b, o)                 RDMEM_8(b, o)
     SetByte(b, o, v)              WRMEM_8(b, o, v)
     Dereference(a)                RDMEM_64(a)
-    Dereference(a, "byte")        RDMEM_8(a)
+    Dereference(a, "byte")        RDMEM_8(a)          (the parser adds offset 0)
     Dereference(a, "word")        RDMEM_16(a)
     Dereference(a, "dword")       RDMEM_32(a)
     StoreValue(a, v)              WRMEM_64(a, v)
-    StoreValue(a, v, "byte")      WRMEM_8(a, v)       (and word, dword)
+    Dereference(a, "qword")       RDMEM_64(a)
+    Dereference(a, "sdword")      RDMEM_S32(a)        (and sbyte, sword; the old
+                                                   compiler read 8 bytes here)
+    StoreValue(a, v, "byte")      WRMEM_8(a, v)       (and word, dword, qword)
 
 --split-add   also turns an address written as Add(b, o) into the
               two-part form: Dereference(Add(b, o), "dword") becomes
               RDMEM_32(b, o). The parser rebuilds the same Add node.
               A "byte" hint keeps the whole address, since RDMEM_8(b, o)
               is GetByte, which the optimizer treats differently.
---qword       also rewrite the explicit "qword" hint. RDMEM_64 lowers to
-              the one-argument Dereference, which the optimizer treats
-              differently from Dereference(a, "qword"), so code can change.
-              Without the flag those calls are left alone and listed.
-
 Anything the tool cannot map exactly (a hint that is not a string literal,
 a wrong argument count) is left as it is and listed.
 
-The compiler's own sources are skipped: the trusted ailang.x must still
-build them, and it does not know the new names.
+A migrated compiler source can only be built by a compiler that already
+knows RDMEM_/WRMEM_.
 """
 import os
 import sys
 
 NAMES = ("GetByte", "SetByte", "Dereference", "StoreValue")
 HINT_W = {'"byte"': "8", '"word"': "16", '"dword"': "32", '"qword"': "64"}
+# Never valid on the old compiler (it read 8 bytes), but the intent is plain.
+SIGNED_W = {'"sbyte"': "S8", '"sword"': "S16", '"sdword"': "S32"}
 
 SKIP_DIRS = {".git", "third_party", "archive", "test262"}
-SKIP_PREFIXES = (os.path.join("Librarys", "Compiler") + os.sep,)
-SKIP_FILES = {"ailang_cli.ailang", "ailang_console.ailang", "ailang_lsp.ailang"}
 
 
 def code_mask(text):
@@ -181,8 +178,8 @@ def convert(name, args, opts):
         if len(args) == 1:
             return join("RDMEM_64", addr_parts(args[0]))
         if len(args) == 2:
-            w = HINT_W.get(args[1].strip())
-            if w is None or (w == "64" and not opts["qword"]):
+            w = HINT_W.get(args[1].strip()) or SIGNED_W.get(args[1].strip())
+            if w is None:
                 return None
             return join("RDMEM_" + w, addr_parts(args[0], w))
         return None
@@ -191,19 +188,11 @@ def convert(name, args, opts):
             return join("WRMEM_64", addr_parts(args[0]) + [args[1]])
         if len(args) == 3:
             w = HINT_W.get(args[2].strip())
-            if w is None or (w == "64" and not opts["qword"]):
+            if w is None:
                 return None
             return join("WRMEM_" + w, addr_parts(args[0], w) + [args[1]])
         return None
     return None
-
-
-def skip(rel):
-    if os.path.basename(rel) in SKIP_FILES:
-        return True
-    if os.path.basename(rel).startswith("Library.Analyzer"):
-        return True
-    return any(rel.startswith(p) for p in SKIP_PREFIXES)
 
 
 def files(paths):
@@ -219,15 +208,13 @@ def files(paths):
 
 
 def main(argv):
-    opts = {"write": False, "split_add": False, "qword": False}
+    opts = {"write": False, "split_add": False}
     paths = []
     for a in argv:
         if a == "--write":
             opts["write"] = True
         elif a == "--split-add":
             opts["split_add"] = True
-        elif a == "--qword":
-            opts["qword"] = True
         elif a.startswith("-"):
             sys.exit("unknown flag " + a)
         else:
@@ -238,8 +225,6 @@ def main(argv):
     nfiles = 0
     for f in files(paths):
         rel = os.path.relpath(f)
-        if skip(rel):
-            continue
         with open(f, encoding="utf-8", errors="surrogateescape") as h:
             src = h.read()
         new = rewrite(src, opts, stats, rel)

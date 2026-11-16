@@ -51,7 +51,7 @@ SubRoutine.Main {
 
     i = 0
     WhileLoop LessThan(i, size) {
-        StoreValue(Add(arr, Multiply(i, 8)), i)
+        WRMEM_64(arr, Multiply(i, 8), i)
         i = Add(i, 1)
     }
 
@@ -60,7 +60,7 @@ SubRoutine.Main {
     WhileLoop LessThan(pass, 10) {
         i = 0
         WhileLoop LessThan(i, size) {
-            sum = Add(sum, Dereference(Add(arr, Multiply(i, 8))))
+            sum = Add(sum, RDMEM_64(arr, Multiply(i, 8)))
             i = Add(i, 16)
         }
         pass = Add(pass, 1)
@@ -105,7 +105,7 @@ SubRoutine.Main {
 
     i = 0
     WhileLoop LessThan(i, size) {
-        StoreValue(Add(arr, Multiply(i, 8)), i)
+        WRMEM_64(arr, Multiply(i, 8), i)
         i = Add(i, 1)
     }
 
@@ -115,7 +115,7 @@ SubRoutine.Main {
         i = 0
         WhileLoop LessThan(i, size) {
             idx = Modulo(Multiply(i, 7919), size)
-            sum = Add(sum, Dereference(Add(arr, Multiply(idx, 8))))
+            sum = Add(sum, RDMEM_64(arr, Multiply(idx, 8)))
             i = Add(i, 16)
         }
         pass = Add(pass, 1)
@@ -158,8 +158,8 @@ SubRoutine.Main {
     i = 0
     WhileLoop LessThan(i, 1000000) {
         p = Arena_Alloc64()
-        StoreValue(p, i)
-        sum = Add(sum, Dereference(p))
+        WRMEM_64(p, i)
+        sum = Add(sum, RDMEM_64(p))
         Arena_Free64(p)
         i = Add(i, 1)
     }

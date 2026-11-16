@@ -11,6 +11,7 @@ Binaries are gitignored (`*.x`). Sources live on git tags/commits.
 | `analyzer-2026-08-05.x` | Analyzer from that era |
 | `ailang-2026-06-02-backup8-4.x` | Older root `ailang-backup8-4-2026.x` copy |
 | `ailang-2026-10-04.x`, `ailang-2026-10-06-*.x`, `ailang-2026-10-13-*.x` | Moved here from `Librarys/Compiler/Deprecated/` on 2026-11-04. The suffix is the source commit. |
+| `ailang-2026-11-16-memprim-seed.x` | Seed for branch `memprim-rdwr`, where the tree spells memory access as RDMEM_/WRMEM_ and GetByte/SetByte/Dereference/StoreValue no longer exist. The root `ailang.x` cannot build that tree; build it with this file until a new host is promoted. Bootstrap fixed point, 7875125 bytes, sha256 `30e4ec88c765457a10778a37d63264a49dec31560af6f572e7e39ca1966009ea`. |
 
 Restore:
 
