@@ -1,0 +1,159 @@
+// Library.JSCompStmtPart2.ailang
+// Functions moved out of Library.JSCompStmt.ailang.
+// Split from the JS engine so one function fits in context.
+// FixedPools stay in the parent library. Function names are unchanged
+// except for the new helpers this split adds.
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+
+// ---------------------------------------------------------------------------
+// Compile program root — iterate body chain via N_BODY -> N_NEXT, emit HALT
+// ---------------------------------------------------------------------------
+Function.JSComp__CompileProgram {
+    Input: node: Integer
+    Output: Integer
+    Body: {
+        save_node = node
+        IfCondition EqualTo(JSCompState.error, 1) ThenBlock: { ReturnValue(-1) }
+
+        JSComp__PushScope()
+
+        // Pre-scan: recursively count ALL var/func declarations in the
+        // program tree (except inside nested functions).  `var` is
+        // function-scoped so `for (var i ...)` hoists to program level.
+        pre_count = JSComp__CountVars(JSParse_GetBody(save_node))
+        // M20b: dstr-assign / compound temps (__dt__, __ir__, __cb__, …) are
+        // AddLocal'd during body compile but must sit in the reserved frame —
+        // otherwise SET_LOCAL clobbers the operand stack (e.g. assignment
+        // expression result `r = [] = vals` lost identity).
+        // M128e6ah: for-in __keys__/__idx__, catch binds, with temps — need
+        // more headroom so throw/catch cannot overwrite var slots (A1.5_T2 p4).
+        pre_count = Add(pre_count, 256)
+
+        // Reserve local slots on the value stack (mirrors what CALL does for
+        // function frames).  Each PUSH_UNDEF advances sp past the slot so
+        // subsequent operand pushes land above all locals.
+        JSCompTmp.idx = 0
+        WhileLoop LessThan(JSCompTmp.idx, pre_count) {
+            JSComp__Emit1(JSOp.PUSH_UNDEF)
+            JSCompTmp.idx = Add(JSCompTmp.idx, 1)
+        }
+
+        // Create global bindings for all program-level `var` / func names
+        // so unresolvable ReferenceError does not fire on hoisted names.
+        // Var names → undefined; function *names* also get undef here (values
+        // installed in pass 1 below).
+        // M128j: HoistVars skips SET_GLOBAL in eval_mode (BindNameUndef handles
+        // CreateGlobalVarBinding; must not re-init existing globals to undefined).
+        JSComp__HoistVars(JSParse_GetBody(save_node))
+
+        // TDZ pre-declaration: scan top-level for let/const VAR_DECL + CLASS_DECL
+        // (lex-env-no-init-cls: typeof C; class C {} must TDZ before body eval)
+        stmt = JSParse_GetBody(save_node)
+        WhileLoop GreaterEqual(stmt, 0) {
+            st_tdz = JSParse_GetType(stmt)
+            IfCondition EqualTo(st_tdz, ASTType.VAR_DECL) ThenBlock: {
+                tdz_op = JSParse_GetOp(stmt)
+                IfCondition GreaterEqual(tdz_op, 71) ThenBlock: {
+                    tdz_pat = JSParse_GetRight(stmt)
+                    IfCondition LessThan(tdz_pat, 0) ThenBlock: {
+                        tdz_np = JSParse_GetNamePtr(stmt)
+                        tdz_nl = JSParse_GetNameLen(stmt)
+                        tdz_slot = JSComp__AddLocal(tdz_np, tdz_nl)
+                        IfCondition And(GreaterEqual(tdz_slot, 0), LessThan(tdz_slot, 256)) ThenBlock: {
+                            SetByte(JSCompState.tdz_map, tdz_slot, 1)
+                        }
+                        // M60: env TDZ mark for free-var capture
+                        IfCondition GreaterEqual(tdz_slot, 0) ThenBlock: {
+                            JSComp__Push(stmt)
+                            JSComp__EmitTdzEnvMark(tdz_np, tdz_nl, tdz_slot)
+                            stmt = JSComp__Pop()
+                        }
+                        // M128d: register const name during pre-scan so pass-1
+                        // function bodies see IsConstName (THROW_CONST) for free-var
+                        // writes to outer const — before pass-2 VAR_DECL runs.
+                        IfCondition EqualTo(tdz_op, 72) ThenBlock: {
+                            IfCondition And(GreaterEqual(tdz_slot, 0), LessThan(tdz_slot, 256)) ThenBlock: {
+                                SetByte(JSCompState.const_map, tdz_slot, 1)
+                            }
+                            JSComp__RegisterConstName(tdz_np, tdz_nl)
+                        }
+                        // GlobalDeclarationInstantiation: let/const undefined,
+                        // NaN, or Infinity throws SyntaxError. This walk is only
+                        // the program's top-level decls, so block and function
+                        // lets are not here. The harness compiles scripts with
+                        // eval_mode set, so the check is not gated on that flag.
+                        JSCompTmp.name_ptr = JSParse_GetNamePtr(stmt)
+                        JSCompTmp.name_len = JSParse_GetNameLen(stmt)
+                        JSCompTmp.val = JSComp__IsRestrictedGlobalName(JSCompTmp.name_ptr, JSCompTmp.name_len)
+                        IfCondition EqualTo(JSCompTmp.val, 1) ThenBlock: {
+                            JSComp__Emit1(JSOp.THROW_RESTRICTED)
+                        }
+                    }
+                }
+            }
+            IfCondition EqualTo(st_tdz, ASTType.CLASS_DECL) ThenBlock: {
+                tdz_np = JSParse_GetNamePtr(stmt)
+                tdz_nl = JSParse_GetNameLen(stmt)
+                IfCondition And(NotEqual(tdz_np, 0), GreaterThan(tdz_nl, 0)) ThenBlock: {
+                    tdz_slot = JSComp__AddLocal(tdz_np, tdz_nl)
+                    IfCondition And(GreaterEqual(tdz_slot, 0), LessThan(tdz_slot, 256)) ThenBlock: {
+                        SetByte(JSCompState.tdz_map, tdz_slot, 1)
+                    }
+                    IfCondition GreaterEqual(tdz_slot, 0) ThenBlock: {
+                        JSComp__Push(stmt)
+                        JSComp__EmitTdzEnvMark(tdz_np, tdz_nl, tdz_slot)
+                        stmt = JSComp__Pop()
+                    }
+                }
+            }
+            stmt = JSParse_GetNext(stmt)
+        }
+
+        // M128c/M128f: Instantiate function declarations before other statements
+        // (ES script/eval Instantiation). Always pass-1 so eval sees
+        // `function f` before later statements in the same eval body.
+        stmt = JSParse_GetBody(save_node)
+        WhileLoop GreaterEqual(stmt, 0) {
+            st_nt = JSParse_GetType(stmt)
+            is_fdecl = 0
+            IfCondition EqualTo(st_nt, ASTType.FUNC_DECL) ThenBlock: { is_fdecl = 1 }
+            IfCondition EqualTo(st_nt, ASTType.GEN_FUNC_DECL) ThenBlock: { is_fdecl = 1 }
+            IfCondition EqualTo(st_nt, ASTType.ASYNC_FUNC_DECL) ThenBlock: { is_fdecl = 1 }
+            IfCondition EqualTo(is_fdecl, 1) ThenBlock: {
+                JSComp__Push(stmt)
+                JSComp__CompileNode(stmt)
+                stmt = JSComp__Pop()
+            }
+            stmt = JSParse_GetNext(stmt)
+        }
+
+        // Pass 2: statements (skip function decls already emitted in pass 1)
+        stmt = JSParse_GetBody(save_node)
+        WhileLoop GreaterEqual(stmt, 0) {
+            st_nt = JSParse_GetType(stmt)
+            is_fdecl = 0
+            IfCondition EqualTo(st_nt, ASTType.FUNC_DECL) ThenBlock: { is_fdecl = 1 }
+            IfCondition EqualTo(st_nt, ASTType.GEN_FUNC_DECL) ThenBlock: { is_fdecl = 1 }
+            IfCondition EqualTo(st_nt, ASTType.ASYNC_FUNC_DECL) ThenBlock: { is_fdecl = 1 }
+            IfCondition EqualTo(is_fdecl, 0) ThenBlock: {
+                next_stmt = JSParse_GetNext(stmt)
+                IfCondition And(EqualTo(JSCompState.eval_mode, 1), LessThan(next_stmt, 0)) ThenBlock: {
+                    JSCompState.is_last_stmt = 1
+                } ElseBlock: {
+                    JSCompState.is_last_stmt = 0
+                }
+                JSComp__Push(stmt)
+                JSComp__CompileNode(stmt)
+                stmt = JSComp__Pop()
+            }
+            stmt = JSParse_GetNext(stmt)
+        }
+        JSCompState.is_last_stmt = 0
+
+        JSComp__Emit1(JSOp.HALT)
+        JSComp__PopScope()
+        ReturnValue(0)
+    }
+}

@@ -217,6 +217,57 @@ globalThis.asyncTest = asyncTest;
 if (typeof $262 !== "undefined") {
   globalThis.$262 = $262;
 }
+// Wave 0 Symbol: other realm shares well-known symbols and the global
+// registry, but Symbol / Symbol.for / Symbol.keyFor are distinct functions.
+// Not a second VM. Tests that need a different Array/Object still fail.
+if (typeof $262 === "undefined") { $262 = {}; globalThis.$262 = $262; }
+if (typeof $262.createRealm !== "function") {
+  $262.createRealm = function() {
+    var src = Symbol;
+    var g = {};
+    function RealmSymbol(desc) { return src(desc); }
+    RealmSymbol.prototype = src.prototype;
+    var names = [
+      "asyncIterator", "hasInstance", "isConcatSpreadable", "iterator",
+      "match", "matchAll", "replace", "search", "species", "split",
+      "toPrimitive", "toStringTag", "unscopables", "dispose", "asyncDispose"
+    ];
+    var i;
+    for (i = 0; i < names.length; i++) {
+      RealmSymbol[names[i]] = src[names[i]];
+    }
+    RealmSymbol.for = function(key) { return src.for(key); };
+    RealmSymbol.keyFor = function(sym) { return src.keyFor(sym); };
+    function RealmTypeError(msg) {
+      var text = "";
+      if (msg !== undefined) text = msg;
+      var e = new TypeError(text);
+      if (typeof Object.setPrototypeOf === "function") {
+        Object.setPrototypeOf(e, RealmTypeError.prototype);
+      }
+      return e;
+    }
+    RealmTypeError.prototype = Object.create(TypeError.prototype);
+    RealmTypeError.prototype.constructor = RealmTypeError;
+    RealmTypeError.prototype.name = "TypeError";
+    g.TypeError = RealmTypeError;
+    function RealmRegExp(pattern, flags) {
+      var args = arguments.length < 2 ? [pattern] : [pattern, flags];
+      return Reflect.construct(RegExp, args, RealmRegExp);
+    }
+    RealmRegExp.prototype = Object.create(RegExp.prototype);
+    RealmRegExp.prototype.constructor = RealmRegExp;
+    RealmRegExp.prototype.compile = function () {
+      if (Object.getPrototypeOf(this) !== RealmRegExp.prototype) {
+        throw new RealmTypeError("RegExp.prototype.compile cross-realm");
+      }
+      return this;
+    };
+    g.RegExp = RealmRegExp;
+    g.Symbol = RealmSymbol;
+    return { global: g };
+  };
+}
 // M128e6ai: always provide Reflect (Proxy with tests / set-mutable-binding)
 if (typeof Reflect === "undefined") { Reflect = {}; }
 if (typeof Reflect.has !== "function") {
@@ -225,7 +276,9 @@ if (typeof Reflect.has !== "function") {
 if (typeof Reflect.get !== "function") {
   Reflect.get = function(o, p, r) { return o[p]; };
 }
-// OrdinarySet with Receiver (Proxy gOPD/defineProperty traps fire on r)
+// Fallback only. The engine Reflect.set is OrdinarySet with a receiver.
+// Overwriting it made length 4, made it constructable, and swallowed throws.
+if (typeof Reflect.set !== "function") {
 Reflect.set = function(target, p, v, receiver) {
   if (arguments.length < 4) receiver = target;
   try {
@@ -251,6 +304,7 @@ Reflect.set = function(target, p, v, receiver) {
     return true;
   } catch (e) { return false; }
 };
+}
 if (typeof Reflect.getOwnPropertyDescriptor !== "function") {
   Reflect.getOwnPropertyDescriptor = function(o, p) {
     return Object.getOwnPropertyDescriptor(o, p);
@@ -282,7 +336,9 @@ if (typeof Reflect.construct !== "function") {
     };
     function __isConstructible(f) {
       var n = f && f.name;
-      if (n && __knownCtor[n]) return true;
+      // Own keys only. __knownCtor["toString"] would otherwise hit
+      // Object.prototype.toString and treat every toString/valueOf as a ctor.
+      if (n && Object.prototype.hasOwnProperty.call(__knownCtor, n)) return true;
       if (!n || n.length === 0) return true;
       if (n.charCodeAt(0) >= 65 && n.charCodeAt(0) <= 90) return true;
       // Bound functions used as newTarget (custom-proto-access-throws)
@@ -4300,8 +4356,14 @@ def _batch_worker(wid, batch_harness, work_items, results, done_count, done_lock
                 proc.stdin.write(src_bytes)
                 proc.stdin.flush()
             except (BrokenPipeError, OSError):
-                # Harness crashed — mark remaining as error and restart
-                results[idx] = {"path": path, "status": "error", "reason": "harness_crash", "time_ms": 0}
+                # Process died the way a one-shot nonzero exit does.
+                # A positive test fails. A negative test passes.
+                results[idx] = {
+                    "path": path,
+                    "status": "pass" if is_negative else "fail",
+                    "reason": "harness_crash",
+                    "time_ms": 0,
+                }
                 with done_lock:
                     done_count[0] += 1
                 # Restart harness
@@ -4352,8 +4414,13 @@ def _batch_worker(wid, batch_harness, work_items, results, done_count, done_lock
                 continue
 
             if not result_byte or len(result_byte) == 0:
-                # Harness exited unexpectedly
-                results[idx] = {"path": path, "status": "error", "reason": "harness_eof", "time_ms": 0}
+                # Harness exited before a status byte. Same as a one-shot crash.
+                results[idx] = {
+                    "path": path,
+                    "status": "pass" if is_negative else "fail",
+                    "reason": "harness_eof",
+                    "time_ms": 0,
+                }
                 with done_lock:
                     done_count[0] += 1
                 # Restart

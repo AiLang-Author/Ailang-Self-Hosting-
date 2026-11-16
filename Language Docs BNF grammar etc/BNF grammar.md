@@ -579,6 +579,8 @@
                      | "MemoryCopy" "(" <expression> "," <expression> "," <expression> ")"
                      | "MemorySet" "(" <expression> "," <expression> "," <expression> ")"
                      | "MemoryCompare" "(" <expression> "," <expression> "," <expression> ")"
+                     | "MemMem" "(" <expression> "," <expression> "," <expression> "," <expression> ")"
+                     | "MemMemFold" "(" <expression> "," <expression> "," <expression> "," <expression> ")"
 
 <hardware_operation> ::= "PortRead" "(" <expression> "," STRING ")"
                         | "PortWrite" "(" <expression> "," <expression> "," STRING ")"

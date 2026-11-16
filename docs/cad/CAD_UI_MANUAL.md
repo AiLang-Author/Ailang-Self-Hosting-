@@ -14,6 +14,7 @@ Pick a tool on the **Sketch** tab (or right-click the viewport for the pie).
 | Tool | What you do |
 |------|-------------|
 | **Line** | Click start, click end. Card: **Length**, **Angle**. Tree child **Line**. |
+| **Move** | Drag a point or a line. A point follows the cursor, and a line moves both ends. A rectangle moves as one piece. There is no selector. |
 | **Circle** | Center: click center, type **Radius** or **Diameter**. 2-pt / 3-pt: click then the same card. |
 | **Rect** | Center: click center, type **Width** / **Height**. 2-pt / 3-pt: click then W/H. |
 | **Polygon** | Choose Center / 2-Point / 3-Point, and Triangle…Octagon. See below. |
@@ -63,10 +64,10 @@ Construct **Offset** / **Angle** planes use the same card (one field).
 
 | Tab | Job |
 |-----|-----|
-| **Sketch** | Draw and constrain on the active plane. |
+| **Sketch** | Draw and constrain on the active plane. **Sketch** stays in the 3D view until you click a plane or a face. |
 | **Solid** | Pick / On Face → **Extrude** (Join/Cut/New) · Revolve · **Modify** (Fillet / Chamfer). |
 | **Construct** | Datum, pick plane / face / origin, through 3pt, offset, angle, flip, **Sketch on Plane**. |
-| **View** | ISO / Top / Front / …, grid, wireframe, **Solid** fill (20–100), 2D↔3D. |
+| **View** | ISO / Top / Front / …, grid, planes, wireframe, **Solid** fill (20–100), 2D↔3D. |
 
 ### Construct — planes
 

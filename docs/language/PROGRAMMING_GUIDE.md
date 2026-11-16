@@ -147,6 +147,8 @@ b = GetByte(buf, 3)                    // Read single byte at offset 3
 MemoryCopy(dst, src, count)            // Copy bytes
 MemorySet(buf, 0, 256)                 // Fill with zeros
 MemChr(buf, 10, len)                   // Find byte (like memchr)
+MemMem(hay, haylen, needle, needlen)   // First offset of needle, or -1
+MemMemFold(hay, haylen, needle, needlen) // Same, folding ASCII A-Z to a-z
 
 // Free
 Deallocate(buf, 256)

@@ -243,6 +243,8 @@ These are compiler primitives for direct memory access.
 | `MemorySet(ptr, val, n)` | Fill `n` bytes at `ptr` with `val` |
 | `MemChr(ptr, byte, n)` | Find first occurrence of `byte` in `n` bytes. Returns offset or -1 (SSE2) |
 | `MemCompare(a, b, n)` | Compare `n` bytes. Returns 0 if equal (SSE2) |
+| `MemMem(hay, haylen, needle, needlen)` | First offset of `needle` in `hay`, or -1. Needle length 0 returns 0 (SSE2) |
+| `MemMemFold(hay, haylen, needle, needlen)` | `MemMem` with ASCII A–Z folded to a–z on both sides (SSE2) |
 | `AddressOf(var)` | Get address of a variable |
 
 ```ailang
@@ -255,6 +257,8 @@ SetByte(buf, 1, 105)            // 'i'
 SetByte(buf, 2, 0)              // NUL
 
 off = MemChr(buf, 105, 64)      // → 1  (offset of 'i')
+off = MemMem(buf, 64, pat, 3)   // first offset of pat, or -1
+off = MemMemFold(buf, 64, pat, 3)  // same, ASCII A-Z folded
 ```
 
 ---
@@ -323,6 +327,8 @@ GetByte(ptr,off)                Decrement(n)
 SetByte(ptr,off,val)
 MemChr(ptr,byte,n)
 MemCompare(a,b,n)
+MemMem(hay,haylen,needle,needlen)
+MemMemFold(hay,haylen,needle,needlen)
 MemoryCopy(dst,src,n)
 ```
 

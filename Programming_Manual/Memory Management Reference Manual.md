@@ -268,6 +268,8 @@ Arena_Reset()
 | `MemorySet(ptr, val, n)` | Fill `n` bytes with `val` |
 | `MemChr(ptr, byte, n)` | Find byte in `n` bytes, returns offset or -1 (SSE2) |
 | `MemCompare(a, b, n)` | Compare `n` bytes, returns 0 if equal (SSE2) |
+| `MemMem(hay, haylen, needle, needlen)` | First offset of `needle` in `hay`, or -1 (SSE2) |
+| `MemMemFold(hay, haylen, needle, needlen)` | Same search, folding ASCII A–Z to a–z on both sides (SSE2) |
 | `AddressOf(var)` | Get address of a variable |
 
 ```ailang
@@ -369,10 +371,16 @@ One potential cache miss if the heap block is cold.
   loops are the primary memory performance bottleneck — use
   `Arena_Reset()` to amortize.
 
-### MemoryCopy / MemChr / MemCompare are SSE2-vectorized
+### MemoryCopy / MemChr / MemCompare / MemMem are SSE2-vectorized
 
 These operate in 16-byte strides. Prefer them over byte-by-byte loops
 for any buffer operation on more than a few bytes.
+
+`MemMem` returns the first byte offset of `needle`, or `-1`. A needle
+length of 0 returns 0. A haystack shorter than the needle returns `-1`.
+`MemMemFold` is the same search with ASCII A–Z folded to a–z in both
+buffers. Other bytes, including bytes at or above `0x80`, are compared
+unchanged.
 
 ---
 
