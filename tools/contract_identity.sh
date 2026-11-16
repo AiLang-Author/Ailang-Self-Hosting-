@@ -94,6 +94,13 @@ echo "$mem_out" | grep -q "^done$" || fail "memprim_rdwr.ailang did not finish"
 ok "memprim_rdwr.ailang: all widths, sign extension, IO forms"
 [[ "$rc_badmem" -ne 0 ]] || fail "next compiled bad_memprim.ailang"
 ok "next rejected bad_memprim.ailang"
+for pair in "memprim_byte_base:mismatches 0" "ptrfield_cmpskip:ptrfield 77"; do
+    name="${pair%%:*}"; want="${pair#*:}"
+    "$NEXT_AILANG" "$ROOT/tests/contract/$name.ailang" "$TMP/$name.x"
+    got="$("$TMP/$name.x")"
+    [[ "$got" == "$want" ]] || fail "$name.ailang printed '$got', want '$want'"
+    ok "$name.ailang: $want"
+done
 
 echo "== D. negative tests against next only =="
 set +e
