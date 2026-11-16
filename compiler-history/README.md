@@ -11,7 +11,9 @@ Binaries are gitignored (`*.x`). Sources live on git tags/commits.
 | `analyzer-2026-08-05.x` | Analyzer from that era |
 | `ailang-2026-06-02-backup8-4.x` | Older root `ailang-backup8-4-2026.x` copy |
 | `ailang-2026-10-04.x`, `ailang-2026-10-06-*.x`, `ailang-2026-10-13-*.x` | Moved here from `Librarys/Compiler/Deprecated/` on 2026-11-04. The suffix is the source commit. |
-| `ailang-2026-11-16-memprim-seed.x` | Seed for branch `memprim-rdwr`, where the tree spells memory access as RDMEM_/WRMEM_ and GetByte/SetByte/Dereference/StoreValue no longer exist. The root `ailang.x` cannot build that tree; build it with this file until a new host is promoted. Bootstrap fixed point, 7875176 bytes, sha256 `7cc4128adaf3c1be31de15007aca1f4d4e187187026a6618c509d2f9c50f2ec4`. |
+| `ailang-2026-11-16-pre-memprim.x` | Host replaced 2026-11-16 by the RDMEM_/WRMEM_ compiler. 7888332 bytes, sha256 `6ee514776c33e8f680cc912bb3918ebf33de23ec3696937713b29517e4d2802a`. Knows GetByte/SetByte/Dereference/StoreValue only, so it cannot build the tree after that date. |
+| `ailang-2026-11-16-memprim-seed.x` | The promoted host itself (same bytes as root `ailang.x` on 2026-11-16), sha256 `7cc4128adaf3c1be31de15007aca1f4d4e187187026a6618c509d2f9c50f2ec4`. |
+| `analyzer-2026-11-16-pre-memprim.x`, `ailang_lsp-2026-11-16-pre-memprim.x` | Analyzer and LSP built from the old parser; both report RDMEM_/WRMEM_ calls as undefined. Replaced by rebuilds from the migrated source. |
 
 Restore:
 
