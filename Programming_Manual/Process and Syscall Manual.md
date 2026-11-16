@@ -206,9 +206,9 @@ not executable, etc.). Wraps syscall 59 (execve).
 ```ailang
 // Build argv: ["/bin/ls", "-la", NULL]
 argv = Allocate(24)               // 3 pointers × 8 bytes
-StoreValue(argv, "/bin/ls")
-StoreValue(Add(argv, 8), "-la")
-StoreValue(Add(argv, 16), 0)      // NULL terminator
+WRMEM_64(argv, "/bin/ls")
+WRMEM_64(argv, 8, "-la")
+WRMEM_64(argv, 16, 0)      // NULL terminator
 
 result = ProcessExec("/bin/ls", argv)
 // Only reached if exec failed
@@ -302,8 +302,8 @@ pid = ProcessFork()
 IfCondition EqualTo(pid, 0) ThenBlock: {
     // Child: build argv and exec
     argv = Allocate(16)
-    StoreValue(argv, "/usr/bin/wc")
-    StoreValue(Add(argv, 8), 0)
+    WRMEM_64(argv, "/usr/bin/wc")
+    WRMEM_64(argv, 8, 0)
 
     ProcessExec("/usr/bin/wc", argv)
 
@@ -335,7 +335,7 @@ IfCondition EqualTo(pid, 0) ThenBlock: {
     // Parent: read from pipe
     buf = Allocate(256)
     n = PipeRead(pipe, buf, 255)
-    SetByte(buf, n, 0)    // NUL-terminate
+    WRMEM_8(buf, n, 0)    // NUL-terminate
     PrintMessage(buf)
     ProcessWait(pid, 0)
     Deallocate(buf, 256)

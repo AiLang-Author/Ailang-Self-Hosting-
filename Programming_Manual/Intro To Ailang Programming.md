@@ -61,7 +61,7 @@ C arrays decay to pointers, `a[i]` is `*(a + i)`, pointer arithmetic is implicit
 ```ailang
 // Access element i of an 8-byte-stride array
 offset = Multiply(i, 8)
-element = Dereference(Add(base_ptr, offset))
+element = RDMEM_64(base_ptr, offset)
 ```
 
 Verbose? Yes. Ambiguous? Never.
