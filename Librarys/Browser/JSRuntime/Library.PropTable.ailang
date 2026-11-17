@@ -10,13 +10,12 @@
 // =============================================================================
 FixedPool.PropConst {
     "ENTRY_SIZE":      Initialize=16
-    // Was 32 → 64 (DOM wrappers). M43: Array.prototype installs ~32 methods
-    // + matching __a_* attr keys + __proto__/symbols → hit 64 hard, so
-    // Array.prototype.foo = … silently dropped (map inherited-index tests).
-    // 128 leaves headroom for builtins + user props on hot prototypes.
-    "MAX_ENTRIES":     Initialize=128
-    // 8-byte count header + 128 * 16-byte entries = 2056
-    "TABLE_SIZE":      Initialize=2056
+    // Was 32 → 64 → 128. Global this plus __a_ attr keys fills 128
+    // under the test262 polyfill, so this.p1 = 1 was dropped.
+    // 256 covers builtins, attr keys, and script vars on the global object.
+    "MAX_ENTRIES":     Initialize=256
+    // 8-byte count header + 256 * 16-byte entries = 4104
+    "TABLE_SIZE":      Initialize=4104
     "MAX_TABLES":      Initialize=65536
     "TOMBSTONE":       Initialize=-2
     "GLOBAL_SLOTS":    Initialize=2048
@@ -34,6 +33,11 @@ FixedPool.PropState {
     "global_hash":   Initialize=0
     "arr_side":      Initialize=0
     "arr_side_count": Initialize=0
+    // Recycled tables (JSRT_GcTick). 0 = none. Next link stored at table+8.
+    "free_head":     Initialize=0
+    // 256 slots × (key, table, entry). Repeated lookups skip the linear scan.
+    "cache":         Initialize=0
+    "cache_hold":    Initialize=0
 }
 
 // =============================================================================
@@ -47,6 +51,19 @@ FixedPool.PropTmp {
     "addr":      Initialize=0
     "count":     Initialize=0
     "ekey":      Initialize=0
+    // KeyEq only. Do not reuse idx/addr/ekey — callers hold those across KeyEq.
+    "eq_cs":     Initialize=0
+    "eq_js":     Initialize=0
+    "eq_ia":     Initialize=0
+    "eq_ja":     Initialize=0
+    "eq_jn":     Initialize=0
+    "eq_cu":     Initialize=0
+    "eq_ju":     Initialize=0
+    "eq_n":      Initialize=0
+    "eq_pend":   Initialize=0
+    "eq_gotc":   Initialize=0
+    "eq_gotj":   Initialize=0
+    "eq_go":     Initialize=0
 }
 
 // =============================================================================
@@ -72,6 +89,12 @@ Function.PropTable_Init {
         MemorySet(PropState.arr_side, 0, arr_side_sz)
         PropState.arr_side_count = 0
 
+        // 256 × 24 bytes. Zero means empty.
+        PropState.cache = Allocate(6144)
+        IfCondition NotEqual(PropState.cache, 0) ThenBlock: {
+            MemorySet(PropState.cache, 0, 6144)
+        }
+
         ReturnValue(1)
     }
 }
@@ -85,6 +108,12 @@ Function.PropTable_Init {
 Function.PropTable_Alloc {
     Output: Address
     Body: {
+        IfCondition NotEqual(PropState.free_head, 0) ThenBlock: {
+            PropTmp.addr = PropState.free_head
+            PropState.free_head = RDMEM_64(PropTmp.addr, 8)
+            MemorySet(PropTmp.addr, 0, PropConst.TABLE_SIZE)
+            ReturnValue(PropTmp.addr)
+        }
         idx = PropState.next_slot
         IfCondition GreaterEqual(idx, PropConst.MAX_TABLES) ThenBlock: {
             ReturnValue(0)
@@ -93,6 +122,201 @@ Function.PropTable_Alloc {
         MemorySet(addr, 0, PropConst.TABLE_SIZE)
         PropState.next_slot = Add(idx, 1)
         ReturnValue(addr)
+    }
+}
+
+// One UTF-8 code unit from a C property key, same rules as CreateStringUTF8Len.
+// 1 = produced a unit in eq_cu and a byte width in eq_n. 0 = NUL.
+Function.PropTable__CUnit {
+    Input: p: Address
+    Input: i: Integer
+    Output: Integer
+    Body: {
+        save_p = p
+        save_i = i
+        IfCondition NotEqual(PropTmp.eq_pend, 0) ThenBlock: {
+            PropTmp.eq_cu = PropTmp.eq_pend
+            PropTmp.eq_pend = 0
+            PropTmp.eq_n = 0
+            ReturnValue(1)
+        }
+        b0 = RDMEM_8(save_p, save_i)
+        IfCondition LessThan(b0, 0) ThenBlock: { b0 = Add(b0, 256) }
+        IfCondition EqualTo(b0, 0) ThenBlock: {
+            PropTmp.eq_n = 0
+            ReturnValue(0)
+        }
+        IfCondition LessThan(b0, 128) ThenBlock: {
+            PropTmp.eq_cu = b0
+            PropTmp.eq_n = 1
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(BitwiseAnd(b0, 224), 192) ThenBlock: {
+            b1 = RDMEM_8(save_p, Add(save_i, 1))
+            IfCondition LessThan(b1, 0) ThenBlock: { b1 = Add(b1, 256) }
+            IfCondition EqualTo(BitwiseAnd(b1, 192), 128) ThenBlock: {
+                cp = Add(ShiftLeft(BitwiseAnd(b0, 31), 6), BitwiseAnd(b1, 63))
+                IfCondition GreaterEqual(cp, 128) ThenBlock: {
+                    PropTmp.eq_cu = cp
+                    PropTmp.eq_n = 2
+                    ReturnValue(1)
+                }
+            }
+        }
+        IfCondition EqualTo(BitwiseAnd(b0, 240), 224) ThenBlock: {
+            b1 = RDMEM_8(save_p, Add(save_i, 1))
+            IfCondition LessThan(b1, 0) ThenBlock: { b1 = Add(b1, 256) }
+            b2 = RDMEM_8(save_p, Add(save_i, 2))
+            IfCondition LessThan(b2, 0) ThenBlock: { b2 = Add(b2, 256) }
+            IfCondition And(EqualTo(BitwiseAnd(b1, 192), 128), EqualTo(BitwiseAnd(b2, 192), 128)) ThenBlock: {
+                cp = Add(Add(ShiftLeft(BitwiseAnd(b0, 15), 12), ShiftLeft(BitwiseAnd(b1, 63), 6)), BitwiseAnd(b2, 63))
+                IfCondition GreaterEqual(cp, 2048) ThenBlock: {
+                    PropTmp.eq_cu = cp
+                    PropTmp.eq_n = 3
+                    ReturnValue(1)
+                }
+            }
+        }
+        IfCondition EqualTo(BitwiseAnd(b0, 248), 240) ThenBlock: {
+            b1 = RDMEM_8(save_p, Add(save_i, 1))
+            IfCondition LessThan(b1, 0) ThenBlock: { b1 = Add(b1, 256) }
+            b2 = RDMEM_8(save_p, Add(save_i, 2))
+            IfCondition LessThan(b2, 0) ThenBlock: { b2 = Add(b2, 256) }
+            b3 = RDMEM_8(save_p, Add(save_i, 3))
+            IfCondition LessThan(b3, 0) ThenBlock: { b3 = Add(b3, 256) }
+            IfCondition And(And(EqualTo(BitwiseAnd(b1, 192), 128), EqualTo(BitwiseAnd(b2, 192), 128)), EqualTo(BitwiseAnd(b3, 192), 128)) ThenBlock: {
+                cp = Add(Add(Add(ShiftLeft(BitwiseAnd(b0, 7), 18), ShiftLeft(BitwiseAnd(b1, 63), 12)), ShiftLeft(BitwiseAnd(b2, 63), 6)), BitwiseAnd(b3, 63))
+                IfCondition And(GreaterEqual(cp, 65536), LessThan(cp, 1114112)) ThenBlock: {
+                    adj = Subtract(cp, 65536)
+                    PropTmp.eq_cu = Add(55296, ShiftRight(adj, 10))
+                    PropTmp.eq_pend = Add(56320, BitwiseAnd(adj, 1023))
+                    PropTmp.eq_n = 4
+                    ReturnValue(1)
+                }
+            }
+        }
+        PropTmp.eq_cu = b0
+        PropTmp.eq_n = 1
+        ReturnValue(1)
+    }
+}
+
+// C property keys are UTF-8. Runtime lookups pass UTF-16 JS strings.
+// StrEq compares bytes to code units, so U+FFFD does not match its UTF-8 bytes.
+Function.PropTable__KeyEq {
+    Input: a: Address
+    Input: b: Address
+    Output: Integer
+    Body: {
+        save_a = a
+        save_b = b
+        IfCondition EqualTo(save_a, save_b) ThenBlock: { ReturnValue(1) }
+        IfCondition Or(EqualTo(save_a, 0), EqualTo(save_b, 0)) ThenBlock: { ReturnValue(0) }
+        PropTmp.eq_cs = save_a
+        PropTmp.eq_js = save_b
+        IfCondition EqualTo(JSRT_StrEq(PropTmp.eq_cs, PropTmp.eq_js), 1) ThenBlock: {
+            ReturnValue(1)
+        }
+        aj = JSRT_StrIsJS(PropTmp.eq_cs)
+        bj = JSRT_StrIsJS(PropTmp.eq_js)
+        IfCondition EqualTo(aj, bj) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(aj, 1) ThenBlock: {
+            swap = PropTmp.eq_cs
+            PropTmp.eq_cs = PropTmp.eq_js
+            PropTmp.eq_js = swap
+        }
+        // ASCII C keys already failed StrEq. Only multi-byte UTF-8 can still match.
+        bi = 0
+        hi = 0
+        WhileLoop EqualTo(hi, 0) {
+            b0 = RDMEM_8(PropTmp.eq_cs, bi)
+            IfCondition LessThan(b0, 0) ThenBlock: { b0 = Add(b0, 256) }
+            IfCondition EqualTo(b0, 0) ThenBlock: { hi = 2 }
+            IfCondition GreaterEqual(b0, 128) ThenBlock: { hi = 1 }
+            bi = Add(bi, 1)
+        }
+        IfCondition NotEqual(hi, 1) ThenBlock: { ReturnValue(0) }
+        PropTmp.eq_pend = 0
+        PropTmp.eq_ia = 0
+        PropTmp.eq_ja = 0
+        PropTmp.eq_jn = JSRT_StrLen(PropTmp.eq_js)
+        PropTmp.eq_go = 1
+        WhileLoop EqualTo(PropTmp.eq_go, 1) {
+            PropTmp.eq_gotc = PropTable__CUnit(PropTmp.eq_cs, PropTmp.eq_ia)
+            PropTmp.eq_ia = Add(PropTmp.eq_ia, PropTmp.eq_n)
+            PropTmp.eq_gotj = 0
+            IfCondition LessThan(PropTmp.eq_ja, PropTmp.eq_jn) ThenBlock: {
+                PropTmp.eq_ju = JSRT_StrUnit(PropTmp.eq_js, PropTmp.eq_ja)
+                PropTmp.eq_ja = Add(PropTmp.eq_ja, 1)
+                PropTmp.eq_gotj = 1
+            }
+            IfCondition And(EqualTo(PropTmp.eq_gotc, 0), EqualTo(PropTmp.eq_gotj, 0)) ThenBlock: {
+                ReturnValue(1)
+            }
+            IfCondition Or(EqualTo(PropTmp.eq_gotc, 0), EqualTo(PropTmp.eq_gotj, 0)) ThenBlock: {
+                ReturnValue(0)
+            }
+            IfCondition NotEqual(PropTmp.eq_cu, PropTmp.eq_ju) ThenBlock: {
+                ReturnValue(0)
+            }
+        }
+        ReturnValue(0)
+    }
+}
+
+// Slot address for the direct-mapped name cache, or 0.
+Function.PropTable__CacheBase {
+    Input: key: Address
+    Output: Address
+    Body: {
+        IfCondition EqualTo(PropState.cache, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(key, 0) ThenBlock: { ReturnValue(0) }
+        // Pointers are 8-aligned, so drop the low bits before the mask.
+        ReturnValue(Add(PropState.cache, Multiply(BitwiseAnd(Divide(key, 16), 255), 24)))
+    }
+}
+
+// Entry address if this key was cached for this table and still matches.
+Function.PropTable__CacheHit {
+    Input: table: Address
+    Input: key: Address
+    Output: Address
+    Body: {
+        save_table = table
+        save_key = key
+        base = PropTable__CacheBase(save_key)
+        IfCondition EqualTo(base, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(RDMEM_64(base), save_key) ThenBlock: { ReturnValue(0) }
+        IfCondition NotEqual(RDMEM_64(base, 8), save_table) ThenBlock: { ReturnValue(0) }
+        PropState.cache_hold = base
+        IfCondition EqualTo(RDMEM_64(PropState.cache_hold, 16), 0) ThenBlock: { ReturnValue(0) }
+        ekey = RDMEM_64(RDMEM_64(PropState.cache_hold, 16))
+        IfCondition EqualTo(ekey, save_key) ThenBlock: {
+            ReturnValue(RDMEM_64(PropState.cache_hold, 16))
+        }
+        IfCondition EqualTo(ekey, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(ekey, PropConst.TOMBSTONE) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(PropTable__KeyEq(RDMEM_64(RDMEM_64(PropState.cache_hold, 16)), save_key), 1) ThenBlock: {
+            ReturnValue(RDMEM_64(PropState.cache_hold, 16))
+        }
+        ReturnValue(0)
+    }
+}
+
+Function.PropTable__CacheStore {
+    Input: table: Address
+    Input: key: Address
+    Input: addr: Address
+    Body: {
+        save_table = table
+        save_key = key
+        save_addr = addr
+        base = PropTable__CacheBase(save_key)
+        IfCondition EqualTo(base, 0) ThenBlock: { ReturnValue(0) }
+        WRMEM_64(base, save_key)
+        WRMEM_64(base, 8, save_table)
+        WRMEM_64(base, 16, save_addr)
+        ReturnValue(1)
     }
 }
 
@@ -111,9 +335,13 @@ Function.PropTable_Lookup {
         IfCondition EqualTo(save_table, 0) ThenBlock: {
             ReturnValue(-1)
         }
-        count = Dereference(save_table)
+        count = RDMEM_64(save_table)
         IfCondition EqualTo(count, 0) ThenBlock: {
             ReturnValue(-1)
+        }
+        hit = PropTable__CacheHit(save_table, save_key)
+        IfCondition NotEqual(hit, 0) ThenBlock: {
+            ReturnValue(RDMEM_64(hit, 8))
         }
         // Clamp count to MAX_ENTRIES
         IfCondition GreaterThan(count, PropConst.MAX_ENTRIES) ThenBlock: {
@@ -123,7 +351,7 @@ Function.PropTable_Lookup {
         WhileLoop LessThan(PropTmp.idx, count) {
             // Entry at offset 8 + idx*16
             PropTmp.addr = Add(save_table, Add(8, Multiply(PropTmp.idx, PropConst.ENTRY_SIZE)))
-            PropTmp.ekey = Dereference(PropTmp.addr)
+            PropTmp.ekey = RDMEM_64(PropTmp.addr)
             // Skip empty (0) and tombstone (-2)
             IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
                 PropTmp.idx = Add(PropTmp.idx, 1)
@@ -133,11 +361,13 @@ Function.PropTable_Lookup {
                 } ElseBlock: {
                     // Pointer compare first (fast path)
                     IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
-                        ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+                        PropTable__CacheStore(save_table, save_key, PropTmp.addr)
+                        ReturnValue(RDMEM_64(PropTmp.addr, 8))
                     }
-                    // String compare fallback (M31a: JS UTF-16 or C keys)
-                    IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
-                        ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+                    // String compare fallback. C keys are UTF-8; lookups are UTF-16.
+                    IfCondition EqualTo(PropTable__KeyEq(PropTmp.ekey, save_key), 1) ThenBlock: {
+                        PropTable__CacheStore(save_table, save_key, PropTmp.addr)
+                        ReturnValue(RDMEM_64(PropTmp.addr, 8))
                     }
                     PropTmp.idx = Add(PropTmp.idx, 1)
                 }
@@ -164,17 +394,22 @@ Function.PropTable_Insert {
         IfCondition EqualTo(save_table, 0) ThenBlock: {
             ReturnValue(-1)
         }
-        count = Dereference(save_table)
+        count = RDMEM_64(save_table)
         // Clamp count to MAX_ENTRIES
         IfCondition GreaterThan(count, PropConst.MAX_ENTRIES) ThenBlock: {
             count = PropConst.MAX_ENTRIES
         }
         // First pass: check if key already exists
+        hit = PropTable__CacheHit(save_table, save_key)
+        IfCondition NotEqual(hit, 0) ThenBlock: {
+            WRMEM_64(hit, 8, save_val)
+            ReturnValue(0)
+        }
         first_tombstone = -1
         PropTmp.idx = 0
         WhileLoop LessThan(PropTmp.idx, count) {
             PropTmp.addr = Add(save_table, Add(8, Multiply(PropTmp.idx, PropConst.ENTRY_SIZE)))
-            PropTmp.ekey = Dereference(PropTmp.addr)
+            PropTmp.ekey = RDMEM_64(PropTmp.addr)
             // Track first tombstone for reuse
             IfCondition EqualTo(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
                 IfCondition EqualTo(first_tombstone, -1) ThenBlock: {
@@ -184,12 +419,14 @@ Function.PropTable_Insert {
                 IfCondition NotEqual(PropTmp.ekey, 0) ThenBlock: {
                     // Pointer compare
                     IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
-                        StoreValue(Add(PropTmp.addr, 8), save_val)
+                        WRMEM_64(PropTmp.addr, 8, save_val)
+                        PropTable__CacheStore(save_table, save_key, PropTmp.addr)
                         ReturnValue(0)
                     }
-                    // String compare
-                    IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
-                        StoreValue(Add(PropTmp.addr, 8), save_val)
+                    // String compare. C keys are UTF-8; lookups are UTF-16.
+                    IfCondition EqualTo(PropTable__KeyEq(PropTmp.ekey, save_key), 1) ThenBlock: {
+                        WRMEM_64(PropTmp.addr, 8, save_val)
+                        PropTable__CacheStore(save_table, save_key, PropTmp.addr)
                         ReturnValue(0)
                     }
                 }
@@ -200,8 +437,8 @@ Function.PropTable_Insert {
         // Reuse tombstone if available
         IfCondition NotEqual(first_tombstone, -1) ThenBlock: {
             PropTmp.addr = Add(save_table, Add(8, Multiply(first_tombstone, PropConst.ENTRY_SIZE)))
-            StoreValue(PropTmp.addr, save_key)
-            StoreValue(Add(PropTmp.addr, 8), save_val)
+            WRMEM_64(PropTmp.addr, save_key)
+            WRMEM_64(PropTmp.addr, 8, save_val)
             ReturnValue(1)
         }
         // Append at end if room
@@ -209,10 +446,10 @@ Function.PropTable_Insert {
             ReturnValue(-1)
         }
         PropTmp.addr = Add(save_table, Add(8, Multiply(count, PropConst.ENTRY_SIZE)))
-        StoreValue(PropTmp.addr, save_key)
-        StoreValue(Add(PropTmp.addr, 8), save_val)
+        WRMEM_64(PropTmp.addr, save_key)
+        WRMEM_64(PropTmp.addr, 8, save_val)
         // Increment count
-        StoreValue(save_table, Add(count, 1))
+        WRMEM_64(save_table, Add(count, 1))
         ReturnValue(1)
     }
 }
@@ -250,14 +487,14 @@ Function.PropTable_Delete {
         IfCondition EqualTo(save_table, 0) ThenBlock: {
             ReturnValue(-1)
         }
-        count = Dereference(save_table)
+        count = RDMEM_64(save_table)
         IfCondition GreaterThan(count, PropConst.MAX_ENTRIES) ThenBlock: {
             count = PropConst.MAX_ENTRIES
         }
         PropTmp.idx = 0
         WhileLoop LessThan(PropTmp.idx, count) {
             PropTmp.addr = Add(save_table, Add(8, Multiply(PropTmp.idx, PropConst.ENTRY_SIZE)))
-            PropTmp.ekey = Dereference(PropTmp.addr)
+            PropTmp.ekey = RDMEM_64(PropTmp.addr)
             IfCondition NotEqual(PropTmp.ekey, 0) ThenBlock: {
                 IfCondition NotEqual(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
                     found = 0
@@ -265,14 +502,14 @@ Function.PropTable_Delete {
                         found = 1
                     }
                     IfCondition EqualTo(found, 0) ThenBlock: {
-                        IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
+                        IfCondition EqualTo(PropTable__KeyEq(PropTmp.ekey, save_key), 1) ThenBlock: {
                             found = 1
                         }
                     }
                     IfCondition EqualTo(found, 1) ThenBlock: {
-                        old_val = Dereference(Add(PropTmp.addr, 8))
-                        StoreValue(PropTmp.addr, PropConst.TOMBSTONE)
-                        StoreValue(Add(PropTmp.addr, 8), 0)
+                        old_val = RDMEM_64(PropTmp.addr, 8)
+                        WRMEM_64(PropTmp.addr, PropConst.TOMBSTONE)
+                        WRMEM_64(PropTmp.addr, 8, 0)
                         ReturnValue(old_val)
                     }
                 }
@@ -296,14 +533,14 @@ Function.PropTable_Keys {
         IfCondition EqualTo(save_table, 0) ThenBlock: {
             ReturnValue(keys)
         }
-        count = Dereference(save_table)
+        count = RDMEM_64(save_table)
         IfCondition GreaterThan(count, PropConst.MAX_ENTRIES) ThenBlock: {
             count = PropConst.MAX_ENTRIES
         }
         PropTmp.idx = 0
         WhileLoop LessThan(PropTmp.idx, count) {
             PropTmp.addr = Add(save_table, Add(8, Multiply(PropTmp.idx, PropConst.ENTRY_SIZE)))
-            PropTmp.ekey = Dereference(PropTmp.addr)
+            PropTmp.ekey = RDMEM_64(PropTmp.addr)
             // Only collect live entries (not empty, not tombstone)
             IfCondition NotEqual(PropTmp.ekey, 0) ThenBlock: {
                 IfCondition NotEqual(PropTmp.ekey, PropConst.TOMBSTONE) ThenBlock: {
@@ -360,7 +597,7 @@ Function.GlobalHash_Lookup {
         WhileLoop LessThan(PropTmp.idx, PropConst.GLOBAL_SLOTS) {
             slot_idx = BitwiseAnd(Add(bucket, PropTmp.idx), 2047)
             PropTmp.addr = Add(PropState.global_hash, Multiply(slot_idx, PropConst.ENTRY_SIZE))
-            PropTmp.ekey = Dereference(PropTmp.addr)
+            PropTmp.ekey = RDMEM_64(PropTmp.addr)
             // Empty slot = not found
             IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
                 ReturnValue(-1)
@@ -371,11 +608,11 @@ Function.GlobalHash_Lookup {
             } ElseBlock: {
                 // Pointer compare
                 IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
-                    ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+                    ReturnValue(RDMEM_64(PropTmp.addr, 8))
                 }
                 // String compare
                 IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
-                    ReturnValue(Dereference(Add(PropTmp.addr, 8)))
+                    ReturnValue(RDMEM_64(PropTmp.addr, 8))
                 }
                 PropTmp.idx = Add(PropTmp.idx, 1)
             }
@@ -402,15 +639,15 @@ Function.GlobalHash_Insert {
         WhileLoop LessThan(PropTmp.idx, PropConst.GLOBAL_SLOTS) {
             slot_idx = BitwiseAnd(Add(bucket, PropTmp.idx), 2047)
             PropTmp.addr = Add(PropState.global_hash, Multiply(slot_idx, PropConst.ENTRY_SIZE))
-            PropTmp.ekey = Dereference(PropTmp.addr)
+            PropTmp.ekey = RDMEM_64(PropTmp.addr)
             // Empty slot — insert here (or first tombstone)
             IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
                 IfCondition NotEqual(tomb_addr, 0) ThenBlock: {
-                    StoreValue(tomb_addr, save_key)
-                    StoreValue(Add(tomb_addr, 8), save_val)
+                    WRMEM_64(tomb_addr, save_key)
+                    WRMEM_64(tomb_addr, 8, save_val)
                 } ElseBlock: {
-                    StoreValue(PropTmp.addr, save_key)
-                    StoreValue(Add(PropTmp.addr, 8), save_val)
+                    WRMEM_64(PropTmp.addr, save_key)
+                    WRMEM_64(PropTmp.addr, 8, save_val)
                 }
                 ReturnValue(1)
             }
@@ -422,11 +659,11 @@ Function.GlobalHash_Insert {
             } ElseBlock: {
                 // Existing key — update value
                 IfCondition EqualTo(PropTmp.ekey, save_key) ThenBlock: {
-                    StoreValue(Add(PropTmp.addr, 8), save_val)
+                    WRMEM_64(PropTmp.addr, 8, save_val)
                     ReturnValue(0)
                 }
                 IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: {
-                    StoreValue(Add(PropTmp.addr, 8), save_val)
+                    WRMEM_64(PropTmp.addr, 8, save_val)
                     ReturnValue(0)
                 }
                 PropTmp.idx = Add(PropTmp.idx, 1)
@@ -434,8 +671,8 @@ Function.GlobalHash_Insert {
         }
         // Table full — try tombstone
         IfCondition NotEqual(tomb_addr, 0) ThenBlock: {
-            StoreValue(tomb_addr, save_key)
-            StoreValue(Add(tomb_addr, 8), save_val)
+            WRMEM_64(tomb_addr, save_key)
+            WRMEM_64(tomb_addr, 8, save_val)
             ReturnValue(1)
         }
         ReturnValue(-1)
@@ -456,7 +693,7 @@ Function.GlobalHash_Delete {
         WhileLoop LessThan(PropTmp.idx, PropConst.GLOBAL_SLOTS) {
             slot_idx = BitwiseAnd(Add(bucket, PropTmp.idx), 2047)
             PropTmp.addr = Add(PropState.global_hash, Multiply(slot_idx, PropConst.ENTRY_SIZE))
-            PropTmp.ekey = Dereference(PropTmp.addr)
+            PropTmp.ekey = RDMEM_64(PropTmp.addr)
             IfCondition EqualTo(PropTmp.ekey, 0) ThenBlock: {
                 ReturnValue(0)
             }
@@ -469,8 +706,8 @@ Function.GlobalHash_Delete {
                     IfCondition EqualTo(JSRT_StrEq(PropTmp.ekey, save_key), 1) ThenBlock: { hit = 1 }
                 }
                 IfCondition EqualTo(hit, 1) ThenBlock: {
-                    StoreValue(PropTmp.addr, PropConst.TOMBSTONE)
-                    StoreValue(Add(PropTmp.addr, 8), 0)
+                    WRMEM_64(PropTmp.addr, PropConst.TOMBSTONE)
+                    WRMEM_64(PropTmp.addr, 8, 0)
                     ReturnValue(1)
                 }
                 PropTmp.idx = Add(PropTmp.idx, 1)
@@ -517,16 +754,16 @@ Function.ArrSide_Lookup {
             ReturnValue(0)
         }
         // Key = XArray payload at JSValue+8
-        save_key = Dereference(Add(save_arr, 8))
+        save_key = RDMEM_64(save_arr, 8)
         IfCondition EqualTo(save_key, 0) ThenBlock: {
             ReturnValue(0)
         }
         as_i = 0
         WhileLoop LessThan(as_i, PropState.arr_side_count) {
             as_addr = Add(PropState.arr_side, Multiply(as_i, PropConst.ARR_SIDE_ENTRY))
-            as_ent = Dereference(as_addr)
+            as_ent = RDMEM_64(as_addr)
             IfCondition EqualTo(as_ent, save_key) ThenBlock: {
-                ReturnValue(Dereference(Add(as_addr, 8)))
+                ReturnValue(RDMEM_64(as_addr, 8))
             }
             as_i = Add(as_i, 1)
         }
@@ -543,7 +780,7 @@ Function.ArrSide_GetOrCreate {
         IfCondition EqualTo(save_arr, 0) ThenBlock: {
             ReturnValue(0)
         }
-        save_key = Dereference(Add(save_arr, 8))
+        save_key = RDMEM_64(save_arr, 8)
         IfCondition EqualTo(save_key, 0) ThenBlock: {
             ReturnValue(0)
         }
@@ -559,8 +796,8 @@ Function.ArrSide_GetOrCreate {
             PropState.arr_side_count = 0
         }
         as_addr = Add(PropState.arr_side, Multiply(PropState.arr_side_count, PropConst.ARR_SIDE_ENTRY))
-        StoreValue(as_addr, save_key)
-        StoreValue(Add(as_addr, 8), pt)
+        WRMEM_64(as_addr, save_key)
+        WRMEM_64(as_addr, 8, pt)
         PropState.arr_side_count = Add(PropState.arr_side_count, 1)
         ReturnValue(pt)
     }

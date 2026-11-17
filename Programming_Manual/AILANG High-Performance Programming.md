@@ -66,7 +66,7 @@ These are compiler primitives, not library loops:
 | `MemCompare(a, b, n)` | `0` when the `n` bytes match. |
 | `MemoryCopy(dst, src, n)` | Move a line only when you must keep it. |
 
-A `WhileLoop` of `GetByte` over a multi-megabyte buffer is the slow version of one of these calls. The interpreter pays for every byte. The primitive pays for a 16-byte vector step.
+A `WhileLoop` of `RDMEM_8` over a multi-megabyte buffer is the slow version of one of these calls. The interpreter pays for every byte. The primitive pays for a 16-byte vector step.
 
 ### Pull a literal out of a pattern
 
@@ -112,7 +112,7 @@ Resuming at `cand + 1` looks right and loops forever when the anchor sits later 
 // Slow. One interpreter step per byte.
 i = 0
 WhileLoop LessThan(i, n) {
-    IfCondition EqualTo(GetByte(hay, i), 101) ThenBlock: { ReturnValue(i) }
+    IfCondition EqualTo(RDMEM_8(hay, i), 101) ThenBlock: { ReturnValue(i) }
     i = Add(i, 1)
 }
 

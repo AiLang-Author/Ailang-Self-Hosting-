@@ -775,8 +775,8 @@ SubRoutine.ProcessWithResidual {
         offset = Multiply(i, 8)
         read_ptr = Add(LayerIO.input_ptr, offset)
         write_ptr = Add(Pointers.TempBuffer, offset)
-        val = Dereference(read_ptr)
-        StoreValue(write_ptr, val)
+        val = RDMEM_64(read_ptr)
+        WRMEM_64(write_ptr, val)
         i = Add(i, 1)
     }
     
@@ -791,11 +791,11 @@ SubRoutine.ProcessWithResidual {
         stash_ptr = Add(Pointers.TempBuffer, offset)
         output_ptr = Add(LayerIO.output_ptr, offset)
         
-        stashed = Dereference(stash_ptr)
-        transformed = Dereference(output_ptr)
+        stashed = RDMEM_64(stash_ptr)
+        transformed = RDMEM_64(output_ptr)
         
         new_val = Add(stashed, transformed)
-        StoreValue(output_ptr, new_val)
+        WRMEM_64(output_ptr, new_val)
         
         dim = Add(dim, 1)
     }
@@ -821,15 +821,15 @@ SubRoutine.OptimizedCopy {
         offset2 = Multiply(Add(i, 2), 8)
         offset3 = Multiply(Add(i, 3), 8)
         
-        val0 = Dereference(Add(src_ptr, offset0))
-        val1 = Dereference(Add(src_ptr, offset1))
-        val2 = Dereference(Add(src_ptr, offset2))
-        val3 = Dereference(Add(src_ptr, offset3))
+        val0 = RDMEM_64(src_ptr, offset0)
+        val1 = RDMEM_64(src_ptr, offset1)
+        val2 = RDMEM_64(src_ptr, offset2)
+        val3 = RDMEM_64(src_ptr, offset3)
         
-        StoreValue(Add(dest_ptr, offset0), val0)
-        StoreValue(Add(dest_ptr, offset1), val1)
-        StoreValue(Add(dest_ptr, offset2), val2)
-        StoreValue(Add(dest_ptr, offset3), val3)
+        WRMEM_64(dest_ptr, offset0, val0)
+        WRMEM_64(dest_ptr, offset1, val1)
+        WRMEM_64(dest_ptr, offset2, val2)
+        WRMEM_64(dest_ptr, offset3, val3)
         
         i = Add(i, 4)
     }
@@ -837,8 +837,8 @@ SubRoutine.OptimizedCopy {
     // Handle remaining elements
     WhileLoop LessThan(i, element_count) {
         offset = Multiply(i, 8)
-        val = Dereference(Add(src_ptr, offset))
-        StoreValue(Add(dest_ptr, offset), val)
+        val = RDMEM_64(src_ptr, offset)
+        WRMEM_64(dest_ptr, offset, val)
         i = Add(i, 1)
     }
 }

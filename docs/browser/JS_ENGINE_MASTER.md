@@ -35,7 +35,23 @@ HTML/CSS (layout/render)  ↔  JSBridge  ↔  JSEngine
 
 ## 2. Current scores (authoritative)
 
-### Full test262 (~49.7k)
+### Full test262, working tree (2026-11-09)
+
+Harness `/tmp/js262/test262_harness_ots3.x`, legacy, `--no-batch -j 8 --timeout 12`. JSON: `results/test262_full_2026-11-09.json`. Do not overwrite it or the Nov 6 / Nov 8 JSON files.
+
+| Metric | 2026-11-08 | **2026-11-09** |
+|--------|----------:|---------------:|
+| Pass / total | 33497 / 49723 | **35392 / 49723** |
+| pass/total | 67.4% | **71.2%** |
+| Fail | 16021 | 14133 |
+| Timeout (counted in the total) | 205 | 198 |
+| Wall | 4534.9s | 4365.8s |
+
+The runner's printed Pass% is pass/(pass+fail): 71.5% on Nov 9.
+
+90% of the 49723 tests is 44751 passes. This run is 9359 short of that bar. The Nov 9 JSON does not include the later `Object.prototype.__proto__` accessor (15/15 on `/tmp/js262/test262_harness_ots4.x`, `/tmp/js262/obj_proto_v4.json`).
+
+### Full test262 (~49.7k), August tips
 
 | Metric | M128e7d6 (2026-08-03) | **M128e7e1 (2026-08-05)** |
 |--------|----------------------:|--------------------------:|

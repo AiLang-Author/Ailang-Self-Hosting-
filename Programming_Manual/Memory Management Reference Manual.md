@@ -260,29 +260,33 @@ Arena_Reset()
 
 | Primitive | Description |
 |-----------|-------------|
-| `Dereference(ptr)` | Read 8-byte value at `ptr` |
-| `StoreValue(ptr, val)` | Write 8-byte value to `ptr` |
-| `GetByte(ptr, offset)` | Read 1 byte at `ptr + offset` |
-| `SetByte(ptr, offset, val)` | Write 1 byte at `ptr + offset` |
+| `RDMEM_64(ptr)` | Read 8-byte value at `ptr` |
+| `WRMEM_64(ptr, val)` | Write 8-byte value to `ptr` |
+| `RDMEM_8(ptr, offset)` | Read 1 byte at `ptr + offset` |
+| `WRMEM_8(ptr, offset, val)` | Write 1 byte at `ptr + offset` |
+
+Every width has a read and a write: `RDMEM_8/16/32/64`, the sign-extending `RDMEM_S8/S16/S32`, and `WRMEM_8/16/32/64`, each taking `(addr)` or `(base, offset)`. See *Memory Access Guide (RDMEM & WRMEM)* for the full set and the `_IO_` forms for device memory.
 | `MemoryCopy(dst, src, n)` | Copy `n` bytes (SSE2-vectorized) |
 | `MemorySet(ptr, val, n)` | Fill `n` bytes with `val` |
 | `MemChr(ptr, byte, n)` | Find byte in `n` bytes, returns offset or -1 (SSE2) |
 | `MemCompare(a, b, n)` | Compare `n` bytes, returns 0 if equal (SSE2) |
+| `MemMem(hay, haylen, needle, needlen)` | First offset of `needle` in `hay`, or -1 (SSE2) |
+| `MemMemFold(hay, haylen, needle, needlen)` | Same search, folding ASCII A–Z to a–z on both sides (SSE2) |
 | `AddressOf(var)` | Get address of a variable |
 
 ```ailang
 // Array element access (8-byte elements)
 offset  = Multiply(i, 8)
-element = Dereference(Add(base_ptr, offset))
+element = RDMEM_64(base_ptr, offset)
 
 // Struct-style manual layout
-StoreValue(ptr, id)              // field 0 at offset 0
-StoreValue(Add(ptr, 8), age)     // field 1 at offset 8
-StoreValue(Add(ptr, 16), score)  // field 2 at offset 16
+WRMEM_64(ptr, id)              // field 0 at offset 0
+WRMEM_64(ptr, 8, age)     // field 1 at offset 8
+WRMEM_64(ptr, 16, score)  // field 2 at offset 16
 
-id    = Dereference(ptr)
-age   = Dereference(Add(ptr, 8))
-score = Dereference(Add(ptr, 16))
+id    = RDMEM_64(ptr)
+age   = RDMEM_64(ptr, 8)
+score = RDMEM_64(ptr, 16)
 ```
 
 ---
@@ -314,7 +318,7 @@ files, between passes) rather than tracking every individual allocation.
 
 ```ailang
 IfCondition NotEqual(ptr, 0) ThenBlock: {
-    val = Dereference(ptr)
+    val = RDMEM_64(ptr)
 }
 ```
 
@@ -323,7 +327,7 @@ IfCondition NotEqual(ptr, 0) ThenBlock: {
 ```ailang
 IfCondition LessThan(index, array_size) ThenBlock: {
     offset  = Multiply(index, 8)
-    element = Dereference(Add(array_ptr, offset))
+    element = RDMEM_64(array_ptr, offset)
 }
 ```
 
@@ -369,10 +373,16 @@ One potential cache miss if the heap block is cold.
   loops are the primary memory performance bottleneck — use
   `Arena_Reset()` to amortize.
 
-### MemoryCopy / MemChr / MemCompare are SSE2-vectorized
+### MemoryCopy / MemChr / MemCompare / MemMem are SSE2-vectorized
 
 These operate in 16-byte strides. Prefer them over byte-by-byte loops
 for any buffer operation on more than a few bytes.
+
+`MemMem` returns the first byte offset of `needle`, or `-1`. A needle
+length of 0 returns 0. A haystack shorter than the needle returns `-1`.
+`MemMemFold` is the same search with ASCII A–Z folded to a–z in both
+buffers. Other bytes, including bytes at or above `0x80`, are compared
+unchanged.
 
 ---
 
@@ -415,7 +425,7 @@ SubRoutine.RingPush {
     // assumes: value is set by caller
     IfCondition LessThan(Ring.count, Ring.size) ThenBlock: {
         offset = Multiply(Ring.tail, 8)
-        StoreValue(Add(Ring.buf, offset), value)
+        WRMEM_64(Ring.buf, offset, value)
         Ring.tail  = Modulo(Add(Ring.tail, 1), Ring.size)
         Ring.count = Add(Ring.count, 1)
     }
@@ -425,7 +435,7 @@ SubRoutine.RingPop {
     // sets: value for caller
     IfCondition GreaterThan(Ring.count, 0) ThenBlock: {
         offset = Multiply(Ring.head, 8)
-        value = Dereference(Add(Ring.buf, offset))
+        value = RDMEM_64(Ring.buf, offset)
         Ring.head  = Modulo(Add(Ring.head, 1), Ring.size)
         Ring.count = Subtract(Ring.count, 1)
     }
@@ -468,7 +478,7 @@ Function.BumpAlloc {
 
 ### Segmentation fault (SIGSEGV)
 
-- Dereferencing `0` — check for null before `Dereference`
+- Dereferencing `0` — check for null before `RDMEM_64`
 - Out-of-bounds array access — check index against size
 - Use-after-free — zero the pointer after `Deallocate`
 - Wrong `Deallocate` size routed to wrong slab — verify sizes match

@@ -135,18 +135,20 @@ LibraryImport.Arena
 buf = Allocate(256)
 
 // Write data
-StoreValue(buf, 42)                    // Write 8-byte integer at offset 0
-StoreValue(Add(buf, 8), 100)           // Write at offset 8
-SetByte(buf, 0, 65)                    // Write single byte ('A')
+WRMEM_64(buf, 42)                    // Write 8-byte integer at offset 0
+WRMEM_64(buf, 8, 100)           // Write at offset 8
+WRMEM_8(buf, 0, 65)                    // Write single byte ('A')
 
 // Read data
-val = Dereference(buf)                 // Read 8-byte integer at buf
-b = GetByte(buf, 3)                    // Read single byte at offset 3
+val = RDMEM_64(buf)                 // Read 8-byte integer at buf
+b = RDMEM_8(buf, 3)                    // Read single byte at offset 3
 
 // Memory operations
 MemoryCopy(dst, src, count)            // Copy bytes
 MemorySet(buf, 0, 256)                 // Fill with zeros
 MemChr(buf, 10, len)                   // Find byte (like memchr)
+MemMem(hay, haylen, needle, needlen)   // First offset of needle, or -1
+MemMemFold(hay, haylen, needle, needlen) // Same, folding ASCII A-Z to a-z
 
 // Free
 Deallocate(buf, 256)
@@ -163,9 +165,9 @@ cmp = StringCompare(s1, s2)            // Returns 0 if equal
 
 // Build strings in buffers
 buf = Allocate(128)
-SetByte(buf, 0, 72)                    // 'H'
-SetByte(buf, 1, 105)                   // 'i'
-SetByte(buf, 2, 0)                     // null terminator
+WRMEM_8(buf, 0, 72)                    // 'H'
+WRMEM_8(buf, 1, 105)                   // 'i'
+WRMEM_8(buf, 2, 0)                     // null terminator
 ```
 
 ---
@@ -756,7 +758,7 @@ Function.RunCommand {
 
             // Build minimal environment
             envp = Allocate(8)
-            StoreValue(envp, 0)
+            WRMEM_64(envp, 0)
 
             // Replace process with target binary
             SystemCall(59, cmd_path, argv, envp, 0, 0)  // SYS_EXECVE
@@ -765,9 +767,9 @@ Function.RunCommand {
 
         // Parent process — wait for child
         status_buf = Allocate(8)
-        StoreValue(status_buf, 0)
+        WRMEM_64(status_buf, 0)
         SystemCall(61, pid, status_buf, 0, 0, 0)   // SYS_WAIT4
-        wstatus = Dereference(status_buf)
+        wstatus = RDMEM_64(status_buf)
         exit_code = BitwiseAnd(Divide(wstatus, 256), 255)
         Deallocate(status_buf, 8)
         ReturnValue(exit_code)
@@ -780,10 +782,10 @@ Function.RunCommand {
 ```ailang
 // Example: ls -la /tmp
 argv = Allocate(32)                    // 4 pointers x 8 bytes
-StoreValue(Add(argv, 0),  "/bin/ls")
-StoreValue(Add(argv, 8),  "-la")
-StoreValue(Add(argv, 16), "/tmp")
-StoreValue(Add(argv, 24), 0)          // NULL terminator
+WRMEM_64(argv, 0, "/bin/ls")
+WRMEM_64(argv, 8, "-la")
+WRMEM_64(argv, 16, "/tmp")
+WRMEM_64(argv, 24, 0)          // NULL terminator
 rc = RunCommand("/bin/ls", argv)
 Deallocate(argv, 32)
 ```
@@ -806,7 +808,7 @@ Function.StartDaemon {
             }
             SystemCall(112)                     // SYS_SETSID
             envp = Allocate(8)
-            StoreValue(envp, 0)
+            WRMEM_64(envp, 0)
             SystemCall(59, cmd_path, argv, envp, 0, 0)
             SystemCall(60, 127)
         }

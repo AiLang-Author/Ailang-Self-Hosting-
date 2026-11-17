@@ -1,0 +1,849 @@
+// Library.JSBridgePart7.ailang — JSBridge functions
+// Moved out of Library.JSBridge.ailang. Pools stay in the parent.
+// Split from the JS engine so one function fits in context.
+// FixedPools stay in the parent library. Function names are unchanged
+// except for the new helpers this split adds.
+//
+// Copyright (c) 2026 Sean Collins, 2 Paws Machine and Engineering. SCSL.
+
+
+// =============================================================================
+// HELPER — get DOM index from arg buffer slot
+// Dereferences the pointer at args+offset to get the JSValue, then extracts idx
+// =============================================================================
+Function.JSBridge__GetArgDomIdx {
+    Input: args: Address
+    Input: offset: Integer
+    Output: Integer
+    Body: {
+        arg_val = RDMEM_64(args, offset)
+        ReturnValue(JSBridge__GetDomIdx(arg_val))
+    }
+}
+
+
+// =============================================================================
+// SET_PROP INTERCEPT — called by JSVM on SET_PROP to handle DOM mutations
+// If the object has __dom_idx and the property is innerHTML/textContent,
+// updates the actual DOM text node. Returns 1 if intercepted, 0 if not.
+// =============================================================================
+Function.JSBridge_SetProp {
+    Input: obj: Address
+    Input: prop: Address
+    Input: val: Address
+    Output: Integer
+    Body: {
+        // Store all inputs in FixedPool — locals get clobbered by every function call
+        JSBridgeTmp.obj = obj
+        JSBridgeTmp.name_ptr = prop
+        JSBridgeTmp.val = val
+
+        // Check for __dom_idx on the object
+        JSBridgeTmp.dom_idx = JSBridge__GetDomIdx(JSBridgeTmp.obj)
+        IfCondition LessThan(JSBridgeTmp.dom_idx, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Check if property is "innerHTML" or "textContent" by byte inspection
+        p0 = RDMEM_8(JSBridgeTmp.name_ptr, 0)
+
+        // "innerHTML" starts with 'i' = 105, check 'n' at 1 and 'H' at 5
+        JSBridgeTmp.found = 0
+        IfCondition EqualTo(p0, 105) ThenBlock: {
+            p1 = RDMEM_8(JSBridgeTmp.name_ptr, 1)
+            IfCondition EqualTo(p1, 110) ThenBlock: {
+                p5 = RDMEM_8(JSBridgeTmp.name_ptr, 5)
+                IfCondition EqualTo(p5, 72) ThenBlock: {
+                    JSBridgeTmp.found = 1
+                }
+            }
+        }
+
+        // "textContent" starts with 't' = 116, check 'e' at 1 and 'C' at 4
+        IfCondition EqualTo(p0, 116) ThenBlock: {
+            p1 = RDMEM_8(JSBridgeTmp.name_ptr, 1)
+            IfCondition EqualTo(p1, 101) ThenBlock: {
+                p4 = RDMEM_8(JSBridgeTmp.name_ptr, 4)
+                IfCondition EqualTo(p4, 67) ThenBlock: {
+                    JSBridgeTmp.found = 1
+                }
+            }
+        }
+
+        IfCondition EqualTo(JSBridgeTmp.found, 0) ThenBlock: {
+            ReturnValue(0)
+        }
+
+        // Convert value to string
+        JSBridgeTmp.result = JSRT_ToString(JSBridgeTmp.val)
+        IfCondition EqualTo(JSBridgeTmp.result, 0) ThenBlock: {
+            ReturnValue(1)
+        }
+
+        // M31a: flatten UTF-16 JS string to C for DOM
+        JSBridgeTmp.ptr = JSRT_GetPayload(JSBridgeTmp.result)
+        IfCondition EqualTo(JSBridgeTmp.ptr, 0) ThenBlock: {
+            JSBridgeTmp.len = 0
+        } ElseBlock: {
+            JSBridgeTmp.len = JSRT_StrLen(JSBridgeTmp.ptr)
+            JSBridgeTmp.ptr = JSRT_StrToC(JSBridgeTmp.ptr)
+        }
+
+        // DOM_SetTextContent copies into stable Allocate() storage and replaces
+        // children. The old path stored a pointer into JS str_slab/val_pool which
+        // is reclaimed — e2e then saw stale/empty text after innerHTML assign.
+        DOM_SetTextContent(JSBridgeTmp.dom_idx, JSBridgeTmp.ptr, JSBridgeTmp.len)
+
+        // Mirror onto the wrapper so el.innerHTML reads match
+        JSRT_ObjSet(JSBridgeTmp.obj, JSBridgeTmp.name_ptr, JSBridgeTmp.result)
+
+        ReturnValue(1)
+    }
+}
+
+
+// =============================================================================
+// REGEXP CONSTRUCTOR — new RegExp(pattern, flags)
+// Creates a regexp object with compiled NFA handle and instance methods.
+// =============================================================================
+// 1 if the JS string header has a code unit above 255.
+Function.JSBridge__StrHasHi {
+    Input: s: Address
+    Output: Integer
+    Body: {
+        JSBridgeTmp.ptr = s
+        JSBridgeTmp.count = 0
+        JSBridgeTmp.len = JSRT_StrLen(JSBridgeTmp.ptr)
+        WhileLoop LessThan(JSBridgeTmp.count, JSBridgeTmp.len) {
+            JSBridgeTmp.type = JSRT_StrUnit(JSBridgeTmp.ptr, JSBridgeTmp.count)
+            IfCondition GreaterThan(JSBridgeTmp.type, 255) ThenBlock: {
+                JSBridgeTmp.ptr = 0
+                JSBridgeTmp.count = 0
+                JSBridgeTmp.len = 0
+                JSBridgeTmp.type = 0
+                ReturnValue(1)
+            }
+            JSBridgeTmp.count = Add(JSBridgeTmp.count, 1)
+        }
+        JSBridgeTmp.ptr = 0
+        JSBridgeTmp.count = 0
+        JSBridgeTmp.len = 0
+        JSBridgeTmp.type = 0
+        ReturnValue(0)
+    }
+}
+
+Function.JSBridge__NRegExpCtor {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        save_args = args
+        save_argc = argc
+
+        // ─── Extract pattern string (arg0, default "") ───
+        // A regexp argument contributes its source, not ToString ("/src/").
+        pat_ptr = 0
+        pat_len = 0
+        copied_re = 0
+        JSBridgeTmp.cb_val = 0
+        JSBridgeTmp.ptr = 0
+        JSBridgeTmp.found = 0
+        JSBridgeTmp.len = 0
+        IfCondition GreaterThan(save_argc, 0) ThenBlock: {
+            arg0 = RDMEM_64(save_args)
+            a0_type = JSRT_GetType(arg0)
+            IfCondition EqualTo(a0_type, JSType.STRING) ThenBlock: {
+                arg0 = RDMEM_64(save_args)
+                JSBridgeTmp.cb_val = arg0
+                JSBridge__Push(save_args)
+                JSBridgeTmp.count = JSBridge__StrHasHi(JSRT_GetPayload(JSBridgeTmp.cb_val))
+                save_args = JSBridge__Pop()
+                IfCondition EqualTo(JSBridgeTmp.count, 1) ThenBlock: {
+                    pat_ptr = JSRT_GetPayload(JSBridgeTmp.cb_val)
+                    pat_len = JSRT_StrLen(pat_ptr)
+                } ElseBlock: {
+                    JSBridgeTmp.cb_val = 0
+                    arg0 = RDMEM_64(save_args)
+                    pat_ptr = JSRT_StrToC(JSRT_GetPayload(arg0))
+                    pat_len = 0
+                    IfCondition NotEqual(pat_ptr, 0) ThenBlock: { pat_len = StringLength(pat_ptr) }
+                }
+                JSBridgeTmp.count = 0
+            }
+            IfCondition NotEqual(a0_type, JSType.STRING) ThenBlock: {
+                IfCondition NotEqual(a0_type, JSType.UNDEFINED) ThenBlock: {
+                    IfCondition EqualTo(a0_type, JSType.OBJECT) ThenBlock: {
+                        arg0 = RDMEM_64(save_args)
+                        JSBridge__Push(save_args)
+                        cls = JSRT_ObjGet(arg0, "__class__")
+                        save_args = JSBridge__Pop()
+                        JSBridge__Push(save_args)
+                        JSBridge__Push(cls)
+                        ct_cls = JSRT_GetType(cls)
+                        cls = JSBridge__Pop()
+                        save_args = JSBridge__Pop()
+                        IfCondition EqualTo(ct_cls, JSType.STRING) ThenBlock: {
+                            cp = JSRT_GetPayload(cls)
+                            IfCondition EqualTo(JSRT_StrEq(cp, "RegExp"), 1) ThenBlock: {
+                                copied_re = 1
+                            }
+                        }
+                        IfCondition EqualTo(copied_re, 0) ThenBlock: {
+                            arg0 = RDMEM_64(save_args)
+                            JSBridge__Push(save_args)
+                            rh = JSRT_ObjGet(arg0, "__regex_handle__")
+                            save_args = JSBridge__Pop()
+                            IfCondition EqualTo(JSRT_GetType(rh), JSType.NUMBER) ThenBlock: {
+                                copied_re = 1
+                            }
+                        }
+                    }
+                    IfCondition EqualTo(copied_re, 1) ThenBlock: {
+                        arg0 = RDMEM_64(save_args)
+                        JSBridge__Push(save_args)
+                        s_val = JSRT_ObjGet(arg0, "source")
+                        save_args = JSBridge__Pop()
+                        IfCondition EqualTo(JSRT_GetType(s_val), JSType.STRING) ThenBlock: {
+                            pat_ptr = JSRT_StrToC(JSRT_GetPayload(s_val))
+                            pat_len = 0
+                            IfCondition NotEqual(pat_ptr, 0) ThenBlock: { pat_len = StringLength(pat_ptr) }
+                        }
+                    }
+                    IfCondition EqualTo(copied_re, 0) ThenBlock: {
+                        arg0 = RDMEM_64(save_args)
+                        JSBridgeTmp.obj = arg0
+                        JSBridge__Push(save_args)
+                        JSBridgeTmp.val = JSRT_ToString(JSBridgeTmp.obj)
+                        save_args = JSBridge__Pop()
+                        // Pattern ToString throw must win over flag SyntaxError.
+                        IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: {
+                            ReturnValue(JSRT_Undefined())
+                        }
+                        IfCondition EqualTo(JSBridgeTmp.val, 0) ThenBlock: {
+                            ReturnValue(JSRT_Undefined())
+                        }
+                        pat_ptr = JSRT_StrToC(JSRT_GetPayload(JSBridgeTmp.val))
+                        pat_len = 0
+                        IfCondition NotEqual(pat_ptr, 0) ThenBlock: { pat_len = StringLength(pat_ptr) }
+                    }
+                }
+            }
+        }
+
+        // ─── Extract flags string (arg1, default "") ───
+        // No flags argument: copy them from a regexp pattern. source already copied.
+        flg_ptr = 0
+        flg_len = 0
+        IfCondition And(EqualTo(copied_re, 1), LessThan(save_argc, 2)) ThenBlock: {
+            arg0 = RDMEM_64(save_args)
+            JSBridge__Push(save_args)
+            JSBridge__Push(pat_ptr)
+            f_val = JSRT_ObjGet(arg0, "flags")
+            pat_ptr = JSBridge__Pop()
+            save_args = JSBridge__Pop()
+            IfCondition EqualTo(JSRT_GetType(f_val), JSType.STRING) ThenBlock: {
+                flg_ptr = JSRT_StrToC(JSRT_GetPayload(f_val))
+                flg_len = 0
+                IfCondition NotEqual(flg_ptr, 0) ThenBlock: { flg_len = StringLength(flg_ptr) }
+            }
+        }
+        IfCondition GreaterThan(save_argc, 1) ThenBlock: {
+            arg1 = RDMEM_64(save_args, 8)
+            a1_type = JSRT_GetType(arg1)
+            IfCondition EqualTo(a1_type, JSType.STRING) ThenBlock: {
+                flg_ptr = JSRT_StrToC(JSRT_GetPayload(arg1))
+                flg_len = 0
+                IfCondition NotEqual(flg_ptr, 0) ThenBlock: { flg_len = StringLength(flg_ptr) }
+            }
+            IfCondition NotEqual(a1_type, JSType.STRING) ThenBlock: {
+                IfCondition NotEqual(a1_type, JSType.UNDEFINED) ThenBlock: {
+                    JSBridge__Push(save_args)
+                    f_val = JSRT_ToString(arg1)
+                    save_args = JSBridge__Pop()
+                    flg_ptr = JSRT_StrToC(JSRT_GetPayload(f_val))
+                    flg_len = 0
+                    IfCondition NotEqual(flg_ptr, 0) ThenBlock: { flg_len = StringLength(flg_ptr) }
+                }
+            }
+        }
+
+        // ─── Parse flags string → bitfield ───
+        // g=32, i=1, m=2, s=4, y=64, u=16, v=128 (UNICODE_SETS), d=hasIndices
+        flags_int = 0
+        has_global = 0
+        has_icase = 0
+        has_mline = 0
+        has_dotall = 0
+        has_sticky = 0
+        has_unicode = 0
+        has_unicode_sets = 0
+        has_indices = 0
+        seen_f = 0
+        bad_f = 0
+        fi = 0
+        WhileLoop LessThan(fi, flg_len) {
+            fc = RDMEM_8(flg_ptr, fi)
+            matched = 0
+            // 'g' = 103
+            IfCondition EqualTo(fc, 103) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(seen_f, 1), 0) ThenBlock: { bad_f = 1 }
+                seen_f = BitwiseOr(seen_f, 1)
+                flags_int = BitwiseOr(flags_int, 32)
+                has_global = 1
+                matched = 1
+            }
+            // 'i' = 105
+            IfCondition EqualTo(fc, 105) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(seen_f, 2), 0) ThenBlock: { bad_f = 1 }
+                seen_f = BitwiseOr(seen_f, 2)
+                flags_int = BitwiseOr(flags_int, 1)
+                has_icase = 1
+                matched = 1
+            }
+            // 'm' = 109
+            IfCondition EqualTo(fc, 109) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(seen_f, 4), 0) ThenBlock: { bad_f = 1 }
+                seen_f = BitwiseOr(seen_f, 4)
+                flags_int = BitwiseOr(flags_int, 2)
+                has_mline = 1
+                matched = 1
+            }
+            // 's' = 115
+            IfCondition EqualTo(fc, 115) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(seen_f, 8), 0) ThenBlock: { bad_f = 1 }
+                seen_f = BitwiseOr(seen_f, 8)
+                flags_int = BitwiseOr(flags_int, 4)
+                has_dotall = 1
+                matched = 1
+            }
+            // 'u' = 117
+            IfCondition EqualTo(fc, 117) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(seen_f, 16), 0) ThenBlock: { bad_f = 1 }
+                seen_f = BitwiseOr(seen_f, 16)
+                flags_int = BitwiseOr(flags_int, 16)
+                has_unicode = 1
+                matched = 1
+            }
+            // 'y' = 121
+            IfCondition EqualTo(fc, 121) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(seen_f, 32), 0) ThenBlock: { bad_f = 1 }
+                seen_f = BitwiseOr(seen_f, 32)
+                flags_int = BitwiseOr(flags_int, 64)
+                has_sticky = 1
+                matched = 1
+            }
+            // 'v' = 118 unicodeSets
+            IfCondition EqualTo(fc, 118) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(seen_f, 64), 0) ThenBlock: { bad_f = 1 }
+                seen_f = BitwiseOr(seen_f, 64)
+                flags_int = BitwiseOr(flags_int, 128)
+                has_unicode_sets = 1
+                matched = 1
+            }
+            // 'd' = 100 hasIndices
+            IfCondition EqualTo(fc, 100) ThenBlock: {
+                IfCondition NotEqual(BitwiseAnd(seen_f, 128), 0) ThenBlock: { bad_f = 1 }
+                seen_f = BitwiseOr(seen_f, 128)
+                has_indices = 1
+                matched = 1
+            }
+            IfCondition EqualTo(matched, 0) ThenBlock: { bad_f = 1 }
+            fi = Add(fi, 1)
+        }
+        IfCondition EqualTo(bad_f, 1) ThenBlock: {
+            terr = JSVM_CreateTypedError("SyntaxError", "Invalid regular expression flags")
+            JSVMCall.exc_prop = 1
+            JSVM_ThrowValue(terr)
+            ReturnValue(JSRT_Undefined())
+        }
+        // u+v is SyntaxError (Compile also rejects)
+        IfCondition And(EqualTo(has_unicode, 1), EqualTo(has_unicode_sets, 1)) ThenBlock: {
+            terr = JSVM_CreateTypedError("SyntaxError", "Invalid regular expression flags")
+            JSVMCall.exc_prop = 1
+            JSVM_ThrowValue(terr)
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // ─── Compile regex ───
+        rx_handle = 0
+        JSBridgeTmp.found = 0
+        IfCondition NotEqual(pat_ptr, 0) ThenBlock: {
+            JSBridgeTmp.found = 1
+            JSBridgeTmp.ptr = pat_ptr
+            JSBridgeTmp.len = pat_len
+            JSBridge__Push(JSBridgeTmp.cb_val)
+            rx_handle = JSRegex_Compile(JSBridgeTmp.ptr, flags_int)
+            JSBridgeTmp.cb_val = JSBridge__Pop()
+        }
+        IfCondition EqualTo(JSBridgeTmp.found, 0) ThenBlock: {
+            // Empty pattern — matches everything
+            rx_handle = JSRegex_Compile("", flags_int)
+        }
+        // M30i: invalid pattern → SyntaxError
+        IfCondition EqualTo(rx_handle, 0) ThenBlock: {
+            terr = JSVM_CreateTypedError("SyntaxError", "Invalid regular expression")
+            JSVMCall.exc_prop = 1
+            JSVM_ThrowValue(terr)
+            JSBridgeTmp.cb_val = 0
+            JSBridgeTmp.ptr = 0
+            JSBridgeTmp.found = 0
+            JSBridgeTmp.len = 0
+            ReturnValue(JSRT_Undefined())
+        }
+
+        // ─── Create RegExp object ───
+        re_obj = JSRT_CreateObject()
+
+        // __class__ = "RegExp"
+        JSBridge__Push(re_obj)
+        cls_val = JSRT_CreateString("RegExp")
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "__class__", cls_val)
+
+        // source = pattern string. A non-Latin-1 pattern keeps the original
+        // JS string; CreateStringLen would read a JS header as bytes.
+        JSBridge__Push(re_obj)
+        IfCondition EqualTo(JSBridgeTmp.cb_val, 0) ThenBlock: {
+            IfCondition NotEqual(JSBridgeTmp.ptr, 0) ThenBlock: {
+                JSBridgeTmp.cb_val = JSRT_CreateStringLen(JSBridgeTmp.ptr, JSBridgeTmp.len)
+            }
+            IfCondition EqualTo(JSBridgeTmp.ptr, 0) ThenBlock: {
+                JSBridgeTmp.cb_val = JSRT_CreateString("(?:)")
+            }
+        }
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "source", JSBridgeTmp.cb_val)
+
+        // flags = flags string
+        JSBridge__Push(re_obj)
+        IfCondition NotEqual(flg_ptr, 0) ThenBlock: {
+            flg_val = JSRT_CreateStringLen(flg_ptr, flg_len)
+        }
+        IfCondition EqualTo(flg_ptr, 0) ThenBlock: {
+            flg_val = JSRT_CreateString("")
+        }
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "flags", flg_val)
+
+        // __regex_handle__ = raw handle (stored as float bits to avoid Float_FromInt)
+        JSBridge__Push(re_obj)
+        rh_val = JSRT_CreateFloat(rx_handle)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "__regex_handle__", rh_val)
+
+        // global, ignoreCase, multiline boolean properties
+        JSBridge__Push(re_obj)
+        g_val = JSRT_CreateBool(has_global)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "global", g_val)
+
+        JSBridge__Push(re_obj)
+        ic_val = JSRT_CreateBool(has_icase)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "ignoreCase", ic_val)
+
+        JSBridge__Push(re_obj)
+        ml_val = JSRT_CreateBool(has_mline)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "multiline", ml_val)
+
+        JSBridge__Push(re_obj)
+        ds_val = JSRT_CreateBool(has_dotall)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "dotAll", ds_val)
+
+        JSBridge__Push(re_obj)
+        st_val = JSRT_CreateBool(has_sticky)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "sticky", st_val)
+        JSBridge__Push(re_obj)
+        uc_val = JSRT_CreateBool(has_unicode)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "unicode", uc_val)
+        JSBridge__Push(re_obj)
+        us_val = JSRT_CreateBool(has_unicode_sets)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "unicodeSets", us_val)
+        JSBridge__Push(re_obj)
+        hi_val = JSRT_CreateBool(has_indices)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "hasIndices", hi_val)
+
+        // lastIndex = 0
+        JSBridge__Push(re_obj)
+        li_val = JSRT_CreateNumber(0)
+        re_obj = JSBridge__Pop()
+        JSRT_ObjSet(re_obj, "lastIndex", li_val)
+        // Own data copies of the prototype accessors. Not enumerable, or
+        // for-in and defineProperties(Properties=regexp) treat them as descs.
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "source", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "flags", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "global", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "ignoreCase", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "multiline", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "dotAll", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "sticky", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "unicode", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "unicodeSets", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "hasIndices", 5)
+        re_obj = JSBridge__Pop()
+        JSBridge__Push(re_obj)
+        JSBridge__SetAttrBits(re_obj, "lastIndex", 1)
+        re_obj = JSBridge__Pop()
+
+        // Subclass new.target.prototype, otherwise RegExp.prototype.
+        // compile brands on this identity, so a subclass must not be rewritten
+        // back to the builtin prototype.
+        JSBridge__Push(re_obj)
+        JSBridgeTmp.ptr = JSBridgeState.regexp_proto
+        JSBridgeTmp.name_ptr = JSVM__GetGlobal("__new_target__")
+        IfCondition EqualTo(JSRT_GetType(JSBridgeTmp.name_ptr), JSType.FUNCTION) ThenBlock: {
+            JSBridgeTmp.val2 = JSVM__GetGlobal("RegExp")
+            IfCondition EqualTo(JSRT_SameRef(JSBridgeTmp.name_ptr, JSBridgeTmp.val2), 0) ThenBlock: {
+                JSBridge__Push(JSBridgeTmp.ptr)
+                JSBridgeTmp.val2 = JSRT_ObjGet(JSBridgeTmp.name_ptr, "prototype")
+                JSBridgeTmp.ptr = JSBridge__Pop()
+                pt = JSRT_GetType(JSBridgeTmp.val2)
+                IfCondition Or(EqualTo(pt, JSType.OBJECT), Or(EqualTo(pt, JSType.FUNCTION), EqualTo(pt, JSType.ARRAY))) ThenBlock: {
+                    JSBridgeTmp.ptr = JSBridgeTmp.val2
+                }
+            }
+        }
+        re_obj = JSBridge__Pop()
+        IfCondition NotEqual(JSBridgeTmp.ptr, 0) ThenBlock: {
+            JSBridge__Push(re_obj)
+            JSRT_ObjSet(re_obj, "__proto__", JSBridgeTmp.ptr)
+            re_obj = JSBridge__Pop()
+        }
+        JSBridgeTmp.ptr = 0
+        JSBridgeTmp.val2 = 0
+        JSBridgeTmp.cb_val = 0
+        JSBridgeTmp.name_ptr = 0
+        JSBridgeTmp.found = 0
+        JSBridgeTmp.len = 0
+
+        ReturnValue(re_obj)
+    }
+}
+
+
+// Copy one own data property. dst and src stay in JSBridgeTmp.obj / .val.
+Function.JSBridge__CopyOwn {
+    Input: key: Address
+    Output: Integer
+    Body: {
+        JSBridgeTmp.name_ptr = key
+        v = JSRT_ObjGet(JSBridgeTmp.val, JSBridgeTmp.name_ptr)
+        JSBridgeTmp.val2 = v
+        JSRT_ObjSet(JSBridgeTmp.obj, JSBridgeTmp.name_ptr, JSBridgeTmp.val2)
+        JSBridge__SetAttrBits(JSBridgeTmp.obj, JSBridgeTmp.name_ptr, 5)
+        JSBridgeTmp.name_ptr = 0
+        JSBridgeTmp.val2 = 0
+        ReturnValue(1)
+    }
+}
+
+
+// Annex B B.2.5.1 RegExp.prototype.compile(pattern, flags).
+// Reinitializes [[OriginalSource]] / [[OriginalFlags]] / matcher, then
+// strict-sets lastIndex to 0. A non-writable lastIndex throws after the
+// source and flags are already updated.
+Function.JSBridge__NRegExpCompile {
+    Input: args: Address
+    Input: argc: Integer
+    Output: Address
+    Body: {
+        JSBridgeTmp.addr = args
+        JSBridgeTmp.idx = argc
+        JSBridgeTmp.obj = JSVM__GetGlobal("this")
+        tt = JSRT_GetType(JSBridgeTmp.obj)
+        ok = 0
+        IfCondition EqualTo(tt, JSType.OBJECT) ThenBlock: {
+            rh = JSRT_ObjGet(JSBridgeTmp.obj, "__regex_handle__")
+            IfCondition EqualTo(JSRT_GetType(rh), JSType.NUMBER) ThenBlock: {
+                ok = 1
+            }
+        }
+        IfCondition EqualTo(ok, 0) ThenBlock: {
+            terr = JSVM_CreateTypedError("TypeError", "RegExp.prototype.compile called on incompatible receiver")
+            JSVM__SetGlobal("__pend_exc__", terr)
+            JSVMCall.exc_prop = 1
+            JSVMCall.thrown_val = terr
+            JSVM_ThrowValue(terr)
+            JSBridgeTmp.obj = 0
+            JSBridgeTmp.addr = 0
+            ReturnValue(JSRT_Undefined())
+        }
+        // Builtin RegExp.prototype only. A subclass or another realm's
+        // prototype is an incompatible receiver.
+        JSBridge__Push(JSBridgeTmp.obj)
+        JSBridgeTmp.val2 = JSRT_ObjGet(JSBridgeTmp.obj, "__proto__")
+        JSBridgeTmp.obj = JSBridge__Pop()
+        IfCondition EqualTo(JSRT_SameRef(JSBridgeTmp.val2, JSBridgeState.regexp_proto), 0) ThenBlock: {
+            terr = JSVM_CreateTypedError("TypeError", "RegExp.prototype.compile called on incompatible receiver")
+            JSVM__SetGlobal("__pend_exc__", terr)
+            JSVMCall.exc_prop = 1
+            JSVMCall.thrown_val = terr
+            JSVM_ThrowValue(terr)
+            JSBridgeTmp.obj = 0
+            JSBridgeTmp.val2 = 0
+            JSBridgeTmp.addr = 0
+            ReturnValue(JSRT_Undefined())
+        }
+        is_re = 0
+        IfCondition GreaterThan(JSBridgeTmp.idx, 0) ThenBlock: {
+            JSBridgeTmp.val = RDMEM_64(JSBridgeTmp.addr)
+            IfCondition EqualTo(JSRT_GetType(JSBridgeTmp.val), JSType.OBJECT) ThenBlock: {
+                rh = JSRT_ObjGet(JSBridgeTmp.val, "__regex_handle__")
+                IfCondition EqualTo(JSRT_GetType(rh), JSType.NUMBER) ThenBlock: {
+                    is_re = 1
+                }
+            }
+        }
+        IfCondition EqualTo(is_re, 1) ThenBlock: {
+            IfCondition GreaterThan(JSBridgeTmp.idx, 1) ThenBlock: {
+                JSBridgeTmp.val2 = RDMEM_64(JSBridgeTmp.addr, 8)
+                ft = JSRT_GetType(JSBridgeTmp.val2)
+                IfCondition NotEqual(ft, JSType.UNDEFINED) ThenBlock: {
+                    terr = JSVM_CreateTypedError("TypeError", "Cannot supply flags when compiling one RegExp from another")
+                    JSVM__SetGlobal("__pend_exc__", terr)
+                    JSVMCall.exc_prop = 1
+                    JSVMCall.thrown_val = terr
+                    JSVM_ThrowValue(terr)
+                    JSBridgeTmp.obj = 0
+                    JSBridgeTmp.val = 0
+                    JSBridgeTmp.val2 = 0
+                    JSBridgeTmp.addr = 0
+                    ReturnValue(JSRT_Undefined())
+                }
+            }
+        }
+        IfCondition EqualTo(is_re, 1) ThenBlock: { JSBridgeTmp.idx = 1 }
+        // undefined pattern is the empty string. argc 0 would store source
+        // "(?:)" while new RegExp("") stores "".
+        need_empty = 0
+        IfCondition EqualTo(is_re, 0) ThenBlock: {
+            IfCondition EqualTo(JSBridgeTmp.idx, 0) ThenBlock: { need_empty = 1 }
+            IfCondition GreaterThan(JSBridgeTmp.idx, 0) ThenBlock: {
+                JSBridgeTmp.val = RDMEM_64(JSBridgeTmp.addr)
+                IfCondition EqualTo(JSRT_GetType(JSBridgeTmp.val), JSType.UNDEFINED) ThenBlock: {
+                    need_empty = 1
+                }
+            }
+        }
+        IfCondition EqualTo(need_empty, 1) ThenBlock: {
+            has_f = 0
+            IfCondition GreaterThan(JSBridgeTmp.idx, 1) ThenBlock: {
+                JSBridgeTmp.cb_val = RDMEM_64(JSBridgeTmp.addr, 8)
+                has_f = 1
+            }
+            JSBridgeTmp.val2 = JSRT_CreateString("")
+            WRMEM_64(JSVMCallBuf.buf, JSBridgeTmp.val2)
+            IfCondition EqualTo(has_f, 1) ThenBlock: {
+                WRMEM_64(JSVMCallBuf.buf, 8, JSBridgeTmp.cb_val)
+                JSBridgeTmp.idx = 2
+            } ElseBlock: {
+                JSBridgeTmp.idx = 1
+            }
+            JSBridgeTmp.addr = JSVMCallBuf.buf
+        }
+        JSBridge__Push(JSBridgeTmp.obj)
+        fresh = JSBridge__NRegExpCtor(JSBridgeTmp.addr, JSBridgeTmp.idx)
+        JSBridgeTmp.val = fresh
+        JSBridgeTmp.obj = JSBridge__Pop()
+        IfCondition EqualTo(JSVMState.throw_delivered, 1) ThenBlock: {
+            JSBridgeTmp.obj = 0
+            JSBridgeTmp.val = 0
+            JSBridgeTmp.addr = 0
+            ReturnValue(JSRT_Undefined())
+        }
+        IfCondition EqualTo(JSVMCall.exc_prop, 1) ThenBlock: {
+            JSBridgeTmp.obj = 0
+            JSBridgeTmp.val = 0
+            JSBridgeTmp.addr = 0
+            ReturnValue(JSRT_Undefined())
+        }
+        JSBridge__CopyOwn("source")
+        JSBridge__CopyOwn("flags")
+        JSBridge__CopyOwn("global")
+        JSBridge__CopyOwn("ignoreCase")
+        JSBridge__CopyOwn("multiline")
+        JSBridge__CopyOwn("dotAll")
+        JSBridge__CopyOwn("sticky")
+        JSBridge__CopyOwn("unicode")
+        JSBridge__CopyOwn("unicodeSets")
+        JSBridge__CopyOwn("hasIndices")
+        JSBridge__CopyOwn("__regex_handle__")
+        JSBridge__CopyOwn("__class__")
+        can = JSBridge_CanAssign(JSBridgeTmp.obj, "lastIndex")
+        IfCondition EqualTo(can, 0) ThenBlock: {
+            terr = JSVM_CreateTypedError("TypeError", "Cannot assign to read only property 'lastIndex'")
+            JSVM__SetGlobal("__pend_exc__", terr)
+            JSVMCall.exc_prop = 1
+            JSVMCall.thrown_val = terr
+            JSVM_ThrowValue(terr)
+            JSBridgeTmp.obj = 0
+            JSBridgeTmp.val = 0
+            JSBridgeTmp.addr = 0
+            ReturnValue(JSRT_Undefined())
+        }
+        JSBridgeTmp.val2 = JSRT_CreateNumber(0)
+        JSRT_ObjSet(JSBridgeTmp.obj, "lastIndex", JSBridgeTmp.val2)
+        JSBridge__SetAttrBits(JSBridgeTmp.obj, "lastIndex", 1)
+        ret = JSBridgeTmp.obj
+        JSBridgeTmp.obj = 0
+        JSBridgeTmp.val = 0
+        JSBridgeTmp.val2 = 0
+        JSBridgeTmp.addr = 0
+        JSBridgeTmp.idx = 0
+        ReturnValue(ret)
+    }
+}
+
+
+// M62: SameValueZero index of key in Map pairs array [[k,v],...]
+Function.JSBridge__MapFindIndex {
+    Input: pairs: Address
+    Input: key: Address
+    Output: Integer
+    Body: {
+        save_p = pairs
+        save_k = key
+        IfCondition NotEqual(JSRT_GetType(save_p), JSType.ARRAY) ThenBlock: {
+            ReturnValue(-1)
+        }
+        i = 0
+        n = JSRT_ArrLen(save_p)
+        WhileLoop LessThan(i, n) {
+            ent = JSRT_ArrGet(save_p, i)
+            IfCondition EqualTo(JSRT_GetType(ent), JSType.ARRAY) ThenBlock: {
+                IfCondition GreaterThan(JSRT_ArrLen(ent), 0) ThenBlock: {
+                    ek = JSRT_ArrGet(ent, 0)
+                    IfCondition EqualTo(JSBridge__SameValueZero(ek, save_k), 1) ThenBlock: {
+                        ReturnValue(i)
+                    }
+                }
+            }
+            i = Add(i, 1)
+        }
+        ReturnValue(-1)
+    }
+}
+
+
+// M62: SameValueZero index in Set values array
+Function.JSBridge__SetFindIndex {
+    Input: vals: Address
+    Input: key: Address
+    Output: Integer
+    Body: {
+        save_p = vals
+        save_k = key
+        IfCondition NotEqual(JSRT_GetType(save_p), JSType.ARRAY) ThenBlock: {
+            ReturnValue(-1)
+        }
+        i = 0
+        n = JSRT_ArrLen(save_p)
+        WhileLoop LessThan(i, n) {
+            ek = JSRT_ArrGet(save_p, i)
+            // skip tombstones
+            is_tomb = 0
+            IfCondition EqualTo(JSRT_GetType(ek), JSType.OBJECT) ThenBlock: {
+                IfCondition EqualTo(JSRT_ObjHas(ek, "__tomb__"), 1) ThenBlock: {
+                    is_tomb = 1
+                }
+            }
+            IfCondition EqualTo(is_tomb, 1) ThenBlock: {
+                i = Add(i, 1)
+            } ElseBlock: {
+                IfCondition EqualTo(JSBridge__SameValueZero(ek, save_k), 1) ThenBlock: {
+                    ReturnValue(i)
+                }
+                i = Add(i, 1)
+            }
+        }
+        ReturnValue(-1)
+    }
+}
+
+
+// SameValueZero (NaN===NaN, +0===-0)
+Function.JSBridge__SameValueZero {
+    Input: a: Address
+    Input: b: Address
+    Output: Integer
+    Body: {
+        save_a = a
+        save_b = b
+        IfCondition EqualTo(save_a, save_b) ThenBlock: {
+            ReturnValue(1)
+        }
+        ta = JSRT_GetType(save_a)
+        tb = JSRT_GetType(save_b)
+        IfCondition NotEqual(ta, tb) ThenBlock: {
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(ta, JSType.NUMBER) ThenBlock: {
+            pa = JSRT_GetPayload(save_a)
+            pb = JSRT_GetPayload(save_b)
+            IfCondition EqualTo(pa, pb) ThenBlock: {
+                ReturnValue(1)
+            }
+            // Engine NaN bit pattern (JSVM NaN global)
+            nan_bits = 9221120237041090560
+            IfCondition And(EqualTo(pa, nan_bits), EqualTo(pb, nan_bits)) ThenBlock: {
+                ReturnValue(1)
+            }
+            // +0 / -0
+            IfCondition And(EqualTo(Float_ToInt(pa), 0), EqualTo(Float_ToInt(pb), 0)) ThenBlock: {
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(ta, JSType.STRING) ThenBlock: {
+            sa = JSRT_GetPayload(save_a)
+            sb = JSRT_GetPayload(save_b)
+            IfCondition EqualTo(JSRT_StrEq(sa, sb), 1) ThenBlock: {
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(ta, JSType.BOOLEAN) ThenBlock: {
+            IfCondition EqualTo(JSRT_IsTruthy(save_a), JSRT_IsTruthy(save_b)) ThenBlock: {
+                ReturnValue(1)
+            }
+            ReturnValue(0)
+        }
+        IfCondition EqualTo(ta, JSType.NULL) ThenBlock: {
+            ReturnValue(1)
+        }
+        IfCondition EqualTo(ta, JSType.UNDEFINED) ThenBlock: {
+            ReturnValue(1)
+        }
+        // objects/functions: reference equality (SameValue)
+        IfCondition EqualTo(JSRT_SameRef(save_a, save_b), 1) ThenBlock: {
+            ReturnValue(1)
+        }
+        ReturnValue(0)
+    }
+}

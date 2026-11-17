@@ -281,7 +281,7 @@ def gen_dispatch(prefix, sub_groups, depth, W):
     W('    Input: key: Address')
     W('    Output: Integer')
     W('    Body: {')
-    W(f'        c = GetByte(key, {depth})')
+    W(f'        c = RDMEM_8(key, {depth})')
     for c in sorted(sub_groups.keys()):
         if c == '':
             # mnemonic complete — call the leaf for this sub-prefix
@@ -463,7 +463,7 @@ def gen(out_path):
     W("    Body: {")
     W("        X86EncResult.desc_a = 0")
     W("        X86EncResult.desc_b = 0")
-    W("        c = GetByte(key, 0)")
+    W("        c = RDMEM_8(key, 0)")
     for c in sorted(first_groups.keys()):
         code = ord(c)
         sub_name = func_name_for(c)
@@ -509,17 +509,17 @@ Function.X86Enc_MemoFind {
         X86EncMemo.hit = 0
         h = 5381
         i = 0
-        c = GetByte(key, 0)
+        c = RDMEM_8(key, 0)
         WhileLoop NotEqual(c, 0) {
             h = BitwiseAnd(Add(Multiply(h, 33), c), 1073741823)
             i = Add(i, 1)
-            c = GetByte(key, i)
+            c = RDMEM_8(key, i)
         }
         idx = Modulo(h, cap)
         probes = 0
         WhileLoop LessThan(probes, cap) {
             slot = Add(tab, Multiply(idx, 32))
-            stored = Dereference(slot)
+            stored = RDMEM_64(slot)
             IfCondition EqualTo(stored, 0) ThenBlock: { ReturnValue(slot) }
             IfCondition EqualTo(StringCompare(stored, key), 0) ThenBlock: {
                 X86EncMemo.hit = 1
@@ -541,10 +541,10 @@ Function.X86Enc_MemoKey {
         copy = Allocate(Add(len, 1))
         i = 0
         WhileLoop LessThan(i, len) {
-            SetByte(copy, i, GetByte(key, i))
+            WRMEM_8(copy, i, RDMEM_8(key, i))
             i = Add(i, 1)
         }
-        SetByte(copy, len, 0)
+        WRMEM_8(copy, len, 0)
         ReturnValue(copy)
     }
 }
@@ -558,17 +558,17 @@ Function.X86Enc_Lookup {
         }
         slot = X86Enc_MemoFind(X86EncMemo.tab, 4096, key)
         IfCondition EqualTo(X86EncMemo.hit, 1) ThenBlock: {
-            X86EncResult.desc_a = Dereference(Add(slot, 8))
-            X86EncResult.desc_b = Dereference(Add(slot, 16))
-            ReturnValue(Dereference(Add(slot, 24)))
+            X86EncResult.desc_a = RDMEM_64(slot, 8)
+            X86EncResult.desc_b = RDMEM_64(slot, 16)
+            ReturnValue(RDMEM_64(slot, 24))
         }
         found = X86Enc_LookupTrie(key)
         IfCondition NotEqual(slot, 0) ThenBlock: {
             IfCondition LessThan(X86EncMemo.n, 3072) ThenBlock: {
-                StoreValue(Add(slot, 8), X86EncResult.desc_a)
-                StoreValue(Add(slot, 16), X86EncResult.desc_b)
-                StoreValue(Add(slot, 24), found)
-                StoreValue(slot, X86Enc_MemoKey(key))
+                WRMEM_64(slot, 8, X86EncResult.desc_a)
+                WRMEM_64(slot, 16, X86EncResult.desc_b)
+                WRMEM_64(slot, 24, found)
+                WRMEM_64(slot, X86Enc_MemoKey(key))
                 X86EncMemo.n = Add(X86EncMemo.n, 1)
             }
         }
@@ -585,13 +585,13 @@ Function.X86Enc_RegType {
         }
         slot = X86Enc_MemoFind(X86EncMemo.rt, 512, name)
         IfCondition EqualTo(X86EncMemo.hit, 1) ThenBlock: {
-            ReturnValue(Dereference(Add(slot, 8)))
+            ReturnValue(RDMEM_64(slot, 8))
         }
         r = X86Enc_RegTypeChain(name)
         IfCondition NotEqual(slot, 0) ThenBlock: {
             IfCondition LessThan(X86EncMemo.rt_n, 384) ThenBlock: {
-                StoreValue(Add(slot, 8), r)
-                StoreValue(slot, X86Enc_MemoKey(name))
+                WRMEM_64(slot, 8, r)
+                WRMEM_64(slot, X86Enc_MemoKey(name))
                 X86EncMemo.rt_n = Add(X86EncMemo.rt_n, 1)
             }
         }
@@ -608,13 +608,13 @@ Function.X86Enc_RegNum {
         }
         slot = X86Enc_MemoFind(X86EncMemo.rn, 512, name)
         IfCondition EqualTo(X86EncMemo.hit, 1) ThenBlock: {
-            ReturnValue(Dereference(Add(slot, 8)))
+            ReturnValue(RDMEM_64(slot, 8))
         }
         r = X86Enc_RegNumChain(name)
         IfCondition NotEqual(slot, 0) ThenBlock: {
             IfCondition LessThan(X86EncMemo.rn_n, 384) ThenBlock: {
-                StoreValue(Add(slot, 8), r)
-                StoreValue(slot, X86Enc_MemoKey(name))
+                WRMEM_64(slot, 8, r)
+                WRMEM_64(slot, X86Enc_MemoKey(name))
                 X86EncMemo.rn_n = Add(X86EncMemo.rn_n, 1)
             }
         }
@@ -644,7 +644,7 @@ Function.X86Enc_RegNum {
     W("        // Find mnemonic end (first space/tab or end)")
     W("        mi = 0")
     W("        WhileLoop LessThan(mi, len) {")
-    W("            mc = GetByte(src, mi)")
+    W("            mc = RDMEM_8(src, mi)")
     W("            IfCondition EqualTo(mc, 32) ThenBlock: { BreakLoop }")
     W("            IfCondition EqualTo(mc, 9)  ThenBlock: { BreakLoop }")
     W("            mi = Add(mi, 1)")
@@ -655,11 +655,11 @@ Function.X86Enc_RegNum {
     W("        // Copy mnemonic uppercase")
     W("        ki = 0")
     W("        WhileLoop LessThan(ki, mi) {")
-    W("            kc = GetByte(src, ki)")
+    W("            kc = RDMEM_8(src, ki)")
     W("            IfCondition And(GreaterEqual(kc,97), LessEqual(kc,122)) ThenBlock: {")
     W("                kc = Subtract(kc, 32)")
     W("            }")
-    W("            SetByte(key_buf, kpos, kc)")
+    W("            WRMEM_8(key_buf, kpos, kc)")
     W("            kpos = Add(kpos, 1)")
     W("            ki = Add(ki, 1)")
     W("        }")
@@ -667,7 +667,7 @@ Function.X86Enc_RegNum {
     W("        i = mi")
     W("        op_idx = 0")
     W("        WhileLoop LessThan(i, len) {")
-    W("            c = GetByte(src, i)")
+    W("            c = RDMEM_8(src, i)")
     W("            // Skip spaces, commas")
     W("            IfCondition Or(EqualTo(c,32), Or(EqualTo(c,9), EqualTo(c,44))) ThenBlock: {")
     W("                i = Add(i, 1)")
@@ -676,7 +676,7 @@ Function.X86Enc_RegNum {
     W("            // Read token: stop at space, comma")
     W("            tok_start = i")
     W("            WhileLoop LessThan(i, len) {")
-    W("                c2 = GetByte(src, i)")
+    W("                c2 = RDMEM_8(src, i)")
     W("                IfCondition Or(EqualTo(c2,32), Or(EqualTo(c2,9), EqualTo(c2,44))) ThenBlock: { BreakLoop }")
     W("                i = Add(i, 1)")
     W("            }")
@@ -685,16 +685,16 @@ Function.X86Enc_RegNum {
     W("            tok = Allocate(Add(tok_len, 1))")
     W("            tj = 0")
     W("            WhileLoop LessThan(tj, tok_len) {")
-    W("                tc = GetByte(src, Add(tok_start, tj))")
+    W("                tc = RDMEM_8(src, Add(tok_start, tj))")
     W("                IfCondition And(GreaterEqual(tc,65), LessEqual(tc,90)) ThenBlock: { tc = Add(tc,32) }")
-    W("                SetByte(tok, tj, tc)")
+    W("                WRMEM_8(tok, tj, tc)")
     W("                tj = Add(tj, 1)")
     W("            }")
-    W("            SetByte(tok, tok_len, 0)")
+    W("            WRMEM_8(tok, tok_len, 0)")
     W("            // Extract base register name (stop at '{', '[', '+')")
     W("            base_len = 0")
     W("            WhileLoop LessThan(base_len, tok_len) {")
-    W("                bc = GetByte(tok, base_len)")
+    W("                bc = RDMEM_8(tok, base_len)")
     W("                IfCondition EqualTo(bc, 123) ThenBlock: { BreakLoop }")  # '{'
     W("                IfCondition EqualTo(bc, 91)  ThenBlock: { BreakLoop }")  # '['
     W("                IfCondition EqualTo(bc, 43)  ThenBlock: { BreakLoop }")  # '+'
@@ -703,10 +703,10 @@ Function.X86Enc_RegNum {
     W("            base = Allocate(Add(base_len, 1))")
     W("            bj = 0")
     W("            WhileLoop LessThan(bj, base_len) {")
-    W("                SetByte(base, bj, GetByte(tok, bj))")
+    W("                WRMEM_8(base, bj, RDMEM_8(tok, bj))")
     W("                bj = Add(bj, 1)")
     W("            }")
-    W("            SetByte(base, base_len, 0)")
+    W("            WRMEM_8(base, base_len, 0)")
     W("            // Register or immediate?")
     W("            rtype = X86Enc_RegType(base)")
     W("            IfCondition NotEqual(rtype, 0) ThenBlock: {")
@@ -715,24 +715,24 @@ Function.X86Enc_RegNum {
     W("                has_zero = 0")
     W("                di = base_len")
     W("                WhileLoop LessThan(di, tok_len) {")
-    W("                    dc = GetByte(tok, di)")
+    W("                    dc = RDMEM_8(tok, di)")
     W("                    IfCondition EqualTo(dc, 123) ThenBlock: {")  # '{'
     W("                        // read until '}'")
     W("                        dec_start = Add(di, 1)")
     W("                        di = Add(di, 1)")
     W("                        WhileLoop LessThan(di, tok_len) {")
-    W("                            ec = GetByte(tok, di)")
+    W("                            ec = RDMEM_8(tok, di)")
     W("                            IfCondition EqualTo(ec, 125) ThenBlock: { BreakLoop }")  # '}'
     W("                            di = Add(di, 1)")
     W("                        }")
     W("                        dec_len = Subtract(di, dec_start)")
     W("                        // Check if it's 'z' (zeroing) or a k register (mask)")
     W("                        IfCondition EqualTo(dec_len, 1) ThenBlock: {")
-    W("                            zc = GetByte(tok, dec_start)")
+    W("                            zc = RDMEM_8(tok, dec_start)")
     W("                            IfCondition EqualTo(zc, 122) ThenBlock: { has_zero = 1 }")  # 'z'
     W("                        } ElseBlock: {")
     W("                            // k0..k7 -> mask register")
-    W("                            kc2 = GetByte(tok, dec_start)")
+    W("                            kc2 = RDMEM_8(tok, dec_start)")
     W("                            IfCondition EqualTo(kc2, 107) ThenBlock: { has_mask = 1 }")  # 'k'
     W("                        }")
     W("                    }")
@@ -740,28 +740,28 @@ Function.X86Enc_RegNum {
     W("                }")
     W("                // Build full type string in key")
     W("                rtype_len = StringLength(rtype)")
-    W("                SetByte(key_buf, kpos, 95)")  # '_'
+    W("                WRMEM_8(key_buf, kpos, 95)")  # '_'
     W("                kpos = Add(kpos, 1)")
     W("                rtj = 0")
     W("                WhileLoop LessThan(rtj, rtype_len) {")
-    W("                    SetByte(key_buf, kpos, GetByte(rtype, rtj))")
+    W("                    WRMEM_8(key_buf, kpos, RDMEM_8(rtype, rtj))")
     W("                    kpos = Add(kpos, 1)")
     W("                    rtj = Add(rtj, 1)")
     W("                }")
     W("                IfCondition EqualTo(has_mask, 1) ThenBlock: {")
-    W("                    SetByte(key_buf, kpos, 123)")
+    W("                    WRMEM_8(key_buf, kpos, 123)")
     W("                    kpos = Add(kpos, 1)")
-    W("                    SetByte(key_buf, kpos, 107)")
+    W("                    WRMEM_8(key_buf, kpos, 107)")
     W("                    kpos = Add(kpos, 1)")
-    W("                    SetByte(key_buf, kpos, 125)")
+    W("                    WRMEM_8(key_buf, kpos, 125)")
     W("                    kpos = Add(kpos, 1)")
     W("                }")
     W("                IfCondition EqualTo(has_zero, 1) ThenBlock: {")
-    W("                    SetByte(key_buf, kpos, 123)")
+    W("                    WRMEM_8(key_buf, kpos, 123)")
     W("                    kpos = Add(kpos, 1)")
-    W("                    SetByte(key_buf, kpos, 122)")
+    W("                    WRMEM_8(key_buf, kpos, 122)")
     W("                    kpos = Add(kpos, 1)")
-    W("                    SetByte(key_buf, kpos, 125)")
+    W("                    WRMEM_8(key_buf, kpos, 125)")
     W("                    kpos = Add(kpos, 1)")
     W("                }")
     W("                rnum = X86Enc_RegNum(base)")
@@ -783,11 +783,11 @@ Function.X86Enc_RegNum {
     W("                        imm_type_len = 5")
     W("                    }")
     W("                }")
-    W("                SetByte(key_buf, kpos, 95)")  # '_'
+    W("                WRMEM_8(key_buf, kpos, 95)")  # '_'
     W("                kpos = Add(kpos, 1)")
     W("                itj = 0")
     W("                WhileLoop LessThan(itj, imm_type_len) {")
-    W("                    SetByte(key_buf, kpos, GetByte(imm_type_str, itj))")
+    W("                    WRMEM_8(key_buf, kpos, RDMEM_8(imm_type_str, itj))")
     W("                    kpos = Add(kpos, 1)")
     W("                    itj = Add(itj, 1)")
     W("                }")
@@ -798,7 +798,7 @@ Function.X86Enc_RegNum {
     W("            }")
     W("            op_idx = Add(op_idx, 1)")
     W("        }")
-    W("        SetByte(key_buf, kpos, 0)")
+    W("        WRMEM_8(key_buf, kpos, 0)")
     W("        X86AsmParse.nops = op_idx")
     W("        ReturnValue(key_buf)")
     W("    }")
@@ -819,10 +819,10 @@ Function.X86Enc_RegNum {
     W("        i = 0")
     W("        found = -1")
     W("        WhileLoop LessThan(i, Subtract(len, 4)) {")
-    W("            IfCondition EqualTo(GetByte(key, i), 95) ThenBlock: {")
-    W("                IfCondition EqualTo(GetByte(key, Add(i,1)), 105) ThenBlock: {")
-    W("                    IfCondition EqualTo(GetByte(key, Add(i,2)), 109) ThenBlock: {")
-    W("                        IfCondition EqualTo(GetByte(key, Add(i,3)), 109) ThenBlock: {")
+    W("            IfCondition EqualTo(RDMEM_8(key, i), 95) ThenBlock: {")
+    W("                IfCondition EqualTo(RDMEM_8(key, Add(i,1)), 105) ThenBlock: {")
+    W("                    IfCondition EqualTo(RDMEM_8(key, Add(i,2)), 109) ThenBlock: {")
+    W("                        IfCondition EqualTo(RDMEM_8(key, Add(i,3)), 109) ThenBlock: {")
     W("                            found = i")
     W("                            i = len")
     W("                        }")
@@ -833,31 +833,31 @@ Function.X86Enc_RegNum {
     W("        }")
     W("        IfCondition EqualTo(found, -1) ThenBlock: { ReturnValue(0) }")
     W("        num_start = Add(found, 4)")
-    W("        c0 = GetByte(key, num_start)")
+    W("        c0 = RDMEM_8(key, num_start)")
     W("        // imm8 -> imm32: shift tail right by 1, write \"32\"")
     W("        IfCondition EqualTo(c0, 56) ThenBlock: {")
     W("            j = len")
     W("            WhileLoop GreaterThan(j, num_start) {")
-    W("                SetByte(key, Add(j, 1), GetByte(key, j))")
+    W("                WRMEM_8(key, Add(j, 1), RDMEM_8(key, j))")
     W("                j = Subtract(j, 1)")
     W("            }")
-    W("            SetByte(key, num_start, 51)")
-    W("            SetByte(key, Add(num_start, 1), 50)")
+    W("            WRMEM_8(key, num_start, 51)")
+    W("            WRMEM_8(key, Add(num_start, 1), 50)")
     W("            ReturnValue(1)")
     W("        }")
     W("        // imm16 -> imm32")
     W("        IfCondition EqualTo(c0, 49) ThenBlock: {")
-    W("            IfCondition EqualTo(GetByte(key, Add(num_start,1)), 54) ThenBlock: {")
-    W("                SetByte(key, num_start, 51)")
-    W("                SetByte(key, Add(num_start, 1), 50)")
+    W("            IfCondition EqualTo(RDMEM_8(key, Add(num_start,1)), 54) ThenBlock: {")
+    W("                WRMEM_8(key, num_start, 51)")
+    W("                WRMEM_8(key, Add(num_start, 1), 50)")
     W("                ReturnValue(1)")
     W("            }")
     W("        }")
     W("        // imm32 -> imm64")
     W("        IfCondition EqualTo(c0, 51) ThenBlock: {")
-    W("            IfCondition EqualTo(GetByte(key, Add(num_start,1)), 50) ThenBlock: {")
-    W("                SetByte(key, num_start, 54)")
-    W("                SetByte(key, Add(num_start, 1), 52)")
+    W("            IfCondition EqualTo(RDMEM_8(key, Add(num_start,1)), 50) ThenBlock: {")
+    W("                WRMEM_8(key, num_start, 54)")
+    W("                WRMEM_8(key, Add(num_start, 1), 52)")
     W("                ReturnValue(1)")
     W("            }")
     W("        }")

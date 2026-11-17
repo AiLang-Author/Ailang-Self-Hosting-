@@ -126,7 +126,7 @@ def wrap_helper(letter: str, body: str) -> str:
         f"    Body: {{\n"
         f"        buf = CadAppIpc.cmd\n"
         f"        IfCondition EqualTo(buf, 0) ThenBlock: {{ ReturnValue(0) }}\n"
-        f"        c0 = GetByte(buf, 0)\n"
+        f"        c0 = RDMEM_8(buf, 0)\n"
         f"{body}"
         f"        ReturnValue(0)\n"
         f"    }}\n"
@@ -201,8 +201,8 @@ def main() -> None:
         IfCondition LessThan(n, 1) ThenBlock: {{
             ReturnValue(0)
         }}
-        SetByte(buf, n, 0)
-        c00 = GetByte(buf, 0)
+        WRMEM_8(buf, n, 0)
+        c00 = RDMEM_8(buf, 0)
         skip_log = 0
         IfCondition EqualTo(c00, 111) ThenBlock: {{ skip_log = 1 }}
         IfCondition EqualTo(c00, 104) ThenBlock: {{ skip_log = 1 }}
@@ -211,7 +211,7 @@ def main() -> None:
             nn = n
             IfCondition GreaterThan(nn, 48) ThenBlock: {{ nn = 48 }}
             CA_Log(buf, nn)
-            IfCondition NotEqual(GetByte(buf, Subtract(n, 1)), 10) ThenBlock: {{
+            IfCondition NotEqual(RDMEM_8(buf, Subtract(n, 1)), 10) ThenBlock: {{
                 CA_Log("\\n", 1)
             }}
         }}
@@ -219,7 +219,7 @@ def main() -> None:
         IfCondition EqualTo(CA_ParseClick(buf), 1) ThenBlock: {{
             ReturnValue(2)
         }}
-        c0 = GetByte(buf, 0)
+        c0 = RDMEM_8(buf, 0)
         Branch c0 {{
 {case_block}
             Default: {{ ReturnValue(0) }}

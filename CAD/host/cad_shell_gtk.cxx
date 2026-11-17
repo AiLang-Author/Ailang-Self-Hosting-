@@ -156,9 +156,9 @@ static void read_tool_state(int *mode, int *tool, int *nclick) {
     fclose(f);
 }
 
-/* Pick, trim, constraint: click selects an entity. No placement rubber-band. */
+/* Pick, trim, constraint, move: the drag is the tool, not the camera. */
 static int tool_is_select(int tool) {
-    return tool == 4 || tool == 5 || tool == 7;
+    return tool == 4 || tool == 5 || tool == 7 || tool == 19;
 }
 
 /* Ctrl, Shift, or Alt held: add or remove this profile. A plain click replaces. */
@@ -1117,7 +1117,16 @@ static void draw_edit_hud(cairo_t *cr, GtkAllocation *al) {
 
         char rhs[48];
         const char *shown = card.f[i].val;
-        if (act && (G.dimn > 0 || G.dim_sel)) shown = G.dimbuf;
+        int letters = 0;
+        {
+            const char *q;
+            for (q = card.f[i].val; *q; q++) {
+                if ((*q >= 'A' && *q <= 'Z') || (*q >= 'a' && *q <= 'z'))
+                    letters = 1;
+            }
+        }
+        /* NEW/CUT/JOIN stay words. A leftover height must not cover them. */
+        if (act && !letters && (G.dimn > 0 || G.dim_sel)) shown = G.dimbuf;
         int empty = (!shown[0] || strcmp(shown, "_") == 0);
         if (act) {
             if (empty)
@@ -1173,6 +1182,8 @@ static const char *k_help_fallback =
     "  Enter on Side or Diameter places the n-gon. Second click also places.\n"
     "\n"
     "Esc cancels the current click. Right-click = tool pie.\n"
+    "Sketch stays in the 3D view until you click a plane or a face.\n"
+    "Move: drag a point or a line. A point follows the cursor, and a line moves both ends. A rectangle moves as one piece.\n"
     "The solid stays on screen in Sketch. On Face looks at that plane.\n"
     "Project (Sketch tab / pie) shows dashed face edges + gold anchors.\n"
     "Construct: Pick Plane / From Face / Origin / Through 3pt, then Offset\n"
@@ -1921,6 +1932,22 @@ static void hud_commit(void) {
     gtk_widget_queue_draw(G.da);
 }
 
+static int hud_only_enum(void) {
+    DimCard card;
+    int i, active_enum = 0;
+    memset(&card, 0, sizeof card);
+    if (!G.dimhud[0] || !parse_dimhud(G.dimhud, &card))
+        return 0;
+    if (card.n != 1) return 0;
+    for (i = 0; i < card.n; i++) {
+        if (card.f[i].active) {
+            char k0 = card.f[i].key[0];
+            if (k0 == 'S' || k0 == 'O') active_enum = 1;
+        }
+    }
+    return active_enum;
+}
+
 static int hud_active_is_enum(void) {
     DimCard card;
     int i;
@@ -2004,6 +2031,11 @@ static gboolean hud_handle_key(GdkEventKey *e) {
 
     int dig = hud_digit_char(kv);
     if (dig >= 0) {
+        /* Loft's only row is NEW/CUT. A digit must not turn it into a height. */
+        if (hud_only_enum()) {
+            gtk_widget_queue_draw(G.da);
+            return TRUE;
+        }
         /* Typing a number on Pick/OP jumps to the numeric row. */
         if (hud_active_is_enum())
             write_cmd("htab");
@@ -2168,10 +2200,10 @@ static gboolean poll_tick(gpointer) {
     read_line_file(path_notice, nt, sizeof nt);
     read_line_file(path_dimhud, dh, sizeof dh);
     if (strcmp(dh, G.dimhud) != 0) {
-        int opened = (!G.dimhud[0] && dh[0]);
         snprintf(G.dimhud, sizeof G.dimhud, "%s", dh);
         G.hud_idle = 0;
-        if (opened || (dh[0] && G.dimn == 0 && !G.dim_sel && G.dim_kind == 0))
+        /* A new card drops the previous type-in, so Height=20 cannot sit on Operation. */
+        if (dh[0] && G.dim_kind == 0)
             hud_seed_from_card();
         if (!dh[0] && G.dim_kind == 0)
             hud_clear_typein();
@@ -2328,7 +2360,7 @@ static void size_window_to_monitor(GtkWindow *w) {
 }
 
 static void on_ribbon_page(GtkNotebook *, GtkWidget *, guint page, gpointer) {
-    if ((int)page == G.page_solid) write_cmd("profiles");
+    if ((int)page == G.page_solid) write_cmd("solid");
 }
 
 static void on_import(GtkWidget *, gpointer) {
@@ -2991,7 +3023,9 @@ int main(int argc, char **argv) {
 
     /* SKETCH */
     GtkWidget *sk = tab_box();
+    gtk_box_pack_start(GTK_BOX(sk), mk_btn("Sketch", "sketch"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(sk), mk_btn("Line", "tool_line"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(sk), mk_btn("Move", "tool_move"), FALSE, FALSE, 0);
     {
         static const char *rl[] = {"2-Point Rect", "Center Rect", "3-Point Rect", NULL};
         static const char *rc[] = {"tool_rect", "tool_rectc", "tool_rect3", NULL};
@@ -3081,6 +3115,7 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(so), mk_btn("Pick", "tool_pick"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(so), mk_btn("On Face", "plane_top"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(so), mk_btn("Extrude", "repad"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(so), mk_btn("Loft", "loft"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(so), mk_btn("Revolve", "revolve"), FALSE, FALSE, 0);
     {
         static const char *ml[] = {"Fillet", "Chamfer", NULL};
@@ -3134,6 +3169,7 @@ int main(int argc, char **argv) {
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Back", "view6"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Bottom", "view7"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Grid", "grid"), FALSE, FALSE, 0);
+    gtk_box_pack_start(GTK_BOX(vw), mk_btn("Planes", "planes"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Sketch", "skvis"), FALSE, FALSE, 0);
     gtk_box_pack_start(GTK_BOX(vw), mk_btn("Wire", "wire"), FALSE, FALSE, 0);
     {

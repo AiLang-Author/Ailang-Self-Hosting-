@@ -13,8 +13,8 @@ NEXT_ANALYZER="$ROOT/analyzer-next.x"
 NEXT2="$ROOT/ailang-next2.x"
 NEXT3="$ROOT/ailang-next3.x"
 
-HOST_AILANG_SHA="9d7f005a88cd075312d370b0b94d58929825dd22b9b31bc84ee913b0cb3cb87f"
-HOST_ANALYZER_SHA="43a7b024bbe6f61a1d084f57b18942f9acaa62ccda7fd906d312df4e5ae1efe8"
+HOST_AILANG_SHA="7cc4128adaf3c1be31de15007aca1f4d4e187187026a6618c509d2f9c50f2ec4"
+HOST_ANALYZER_SHA="592d8972cd9c635439fdb1907ac7518f4fe0421c42929f4131e08a7b907b8e51"
 
 TMP="$ROOT/tests/contract/_out"
 mkdir -p "$TMP"
@@ -78,6 +78,29 @@ echo "$ret_out"
 echo "$ret_out" | grep -q "fib7=13" || fail "Fib ThenBlock ReturnValue fell through"
 echo "$ret_out" | grep -q "clamp=0" || fail "ClampNeg ThenBlock ReturnValue fell through"
 ok "ret_in_then.ailang: ReturnValue in ThenBlock returns"
+
+echo "== RDMEM / WRMEM memory primitives =="
+MEM_SRC="$ROOT/tests/contract/memprim_rdwr.ailang"
+"$NEXT_AILANG" "$MEM_SRC" "$TMP/memprim_next.x"
+set +e
+mem_out="$("$TMP/memprim_next.x")"
+mem_rc=$?
+"$NEXT_AILANG" "$ROOT/tests/contract/bad_memprim.ailang" "$TMP/bad_memprim.x"
+rc_badmem=$?
+set -e
+[[ "$mem_rc" -eq 0 ]] || fail "memprim_rdwr.ailang next run rc=$mem_rc"
+echo "$mem_out" | grep -q "FAIL" && fail "memprim_rdwr.ailang: $(echo "$mem_out" | grep FAIL | head -1)"
+echo "$mem_out" | grep -q "^done$" || fail "memprim_rdwr.ailang did not finish"
+ok "memprim_rdwr.ailang: all widths, sign extension, IO forms"
+[[ "$rc_badmem" -ne 0 ]] || fail "next compiled bad_memprim.ailang"
+ok "next rejected bad_memprim.ailang"
+for pair in "memprim_byte_base:mismatches 0" "ptrfield_cmpskip:ptrfield 77"; do
+    name="${pair%%:*}"; want="${pair#*:}"
+    "$NEXT_AILANG" "$ROOT/tests/contract/$name.ailang" "$TMP/$name.x"
+    got="$("$TMP/$name.x")"
+    [[ "$got" == "$want" ]] || fail "$name.ailang printed '$got', want '$want'"
+    ok "$name.ailang: $want"
+done
 
 echo "== D. negative tests against next only =="
 set +e

@@ -235,26 +235,30 @@ These are compiler primitives for direct memory access.
 |-----------|-------------|
 | `Allocate(size)` | Allocate `size` bytes, returns `Address` |
 | `Deallocate(ptr, size)` | Return `size` bytes at `ptr` to allocator |
-| `Dereference(ptr)` | Read 8-byte value at address `ptr` |
-| `StoreValue(ptr, val)` | Write 8-byte value `val` to address `ptr` |
-| `GetByte(ptr, offset)` | Read 1 byte at `ptr + offset` |
-| `SetByte(ptr, offset, val)` | Write 1 byte `val` at `ptr + offset` |
+| `RDMEM_64(ptr)` | Read 8-byte value at address `ptr` |
+| `WRMEM_64(ptr, val)` | Write 8-byte value `val` to address `ptr` |
+| `RDMEM_8(ptr, offset)` | Read 1 byte at `ptr + offset` |
+| `WRMEM_8(ptr, offset, val)` | Write 1 byte `val` at `ptr + offset` |
 | `MemoryCopy(dst, src, n)` | Copy `n` bytes from `src` to `dst` (SSE2) |
 | `MemorySet(ptr, val, n)` | Fill `n` bytes at `ptr` with `val` |
 | `MemChr(ptr, byte, n)` | Find first occurrence of `byte` in `n` bytes. Returns offset or -1 (SSE2) |
 | `MemCompare(a, b, n)` | Compare `n` bytes. Returns 0 if equal (SSE2) |
+| `MemMem(hay, haylen, needle, needlen)` | First offset of `needle` in `hay`, or -1. Needle length 0 returns 0 (SSE2) |
+| `MemMemFold(hay, haylen, needle, needlen)` | `MemMem` with ASCII A–Z folded to a–z on both sides (SSE2) |
 | `AddressOf(var)` | Get address of a variable |
 
 ```ailang
 buf = Allocate(64)
-StoreValue(buf, 42)
-val = Dereference(buf)          // → 42
+WRMEM_64(buf, 42)
+val = RDMEM_64(buf)          // → 42
 
-SetByte(buf, 0, 72)             // 'H'
-SetByte(buf, 1, 105)            // 'i'
-SetByte(buf, 2, 0)              // NUL
+WRMEM_8(buf, 0, 72)             // 'H'
+WRMEM_8(buf, 1, 105)            // 'i'
+WRMEM_8(buf, 2, 0)              // NUL
 
 off = MemChr(buf, 105, 64)      // → 1  (offset of 'i')
+off = MemMem(buf, 64, pat, 3)   // first offset of pat, or -1
+off = MemMemFold(buf, 64, pat, 3)  // same, ASCII A-Z folded
 ```
 
 ---
@@ -285,10 +289,10 @@ from AILang. This is philosophy, not oversight.
 | `++` / `--` | C/C++ | Pre/post ambiguity, UB in expressions |
 | `?:` ternary | C/C++ | Readability — use `IfCondition` |
 | `,` comma | C/C++ | Implicit sequencing, confusing in args |
-| `->` | C/C++ | Use `Dereference(Add(ptr, offset))` |
-| `[]` subscript | C/C++ | Use `Dereference(Add(ptr, Multiply(i, 8)))` |
+| `->` | C/C++ | Use `RDMEM_64(ptr, offset)` |
+| `[]` subscript | C/C++ | Use `RDMEM_64(ptr, Multiply(i, 8))` |
 | `&` address-of (unary) | C/C++ | Use `AddressOf(var)` |
-| `*` dereference (unary) | C/C++ | Use `Dereference(ptr)` |
+| `*` dereference (unary) | C/C++ | Use `RDMEM_64(ptr)` |
 | `sizeof` | C/C++ | Sizes are explicit in AILang |
 | `~=` / `**=` | Python | Not needed |
 | `^` XOR | C/C++ | `^` is Power in AILang — use `BitwiseXor()` |
@@ -317,12 +321,14 @@ RightShift(a,n)  (a>>n)
 MEMORY                          MATH PRIMITIVES
 Allocate(n)                     Abs(n)
 Deallocate(ptr,n)               Min(a,b)  Max(a,b)
-Dereference(ptr)                ISqrt(n)
-StoreValue(ptr,val)             Increment(n)
-GetByte(ptr,off)                Decrement(n)
-SetByte(ptr,off,val)
+RDMEM_64(ptr)                ISqrt(n)
+WRMEM_64(ptr, val)             Increment(n)
+RDMEM_8(ptr, off)                Decrement(n)
+WRMEM_8(ptr, off, val)
 MemChr(ptr,byte,n)
 MemCompare(a,b,n)
+MemMem(hay,haylen,needle,needlen)
+MemMemFold(hay,haylen,needle,needlen)
 MemoryCopy(dst,src,n)
 ```
 

@@ -313,6 +313,22 @@ Finds the first occurrence of `byte` in `length` bytes starting at `addr`. Retur
 result = MemChr(addr, byte, length)
 ```
 
+### MemMem
+
+Finds the first occurrence of `needle` in `haylen` bytes at `hay`. Returns the byte offset, or `-1` if it is not there. A `needlen` of 0 returns 0. If `haylen` is shorter than `needlen`, the result is `-1`.
+
+```ailang
+result = MemMem(hay, haylen, needle, needlen)
+```
+
+### MemMemFold
+
+Same search and return values as `MemMem`. While comparing, ASCII `A`–`Z` is folded to `a`–`z` on both the haystack and the needle. Every other byte is compared unchanged.
+
+```ailang
+result = MemMemFold(hay, haylen, needle, needlen)
+```
+
 ---
 
 ## Advanced Text Processing

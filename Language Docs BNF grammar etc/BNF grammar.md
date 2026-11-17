@@ -569,16 +569,26 @@
                        | <hardware_operation>
                        | <atomic_operation>
 
-<pointer_operation> ::= "Dereference" "(" <expression> [ "," STRING ] ")"
+<pointer_operation> ::= <mem_read> "(" <expression> [ "," <expression> ] ")"
+                      | <mem_write> "(" <expression> "," <expression> [ "," <expression> ] ")"
                       | "AddressOf" "(" <expression> ")"
                       | "SizeOf" "(" <expression> ")"
 
+(* Width-explicit memory access. (addr) or (base, offset) for a read;
+   (addr, value) or (base, offset, value) for a write. _IO_ marks device
+   memory: one access of that width, in program order, never optimized. *)
+<mem_read>   ::= "RDMEM_" [ "IO_" ] <mem_rwidth>
+<mem_write>  ::= "WRMEM_" [ "IO_" ] <mem_width>
+<mem_width>  ::= "8" | "16" | "32" | "64"
+<mem_rwidth> ::= <mem_width> | "S8" | "S16" | "S32"
+
 <memory_operation> ::= "Allocate" "(" <expression> [ "," <expression> ] ")"
                      | "Deallocate" "(" <expression> ")"
-                     | "StoreValue" "(" <expression> "," <expression> [ "," STRING ] ")"
                      | "MemoryCopy" "(" <expression> "," <expression> "," <expression> ")"
                      | "MemorySet" "(" <expression> "," <expression> "," <expression> ")"
                      | "MemoryCompare" "(" <expression> "," <expression> "," <expression> ")"
+                     | "MemMem" "(" <expression> "," <expression> "," <expression> "," <expression> ")"
+                     | "MemMemFold" "(" <expression> "," <expression> "," <expression> "," <expression> ")"
 
 <hardware_operation> ::= "PortRead" "(" <expression> "," STRING ")"
                         | "PortWrite" "(" <expression> "," <expression> "," STRING ")"
