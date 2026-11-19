@@ -39,10 +39,8 @@ Function.FPUCompileX86MemOps_TryCompile {
             ReturnValue(FPUCompileX86_MemSet(node))
         }
         
-        cmp = StringCompare(func_name, "MemoryCopy")
-        IfCondition EqualTo(cmp, 0) ThenBlock: {
-            ReturnValue(FPUCompileX86_MemCopy(node))
-        }
+        // MemoryCopy is CompileMem_MemoryCopy. It runs first and returns
+        // the dest pointer. This dispatcher does not emit a second copy.
         
         cmp = StringCompare(func_name, "MemCompare")
         IfCondition EqualTo(cmp, 0) ThenBlock: {
@@ -156,87 +154,8 @@ Function.FPUCompileX86_MemSet {
     }
 }
 
-// =============================================================================
-// MEMORYCOPY - Copy memory from src to dest
-// MemoryCopy(dest, src, count) -> count
-// =============================================================================
-Function.FPUCompileX86_MemCopy {
-    Input: node: Address
-    Output: Integer
-    Body: {
-        arg_count = AST_GetChildCount(node)
-        IfCondition NotEqual(arg_count, 3) ThenBlock: {
-            PrintMessage("[FPU] MemoryCopy requires 3 arguments\n")
-            ReturnValue(0)
-        }
-        
-        arg0 = AST_GetChild(node, 0)  // dest
-        arg1 = AST_GetChild(node, 1)  // src
-        arg2 = AST_GetChild(node, 2)  // count
-        
-        sse_loop = Emit_CreateLabel()
-        scalar_check = Emit_CreateLabel()
-        scalar_loop = Emit_CreateLabel()
-        done_label = Emit_CreateLabel()
-        
-        // Evaluate args
-        Compile_Expression(arg2)
-        Emit_PushRax()
-        
-        Compile_Expression(arg1)
-        Emit_PushRax()
-        
-        Compile_Expression(arg0)
-        Emit_PushRax()
-        
-        // Pop: RDI=dest, RSI=src, RCX=count
-        Emit_PopRdi()
-        Emit_PopRsi()
-        Emit_PopRcx()
-        
-        Emit_MovR8Rcx()
-        
-        Trans_Asm("TEST rcx, rcx")
-        Emit_Je(done_label)
-        
-        // === SSE2 LOOP ===
-        Emit_MarkLabel(sse_loop)
-        
-        Trans_Asm("CMP rcx, 16")
-        Emit_Jb(scalar_check)
-        
-        // Load 16 bytes from [RSI]
-        X86_MOVDQU_XMM0_DerefRSI()
-        
-        // Store 16 bytes to [RDI]
-        X86_MOVDQU_DerefRDI_XMM0()
-        
-        Trans_Asm("ADD rsi, 16")
-        Trans_Asm("ADD rdi, 16")
-        Trans_Asm("SUB rcx, 16")
-        
-        Emit_Jmp(sse_loop)
-        
-        // === SCALAR FALLBACK ===
-        Emit_MarkLabel(scalar_check)
-        Trans_Asm("TEST rcx, rcx")
-        Emit_Je(done_label)
-        
-        Emit_MarkLabel(scalar_loop)
-        X86_MovzxEAX_ByteDerefRSI()
-        X86_MovByte_DerefRDI_AL()
-        Trans_Asm("INC rsi")
-        Trans_Asm("INC rdi")
-        Trans_Asm("DEC rcx")
-        Emit_Jne(scalar_loop)
-        
-        // === DONE ===
-        Emit_MarkLabel(done_label)
-        Emit_MovRaxR8()
-        
-        ReturnValue(1)
-    }
-}
+// MemoryCopy is CompileMem_MemoryCopy. It returns the dest pointer and
+// restores rsi, rdi, and rcx. This file does not emit a second copy.
 
 // =============================================================================
 // MEMCOMPARE - Compare two memory regions
@@ -397,6 +316,27 @@ Function.FPUCompileX86_MemCompare {
 //   2. Load 16 bytes, PCMPEQB, PMOVMSKB
 //   3. BSF to find first match position
 // =============================================================================
+// Length is a literal 0..16. addr in rdi, search byte in al. No loop.
+Function.FPUCompileX86_MemChrFixedBody {
+    Input: n: Integer
+    Body: {
+        done_label = Emit_CreateLabel()
+        step = 0
+        WhileLoop LessThan(step, n) {
+            miss = Emit_CreateLabel()
+            X86_MemChrTest(step)
+            Emit_Jne(miss)
+            Emit_MovRaxImm64(step)
+            Emit_Jmp(done_label)
+            Emit_MarkLabel(miss)
+            step = Add(step, 1)
+        }
+        Emit_MovRaxNeg1()
+        Emit_MarkLabel(done_label)
+        ReturnValue(0)
+    }
+}
+
 Function.FPUCompileX86_MemChr {
     Input: node: Address
     Output: Integer
@@ -410,12 +350,27 @@ Function.FPUCompileX86_MemChr {
         arg0 = AST_GetChild(node, 0)  // addr
         arg1 = AST_GetChild(node, 1)  // byte
         arg2 = AST_GetChild(node, 2)  // length
+
+        IfCondition EqualTo(AST_GetType(arg2), AST.NUMBER) ThenBlock: {
+            nfix = StringToNumber(AST_GetData1(arg2))
+            IfCondition GreaterEqual(nfix, 0) ThenBlock: {
+                IfCondition LessEqual(nfix, 16) ThenBlock: {
+                    Compile_Expression(arg1)
+                    Emit_PushRax()
+                    Compile_Expression(arg0)
+                    Emit_PushRax()
+                    Emit_PopRdi()
+                    Emit_PopRax()
+                    FPUCompileX86_MemChrFixedBody(nfix)
+                    ReturnValue(1)
+                }
+            }
+        }
         
         sse_loop = Emit_CreateLabel()
         found_sse = Emit_CreateLabel()
         scalar_check = Emit_CreateLabel()
-        scalar_loop = Emit_CreateLabel()
-        found_scalar = Emit_CreateLabel()
+        short_scan = Emit_CreateLabel()
         not_found = Emit_CreateLabel()
         done_label = Emit_CreateLabel()
         
@@ -484,33 +439,42 @@ Function.FPUCompileX86_MemChr {
         
         Emit_Jmp(done_label)
         
-        // === SCALAR FALLBACK ===
+        // Remainder after the SSE loop, or the whole region when it
+        // was shorter than 16. A prior chunk makes an overlapping
+        // 16-byte compare safe. A short region stays inside its length.
         Emit_MarkLabel(scalar_check)
-        
-        // Restore search byte
-        Emit_MovRaxR9()
-        
         Trans_Asm("TEST rcx, rcx")
         Emit_Je(not_found)
-        
-        Emit_MarkLabel(scalar_loop)
-        X86_MovzxEDX_ByteDerefRDI()
-        Trans_Asm("CMP dl, al")
-        Emit_Je(found_scalar)
-        
-        Trans_Asm("INC rdi")
-        Trans_Asm("DEC rcx")
-        Emit_Jne(scalar_loop)
+        Trans_Asm("CMP rdi, r8")
+        Emit_Je(short_scan)
+        X86_MemChrOverlap()
+        Trans_Asm("TEST eax, eax")
+        Emit_Je(not_found)
+        X86_MemChrOverlapOff()
+        Emit_Jmp(done_label)
+
+        Emit_MarkLabel(short_scan)
+        Emit_MovRaxR9()
+        step = 0
+        WhileLoop LessThan(step, 15) {
+            miss = Emit_CreateLabel()
+            IfCondition GreaterThan(step, 0) ThenBlock: {
+                ins = StringConcat("CMP rcx, ", NumberToString(step))
+                Trans_Asm(ins)
+                Emit_Jbe(not_found)
+            }
+            X86_MemChrTest(step)
+            Emit_Jne(miss)
+            Emit_MovRaxImm64(step)
+            Emit_Jmp(done_label)
+            Emit_MarkLabel(miss)
+            step = Add(step, 1)
+        }
+        Emit_Jmp(not_found)
         
         // === NOT FOUND ===
         Emit_MarkLabel(not_found)
         Emit_MovRaxNeg1()  // Return -1
-        Emit_Jmp(done_label)
-        
-        // === FOUND IN SCALAR ===
-        Emit_MarkLabel(found_scalar)
-        Emit_MovRaxRdi()
-        Emit_SubRaxR8()
         
         // === DONE ===
         Emit_MarkLabel(done_label)
