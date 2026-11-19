@@ -1,6 +1,6 @@
 # High-Performance AILANG
 
-How to write an AILANG program that stays readable and still runs with tools that have had decades of C work. The worked example is `AiLang_CoreUtils/dist/grep_util/grep.ailang`, measured against GNU grep 3.11.
+How to write an AILANG program that stays readable and still runs with tools that have had decades of C work. The first worked example is `AiLang_CoreUtils/dist/grep_util/grep.ailang`, measured against GNU grep 3.11. The second, "Second example: a server" below, is a one-core HTTP server measured against a Rust entry in the same challenge.
 
 The speed does not come from a secret instruction. It comes from doing the obvious thing once, with a compiler primitive, and from not doing the clever thing on every byte.
 
@@ -122,6 +122,8 @@ ReturnValue(MemChr(hay, 101, n))
 
 A short compare of a needle you already located is fine as `MemCompare`. A scan of the file is not.
 
+This rule is about long buffers. A primitive call has a fixed price of its own, and on a short string that price wins. See "Price the call, not only the loop" in the server part below.
+
 ### Do not call a function per line
 
 `LineMatches` is the right call when the pattern is a real regex and the line is a real candidate. It is the wrong call for two million lines that are mostly misses. The literal fast path never calls it. The regex fast path calls it only after a literal hit, and several patterns do not call it at all.
@@ -183,6 +185,99 @@ The branch is the whole optimization. One side is the primitive. The other side 
 | `LineMatches` | The per-line engine for everything that is still a real regex. |
 
 Read `ProcessMapped` before `LineMatches`. The fast program is the first one. The second one is what you call when the first one cannot decide.
+
+## Second example: a server
+
+The grep reads one big file. A server does the opposite: millions of small requests, each a few hundred bytes of parsing, a few B-tree pages, and a few kilobytes of JSON. The worked example is the twelve-dollar server challenge entry `submissions/ailang-native-2paws` (HTTP/1.1 on io_uring, a native SQLite reader and writer, JWT HS256), measured on one core of an FX-8320 at 200,000 users against the Rust entry `rust-iouring-kensac`.
+
+### Measure per request, user and kernel apart
+
+`perf record -e cycles:u -p <pids>` for 30 seconds in the middle of a steady load, with the binary built by `ailang.x -funcmap`, so samples map to function names (code starts at `0x4000b0` plus the map offset). Read `utime` and `stime` of every thread from `/proc/<pid>/task/*/stat` before and after. Divide CPU time by requests served in the same window.
+
+| per request | AILang | Rust |
+|---|---:|---:|
+| total CPU | 41.4 µs | 30.0 µs |
+| kernel | 23.5 µs | 20.2 µs |
+| user | 17.9 µs | 9.8 µs |
+
+Without the split you optimize the wrong half. Here most of the gap was user time, and most of that was spread thin across every hot function, not one bad loop.
+
+Know your noise before you claim a win. Kernel time moved between 23.4 and 24.7 µs per request across identical runs. A change worth less than about 1 µs per request does not show in a whole-server profile. Measure it with a micro-benchmark of the one function, hot and cold, and only then confirm with the server.
+
+### Price the call, not only the loop
+
+`MemChr` costs about 20 ns per call before it reads a byte. JSON escaping needs three tests per byte (`"`, `\`, below `0x20`). On a 114-byte post body:
+
+| scan | ns per body |
+|---|---:|
+| one 8-byte SWAR loop testing all three | 47 |
+| `MemChr` for `"`, `MemChr` for `\`, SWAR for the rest | 121 |
+
+The primitive is the right tool for a file and the wrong one for a field. Below a few hundred bytes, one pass that does every test beats several primitive calls that each do one. Measure the crossover for your own case; 114 bytes is the only size this was measured at.
+
+### Write short fixed pieces with stores
+
+`MemoryCopy` copies 16 bytes per step and then copies the rest one byte at a time. A 6-byte `{"id":` never reaches the vector step; it is six trips through a byte loop. A feed entry wrote five such pieces with `MemoryCopy`. Writing each as one or two `WRMEM_64` stores of a precomputed little-endian word took that function from 1.18 to 0.63 µs per request.
+
+```ailang
+// '{"id":' as one word; the two bytes past it are overwritten by what follows
+WRMEM_64(Add(out, ol), FeedSt.k_id)
+FeedSt.len = Add(ol, 6)
+```
+
+This needs slack past the end of the buffer: allocate the output buffer 64 bytes larger than its capacity.
+
+### One operation per statement in a hot loop
+
+Nested expressions compile to `push`/`pop` chains and stack spills. SHA-256's compression function written as nested expressions ran at 3.59 µs per block. The same rounds written one operation per statement, stepping pointers instead of computing `Add(base, Multiply(i, 8))`, ran at 2.67 µs, with identical digests.
+
+```ailang
+// slower
+se = BitwiseAnd(BitwiseXor(BitwiseXor(RightShift(xe, 6), RightShift(xe, 11)), RightShift(xe, 25)), m32)
+
+// faster
+t = RightShift(xe, 6)
+u = RightShift(xe, 11)
+t = BitwiseXor(t, u)
+u = RightShift(xe, 25)
+t = BitwiseXor(t, u)
+se = BitwiseAnd(t, m32)
+```
+
+Do this in the few loops a profile names, not everywhere. The readable form is the right default, and the compiler is meant to close this gap.
+
+### Divide by a constant with a multiply
+
+`x / 10` for `0 <= x < 2^32` is `RightShift(Multiply(x, 3435973837), 35)`. Seven digits went from 48 to 36 ns.
+
+Keep that constant in a variable or a pool field until the compiler fix lands. `Multiply` by a literal strictly between 2^31 and 2^32 used a 32-bit `IMUL` and kept only the low 32 bits of the product: `Multiply(7, 2147483649)` gave 2147483655. Exactly 2^31 and 2^32, negatives, every other operation and the constant held in a variable were all correct. An 11,089-case sweep of constants through every operation and form found this one bug and nothing else.
+
+### Use `_IO` only for memory someone else writes while you run
+
+`RDMEM_IO_*` and `WRMEM_IO_*` are volatile: the optimizer never caches, merges or moves them. They exist for devices. In an io_uring ring the device is the kernel, but only the head and tail indices (and the provided-buffer ring tail) change under you. Submission and completion entries are filled before the tail store publishes them and read after the tail load says they are ready, so plain `WRMEM`/`RDMEM` is correct there, ordered by those volatile accesses. `RDMEM_S8/S16/S32` are the plain signed reads; a signed field does not need `_IO`.
+
+### The first reader pays the miss
+
+The same escape scan took 40 ns on a hot body and 151 ns on bodies spread over 128 MB. In the server it was the first code to touch each post body, so the profile charged it with the cache misses. Rust paid the same misses in `memmove`. Huge pages bought about 10%. Touching all twenty bodies before writing JSON did not help. Before you optimize a function, run it hot and cold. If the cold number is the profile's number, the cost is memory, not code.
+
+### Keep the disk off the response path
+
+A commit's responses must wait for its WAL write, but nothing else should. The server writes through a shared-memory ring to a separate I/O process, and a second process does checkpoints (WAL fdatasync, write-back, database fdatasync), so WAL appends never queue behind a sync. That took a 220,000-user hold on an SSD from p99 7.4 s to 583 ms.
+
+What remained was the kernel. In a memory-limited cgroup the dirty-page limit is scaled to the cgroup's free memory, and a write that crosses it waits in `balance_dirty_pages`. Sampling `/proc/<pid>/task/*/wchan` every 10 ms while the process is in `D` state shows exactly where. The Rust entry stalled the same way, on its event loop.
+
+### Do not log from the processes you are timing
+
+Forked processes share their stdout file position. When one process's `write` to the log blocks on a throttled disk, the others wait in `fdget_pos` for the same file. Diagnostic logging turned one 220,000-user run into a different result. Log to a separate file per process, or keep the threshold high, and never quote a number measured with logging on.
+
+### Where to read it in the server
+
+| Function | What it is for |
+|---|---|
+| `Feed.PutPost`, `Feed.PutEscN`, `Feed.PutInt` | The feed JSON: word stores, the SWAR escape scan, digits by multiply |
+| `Crypto.SHA256_Compress` | One operation per statement |
+| `IoUring.GetSqe`, `IoUring.PBufRingAdd` | Plain entry writes, volatile tail stores |
+| `SQLite.IoServe`, `SQLite.CkServe` | The I/O process and the checkpoint worker |
 
 ## When this advice stops
 
