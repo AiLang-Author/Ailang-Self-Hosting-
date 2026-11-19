@@ -206,14 +206,19 @@ Know your noise before you claim a win. Kernel time moved between 23.4 and 24.7 
 
 ### Price the call, not only the loop
 
-`MemChr` costs about 20 ns per call before it reads a byte. JSON escaping needs three tests per byte (`"`, `\`, below `0x20`). On a 114-byte post body:
+JSON escaping needs three tests per byte (`"`, `\`, below `0x20`). On a 114-byte post body, hot:
 
 | scan | ns per body |
 |---|---:|
-| one 8-byte SWAR loop testing all three | 47 |
-| `MemChr` for `"`, `MemChr` for `\`, SWAR for the rest | 121 |
+| one 8-byte SWAR loop testing all three | 129 |
+| `MemChr` for `"`, `MemChr` for `\`, SWAR only for bytes below `0x20` | 110 |
+| one `MemChr` alone | 19 |
 
-The primitive is the right tool for a file and the wrong one for a field. Below a few hundred bytes, one pass that does every test beats several primitive calls that each do one. Measure the crossover for your own case; 114 bytes is the only size this was measured at.
+One `MemChr` call covers the whole body in 19 ns, call included. Its SSE2 loop tests 16 bytes per step. The compiled SWAR loop spends about 60 instructions on every 8 bytes. At this size, two primitive passes plus a smaller loop beat one loop that does every test. Price the call before you avoid it. Measure the crossover for your own case; 114 bytes is the only size this was measured at.
+
+### Check the answer before you read the clock
+
+An earlier version of this section said the opposite: 47 ns for the single SWAR loop and 121 ns for the `MemChr` version. The 47 came from a miscompiled loop. The register holding the `\` pattern was overwritten with the space pattern, so every space matched as a backslash and the scan stopped at the second word. It was fast because it did almost no work. The server's tests still passed: a wrong "needs escaping" answer only sends the body down the slower escaping path, and the output is the same. Make every benchmark print or check the result it timed, and compare that result with a reference before you trust the time.
 
 ### Write short fixed pieces with stores
 
@@ -244,7 +249,7 @@ t = BitwiseXor(t, u)
 se = BitwiseAnd(t, m32)
 ```
 
-Do this in the few loops a profile names, not everywhere. The readable form is the right default, and the compiler is meant to close this gap.
+Do this in the few loops a profile names, not everywhere. The readable form is the right default, and the compiler is meant to close this gap. It mostly has. After the November 2026 register work, nested and flattened ran at 2.70 and 2.03 µs. Two later changes cut the nested time to 2.19 µs, against about 2.0 flattened. An operator with two compound operands now parks the left operand in rbx instead of on the stack whenever the right side provably never writes rbx. When rbx already holds a variable, the operator reads the left operand from memory instead of pushing and popping rbx.
 
 ### Divide by a constant with a multiply
 
@@ -258,7 +263,7 @@ Keep that constant in a variable or a pool field until the compiler fix lands. `
 
 ### The first reader pays the miss
 
-The same escape scan took 40 ns on a hot body and 151 ns on bodies spread over 128 MB. In the server it was the first code to touch each post body, so the profile charged it with the cache misses. Rust paid the same misses in `memmove`. Huge pages bought about 10%. Touching all twenty bodies before writing JSON did not help. Before you optimize a function, run it hot and cold. If the cold number is the profile's number, the cost is memory, not code.
+The single-loop escape scan took 129 ns on a hot body and about 235 ns on bodies spread over 128 MB, one per 4 KB page. A second pass over the same pages cost the same as the first. Huge pages took it to about 215 ns. In the server this scan was the first code to touch each post body, so the profile charged it with those misses. Rust paid the same misses in `memmove`. Before you optimize a function, run it hot and cold. If the cold number is the profile's number, the cost is memory, not code.
 
 ### Keep the disk off the response path
 
