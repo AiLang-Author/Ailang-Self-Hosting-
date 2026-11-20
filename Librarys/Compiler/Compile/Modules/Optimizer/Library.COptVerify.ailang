@@ -40,6 +40,12 @@ FixedPool.VerifyDec {
     "ext": Initialize=0, CanChange=True
     "greg": Initialize=0, CanChange=True
     "grm": Initialize=-1, CanChange=True
+    // Memory operand of the last decoded instruction (Optimize_DeadStores).
+    // m_base/m_idx -1 when absent, -2 for a RIP-relative or absolute disp32.
+    "m_on": Initialize=0, CanChange=True
+    "m_base": Initialize=-1, CanChange=True
+    "m_idx": Initialize=-1, CanChange=True
+    "m_disp": Initialize=0, CanChange=True
 }
 
 Function.Optimize_VerifyReset {
@@ -231,6 +237,29 @@ Function.Optimize_VerifyPrefixes {
     }
 }
 
+// The signed displacement at the decode position: disp8 for mode 1,
+// disp32 for mode 2, 0 otherwise. Does not advance.
+Function.Optimize_VerifyDisp {
+    Input: mode: Integer
+    Output: Integer
+    Body: {
+        p = VerifyDec.pos
+        IfCondition EqualTo(mode, 1) ThenBlock: {
+            IfCondition GreaterEqual(p, VerifyDec.lim) ThenBlock: { ReturnValue(0) }
+            b = RDMEM_8(Emit.code, p)
+            IfCondition GreaterEqual(b, 128) ThenBlock: { b = Subtract(b, 256) }
+            ReturnValue(b)
+        }
+        IfCondition EqualTo(mode, 2) ThenBlock: {
+            IfCondition GreaterThan(Add(p, 4), VerifyDec.lim) ThenBlock: { ReturnValue(0) }
+            d = BitwiseOr(BitwiseOr(RDMEM_8(Emit.code, p), LeftShift(RDMEM_8(Emit.code, Add(p, 1)), 8)), BitwiseOr(LeftShift(RDMEM_8(Emit.code, Add(p, 2)), 16), LeftShift(RDMEM_8(Emit.code, Add(p, 3)), 24)))
+            IfCondition GreaterEqual(d, 2147483648) ThenBlock: { d = Subtract(d, 4294967296) }
+            ReturnValue(d)
+        }
+        ReturnValue(0)
+    }
+}
+
 Function.Optimize_VerifySib {
     Input: mode: Integer
     Body: {
@@ -248,9 +277,11 @@ Function.Optimize_VerifySib {
                 idx = Add(idx, 8)
             }
             Optimize_VerifyR(idx)
+            VerifyDec.m_idx = idx
         }
         IfCondition EqualTo(mode, 0) ThenBlock: {
             IfCondition EqualTo(base3, 5) ThenBlock: {
+                VerifyDec.m_base = -2
                 Optimize_VerifySkip(4)
                 ReturnValue(0)
             }
@@ -260,6 +291,8 @@ Function.Optimize_VerifySib {
             base = Add(base, 8)
         }
         Optimize_VerifyR(base)
+        VerifyDec.m_base = base
+        VerifyDec.m_disp = Optimize_VerifyDisp(mode)
         IfCondition EqualTo(mode, 1) ThenBlock: { Optimize_VerifySkip(1) }
         IfCondition EqualTo(mode, 2) ThenBlock: { Optimize_VerifySkip(4) }
         ReturnValue(0)
@@ -289,12 +322,17 @@ Function.Optimize_VerifyEatModrm {
             VerifyDec.grm = grm
             ReturnValue(0)
         }
+        VerifyDec.m_on = 1
+        VerifyDec.m_base = -1
+        VerifyDec.m_idx = -1
+        VerifyDec.m_disp = 0
         IfCondition EqualTo(rm3, 4) ThenBlock: {
             Optimize_VerifySib(mode)
             ReturnValue(0)
         }
         IfCondition EqualTo(mode, 0) ThenBlock: {
             IfCondition EqualTo(rm3, 5) ThenBlock: {
+                VerifyDec.m_base = -2
                 Optimize_VerifySkip(4)
                 ReturnValue(0)
             }
@@ -304,6 +342,8 @@ Function.Optimize_VerifyEatModrm {
             base = Add(base, 8)
         }
         Optimize_VerifyR(base)
+        VerifyDec.m_base = base
+        VerifyDec.m_disp = Optimize_VerifyDisp(mode)
         IfCondition EqualTo(mode, 1) ThenBlock: { Optimize_VerifySkip(1) }
         IfCondition EqualTo(mode, 2) ThenBlock: { Optimize_VerifySkip(4) }
         ReturnValue(0)
@@ -1236,6 +1276,10 @@ Function.Optimize_VerifyInsn {
         VerifyDec.ext = 0
         VerifyDec.greg = 0
         VerifyDec.grm = -1
+        VerifyDec.m_on = 0
+        VerifyDec.m_base = -1
+        VerifyDec.m_idx = -1
+        VerifyDec.m_disp = 0
         IfCondition LessThan(pos, 0) ThenBlock: { ReturnValue(0) }
         IfCondition GreaterEqual(pos, Emit.code_size) ThenBlock: { ReturnValue(0) }
         Optimize_VerifyPrefixes()
@@ -1556,5 +1600,275 @@ Function.Optimize_VerifyFlush {
         }
         VerifyState.n = 0
         ReturnValue(0)
+    }
+}
+
+// =============================================================================
+// DEAD FRAME STORES
+// After a function is emitted, decode its bytes from the end of the
+// prologue to the return label. A store to [rbp+disp] whose bytes no
+// instruction in the function reads (byte-range overlap, Optimize_DSSize)
+// becomes a nop of the same length, so no offset or label moves. The pass gives up on the whole
+// function when anything is uncertain: an undecodable byte, a label that is
+// not an instruction boundary (data such as a switch table decoded out of
+// step), rbp used as a register or as an index, lea of a frame slot (the
+// address may reach other slots), an rsp-relative operand that could reach
+// the frame, or inline asm. AILANG_DSE=0 turns it off.
+// =============================================================================
+
+FixedPool.DSState {
+    "start": Initialize=0, CanChange=True
+    "label0": Initialize=0, CanChange=True
+    "want": Initialize=-1, CanChange=True
+    "total": Initialize=0, CanChange=True
+}
+
+Function.Optimize_DSWant {
+    Output: Integer
+    Body: {
+        IfCondition GreaterEqual(DSState.want, 0) ThenBlock: { ReturnValue(DSState.want) }
+        DSState.want = 1
+        env_fd = SystemCall(2, "/proc/self/environ", 0, 0)
+        IfCondition GreaterEqual(env_fd, 0) ThenBlock: {
+            buf = Allocate(131072)
+            n = SystemCall(0, env_fd, buf, 131072)
+            SystemCall(3, env_fd, 0, 0)
+            IfCondition GreaterThan(n, 0) ThenBlock: {
+                IfCondition GreaterEqual(MemMem(buf, n, "AILANG_DSE=0", 12), 0) ThenBlock: { DSState.want = 0 }
+            }
+            Deallocate(buf, 131072)
+        }
+        ReturnValue(DSState.want)
+    }
+}
+
+Function.Optimize_DSMark {
+    Body: {
+        DSState.start = Emit.code_size
+        DSState.label0 = Emit.label_count
+    }
+}
+
+// Primary opcode at pos after legacy prefixes and REX: the byte, or
+// 0x0F00 | second byte for two-byte opcodes. pfx bits: 1 = 66, 2 = F2,
+// 4 = F3, 8 = LOCK, in DSState via the return high bits (<< 16).
+Function.Optimize_DSOp {
+    Input: pos: Integer
+    Output: Integer
+    Body: {
+        p = pos
+        pfx = 0
+        k = 0
+        WhileLoop LessThan(k, 8) {
+            b = RDMEM_8(Emit.code, p)
+            hit = 0
+            IfCondition EqualTo(b, 102) ThenBlock: { pfx = BitwiseOr(pfx, 1) hit = 1 }
+            IfCondition EqualTo(b, 242) ThenBlock: { pfx = BitwiseOr(pfx, 2) hit = 1 }
+            IfCondition EqualTo(b, 243) ThenBlock: { pfx = BitwiseOr(pfx, 4) hit = 1 }
+            IfCondition EqualTo(b, 240) ThenBlock: { pfx = BitwiseOr(pfx, 8) hit = 1 }
+            IfCondition EqualTo(b, 46) ThenBlock: { hit = 1 }
+            IfCondition EqualTo(b, 62) ThenBlock: { hit = 1 }
+            IfCondition EqualTo(b, 38) ThenBlock: { hit = 1 }
+            IfCondition EqualTo(b, 54) ThenBlock: { hit = 1 }
+            IfCondition EqualTo(b, 100) ThenBlock: { hit = 1 }
+            IfCondition EqualTo(b, 101) ThenBlock: { hit = 1 }
+            IfCondition EqualTo(b, 103) ThenBlock: { hit = 1 }
+            IfCondition EqualTo(hit, 0) ThenBlock: { BreakLoop }
+            p = Add(p, 1)
+            k = Add(k, 1)
+        }
+        b = RDMEM_8(Emit.code, p)
+        IfCondition And(GreaterEqual(b, 64), LessEqual(b, 79)) ThenBlock: {
+            p = Add(p, 1)
+            b = RDMEM_8(Emit.code, p)
+        }
+        IfCondition EqualTo(b, 15) ThenBlock: {
+            b = BitwiseOr(3840, RDMEM_8(Emit.code, Add(p, 1)))
+        }
+        ReturnValue(BitwiseOr(b, LeftShift(pfx, 16)))
+    }
+}
+
+// 1 when the instruction whose opcode word is op only writes its memory
+// operand (a plain store). Called right after Optimize_VerifyInsn decoded it.
+Function.Optimize_DSIsStore {
+    Input: op: Integer
+    Output: Integer
+    Body: {
+        pfx = RightShift(op, 16)
+        o = BitwiseAnd(op, 65535)
+        IfCondition NotEqual(BitwiseAnd(pfx, 8), 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(o, 136) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(o, 137) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(o, 198) ThenBlock: { ReturnValue(EqualTo(VerifyDec.ext, 0)) }
+        IfCondition EqualTo(o, 199) ThenBlock: { ReturnValue(EqualTo(VerifyDec.ext, 0)) }
+        IfCondition EqualTo(o, 3857) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(o, 3881) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(o, 4054) ThenBlock: { ReturnValue(NotEqual(BitwiseAnd(pfx, 1), 0)) }
+        IfCondition EqualTo(o, 3967) ThenBlock: {
+            IfCondition NotEqual(BitwiseAnd(pfx, 5), 0) ThenBlock: { ReturnValue(1) }
+        }
+        ReturnValue(0)
+    }
+}
+
+// Bytes an access may touch: 16 for the 16-byte SSE moves (movups/movaps/
+// movdqa/movdqu, no F2/F3 scalar prefix on 0F 10/11), else 8. Narrow
+// accesses count as 8, which only keeps more stores.
+Function.Optimize_DSSize {
+    Input: op: Integer
+    Output: Integer
+    Body: {
+        pfx = RightShift(op, 16)
+        o = BitwiseAnd(op, 65535)
+        IfCondition Or(EqualTo(o, 3856), EqualTo(o, 3857)) ThenBlock: {
+            IfCondition EqualTo(BitwiseAnd(pfx, 6), 0) ThenBlock: { ReturnValue(16) }
+            ReturnValue(8)
+        }
+        IfCondition Or(EqualTo(o, 3880), EqualTo(o, 3881)) ThenBlock: { ReturnValue(16) }
+        IfCondition Or(EqualTo(o, 3951), EqualTo(o, 3967)) ThenBlock: {
+            IfCondition NotEqual(BitwiseAnd(pfx, 5), 0) ThenBlock: { ReturnValue(16) }
+        }
+        ReturnValue(8)
+    }
+}
+
+Function.Optimize_DSHasAsm {
+    Input: node: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(node, 0) ThenBlock: { ReturnValue(0) }
+        t = AST_GetType(node)
+        IfCondition EqualTo(t, AST.INLINEASM) ThenBlock: { ReturnValue(1) }
+        IfCondition EqualTo(t, AST.OP_INLINE_ASM) ThenBlock: { ReturnValue(1) }
+        n = AST_GetChildCount(node)
+        i = 0
+        WhileLoop LessThan(i, n) {
+            IfCondition EqualTo(Optimize_DSHasAsm(AST_GetChild(node, i)), 1) ThenBlock: { ReturnValue(1) }
+            i = Add(i, 1)
+        }
+        ReturnValue(0)
+    }
+}
+
+// Returns the number of stores turned into nops.
+Function.Optimize_DeadStores {
+    Input: body: Address
+    Output: Integer
+    Body: {
+        IfCondition EqualTo(Optimize_DSWant(), 0) ThenBlock: { ReturnValue(0) }
+        start = DSState.start
+        endp = Emit.code_size
+        n = Subtract(endp, start)
+        IfCondition LessEqual(n, 0) ThenBlock: { ReturnValue(0) }
+        IfCondition EqualTo(Optimize_DSHasAsm(body), 1) ThenBlock: { ReturnValue(0) }
+        cap = 4096
+        bnd = Allocate(n)
+        k = 0
+        WhileLoop LessThan(k, n) {
+            WRMEM_8(bnd, k, 0)
+            k = Add(k, 1)
+        }
+        cpos = Allocate(Multiply(cap, 8))
+        clen = Allocate(Multiply(cap, 8))
+        cdisp = Allocate(Multiply(cap, 8))
+        rdisp = Allocate(Multiply(cap, 8))
+        csz = Allocate(Multiply(cap, 8))
+        rsz = Allocate(Multiply(cap, 8))
+        nc = 0
+        nr = 0
+        ok = 1
+        pos = start
+        WhileLoop LessThan(pos, endp) {
+            info = Optimize_VerifyInsn(pos)
+            ilen = BitwiseAnd(info, 255)
+            IfCondition EqualTo(ilen, 0) ThenBlock: { ok = 0 BreakLoop }
+            WRMEM_8(bnd, Subtract(pos, start), 1)
+            rd = BitwiseAnd(RightShift(info, 24), 65535)
+            wr = BitwiseAnd(RightShift(info, 8), 65535)
+            mem_rbp = 0
+            IfCondition EqualTo(VerifyDec.m_on, 1) ThenBlock: {
+                IfCondition EqualTo(VerifyDec.m_idx, 5) ThenBlock: { ok = 0 BreakLoop }
+                IfCondition EqualTo(VerifyDec.m_base, 4) ThenBlock: {
+                    IfCondition GreaterEqual(VerifyDec.m_idx, 0) ThenBlock: { ok = 0 BreakLoop }
+                    IfCondition GreaterEqual(VerifyDec.m_disp, 32) ThenBlock: { ok = 0 BreakLoop }
+                }
+                IfCondition EqualTo(VerifyDec.m_base, 5) ThenBlock: {
+                    IfCondition GreaterEqual(VerifyDec.m_idx, 0) ThenBlock: { ok = 0 BreakLoop }
+                    mem_rbp = 1
+                }
+            }
+            IfCondition NotEqual(BitwiseAnd(BitwiseOr(rd, wr), 32), 0) ThenBlock: {
+                IfCondition EqualTo(mem_rbp, 0) ThenBlock: { ok = 0 BreakLoop }
+                IfCondition NotEqual(BitwiseAnd(wr, 32), 0) ThenBlock: { ok = 0 BreakLoop }
+            }
+            IfCondition EqualTo(mem_rbp, 1) ThenBlock: {
+                op = Optimize_DSOp(pos)
+                IfCondition EqualTo(BitwiseAnd(op, 65535), 141) ThenBlock: { ok = 0 BreakLoop }
+                IfCondition EqualTo(Optimize_DSIsStore(op), 1) ThenBlock: {
+                    o = BitwiseAnd(op, 65535)
+                    IfCondition Or(EqualTo(o, 136), EqualTo(o, 137)) ThenBlock: {
+                        IfCondition EqualTo(VerifyDec.greg, 5) ThenBlock: { ok = 0 BreakLoop }
+                    }
+                    IfCondition GreaterEqual(nc, cap) ThenBlock: { ok = 0 BreakLoop }
+                    WRMEM_64(Add(cpos, Multiply(nc, 8)), pos)
+                    WRMEM_64(Add(clen, Multiply(nc, 8)), ilen)
+                    WRMEM_64(Add(cdisp, Multiply(nc, 8)), VerifyDec.m_disp)
+                    WRMEM_64(Add(csz, Multiply(nc, 8)), Optimize_DSSize(op))
+                    nc = Add(nc, 1)
+                } ElseBlock: {
+                    IfCondition GreaterEqual(nr, cap) ThenBlock: { ok = 0 BreakLoop }
+                    WRMEM_64(Add(rdisp, Multiply(nr, 8)), VerifyDec.m_disp)
+                    WRMEM_64(Add(rsz, Multiply(nr, 8)), Optimize_DSSize(op))
+                    nr = Add(nr, 1)
+                }
+            }
+            pos = Add(pos, ilen)
+        }
+        IfCondition NotEqual(pos, endp) ThenBlock: { ok = 0 }
+        IfCondition EqualTo(ok, 1) ThenBlock: {
+            li = DSState.label0
+            WhileLoop LessThan(li, Emit.label_count) {
+                ent = Array.Get(Emit.labels, li)
+                IfCondition EqualTo(RDMEM_64(Add(ent, LabelField.RESOLVED)), 1) ThenBlock: {
+                    la = RDMEM_64(Add(ent, LabelField.ADDRESS))
+                    IfCondition And(GreaterEqual(la, start), LessThan(la, endp)) ThenBlock: {
+                        IfCondition EqualTo(RDMEM_8(bnd, Subtract(la, start)), 0) ThenBlock: { ok = 0 BreakLoop }
+                    }
+                }
+                li = Add(li, 1)
+            }
+        }
+        killed = 0
+        IfCondition EqualTo(ok, 1) ThenBlock: {
+            ci = 0
+            WhileLoop LessThan(ci, nc) {
+                d = RDMEM_64(Add(cdisp, Multiply(ci, 8)))
+                dsz = RDMEM_64(Add(csz, Multiply(ci, 8)))
+                dead = 1
+                ri = 0
+                WhileLoop LessThan(ri, nr) {
+                    r = RDMEM_64(Add(rdisp, Multiply(ri, 8)))
+                    rz = RDMEM_64(Add(rsz, Multiply(ri, 8)))
+                    // [r, r+rz) overlaps [d, d+dsz)
+                    IfCondition And(LessThan(r, Add(d, dsz)), LessThan(d, Add(r, rz))) ThenBlock: { dead = 0 BreakLoop }
+                    ri = Add(ri, 1)
+                }
+                IfCondition EqualTo(dead, 1) ThenBlock: {
+                    EmitTag_NopBytes(RDMEM_64(Add(cpos, Multiply(ci, 8))), RDMEM_64(Add(clen, Multiply(ci, 8))))
+                    killed = Add(killed, 1)
+                }
+                ci = Add(ci, 1)
+            }
+        }
+        DSState.total = Add(DSState.total, killed)
+        Deallocate(bnd, n)
+        Deallocate(cpos, Multiply(cap, 8))
+        Deallocate(clen, Multiply(cap, 8))
+        Deallocate(cdisp, Multiply(cap, 8))
+        Deallocate(rdisp, Multiply(cap, 8))
+        Deallocate(csz, Multiply(cap, 8))
+        Deallocate(rsz, Multiply(cap, 8))
+        ReturnValue(killed)
     }
 }
